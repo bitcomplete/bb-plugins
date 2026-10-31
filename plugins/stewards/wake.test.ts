@@ -345,6 +345,25 @@ describe("the nightly prompt", () => {
     expect(escalation).not.toContain("## The record since");
   });
 
+  // BB-154: the digest lists the marked bindings and open stalls, so a quiet
+  // stall is visible once a day even before the requeue threshold.
+  it("lists bindings waiting with no wake source and open stall escalations in the digest", () => {
+    const { s, bind } = world();
+    const marked = bind("ENG-12");
+    s.patch(marked.id, {
+      noWakeSource: true,
+      requeueWakeCount: 2,
+      status: { phase: "In Progress", summary: "Waiting.", nextAction: "the vendor", actor: "other", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T },
+    });
+    const stall = s.escalate({ bindingId: marked.id, kind: "stall", question: "ENG-12 has woken by requeue 2 times with the same wait.", meanwhile: "Waiting.", route: "project", recommendation: null });
+    const current = s.binding(marked.id)!;
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [current], stall: [{ escalation: stall, from: current }], held: [] };
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records });
+    expect(wake).toContain("### Waiting with no wake source");
+    expect(wake).toContain("- ENG-12 (ticket, In Progress): waiting with no wake source: the vendor's reply (2 requeue-only wakes)");
+    expect(wake).toContain(`- ENG-12: stall escalation ${stall.id} with the project steward, since 2026-10-18: ENG-12 has woken by requeue 2 times with the same wait.`);
+  });
+
   it("shows the project's standing-rules list in an approval wake, and works with none configured (BB-54)", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");

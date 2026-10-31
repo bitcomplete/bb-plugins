@@ -3697,7 +3697,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const delivery = await deliverWake(b, config, playbook, disabledOpsWake(b, config, playbook));
       if (delivery === false) return;
-      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false });
+      // BB-154: the turn's reason, so a stale requeue cannot be counted by its report.
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), lastWakeReason: "disabled", pending: [], archiveWhenIdle: false });
       noteRespawn(b, delivery.respawned);
     }
 
@@ -5636,8 +5637,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, ...(confirmed === null ? {} : { confirmed }), label: config?.file.label ?? "bb-managed" }),
             );
             // A turn like any wake's: it ends with steward_report, and one
-            // waiting on someone else is archived when it is done.
-            if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
+            // waiting on someone else is archived when it is done. Its reason
+            // is not a requeue, so a stale one is never counted (BB-154).
+            if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastWakeReason: "changed", archiveWhenIdle: false });
           });
           if (sent.outcome === "sent") {
             bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);

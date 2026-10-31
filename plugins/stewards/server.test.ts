@@ -9582,6 +9582,9 @@ describe("a wait with no wake source (BB-154)", () => {
     expect(b.noWakeSource).toBe(true);
     // The report that set the wait was an adoption wake, not a requeue.
     expect(b.requeueWakeCount).toBe(0);
+    // Criterion 2: the CLI status line reads the mark (the page half is `effortPhrase`).
+    expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toContain("waiting, no wake source");
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain("waiting, no wake source");
 
     await requeue(t);
     expect(t.sends.at(-1)!.text).toContain("**Waiting with no wake source.**");
