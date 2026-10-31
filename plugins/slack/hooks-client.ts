@@ -138,16 +138,16 @@ export type SessionFile = z.infer<typeof sessionFileSchema>;
 export const sessionEventSchema = z
   .object({
     source: z.literal(SOURCE),
-    /** Empty on an `invited` or `block_action` wake: there is no conversation. */
+    /** Empty on a `block_action` wake: there is no conversation. */
     session: z.string().max(200),
     /**
      * The opaque proof that this session belongs to `owner`, echoed to
      * `POST /v1/subscribe` to lease it. Empty (and omitted) when `session` is
-     * empty, as on `invited` and `block_action` wakes. Secret-like: it is
-     * never logged and never put in a wake's text.
+     * empty, as on a `block_action` wake. Secret-like: it is never logged and
+     * never put in a wake's text.
      */
     capability: z.string().max(2000).default(""),
-    action: z.enum(["message", "edited", "deleted", "assistant_thread_started", "assistant_thread_context_changed", "invited", "block_action"]),
+    action: z.enum(["message", "edited", "deleted", "assistant_thread_started", "assistant_thread_context_changed", "block_action"]),
     /** True for a channel app_mention, false for a DM or assistant-thread event. */
     mention: z.boolean().default(false),
     /**
@@ -164,7 +164,7 @@ export const sessionEventSchema = z
      * thread lives in, so this is the only place the viewed channel appears.
      */
     contextChannel: z.string().max(200).default(""),
-    /** Empty on an `invited` or `block_action` wake: there is no thread. */
+    /** Empty on a `block_action` wake: there is no thread. */
     thread: z.string().max(200).default(""),
     asker: personWire,
     owner: personWire,
