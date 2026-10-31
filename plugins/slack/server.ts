@@ -1060,6 +1060,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       await backstop(event.session, heldPrompt(event, held), event.tagged ? "tagged" : "untagged");
     }
 
+    /** Whether a queued-row error means the row moved on (dispatched or was removed). */
+    function queuedRowMovedOn(error: unknown): boolean {
+      const e = error as { code?: string; status?: number };
+      return e.code === "NOT_FOUND" || e.code === "CONFLICT" || e.status === 404 || e.status === 409 || e.status === 410;
+    }
+
     /** The queued wake's text rebuilt with the edited words. */
     function rebuiltWakeText(event: SessionEvent, wake: WakeDelivery): string {
       return wakeText({ ...event, files: wake.files, comment: { text: event.comment.text, untrusted: false } });
@@ -1080,7 +1086,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const before = sessions.get(event.session);
       if (options.owesReply && event.tagged) countWake(event);
       const body = `[Slack — session ${event.session}]\n${correction}${options.owesReply ? `\n\nReply in Slack with the slack_reply tool (session ${event.session}). If the message needs no answer, use the slack_ack tool (session ${event.session}) instead.` : `\n\nNo reply is needed for this deletion.`}`;
-      void hooks.status(event.session, "is thinking…", checkSignal()).catch(() => undefined);
+      // Only an edit owes a reply, so only an edit shows the thinking indicator.
+      // A deletion that starts a turn is answered silently, and nothing would
+      // clear an indicator it never owed a reply for.
+      if (options.owesReply) void hooks.status(event.session, "is thinking…", checkSignal()).catch(() => undefined);
       const handedAt = deps.now();
       const outcome = await sendToThread(event.session, threadId, body);
       if (outcome.kind === "gone") {
@@ -1125,18 +1134,26 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
             input: [{ type: "text", text: rebuiltWakeText(event, wake), mentions: [] }],
           });
           // Keep the new row version, so a second edit of the same message can
-          // still rewrite it in place.
-          updateWake(event.session, event.ts, { text: event.comment.text, files: event.files, queuedUpdatedAt: updated.updatedAt });
+          // still rewrite it in place. `files` is not patched: a correction
+          // wake carries none, so the recorded ones are kept for a rebuild.
+          updateWake(event.session, event.ts, { text: event.comment.text, queuedUpdatedAt: updated.updatedAt });
           bb.log.info(`Slack session ${logSession}: rewrote queued message ${wake.queuedMessageId} after an edit`);
           return;
         } catch (error) {
+          // A transient failure leaves the row queued with its old text; do not
+          // steer, or the stale row would arrive after the correction.
+          if (!queuedRowMovedOn(error)) {
+            bb.log.warn(`Slack session ${logSession}: could not rewrite the queued message (${errorMessage(error)}); leaving it`);
+            return;
+          }
           // The row moved on (dispatched, was edited, or was cancelled): fall
           // through and steer the thread instead.
-          bb.log.info(`Slack session ${logSession}: could not rewrite the queued message (${errorMessage(error)}); steering the thread`);
+          bb.log.info(`Slack session ${logSession}: the queued message moved on (${errorMessage(error)}); steering the thread`);
         }
       }
       if (wake.state === "held") {
-        // The original was held for the owner; an edit is a fresh hold.
+        // Defence: a held wake's author is a non-owner, so an edit from them is
+        // intercepted as untrusted before this point. Kept for safety.
         countWake(event);
         await holdUntrusted(event, logSession);
         return;
@@ -1144,7 +1161,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const quote = clipMention(wake.text, 200);
       const now = clipMention(event.comment.text, 200);
       await steerCorrection(event, record, `the message "${quote}" was edited; it now reads: "${now}"`, { owesReply: true });
-      updateWake(event.session, event.ts, { text: event.comment.text, files: event.files, state: "started" });
+      updateWake(event.session, event.ts, { text: event.comment.text, state: "started" });
     }
 
     /** An owner's deletion of a delivered wake: remove the queued row, or steer. */
@@ -1164,7 +1181,11 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           bb.log.info(`Slack session ${logSession}: removed queued message ${wake.queuedMessageId} after a deletion`);
           return;
         } catch (error) {
-          bb.log.info(`Slack session ${logSession}: could not remove the queued message (${errorMessage(error)}); steering the thread`);
+          if (!queuedRowMovedOn(error)) {
+            bb.log.warn(`Slack session ${logSession}: could not remove the queued message (${errorMessage(error)}); leaving it`);
+            return;
+          }
+          bb.log.info(`Slack session ${logSession}: the queued message moved on (${errorMessage(error)}); steering the thread`);
         }
       }
       if (wake.state === "held") {
@@ -1212,6 +1233,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return;
       }
       if (isUntrusted(event)) {
+        if (wake.state === "held") {
+          // A non-owner deleted their held message: withdraw the request, so
+          // the owner is not asked to confirm words that no longer exist.
+          if (wake.heldId !== "") await takePending(event.session, wake.heldId);
+          forgetWake(event.session, event.ts);
+          const current = sessions.get(event.session);
+          if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
+          bb.log.info(`Slack session ${logSession}: withdrew a held message that was deleted`);
+          return;
+        }
         // A deletion carries no words to hold; nothing to do.
         bb.log.info(`Slack session ${logSession}: a message from someone other than the owner was deleted; ignored`);
         return;

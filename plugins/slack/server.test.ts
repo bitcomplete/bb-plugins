@@ -1485,6 +1485,74 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("keeps a queued message's files line across a second edit", async () => {
+    const s = await live({ send: () => ({ delivery: "queued", queuedMessage: { id: "qm-f", updatedAt: 5 } }) });
+    s.hooks.last().send(s.hooks.session({ ts: "10.1" }));
+    await tick();
+    const files = [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }];
+    s.hooks.last().send(s.hooks.session({ ts: "10.2", comment: { text: "the first draft", untrusted: false }, files }));
+    await tick();
+    // A correction wake carries no files; the recorded ones must survive it.
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "10.2", comment: { text: "the second draft", untrusted: false } }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "10.2", comment: { text: "the third draft", untrusted: false } }));
+    await tick();
+    const updates = s.harness.sdk.callsTo("threads.queuedMessages.update");
+    expect(updates).toHaveLength(2);
+    expect(JSON.stringify(updates[1]![0])).toContain("shot.png");
+    expect(JSON.stringify(updates[1]![0])).toContain("the third draft");
+    await s.stop();
+  });
+
+  it("leaves a queued message alone on a transient rewrite failure", async () => {
+    const s = await live({
+      send: () => ({ delivery: "queued", queuedMessage: { id: "qm-t", updatedAt: 5 } }),
+      updateQueued: () => {
+        throw Object.assign(new Error("try later"), { status: 503 });
+      },
+    });
+    s.hooks.last().send(s.hooks.session({ ts: "11.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "11.2", comment: { text: "the first draft", untrusted: false } }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "11.2", comment: { text: "the second draft", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(1);
+    // No steer: the stale row is still queued and would arrive after the correction.
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("does not set the thinking status for a deletion", async () => {
+    const s = await live({ sendAttempt: "start-turn" });
+    s.hooks.last().send(s.hooks.session({ ts: "12.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "12.2", comment: { text: "please do this", untrusted: false } }));
+    await tick();
+    const before = s.hooks.statuses.length;
+    s.hooks.last().send(s.hooks.session({ action: "deleted", ts: "12.2", comment: { text: "", untrusted: false } }));
+    await tick();
+    // The deletion steers without a thinking indicator that nothing would clear.
+    expect(s.hooks.statuses.length).toBe(before);
+    await s.stop();
+  });
+
+  it("withdraws a held request when the non-owner deletes their message", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session({ ts: "13.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "13.2", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "halt work", untrusted: true } }));
+    await tick();
+    const pendingBefore = (await s.bb.storage.kv.get("sessions/pending")) as Record<string, { requests: unknown[] }>;
+    expect(pendingBefore["D0123:1712345678.901234"]?.requests).toHaveLength(1);
+
+    s.hooks.last().send(s.hooks.session({ action: "deleted", ts: "13.2", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "", untrusted: true } }));
+    await tick();
+    const pendingAfter = (await s.bb.storage.kv.get("sessions/pending")) as Record<string, { requests: unknown[] } | undefined>;
+    expect(pendingAfter["D0123:1712345678.901234"]).toBeUndefined();
+    await s.stop();
+  });
+
   it("does not let an untagged hold prompt consume a tagged wake's reply slot", async () => {
     const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
     // A tagged owner wake, unanswered.
