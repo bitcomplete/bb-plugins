@@ -5,14 +5,16 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, phaseInstructions, type BigDecision, type LessonRules, type Playbook } from "./config.js";
+import { formatDuration, phaseInstructions, type LessonRules, type Playbook } from "./config.js";
+import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
-import { newHumanComments, prGate, reportedItem, unheardWait, type GateState, type ProjectApprovalRecord } from "./reconcile.js";
+import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { prGate, type ProjectApprovalRecord } from "./gate.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";

@@ -56,6 +56,18 @@ add a statement at the end of `MIGRATIONS`, never edit one. A change to a
 cross-repo contract changes every side in the same PR or in ordered PRs,
 as the project's guidance says.
 
+**Split the decision from the feature.** When a change touches an
+owner-reviewed trigger that has its own seam in the code — a shared
+contract file and its copies, a migration, a credential or scope the
+feature needs, gate or identity code — land that part first as its own pull
+request, and the feature that uses it second. The first part must stand
+alone: readable, tested and still correct if the second never lands. Each
+PR body names its sibling. Never split a single behaviour change so that
+neither half shows the trigger, and do not split a change small enough to
+read in one sitting: every PR is a reviewer round and every bb-plugins
+merge moves the pin. Which seams a project has is the project's guidance,
+not this skill's.
+
 Review your own diff before committing; there is no user to ask.
 
 ## Test
@@ -80,6 +92,8 @@ Implements [<KEY>](<url>). <Two to five lines: what changed and why.>
 
 > <When the project's guidance says a merge to this repo restarts servers:
 > the restart note from `.bb/AGENTS.md`.>
+
+Sibling PR: <the pull request this is one half of, or omit when it stands alone.>
 
 ## Classification
 <owner-reviewed | no-review>: <the trigger from the project's guidance, or why none applies>

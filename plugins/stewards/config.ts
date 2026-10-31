@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { decideEntrySchema, defaultDecideList } from "./decisions.js";
 import { SENTRY_SLUG, opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
 
@@ -76,67 +77,6 @@ export const modelSpecSchema = z
   });
 
 // ---- the project file -------------------------------------------------------------
-
-/**
- * One entry of the project's decide list: the decisions the project steward
- * may make itself, and those only the user may make. `paths` are the
- * repo-relative file patterns a pull request touches to match the entry; the
- * decide list is one list, and an entry with no mark, an unknown mark, or a
- * pull request the reviewer cannot classify is the user's (fail closed).
- */
-export type DecideMark = "project" | "user";
-export type BigDecision = { text: string; decide: DecideMark; paths: string[] };
-
-/**
- * The big decisions: every one of these is the user's, never the project
- * steward's, whatever a caller says. Kept as bare strings here and marked
- * `user` by the schema, so a project file that has not been migrated still
- * fails closed.
- */
-export const DEFAULT_BIG_DECISIONS: readonly string[] = [
-  "Changing what a ticket's requester asked for, beyond clarifying it",
-  "A public API, data contract or schema change other teams depend on",
-  "Anything irreversible in production: data deletion, migrations without a way back",
-  "New vendors, services or spending",
-  "A conflict between people that the project's guidance does not settle",
-  "Granting a new credential, token or cluster access, or widening what an existing one can reach",
-  "Letting anyone other than a server's owner direct that server or its stewards",
-];
-
-/**
- * The owner-reviewed triggers from `.bb/AGENTS.md` ("Change classification")
- * that are not big decisions: the project steward may decide these itself.
- * They are the default `project` half of the decide list.
- */
-export const DEFAULT_PROJECT_DECISIONS: readonly { text: string; paths: string[] }[] = [
-  { text: "A cross-repo contract other repos implement", paths: ["bb-plugins/plugins/*/source-contract.ts", "bb-gate/docs/hooks.md", "bb-gate/docker/bb-server/**", "devbox/kploy/**"] },
-  { text: "Anything that could stop every developer's server from starting or being routed to", paths: ["bb-gate/docker/bb-server/**", "bb-gate/backend.json"] },
-  { text: "Production infrastructure", paths: ["bb-gate/kploy/**", "bb-gate/bc-prod.yaml", "bb-gate/.github/workflows/**", "devbox/host/**", "devbox/image/**", "devbox/profiles/**", "devbox/bin/**", "devbox/kploy/**", "devbox/bc-prod.yaml", "devbox/.github/workflows/**"] },
-  { text: "A store migration", paths: ["bb-plugins/plugins/*/store.ts"] },
-  { text: "A new dependency", paths: ["**/package.json", "**/package-lock.json", "**/go.mod", "**/go.sum"] },
-];
-
-/**
- * A decide-list entry as a project file writes it: a bare string (the user's,
- * by default) or an object that marks it. An unknown mark fails closed to the
- * user; a `paths` list lets the plugin match a pull request to the entry.
- */
-const decideEntrySchema = z.union([
-  z.string().trim().min(1).max(300).transform((text): BigDecision => ({ text, decide: "user", paths: [] })),
-  z
-    .object({
-      text: z.string().trim().min(1).max(300),
-      decide: z.string().trim().max(40).optional(),
-      paths: z.array(z.string().trim().min(1).max(300)).max(50).optional(),
-    })
-    .strict()
-    .transform((entry): BigDecision => ({ text: entry.text, decide: entry.decide === "project" ? "project" : "user", paths: entry.paths ?? [] })),
-]);
-
-export const defaultDecideList = (): BigDecision[] => [
-  ...DEFAULT_BIG_DECISIONS.map((text): BigDecision => ({ text, decide: "user", paths: [] })),
-  ...DEFAULT_PROJECT_DECISIONS.map((entry): BigDecision => ({ text: entry.text, decide: "project", paths: entry.paths })),
-];
 
 const clock = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/u, 'a time such as "01:00"');
 

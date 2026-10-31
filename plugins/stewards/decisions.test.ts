@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { defaultDecideList, parseProjectFile, type BigDecision } from "./config.js";
+import { parseProjectFile } from "./config.js";
+import { defaultDecideList, type BigDecision } from "./decisions.js";
 import { decideFor, decideForEntry, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, isSelfWidening, SELF_WIDENING_PATHS, touchesAny } from "./decisions.js";
 
 const decisions: BigDecision[] = [
@@ -59,7 +60,9 @@ describe("the decide list fails closed", () => {
     expect(decideForPull(["bb-plugins/plugins/linear/wake.ts"], decisions)).toBe("user");
     expect(decideForPull([], decisions)).toBe("user");
     expect(decideForPull(null, decisions)).toBe("user");
-    expect(decideForPull(["bb-plugins/plugins/stewards/store.ts"], decisions)).toBe("user");
+    // The gate's own files stay the user's; a non-gate stewards file is placed by the decide list (BB-153).
+    expect(decideForPull(["bb-plugins/plugins/stewards/gate.ts"], decisions)).toBe("user");
+    expect(decideForPull(["bb-plugins/plugins/stewards/store.ts"], decisions)).toBe("project");
     // An identity path no project entry names is already the user's, whether or
     // not a `user` entry lists it (BB-77).
     const identity: BigDecision[] = [
@@ -73,7 +76,7 @@ describe("the decide list fails closed", () => {
   it("gives the failed files fetch its own refusal text, not the self-widening one (BB-51)", () => {
     expect(decideForRefusal(null, "A store migration", decisions)).toMatch(/^the changed files could not be read/u);
     expect(decideForRefusal([], "A store migration", decisions)).toMatch(/^the pull request changes no files/u);
-    expect(decideForRefusal(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toMatch(/^the change touches the decide list or the code that enforces it/u);
+    expect(decideForRefusal(["bb-plugins/plugins/stewards/gate.ts"], "A store migration", decisions)).toMatch(/^the change touches the decide list or the code that enforces it/u);
     expect(decideForRefusal(["bb-plugins/plugins/linear/store.ts"], "A store migration", decisions)).toBeNull();
     expect(decideForRefusal(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toMatch(/do not touch/u);
     // Every refusal carries the decide-list listing (BB-135).
@@ -129,14 +132,24 @@ describe("explainDecision names the entries that matched and the one that decide
     expect(listing).toContain("Deciding entry: none (the user's).");
   });
 
-  it("reports self-widening as the user's, with no deciding entry", () => {
+  it("reports self-widening as the user's, with no deciding entry, and names the tripped files (BB-153)", () => {
     const e = explainDecision(["bb-plugins/plugins/stewards/decisions.ts", "bb-gate/docs/hooks.md"], overlap);
     expect(e.selfWidening).toBe(true);
+    expect(e.selfWideningFiles).toEqual(["bb-plugins/plugins/stewards/decisions.ts"]);
     expect(e.winner).toBeNull();
     expect(e.mark).toBe("user");
     const listing = formatDecisionListing(e);
     expect(listing).toContain("Deciding entry: none — self-widening is always the user's.");
+    expect(listing).toContain("Self-widening: bb-plugins/plugins/stewards/decisions.ts");
     expect(listing).toContain('"A cross-repo contract" [project]');
+  });
+
+  it("names every tripped file, repo-relative as GitHub reports them (BB-153)", () => {
+    const e = explainDecision(["plugins/stewards/gate.ts", "plugins/stewards/approvals.ts", "plugins/stewards/server.ts"], overlap);
+    expect(e.selfWideningFiles).toEqual(["plugins/stewards/gate.ts", "plugins/stewards/approvals.ts"]);
+    expect(formatDecisionListing(e)).toContain("Self-widening: plugins/stewards/gate.ts, plugins/stewards/approvals.ts");
+    // A non-widening change carries no such line.
+    expect(formatDecisionListing(explainDecision(["plugins/stewards/server.ts"], overlap))).not.toContain("Self-widening:");
   });
 
   it("reports an unreadable or empty file list as the user's, and matches nothing", () => {
@@ -175,7 +188,7 @@ describe("nothing the old decide-list code left to the user moves to the project
   const cases: Array<{ name: string; files: string[] | null; entry: string | null }> = [
     { name: "the changed files could not be read", files: null, entry: "A store migration" },
     { name: "the pull request changes no files", files: [], entry: "A store migration" },
-    { name: "the change is self-widening", files: ["bb-plugins/plugins/stewards/store.ts"], entry: "A cross-repo contract other repos implement" },
+    { name: "the change is self-widening", files: ["bb-plugins/plugins/stewards/gate.ts"], entry: "A cross-repo contract other repos implement" },
     { name: "only a user entry's paths matched", files: ["bb-plugins/plugins/linear/source-contract.ts"], entry: "A store migration" },
     { name: "no entry's paths matched", files: ["bb-plugins/plugins/linear/wake.ts"], entry: "A store migration" },
     { name: "the named entry is not marked project", files: ["bb-plugins/plugins/linear/wake.ts"], entry: "An unmarked entry" },
@@ -246,9 +259,38 @@ describe("no self-widening", () => {
 
   it("fires for a repo-relative filename as GitHub returns it (BB-30 review)", () => {
     // github.files returns repo-relative paths, the decide list is workspace-relative.
-    expect(isSelfWidening(["plugins/stewards/server.ts", "plugins/stewards/store.ts"])).toBe(true);
+    expect(isSelfWidening(["plugins/stewards/gate.ts", "plugins/stewards/approvals.ts"])).toBe(true);
     expect(decideFor(["plugins/stewards/decisions.ts"], "A store migration", decisions)).toBe("user");
-    expect(isSelfWidening(["plugins/stewards/config.ts"])).toBe(true);
+    // The files that used to widen the gate no longer do (BB-153).
+    expect(isSelfWidening(["plugins/stewards/config.ts"])).toBe(false);
+    expect(isSelfWidening(["plugins/stewards/server.ts", "plugins/stewards/store.ts"])).toBe(false);
+    expect(isSelfWidening(["plugins/stewards/reconcile.ts"])).toBe(false);
+  });
+
+  it("names exactly the gate's own files, so widening it back is a visible diff (BB-153)", () => {
+    expect([...SELF_WIDENING_PATHS]).toEqual([
+      ".bb/stewards/project.json",
+      "bb-plugins/plugins/stewards/decisions.ts",
+      "bb-plugins/plugins/stewards/gate.ts",
+      "bb-plugins/plugins/stewards/approvals.ts",
+      "bb-plugins/plugins/stewards/approvals-store.ts",
+    ]);
+  });
+
+  it("places a stewards pull request that does not touch the gate by the decide list (BB-153)", () => {
+    const list: BigDecision[] = [
+      { text: "A store migration", decide: "project", paths: ["bb-plugins/plugins/*/store.ts"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["bb-plugins/plugins/*/source-contract.ts"] },
+    ];
+    // The gate's own files stay the user's, whatever entry matches.
+    for (const path of ["bb-plugins/plugins/stewards/gate.ts", "bb-plugins/plugins/stewards/approvals.ts", "bb-plugins/plugins/stewards/approvals-store.ts", "bb-plugins/plugins/stewards/decisions.ts"]) {
+      expect(decideForPull([path], list)).toBe("user");
+    }
+    expect(decideForPull([".bb/stewards/project.json"], list)).toBe("user");
+    // A migration in the stewards' own store.ts now wins its `project` entry.
+    expect(decideForPull(["bb-plugins/plugins/stewards/store.ts"], list)).toBe("project");
+    // Non-gate stewards code is placed by the decide list: no match is the user's.
+    expect(decideForPull(["bb-plugins/plugins/stewards/server.ts", "bb-plugins/plugins/stewards/reconcile.ts", "bb-plugins/plugins/stewards/config.ts"], list)).toBe("user");
   });
 
   it("fails closed when the changed files could not be read", () => {
@@ -259,8 +301,8 @@ describe("no self-widening", () => {
   it("requires the changed files to touch the named entry's paths", () => {
     // The store-migration entry names store.ts; a migration in another plugin matches.
     expect(decideFor(["bb-plugins/plugins/linear/store.ts"], "A store migration", decisions)).toBe("project");
-    // The stewards' own store.ts is self-widening, so it is the user's whatever the entry says.
-    expect(decideFor(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toBe("user");
+    // The stewards' own store.ts is not self-widening, so the migration entry wins (BB-153).
+    expect(decideFor(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toBe("project");
     // A file that matches no entry path is the user's.
     expect(decideFor(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toBe("user");
   });
