@@ -374,6 +374,31 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("names a message's files in the spawned prompt and the follow-up, and still wakes a file-only message", async () => {
+    const s = await live();
+    const files = [
+      { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 },
+      { id: "F2", name: "snippet.go", mimeType: "text/plain", size: 99 },
+    ];
+    // A file-only message (empty text) still wakes the thread.
+    s.hooks.last().send(s.hooks.session({ comment: { text: "", untrusted: false }, files }));
+    await tick();
+    const prompt = String((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string }).prompt);
+    expect(prompt).toContain("(no text)");
+    expect(prompt.endsWith("2 files were attached and not forwarded: shot.png (image/png, 1.2 KB), snippet.go (text/plain, 99 B)")).toBe(true);
+
+    // A follow-up names its own files, and a later message without any carries no line.
+    s.hooks.last().send(s.hooks.session({ comment: { text: "and this one", untrusted: false }, files: [{ id: "F3", name: "log.txt", mimeType: "text/plain", size: 2048 }] }));
+    await tick();
+    const send = s.harness.sdk.callsTo("threads.send").at(-1)![0] as { input: Array<{ text: string }> };
+    expect(send.input[0]!.text.endsWith("1 file was attached and not forwarded: log.txt (text/plain, 2 KB)")).toBe(true);
+    s.hooks.last().send(s.hooks.session({ comment: { text: "nothing attached", untrusted: false } }));
+    await tick();
+    const last = s.harness.sdk.callsTo("threads.send").at(-1)![0] as { input: Array<{ text: string }> };
+    expect(last.input[0]!.text).not.toContain("not forwarded");
+    await s.stop();
+  });
+
   it("leases each live Slack session on the next hello and never logs the capability", async () => {
     const s = await live({ token: "xoxp-test" });
     s.hooks.last().send(s.hooks.session({ capability: "cap-secret" }));
@@ -536,6 +561,45 @@ describe("Slack plugin", () => {
     const released = String((spawns[0]![0] as { prompt: string }).prompt);
     expect(released).toContain("halt work");
     expect(released).toContain("Alice confirmed request");
+    await s.stop();
+  });
+
+  it("names a held message's files in the confirm prompt and the released wake", async () => {
+    const s = await live();
+    const files = [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }];
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: true,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+        files,
+      }),
+    );
+    await tick();
+    const prompt = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    expect(prompt).toContain("1 file was attached and not forwarded: shot.png (image/png, 1.2 KB)");
+    const id = /confirm (r-[a-z0-9]+)/u.exec(prompt)?.[1];
+    expect(id).toBeTruthy();
+
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: true,
+        fromOwner: true,
+        asker: { id: "U0123", name: "Alice" },
+        owner: { id: "U0123", name: "Alice" },
+        comment: { text: `<@U-bb> confirm ${id}`, untrusted: false },
+        // A file on the confirming message is named too, not just the held one.
+        files: [{ id: "F2", name: "confirm.png", mimeType: "image/png", size: 2048 }],
+      }),
+    );
+    await tick();
+    const released = String((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string }).prompt);
+    expect(released).toContain("2 files were attached and not forwarded: shot.png (image/png, 1.2 KB), confirm.png (image/png, 2 KB)");
     await s.stop();
   });
 

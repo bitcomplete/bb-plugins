@@ -39,6 +39,35 @@ describe("sessionEventSchema", () => {
     expect(parsed.action).toBe("message");
   });
 
+  it("reads files when the service sends them, and none when it does not", () => {
+    const base = {
+      source: "slack" as const,
+      session: "D0123:1712345678.901234",
+      action: "message" as const,
+      channel: "D0123",
+      thread: "1712345678.901234",
+      asker: { id: "U0123", name: "Alice" },
+      owner: { id: "U0123", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      comment: { text: "", untrusted: false },
+      at: "2026-10-22T12:00:00Z",
+    };
+    // An older service sends no files field; it is read as none.
+    expect(sessionEventSchema.parse(base).files).toEqual([]);
+    const parsed = sessionEventSchema.parse({
+      ...base,
+      files: [
+        { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 },
+        { id: "F2", name: "snippet.go", mimeType: "text/plain", size: 99 },
+      ],
+    });
+    expect(parsed.files).toEqual([
+      { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 },
+      { id: "F2", name: "snippet.go", mimeType: "text/plain", size: 99 },
+    ]);
+  });
+
   it("rejects a wake from another source", () => {
     expect(sessionEventSchema.safeParse({ source: "linear", session: "x", action: "created", channel: "c", thread: "t", asker: {}, owner: {}, fromOwner: true, comment: {} }).success).toBe(false);
   });
