@@ -1748,9 +1748,13 @@ the row. There is no **Details** button: the row
 itself opens the effort's detail view (BB-85), where the free-text answer and
 the secret form live. The inline block adds no write path the page does not
 already make. The
-project dropdown carries each project's count in its option label, and the
-server counts the needs-you bindings (`needsCount`, the open bindings with
-`needsUser`), so the picker and the sections cannot disagree. `stewardsSidebar`
+project dropdown carries each project's count in its option label. That count is
+the server's needs-you binding count (`needsCount`, the open bindings with
+`needsUser`, so the stewarded half and the yellow rows cannot disagree) plus the
+project's unread one-off thread roots, computed on the client from the host's
+live thread view so every option gets it (BB-160). A one-off root that is unread
+counts; its unread children do not, and an unread worker or reviewer under a
+stewarded effort does not either (BB-131). `stewardsSidebar`
 carries, per project,
 `needs: { count, items }` with the board's row shapes, each tagged
 `question`/`withUser`/`need` and carrying the binding's entity key as

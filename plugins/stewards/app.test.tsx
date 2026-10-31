@@ -490,20 +490,47 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
   };
 
   it("counts the yellow effort rows per project, with no summed badge beside the picker", async () => {
+    const root = { ...sidebarThread("thr_root", "p2"), isUnread: true };
+    let calls = 0;
     const slot = await renderSidebar(
       {
-        stewardsSidebar: () =>
-          sidebarData({
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({
             needsCounts: { p1: 2, p2: 1 },
-            p1: { bindings: [sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true }), sidebarBinding({ key: "ENG-2", threadId: "thr_b", needsUser: true })], needs: { count: 9, items: [] } },
-          }),
+            p1: {
+              bindings: [
+                sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true, workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] }),
+                sidebarBinding({ key: "ENG-2", threadId: "thr_b", needsUser: true }),
+              ],
+              // A changed payload each call, so a refetch commits past BB-95's diff-skip.
+              needs: { count: 8 + calls, items: [] },
+            },
+          });
+        },
       },
       {},
-      [sidebarThread("thr_a"), sidebarThread("thr_b"), sidebarThread("thr_c", "p2")],
+      [
+        sidebarThread("thr_a"),
+        sidebarThread("thr_b"),
+        sidebarThread("thr_c", "p2"),
+        // An unread worker under a stewarded effort does not add to the count (BB-160).
+        { ...sidebarThread("thr_worker"), parentThreadId: "thr_a", isUnread: true },
+        // A one-off root in a project the RPC does not carry adds one; its
+        // unread child does not.
+        root,
+        { ...sidebarThread("thr_child", "p2"), parentThreadId: "thr_root", isUnread: true },
+      ],
     );
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
-    expect(slot.getByRole("option", { name: "Beta (1)" })).toBeTruthy();
+    expect(slot.getByRole("option", { name: "Beta (2)" })).toBeTruthy();
     expect(slot.queryByLabelText("3 waiting on you")).toBeNull();
+    // Reading the one-off root drops its count at once, from the live view (BB-160).
+    root.isUnread = false;
+    const beforeRead = calls;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBeGreaterThan(beforeRead));
+    await waitFor(() => expect(slot.getByRole("option", { name: "Beta (1)" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 
