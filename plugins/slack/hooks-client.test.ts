@@ -74,6 +74,39 @@ describe("sessionEventSchema", () => {
     expect(withHints.files[0]).toMatchObject({ filetype: "python", preview: "print(1)" });
   });
 
+  it("reads history when the service sends it, and none when it does not", () => {
+    const base = {
+      source: "slack" as const,
+      session: "C0123:1712345678.901234",
+      action: "message" as const,
+      mention: true,
+      channel: "C0123",
+      thread: "1712345678.901234",
+      asker: { id: "U0123", name: "Alice" },
+      owner: { id: "U0123", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      comment: { text: "build this", untrusted: false },
+      at: "2026-10-22T12:00:00Z",
+    };
+    // An older service sends no history field; it is read as none.
+    expect(sessionEventSchema.parse(base).history).toEqual([]);
+    const parsed = sessionEventSchema.parse({
+      ...base,
+      history: [
+        { ts: "1712345670.000000", user: { id: "U2", name: "Bob" }, text: "Hello. What is this?", files: [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }] },
+        { ts: "", user: { id: "", name: "" }, text: "[earlier messages omitted]" },
+      ],
+    });
+    expect(parsed.history).toHaveLength(2);
+    expect(parsed.history[0]).toMatchObject({ ts: "1712345670.000000", user: { id: "U2", name: "Bob" }, text: "Hello. What is this?" });
+    expect(parsed.history[0]!.files[0]).toMatchObject({ id: "F1", name: "shot.png" });
+    expect(parsed.history[1]).toMatchObject({ user: { id: "", name: "" }, text: "[earlier messages omitted]" });
+    // A missing user (a bare marker) defaults to the empty one.
+    const bare = sessionEventSchema.parse({ ...base, history: [{ text: "[earlier messages omitted]" }] });
+    expect(bare.history[0]).toMatchObject({ user: { id: "", name: "" }, files: [] });
+  });
+
   it("rejects a wake from another source", () => {
     expect(sessionEventSchema.safeParse({ source: "linear", session: "x", action: "created", channel: "c", thread: "t", asker: {}, owner: {}, fromOwner: true, comment: {} }).success).toBe(false);
   });

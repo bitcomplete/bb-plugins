@@ -9,6 +9,8 @@ import {
   FILES_NAMED,
   filesLine,
   formatFileSize,
+  historyTranscript,
+  HISTORY_OMITTED_MARKER,
   IMAGE_MAX_BYTES,
   isForwardableFile,
   isFromOwner,
@@ -27,7 +29,7 @@ import {
   type ChannelEntry,
   type Project,
 } from "./sessions.js";
-import type { SessionEvent, SessionFile } from "./hooks-client.js";
+import { sessionEventSchema, type SessionEvent, type SessionFile, type SessionHistoryMessage } from "./hooks-client.js";
 
 const PROJECTS: Project[] = [
   { id: "prj-1", name: "Project One", kind: "standard" },
@@ -56,6 +58,7 @@ function event(over: Partial<SessionEvent> = {}): SessionEvent {
     comment: { text: "build this", untrusted: false },
     ts: "",
     files: [],
+    history: [],
     at: "2026-10-22T12:00:00Z",
     ...over,
   };
@@ -157,6 +160,77 @@ describe("wakeText", () => {
     const text = wakeText(event());
     expect(text).not.toContain("not forwarded");
     expect(text).toBe(wakeText(event({ files: [] })));
+  });
+
+  it("prepends the earlier-thread transcript to the first prompt", () => {
+    const history: SessionHistoryMessage[] = [
+      { ts: "1.0", user: { id: "U2", name: "Bob" }, text: "Hello. What is this?", files: [] },
+      { ts: "", user: { id: "", name: "" }, text: HISTORY_OMITTED_MARKER, files: [] },
+      { ts: "2.0", user: { id: "U0123", name: "Alice" }, text: "let me show you", files: [] },
+    ];
+    const text = wakeText(event({ history }));
+    expect(text.startsWith("Earlier in this Slack thread")).toBe(true);
+    expect(text).toContain("Bob (NOT your owner Alice): Hello. What is this?");
+    expect(text).toContain("Alice: let me show you");
+    expect(text).toContain(HISTORY_OMITTED_MARKER);
+    // The transcript comes before the waking message, whose framing is unchanged.
+    expect(text.indexOf("Earlier in this Slack thread")).toBeLessThan(text.indexOf("session D0123"));
+    expect(text).toContain("Reply in Slack with the slack_reply tool");
+  });
+
+  it("leaves a wake with no history byte-identical to today", () => {
+    // A service from before BB-162 sends no `history` field at all.
+    const raw = event() as Record<string, unknown>;
+    delete raw.history;
+    const parsed = sessionEventSchema.parse(raw);
+    expect(parsed.history).toEqual([]);
+    const expected =
+      "[Slack DM from Alice — session D0123:1712345678.901234]\n\nbuild this\n\nReply in Slack with the slack_reply tool (session D0123:1712345678.901234). If the message needs no answer (a thanks, or something bb should not act on), use the slack_ack tool (session D0123:1712345678.901234) instead; slack_ack is only for that, never for skipping work that was asked for.";
+    expect(wakeText(parsed)).toBe(expected);
+    expect(wakeText(event({ history: [] }))).toBe(expected);
+  });
+
+  it("keeps a steered follow-up free of history, as the service sends none", () => {
+    const text = wakeText(event(), { steered: true });
+    expect(text).not.toContain("Earlier in this Slack thread");
+  });
+});
+
+describe("historyTranscript", () => {
+  const owner = { id: "U0123", name: "Alice" };
+  const msg = (over: Partial<SessionHistoryMessage> = {}): SessionHistoryMessage => ({ ts: "1.0", user: { id: "U2", name: "Bob" }, text: "hello", files: [], ...over });
+
+  it("renders one Name: text line per message, oldest first", () => {
+    const transcript = historyTranscript([msg({ text: "what is this" }), msg({ user: { id: "U0123", name: "Alice" }, text: "try it" })], owner);
+    expect(transcript).toContain("Earlier in this Slack thread");
+    expect(transcript).toContain("Bob (NOT your owner Alice): what is this");
+    expect(transcript).toContain("Alice: try it");
+    expect(transcript.indexOf("what is this")).toBeLessThan(transcript.indexOf("try it"));
+  });
+
+  it("renders the clip marker as a note, not as a speaker line", () => {
+    const transcript = historyTranscript([msg({ ts: "", user: { id: "", name: "" }, text: HISTORY_OMITTED_MARKER }), msg()], owner);
+    expect(transcript).toContain(HISTORY_OMITTED_MARKER);
+    expect(transcript).not.toContain(": [earlier messages omitted]");
+    expect(transcript).toContain("Bob (NOT your owner Alice): hello");
+  });
+
+  it("marks a line from someone other than the owner, and only that line", () => {
+    const transcript = historyTranscript([msg({ user: { id: "U0123", name: "Alice" }, text: "mine" }), msg({ user: { id: "U9", name: "Carol" }, text: "theirs" })], owner);
+    expect(transcript).toContain("Alice: mine");
+    expect(transcript).toContain("Carol (NOT your owner Alice): theirs");
+    expect(transcript).not.toContain("Alice (NOT your owner");
+  });
+
+  it("flattens a multiline message to one line and substitutes (no text)", () => {
+    const transcript = historyTranscript([msg({ text: "line one\nline two" }), msg({ text: "   " })], owner);
+    expect(transcript).toContain("Bob (NOT your owner Alice): line one line two");
+    expect(transcript).toContain("Bob (NOT your owner Alice): (no text)");
+    expect(transcript).not.toContain("line one\nline two");
+  });
+
+  it("returns '' for no history, so a wake is unchanged", () => {
+    expect(historyTranscript([], owner)).toBe("");
   });
 });
 
