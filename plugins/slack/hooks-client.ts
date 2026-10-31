@@ -325,8 +325,9 @@ export function fetchBotChannels(fetchImpl: FetchLike, baseUrl: string, signal: 
  * developer need not /invite it from Slack. The service joins with the bot
  * token it holds; the pod sends only its connection id and the channel id.
  * Throws HooksRequestError with `code` "private-channel", "channel-not-found",
- * "archived" or "missing-scope" when Slack refused for a reason the settings
- * page can explain.
+ * "archived", "missing-scope" or "channel-restricted" (the channel does not
+ * let the app post) when Slack refused for a reason the settings page can
+ * explain.
  */
 export function joinChannel(fetchImpl: FetchLike, baseUrl: string, connection: string, channel: string, signal: AbortSignal): Promise<{ ok?: boolean }> {
   return postJson(fetchImpl, baseUrl, "/v1/slack/bot/join", { connection, channel }, okSchema, "the Slack channel join", signal);
@@ -338,8 +339,23 @@ export type SessionTitle = { session: string; connection: string; title: string 
 
 const okSchema = z.object({ ok: z.boolean().optional() }).loose();
 
-export function postMessage(fetchImpl: FetchLike, baseUrl: string, reply: SessionReply, signal: AbortSignal): Promise<{ ok?: boolean }> {
-  return postJson(fetchImpl, baseUrl, `/v1/slack/sessions/${encodeURIComponent(reply.session)}/message`, { connection: reply.connection, text: reply.text }, okSchema, "the Slack reply", signal);
+/**
+ * The answer to a reply. `ephemeral` is present and true when the channel
+ * does not let bb post, so the text was shown only to the connection's own
+ * bound user; `reason` names why (`channel-restricted`). An older service
+ * omits both fields, which is a plain in-channel post.
+ */
+export const replyResponseSchema = z
+  .object({
+    ok: z.boolean().optional(),
+    ephemeral: z.boolean().optional(),
+    reason: z.string().optional(),
+  })
+  .loose();
+export type ReplyResponse = z.infer<typeof replyResponseSchema>;
+
+export function postMessage(fetchImpl: FetchLike, baseUrl: string, reply: SessionReply, signal: AbortSignal): Promise<ReplyResponse> {
+  return postJson(fetchImpl, baseUrl, `/v1/slack/sessions/${encodeURIComponent(reply.session)}/message`, { connection: reply.connection, text: reply.text }, replyResponseSchema, "the Slack reply", signal);
 }
 
 export function setStatus(fetchImpl: FetchLike, baseUrl: string, status: SessionStatus, signal: AbortSignal): Promise<{ ok?: boolean }> {
@@ -433,7 +449,7 @@ export interface HooksLoop {
   /** Drop the current connection and reconnect, so the service forgets the identity bound to it. */
   reconnect(): void;
   /** Post a reply on a Slack session. Throws HooksRequestError, or an Error when there is no connection. */
-  reply(session: string, text: string, signal: AbortSignal): Promise<void>;
+  reply(session: string, text: string, signal: AbortSignal): Promise<ReplyResponse>;
   /** Set the assistant thinking status on a Slack session. */
   status(session: string, status: string, signal: AbortSignal): Promise<void>;
   /** Set the assistant conversation title on a Slack session. */
@@ -640,7 +656,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     },
 
     async reply(session, text, signal) {
-      await postMessage(deps.fetch, deps.baseUrl, { session, connection: requireConnection(), text }, signal);
+      return postMessage(deps.fetch, deps.baseUrl, { session, connection: requireConnection(), text }, signal);
     },
 
     async status(session, status, signal) {

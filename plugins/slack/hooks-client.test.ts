@@ -291,4 +291,44 @@ describe("createHooksLoop", () => {
     abort.abort();
     await running;
   });
+
+  it("reads the ephemeral fallback from a reply, and a missing field as a plain post", async () => {
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let streamReady!: () => void;
+    const ready = new Promise<void>((resolve) => (streamReady = resolve));
+    const replies: unknown[] = [];
+    let answer: Record<string, unknown> = { ok: true, ephemeral: true, reason: "channel-restricted" };
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      const u = String(url);
+      if (u === `${BASE}/v1/events`) {
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            controller = c;
+            streamReady();
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (u === `${BASE}/v1/slack/sessions/D1%3A1/message`) {
+        replies.push(JSON.parse(String(init?.body)));
+        return Response.json(answer);
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const loop = createHooksLoop({ fetch: fetchImpl, baseUrl: BASE, now: () => 1, log: { info: () => undefined, warn: () => undefined }, identity: () => "tok", onSession: () => undefined });
+    const abort = new AbortController();
+    const running = loop.run(abort.signal);
+    await ready;
+    controller.enqueue(encoder.encode(`event: hello\ndata: ${JSON.stringify({ connection: "c_1", leaseSeconds: 3600 })}\n\n`));
+    await vi.waitFor(() => expect(loop.connectionId).toBe("c_1"));
+    expect(await loop.reply("D1:1", "hi", abort.signal)).toMatchObject({ ephemeral: true, reason: "channel-restricted" });
+    // An older gate omits the field, which is a plain in-channel post.
+    answer = { ok: true };
+    expect(await loop.reply("D1:1", "hi", abort.signal)).toEqual({ ok: true });
+    expect(replies).toHaveLength(2);
+    abort.abort();
+    await running;
+  });
 });

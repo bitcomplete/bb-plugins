@@ -14,7 +14,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
 import { z } from "zod";
-import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type Rejection, type SessionEvent, type SessionFile } from "./hooks-client.js";
+import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type Rejection, type ReplyResponse, type SessionEvent, type SessionFile } from "./hooks-client.js";
 import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
 import { toMrkdwn } from "./mrkdwn.js";
 import {
@@ -680,6 +680,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       if (error.unknownConnection) return new Error("This bb server is reconnecting to bb-gate-hooks. Try again in a minute.");
       if (error.status === 400) return new Error("bb-gate-hooks refused the reply as malformed.");
       if (error.status === 413) return new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`);
+      if (error.status === 502 && error.code === "channel-restricted") return new Error("The channel does not let bb post, and showing the reply only to the asker failed too. Nothing was posted. Ask a channel admin to allow posting, or use another channel.");
       if (error.status === 502) return new Error("Slack refused the message. Nothing was posted; try again in a moment.");
       if (error.status === 503) return new Error("bb-gate-hooks cannot post to Slack right now (Slack is unreachable, or the team app's credentials are not set up there). Try again later.");
       return new Error(`bb-gate-hooks answered HTTP ${error.status} to the reply.`);
@@ -692,14 +693,20 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * `clearStatus` clears the thinking indicator after the reply; a caller
      * that never set one (the assistant-pane greeting) passes false.
      */
-    async function postReply(session: string, text: string, signal: AbortSignal, slot: ReplySlot = "any", clearStatus = true): Promise<void> {
+    async function postReply(session: string, text: string, signal: AbortSignal, slot: ReplySlot = "any", clearStatus = true): Promise<{ ephemeral: boolean }> {
+      let answer: ReplyResponse;
       try {
-        await hooks.reply(session, toMrkdwn(text), signal);
+        answer = await hooks.reply(session, toMrkdwn(text), signal);
       } catch (error) {
         throw replyError(error);
       }
       markAnswered(session, slot);
       if (clearStatus) void hooks.status(session, "", checkSignal()).catch(() => undefined);
+      // A missing `ephemeral` is an older bb-gate-hooks that posted in the
+      // channel; only a true field means the fallback was used.
+      const ephemeral = answer.ephemeral === true;
+      if (ephemeral) bb.log.warn(`the Slack reply for session ${sessionLogId(session)} was posted only to the asker: the channel does not let bb post`);
+      return { ephemeral };
     }
 
     /** The plugin's own reply when a turn ends without one. Logged, never thrown. */
@@ -1631,6 +1638,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
               return { state: "not-found", message: `Slack has no open channel with this id that bb can join. ${byHand}` };
             case "missing-scope":
               return { state: "unavailable", message: `The team's Slack app was installed without the channels:join scope, so bb cannot add itself yet. ${byHand}` };
+            case "channel-restricted":
+              return { state: "unavailable", message: `This channel does not let bb post, so a mention here could never be answered. Ask a channel admin to allow posting, or map another channel. ${byHand}` };
             case "not-identified":
               return { state: "unavailable", message: `Sign in with Slack first, then try again. ${byHand}` };
             case "unknown-connection":
@@ -1757,8 +1766,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         // text: a conversion that grows the reply past the cap is refused here.
         if (new TextEncoder().encode(toMrkdwn(text)).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`));
         try {
-          await postReply(id, text, signal);
+          const { ephemeral } = await postReply(id, text, signal);
           void pushTitle(threadId);
+          if (ephemeral) return `Posted only to the asker (session ${id}): the channel does not let bb post, so the message was sent as an ephemeral message visible only to them. That is this message's one reply.`;
           return `Replied in Slack (session ${id}). That is this message's one reply.`;
         } catch (error) {
           return toolError(error);
