@@ -420,6 +420,49 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("prepends the earlier-thread history to the first prompt and fetches only the waking message's files", async () => {
+    const s = await live();
+    const history = [
+      { ts: "1712345670.000000", user: { id: "U2", name: "Bob" }, text: "Hello. What is this and how do I use it", files: [{ id: "HIST", name: "context.png", mimeType: "image/png", size: 1234 }] },
+      { ts: "", user: { id: "", name: "" }, text: "[earlier messages omitted]" },
+      { ts: "1712345675.000000", user: { id: "U0123", name: "Alice" }, text: "let me show you" },
+    ];
+    s.hooks.last().send(s.hooks.session({ history, files: [{ id: "WAKE", name: "shot.png", mimeType: "image/png", size: 1234 }] }));
+    await tick();
+    const spawn = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string }>; title?: string };
+    const text = spawn.input[0]!.text!;
+    expect(text.startsWith("Earlier in this Slack thread")).toBe(true);
+    expect(text).toContain("Bob (NOT your owner Alice): Hello. What is this and how do I use it");
+    expect(text).toContain("Alice: let me show you");
+    expect(text).toContain("[earlier messages omitted]");
+    // The transcript comes before the waking message.
+    expect(text.indexOf("Earlier in this Slack thread")).toBeLessThan(text.indexOf("session D0123"));
+    // The waking message still sets the title, not the history.
+    expect(spawn.title).toBe("build this");
+    // The history's file is metadata only: not fetched, not forwarded.
+    expect(s.hooks.fileFetches.map((f) => f.id)).toEqual(["WAKE"]);
+    expect(spawn.input.map((p) => p.type)).toEqual(["text", "localImage"]);
+    await s.stop();
+  });
+
+  it("keeps the first wake's history when a held message is confirmed", async () => {
+    const s = await live();
+    const history = [{ ts: "1.0", user: { id: "U2", name: "Bob" }, text: "Hello. What is this?", files: [] }];
+    s.hooks.last().send(s.hooks.session({ asker: { id: "U2", name: "Carol" }, fromOwner: false, comment: { text: "halt work", untrusted: true }, history }));
+    await tick();
+    const held = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    const id = /confirm (r-[a-z0-9]+)/u.exec(held)?.[1];
+    expect(id).toBeTruthy();
+    s.hooks.last().send(s.hooks.session({ comment: { text: `confirm ${id}`, untrusted: false } }));
+    await tick();
+    const spawn = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string }> };
+    const text = spawn.input[0]!.text!;
+    expect(text).toContain("Earlier in this Slack thread");
+    expect(text).toContain("Bob (NOT your owner Alice): Hello. What is this?");
+    expect(text).toContain("Alice confirmed request");
+    await s.stop();
+  });
+
   it("forwards a message's images and text files as localImage/localFile parts, and still wakes a file-only message", async () => {
     const s = await live();
     const files = [

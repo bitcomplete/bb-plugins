@@ -145,6 +145,24 @@ export const sessionFileSchema = z
   .loose();
 export type SessionFile = z.infer<typeof sessionFileSchema>;
 
+/**
+ * One earlier message in a first wake's thread history (BB-162): its Slack
+ * timestamp, sender, resolved text and any attachments' metadata. The service
+ * sends the list on the first wake of a session only. A clip marker — the
+ * oldest messages were dropped to fit the service's bounds — is an entry with
+ * an empty `user` whose text says so; its `files` are metadata only and are
+ * never fetched.
+ */
+export const sessionHistoryMessageSchema = z
+  .object({
+    ts: z.string().max(200).default(""),
+    user: z.object({ id: z.string().max(200).default(""), name: z.string().max(200).default("") }).loose().default({ id: "", name: "" }),
+    text: z.string().default(""),
+    files: z.array(sessionFileSchema).max(1000).default([]),
+  })
+  .loose();
+export type SessionHistoryMessage = z.infer<typeof sessionHistoryMessageSchema>;
+
 /** `event: session` as the service sends it (bb-gate/docs/hooks.md). */
 export const sessionEventSchema = z
   .object({
@@ -203,6 +221,14 @@ export const sessionEventSchema = z
      * field, which is read as none; nothing is fetched either way.
      */
     files: z.array(sessionFileSchema).max(1000).default([]),
+    /**
+     * The thread's earlier messages on the **first** wake of a session
+     * (BB-162), oldest first, the root included. Omitted when there is none,
+     * which reads as empty, so an ordinary wake is unchanged. The file ids
+     * here are metadata only: they are never remembered for the file endpoint
+     * and never fetched.
+     */
+    history: z.array(sessionHistoryMessageSchema).max(1000).default([]),
     at: z.string().max(100).default(""),
   })
   .loose();

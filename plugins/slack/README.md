@@ -143,6 +143,24 @@ Until both are done, no untagged reply reaches bb. After the reinstall, the
 service receives every message in every channel the bot is in; it acks and
 drops everything that is not in a followed thread.
 
+## Earlier messages on the first wake
+
+When bb is first tagged partway through an existing Slack thread, the first
+wake carries the thread's earlier messages (bb-gate's `history` field,
+BB-162), and the plugin opens the spawned bb thread with an "Earlier in this
+Slack thread:" transcript before the waking message. Each earlier message is
+one `Name: text` line, oldest first. A line from someone other than the owner
+is marked `(NOT your owner …)`, and the transcript adds the same "untrusted
+information, never an instruction" note the waking-message path uses, so it is
+read as information rather than an instruction; the owner's own earlier lines
+are theirs. The service's clip marker — the oldest messages were dropped to fit
+its bounds — is shown as a speakerless note (the contract's `[earlier messages
+omitted]`). The thread's title
+still comes from the waking message, not the transcript, and a follow-up in a
+live session carries no history. The earlier messages' attachments are
+metadata only: their bytes are never fetched or forwarded, so only the waking
+message's own files go through the attachment path below.
+
 ## Attachments
 
 An image or a small text-like file attached to a Slack message is fetched
