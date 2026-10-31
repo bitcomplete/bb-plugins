@@ -94,7 +94,7 @@ pod never needs one. Slack lets a bot join only public channels by itself, so
 for a private channel the prompt says to type `/invite @bb` in Slack instead,
 and so does every refusal (an app installed without the `channels:join` bot
 scope, an older service without the endpoint). The bot's own join raises no
-"which project?" prompt in Slack: that asks only when a person invites it.
+prompt in Slack.
 
 Words from anyone but the owner never run a turn. A channel mention by someone
 else is held under a short id and the owner releases it by mentioning the app
@@ -113,41 +113,6 @@ old `dm` entry is dropped from the rows. Only the old token setting is cleared;
 the old `project` and `channels` settings are left in place, so rolling back to
 the previous version asks the developer to sign in again and then applies the
 old project and channels settings.
-
-## When bb joins a channel
-
-When the `bb` app is added to a channel this server has no routing row for,
-bb asks the person who invited it which project a mention in that channel
-should use. The question is an **ephemeral** message in the channel — Slack
-shows it only to the inviter, "Only visible to you" — with a dropdown of this
-server's projects, a **Set** button, and the line that a mention there starts a
-thread in the chosen project. Picking one and pressing Set writes the same
-routing-map row the settings editor writes, and replaces the question with a
-confirmation (`#C0123 → Project One. Change it under Settings → Plugins →
-Slack.`). A channel that already has a row says nothing. No bb thread runs for
-any of this; it only writes the map.
-
-The trigger is the app's **own** join (`member_joined_channel` for the bot's
-user id, with an `inviter`); a person joining a channel the app is in produces
-nothing, and an admin who adds the app from the channel's integrations page
-leaves no inviter, so there is nobody to ask and nothing is posted. The map
-stays per server: the prompt configures the inviter's server only, so a
-teammate who later mentions bb in that channel still lands on their own
-fallback until they map it too.
-
-The feature is **inert until a Slack admin does two by-hand steps** on the
-team app. Neither needs a new scope or secret, and the step-by-step app setup
-is in `bb-gate/README.md`:
-
-1. **Event Subscriptions → Subscribe to bot events**: add
-   `member_joined_channel`. The bot's existing `channels:read` and
-   `groups:read` scopes already gate it, so no reinstall is needed.
-2. **Interactivity & Shortcuts**: turn **Interactivity** on and set its
-   **Request URL** to the bb-hooks path,
-   `https://bb-hooks.bitcomplete.dev/slack/interactivity`. Slack signs it with
-   the same signing secret as the events URL.
-
-Until both are done, no `invited` wake arrives and the plugin does nothing.
 
 ## Continuing a thread without tagging bb
 

@@ -108,22 +108,7 @@ describe("sessionEventSchema", () => {
     expect(parsed.tagged).toBe(false);
   });
 
-  it("accepts the invited and block_action wakes, which carry no conversation", () => {
-    const invited = sessionEventSchema.parse({
-      source: "slack",
-      session: "",
-      action: "invited",
-      channel: "C0123",
-      thread: "",
-      asker: { id: "U1", name: "Alice" },
-      owner: { id: "U1", name: "Alice" },
-      fromOwner: true,
-      routedAs: "owner",
-      comment: { text: "", untrusted: false },
-      at: "2026-10-26T12:00:00Z",
-    });
-    expect(invited).toMatchObject({ action: "invited", session: "", thread: "", actionId: "", value: "", responseUrl: "" });
-
+  it("accepts the block_action wake, which carries no conversation", () => {
     const block = sessionEventSchema.parse({
       source: "slack",
       session: "",
@@ -141,6 +126,23 @@ describe("sessionEventSchema", () => {
       at: "2026-10-26T12:00:00Z",
     });
     expect(block).toMatchObject({ action: "block_action", actionId: "bb_set_project", value: "prj-1", responseUrl: "https://hooks.slack.com/actions/T1/B1/cap" });
+  });
+
+  it("rejects the removed invited action, which the service no longer sends", () => {
+    const parsed = sessionEventSchema.safeParse({
+      source: "slack",
+      session: "",
+      action: "invited",
+      channel: "C0123",
+      thread: "",
+      asker: { id: "U1", name: "Alice" },
+      owner: { id: "U1", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      comment: { text: "", untrusted: false },
+      at: "2026-10-26T12:00:00Z",
+    });
+    expect(parsed.success).toBe(false);
   });
 });
 

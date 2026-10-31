@@ -104,6 +104,11 @@ export function confirmationText(channel: string, project: string): string {
  * The Block Kit blocks of the ephemeral "which project?" prompt: the channel
  * bb joined, a static select of this server's projects, a Set button, and the
  * line saying a mention starts a thread in the chosen project.
+ *
+ * Nothing currently posts this prompt: the invite-time prompt was removed and
+ * the mention-time one is a later ticket. It is kept, with
+ * `handleBlockAction`, because the `block_action` wake and
+ * `POST /v1/slack/ephemeral` remain in the hooks contract.
  */
 export function projectPromptBlocks(channel: string, all: Project[]): unknown[] {
   const options = all.slice(0, 100).map((p) => ({ text: { type: "plain_text", text: clipMention(p.name, 74) }, value: p.id }));
@@ -712,37 +717,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The app joined a channel: if this server has no routing row for it, ask
-     * the owner which project a mention there should use, ephemerally in that
-     * channel. An already-mapped channel says nothing. This is inert until the
-     * owner does the two by-hand Slack app steps (bb-gate/README.md), because
-     * no `invited` wake arrives without them.
-     */
-    async function handleInvited(event: SessionEvent): Promise<void> {
-      const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
-      if (channelProject(map.channels, event.channel) !== null) {
-        bb.log.info(`Slack was invited to ${event.channel}, which already has a routing row; nothing to ask`);
-        return;
-      }
-      const all = await projects();
-      if (all.length === 0) {
-        bb.log.warn(`Slack was invited to ${event.channel}, but this server has no projects to offer`);
-        return;
-      }
-      try {
-        await hooks.ephemeral({ channel: event.channel, user: event.owner.id, text: `Which project should a mention in this channel start a thread in?`, blocks: projectPromptBlocks(event.channel, all) }, checkSignal());
-        bb.log.info(`Slack asked which project channel ${event.channel} uses`);
-      } catch (error) {
-        bb.log.warn(`could not post the Slack project prompt for channel ${event.channel}: ${errorMessage(error)}`);
-      }
-    }
-
-    /**
      * The owner clicked the project prompt. Validate the choice against this
      * server's projects, write the routing row, and replace the prompt with the
      * confirmation. A non-owner click never writes; an unknown project or a
      * stale click (the row was set since the prompt was posted) gets a one-line
      * replacement instead.
+     *
+     * Nothing posts the prompt any more, so no `block_action` wake is expected
+     * today; this handler is kept for the mention-time prompt ticket, and the
+     * `block_action` wake remains part of the hooks contract.
      */
     async function handleBlockAction(event: SessionEvent): Promise<void> {
       if (event.actionId !== SET_PROJECT_ACTION && event.actionId !== SET_PROJECT_BUTTON_ACTION) {
@@ -1435,7 +1418,6 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       });
     }
     function onSession(event: SessionEvent): void {
-      if (event.action === "invited") return chain(`invite ${event.channel}`, () => handleInvited(event));
       if (event.action === "block_action") return chain(`block ${event.channel}`, () => handleBlockAction(event));
       chain(`session ${event.session}`, () => handleSession(event), `session ${event.tagged ? event.session : sessionLogId(event.session)}`);
     }
