@@ -815,7 +815,7 @@ describe("Slack plugin", () => {
         thread: "",
         action: "block_action",
         channel: "C0123",
-        actionId: "bb_set_project",
+        actionId: SET_PROJECT_BUTTON_ACTION,
         value: "set",
         responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
         comment: { text: "", untrusted: false },
