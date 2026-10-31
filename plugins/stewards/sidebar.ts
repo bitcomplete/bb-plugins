@@ -26,6 +26,8 @@ export interface SidebarBinding {
   holdBehind: string[];
   /** The party or artifact the next action waits on; it never marks the effort blocked (BB-109). */
   waitingOn: string | null;
+  /** Waiting with nothing the plugin tracks to wake it (BB-154). */
+  noWakeSource: boolean;
   needsUser: boolean;
   /** An open `stuck` escalation (BB-76). */
   stuck: boolean;
@@ -118,6 +120,8 @@ export interface SidebarEffort {
   holdBehind: string[];
   /** The party or artifact the next action waits on; shown as a plain line, never as a block (BB-109). */
   waitingOn: string | null;
+  /** Waiting with nothing the plugin tracks to wake it (BB-154). */
+  noWakeSource: boolean;
   /** The binding's worker records, so a wait on a finished one reads as a lost hand-off (BB-152). */
   workers: SidebarWorker[];
   needsUser: boolean;
@@ -226,6 +230,8 @@ export interface EffortStatus {
   requeueAt: number | null;
   /** The party or artifact the next action waits on (BB-109). */
   waitingOn?: string | null;
+  /** Waiting with nothing the plugin tracks to wake it (BB-154). */
+  noWakeSource?: boolean;
   /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
   workers?: readonly { threadId: string; title: string; status: string }[];
 }
@@ -353,6 +359,10 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? []) || e.pending.some(isLostHandoffNote);
   if (lostHandoff) return e.requeueAt === null ? "hand-off lost: worker finished" : `hand-off lost: worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
+  // BB-154: a free-text wait with no structured source reads so on line two,
+  // ahead of the deployment phrase and the next action, which can look live
+  // when nothing the plugin tracks will deliver the wait.
+  if (e.noWakeSource) return "waiting, no wake source";
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
   if (e.statusActor === "other") return "the other party";
@@ -386,6 +396,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     hold: null,
     holdBehind: [],
     waitingOn: null,
+    noWakeSource: false,
     workers: [],
     needsUser: false,
     stuck: false,
@@ -598,6 +609,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       hold: b.hold,
       holdBehind: b.holdBehind,
       waitingOn: b.waitingOn,
+      noWakeSource: b.noWakeSource,
       workers: b.workers,
       needsUser: b.needsUser,
       stuck: b.stuck,
@@ -690,6 +702,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       hold: null,
       holdBehind: [],
       waitingOn: null,
+      noWakeSource: false,
       workers: [],
       needsUser: false,
       stuck: false,

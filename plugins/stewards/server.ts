@@ -97,6 +97,7 @@ import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
+import { advanceStall, hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
@@ -515,6 +516,8 @@ export const rpcContract = defineRpcContract({
               nextAction: z.string().nullable(),
               actor: z.string().nullable(),
               waitingOn: z.string().nullable(),
+              /** Waiting with nothing the plugin tracks to wake it (BB-154). */
+              noWakeSource: z.boolean(),
               priority: z.string().nullable(),
               hold: z.string().nullable(),
               /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
@@ -613,6 +616,8 @@ export const rpcContract = defineRpcContract({
               nextAction: z.string().nullable(),
               actor: z.string().nullable(),
               waitingOn: z.string().nullable(),
+              /** Waiting with nothing the plugin tracks to wake it (BB-154). */
+              noWakeSource: z.boolean(),
               priority: z.string().nullable(),
               /** The hold reason, for the card's `On hold` line; null when not held. */
               hold: z.string().nullable(),
@@ -685,6 +690,8 @@ export const rpcContract = defineRpcContract({
           /** Entity keys this hold waits behind, for `held behind <keys>`. */
           holdBehind: z.array(z.string()),
           waitingOn: z.string().nullable(),
+          /** Waiting with nothing the plugin tracks to wake it (BB-154). */
+          noWakeSource: z.boolean(),
           needsUser: z.boolean(),
           /** An open `stuck` escalation: the row is blocked (BB-76). */
           stuck: z.boolean(),
@@ -1687,6 +1694,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether the plugin watches a pull request for this binding (BB-154): a
+     * ticket with an open linked one, or an open `pr`/`review` binding whose
+     * entity is the pull request. A closed or merged pull request is not a
+     * source; github will not ring for it again.
+     */
+    function pullWatch(b: Binding): boolean {
+      if (b.kind === "ticket") return leasedPulls(b).length > 0;
+      if (b.kind === "pr" || b.kind === "review") {
+        const entity = b.lastSnapshot?.entity ?? null;
+        return entity !== null && !["closed", "merged"].includes(lc(entity.state));
+      }
+      return false;
+    }
+
+    /** The structured sources that will wake a binding, as the report path reads them (BB-154). */
+    function liveWakeSourceFor(b: Binding): boolean {
+      const sources: WakeSourceInput = {
+        hold: b.hold,
+        holdBehind: b.holdBehind,
+        deployments: b.deployments,
+        runningWorkers: store.workers(b.id).filter((w) => w.status === "running").length,
+        openEscalations: store.openEscalations(b.id).length,
+        openNeeds: store.openNeeds(b.id).length,
+        pullRequestWatch: pullWatch(b),
+      };
+      return hasLiveWakeSource(sources);
+    }
+
+    /**
      * A thread's workspace branch, from its environment, or null when the
      * environment or its branch cannot be read. Cached once known: a thread's
      * branch does not change, and a null is left uncached so a worker whose
@@ -2524,6 +2560,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         awaitingReport: true,
         wokeAt: now(),
         lastJudgmentAt: now(),
+        // BB-154: the reason this turn was woken, so the report that ends it
+        // can count a requeue-only run. Cleared by that report.
+        lastWakeReason: reason,
         commentCursor: cursor > b.commentCursor ? cursor : b.commentCursor,
         pending: [],
         archiveWhenIdle: false,
@@ -3197,7 +3236,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       const delivery = await deliverWake(b, config, playbook, text);
       if (delivery === false) return;
-      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), lastWakeReason: reason, pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
       noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
@@ -3256,7 +3295,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       const delivery = await deliverWake(b, config, playbook, text);
       if (delivery === false) return;
-      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), lastWakeReason: reason, pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
       noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
@@ -3451,7 +3490,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       const delivery = await deliverWake(b, config, playbook, text);
       if (delivery === false) return;
-      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), lastWakeReason: reason, pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
       noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
@@ -3658,7 +3697,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const delivery = await deliverWake(b, config, playbook, disabledOpsWake(b, config, playbook));
       if (delivery === false) return;
-      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false });
+      // BB-154: the turn's reason, so a stale requeue cannot be counted by its report.
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), lastWakeReason: "disabled", pending: [], archiveWhenIdle: false });
       noteRespawn(b, delivery.respawned);
     }
 
@@ -4106,6 +4146,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         withUser: openWith((x) => x.route === "me" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
+        noWakeSource: open.filter((b) => b.noWakeSource),
+        stall: openWith((x) => x.kind === "stall"),
         held: open.filter((b) => b.hold !== null),
       };
     }
@@ -5595,8 +5637,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, ...(confirmed === null ? {} : { confirmed }), label: config?.file.label ?? "bb-managed" }),
             );
             // A turn like any wake's: it ends with steward_report, and one
-            // waiting on someone else is archived when it is done.
-            if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
+            // waiting on someone else is archived when it is done. Its reason
+            // is not a requeue, so a stale one is never counted (BB-154).
+            if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastWakeReason: "changed", archiveWhenIdle: false });
           });
           if (sent.outcome === "sent") {
             bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);
@@ -5890,6 +5933,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
+              noWakeSource: b.noWakeSource,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -5969,6 +6013,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
+              noWakeSource: b.noWakeSource,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -6045,6 +6090,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               hold: b.hold,
               holdBehind: b.holdBehind,
               waitingOn: b.status?.waitingOn ?? null,
+              noWakeSource: b.noWakeSource,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
@@ -6843,9 +6889,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             at: now(),
           };
           const moved = advanced(b.status, status);
+          // BB-154: consume the wake reason here; the mark and the
+          // requeue-only run are decided after this report's own needs are
+          // filed, so an item the turn files counts as a source.
+          const wakeReason = b.lastWakeReason;
           b = store.patch(b.id, {
             status,
             statusAt: now(),
+            lastWakeReason: null,
             ...(moved ? { advancedAt: now() } : {}),
             requeueAt: (() => {
               const at = now() + requeueMs;
@@ -6911,9 +6962,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
           if (playbook !== null && b.lastSnapshot !== null) await syncNeeds(b, b.lastSnapshot, playbook, anyWorkerInFlight(store.workers(b.id)));
+          // BB-154: the mark and the requeue-only run, over the report's final
+          // set of sources (an escalation this turn raised, a need it filed, a
+          // gate item syncNeeds filed, a worker it started).
+          const current = store.binding(b.id) ?? b;
+          const liveSource = liveWakeSourceFor(current);
+          const noWakeSource = waitingOn !== null && waitingOn.trim() !== "" && !liveSource;
+          const stall = advanceStall(
+            { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
+            { reason: wakeReason, waitingOn, liveSource, now: now() },
+          );
+          b = store.patch(b.id, { noWakeSource, requeueWakeCount: stall.state.count, requeueWaitText: stall.state.waitText, requeueFirstAt: stall.state.firstAt });
           const requests = [requested === null ? null : "approval", scheduling === null ? null : "scheduling"].filter((r) => r !== null);
+          // BB-154: at the threshold, raise one `stall` to the project steward.
+          // An open `stall` is itself a live source, so the next report resets
+          // the run; the explicit check keeps a second one from being filed.
+          let stallEscalation: Escalation | null = null;
+          if (stall.escalate && !store.openEscalations(b.id).some((x) => x.kind === "stall")) {
+            const count = stall.state.count;
+            const waitText = stall.state.waitText ?? "";
+            const firstAt = stall.state.firstAt ?? now();
+            stallEscalation = store.escalate({
+              bindingId: b.id,
+              kind: "stall",
+              question: `${b.entityKey} has woken by requeue ${count} time${count === 1 ? "" : "s"} with the same wait (${JSON.stringify(waitText)}), first reported ${iso(firstAt)}, and nothing the plugin tracks will deliver it.`,
+              context: `The steward's waitingOn is free text and no structured source is live on the binding: no open holdBehind, no deployment watch in merged/deploying, no running worker, no open escalation or need, no pull-request watch. It will keep waking by requeue alone.`,
+              meanwhile: "Waiting: the steward keeps reporting the same wait and is woken only by another requeue.",
+              route: "project",
+              recommendation: null,
+              projectId: b.projectId,
+              origin: { threadId, bindingId: b.id, chain: [] },
+            });
+            bb.log.info(`stewards: ${b.entityKey} has requeued ${count} times with the same wait; escalated a stall (${stallEscalation.id})`);
+          }
           if (raised !== null && !(raised.route === "project" && requests.length > 0)) await deliver(b, raised);
           if (requests.length > 0) await wakeProject(b.projectId, raised !== null && raised.route === "project" ? `escalation and ${requests.join(" and ")} request from ${b.entityKey}` : `${requests.join(" and ")} requested for ${b.entityKey}`, { digestDue: false });
+          if (stallEscalation !== null && requests.length === 0 && !(raised !== null && raised.route === "project")) await deliver(b, stallEscalation);
           // The unread dot means "needs you": a turn that ends with nothing for
           // the user is marked read, so a "nothing to do yet" look does not
           // flag the sidebar like a question does. A turn that does need the
@@ -6926,7 +7010,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const parent = store.binding(b.parentBindingId);
             if (parent !== null && parent.endedAt === null) tell(threadId, parent, `Child ${b.entityKey}: ${status.summary} Next: ${status.nextAction} (${status.actor})`);
           }
-          const escalated = raised === null ? "" : ` Escalation ${raised.id} is with ${raised.route === "parent" ? "your parent steward" : "the project steward"}; do what you said meanwhile.`;
+          const escalated = `${raised === null ? "" : ` Escalation ${raised.id} is with ${raised.route === "parent" ? "your parent steward" : "the project steward"}; do what you said meanwhile.`}${stallEscalation === null ? "" : ` Stall escalation ${stallEscalation.id} is with the project steward: nothing the plugin tracks will deliver your wait (${JSON.stringify(stall.state.waitText ?? "")}); name what will, or re-examine it.`}`;
           // Where the gate stands after this report, so a miss shows now and not at the next wake.
           let gateNote = "";
           let gateJustPassed = false;
@@ -7612,7 +7696,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
           const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
-          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
+          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
     }

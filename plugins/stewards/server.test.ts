@@ -9533,3 +9533,105 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(split.githubComments.at(-1)!.body).not.toMatch(/moves the pin/u);
   });
 });
+
+// BB-154: a steward's free-text `waitingOn` with no structured source is
+// marked, its next wake carries the nudge, and consecutive requeue-only wakes
+// with the same wait raise one `stall` to the project steward.
+describe("a wait with no wake source (BB-154)", () => {
+  const waitReport = (waitingOn: string) => ({ phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const, waitingOn, requeueAfter: "1m" });
+  const deploying = (now: number) => ({
+    "acme/web#7": {
+      key: "acme/web#7",
+      state: "deploying",
+      mergeSha: null,
+      target: "",
+      mergedAt: null,
+      prRepo: "acme/web",
+      files: [],
+      repo: "acme/web",
+      environment: "production",
+      deploymentId: null,
+      deploymentState: null,
+      ref: null,
+      sha: null,
+      url: null,
+      at: now,
+      deadlineAt: null,
+      note: null,
+      workflowRuns: [],
+    },
+  });
+
+  async function bound() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    return { t, steward: t.spawns[1]!.id };
+  }
+  /** A requeue wake: make the binding due and run the tick. */
+  async function requeue(t: Awaited<ReturnType<typeof bound>>["t"]) {
+    t.advance(61_000);
+    await t.hooks.requeueTick();
+    await t.flush();
+  }
+
+  it("marks a wait with no source, carries the nudge, and counts the requeue run", async () => {
+    const { t, steward } = await bound();
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.noWakeSource).toBe(true);
+    // The report that set the wait was an adoption wake, not a requeue.
+    expect(b.requeueWakeCount).toBe(0);
+    // Criterion 2: the CLI status line reads the mark (the page half is `effortPhrase`).
+    expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toContain("waiting, no wake source");
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain("waiting, no wake source");
+
+    await requeue(t);
+    expect(t.sends.at(-1)!.text).toContain("**Waiting with no wake source.**");
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(1);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stall")).toHaveLength(0);
+  });
+
+  it("does not mark a wait that has an open holdBehind or a deployment watch", async () => {
+    const { t, steward } = await bound();
+    const id = t.hooks.store.find("ENG-12")!.id;
+    t.hooks.store.patch(id, { hold: "behind ENG-9", holdBehind: ["ENG-9"] });
+    await t.tool("steward_report", waitReport("ENG-9"), steward);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+
+    t.hooks.store.patch(id, { hold: null, holdBehind: [], deployments: deploying(t.now()) as never });
+    await t.tool("steward_report", waitReport("the deploy"), steward);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+  });
+
+  it("raises one stall at the threshold, not again while it is open, and resets on a changed wake", async () => {
+    const { t, steward } = await bound();
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+
+    // Two requeue-only reports with the same wait: the second escalates.
+    await requeue(t);
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    await requeue(t);
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.requeueWakeCount).toBe(2);
+    const stalls = t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stall");
+    expect(stalls).toHaveLength(1);
+    expect(stalls[0]!.route).toBe("project");
+    expect(stalls[0]!.question).toMatch(/woken by requeue 2 times/u);
+    expect(stalls[0]!.question).toMatch(/the vendor's reply/u);
+    expect(stalls[0]!.question).toMatch(/first reported/u);
+
+    // A third requeue does not file a second while the first is open.
+    await requeue(t);
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stall")).toHaveLength(1);
+
+    // A changed wake in between resets the run.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(0);
+  });
+});

@@ -489,6 +489,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
+    noWakeSource: s.noWakeSource,
   };
 }
 
@@ -741,6 +742,7 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
+    noWakeSource: s.noWakeSource,
   };
 }
 

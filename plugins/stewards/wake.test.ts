@@ -109,6 +109,25 @@ describe("a steward's wake", () => {
     expect(wake).toMatch(/report `substantial: false`.*the gate passes immediately on that report.*start the worker in the same turn/u);
   });
 
+  // BB-154: a binding marked waiting with no wake source carries one paragraph
+  // naming what the plugin does not track and what the steward can do.
+  it("carries the no-wake-source paragraph only while marked", () => {
+    const { s, bind } = world();
+    const binding = bind("ENG-12");
+    const status = { phase: "In Progress", summary: "Waiting on the vendor.", nextAction: "the vendor", actor: "other" as const, waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T };
+    s.patch(binding.id, { status });
+    const marked = formatWake(wakeInput({ binding: s.binding(binding.id)! }));
+    expect(marked).not.toContain("**Waiting with no wake source.**");
+
+    s.patch(binding.id, { noWakeSource: true });
+    const wake = formatWake(wakeInput({ binding: s.binding(binding.id)! }));
+    expect(wake).toContain("**Waiting with no wake source.**");
+    expect(wake).toContain("Nothing the plugin tracks will deliver this wait");
+    expect(wake).toContain('"the vendor\'s reply"');
+    expect(wake).toContain("a binding to hold behind, a pull request, a deployment target, a worker");
+    expect(wake).toContain("the condition is your own to re-examine");
+  });
+
   it("lists an open escalation and approval request as on the Stewards page, not to be asked again", () => {
     const { s, bind } = world();
     const binding = bind("ENG-12");
@@ -209,6 +228,8 @@ describe("the nightly prompt", () => {
         { escalation: approval, from: moved },
       ],
       stuck: [{ escalation: stuck, from: held }],
+      noWakeSource: [],
+      stall: [],
       held: [held],
     };
     const wake = formatProjectWake({ reason: "nightly pass 2026-10-18", bindings: [], routed: [], withUser: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions, records });
@@ -304,7 +325,7 @@ describe("the nightly prompt", () => {
     const { s } = world();
     const q = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
     const questions = [{ question: q, about: null }];
-    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], held: [] };
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
     const wake = (timeZone?: string) => formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions, records, ...(timeZone === undefined ? {} : { timeZone }) });
     // 05:00Z on the 18th is still the evening of the 17th in Los Angeles.
     expect(wake("America/Los_Angeles")).toContain(`- ${q.id} (asked 2026-10-17): Freeze on Friday?`);
@@ -313,7 +334,7 @@ describe("the nightly prompt", () => {
   });
 
   it("says so when there is nothing, and leaves the record out of a wake that wants no digest", () => {
-    const empty: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], held: [] };
+    const empty: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
     const nightly = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records: empty });
     expect(nightly).toMatch(/### Your previous digest\n\nNone yet\./u);
     expect(nightly).toMatch(/### What moved\n\nNothing moved\./u);
@@ -322,6 +343,25 @@ describe("the nightly prompt", () => {
     expect(nightly).not.toContain("## Questions open with the user");
     const escalation = formatProjectWake({ reason: "escalation", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], records: empty });
     expect(escalation).not.toContain("## The record since");
+  });
+
+  // BB-154: the digest lists the marked bindings and open stalls, so a quiet
+  // stall is visible once a day even before the requeue threshold.
+  it("lists bindings waiting with no wake source and open stall escalations in the digest", () => {
+    const { s, bind } = world();
+    const marked = bind("ENG-12");
+    s.patch(marked.id, {
+      noWakeSource: true,
+      requeueWakeCount: 2,
+      status: { phase: "In Progress", summary: "Waiting.", nextAction: "the vendor", actor: "other", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T },
+    });
+    const stall = s.escalate({ bindingId: marked.id, kind: "stall", question: "ENG-12 has woken by requeue 2 times with the same wait.", meanwhile: "Waiting.", route: "project", recommendation: null });
+    const current = s.binding(marked.id)!;
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [current], stall: [{ escalation: stall, from: current }], held: [] };
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records });
+    expect(wake).toContain("### Waiting with no wake source");
+    expect(wake).toContain("- ENG-12 (ticket, In Progress): waiting with no wake source: the vendor's reply (2 requeue-only wakes)");
+    expect(wake).toContain(`- ENG-12: stall escalation ${stall.id} with the project steward, since 2026-10-18: ENG-12 has woken by requeue 2 times with the same wait.`);
   });
 
   it("shows the project's standing-rules list in an approval wake, and works with none configured (BB-54)", () => {
