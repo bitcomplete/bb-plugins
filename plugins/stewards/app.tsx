@@ -2142,15 +2142,20 @@ function StewardsSidebarCore({
   // one-off thread roots, so the option label covers everything in the project
   // waiting on the user (BB-160). The needs half comes from the RPC; the unread
   // half is computed here from the host's live thread view, which covers every
-  // project. A one-off root counts, but not its unread children, and an unread
-  // worker or reviewer under a stewarded effort does not count either, so the
-  // stewarded half stays the server's `needsCount` (BB-131).
+  // project. The RPC names the threads each project's stewards and workers own
+  // (BB-160), so a steward thread in a project whose bindings this call does not
+  // carry is not mistaken for a one-off root. A one-off root counts, but not its
+  // unread children, and an unread worker or reviewer under a stewarded effort
+  // does not count either, so the stewarded half stays the server's `needsCount`
+  // (BB-131).
   const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
   const counts = useMemo(
     () =>
       new Map(
         tabs.map((tab) => {
+          const claimed = new Set(data?.projects.find((p) => p.projectId === tab.projectId)?.claimedThreadIds ?? []);
           const unread = tab.threads.filter((e) => {
+            if (claimed.has(e.rootThreadId)) return false;
             const root = byId.get(e.rootThreadId);
             return root !== undefined && isUnread(root);
           }).length;

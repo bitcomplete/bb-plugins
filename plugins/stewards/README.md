@@ -540,9 +540,12 @@ open.
 dropdown shows each project's count in its option label: the yellow effort rows
 (the server's needs-you bindings, `needsCount`) plus the project's unread
 one-off thread roots. The unread half is computed on the client from the host's
-live thread view, so every project option gets it; a one-off root counts, but
-not its unread children, and an unread worker or reviewer under a stewarded
-effort does not count (BB-131). A needs-you effort shows the question or need's
+live thread view, so every project option gets it; the RPC names each project's
+claimed thread ids (the project steward, each binding's steward thread, and every
+worker), so a steward or worker thread in a project whose bindings the call does
+not carry is not counted as a one-off root; a one-off root counts, but not its
+unread children, and an unread worker or reviewer under a stewarded effort does
+not count (BB-131). A needs-you effort shows the question or need's
 text and its one-click actions inline under line two. The server describes each
 item's `actions` once (`needActions`, `questionActions` and `withUserActions` in
 `server.ts`) and both the sidebar and the page render that list, so the two

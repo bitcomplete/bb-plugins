@@ -1752,9 +1752,12 @@ project dropdown carries each project's count in its option label. That count is
 the server's needs-you binding count (`needsCount`, the open bindings with
 `needsUser`, so the stewarded half and the yellow rows cannot disagree) plus the
 project's unread one-off thread roots, computed on the client from the host's
-live thread view so every option gets it (BB-160). A one-off root that is unread
-counts; its unread children do not, and an unread worker or reviewer under a
-stewarded effort does not either (BB-131). `stewardsSidebar`
+live thread view so every option gets it (BB-160). The RPC carries, per project,
+the claimed thread ids — the project steward, each binding's steward thread, and
+every worker the store holds — so a steward or worker thread in a project whose
+bindings this call does not carry is not mistaken for a one-off root (BB-160). A
+one-off root that is unread counts; its unread children do not, and an unread
+worker or reviewer under a stewarded effort does not either (BB-131). `stewardsSidebar`
 carries, per project,
 `needs: { count, items }` with the board's row shapes, each tagged
 `question`/`withUser`/`need` and carrying the binding's entity key as
