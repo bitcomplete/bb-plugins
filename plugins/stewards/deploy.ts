@@ -5,6 +5,7 @@
 // is evaluated by `carries.ts` (BB-132), and either way the steward reports a
 // verdict it disagrees with.
 import { z } from "zod";
+import { matchCarriesRule } from "./carries.js";
 import type { DeploymentTarget } from "./config.js";
 import type { Deployment, EntitySnapshot, WorkflowRun } from "./source-contract.js";
 import type { Observed } from "./store.js";
@@ -83,12 +84,29 @@ export const targetKeyOf = (target: Pick<DeploymentTarget, "name" | "repo" | "en
 export const watchId = (pullKey: string, target: Pick<DeploymentTarget, "name" | "repo" | "environment">, multiple: boolean): string => (!multiple && target.name === undefined ? pullKey : `${pullKey}::${targetKeyOf(target)}`);
 
 /**
+ * Whether a target can concern a merge at all (BB-132 follow-up). A free-text
+ * `carries` is the steward's and keeps today's behaviour, so it always
+ * applies. A structured one applies only when one of its rules matches the
+ * merge's repo and changed files; a target that does not apply gets no watch,
+ * so it never sits in `deploying` or times out to `failed` over a merge it
+ * cannot carry.
+ */
+export const targetAppliesToMerge = (target: DeploymentTarget, prRepo: string, files: readonly string[]): boolean =>
+  typeof target.carries === "string" || matchCarriesRule(target.carries, prRepo, files) !== null;
+
+/**
  * Add a `merged` watch for every merged pull request the binding does not
  * already watch, for each of the playbook's deployment targets (BB-132). The
  * target's timeout is the deadline; a watch that already exists is left
  * alone, except that its `mergeSha` is re-resolved to the merge commit when
  * the source now knows one and the stored one differs (a watch recorded
  * before BB-132 holds the pull request head, which a squash merge rewrites).
+ *
+ * A target whose structured `carries` has no rule for the merge is not
+ * applicable and is skipped; a watch already stored for it is dropped, so it
+ * cannot block closing the ticket. When no target applies at all, every
+ * target is watched, as before, so the merge still lands on the
+ * steward-decided path rather than getting no watch (BB-132 follow-up).
  */
 export function recordMerged(deployments: Deployments, observed: Observed, targets: readonly DeploymentTarget[], now: number): Deployments {
   const pulls = mergedPulls(observed);
@@ -98,7 +116,23 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
   let changed = false;
   for (const p of pulls) {
     const merge = p.pull?.mergeCommit ?? null;
-    for (const target of targets) {
+    const files = p.pull?.files ?? [];
+    // An existing watch's own recorded repo and files decide applicability
+    // when it has them: a snapshot whose files read came back empty must not
+    // drop an in-flight watch. The fresh snapshot is the fallback.
+    const contextFor = (target: DeploymentTarget): { prRepo: string; files: readonly string[] } => {
+      const id = watchId(p.key, target, multiple);
+      const existing = next[id] ?? (id === p.key ? undefined : next[p.key]);
+      if (existing !== undefined && existing.prRepo !== "" && matchesTarget(target, existing.repo, existing.environment)) return { prRepo: existing.prRepo, files: existing.files };
+      return { prRepo: p.unit, files };
+    };
+    const applicable = targets.filter((t) => {
+      const c = contextFor(t);
+      return targetAppliesToMerge(t, c.prRepo, c.files);
+    });
+    const chosen = applicable.length > 0 ? applicable : targets;
+    const chosenIds = new Set(chosen.map((t) => watchId(p.key, t, multiple)));
+    for (const target of chosen) {
       const id = watchId(p.key, target, multiple);
       let existing = next[id];
       // A playbook that grew a target, or named its single one, leaves a
@@ -145,6 +179,14 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
         note: merge === null ? "The merge commit is not known yet; the next read re-resolves it" : null,
         workflowRuns: [],
       };
+      changed = true;
+    }
+    // A watch stored for this pull on a target whose rules no longer apply is
+    // not-applicable: drop it so it never blocks closing the ticket and never
+    // times out to failed.
+    for (const [id, watch] of Object.entries(next)) {
+      if (watch.key !== p.key || chosenIds.has(id)) continue;
+      delete next[id];
       changed = true;
     }
   }

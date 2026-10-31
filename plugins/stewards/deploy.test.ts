@@ -7,6 +7,29 @@ import type { Observed } from "./store.js";
 
 const target: DeploymentTarget = { source: "github", repo: "acme/bb-gate", environment: "production", carries: "the pinned ref contains the merge", timeout: 3_600_000, workflows: [] };
 const named: DeploymentTarget = { ...target, workflows: ["bb-server.yaml"] };
+// The two-target playbook front matter (BB-132 follow-up): structured rules,
+// disjoint repos, so a merge is watched only where a rule can carry it.
+const bbGateTarget: DeploymentTarget = {
+  name: "bb-gate",
+  source: "github",
+  repo: "bitcomplete/bb-gate",
+  environment: "production",
+  carries: [
+    { when: { repo: "bitcomplete/bb-plugins" }, strategy: { kind: "ref-contains-merge" } },
+    { when: { repo: "bitcomplete/bb-gate" }, strategy: { kind: "ref-contains-merge" } },
+  ],
+  timeout: 3_600_000,
+  workflows: [],
+};
+const devboxTarget: DeploymentTarget = {
+  name: "devbox",
+  source: "github",
+  repo: "bitcomplete/devbox",
+  environment: "production",
+  carries: [{ when: { repo: "bitcomplete/devbox" }, strategy: { kind: "ref-contains-merge" } }],
+  timeout: 3_600_000,
+  workflows: [],
+};
 const NOW = Date.parse("2026-10-14T15:00:00Z");
 
 const observed = (over: { entity?: ReturnType<typeof pull>; pulls?: Array<ReturnType<typeof pull>> } = {}): Observed => ({
@@ -81,6 +104,56 @@ describe("recording merged pull requests", () => {
     expect(Object.keys(migrated).sort()).toEqual(["acme/web#7::acme/bb-gate@production", "acme/web#7::devbox"]);
     expect(migrated["acme/web#7::acme/bb-gate@production"]).toMatchObject({ key: "acme/web#7", target: "acme/bb-gate@production", repo: "acme/bb-gate", mergeSha: "aaaaaaa1" });
     expect(migrated["acme/web#7::devbox"]).toMatchObject({ key: "acme/web#7", target: "devbox", repo: "bitcomplete/devbox" });
+  });
+
+  // BB-132 follow-up: a target whose structured rules do not match the merge
+  // gets no watch, so it never sits in deploying, times out to failed, or
+  // blocks the ticket from closing.
+  it("watches only the target whose structured rules match a merge", () => {
+    const plugins = { entity: pull({ key: "bitcomplete/bb-plugins#7", unit: "bitcomplete/bb-plugins" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["plugins/stewards/deploy.ts"] }), pulls: [] };
+    const gateOnly = recordMerged({}, plugins, [bbGateTarget, devboxTarget], NOW);
+    expect(Object.keys(gateOnly)).toEqual(["bitcomplete/bb-plugins#7::bb-gate"]);
+    expect(gateOnly["bitcomplete/bb-plugins#7::bb-gate"]).toMatchObject({ key: "bitcomplete/bb-plugins#7", target: "bb-gate", repo: "bitcomplete/bb-gate", prRepo: "bitcomplete/bb-plugins" });
+
+    const dev = { entity: pull({ key: "bitcomplete/devbox#9", unit: "bitcomplete/devbox" }, { merged: true, mergeCommit: "bbbbbbb2", files: ["gate/server.go"] }), pulls: [] };
+    const devboxOnly = recordMerged({}, dev, [bbGateTarget, devboxTarget], NOW);
+    expect(Object.keys(devboxOnly)).toEqual(["bitcomplete/devbox#9::devbox"]);
+    expect(devboxOnly["bitcomplete/devbox#9::devbox"]).toMatchObject({ key: "bitcomplete/devbox#9", target: "devbox", repo: "bitcomplete/devbox", prRepo: "bitcomplete/devbox" });
+  });
+
+  it("drops a stored watch on a target whose structured rules do not apply", () => {
+    const plugins = { entity: pull({ key: "bitcomplete/bb-plugins#7", unit: "bitcomplete/bb-plugins" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["plugins/stewards/deploy.ts"] }), pulls: [] };
+    // A watch recorded before the filtering existed, on the devbox target.
+    const stale = recordMerged({}, plugins, [devboxTarget], NOW);
+    expect(Object.keys(stale)).toEqual(["bitcomplete/bb-plugins#7::devbox"]);
+    const fixed = recordMerged(stale, plugins, [bbGateTarget, devboxTarget], NOW + 1000);
+    expect(Object.keys(fixed)).toEqual(["bitcomplete/bb-plugins#7::bb-gate"]);
+  });
+
+  it("keeps an in-flight paths-gated watch when a later read's files list is empty", () => {
+    const pathsTarget: DeploymentTarget = {
+      name: "bb-gate",
+      source: "github",
+      repo: "bitcomplete/bb-gate",
+      environment: "production",
+      carries: [{ when: { repo: "bitcomplete/bb-gate", paths: ["docker/bb-server/**"] }, strategy: { kind: "ref-contains-merge" } }],
+      timeout: 3_600_000,
+      workflows: [],
+    };
+    const withFiles = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["docker/bb-server/Dockerfile"] }), pulls: [] };
+    const recorded = recordMerged({}, withFiles, [pathsTarget], NOW);
+    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+    // The stored watch's own files decide, so an empty fresh list neither
+    // drops it nor brings in the other target.
+    const empty = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: [] }), pulls: [] };
+    const again = recordMerged(recorded, empty, [pathsTarget, devboxTarget], NOW + 1000);
+    expect(Object.keys(again)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+  });
+
+  it("still watches a merge no target's rules match, on the steward-decided path", () => {
+    const other = { entity: pull({ key: "bitcomplete/other#3", unit: "bitcomplete/other" }, { merged: true, mergeCommit: "ccccccc3", files: ["README.md"] }), pulls: [] };
+    const deployments = recordMerged({}, other, [bbGateTarget, devboxTarget], NOW);
+    expect(Object.keys(deployments).sort()).toEqual(["bitcomplete/other#3::bb-gate", "bitcomplete/other#3::devbox"]);
   });
 
   it("does not record an open pull request, and reads a ticket's linked merged ones", () => {
