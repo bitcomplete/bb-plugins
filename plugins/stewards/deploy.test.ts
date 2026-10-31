@@ -130,6 +130,26 @@ describe("recording merged pull requests", () => {
     expect(Object.keys(fixed)).toEqual(["bitcomplete/bb-plugins#7::bb-gate"]);
   });
 
+  it("keeps an in-flight paths-gated watch when a later read's files list is empty", () => {
+    const pathsTarget: DeploymentTarget = {
+      name: "bb-gate",
+      source: "github",
+      repo: "bitcomplete/bb-gate",
+      environment: "production",
+      carries: [{ when: { repo: "bitcomplete/bb-gate", paths: ["docker/bb-server/**"] }, strategy: { kind: "ref-contains-merge" } }],
+      timeout: 3_600_000,
+      workflows: [],
+    };
+    const withFiles = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["docker/bb-server/Dockerfile"] }), pulls: [] };
+    const recorded = recordMerged({}, withFiles, [pathsTarget], NOW);
+    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+    // The stored watch's own files decide, so an empty fresh list neither
+    // drops it nor brings in the other target.
+    const empty = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: [] }), pulls: [] };
+    const again = recordMerged(recorded, empty, [pathsTarget, devboxTarget], NOW + 1000);
+    expect(Object.keys(again)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+  });
+
   it("still watches a merge no target's rules match, on the steward-decided path", () => {
     const other = { entity: pull({ key: "bitcomplete/other#3", unit: "bitcomplete/other" }, { merged: true, mergeCommit: "ccccccc3", files: ["README.md"] }), pulls: [] };
     const deployments = recordMerged({}, other, [bbGateTarget, devboxTarget], NOW);

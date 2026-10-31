@@ -117,7 +117,19 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
   for (const p of pulls) {
     const merge = p.pull?.mergeCommit ?? null;
     const files = p.pull?.files ?? [];
-    const applicable = targets.filter((t) => targetAppliesToMerge(t, p.unit, files));
+    // An existing watch's own recorded repo and files decide applicability
+    // when it has them: a snapshot whose files read came back empty must not
+    // drop an in-flight watch. The fresh snapshot is the fallback.
+    const contextFor = (target: DeploymentTarget): { prRepo: string; files: readonly string[] } => {
+      const id = watchId(p.key, target, multiple);
+      const existing = next[id] ?? (id === p.key ? undefined : next[p.key]);
+      if (existing !== undefined && existing.prRepo !== "" && matchesTarget(target, existing.repo, existing.environment)) return { prRepo: existing.prRepo, files: existing.files };
+      return { prRepo: p.unit, files };
+    };
+    const applicable = targets.filter((t) => {
+      const c = contextFor(t);
+      return targetAppliesToMerge(t, c.prRepo, c.files);
+    });
     const chosen = applicable.length > 0 ? applicable : targets;
     const chosenIds = new Set(chosen.map((t) => watchId(p.key, t, multiple)));
     for (const target of chosen) {
