@@ -929,6 +929,8 @@ describe("Slack plugin", () => {
     expect(await s.harness.callRpc("joinChannel", { channel: "C0001" })).toMatchObject({ state: "not-found", message: fallback });
     s.hooks.state.join = () => Response.json({ error: "missing-scope" }, { status: 503 });
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
+    s.hooks.state.join = () => Response.json({ error: "channel-restricted" }, { status: 409 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("does not let bb post") });
     s.hooks.state.join = () => Response.json({ error: "not-identified" }, { status: 403 });
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
     // The service forgot the connection: its own message, not the generic one.
@@ -939,7 +941,7 @@ describe("Slack plugin", () => {
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
     // A name is never sent: the map stores ids.
     expect(await s.harness.callRpc("joinChannel", { channel: "general" })).toMatchObject({ state: "not-found", message: fallback });
-    expect(s.hooks.joins.map((j) => j.channel)).toEqual(["G0456", "C0000", "C0001", "C0789", "C0789", "C0789", "C0789"]);
+    expect(s.hooks.joins.map((j) => j.channel)).toEqual(["G0456", "C0000", "C0001", "C0789", "C0789", "C0789", "C0789", "C0789"]);
     await s.stop();
   });
 
@@ -1002,6 +1004,42 @@ describe("Slack plugin", () => {
     const second = await s.tool("slack_reply", { text: "More." }, { threadId: "thr-1" });
     expect(s.text(second)).toContain("already has its reply");
     expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("tells the turn when the reply was shown only to the asker", async () => {
+    const s = await live();
+    s.hooks.state.message = () => Response.json({ ok: true, ephemeral: true, reason: "channel-restricted" });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const reply = await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("only to the asker");
+    expect(s.text(reply)).toContain("does not let bb post");
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).toContain("posted only to the asker");
+    await s.stop();
+  });
+
+  it("explains a channel-restricted reply failure instead of a generic refusal", async () => {
+    const s = await live();
+    s.hooks.state.message = () => new Response(JSON.stringify({ error: "channel-restricted" }), { status: 502 });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const reply = await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("does not let bb post");
+    expect(s.text(reply)).toContain("Nothing was posted");
+    await s.stop();
+  });
+
+  it("logs a backstop reply that was shown only to the asker", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    s.hooks.state.message = () => Response.json({ ok: true, ephemeral: true, reason: "channel-restricted" });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).toContain("posted only to the asker");
     await s.stop();
   });
 
