@@ -118,12 +118,16 @@ old project and channels settings.
 
 Once the app is subscribed to `message.channels` and `message.groups`, a reply
 inside a channel thread bb is already part of is routed to the conversation's
-owner's server even when it does not tag `@bb`. The wake says the message was
-posted without addressing bb and tells the turn to reply only when the message
-is for bb. Such a reply is delivered to the bb thread but does not owe a reply:
-it is not counted for the one-reply-per-message rule, and a turn that ends
-silently posts no error reply. An untagged reply from someone other than the
-owner is held for the owner's confirmation exactly like an untrusted mention.
+owner's server even when it does not tag `@bb`. The wake frames the message as
+the next message in a conversation bb is part of and tells the turn to treat
+it as a request when it is addressed to bb, continues something bb asked or was
+asked, or asks for something bb can do — including a reply from the owner that
+directly follows a question bb just asked — and otherwise to end the turn
+silently when it is clearly between other people. Such a reply is delivered to
+the bb thread but does not owe a reply: it is not counted for the
+one-reply-per-message rule, and a turn that ends silently posts no error reply.
+An untagged reply from someone other than the owner is held for the owner's
+confirmation exactly like an untrusted mention.
 
 A thread only becomes followed once bb has been tagged or mentioned in it; a
 thread bb is not part of is dropped by bb-gate-hooks, in memory, with no text,

@@ -17,8 +17,9 @@ or addition to the running turn.
 
 A DM and a channel mention of the app both wake the server of the Slack user
 who sent them. A reply inside a channel thread bb is already part of also
-wakes the owner's server without tagging `@bb`; it is a continuation, not a
-request, so it does not owe a reply (see "Replying"). A channel mention by
+wakes the owner's server without tagging `@bb`; the wake frames it as the next
+message in a conversation bb is part of, so it does not owe a reply but the
+turn judges whether it is for bb (see "Replying"). A channel mention by
 someone other than the server's owner is held: no turn runs, and the plugin
 posts one reply asking the owner to `confirm <id>`. Only the owner's mention
 that names the id releases the held text into a thread. Which bb project a
@@ -41,8 +42,11 @@ A Slack wake reaches a thread as a message naming the session
 act on) is instead acknowledged with `slack_ack`, which counts the wake as
 answered and posts nothing, so no error reply fires. It is not for skipping
 work that was asked for; answer a request with `slack_reply`. An untagged wake
-is a reply in a thread bb is already part of; it does not owe a reply, so
-answer it only when it is for bb and otherwise end the turn silently.
+is the next message in a thread bb is already part of; it does not owe a reply,
+but treat it as a request when it is addressed to bb, continues something bb
+asked or was asked, or asks for something bb can do — including a reply from
+the owner that directly follows a question bb just asked — and end the turn
+silently when it is clearly between other people.
 
 | Tool | Use it to |
 |---|---|
@@ -63,7 +67,10 @@ answer it only when it is for bb and otherwise end the turn silently.
   after an ack is refused the same way. A message that arrives while bb is
   working is sent as a steer: it joins the running turn, the wake text says so,
   and the turn's one reply covers both messages. An untagged reply is not
-  counted: reply only when it is for bb, and a silent turn posts no error reply.
+  counted: treat it as a request when it is addressed to bb, continues
+  something bb asked or was asked, or asks for something bb can do, and end the
+  turn silently when it is clearly between other people; a silent turn posts no
+  error reply.
 - The session is leased to this server: the wake carries an opaque capability
   that the plugin echoes to `POST /v1/subscribe`, and the lease is renewed at
   half its life. Reply rights therefore survive a restart of bb-gate-hooks and

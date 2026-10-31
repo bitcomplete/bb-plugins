@@ -106,12 +106,15 @@ describe("wakeText", () => {
     expect(text).toContain("halt work");
   });
 
-  it("says an untagged reply was not addressed to bb and does not need a reply", () => {
+  it("frames an untagged reply as the next message in a conversation bb is part of", () => {
     const text = wakeText(event({ tagged: false, mention: false, channel: "C0123", comment: { text: "what about the second one?", untrusted: false } }));
     expect(text).toContain("session D0123:1712345678.901234");
-    expect(text).toContain("without addressing bb");
-    expect(text).toContain("does not need a reply");
-    expect(text).toContain("only if it is for bb");
+    expect(text).toContain("without tagging bb");
+    expect(text).toContain("treat it as such");
+    expect(text).toContain("reply with the slack_reply tool");
+    expect(text).toContain("directly follows a question bb just asked is for bb");
+    expect(text).toContain("clearly between other people");
+    expect(text).not.toContain("does not need a reply");
     // The old DM wording must not leak into an untagged channel reply.
     expect(text).not.toContain("Slack DM from");
     expect(text).not.toContain("Reply in Slack with the slack_reply tool");
