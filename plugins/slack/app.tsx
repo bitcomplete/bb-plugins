@@ -56,7 +56,7 @@ interface Status {
 const CHANNEL_ID = /^[CG][A-Z0-9]+$/;
 
 /** The warning under a routing row whose project has no machine to run on. */
-const NO_MACHINE_WARNING = "No checkout or environment for this project is on a connected machine; a Slack thread here has no machine it is known to run on.";
+const NO_MACHINE_WARNING = "No checkout or environment for this project is on a connected machine; a Slack thread here runs on a connected machine that may not have the project.";
 
 const isChannelId = (channel: string): boolean => CHANNEL_ID.test(channel.trim());
 
