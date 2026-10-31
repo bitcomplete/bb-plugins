@@ -171,6 +171,16 @@ function fakeSlack(options: { pages?: Array<Array<{ id: string; name: string; pr
   return { fetchImpl, requests };
 }
 
+/** One environment fixture, as the status and spawn code reads it. */
+type TestEnvironment = {
+  environmentProviderId: string | null;
+  hostId: string;
+  createdAt: number;
+  lifecycle: { phase: string };
+  environmentProviderSelection: { inputs: unknown } | null;
+  projectId: string;
+};
+
 const PROJECTS = [
   { id: "prj-1", name: "Project One", kind: "standard" },
   { id: "prj-2", name: "Personal", kind: "personal" },
@@ -182,10 +192,10 @@ const HOSTS = [
 ];
 const SOURCES = [{ type: "local_path", hostId: "host_on", isDefault: true }];
 /** The project's environments, newest last: a workspace on the machine that is on. */
-const ENVIRONMENTS = [
-  { environmentProviderId: "project-checkout", hostId: "host_on", createdAt: 1, lifecycle: { phase: "active" }, environmentProviderSelection: null },
-  { environmentProviderId: "multi-repo-workspace", hostId: "host_on", createdAt: 2, lifecycle: { phase: "active" }, environmentProviderSelection: { inputs: { repos: ["a"] } } },
-  { environmentProviderId: "git-worktree", hostId: "host_off", createdAt: 3, lifecycle: { phase: "active" }, environmentProviderSelection: null },
+const ENVIRONMENTS: TestEnvironment[] = [
+  { environmentProviderId: "project-checkout", hostId: "host_on", createdAt: 1, lifecycle: { phase: "active" }, environmentProviderSelection: null, projectId: "prj-1" },
+  { environmentProviderId: "multi-repo-workspace", hostId: "host_on", createdAt: 2, lifecycle: { phase: "active" }, environmentProviderSelection: { inputs: { repos: ["a"] } }, projectId: "prj-1" },
+  { environmentProviderId: "git-worktree", hostId: "host_off", createdAt: 3, lifecycle: { phase: "active" }, environmentProviderSelection: null, projectId: "prj-1" },
 ];
 
 async function setup(
@@ -198,7 +208,9 @@ async function setup(
     projects?: typeof PROJECTS;
     hosts?: Array<{ id: string; status: string }>;
     sources?: Array<{ type: string; hostId: string; isDefault: boolean }>;
-    environments?: Array<{ environmentProviderId: string | null; hostId: string; createdAt: number; lifecycle: { phase: string }; environmentProviderSelection: { inputs: unknown } | null }>;
+    environments?: TestEnvironment[];
+    /** What `environments.list()` returns with no project filter; defaults to `environments`. */
+    allEnvironments?: TestEnvironment[];
     spawn?: () => unknown;
     send?: (args: { threadId: string; input: Array<{ type: string; text?: string }>; pluginSubmission?: unknown }) => unknown;
     /** What a `threads.queuedMessages.update` returns; a throw simulates a row that moved on. */
@@ -228,11 +240,11 @@ async function setup(
     settings,
     sdk: {
       projects: {
-        list: async () => options.projects ?? PROJECTS,
+        list: async () => (options.projects ?? PROJECTS).map((p) => ({ ...p, sources: options.sources ?? SOURCES })),
         get: async ({ projectId }: { projectId: string }) => ({ id: projectId, name: projectId, kind: "standard", sources: options.sources ?? SOURCES }),
       },
       hosts: { list: async () => options.hosts ?? HOSTS },
-      environments: { list: async () => options.environments ?? ENVIRONMENTS },
+      environments: { list: async (args?: { projectId?: string }) => (args?.projectId === undefined ? (options.allEnvironments ?? options.environments ?? ENVIRONMENTS) : (options.environments ?? ENVIRONMENTS)) },
       threads: {
         spawn: async () => options.spawn?.() ?? { id: "thr-1" },
         send: async (args: { threadId: string; input: Array<{ type: string; text?: string }>; pluginSubmission?: unknown }) => {
@@ -293,7 +305,10 @@ describe("Slack plugin", () => {
       signedIn: false,
       user: null,
       fallback: "",
-      projects: PROJECTS,
+      projects: [
+        { id: "prj-1", name: "Project One", kind: "standard", hasMachine: true },
+        { id: "prj-2", name: "Personal", kind: "personal", hasMachine: true },
+      ],
       channels: [],
       hooks: { configured: true, connected: true, state: "connected" },
     });
@@ -1728,11 +1743,82 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("leaves the environment to bb only when the project has no connected machine", async () => {
-    const s = await live({ environments: [], hosts: [{ id: "host_off", status: "disconnected" }] });
+  it("runs the thread in a project-checkout on a connected machine when the project has no environment or checkout there", async () => {
+    const s = await live({ map: { fallback: "Project One", channels: [] }, environments: [], sources: [] });
     s.hooks.last().send(s.hooks.session());
     await tick();
-    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({ environment: { type: "project-default" } });
+    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
+      environment: { type: "provider", environmentProviderId: "project-checkout", inputs: null, machine: { type: "existing", hostId: "host_on" } },
+    });
+    await s.stop();
+  });
+
+  it("uses the personal-workspace provider for a personal project with no environment or checkout on a connected machine", async () => {
+    const s = await live({ environments: [], sources: [] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
+      environment: { type: "provider", environmentProviderId: "personal-workspace", inputs: null, machine: { type: "existing", hostId: "host_on" } },
+    });
+    await s.stop();
+  });
+
+  it("prefers a connected machine that hosts an active environment over any other connected one", async () => {
+    const s = await live({
+      map: { fallback: "Project One", channels: [] },
+      environments: [],
+      sources: [],
+      hosts: [
+        { id: "host_a", status: "connected" },
+        { id: "host_z", status: "connected" },
+      ],
+      allEnvironments: [{ environmentProviderId: "multi-repo-workspace", hostId: "host_z", createdAt: 1, lifecycle: { phase: "active" }, environmentProviderSelection: null, projectId: "prj-1" }],
+    });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
+      environment: { type: "provider", environmentProviderId: "project-checkout", machine: { type: "existing", hostId: "host_z" } },
+    });
+    await s.stop();
+  });
+
+  it("posts a clear reply naming the project when no connected machine has it", async () => {
+    const s = await live({ map: { fallback: "Project One", channels: [] }, environments: [], sources: [], hosts: [{ id: "host_off", status: "disconnected" }] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    expect(s.hooks.messages.at(-1)?.body.text).toContain("No connected machine has the Project One project");
+    await s.stop();
+  });
+
+  it("turns core's local-host-daemon 502 into the clear reply instead of the raw error", async () => {
+    const s = await live({
+      map: { fallback: "Project One", channels: [] },
+      spawn: () => {
+        throw new Error("HTTP 502: Local host daemon is not initialized");
+      },
+    });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.hooks.messages.at(-1)?.body.text).toContain("No connected machine has the Project One project");
+    expect(s.hooks.messages.at(-1)?.body.text).not.toContain("Local host daemon");
+    await s.stop();
+  });
+
+  it("flags only the projects with no checkout or environment on a connected machine", async () => {
+    const s = await live({ sources: [] });
+    const status = (await s.harness.callRpc("status")) as { projects: Array<{ id: string; name: string; kind: string; hasMachine: boolean }> };
+    expect(status.projects).toEqual([
+      { id: "prj-1", name: "Project One", kind: "standard", hasMachine: true },
+      { id: "prj-2", name: "Personal", kind: "personal", hasMachine: false },
+    ]);
+    await s.stop();
+  });
+
+  it("flags every project when no machine is connected", async () => {
+    const s = await live({ environments: [], sources: [], hosts: [{ id: "host_off", status: "disconnected" }] });
+    const status = (await s.harness.callRpc("status")) as { projects: Array<{ hasMachine: boolean }> };
+    expect(status.projects.every((project) => !project.hasMachine)).toBe(true);
     await s.stop();
   });
 

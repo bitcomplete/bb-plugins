@@ -13,6 +13,7 @@ interface Project {
   id: string;
   name: string;
   kind: string;
+  hasMachine: boolean;
 }
 
 interface ChannelEntry {
@@ -53,6 +54,9 @@ interface Status {
 
 /** A Slack channel id: `C…` or `G…`, never a name. Case-sensitive, like the RPC. */
 const CHANNEL_ID = /^[CG][A-Z0-9]+$/;
+
+/** The warning under a routing row whose project has no machine to run on. */
+const NO_MACHINE_WARNING = "No checkout or environment for this project is on a connected machine; a Slack thread here has no machine it is known to run on.";
 
 const isChannelId = (channel: string): boolean => CHANNEL_ID.test(channel.trim());
 
@@ -316,6 +320,11 @@ function ChannelMapEditor({
   const trimmed = fallback.trim();
   const onServer = (name: string) => projectNames.some((candidate) => candidate.toLowerCase() === name.toLowerCase());
   const missing = trimmed !== "" && !onServer(trimmed);
+  /** Whether the project has a checkout or environment on a connected machine. */
+  const machineReady = (name: string): boolean | null => {
+    const project = status.projects.find((candidate) => candidate.name.toLowerCase() === name.trim().toLowerCase());
+    return project === undefined ? null : project.hasMachine;
+  };
 
   return (
     <div className="flex flex-col gap-2">
@@ -354,6 +363,7 @@ function ChannelMapEditor({
           </select>
         </div>
         {missing ? <span className="text-xs text-destructive">This project is not on this server; conversations fall back to the personal project, or the first one.</span> : null}
+        {!missing && trimmed !== "" && machineReady(trimmed) === false ? <span className="text-xs text-destructive">{NO_MACHINE_WARNING}</span> : null}
         {trimmed === "" ? <span className="text-xs text-muted-foreground">Choose a project for conversations that are not in a mapped channel.</span> : null}
       </div>
       {rows.length === 0 ? <p className="text-muted-foreground">No channel entries yet.</p> : null}
@@ -390,6 +400,7 @@ function ChannelMapEditor({
               </Button>
             </div>
             {note !== null ? <span className="text-xs text-muted-foreground">{note}</span> : null}
+            {machineReady(row.project) === false ? <span className="text-xs text-destructive">{NO_MACHINE_WARNING}</span> : null}
             {needsInvite(row.channel, botChannels) && !joined ? (
               <InvitePrompt
                 channel={row.channel}

@@ -195,7 +195,7 @@ export const rpcContract = defineRpcContract({
       signedIn: z.boolean(),
       user: z.object({ id: z.string(), name: z.string() }).nullable(),
       fallback: z.string(),
-      projects: z.array(z.object({ id: z.string(), name: z.string(), kind: z.string() })),
+      projects: z.array(z.object({ id: z.string(), name: z.string(), kind: z.string(), hasMachine: z.boolean() })),
       channels: z.array(channelEntrySchema),
       hooks: z.object({ configured: z.boolean(), connected: z.boolean(), state: z.string() }),
     }),
@@ -253,6 +253,21 @@ const CHANNEL_ID = /^[CG][A-Z0-9]+$/u;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The reply a Slack conversation gets when the target project has no machine
+ * to run on. It names the project, so the developer knows which routing row
+ * to fix, and is used both when nothing is connected and when core still fell
+ * back to a host daemon this server does not have (a bb-gate pod).
+ */
+function noMachineReply(project: Project): string {
+  return `No connected machine has the ${project.name} project, so a Slack thread cannot start there. Connect a machine in bb (or add a checkout for this project), then try again.`;
+}
+
+/** Whether a spawn failed because core fell back to the server's own host daemon. */
+function isLocalHostDaemonError(error: unknown): boolean {
+  return errorMessage(error).toLowerCase().includes("local host daemon is not initialized");
 }
 
 /**
@@ -517,13 +532,17 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     // ---- projects ----------------------------------------------------------
 
-    async function projects(): Promise<Project[]> {
+    async function listProjects() {
       try {
-        return (await bb.sdk.projects.list({ includePersonal: true })).map((p) => ({ id: p.id, name: p.name, kind: p.kind }));
+        return await bb.sdk.projects.list({ includePersonal: true });
       } catch (error) {
         bb.log.warn(`could not list bb projects: ${errorMessage(error)}`);
         return [];
       }
+    }
+
+    async function projects(): Promise<Project[]> {
+      return (await listProjects()).map((p) => ({ id: p.id, name: p.name, kind: p.kind }));
     }
 
     async function targetProject(event: SessionEvent): Promise<Project | null> {
@@ -538,16 +557,20 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * thread must name a connected machine. The project's newest environment
      * says what the developer actually uses: its provider and inputs are
      * replayed on its machine when that machine is connected. Otherwise the
-     * project's checkout on its default source's machine, and only when the
-     * project has no connected machine at all is the choice left to bb.
+     * project's checkout on its default source's machine. When the project has
+     * neither on a connected machine, it runs a project-checkout provider on a
+     * connected machine anyway (preferring the developer's devbox), and null
+     * only when nothing is connected, so the caller can say so instead of
+     * leaving the choice to core's host daemon.
      */
-    async function environmentFor(project: Project): Promise<SpawnEnvironment> {
+    async function environmentFor(project: Project): Promise<SpawnEnvironment | null> {
       const [hosts, full, environments] = await Promise.all([
         bb.sdk.hosts.list().catch(() => []),
         bb.sdk.projects.get({ projectId: project.id }).catch(() => null),
         bb.sdk.environments.list({ projectId: project.id }).catch(() => []),
       ]);
       const connected = new Set(hosts.filter((h) => h.status === "connected").map((h) => h.id));
+      const providerId = project.kind === "personal" ? "personal-workspace" : "project-checkout";
       const newest = environments
         .filter((e) => e.environmentProviderId !== null && e.lifecycle.phase === "active" && connected.has(e.hostId))
         .sort((a, b) => b.createdAt - a.createdAt)[0];
@@ -557,10 +580,28 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const sources = (full?.sources ?? []).filter((source) => source.type === "local_path");
       const source = sources.find((s) => s.isDefault && connected.has(s.hostId)) ?? sources.find((s) => connected.has(s.hostId));
       if (source !== undefined) {
-        const providerId = project.kind === "personal" ? "personal-workspace" : "project-checkout";
         return { type: "provider", environmentProviderId: providerId, inputs: null, machine: { type: "existing", hostId: source.hostId } };
       }
-      return { type: "project-default" };
+      const hostId = await fallbackHost(connected);
+      if (hostId === null) return null;
+      return { type: "provider", environmentProviderId: providerId, inputs: null, machine: { type: "existing", hostId } };
+    }
+
+    /**
+     * A connected machine to run a project-checkout thread on, when the
+     * project has no environment or checkout on one. Prefers a machine that
+     * hosts an active provider environment of any project (the developer's
+     * devbox), then any connected machine. Null when nothing is connected.
+     */
+    async function fallbackHost(connected: Set<string>): Promise<string | null> {
+      if (connected.size === 0) return null;
+      const environments = await bb.sdk.environments.list().catch(() => []);
+      const active = environments
+        .filter((e) => e.environmentProviderId !== null && e.lifecycle.phase === "active" && connected.has(e.hostId))
+        .sort((a, b) => b.createdAt - a.createdAt);
+      const preferred = active[0]?.hostId;
+      if (preferred !== undefined) return preferred;
+      return [...connected].sort()[0] ?? null;
     }
 
     // ---- the hooks stream --------------------------------------------------
@@ -946,7 +987,23 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         await backstop(event.session, "No bb project is available on this server, so a Slack thread cannot be started. Create a project in bb, then DM again.", event.tagged ? "tagged" : "untagged");
         return false;
       }
-      const thread = await bb.sdk.threads.spawn({ projectId: project.id, environment: await environmentFor(project), prompt: text, title });
+      const environment = await environmentFor(project);
+      if (environment === null) {
+        await backstop(event.session, noMachineReply(project), event.tagged ? "tagged" : "untagged");
+        return false;
+      }
+      let thread: { id: string };
+      try {
+        thread = await bb.sdk.threads.spawn({ projectId: project.id, environment, prompt: text, title });
+      } catch (error) {
+        // Core can still pick its own host daemon (a bb-gate pod has none),
+        // even though this environment names a connected machine. Answer the
+        // same way as when nothing is connected rather than echoing the 502.
+        if (!isLocalHostDaemonError(error)) throw error;
+        bb.log.warn(`Slack session ${event.tagged ? event.session : sessionLogId(event.session)}: bb fell back to a host daemon for ${project.name}; telling the owner instead`);
+        await backstop(event.session, noMachineReply(project), event.tagged ? "tagged" : "untagged");
+        return false;
+      }
       const after = sessions.get(event.session);
       if (after !== undefined) {
         sessions.set(event.session, { ...after, threadId: thread.id, projectId: project.id, handedAt });
@@ -1504,15 +1561,38 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     // ---- the settings and sign-in surface ----------------------------------
 
+    /**
+     * The projects that have an active provider environment or a checkout on a
+     * connected machine, by project id. The routing editor warns beside a row
+     * whose project is missing from this set: a Slack thread there has no
+     * machine it is known to run on.
+     */
+    async function projectsWithMachine(all: Awaited<ReturnType<typeof listProjects>>): Promise<Set<string>> {
+      const [hosts, environments] = await Promise.all([
+        bb.sdk.hosts.list().catch(() => []),
+        bb.sdk.environments.list().catch(() => []),
+      ]);
+      const connected = new Set(hosts.filter((h) => h.status === "connected").map((h) => h.id));
+      const ready = new Set<string>();
+      for (const environment of environments) {
+        if (environment.environmentProviderId !== null && environment.lifecycle.phase === "active" && connected.has(environment.hostId)) ready.add(environment.projectId);
+      }
+      for (const project of all) {
+        if (project.sources.some((source) => source.type === "local_path" && connected.has(source.hostId))) ready.add(project.id);
+      }
+      return ready;
+    }
+
     async function status() {
       const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
       const token = ((await bb.storage.kv.get<string>(TOKEN_KEY)) ?? "").trim();
-      const all = await projects();
+      const all = await listProjects();
+      const ready = await projectsWithMachine(all);
       return {
         signedIn: token !== "",
         user: identity === null ? null : { id: identity.id, name: identity.name },
         fallback: map.fallback,
-        projects: all,
+        projects: all.map((project) => ({ id: project.id, name: project.name, kind: project.kind, hasMachine: ready.has(project.id) })),
         channels: map.channels,
         hooks: { configured: hooksUrl !== "", connected: hooks.connected, state: hooks.state().state },
       };
