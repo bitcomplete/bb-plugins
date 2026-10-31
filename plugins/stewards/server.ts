@@ -95,10 +95,11 @@ import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuid
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
+import { waitingOnNamesWorker } from "./sidebar.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
 
@@ -5373,13 +5374,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // reads. The whole idle handler is one coalesced turn (BB-95), so the
         // signal that refetches is published after the note lands, never before.
         const finished = store.binding(worker.bindingId);
+        // BB-152: a `waitingOn` that names this worker is a hand-off the
+        // steward is still waiting on. Its finish is a wake, not a quiet note:
+        // the steward checks whether what it waited on (a merge, an apply)
+        // happened and does it itself or escalates, never re-waiting on a
+        // worker that is over.
+        const waitedOn = finished !== null && waitingOnNamesWorker(finished.status?.waitingOn ?? null, worker);
         // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
         // the owner or a build is a quiet note. Only a question, an error
-        // report or a gone thread makes the turn due; a failed turn comes
-        // through thread.failed and wakes on its own. A binding following
-        // through is waiting on this worker's result, so its finish is news.
-        const needsSteward = finished !== null && (workerQuestion(result) !== null || workerReportedError(result) || followingThrough(finished));
-        if (finished !== null && finished.endedAt === null) store.note(finished.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
+        // report, a gone thread or a lost hand-off makes the turn due; a
+        // failed turn comes through thread.failed and wakes on its own. A
+        // binding following through is waiting on this worker's result, so its
+        // finish is news.
+        const needsSteward = finished !== null && (workerQuestion(result) !== null || workerReportedError(result) || followingThrough(finished) || waitedOn);
+        if (finished !== null && finished.endedAt === null) store.note(finished.id, workerFinishNote(worker.title, result, waitedOn), !needsSteward);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited
         // on) have had their round consumed (BB-47).

@@ -50,6 +50,7 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   hold: null,
   holdBehind: [],
   waitingOn: null,
+  workers: [],
   needsUser: false,
   stuck: false,
   statusActor: null,
@@ -431,6 +432,23 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM", pending: [finish], requeueAt: now + 12 * 60_000 }), now)).toBe("worker finished, next look 12m");
   });
 
+  it("reads a wait on a finished worker as a lost hand-off, not a plain finish (BB-152)", () => {
+    const now = Date.parse("2026-10-14T15:00:00Z");
+    const finished = { threadId: "thr_w1", title: "ENG-12: Implement", status: "finished" };
+    const finish = { text: 'Worker "ENG-12: Implement" finished its turn. Its final message: I posted the gate.', quiet: true };
+    // `waitingOn` names the finished worker's thread id: a lost hand-off, with
+    // the next look, where a plain finish would read "worker finished".
+    expect(effortPhrase(effort({ key: "a", waitingOn: "worker thr_w1 (merge)", workers: [finished], pending: [finish], requeueAt: now + 12 * 60_000 }), now)).toBe("hand-off lost: worker finished, next look 12m");
+    // By the worker's title too, and with no next look.
+    expect(effortPhrase(effort({ key: "b", waitingOn: "the ENG-12: Implement worker", workers: [finished], pending: [finish] }), now)).toBe("hand-off lost: worker finished");
+    // The loud hand-off note phrases it even with no worker records (the board).
+    const loud = { text: 'Worker "ENG-12: Implement" finished its turn while you were waiting on it. Check whether it happened.' };
+    expect(effortPhrase(effort({ key: "b2", pending: [loud] }), now)).toBe("hand-off lost: worker finished");
+    // A wait on a running worker, or on someone else, is not a lost hand-off.
+    expect(effortPhrase(effort({ key: "c", waitingOn: "worker thr_w1", workers: [{ ...finished, status: "running" }], pending: [finish] }), now)).toBe("worker finished");
+    expect(effortPhrase(effort({ key: "d", waitingOn: "the reviewer", workers: [finished], pending: [finish] }), now)).toBe("worker finished");
+  });
+
   it("phrases a deployment watch's state", () => {
     expect(deploymentPhrase("merged")).toBe("deploying");
     expect(deploymentPhrase("deploying")).toBe("deploying");
@@ -443,6 +461,20 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortTitle("Review acme/web#612: Read metrics", "acme/web#612")).toBe("Read metrics");
     expect(effortTitle("A title that keeps its words", "ENG-1")).toBe("A title that keeps its words");
     expect(effortTitle("Any title", null)).toBe("Any title");
+  });
+
+  it("phrases a binding waiting on a finished worker as a lost hand-off (BB-152)", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "worker thr_w1 (merge)", workers: [{ threadId: "thr_w1", title: "Implement", status: "finished" }] })],
+        }),
+      ],
+    });
+    expect(tabs[0]!.efforts[0]!.phrase).toBe("hand-off lost: worker finished");
   });
 
   it("derives state, section and phrase for every effort a tab builds", () => {

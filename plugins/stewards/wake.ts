@@ -145,6 +145,28 @@ export function workerWaiting(result: string | null): boolean {
   return result !== null && WAITING.test(result);
 }
 
+/** How much of a worker's final message its finish note carries (BB-152). */
+export const FINISH_REPORT_CHARS = 500;
+
+/**
+ * The note queued when a worker's turn ends (BB-52 rule 3, BB-152). It always
+ * carries the worker's final message, clipped, so "worker finished" is never
+ * empty. `waitedOn` is true when the steward's `waitingOn` named this worker:
+ * the note is then the hand-off prompt, and the server queues it loud, so the
+ * steward is woken at once and told to check whether what it waited on (a
+ * merge, an apply) happened rather than to wait on the finished worker again.
+ */
+export function workerFinishNote(title: string, result: string | null, waitedOn: boolean): string {
+  const report = result === null ? "" : oneLine(result, FINISH_REPORT_CHARS);
+  const said = report === "" ? "" : ` Its final message: ${report}`;
+  if (!waitedOn) return `Worker "${title}" finished its turn.${said}`;
+  return (
+    `Worker "${title}" finished its turn while you were waiting on it. ` +
+    `Check whether what you waited on (a merge, an apply) happened; if not, do it yourself (post the gate on the pull request, then merge it with \`gh pr merge\`) or escalate. ` +
+    `Do not re-wait on this worker.${said}`
+  );
+}
+
 /** One worker's question, first under What changed, with how to answer it. */
 function workerQuestionLines(q: WorkerQuestion): string[] {
   const asked = `- **Worker ${q.threadId} asked:** ${q.question}`;

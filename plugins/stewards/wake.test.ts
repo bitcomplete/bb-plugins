@@ -7,7 +7,7 @@ import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { ESCALATED_NEED_KINDS } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS } from "./templates.js";
-import { STANDING_RULES, formatDepsWake, formatOpsWake, formatProjectWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, formatDepsWake, formatOpsWake, formatProjectWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 import type { OpsFinding } from "./ops.js";
 import type { DepsFinding } from "./deps.js";
 
@@ -156,6 +156,31 @@ describe("a steward's wake", () => {
     expect(wake).toContain("- **Worker thr_w1 asked:** Should I bring the reviewer back?");
     expect(wake).toContain("Answer it with `bb thread tell thr_w1 <answer>`, or escalate it, before anything else.");
     expect(wake.indexOf("Worker thr_w1 asked:")).toBeLessThan(wake.indexOf("1 new comment from Sam"));
+  });
+});
+
+describe("the worker finish note (BB-152)", () => {
+  it("always carries the worker's final message, clipped to a bounded length", () => {
+    expect(workerFinishNote("ENG-12: Implement", "Opened acme/web#7; waiting on the reviewer.", false)).toBe(
+      'Worker "ENG-12: Implement" finished its turn. Its final message: Opened acme/web#7; waiting on the reviewer.',
+    );
+    expect(workerFinishNote("ENG-12: Implement", null, false)).toBe('Worker "ENG-12: Implement" finished its turn.');
+    // Whitespace is flattened and the report is bounded.
+    const long = `line one\n\nline two ${"x".repeat(900)}`;
+    const note = workerFinishNote("ENG-12: Implement", long, false);
+    expect(note.length).toBeLessThan(600);
+    expect(note).toContain("line one line two");
+    expect(note).toContain("…");
+  });
+
+  it("prompts the steward when its waitingOn named the worker", () => {
+    const note = workerFinishNote("ENG-12: Implement", "I posted the gate; the merge was refused.", true);
+    expect(note).toMatch(/finished its turn while you were waiting on it/u);
+    expect(note).toMatch(/Check whether what you waited on \(a merge, an apply\) happened/u);
+    expect(note).toMatch(/do it yourself/u);
+    expect(note).toMatch(/`gh pr merge`/u);
+    expect(note).toMatch(/Do not re-wait on this worker/u);
+    expect(note).toContain("I posted the gate; the merge was refused.");
   });
 });
 

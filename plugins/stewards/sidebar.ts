@@ -118,6 +118,8 @@ export interface SidebarEffort {
   holdBehind: string[];
   /** The party or artifact the next action waits on; shown as a plain line, never as a block (BB-109). */
   waitingOn: string | null;
+  /** The binding's worker records, so a wait on a finished one reads as a lost hand-off (BB-152). */
+  workers: SidebarWorker[];
   needsUser: boolean;
   stuck: boolean;
   statusActor: string | null;
@@ -222,6 +224,10 @@ export interface EffortStatus {
   pending: readonly { text: string; quiet?: boolean }[];
   /** When the binding is next due a look, for `next look <time>` (BB-83). */
   requeueAt: number | null;
+  /** The party or artifact the next action waits on (BB-109). */
+  waitingOn?: string | null;
+  /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
+  workers?: readonly { threadId: string; title: string; status: string }[];
 }
 
 /** Whether a worker or reviewer thread is running: the binding is in flight, not quiet. */
@@ -266,9 +272,43 @@ export function endReasonPhrase(reason: string | null): string {
 
 /**
  * A pending note that a worker finished its turn quietly (BB-52 rule 3): the
- * one whose place a stale status summary must not keep (BB-83).
+ * one whose place a stale status summary must not keep (BB-83). The note now
+ * carries the worker's final message (BB-152), so only its opening is matched.
  */
-export const isQuietWorkerFinish = (n: { text: string; quiet?: boolean }): boolean => n.quiet === true && /^Worker ".+" finished its turn\.$/u.test(n.text);
+export const isQuietWorkerFinish = (n: { text: string; quiet?: boolean }): boolean => n.quiet === true && /^Worker ".+" finished its turn\b/u.test(n.text);
+
+/**
+ * A pending note that a worker finished while the steward's `waitingOn` named
+ * it (BB-152): the loud hand-off prompt, not a plain finish. Matched from the
+ * note text so a surface with no worker records still phrases the lost
+ * hand-off; `waitingOnNamesFinishedWorker` catches it after the note is gone.
+ */
+export const isLostHandoffNote = (n: { text: string; quiet?: boolean }): boolean => n.quiet !== true && /^Worker ".+" finished its turn while you were waiting on it\b/u.test(n.text);
+
+/**
+ * Whether a free-text `waitingOn` names a worker: its thread id, or its title,
+ * case-insensitively. A steward that quotes the id and one that names the
+ * worker's task both count.
+ */
+export function waitingOnNamesWorker(waitingOn: string | null, worker: { threadId: string; title: string }): boolean {
+  if (waitingOn === null) return false;
+  const text = waitingOn.toLowerCase();
+  const id = worker.threadId.trim().toLowerCase();
+  const title = worker.title.trim().toLowerCase();
+  return (id !== "" && text.includes(id)) || (title !== "" && text.includes(title));
+}
+
+/**
+ * Whether a `waitingOn` names a worker that is no longer running (BB-152):
+ * the steward is waiting on a finished worker, a lost hand-off. `running` is
+ * the only live status; `finished`, `failed` and `stopped` are all over.
+ */
+export function waitingOnNamesFinishedWorker(
+  waitingOn: string | null,
+  workers: readonly { threadId: string; title: string; status: string }[],
+): boolean {
+  return waitingOn !== null && workers.some((w) => w.status !== "running" && waitingOnNamesWorker(waitingOn, w));
+}
 
 /** A short relative time to a future moment, for `next look <time>` (BB-83). */
 export function untilPhrase(at: number, now: number): string {
@@ -280,18 +320,21 @@ export function untilPhrase(at: number, now: number): string {
 }
 
 /**
- * Line two's status phrase, first match wins (BB-76, BB-86, BB-83):
- * needs you › hold › stuck › running › quiet worker finish ›
+ * Line two's status phrase, first match wins (BB-76, BB-86, BB-83, BB-152):
+ * needs you › hold › stuck › running › lost hand-off › quiet worker finish ›
  * deployment › nextAction › no report. The free-text `waitingOn` is not a
  * prefix (BB-109): a running worker reads the count, and otherwise the
  * `nextAction` reads verbatim, whatever the actor. `the other party` only
  * stands in when there is no report at all.
  *
- * The quiet worker finish (BB-83) sits after the running count and before the
- * external wait: a binding whose worker finished and has nothing to wait on
- * says so instead of repeating the status summary the worker's finish made
- * stale. `now` is the clock for the relative `next look` time; it defaults to
- * the wall clock so a caller with no clock still gets a phrase.
+ * The lost hand-off (BB-152) sits after the running count and before the
+ * quiet finish: a `waitingOn` naming a worker that is over, or the loud
+ * hand-off note, says so rather than reading a plain finish. The quiet worker
+ * finish (BB-83) follows, and before the external wait: a binding whose worker
+ * finished and has nothing to wait on says so instead of repeating the status
+ * summary the worker's finish made stale. `now` is the clock for the relative
+ * `next look` time; it defaults to the wall clock so a caller with no clock
+ * still gets a phrase.
  */
 export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
   if (e.needsUser) return "needs you";
@@ -305,6 +348,10 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
     const n = e.runningWorkers;
     return `${n} worker${n === 1 ? "" : "s"} running`;
   }
+  // A wait on a worker that is no longer running is a lost hand-off, not a
+  // plain finish (BB-152): the steward is waiting on a worker that is over.
+  const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? []) || e.pending.some(isLostHandoffNote);
+  if (lostHandoff) return e.requeueAt === null ? "hand-off lost: worker finished" : `hand-off lost: worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
@@ -339,6 +386,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     hold: null,
     holdBehind: [],
     waitingOn: null,
+    workers: [],
     needsUser: false,
     stuck: false,
     statusActor: null,
@@ -550,6 +598,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       hold: b.hold,
       holdBehind: b.holdBehind,
       waitingOn: b.waitingOn,
+      workers: b.workers,
       needsUser: b.needsUser,
       stuck: b.stuck,
       statusActor: b.status?.actor ?? null,
@@ -641,6 +690,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       hold: null,
       holdBehind: [],
       waitingOn: null,
+      workers: [],
       needsUser: false,
       stuck: false,
       statusActor: null,

@@ -278,8 +278,22 @@ pull request, and otherwise squash-merges, posts the "Merged:" comment
 merge commit, and the restart note when the project's guidance says a merge
 there restarts servers), and closes the Merge item. If it refuses, do not
 look for another way: fix the gate, or if the thread's permission system
-refuses the command, post the gate on the PR, put it in your final message,
-and the steward merges with the same command. Carry on here once it is in.
+refuses the command (or a direct `gh pr merge`), take the hand-off path
+below. Carry on here once it is in.
+
+### When the merge is refused
+
+A permission system that refuses `bb stewards merge` (or `gh pr merge`)
+refuses the message you would send your steward with `bb thread tell` too,
+so do not try either. Post the gate on the PR instead: one signed comment
+naming the lane, the approved sha, that every check is green, and the exact
+command to run (`bb stewards merge <owner/repo#N>`). Then end your turn with
+the hand-off in your final message: the PR URL and number, the lane, the
+approved sha, that the merge was refused, and that the PR is ready to merge.
+The plugin delivers that final message to the steward, and a steward whose
+`waitingOn` names you is woken at once; it merges with the same command.
+You do not merge it yourself later and you do not wait for the steward: end
+the turn after the comment and the report.
 
 Then stop the reviewer with `bb thread stop <reviewer-id>` and **end your
 turn**. You do not watch the release: no `gh run list`, `gh run watch` or
@@ -301,7 +315,8 @@ still has to be applied on the host by hand: say so in your final message.
 Your final message is what the steward reads when the turn ends. Put in it
 the PR URL and number, the lane, the approved sha, the merge commit,
 whether the merge stages a restart, and anything still open — a refused
-`bb stewards merge`, a disputed blocker, a change that still needs applying
+`bb stewards merge` (with the gate already posted on the PR, per "When the
+merge is refused"), a disputed blocker, a change that still needs applying
 by hand. If something you already saw while merging (a check, a signed
 comment, a failed run on the PR page) shows a build failing or hung, add
 one line starting "Build problem:" with the run URL; the steward escalates

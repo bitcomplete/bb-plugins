@@ -1131,7 +1131,9 @@ describe("a Linear ticket steward", () => {
     // BB-52 rule 3: a worker ending its turn waiting is a quiet note, not a wake.
     await t.idle("thr_w1", "Opened acme/web#7; waiting on the reviewer.");
     expect(t.sends).toEqual([]);
-    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ text: 'Worker "ENG-12: Implement" finished its turn.', quiet: true }]);
+    // BB-152: the finish note carries the worker's final message.
+    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ quiet: true }]);
+    expect(t.hooks.store.open("p1")[0]!.pending[0]!.text).toBe('Worker "ENG-12: Implement" finished its turn. Its final message: Opened acme/web#7; waiting on the reviewer.');
 
     // A question wakes it, with the worker's words.
     await t.idle("thr_w1", "Should I bring the reviewer back once it finishes?");
@@ -8685,7 +8687,34 @@ describe("a steward idle in an active stage (BB-83)", () => {
     // open: there is something to wait on, so the finish is quiet.
     await t.idle("thr_w1", "Merged acme/web#7.");
     expect(t.sends).toHaveLength(before);
-    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ text: 'Worker "ENG-12: Implement" finished its turn.', quiet: true }]);
+    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ quiet: true }]);
+    expect(t.hooks.store.open("p1")[0]!.pending[0]!.text).toBe('Worker "ENG-12: Implement" finished its turn. Its final message: Merged acme/web#7.');
+  });
+
+  it("wakes at once, with the report, when the worker it waited on finishes (BB-152)", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The steward is waiting on this worker for the merge.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Worker merging.", nextAction: "Wait for the merge", actor: "other", waitingOn: "worker thr_w1 (merge)" }, steward);
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const before = t.sends.length;
+    // The merge was refused, so the pull request is still open and the idle
+    // rule would not fire. The lost hand-off wakes anyway, with the report and
+    // the instruction not to wait on the finished worker again.
+    await t.idle("thr_w1", "gh pr merge was refused; I posted the gate on acme/web#7 and the PR is ready to merge.");
+    expect(t.sends).toHaveLength(before + 1);
+    const wake = t.sends.at(-1)!.text;
+    expect(wake).toMatch(/finished its turn while you were waiting on it/u);
+    expect(wake).toMatch(/Do not re-wait on this worker/u);
+    expect(wake).toMatch(/gh pr merge was refused/u);
+    // The hand-off note was delivered (the wake consumed it), and the worker
+    // finished rather than being left running.
+    expect(t.hooks.store.open("p1")[0]!.pending).toEqual([]);
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
   });
 
   it("wakes once after the grace, and not again after the steward reports", async () => {
