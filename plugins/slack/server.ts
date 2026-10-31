@@ -926,7 +926,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      */
     function attachmentFilename(file: SessionFile): string {
       const cleaned = file.name.replace(/[\p{Cc}\p{Cf}]/gu, "").replace(/[\\/]/gu, "-").trim();
-      return cleaned === "" ? "slack-file" : cleaned.slice(0, 200);
+      // An empty name, or one of only dots, is not a usable attachment name either.
+      return cleaned === "" || /^\.+$/u.test(cleaned) ? "slack-file" : cleaned.slice(0, 200);
     }
 
     /** An upload result as the prompt input part `threads.send`/`spawn` take. */

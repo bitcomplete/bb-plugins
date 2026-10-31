@@ -512,6 +512,23 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("gives a dot-only or empty file name a safe upload name", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        comment: { text: "two", untrusted: false },
+        files: [
+          { id: "F1", name: "..", mimeType: "image/png", size: 10 },
+          { id: "F2", name: "", mimeType: "image/png", size: 10 },
+        ],
+      }),
+    );
+    await tick();
+    const uploads = s.harness.sdk.callsTo("projects.attachments.upload").map((call) => (call[0] as { filename: string }).filename);
+    expect(uploads).toEqual(["slack-file", "slack-file"]);
+    await s.stop();
+  });
+
   it("leases each live Slack session on the next hello and never logs the capability", async () => {
     const s = await live({ token: "xoxp-test" });
     s.hooks.last().send(s.hooks.session({ capability: "cap-secret" }));
