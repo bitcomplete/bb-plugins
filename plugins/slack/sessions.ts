@@ -17,6 +17,35 @@ export const SESSION_TEXT_CHARS = 20_000;
  */
 export const STEER_NOTE = "This message arrived while the previous one was being handled (or just after it finished), so treat it as a correction or addition to that work, not a new question.";
 
+/**
+ * How one wake was delivered, keyed by the message's own Slack `ts`, so an
+ * edit or deletion can find the wake it corrects. A session keeps only its
+ * last few wakes; an older correction is dropped.
+ */
+export const wakeDeliverySchema = z.object({
+  ts: z.string().max(200),
+  /**
+   * `held`: the words were parked for the owner's confirmation, so no turn
+   * runs yet. `queued`: the wake is a queued row whose turn has not started.
+   * `started`: the wake reached a turn (running or finished).
+   */
+  state: z.enum(["held", "queued", "started"]),
+  /** The queued row's id and version, for an in-place rewrite or removal. */
+  queuedMessageId: z.string().default(""),
+  queuedUpdatedAt: z.number().default(0),
+  /** The held request's id, so a deletion can withdraw it. */
+  heldId: z.string().default(""),
+  /** The message's text as delivered, quoted when a correction steers. */
+  text: z.string().default(""),
+  /** The message's attachments, so a rebuilt wake keeps its files line. */
+  files: z.array(sessionFileSchema).default([]),
+  /** Whether the wake carried a confirmed request rather than a plain message. */
+  confirmed: z.boolean().default(false),
+  /** When the wake was delivered; the oldest entries are dropped first. */
+  at: z.number(),
+});
+export type WakeDelivery = z.infer<typeof wakeDeliverySchema>;
+
 /** One Slack conversation's mapping to a bb thread, and how many wakes it has had. */
 export const sessionRecordSchema = z.object({
   channel: z.string(),
@@ -56,6 +85,11 @@ export const sessionRecordSchema = z.object({
   steeredAt: z.number().nullable().default(null),
   /** The last Slack conversation title pushed, so it is not pushed twice. */
   title: z.string().nullable().default(null),
+  /**
+   * The last few wakes' delivery, so a Slack edit or deletion can find the
+   * wake it corrects. Bounded by the plugin; oldest first.
+   */
+  wakes: z.array(wakeDeliverySchema).default([]),
 });
 export type SessionRecord = z.infer<typeof sessionRecordSchema>;
 

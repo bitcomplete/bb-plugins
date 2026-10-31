@@ -48,6 +48,7 @@ function event(over: Partial<SessionEvent> = {}): SessionEvent {
     value: "",
     responseUrl: "",
     comment: { text: "build this", untrusted: false },
+    ts: "",
     files: [],
     at: "2026-10-22T12:00:00Z",
     ...over,
