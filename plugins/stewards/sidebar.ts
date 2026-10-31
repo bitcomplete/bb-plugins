@@ -327,11 +327,14 @@ export function untilPhrase(at: number, now: number): string {
  * `nextAction` reads verbatim, whatever the actor. `the other party` only
  * stands in when there is no report at all.
  *
- * The quiet worker finish (BB-83) sits after the running count and before the
- * external wait: a binding whose worker finished and has nothing to wait on
- * says so instead of repeating the status summary the worker's finish made
- * stale. `now` is the clock for the relative `next look` time; it defaults to
- * the wall clock so a caller with no clock still gets a phrase.
+ * The lost hand-off (BB-152) sits after the running count and before the
+ * quiet finish: a `waitingOn` naming a worker that is over, or the loud
+ * hand-off note, says so rather than reading a plain finish. The quiet worker
+ * finish (BB-83) follows, and before the external wait: a binding whose worker
+ * finished and has nothing to wait on says so instead of repeating the status
+ * summary the worker's finish made stale. `now` is the clock for the relative
+ * `next look` time; it defaults to the wall clock so a caller with no clock
+ * still gets a phrase.
  */
 export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
   if (e.needsUser) return "needs you";

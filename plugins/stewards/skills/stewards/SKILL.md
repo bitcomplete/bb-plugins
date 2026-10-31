@@ -54,7 +54,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   `steward` = you, including your own next step such as re-checking on the
   next deployment wake, `other` = someone else), what
   you are waiting on (`waitingOn`: the party or artifact the next action waits
-  on, such as checks, a review or a deploy), and `requeueAfter`. On a ticket, report the ready
+  on, such as checks, a review or a deploy), and `requeueAfter`. When the next
+  action waits on one of your own workers, name that worker in `waitingOn`
+  (its thread id or its title): the plugin wakes you the moment it finishes,
+  even while its pull request is still open, and a `waitingOn` you leave on a
+  finished worker reads `hand-off lost: worker finished`. On a ticket, report the ready
   checklist too, each item by its number in the wake
   (`{ item: 1, met: true }`); a paraphrase is refused. Three turns in a row
   without a report raise `stuck`. When only the user can do something — a
