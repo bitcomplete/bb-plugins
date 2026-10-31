@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseProjectFile } from "./config.js";
-import { defaultDecideList, type BigDecision } from "./decisions.js";
-import { decideFor, decideForEntry, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, isSelfWidening, SELF_WIDENING_PATHS, touchesAny } from "./decisions.js";
+import { decideFor, decideForEntry, decideForPull, decideForRefusal, defaultDecideList, explainDecision, formatDecisionListing, isSelfWidening, SELF_WIDENING_PATHS, touchesAny, type BigDecision } from "./decisions.js";
 
 const decisions: BigDecision[] = [
   { text: "Changing what a ticket's requester asked for", decide: "user", paths: [] },
