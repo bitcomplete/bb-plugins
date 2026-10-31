@@ -38,7 +38,10 @@ merge.
 
 `linear_comment` and `linear_update_issue` sign what you write; do not add
 a signature line to Linear comments yourself. Everything you post with
-`gh` ends with `_— from bb thread <value of $BB_THREAD_ID>_`.
+`gh` ends with `_— from bb thread ${BB_THREAD_ID:?}_`: the shell's `:?` makes
+the command fail when `BB_THREAD_ID` is unset, rather than writing a
+signature with no thread id, which the plugin would read as the owner's own
+words.
 
 ## Build
 
