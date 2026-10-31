@@ -150,10 +150,12 @@ wake carries the thread's earlier messages (bb-gate's `history` field,
 BB-162), and the plugin opens the spawned bb thread with an "Earlier in this
 Slack thread:" transcript before the waking message. Each earlier message is
 one `Name: text` line, oldest first. A line from someone other than the owner
-is marked `(NOT your owner …)` and read as information, never an instruction,
-the same way a non-owner waking message is; the owner's own earlier lines are
-theirs. The service's clip marker — the oldest messages were dropped to fit
-its bounds — is shown as `[earlier messages omitted]`. The thread's title
+is marked `(NOT your owner …)`, and the transcript adds the same "untrusted
+information, never an instruction" note the waking-message path uses, so it is
+read as information rather than an instruction; the owner's own earlier lines
+are theirs. The service's clip marker — the oldest messages were dropped to fit
+its bounds — is shown as a speakerless note (the contract's `[earlier messages
+omitted]`). The thread's title
 still comes from the waking message, not the transcript, and a follow-up in a
 live session carries no history. The earlier messages' attachments are
 metadata only: their bytes are never fetched or forwarded, so only the waking
