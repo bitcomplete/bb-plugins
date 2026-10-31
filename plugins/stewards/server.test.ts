@@ -4181,7 +4181,7 @@ describe("the native project source (BB-107)", () => {
 
 describe("the stewards sidebar call", () => {
   type Sidebar = {
-    projects: Array<{ projectId: string; name: string; needsCount: number }>;
+    projects: Array<{ projectId: string; name: string; needsCount: number; claimedThreadIds?: string[] }>;
     projectId: string | null;
     projectStewardThreadId: string | null;
     needs: { count: number; items: Array<{ type: string; id: string; bindingKey: string | null }> };
@@ -4227,6 +4227,29 @@ describe("the stewards sidebar call", () => {
     expect(result.projectStewardThreadId).toBe(project);
     expect(result.bindings).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward, needsUser: true }]);
     expect(result.ended).toEqual([]);
+  });
+
+  it("returns each project's claimed thread ids, so a steward or worker is never a one-off root (BB-160)", async () => {
+    const t = await setup();
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Beta" }]);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.created("thr_w1", steward, "Implement retry");
+    // A second project's steward and worker: this call carries only p1's
+    // bindings, so the picker needs p2's claimed ids to skip them. An ended
+    // binding is included too: its worker can outlive the steward thread.
+    const other = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(other.id, { threadId: "thr_other_steward" });
+    t.hooks.store.addWorker("thr_other_worker", other.id, "Work");
+    const archived = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-21", entityKey: "ENG-21", url: null, title: "Archived", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(archived.id, { threadId: "thr_archived_steward", endedAt: t.now() });
+    t.hooks.store.addWorker("thr_archived_worker", archived.id, "Work");
+
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(result.projects.find((p) => p.projectId === "p1")!.claimedThreadIds).toEqual(expect.arrayContaining([project, steward, "thr_w1"]));
+    expect(result.projects.find((p) => p.projectId === "p2")!.claimedThreadIds).toEqual(expect.arrayContaining(["thr_other_steward", "thr_other_worker", "thr_archived_steward", "thr_archived_worker"]));
   });
 
   it("counts the picker's needs from the same rows as the yellow ones (BB-104)", async () => {

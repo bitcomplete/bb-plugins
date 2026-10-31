@@ -659,8 +659,21 @@ export const rpcContract = defineRpcContract({
   stewardsSidebar: {
     input: z.object({ projectId: z.string().min(1).max(100).nullable() }),
     output: z.object({
-      /** Every stewarded project, for the picker, with its needs-you binding count. */
-      projects: z.array(z.object({ projectId: z.string(), name: z.string(), needsCount: z.number() })),
+      /** Every stewarded project, for the picker, with its needs-you binding count and claimed thread ids. */
+      projects: z.array(
+        z.object({
+          projectId: z.string(),
+          name: z.string(),
+          needsCount: z.number(),
+          /**
+           * The project's steward and worker thread ids, so the picker skips
+           * them when it sums unread one-off roots for a project whose
+           * bindings this call does not carry (BB-160). Optional so a client
+           * built from the previous image tolerates its absence.
+           */
+          claimedThreadIds: z.array(z.string()).optional(),
+        }),
+      ),
       /** The project the rest of the payload is for; null when nothing is stewarded. */
       projectId: z.string().nullable(),
       projectStewardThreadId: z.string().nullable(),
@@ -6049,6 +6062,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const projects = projectIds(configs.map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
+        // The threads each project's stewards and workers own, so the picker's
+        // unread sum does not count them as one-off roots when this call carries
+        // another project's bindings (BB-160). The store already holds them: the
+        // project steward, each binding's steward thread, and every worker. One
+        // pass over all bindings, so a project whose bindings this call does not
+        // carry still gets its set.
+        const claimed = new Map<string, Set<string>>();
+        const claim = (projectId: string, threadId: string | null): void => {
+          if (threadId === null) return;
+          const set = claimed.get(projectId) ?? new Set<string>();
+          set.add(threadId);
+          claimed.set(projectId, set);
+        };
+        for (const p of store.projects()) claim(p.projectId, p.threadId);
+        for (const b of store.all()) {
+          claim(b.projectId, b.threadId);
+          for (const w of store.workers(b.id)) claim(b.projectId, w.threadId);
+        }
         // The picker's count is the server's own: the open bindings that need
         // the user, so the pill and the yellow rows cannot disagree (BB-100).
         const picker = projects.map((p) => ({
@@ -6056,6 +6087,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // One SQL count per project, so the picker never parses every binding
           // and runs three more queries each (BB-104).
           needsCount: store.countNeedsUser(p.projectId),
+          // The threads this project's stewards and workers own, for every
+          // project, so the picker's unread sum does not count them as one-off
+          // roots when this call carries another project's bindings (BB-160).
+          claimedThreadIds: [...(claimed.get(p.projectId) ?? [])],
         }));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
         if (picked === undefined) {

@@ -464,12 +464,12 @@ const sidebarBinding = (over: Record<string, unknown>) => ({
   ...over,
 });
 
-const sidebarData = (over: { p1?: Record<string, unknown>; p2?: Record<string, unknown>; needsCounts?: Record<string, number> } = {}) => {
+const sidebarData = (over: { p1?: Record<string, unknown>; p2?: Record<string, unknown>; needsCounts?: Record<string, number>; claimedIds?: Record<string, string[]> } = {}) => {
   const p1 = over.p1 ?? {};
   return {
     projects: [
-      { projectId: "p1", name: "Acme", needsCount: over.needsCounts?.p1 ?? 0 },
-      { projectId: "p2", name: "Beta", needsCount: over.needsCounts?.p2 ?? 0 },
+      { projectId: "p1", name: "Acme", needsCount: over.needsCounts?.p1 ?? 0, ...(over.claimedIds?.p1 === undefined ? {} : { claimedThreadIds: over.claimedIds.p1 }) },
+      { projectId: "p2", name: "Beta", needsCount: over.needsCounts?.p2 ?? 0, ...(over.claimedIds?.p2 === undefined ? {} : { claimedThreadIds: over.claimedIds.p2 }) },
     ],
     projectId: "p1",
     projectStewardThreadId: (p1.projectStewardThreadId as string | null) ?? null,
@@ -498,6 +498,9 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
           calls += 1;
           return sidebarData({
             needsCounts: { p1: 2, p2: 1 },
+            // The RPC claims p2's steward and worker threads even though it
+            // carries only p1's bindings (BB-160).
+            claimedIds: { p2: ["thr_steward_p2", "thr_worker_p2"] },
             p1: {
               bindings: [
                 sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true, workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] }),
@@ -516,8 +519,12 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
         sidebarThread("thr_c", "p2"),
         // An unread worker under a stewarded effort does not add to the count (BB-160).
         { ...sidebarThread("thr_worker"), parentThreadId: "thr_a", isUnread: true },
-        // A one-off root in a project the RPC does not carry adds one; its
-        // unread child does not.
+        // A steward thread and its worker in a project the RPC does not carry
+        // are claimed, so they add nothing (BB-160).
+        { ...sidebarThread("thr_steward_p2", "p2"), isUnread: true },
+        { ...sidebarThread("thr_worker_p2", "p2"), parentThreadId: "thr_steward_p2", isUnread: true },
+        // A genuine one-off root in that same project adds one; its unread
+        // child does not.
         root,
         { ...sidebarThread("thr_child", "p2"), parentThreadId: "thr_root", isUnread: true },
       ],
