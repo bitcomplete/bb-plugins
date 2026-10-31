@@ -40,6 +40,7 @@ import {
   type PendingRequest,
   type Project,
   type SessionRecord,
+  type WakeDelivery,
 } from "./sessions.js";
 import { CONNECTION_CHANGED } from "./channels.js";
 
@@ -54,6 +55,11 @@ export const CALLBACK_PATH = "/signin/callback";
  * exists is kept for the thread's life, not this long.
  */
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * How many of a session's most recent wakes are kept, so a Slack edit or
+ * deletion can find the wake it corrects. An older correction is dropped.
+ */
+export const WAKE_MAP_MAX = 8;
 /** A sign-in state the plugin started is good for as long as the service's own. */
 export const PENDING_TTL_MS = 10 * 60 * 1000;
 
@@ -278,6 +284,18 @@ function resultPage(title: string, body: string, status: number): Response {
 
 /** The environment a spawned thread runs in: `threads.spawn`'s `environment`. */
 type SpawnEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
+
+/**
+ * How a wake reached its bb thread: joined a running turn (`steered`), started
+ * a turn (`started`), became a queued row (`queued`), or could not be
+ * delivered (`gone`/`failed`).
+ */
+type SendOutcome =
+  | { kind: "steered" }
+  | { kind: "started" }
+  | { kind: "queued"; queuedMessageId: string; queuedUpdatedAt: number }
+  | { kind: "gone" }
+  | { kind: "failed" };
 
 export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
@@ -855,12 +873,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /**
      * Message a thread as a steer: it joins the turn already running, or starts
      * one when the thread is idle. The dispatch hook above records which, so
-     * the caller can account the wake. "gone" when the thread no longer
+     * the caller can account the wake. "queued" when the message became a
+     * queued row whose turn has not started, "gone" when the thread no longer
      * exists, "failed" for a transient error.
      */
-    async function sendToThread(session: string, threadId: string, text: string): Promise<"steered" | "started" | "gone" | "failed"> {
+    async function sendToThread(session: string, threadId: string, text: string): Promise<SendOutcome> {
       try {
-        await bb.sdk.threads.send({
+        const result = await bb.sdk.threads.send({
           threadId,
           input: [{ type: "text", text, mentions: [] }],
           mode: "steer",
@@ -868,13 +887,18 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         });
         const attempt = dispatchAttempts.get(session);
         dispatchAttempts.delete(session);
-        return attempt === "join-turn" ? "steered" : "started";
+        // A queued row has not started a turn; the caller records it so a later
+        // edit can rewrite the row and a later deletion can remove it.
+        if (result.delivery === "queued") {
+          return { kind: "queued", queuedMessageId: result.queuedMessage.id, queuedUpdatedAt: result.queuedMessage.updatedAt };
+        }
+        return attempt === "join-turn" ? { kind: "steered" } : { kind: "started" };
       } catch (error) {
         dispatchAttempts.delete(session);
         const e = error as { code?: string; status?: number };
-        if (e.code === "NOT_FOUND" || e.status === 404 || e.status === 410) return "gone";
+        if (e.code === "NOT_FOUND" || e.status === 404 || e.status === 410) return { kind: "gone" };
         bb.log.warn(`Slack could not message thread ${threadId}: ${errorMessage(error)}`);
-        return "failed";
+        return { kind: "failed" };
       }
     }
 
@@ -915,12 +939,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       if (changed) await saveSessions();
     }
 
-    /** Start the bb thread for a conversation, or answer with the reason it cannot. */
-    async function spawnThread(event: SessionEvent, text: string, title: string, handedAt: number, record: SessionRecord): Promise<void> {
+    /** Start the bb thread for a conversation, or answer with the reason it cannot. Returns whether one started. */
+    async function spawnThread(event: SessionEvent, text: string, title: string, handedAt: number, record: SessionRecord): Promise<boolean> {
       const project = await targetProject(event);
       if (project === null) {
         await backstop(event.session, "No bb project is available on this server, so a Slack thread cannot be started. Create a project in bb, then DM again.", event.tagged ? "tagged" : "untagged");
-        return;
+        return false;
       }
       const thread = await bb.sdk.threads.spawn({ projectId: project.id, environment: await environmentFor(project), prompt: text, title });
       const after = sessions.get(event.session);
@@ -930,7 +954,286 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       }
       if (event.tagged) bb.log.info(`Slack session ${event.session} started bb thread ${thread.id} in ${project.name}`);
       else bb.log.info(`Slack: started bb thread ${thread.id} in ${project.name} for an untagged thread reply`);
+      return true;
     }
+
+    // ---- correcting an earlier wake ----------------------------------------
+
+    /** How a wake's delivery is recorded in the per-session map. */
+    type WakeInput = {
+      ts: string;
+      state: WakeDelivery["state"];
+      text: string;
+      files: SessionFile[];
+      queuedMessageId?: string;
+      queuedUpdatedAt?: number;
+      heldId?: string;
+      confirmed?: boolean;
+    };
+
+    /** Remember a wake's delivery, keyed by `ts`; bounded to the last few. */
+    function recordWake(session: string, wake: WakeInput): void {
+      if (wake.ts === "") return;
+      const r = sessions.get(session);
+      if (r === undefined) return;
+      const entry: WakeDelivery = {
+        ts: wake.ts,
+        state: wake.state,
+        queuedMessageId: wake.queuedMessageId ?? "",
+        queuedUpdatedAt: wake.queuedUpdatedAt ?? 0,
+        heldId: wake.heldId ?? "",
+        text: wake.text,
+        files: wake.files,
+        confirmed: wake.confirmed ?? false,
+        at: deps.now(),
+      };
+      const next = [...r.wakes.filter((w) => w.ts !== wake.ts), entry].slice(-WAKE_MAP_MAX);
+      sessions.set(session, { ...r, wakes: next });
+      void saveSessions();
+    }
+
+    /** The wake a correction's `ts` matches, or null when it produced none. */
+    function wakeFor(session: string, ts: string): WakeDelivery | null {
+      if (ts === "") return null;
+      return sessions.get(session)?.wakes.find((w) => w.ts === ts) ?? null;
+    }
+
+    /** Update a recorded wake after it was corrected. */
+    function updateWake(session: string, ts: string, patch: Partial<Pick<WakeDelivery, "text" | "files" | "state" | "queuedUpdatedAt">>): void {
+      const r = sessions.get(session);
+      if (r === undefined) return;
+      let changed = false;
+      const next = r.wakes.map((w) => {
+        if (w.ts !== ts) return w;
+        changed = true;
+        return { ...w, ...patch };
+      });
+      if (!changed) return;
+      sessions.set(session, { ...r, wakes: next });
+      void saveSessions();
+    }
+
+    /** Drop a recorded wake, so a later correction of the same message is ignored. */
+    function forgetWake(session: string, ts: string): void {
+      const r = sessions.get(session);
+      if (r === undefined) return;
+      const next = r.wakes.filter((w) => w.ts !== ts);
+      if (next.length === r.wakes.length) return;
+      sessions.set(session, { ...r, wakes: next });
+      void saveSessions();
+    }
+
+    /** Refresh a session's wake time and capability without counting a wake. */
+    function refreshSession(event: SessionEvent): void {
+      const r = sessions.get(event.session);
+      if (r === undefined) return;
+      sessions.set(event.session, { ...r, eventAt: deps.now(), capability: event.capability === "" ? r.capability : event.capability });
+    }
+
+    /** Count a wake on a session, for a correction delivered without a new record. */
+    function countWake(event: SessionEvent): void {
+      const r = sessions.get(event.session);
+      if (r === undefined) return;
+      sessions.set(event.session, {
+        ...r,
+        eventAt: deps.now(),
+        capability: event.capability === "" ? r.capability : event.capability,
+        events: r.events + (event.tagged ? 1 : 0),
+        untagged: r.untagged + (event.tagged ? 0 : 1),
+      });
+    }
+
+    /**
+     * Hold a message from someone other than the owner and ask the owner to
+     * confirm it. Shared by a new untrusted wake and an untrusted edit; the
+     * caller has already counted the wake.
+     */
+    async function holdUntrusted(event: SessionEvent, logSession: string): Promise<void> {
+      const held = await addPending(event.session, { asker: event.asker.name.trim() === "" ? "someone" : event.asker.name, text: event.comment.text, at: event.at, tagged: event.tagged, files: event.files });
+      recordWake(event.session, { ts: event.ts, state: "held", heldId: held.id, text: event.comment.text, files: event.files });
+      if (event.tagged) {
+        bb.log.info(`Slack session ${logSession}: held ${held.asker}'s message as ${held.id}; no turn runs until ${event.owner.name || "the owner"} confirms it`);
+      } else {
+        // The channel, user and text of an untagged reply are never logged.
+        bb.log.info(`Slack session ${logSession}: held an untagged thread reply as ${held.id}; no turn runs until the owner confirms it`);
+      }
+      await backstop(event.session, heldPrompt(event, held), event.tagged ? "tagged" : "untagged");
+    }
+
+    /** The queued wake's text rebuilt with the edited words. */
+    function rebuiltWakeText(event: SessionEvent, wake: WakeDelivery): string {
+      return wakeText({ ...event, files: wake.files, comment: { text: event.comment.text, untrusted: false } });
+    }
+
+    /**
+     * Steer a thread with a correction. An edit is a new wake that owes its own
+     * reply; a deletion owes none. The accounting mirrors a normal follow-up: a
+     * steer that joins a running turn shares that turn's reply, and one that
+     * starts a turn keeps its own.
+     */
+    async function steerCorrection(event: SessionEvent, record: SessionRecord, correction: string, options: { owesReply: boolean }): Promise<void> {
+      const threadId = record.threadId;
+      if (threadId === null) {
+        bb.log.info(`Slack session ${sessionLogId(event.session)}: no bb thread to steer for a ${event.action}; ignored`);
+        return;
+      }
+      const before = sessions.get(event.session);
+      if (options.owesReply && event.tagged) countWake(event);
+      const body = `[Slack — session ${event.session}]\n${correction}${options.owesReply ? `\n\nReply in Slack with the slack_reply tool (session ${event.session}). If the message needs no answer, use the slack_ack tool (session ${event.session}) instead.` : `\n\nNo reply is needed for this deletion.`}`;
+      void hooks.status(event.session, "is thinking…", checkSignal()).catch(() => undefined);
+      const handedAt = deps.now();
+      const outcome = await sendToThread(event.session, threadId, body);
+      if (outcome.kind === "gone") {
+        bb.log.info(`Slack session ${sessionLogId(event.session)}'s bb thread ${threadId} is gone; forgetting it`);
+        forgetThread(threadId);
+        return;
+      }
+      if (outcome.kind === "failed") {
+        await backstop(event.session, "Your bb could not deliver a correction to its thread. Try again in a moment.", event.tagged ? "tagged" : "untagged");
+        return;
+      }
+      if (options.owesReply && event.tagged) {
+        if (outcome.kind === "steered" && (before?.answered ?? 0) < (before?.events ?? 0)) await uncountWake(event.session);
+        else if (outcome.kind !== "steered") await markHanded(event.session, handedAt);
+      } else if (!options.owesReply) {
+        // A deletion owes no reply: drop the original wake's obligation if the
+        // turn it belonged to has not replied yet.
+        const current = sessions.get(event.session);
+        if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
+      }
+    }
+
+    /** An owner's edit of a delivered wake: rewrite the queued row, or steer. */
+    async function handleEditedWake(event: SessionEvent, record: SessionRecord, wake: WakeDelivery, logSession: string): Promise<void> {
+      // A confirmed request's delivered instruction is the held text, not the
+      // owner's `confirm <id>` message; editing that message changes nothing.
+      if (wake.confirmed) {
+        bb.log.info(`Slack session ${logSession}: a confirmed request's message was edited; the instruction is unchanged`);
+        return;
+      }
+      // A still-queued wake is rewritten in place with the queued-message
+      // update. `threads.editMessage` cannot do this: it rewrites a message
+      // that has already been dispatched and refuses while a queued row is
+      // claimed, so the queued-row update is the in-place rewrite the ticket
+      // describes, with `expectedUpdatedAt` as its optimistic check.
+      if (wake.state === "queued" && record.threadId !== null && wake.queuedMessageId !== "") {
+        try {
+          const updated = await bb.sdk.threads.queuedMessages.update({
+            threadId: record.threadId,
+            queuedMessageId: wake.queuedMessageId,
+            expectedUpdatedAt: wake.queuedUpdatedAt,
+            input: [{ type: "text", text: rebuiltWakeText(event, wake), mentions: [] }],
+          });
+          // Keep the new row version, so a second edit of the same message can
+          // still rewrite it in place.
+          updateWake(event.session, event.ts, { text: event.comment.text, files: event.files, queuedUpdatedAt: updated.updatedAt });
+          bb.log.info(`Slack session ${logSession}: rewrote queued message ${wake.queuedMessageId} after an edit`);
+          return;
+        } catch (error) {
+          // The row moved on (dispatched, was edited, or was cancelled): fall
+          // through and steer the thread instead.
+          bb.log.info(`Slack session ${logSession}: could not rewrite the queued message (${errorMessage(error)}); steering the thread`);
+        }
+      }
+      if (wake.state === "held") {
+        // The original was held for the owner; an edit is a fresh hold.
+        countWake(event);
+        await holdUntrusted(event, logSession);
+        return;
+      }
+      const quote = clipMention(wake.text, 200);
+      const now = clipMention(event.comment.text, 200);
+      await steerCorrection(event, record, `the message "${quote}" was edited; it now reads: "${now}"`, { owesReply: true });
+      updateWake(event.session, event.ts, { text: event.comment.text, files: event.files, state: "started" });
+    }
+
+    /** An owner's deletion of a delivered wake: remove the queued row, or steer. */
+    async function handleDeletedWake(event: SessionEvent, record: SessionRecord, wake: WakeDelivery, logSession: string): Promise<void> {
+      // A confirmed request was already delivered; deleting the owner's
+      // `confirm <id>` message does not withdraw the instruction.
+      if (wake.confirmed) {
+        bb.log.info(`Slack session ${logSession}: a confirmed request's message was deleted; the instruction stands`);
+        return;
+      }
+      if (wake.state === "queued" && record.threadId !== null && wake.queuedMessageId !== "") {
+        try {
+          await bb.sdk.threads.queuedMessages.delete({ threadId: record.threadId, queuedMessageId: wake.queuedMessageId });
+          forgetWake(event.session, event.ts);
+          const current = sessions.get(event.session);
+          if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
+          bb.log.info(`Slack session ${logSession}: removed queued message ${wake.queuedMessageId} after a deletion`);
+          return;
+        } catch (error) {
+          bb.log.info(`Slack session ${logSession}: could not remove the queued message (${errorMessage(error)}); steering the thread`);
+        }
+      }
+      if (wake.state === "held") {
+        // The original was held for the owner: withdraw the request.
+        if (wake.heldId !== "") await takePending(event.session, wake.heldId);
+        forgetWake(event.session, event.ts);
+        const current = sessions.get(event.session);
+        if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
+        return;
+      }
+      const quote = clipMention(wake.text, 200);
+      await steerCorrection(event, record, `the message "${quote}" was deleted; disregard it`, { owesReply: false });
+      forgetWake(event.session, event.ts);
+    }
+
+    /**
+     * A Slack edit or deletion arrived. Key on the action first: find the wake
+     * it corrects by `ts` and apply the rule (rewrite or remove while it is
+     * queued, steer once its turn has started). A correction to a message that
+     * never produced a wake is dropped, and an edit from someone other than the
+     * owner is held like the original.
+     */
+    async function handleCorrection(event: SessionEvent): Promise<void> {
+      const record = sessions.get(event.session);
+      if (record === undefined) {
+        bb.log.info(`Slack correction for an unknown session; ignored`);
+        return;
+      }
+      // The service routed the correction here, so renew the session from it.
+      refreshSession(event);
+      await saveSessions();
+      const wake = wakeFor(event.session, event.ts);
+      if (wake === null) {
+        bb.log.info(`Slack session ${sessionLogId(event.session)} ${event.action} a message that produced no wake; ignored`);
+        return;
+      }
+      const logSession = event.tagged ? event.session : sessionLogId(event.session);
+      if (event.action === "edited") {
+        if (isUntrusted(event)) {
+          countWake(event);
+          await holdUntrusted(event, logSession);
+          return;
+        }
+        await handleEditedWake(event, record, wake, logSession);
+        return;
+      }
+      if (isUntrusted(event)) {
+        // A deletion carries no words to hold; nothing to do.
+        bb.log.info(`Slack session ${logSession}: a message from someone other than the owner was deleted; ignored`);
+        return;
+      }
+      await handleDeletedWake(event, record, wake, logSession);
+    }
+
+    // A queued wake's row dispatched, so its turn has started: a later edit
+    // steers instead of rewriting the queue. A cancelled row is dropped, so a
+    // later correction of it is ignored.
+    bb.events.on("message.dispatched", ({ entry }) => {
+      for (const [session, r] of sessions) {
+        const wake = r.wakes.find((w) => w.queuedMessageId === entry.id && w.state === "queued");
+        if (wake !== undefined) updateWake(session, wake.ts, { state: "started" });
+      }
+    });
+    bb.events.on("message.cancelled", ({ entry }) => {
+      for (const [session, r] of sessions) {
+        const wake = r.wakes.find((w) => w.queuedMessageId === entry.id);
+        if (wake !== undefined) forgetWake(session, wake.ts);
+      }
+    });
 
     /**
      * A Slack conversation woke this server. The first message spawns a bb
@@ -942,6 +1245,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * turn that ends silently posts no backstop for it either.
      */
     async function handleSession(event: SessionEvent): Promise<void> {
+      // A correction to an earlier message is not a new request: key on the
+      // action first, find the wake it corrects by `ts`, and rewrite or remove
+      // it while it is queued or steer the thread once its turn has started.
+      if (event.action === "edited" || event.action === "deleted") {
+        await handleCorrection(event);
+        return;
+      }
       const previous = sessions.get(event.session);
       const contextChange = event.action === "assistant_thread_context_changed";
       // `events` counts the tagged wakes the one-reply-per-message rule and the
@@ -962,6 +1272,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         handedAt: previous?.handedAt ?? null,
         steeredAt: previous?.steeredAt ?? null,
         title: previous?.title ?? null,
+        wakes: previous?.wakes ?? [],
       };
       sessions.set(event.session, record);
       // A wake for the session means the service routed it here again: a
@@ -995,14 +1306,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // owner to confirm one by id. The map decides where a thread starts, not
       // whose words it trusts.
       if (isUntrusted(event)) {
-        const held = await addPending(event.session, { asker: event.asker.name.trim() === "" ? "someone" : event.asker.name, text: event.comment.text, at: event.at, tagged: event.tagged, files: event.files });
-        if (event.tagged) {
-          bb.log.info(`Slack session ${logSession}: held ${held.asker}'s message as ${held.id}; no turn runs until ${event.owner.name || "the owner"} confirms it`);
-        } else {
-          // The channel, user and text of an untagged reply are never logged.
-          bb.log.info(`Slack session ${logSession}: held an untagged thread reply as ${held.id}; no turn runs until the owner confirms it`);
-        }
-        await backstop(event.session, heldPrompt(event, held), event.tagged ? "tagged" : "untagged");
+        await holdUntrusted(event, logSession);
         return;
       }
 
@@ -1038,11 +1342,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const handedAt = deps.now();
       try {
         if (record.threadId === null) {
-          await spawnThread(event, text, title, handedAt, record);
+          if (await spawnThread(event, text, title, handedAt, record)) {
+            recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+          }
           return;
         }
         const outcome = await sendToThread(event.session, record.threadId, steerText);
-        if (outcome === "steered") {
+        if (outcome.kind === "steered") {
           // A steer joins the turn already running. When a tagged wake is still
           // outstanding, the running turn's one reply covers this one too, so
           // drop the obligation it just added and keep handedAt: the turn it
@@ -1050,16 +1356,25 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           // outstanding the turn has already replied, so the wake keeps its own
           // obligation and its own reply.
           if (taggedWake && (previous?.answered ?? 0) < (previous?.events ?? 0)) await uncountWake(event.session);
-        } else if (outcome === "started") {
+          recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+        } else if (outcome.kind === "started") {
           await markHanded(event.session, handedAt);
-        } else if (outcome === "gone") {
+          recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+        } else if (outcome.kind === "queued") {
+          // The message is a queued row whose turn has not started. Record it so
+          // a later edit rewrites the row and a later deletion removes it.
+          await markHanded(event.session, handedAt);
+          recordWake(event.session, { ts: event.ts, state: "queued", queuedMessageId: outcome.queuedMessageId, queuedUpdatedAt: outcome.queuedUpdatedAt, text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+        } else if (outcome.kind === "gone") {
           bb.log.info(`Slack session ${logSession}'s bb thread ${record.threadId} is gone; starting a new one`);
           const after = sessions.get(event.session);
           if (after !== undefined) {
             sessions.set(event.session, { ...after, threadId: null, projectId: null });
             await saveSessions();
           }
-          await spawnThread(event, text, title, handedAt, after ?? record);
+          if (await spawnThread(event, text, title, handedAt, after ?? record)) {
+            recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+          }
         } else {
           // A transient error keeps the mapping: the thread still exists and
           // the next message must continue it, not start a second one.

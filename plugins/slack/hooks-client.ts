@@ -147,7 +147,7 @@ export const sessionEventSchema = z
      * never logged and never put in a wake's text.
      */
     capability: z.string().max(2000).default(""),
-    action: z.enum(["message", "assistant_thread_started", "assistant_thread_context_changed", "invited", "block_action"]),
+    action: z.enum(["message", "edited", "deleted", "assistant_thread_started", "assistant_thread_context_changed", "invited", "block_action"]),
     /** True for a channel app_mention, false for a DM or assistant-thread event. */
     mention: z.boolean().default(false),
     /**
@@ -181,6 +181,12 @@ export const sessionEventSchema = z
      */
     responseUrl: z.string().max(2000).default(""),
     comment: z.object({ text: z.string(), untrusted: z.boolean() }).loose(),
+    /**
+     * The message's own Slack timestamp, the key the plugin matches an edit or
+     * deletion to the wake it delivered. Set on every `message`, `edited` and
+     * `deleted` wake; empty (and omitted) on every other wake.
+     */
+    ts: z.string().max(200).default(""),
     /**
      * The message's attachments, metadata only. An older service sends no
      * field, which is read as none; nothing is fetched either way.

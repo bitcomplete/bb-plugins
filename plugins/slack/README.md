@@ -174,6 +174,26 @@ Until both are done, no untagged reply reaches bb. After the reinstall, the
 service receives every message in every channel the bot is in; it acks and
 drops everything that is not in a followed thread.
 
+## Editing and deleting a message
+
+bb-gate-hooks routes an edit or a deletion of a DM to the conversation's
+owner as a correction carrying the original message's `ts`. The plugin keeps
+the last few wakes per conversation keyed by that `ts` and applies the
+correction to the wake it matches:
+
+- **Still queued** (its turn has not started): an edit rewrites the queued
+  message in place, and a deletion removes it from the queue. A removed wake
+  owes no reply.
+- **Turn started or finished**: an edit steers the thread with the original
+  text and the new one, and the correction owes its own reply if the turn has
+  already replied; a deletion steers with "that message was deleted; disregard
+  it" and owes no reply.
+- A correction of a message that never produced a wake (never routed, or older
+  than the last few) is dropped.
+- An edit from someone other than the owner follows the untrusted path: the
+  new text is held for the owner's confirmation, exactly like the original
+  message.
+
 ## By hand (a Slack admin)
 
 The Slack app itself, its scopes, the events URL and the redirect URL are set

@@ -201,6 +201,10 @@ async function setup(
     environments?: Array<{ environmentProviderId: string | null; hostId: string; createdAt: number; lifecycle: { phase: string }; environmentProviderSelection: { inputs: unknown } | null }>;
     spawn?: () => unknown;
     send?: (args: { threadId: string; input: Array<{ type: string; text?: string }>; pluginSubmission?: unknown }) => unknown;
+    /** What a `threads.queuedMessages.update` returns; a throw simulates a row that moved on. */
+    updateQueued?: (args: { threadId: string; queuedMessageId: string; expectedUpdatedAt: number; input: Array<{ type: string; text?: string }> }) => unknown;
+    /** What a `threads.queuedMessages.delete` returns; a throw simulates a row that moved on. */
+    deleteQueued?: (args: { threadId: string; queuedMessageId: string }) => unknown;
     /** What the dispatch hook reports for a `threads.send`: joined or started. */
     sendAttempt?: "join-turn" | "start-turn";
     get?: () => unknown;
@@ -243,6 +247,10 @@ async function setup(
             );
           }
           return options.send?.(args) ?? { delivery: "sent" };
+        },
+        queuedMessages: {
+          update: async (args: { threadId: string; queuedMessageId: string; expectedUpdatedAt: number; input: Array<{ type: string; text?: string }> }) => options.updateQueued?.(args) ?? { id: args.queuedMessageId, updatedAt: args.expectedUpdatedAt + 1 },
+          delete: async (args: { threadId: string; queuedMessageId: string }) => options.deleteQueued?.(args) ?? { ok: true },
         },
         get: async () => options.get?.() ?? { title: "Build BB-38", titleFallback: null },
         events: { list: async () => options.turns ?? [] },
@@ -1317,6 +1325,163 @@ describe("Slack plugin", () => {
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
     expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
+    await s.stop();
+  });
+
+  it("rewrites a still-queued message in place when it is edited", async () => {
+    const s = await live({ send: () => ({ delivery: "queued", queuedMessage: { id: "qm-1", updatedAt: 5 } }) });
+    // The first wake spawns the thread; the second becomes a queued row.
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    s.hooks.last().send(s.hooks.session({ ts: "1.2", comment: { text: "the first draft", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+
+    // The edit rewrites the queued row in place, with the wake's own framing.
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "1.2", comment: { text: "the second draft", untrusted: false } }));
+    await tick();
+    const updates = s.harness.sdk.callsTo("threads.queuedMessages.update");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]![0]).toMatchObject({ threadId: "thr-1", queuedMessageId: "qm-1", expectedUpdatedAt: 5 });
+    const input = (updates[0]![0] as { input: Array<{ text: string }> }).input;
+    expect(input[0]!.text).toContain("the second draft");
+    expect(input[0]!.text).toContain("session D0123:1712345678.901234");
+    // A second edit uses the row's new version, so it still rewrites in place.
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "1.2", comment: { text: "the third draft", untrusted: false } }));
+    await tick();
+    const second = s.harness.sdk.callsTo("threads.queuedMessages.update");
+    expect(second).toHaveLength(2);
+    expect(second[1]![0]).toMatchObject({ expectedUpdatedAt: 6 });
+    expect(JSON.stringify(second[1]![0])).toContain("the third draft");
+    // A still-queued correction is not steered and starts no new turn.
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("steers when the queued row dispatched before the edit", async () => {
+    const s = await live({ send: () => ({ delivery: "queued", queuedMessage: { id: "qm-3", updatedAt: 5 } }) });
+    s.hooks.last().send(s.hooks.session({ ts: "7.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "7.2", comment: { text: "the first draft", untrusted: false } }));
+    await tick();
+    // The row drains: its turn has started, so the recorded wake is now started.
+    await s.harness.behavior.emitThreadEvent("message.dispatched", { entry: { id: "qm-3" } as never });
+    await tick();
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "7.2", comment: { text: "the second draft", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(0);
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(2);
+    expect(JSON.stringify(s.harness.sdk.callsTo("threads.send")[1]![0])).toContain("was edited");
+    await s.stop();
+  });
+
+  it("steers when a queued row moved on before the edit could rewrite it", async () => {
+    const s = await live({
+      send: () => ({ delivery: "queued", queuedMessage: { id: "qm-4", updatedAt: 5 } }),
+      updateQueued: () => {
+        throw Object.assign(new Error("row moved on"), { status: 409 });
+      },
+    });
+    s.hooks.last().send(s.hooks.session({ ts: "8.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "8.2", comment: { text: "the first draft", untrusted: false } }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "8.2", comment: { text: "the second draft", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(1);
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(2);
+    expect(JSON.stringify(s.harness.sdk.callsTo("threads.send")[1]![0])).toContain("was edited");
+    await s.stop();
+  });
+
+  it("steers the thread when a message whose turn started is edited", async () => {
+    const s = await live({ sendAttempt: "start-turn" });
+    s.hooks.last().send(s.hooks.session({ ts: "2.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "2.2", comment: { text: "the first draft", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "2.2", comment: { text: "the second draft", untrusted: false } }));
+    await tick();
+    const sends = s.harness.sdk.callsTo("threads.send");
+    expect(sends).toHaveLength(2);
+    const body = JSON.stringify(sends[1]![0]);
+    expect(body).toContain("was edited");
+    expect(body).toContain("it now reads");
+    expect(body).toContain("the first draft");
+    expect(body).toContain("the second draft");
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(0);
+    await s.stop();
+  });
+
+  it("removes a still-queued message when it is deleted", async () => {
+    const s = await live({ send: () => ({ delivery: "queued", queuedMessage: { id: "qm-2", updatedAt: 9 } }) });
+    s.hooks.last().send(s.hooks.session({ ts: "3.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "3.2", comment: { text: "please do this", untrusted: false } }));
+    await tick();
+
+    s.hooks.last().send(s.hooks.session({ action: "deleted", ts: "3.2", comment: { text: "", untrusted: false } }));
+    await tick();
+    const deletes = s.harness.sdk.callsTo("threads.queuedMessages.delete");
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]![0]).toMatchObject({ threadId: "thr-1", queuedMessageId: "qm-2" });
+    // The removed wake owes no reply, and no steer was sent.
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, { events: number }>;
+    expect(stored["D0123:1712345678.901234"]).toMatchObject({ events: 1 });
+    await s.stop();
+  });
+
+  it("steers the thread when a message whose turn started is deleted", async () => {
+    const s = await live({ sendAttempt: "start-turn" });
+    s.hooks.last().send(s.hooks.session({ ts: "4.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "4.2", comment: { text: "please do this", untrusted: false } }));
+    await tick();
+
+    s.hooks.last().send(s.hooks.session({ action: "deleted", ts: "4.2", comment: { text: "", untrusted: false } }));
+    await tick();
+    const sends = s.harness.sdk.callsTo("threads.send");
+    expect(sends).toHaveLength(2);
+    const body = JSON.stringify(sends[1]![0]);
+    expect(body).toContain("was deleted");
+    expect(body).toContain("disregard it");
+    expect(body).toContain("No reply is needed");
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.delete")).toHaveLength(0);
+    await s.stop();
+  });
+
+  it("ignores an edit of a message that produced no wake", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session({ ts: "5.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "9.9", comment: { text: "nope", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(0);
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+    await s.stop();
+  });
+
+  it("holds an edit from someone other than the owner like the original message", async () => {
+    const s = await live();
+    // The owner's first wake spawns the thread; the non-owner's message is held.
+    s.hooks.last().send(s.hooks.session({ ts: "6.1" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "6.2", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "halt work", untrusted: true } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "6.2", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "halt all work", untrusted: true } }));
+    await tick();
+    // Still no turn runs, and the edited words are what the owner is asked to confirm.
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(0);
+    const prompt = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    expect(prompt).toContain("Carol asked");
+    expect(prompt).toContain("halt all work");
     await s.stop();
   });
 
