@@ -2661,7 +2661,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         deployments = recordMerged(deployments, observed, deployTargets, now());
         if (deployments !== beforeDeploy) {
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
-          deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
+          // A reconcile can also only drop a not-applicable watch (BB-132
+          // follow-up): there is nothing new to await, so do not announce it.
+          if (fresh.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
         }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
         // BB-59: a deployment that already exists confirms a merge whose
