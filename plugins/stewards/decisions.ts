@@ -4,21 +4,87 @@
 // no mark or an unknown mark, a pull request no entry matches, and, above all,
 // a pull request that changes the decide list or the code that enforces it.
 // Pure, so the rule is the same wherever it is applied and easy to test.
-import type { BigDecision, DecideMark } from "./config.js";
+import { z } from "zod";
+
+/**
+ * One entry of the project's decide list: the decisions the project steward
+ * may make itself, and those only the user may make. `paths` are the
+ * repo-relative file patterns a pull request touches to match the entry; the
+ * decide list is one list, and an entry with no mark, an unknown mark, or a
+ * pull request the reviewer cannot classify is the user's (fail closed).
+ */
+export type DecideMark = "project" | "user";
+export type BigDecision = { text: string; decide: DecideMark; paths: string[] };
+
+/**
+ * The big decisions: every one of these is the user's, never the project
+ * steward's, whatever a caller says. Kept as bare strings here and marked
+ * `user` by the schema, so a project file that has not been migrated still
+ * fails closed.
+ */
+export const DEFAULT_BIG_DECISIONS: readonly string[] = [
+  "Changing what a ticket's requester asked for, beyond clarifying it",
+  "A public API, data contract or schema change other teams depend on",
+  "Anything irreversible in production: data deletion, migrations without a way back",
+  "New vendors, services or spending",
+  "A conflict between people that the project's guidance does not settle",
+  "Granting a new credential, token or cluster access, or widening what an existing one can reach",
+  "Letting anyone other than a server's owner direct that server or its stewards",
+];
+
+/**
+ * The owner-reviewed triggers from `.bb/AGENTS.md` ("Change classification")
+ * that are not big decisions: the project steward may decide these itself.
+ * They are the default `project` half of the decide list.
+ */
+export const DEFAULT_PROJECT_DECISIONS: readonly { text: string; paths: string[] }[] = [
+  { text: "A cross-repo contract other repos implement", paths: ["bb-plugins/plugins/*/source-contract.ts", "bb-gate/docs/hooks.md", "bb-gate/docker/bb-server/**", "devbox/kploy/**"] },
+  { text: "Anything that could stop every developer's server from starting or being routed to", paths: ["bb-gate/docker/bb-server/**", "bb-gate/backend.json"] },
+  { text: "Production infrastructure", paths: ["bb-gate/kploy/**", "bb-gate/bc-prod.yaml", "bb-gate/.github/workflows/**", "devbox/host/**", "devbox/image/**", "devbox/profiles/**", "devbox/bin/**", "devbox/kploy/**", "devbox/bc-prod.yaml", "devbox/.github/workflows/**"] },
+  { text: "A store migration", paths: ["bb-plugins/plugins/*/store.ts"] },
+  { text: "A new dependency", paths: ["**/package.json", "**/package-lock.json", "**/go.mod", "**/go.sum"] },
+];
+
+/**
+ * A decide-list entry as a project file writes it: a bare string (the user's,
+ * by default) or an object that marks it. An unknown mark fails closed to the
+ * user; a `paths` list lets the plugin match a pull request to the entry.
+ */
+export const decideEntrySchema = z.union([
+  z.string().trim().min(1).max(300).transform((text): BigDecision => ({ text, decide: "user", paths: [] })),
+  z
+    .object({
+      text: z.string().trim().min(1).max(300),
+      decide: z.string().trim().max(40).optional(),
+      paths: z.array(z.string().trim().min(1).max(300)).max(50).optional(),
+    })
+    .strict()
+    .transform((entry): BigDecision => ({ text: entry.text, decide: entry.decide === "project" ? "project" : "user", paths: entry.paths ?? [] })),
+]);
+
+export const defaultDecideList = (): BigDecision[] => [
+  ...DEFAULT_BIG_DECISIONS.map((text): BigDecision => ({ text, decide: "user", paths: [] })),
+  ...DEFAULT_PROJECT_DECISIONS.map((entry): BigDecision => ({ text: entry.text, decide: "project", paths: entry.paths })),
+];
 
 /**
  * The paths whose change is always the user's decision, whatever the decide
  * list says: the list itself, and the code that records or checks a
  * project-steward approval. This is the no-self-widening rule, and it is
  * hard-coded so a pull request cannot mark itself `project`.
+ *
+ * It names only the gate's own files (BB-153): the decide list and its parsing
+ * (`decisions.ts`), the merge gate (`gate.ts`), the approval posting and page
+ * actions (`approvals.ts`), and the approval store (`approvals-store.ts`). A
+ * stewards change to any other file — `server.ts`, `store.ts`, `reconcile.ts`,
+ * `config.ts` — is placed by the decide list like any other pull request.
  */
 export const SELF_WIDENING_PATHS: readonly string[] = [
   ".bb/stewards/project.json",
-  "bb-plugins/plugins/stewards/config.ts",
   "bb-plugins/plugins/stewards/decisions.ts",
-  "bb-plugins/plugins/stewards/reconcile.ts",
-  "bb-plugins/plugins/stewards/store.ts",
-  "bb-plugins/plugins/stewards/server.ts",
+  "bb-plugins/plugins/stewards/gate.ts",
+  "bb-plugins/plugins/stewards/approvals.ts",
+  "bb-plugins/plugins/stewards/approvals-store.ts",
 ];
 
 /** A glob with `*` (within a path segment) and `**` (across segments). */
@@ -125,6 +191,8 @@ export type DecisionExplanation = {
   mark: DecideMark;
   /** True when the change touches the decide list or the code that enforces it. */
   selfWidening: boolean;
+  /** The changed files that tripped the self-widening rule, as the pull request reports them. */
+  selfWideningFiles: string[];
   /** True when the changed files could not be read (a missing or empty list). */
   unreadable: boolean;
   /** The one-line rule. */
@@ -142,22 +210,23 @@ export type DecisionExplanation = {
 export function explainDecision(files: readonly string[] | null | undefined, decisions: readonly BigDecision[]): DecisionExplanation {
   const rule = DECISION_RULE;
   if (files === null || files === undefined) {
-    return { matched: [], winner: null, mark: "user", selfWidening: false, unreadable: true, rule, reason: "the changed files could not be read" };
+    return { matched: [], winner: null, mark: "user", selfWidening: false, selfWideningFiles: [], unreadable: true, rule, reason: "the changed files could not be read" };
   }
   if (files.length === 0) {
-    return { matched: [], winner: null, mark: "user", selfWidening: false, unreadable: true, rule, reason: "the pull request changes no files" };
+    return { matched: [], winner: null, mark: "user", selfWidening: false, selfWideningFiles: [], unreadable: true, rule, reason: "the pull request changes no files" };
   }
   const matched: DecisionMatch[] = decisions
     .filter((d) => d.paths.length > 0 && touchesAny(files, d.paths))
     .map((d) => ({ text: d.text, decide: d.decide === "project" ? "project" : "user", files: files.filter((f) => touchesAny([f], d.paths)) }));
   if (isSelfWidening(files)) {
-    return { matched, winner: null, mark: "user", selfWidening: true, unreadable: false, rule, reason: "the change touches the decide list or the code that enforces it" };
+    const selfWideningFiles = files.filter((f) => isSelfWidening([f]));
+    return { matched, winner: null, mark: "user", selfWidening: true, selfWideningFiles, unreadable: false, rule, reason: "the change touches the decide list or the code that enforces it" };
   }
   const user = matched.find((m) => m.decide === "user");
-  if (user !== undefined) return { matched, winner: user, mark: "user", selfWidening: false, unreadable: false, rule, reason: `the changed files touch ${JSON.stringify(user.text)}, which is the user's decision` };
+  if (user !== undefined) return { matched, winner: user, mark: "user", selfWidening: false, selfWideningFiles: [], unreadable: false, rule, reason: `the changed files touch ${JSON.stringify(user.text)}, which is the user's decision` };
   const project = matched.find((m) => m.decide === "project");
-  if (project !== undefined) return { matched, winner: project, mark: "project", selfWidening: false, unreadable: false, rule, reason: `the changed files touch ${JSON.stringify(project.text)}, which is the project steward's decision` };
-  return { matched, winner: null, mark: "user", selfWidening: false, unreadable: false, rule, reason: "no decide-list entry's paths matched" };
+  if (project !== undefined) return { matched, winner: project, mark: "project", selfWidening: false, selfWideningFiles: [], unreadable: false, rule, reason: `the changed files touch ${JSON.stringify(project.text)}, which is the project steward's decision` };
+  return { matched, winner: null, mark: "user", selfWidening: false, selfWideningFiles: [], unreadable: false, rule, reason: "no decide-list entry's paths matched" };
 }
 
 /**
@@ -179,7 +248,10 @@ export function formatDecisionListing(explanation: DecisionExplanation): string 
     : explanation.winner === null
       ? "Deciding entry: none (the user's)."
       : `Deciding entry: ${JSON.stringify(explanation.winner.text)} [${explanation.winner.decide}].`;
-  return `${entries}\n${winner}\nRule: ${explanation.rule}`;
+  // The tripped files, so a worker can see which ones to carry in a separate
+  // pull request rather than in the one that needs the feature (BB-153).
+  const selfWidening = explanation.selfWidening && explanation.selfWideningFiles.length > 0 ? `\nSelf-widening: ${explanation.selfWideningFiles.join(", ")}` : "";
+  return `${entries}\n${winner}${selfWidening}\nRule: ${explanation.rule}`;
 }
 
 /**

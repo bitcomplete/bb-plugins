@@ -17,6 +17,8 @@ import { deploymentsSchema, type Deployments } from "./deploy.js";
 import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import type { GuidanceCitation } from "./guidance.js";
+import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore } from "./approvals-store.js";
+export type { ProjectApproval } from "./approvals-store.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
@@ -239,17 +241,7 @@ export const CHAIN_MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN context TEXT`,
   // The pull-request head a project-steward approval is bound to.
   `ALTER TABLE escalations ADD COLUMN head_sha TEXT`,
-  // A project steward's approval of an owner-reviewed pull request, bound to
-  // the head sha: a new push is a new sha and voids it. It lives only here,
-  // never as a GitHub comment or review.
-  `CREATE TABLE IF NOT EXISTS project_approvals (
-     binding_id TEXT NOT NULL,
-     head_sha TEXT NOT NULL,
-     entry TEXT,
-     by_thread TEXT NOT NULL,
-     created_at INTEGER NOT NULL,
-     PRIMARY KEY (binding_id, head_sha)
-   )`,
+  ...APPROVALS_CHAIN_MIGRATIONS,
   // Every question becomes an escalation with route `me`, keeping its id and
   // its answer. Questions that were forwarded keep their link, so the page
   // still shows the question rather than the raw escalation.
@@ -456,16 +448,9 @@ export const IDLE_MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN idle_wake_now INTEGER NOT NULL DEFAULT 0`,
 ];
 
-// BB-77: the project-steward approval marker. The approval record gains the
-// GitHub comment id of the `bb-approval` marker the plugin posted (the lane
-// gate honours a marker only when its id is recorded, so a hand-typed lookalike
-// never counts) and the verdict it carried (approved or declined). Additive and
-// defaulted: a record made before this step reads as an approval with no marker
-// id, which the gate ignores.
-export const APPROVAL_MARKER_MIGRATIONS = [
-  `ALTER TABLE project_approvals ADD COLUMN comment_id TEXT`,
-  `ALTER TABLE project_approvals ADD COLUMN verdict TEXT NOT NULL DEFAULT 'approved'`,
-];
+// BB-77: the project-steward approval marker's migration group lives with the
+// table it alters, in approvals-store.ts, so the gate's own files can be named.
+export { APPROVAL_MARKER_MIGRATIONS } from "./approvals-store.js";
 
 // BB-97: the status report's actor `me` is renamed `user`, so all three values
 // name a party rather than a pronoun. A stored row keeps its meaning: this
@@ -888,26 +873,6 @@ export type Escalation = {
 };
 
 /**
- * A project steward's approval (or decline) of an owner-reviewed pull request,
- * bound to its head sha. `commentId` is the GitHub comment id of the
- * `bb-approval` marker the plugin posted for it; the lane gate honours a marker
- * only when its comment id is recorded here, so a hand-typed lookalike never
- * counts.
- */
-export type ProjectApproval = {
-  bindingId: string;
-  headSha: string;
-  /** The decide-list entry the project steward classified it under. */
-  entry: string | null;
-  byThread: string;
-  /** The GitHub comment id of the marker the plugin posted, or null for a record made before markers. */
-  commentId: string | null;
-  /** The marker's verdict. */
-  verdict: "approved" | "declined";
-  createdAt: number;
-};
-
-/**
  * A question put to the user, kept until it is answered so the project
  * steward lists it from here, not from its transcript. One made by forwarding
  * an escalation closes with that escalation, and closing it resolves the
@@ -1162,13 +1127,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const pendingDeliveriesStmt = db.prepare<[number], Record<string, unknown>>("SELECT * FROM pending_deliveries WHERE delivered_at IS NULL AND created_at <= ? ORDER BY created_at");
   const markDeliveryDoneStmt = db.prepare("UPDATE pending_deliveries SET delivered_at = ? WHERE id = ?");
 
-  const insertProjectApproval = db.prepare(
-    "INSERT INTO project_approvals (binding_id, head_sha, entry, by_thread, comment_id, verdict, created_at) VALUES (@binding_id, @head_sha, @entry, @by_thread, @comment_id, @verdict, @created_at) ON CONFLICT (binding_id, head_sha) DO UPDATE SET entry = @entry, by_thread = @by_thread, comment_id = @comment_id, verdict = @verdict, created_at = @created_at",
-  );
-  const getProjectApproval = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
-  const projectApprovalsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? ORDER BY created_at");
-  const deleteProjectApproval = db.prepare("DELETE FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
-
   const insertWorker = db.prepare("INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES (?, ?, ?, 'running', ?)");
   const getWorker = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE thread_id = ?");
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
@@ -1345,15 +1303,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
     resolvedAt: x.resolvedAt,
   });
 
-  const toProjectApproval = (r: Record<string, unknown>): ProjectApproval => ({
-    bindingId: String(r.binding_id),
-    headSha: String(r.head_sha),
-    entry: r.entry === null || r.entry === undefined ? null : String(r.entry),
-    byThread: String(r.by_thread),
-    commentId: r.comment_id === null || r.comment_id === undefined ? null : String(r.comment_id),
-    verdict: String(r.verdict ?? "approved") === "declined" ? "declined" : "approved",
-    createdAt: Number(r.created_at),
-  });
   const toWorker = (r: Record<string, unknown>): Worker => ({
     threadId: String(r.thread_id),
     bindingId: String(r.binding_id),
@@ -1905,33 +1854,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
 
     // project-steward approvals of owner-reviewed pull requests (BB-30)
-    /**
-     * The project steward's approval of an owner-reviewed pull request, if it
-     * recorded one for this binding's current head. A new push is a new sha,
-     * so this is null again and the approval must be asked for afresh.
-     */
-    projectApproval(bindingId: string, headSha: string): ProjectApproval | null {
-      const r = getProjectApproval.get(bindingId, headSha);
-      return r === undefined ? null : toProjectApproval(r);
-    },
-    /** Every approval or decline the plugin recorded for a binding, oldest first; the gate matches a marker to one by comment id. */
-    projectApprovals(bindingId: string): ProjectApproval[] {
-      return projectApprovalsFor.all(bindingId).map(toProjectApproval);
-    },
-    /**
-     * Record a project-steward approval or decline, bound to the pull
-     * request's head sha and to the marker comment the plugin posted. The
-     * caller is responsible for checking that the approver is the project
-     * steward's thread; this is the store half.
-     */
-    recordProjectApproval(fields: { bindingId: string; headSha: string; entry: string | null; byThread: string; commentId?: string | null; verdict?: "approved" | "declined" }): ProjectApproval {
-      insertProjectApproval.run({ binding_id: fields.bindingId, head_sha: fields.headSha, entry: fields.entry, by_thread: fields.byThread, comment_id: fields.commentId ?? null, verdict: fields.verdict ?? "approved", created_at: now() });
-      return toProjectApproval(getProjectApproval.get(fields.bindingId, fields.headSha)!);
-    },
-    /** Drop a recorded approval (a new push voids it by sha; this is for an explicit retraction). */
-    clearProjectApproval(bindingId: string, headSha: string): boolean {
-      return deleteProjectApproval.run(bindingId, headSha).changes > 0;
-    },
+    ...createApprovalsStore(db, now),
 
     // questions to the user
     ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[]; resolutionKind?: ResolutionKind; url?: string | null; data?: Record<string, unknown> }): Question {

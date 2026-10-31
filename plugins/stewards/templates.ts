@@ -1,7 +1,8 @@
 // What `bb stewards init` writes into a project's `.bb`: the project file and
 // the four default playbooks. They are starting points, meant to be edited
 // and reviewed like any other change to `.bb`.
-import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL, defaultDecideList } from "./config.js";
+import { DEFAULT_LABEL } from "./config.js";
+import { DEFAULT_BIG_DECISIONS, defaultDecideList } from "./decisions.js";
 
 /**
  * A credential a worker needs, in the linear-tickets build section. The worker

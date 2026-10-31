@@ -94,6 +94,11 @@ worker that spawned you.
    self-widening change. Record the matched entry's `text` and its
    `decide` mark and name both in the owner-review line, so the reader
    knows who decides.
+
+   **Read the sibling PR first.** When the PR body names a sibling pull
+   request, read it before assigning a lane. Classify each PR from its own
+   diff with the sibling in view. A split that hides a trigger — neither
+   half's diff shows it — is a blocker.
 5. **Read the ticket's intent against the diff.** The questions, in order:
    - Does the change do what the ticket asks, all of it, and nothing the
      ticket did not ask for?
