@@ -64,8 +64,13 @@ export const PENDING_TTL_MS = 10 * 60 * 1000;
  */
 export const ASSISTANT_GREETING = "Hi, I'm your bb. Tell me what you need and I'll start a thread for it.";
 
-/** The Block Kit action id the ephemeral "which project?" prompt uses. */
+/** The Block Kit action id of the ephemeral "which project?" prompt's select. */
 export const SET_PROJECT_ACTION = "bb_set_project";
+/**
+ * The Block Kit action id of the prompt's Set button. Slack requires action
+ * ids to be unique within a block, so the button cannot share the select's.
+ */
+export const SET_PROJECT_BUTTON_ACTION = "bb_set_project_button";
 /** Slack's response_url host; the plugin posts to no other host. */
 export const SLACK_RESPONSE_HOST = "hooks.slack.com";
 
@@ -102,7 +107,7 @@ export function projectPromptBlocks(channel: string, all: Project[]): unknown[] 
       type: "actions",
       elements: [
         { type: "static_select", action_id: SET_PROJECT_ACTION, placeholder: { type: "plain_text", text: "Choose a project" }, options },
-        { type: "button", action_id: SET_PROJECT_ACTION, text: { type: "plain_text", text: "Set" }, value: "set" },
+        { type: "button", action_id: SET_PROJECT_BUTTON_ACTION, text: { type: "plain_text", text: "Set" }, value: "set" },
       ],
     },
     { type: "context", elements: [{ type: "mrkdwn", text: "A mention of bb in this channel will start a thread in the chosen project." }] },
@@ -722,7 +727,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * replacement instead.
      */
     async function handleBlockAction(event: SessionEvent): Promise<void> {
-      if (event.actionId !== SET_PROJECT_ACTION) {
+      if (event.actionId !== SET_PROJECT_ACTION && event.actionId !== SET_PROJECT_BUTTON_ACTION) {
         bb.log.info(`Slack block action ${event.actionId} is not the project prompt; ignored`);
         return;
       }

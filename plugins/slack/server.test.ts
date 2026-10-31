@@ -1,6 +1,6 @@
 import { createFakePluginHost, makeMessageDispatchHookContext } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors } from "./server.js";
+import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors, SET_PROJECT_ACTION, SET_PROJECT_BUTTON_ACTION } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
@@ -675,6 +675,12 @@ describe("Slack plugin", () => {
     const select = actions.elements[0] as { action_id: string; options: Array<{ value: string }> };
     expect(select.action_id).toBe("bb_set_project");
     expect(select.options.map((o) => o.value)).toEqual(["prj-1", "prj-2"]);
+    const button = actions.elements[1] as { action_id: string };
+    expect(button.action_id).toBe(SET_PROJECT_BUTTON_ACTION);
+    // Slack rejects a block whose action ids repeat, so every one must differ.
+    const actionIds = actions.elements.map((e) => (e as { action_id: string }).action_id);
+    expect(new Set(actionIds).size).toBe(actionIds.length);
+    expect(SET_PROJECT_ACTION).not.toBe(SET_PROJECT_BUTTON_ACTION);
     expect(JSON.stringify(blocks)).toContain("start a thread in the chosen project");
     await s.stop();
   });
@@ -810,6 +816,26 @@ describe("Slack plugin", () => {
         action: "block_action",
         channel: "C0123",
         actionId: "bb_set_project",
+        value: "set",
+        responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
+        comment: { text: "", untrusted: false },
+      }),
+    );
+    await tick();
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([]);
+    expect(String(s.hooks.responses.at(-1)?.body.text)).toContain("Pick a project");
+    await s.stop();
+  });
+
+  it("keeps the 'pick a project' reply for a bare Set button press", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "block_action",
+        channel: "C0123",
+        actionId: SET_PROJECT_BUTTON_ACTION,
         value: "set",
         responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
         comment: { text: "", untrusted: false },
