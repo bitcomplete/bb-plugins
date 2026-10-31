@@ -94,7 +94,7 @@ pod never needs one. Slack lets a bot join only public channels by itself, so
 for a private channel the prompt says to type `/invite @bb` in Slack instead,
 and so does every refusal (an app installed without the `channels:join` bot
 scope, an older service without the endpoint). The bot's own join raises no
-prompt in Slack.
+prompt in Slack and writes nothing to the routing map.
 
 Words from anyone but the owner never run a turn. A channel mention by someone
 else is held under a short id and the owner releases it by mentioning the app
