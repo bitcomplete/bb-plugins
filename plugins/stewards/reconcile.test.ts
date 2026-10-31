@@ -603,6 +603,51 @@ describe("the pull request gate (build-tickets)", () => {
     expect(prGate(recorded, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ projectApproved: true, gateMet: true });
   });
 
+  // BB-151: the worker's gate comment on bb-gate#60 (id 6533066554) was signed
+  // `_— from bb thread ` with no thread id and no closing `_`, because its
+  // shell's `$BB_THREAD_ID` was empty. `signedBy()` reads that as unsigned, and
+  // the text approves, so the plugin took it as the owner's LGTM and closed the
+  // approve-pr need 23 seconds after filing it.
+  it("never reads a comment whose agent signature lost its thread id as the owner's approval (BB-151)", () => {
+    const broken = comment({
+      id: "6533066554",
+      author: "jane",
+      body: "Owner-reviewed lane. Independent review approved on cbba8a8 (round 2, 0 blockers); `test` and `bc-prod.yaml schema` are green and the branch is clean. @trotterdylan, this needs your approval before I merge.\n\n_— from bb thread \n",
+      signedBy: null,
+      createdAt: "2026-10-30T20:43:23Z",
+      url: "https://github.com/bitcomplete/bb-gate/pull/60#issuecomment-6533066554",
+    });
+    // It would approve on its words alone, which is why it must be read as a thread's.
+    expect(classifyApproval(broken.body)).toBe("approve");
+    expect(ownerApproval(pull({ comments: [marker(head, "approved", "owner-reviewed"), broken] }, green))).toMatchObject({ approved: false, at: null, id: null, url: null });
+    // The gate still waits on the owner, so the need and the escalation stay open.
+    expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), broken] }, green))).toMatchObject({ gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    // A well-formed signature is a thread's too, as before.
+    const signed = comment({ id: "signed", author: "jane", body: "LGTM\n\n_— from bb thread thr_w_", signedBy: "thr_w", createdAt: "2026-10-30T20:44:00Z" });
+    expect(ownerApproval(pull({ comments: [signed] })).approved).toBe(false);
+    // The signature text anywhere in the body marks it, not only at the end.
+    const quoted = comment({ id: "quoted", author: "jane", body: "I asked for `_— from bb thread ` in the fix. LGTM.", signedBy: null, createdAt: "2026-10-30T20:45:00Z" });
+    expect(ownerApproval(pull({ comments: [quoted] })).approved).toBe(false);
+    // The reviews loop has the same hole: an APPROVED review whose flattened
+    // comment carries a malformed signature is a thread's too (BB-151).
+    const malformedReview = comment({ id: "PRR_1", author: "jane", did: "approved", body: "LGTM\n\n_— from bb thread ", signedBy: null, createdAt: "2026-10-30T20:46:00Z", url: "https://github.com/acme/web/pull/7#pullrequestreview-1" });
+    const reviewEntity = pull({ comments: [malformedReview] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: "2026-10-30T20:46:00Z", commit: head }] });
+    expect(ownerApproval(reviewEntity)).toMatchObject({ approved: false, id: null, url: null, kind: null });
+  });
+
+  it("returns the comment or review id and URL that approved (BB-151)", () => {
+    const c = comment({ id: "6533066555", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z", url: "https://github.com/acme/web/pull/7#issuecomment-6533066555" });
+    expect(ownerApproval(pull({ comments: [c] }))).toMatchObject({ approved: true, id: "6533066555", url: "https://github.com/acme/web/pull/7#issuecomment-6533066555", kind: "comment" });
+    // An APPROVED review is named by its flattened comment's id and URL.
+    const at = "2026-10-14T18:00:00Z";
+    const flat = comment({ id: "PRR_99", author: "jane", did: "approved", body: "", signedBy: null, createdAt: at, url: "https://github.com/acme/web/pull/7#pullrequestreview-99" });
+    const entity = pull({ comments: [flat] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: at, commit: head }] });
+    expect(ownerApproval(entity)).toMatchObject({ approved: true, id: "PRR_99", url: "https://github.com/acme/web/pull/7#pullrequestreview-99", kind: "review" });
+    // With no flattened comment the review still approves; there is just no id to name.
+    const bare = pull({}, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: at, commit: head }] });
+    expect(ownerApproval(bare)).toMatchObject({ approved: true, id: null, url: null, kind: "review" });
+  });
+
   // BB-118: a review steward posts a real, signed review as the connected
   // user. Its marker is the reviewer's round, and its APPROVED review is the
   // thread's, not the owner's approval.

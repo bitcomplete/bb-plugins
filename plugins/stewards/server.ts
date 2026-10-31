@@ -5070,6 +5070,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The comment or review that satisfied the gate, as "comment 6533…" or
+     * "review 123…", with its URL; empty when the gate has no id to name. The
+     * resolution text carries it so a closed approve-pr item is traceable to
+     * what closed it (BB-151).
+     */
+    function approvalRef(g: ReturnType<typeof prGate>): string {
+      const id = g.projectApproved ? g.projectApprovalId : g.ownerApprovalId;
+      if (id === null) return "";
+      const url = g.projectApproved ? g.projectApprovalUrl : g.ownerApprovalUrl;
+      const kind = g.projectApproved ? "comment" : (g.ownerApprovalKind ?? "comment");
+      return url === null ? `${kind} ${id}` : `${kind} ${id}, ${url}`;
+    }
+
+    /**
      * File, refresh and close the plugin's "needs you" items from a snapshot:
      * `approve-spec` (the user's approval of the ready gate), and, per observed
      * pull request, `approve-pr` and `merge`. The conditions are recomputed on
@@ -5169,8 +5183,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (approvalEsc.route === "me") fileApprovePrNeed(b, pull, approvalEsc.id, g.headSha, listing);
             store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
           } else if (g.ownerApproved || g.projectApproved) {
-            store.closeNeedByKey(b.id, "approve-pr", url, "Approval is present.");
-            store.resolve(approvalEsc.id, g.projectApproved ? "Approved by the project steward." : "Approved by the owner.");
+            // The resolution names what approved, so a closed item can always
+            // be traced to the comment or review that closed it (BB-151).
+            const ref = approvalRef(g);
+            const suffix = ref === "" ? "" : ` (${ref})`;
+            store.closeNeedByKey(b.id, "approve-pr", url, `Approval is present${suffix}.`);
+            store.resolve(approvalEsc.id, `Approved by ${g.projectApproved ? "the project steward" : "the owner"}${suffix}.`);
           } else {
             // The marker is no longer approved (or gone): withdraw the request
             // with the gate's words, never "Approved.".

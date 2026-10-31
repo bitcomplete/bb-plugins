@@ -414,17 +414,28 @@ export function isMarkerComment(body: string): boolean {
 /**
  * Whether the owner has approved a pull request: an unsigned approving comment
  * by the connected user, or an APPROVED review from them. A signed comment is
- * a thread's (the reviewer's marker, a worker's), never the owner's. So is an
- * unsigned comment that carries a `bb-review` or `bb-approval` marker: the
- * reviewer posts as the connected user, and its marker is a thread's whatever
- * the signature line says (BB-110).
+ * a thread's (the reviewer's marker, a worker's), never the owner's. So is a
+ * comment that merely contains the signature text `— from bb thread`, even
+ * when the thread id and the closing `_` are missing: a malformed signature is
+ * still an agent's, and the gate fails closed rather than reading its words as
+ * the owner's (BB-151). An unsigned comment that carries a `bb-review` or
+ * `bb-approval` marker is a thread's too (BB-110).
  *
  * A review steward posts a real, signed review as the connected user too, so
  * an APPROVED review that a thread's review comment stands behind is that
  * thread's, not the owner's (BB-118). The snapshot's `pull.reviews` carries no
  * body, so the review is matched to its flattened comment by author and time.
+ *
+ * `id`, `url` and `kind` name what approved, for the resolution text: a
+ * review's flattened comment carries the review's GitHub id and URL.
  */
 const REVIEW_DIDS = new Set(["approved", "requested changes", "reviewed", "had a review dismissed"]);
+
+/** The signature line's opening text, without the thread id or the closing `_`. A malformed signature still marks an agent's comment (BB-151). */
+const SIGNATURE_TEXT = "— from bb thread";
+
+/** Whether a body carries the signature text anywhere, however malformed (BB-151). */
+export const hasSignatureText = (body: string): boolean => body.includes(SIGNATURE_TEXT);
 
 /** The (author, time) pairs of the reviews a thread posted, signed or marked. github-watcher builds a review's flattened comment and its `pull.reviews` entry from the same `submittedAt ?? createdAt`, so the pair identifies the review. */
 function threadReviewKeys(entity: EntitySnapshot): Set<string> {
@@ -439,15 +450,40 @@ function threadReviewKeys(entity: EntitySnapshot): Set<string> {
   return keys;
 }
 
-export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: string | null } {
+export type OwnerApproval = {
+  approved: boolean;
+  at: string | null;
+  /** The GitHub comment, or flattened review, id that approved; null when none did. */
+  id: string | null;
+  /** Its URL, or null. */
+  url: string | null;
+  /** Whether a review or a plain comment approved; null when none did. */
+  kind: "comment" | "review" | null;
+};
+
+export function ownerApproval(entity: EntitySnapshot): OwnerApproval {
   const viewer = entity.viewer === null ? null : entity.viewer.toLowerCase();
-  if (viewer === null) return { approved: false, at: null };
-  let at: string | null = null;
+  if (viewer === null) return { approved: false, at: null, id: null, url: null, kind: null };
+  let bestAt: string | null = null;
+  let bestId: string | null = null;
+  let bestUrl: string | null = null;
+  let bestKind: "comment" | "review" | null = null;
+  const note = (at: string, id: string | null, url: string | null, kind: "comment" | "review") => {
+    if (bestAt === null || at > bestAt) {
+      bestAt = at;
+      bestId = id;
+      bestUrl = url;
+      bestKind = kind;
+    }
+  };
   for (const c of entity.comments) {
-    if (c.signedBy !== null || c.author.toLowerCase() !== viewer) continue;
+    // A malformed signature is an agent's: never the owner's approval (BB-151).
+    if (c.signedBy !== null || hasSignatureText(c.body) || c.author.toLowerCase() !== viewer) continue;
     if (isMarkerComment(c.body)) continue;
-    if (classifyApproval(c.body) !== "approve") continue;
-    if (at === null || c.createdAt > at) at = c.createdAt;
+    const review = REVIEW_DIDS.has(c.did.toLowerCase());
+    // A flattened APPROVED review approves by its state; any other comment by its words.
+    if (c.did.toLowerCase() !== "approved" && classifyApproval(c.body) !== "approve") continue;
+    note(c.createdAt, c.id, c.url, review ? "review" : "comment");
   }
   const threads = threadReviewKeys(entity);
   for (const r of entity.pull?.reviews ?? []) {
@@ -456,9 +492,15 @@ export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: 
     // A review a thread posted as the connected user (a review steward's
     // APPROVED review) is not the owner's approval (BB-118).
     if (threads.has(`${r.author.toLowerCase()}\u0000${when}`)) continue;
-    if (at === null || when > at) at = when;
+    // The flattened comment carries the review's GitHub id and URL. A
+    // malformed signature on it is still a thread's, so the review is too
+    // (BB-151); `threadReviewKeys` only catches a well-formed one.
+    const flat = entity.comments.find((c) => c.author.toLowerCase() === viewer && c.createdAt === when && c.did.toLowerCase() === "approved");
+    if (flat !== undefined && (flat.signedBy !== null || hasSignatureText(flat.body))) continue;
+    note(when, flat?.id ?? null, flat?.url ?? null, "review");
   }
-  return { approved: at !== null, at };
+  if (bestAt === null) return { approved: false, at: null, id: null, url: null, kind: null };
+  return { approved: true, at: bestAt, id: bestId, url: bestUrl, kind: bestKind };
 }
 
 // ---- the project steward's approval marker --------------------------------------------
@@ -568,6 +610,13 @@ export type PrGate = {
   checksState: string | null;
   ownerApproved: boolean;
   ownerApprovalAt: string | null;
+  /** The comment or flattened review that approved, for the resolution text (BB-151). */
+  ownerApprovalId: string | null;
+  ownerApprovalUrl: string | null;
+  ownerApprovalKind: "comment" | "review" | null;
+  /** The project-steward marker that approved, when that is the gate. */
+  projectApprovalId: string | null;
+  projectApprovalUrl: string | null;
   gateMet: boolean;
   /** What is missing, in words; null when the gate is met. */
   missing: string | null;
@@ -646,6 +695,11 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     checksState,
     ownerApproved: owner.approved,
     ownerApprovalAt: owner.at,
+    ownerApprovalId: owner.id,
+    ownerApprovalUrl: owner.url,
+    ownerApprovalKind: owner.kind,
+    projectApprovalId: approval?.comment.id ?? null,
+    projectApprovalUrl: approval?.comment.url ?? null,
     gateMet,
     missing,
     needsOwnerApproval: approvalNeeded && decision === "user",

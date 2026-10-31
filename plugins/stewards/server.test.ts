@@ -4747,6 +4747,45 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
+  // BB-151: the worker's gate comment on bb-gate#60 lost its thread id. The
+  // plugin filed the need and the escalation and closed both 23 seconds later
+  // as "Approval is present."; the owner never approved, and the pull request
+  // sat unmerged overnight. With only that comment, both must stay open.
+  it("keeps the approve-pr need and its escalation open when the only owner comment has a broken signature (BB-151)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(need).toBeDefined();
+    expect(esc).toMatchObject({ route: "me" });
+    const broken = comment({
+      id: "6533066554",
+      author: "jane",
+      body: "Owner-reviewed lane. Independent review approved on cbba8a8 (round 2, 0 blockers); `test` and `bc-prod.yaml schema` are green and the branch is clean. @trotterdylan, this needs your approval before I merge.\n\n_— from bb thread \n",
+      signedBy: null,
+      createdAt: "2026-10-30T20:43:23Z",
+      url: "https://github.com/bitcomplete/bb-gate/pull/60#issuecomment-6533066554",
+    });
+    t.entities.set("acme/web#7", pull({ comments: [marker, broken] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.need(need.id)!.status).toBe("open");
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.id === esc.id)).toBe(true);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
+  it("names the approving comment and its URL when sync closes the approve-pr need (BB-151)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    const approved = comment({ id: "6533066555", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-30T20:50:00Z", url: "https://github.com/acme/web/pull/7#issuecomment-6533066555" });
+    t.entities.set("acme/web#7", pull({ comments: [marker, approved] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    expect(t.hooks.store.need(need.id)!.resolution).toBe("Approval is present (comment 6533066555, https://github.com/acme/web/pull/7#issuecomment-6533066555).");
+    expect(t.hooks.store.escalation(esc.id)!.resolution).toBe("Approved by the owner (comment 6533066555, https://github.com/acme/web/pull/7#issuecomment-6533066555).");
+  });
+
   it("refuses an approve-pr the gate cannot hold, names the missing step and files nothing (BB-21)", async () => {
     const t = await withPull([]);
     const b = t.binding();
