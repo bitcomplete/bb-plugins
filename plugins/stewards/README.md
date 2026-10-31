@@ -537,10 +537,14 @@ marked read, so they are almost always unread and the row would otherwise sit
 open.
 
 **The needs-you items and the picker count (BB-46, BB-85).** The project
-dropdown shows each project's count in its option label, counting the yellow
-effort rows. A needs-you effort shows the question or need's text and its
-one-click actions inline under line two. The server describes each item's
-`actions` once (`needActions`, `questionActions` and `withUserActions` in
+dropdown shows each project's count in its option label: the yellow effort rows
+(the server's needs-you bindings, `needsCount`) plus the project's unread
+one-off thread roots. The unread half is computed on the client from the host's
+live thread view, so every project option gets it; a one-off root counts, but
+not its unread children, and an unread worker or reviewer under a stewarded
+effort does not count (BB-131). A needs-you effort shows the question or need's
+text and its one-click actions inline under line two. The server describes each
+item's `actions` once (`needActions`, `questionActions` and `withUserActions` in
 `server.ts`) and both the sidebar and the page render that list, so the two
 cannot drift: a fixed-choice question or a `decide` need carries one button per
 choice, an `approve-spec` row **Open ticket** / **Approve** / **Decline**, an

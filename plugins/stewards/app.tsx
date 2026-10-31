@@ -2138,9 +2138,28 @@ function StewardsSidebarCore({
     previousTabs.current = next;
     return next;
   }, [projects, threads, data]);
-  // The picker's count is the server's needs-you binding count, so the pill and
-  // the yellow rows cannot disagree (BB-100).
-  const counts = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needsCount] as const)), [data]);
+  // The picker's count is the server's needs-you binding count plus the unread
+  // one-off thread roots, so the option label covers everything in the project
+  // waiting on the user (BB-160). The needs half comes from the RPC; the unread
+  // half is computed here from the host's live thread view, which covers every
+  // project. A one-off root counts, but not its unread children, and an unread
+  // worker or reviewer under a stewarded effort does not count either, so the
+  // stewarded half stays the server's `needsCount` (BB-131).
+  const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
+  const counts = useMemo(
+    () =>
+      new Map(
+        tabs.map((tab) => {
+          const unread = tab.threads.filter((e) => {
+            const root = byId.get(e.rootThreadId);
+            return root !== undefined && isUnread(root);
+          }).length;
+          const needs = data?.projects.find((p) => p.projectId === tab.projectId)?.needsCount ?? 0;
+          return [tab.projectId, needs + unread] as const;
+        }),
+      ),
+    [tabs, byId, data],
+  );
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs.find((t) => t.projectId === data?.projectId) ?? tabs[0] ?? null;
   // A steward's visible change updates the badge and block within seconds; the
   // half-minute poll stays the fallback. Only a signal that names the shown
@@ -2156,7 +2175,6 @@ function StewardsSidebarCore({
       [shownProjectId, refetch],
     ),
   );
-  const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
   // `byId` is a new Map on every host tick, so `pick` reads it through a ref:
   // a new callback each tick would defeat `ProjectTabs`' memo (BB-95).
   const byIdRef = useRef(byId);

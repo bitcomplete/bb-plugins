@@ -495,14 +495,30 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
         stewardsSidebar: () =>
           sidebarData({
             needsCounts: { p1: 2, p2: 1 },
-            p1: { bindings: [sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true }), sidebarBinding({ key: "ENG-2", threadId: "thr_b", needsUser: true })], needs: { count: 9, items: [] } },
+            p1: {
+              bindings: [
+                sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true, workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] }),
+                sidebarBinding({ key: "ENG-2", threadId: "thr_b", needsUser: true }),
+              ],
+              needs: { count: 9, items: [] },
+            },
           }),
       },
       {},
-      [sidebarThread("thr_a"), sidebarThread("thr_b"), sidebarThread("thr_c", "p2")],
+      [
+        sidebarThread("thr_a"),
+        sidebarThread("thr_b"),
+        sidebarThread("thr_c", "p2"),
+        // An unread worker under a stewarded effort does not add to the count (BB-160).
+        { ...sidebarThread("thr_worker"), parentThreadId: "thr_a", isUnread: true },
+        // A one-off root in a project the RPC does not carry adds one; its
+        // unread child does not.
+        { ...sidebarThread("thr_root", "p2"), isUnread: true },
+        { ...sidebarThread("thr_child", "p2"), parentThreadId: "thr_root", isUnread: true },
+      ],
     );
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
-    expect(slot.getByRole("option", { name: "Beta (1)" })).toBeTruthy();
+    expect(slot.getByRole("option", { name: "Beta (2)" })).toBeTruthy();
     expect(slot.queryByLabelText("3 waiting on you")).toBeNull();
     slot.lifecycle.unmount();
   });
