@@ -492,8 +492,11 @@ export function ownerApproval(entity: EntitySnapshot): OwnerApproval {
     // A review a thread posted as the connected user (a review steward's
     // APPROVED review) is not the owner's approval (BB-118).
     if (threads.has(`${r.author.toLowerCase()}\u0000${when}`)) continue;
-    // The flattened comment carries the review's GitHub id and URL.
+    // The flattened comment carries the review's GitHub id and URL. A
+    // malformed signature on it is still a thread's, so the review is too
+    // (BB-151); `threadReviewKeys` only catches a well-formed one.
     const flat = entity.comments.find((c) => c.author.toLowerCase() === viewer && c.createdAt === when && c.did.toLowerCase() === "approved");
+    if (flat !== undefined && (flat.signedBy !== null || hasSignatureText(flat.body))) continue;
     note(when, flat?.id ?? null, flat?.url ?? null, "review");
   }
   if (bestAt === null) return { approved: false, at: null, id: null, url: null, kind: null };

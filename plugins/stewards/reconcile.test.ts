@@ -628,6 +628,11 @@ describe("the pull request gate (build-tickets)", () => {
     // The signature text anywhere in the body marks it, not only at the end.
     const quoted = comment({ id: "quoted", author: "jane", body: "I asked for `_— from bb thread ` in the fix. LGTM.", signedBy: null, createdAt: "2026-10-30T20:45:00Z" });
     expect(ownerApproval(pull({ comments: [quoted] })).approved).toBe(false);
+    // The reviews loop has the same hole: an APPROVED review whose flattened
+    // comment carries a malformed signature is a thread's too (BB-151).
+    const malformedReview = comment({ id: "PRR_1", author: "jane", did: "approved", body: "LGTM\n\n_— from bb thread ", signedBy: null, createdAt: "2026-10-30T20:46:00Z", url: "https://github.com/acme/web/pull/7#pullrequestreview-1" });
+    const reviewEntity = pull({ comments: [malformedReview] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: "2026-10-30T20:46:00Z", commit: head }] });
+    expect(ownerApproval(reviewEntity)).toMatchObject({ approved: false, id: null, url: null, kind: null });
   });
 
   it("returns the comment or review id and URL that approved (BB-151)", () => {
