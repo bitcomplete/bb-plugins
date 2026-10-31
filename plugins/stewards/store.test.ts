@@ -681,6 +681,28 @@ describe("a worker's pending model check", () => {
   });
 });
 
+describe("the lost-hand-off phrase the store rings on (BB-152)", () => {
+  const status = (waitingOn: string | null) => ({ phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const, waitingOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1_000 });
+
+  it("rings when a status write makes waitingOn name a finished worker", () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS) db.exec(sql);
+    const columns: string[] = [];
+    const s = createStore(db, () => 1_000, { onProjectChange: (_projectId, cols) => columns.push(...cols) });
+    const b = s.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "Fix login", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "In Progress", stage: "build" });
+    s.addWorker("thr_w1", b.id, "ENG-12: Implement");
+    s.setWorker("thr_w1", "finished", "Merged acme/web#7.");
+    // A report waiting on the reviewer is not a lost hand-off, so after it the
+    // channel is quiet until the phrase actually changes.
+    s.patch(b.id, { status: status("the reviewer") });
+    columns.length = 0;
+    // Naming the finished worker changes the phrase to the lost hand-off, so
+    // the status write rings the refetch.
+    s.patch(b.id, { status: status("worker thr_w1 (merge)") });
+    expect(columns).toContain("status");
+  });
+});
+
 describe("the escalation-chain migration (BB-30)", () => {
   function legacy() {
     const db = new Database(":memory:");

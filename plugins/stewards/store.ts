@@ -1465,6 +1465,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
         deployment: newestDeployment === null ? null : newestDeployment.state,
         pending: b.pending,
         requeueAt: b.requeueAt,
+        waitingOn: b.status?.waitingOn ?? null,
+        // The lost-hand-off phrase (BB-152) reads the worker statuses, so the
+        // ring must too; the query is one indexed row set per status write.
+        workers: workersFor.all(b.id).map(toWorker),
       },
       now,
     );

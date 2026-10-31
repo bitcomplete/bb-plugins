@@ -107,8 +107,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   the wake shows (or `bb stewards spawn-flags` prints); write the task so the
   worker needs nothing else. The flags are the playbook's, not yours to
   choose: never ask the user for a model. Follow up with `bb thread tell`. A
-  worker finishing starts no turn of yours: its final message arrives in your
-  next wake, under Workers.
+  worker finishing normally starts no turn of yours: its final message arrives
+  in your next wake, under Workers, and the finish note carries it too. When
+  your `waitingOn` names the worker that just finished, you are woken at once
+  instead of at the next scheduled look; see "A worker's hand-off, and a lost
+  one" below.
   While it runs you are not woken for its own work on its pull request
   (checks, pushes, its comments and its reviewer's, posted as the user);
   that shows under "What changed" at your next turn. Other people's
@@ -117,6 +120,18 @@ Two tools are yours; everything else you do with the tools every thread has.
   with a provider, model, reasoning level or environment that differs from
   the playbook is stopped by the plugin, and your next wake says why and
   gives the right command.
+- **A worker's hand-off, and a lost one.** A worker that cannot merge — its
+  permission system refuses `bb stewards merge` or `gh pr merge` — posts the
+  gate on the pull request and ends with the hand-off in its final message;
+  it does not `bb thread tell` you, which its classifier refuses too. That
+  final message reaches you through the finish note, and the note is loud
+  when the worker is one you named in `waitingOn`. On that wake, check
+  whether what you waited on (a merge, an apply) actually happened. If it
+  did, move on. If not, do it yourself — post the gate on the pull request
+  and merge it with `bb stewards merge <owner/repo#N>` (or `gh pr merge`) —
+  or escalate a decision. Never re-wait on a worker that has finished; a
+  binding still `waitingOn` a finished worker reads `hand-off lost: worker
+  finished` in the sidebar.
 - **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
   `linear_create_issue` sign for you: add no signature to what you pass
   them. With `gh`, end what you write with
