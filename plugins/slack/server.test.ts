@@ -1553,6 +1553,32 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("ignores a non-owner's deletion after the owner confirmed their message", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session({ ts: "14.1" }));
+    await tick();
+    // A non-owner message is held.
+    s.hooks.last().send(s.hooks.session({ ts: "14.2", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "halt work", untrusted: true } }));
+    await tick();
+    const prompt = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    const id = /confirm (r-[a-z0-9]+)/u.exec(prompt)?.[1];
+    expect(id).toBeTruthy();
+    // The owner confirms it: the confirm message is its own outstanding wake.
+    s.hooks.last().send(s.hooks.session({ ts: "14.3", comment: { text: `<@U-bb> confirm ${id}`, untrusted: false } }));
+    await tick();
+    const before = (await s.bb.storage.kv.get("sessions")) as Record<string, { events: number; answered: number }>;
+    const sendsBefore = s.harness.sdk.callsTo("threads.send").length;
+
+    // The non-owner deletes their original message: the request was already
+    // taken, so nothing is withdrawn and the confirm wake keeps its obligation.
+    s.hooks.last().send(s.hooks.session({ action: "deleted", ts: "14.2", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "", untrusted: true } }));
+    await tick();
+    const after = (await s.bb.storage.kv.get("sessions")) as Record<string, { events: number; answered: number }>;
+    expect(after["D0123:1712345678.901234"]).toMatchObject({ events: before["D0123:1712345678.901234"]!.events, answered: before["D0123:1712345678.901234"]!.answered });
+    expect(s.harness.sdk.callsTo("threads.send").length).toBe(sendsBefore);
+    await s.stop();
+  });
+
   it("does not let an untagged hold prompt consume a tagged wake's reply slot", async () => {
     const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
     // A tagged owner wake, unanswered.

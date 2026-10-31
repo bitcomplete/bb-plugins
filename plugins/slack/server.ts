@@ -1189,11 +1189,14 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         }
       }
       if (wake.state === "held") {
-        // The original was held for the owner: withdraw the request.
-        if (wake.heldId !== "") await takePending(event.session, wake.heldId);
-        forgetWake(event.session, event.ts);
-        const current = sessions.get(event.session);
-        if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
+        // The original was held for the owner: withdraw the request if it still
+        // waits. The confirm prompt already answered the held wake, so nothing
+        // is uncounted. If nothing waits under the id, the request was already
+        // confirmed and the instruction stands, so the deletion is ignored.
+        if (wake.heldId !== "" && (await takePending(event.session, wake.heldId)) !== null) {
+          forgetWake(event.session, event.ts);
+          bb.log.info(`Slack session ${logSession}: withdrew a held message that was deleted`);
+        }
         return;
       }
       const quote = clipMention(wake.text, 200);
@@ -1233,14 +1236,17 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return;
       }
       if (isUntrusted(event)) {
-        if (wake.state === "held") {
+        if (wake.state === "held" && wake.heldId !== "") {
           // A non-owner deleted their held message: withdraw the request, so
-          // the owner is not asked to confirm words that no longer exist.
-          if (wake.heldId !== "") await takePending(event.session, wake.heldId);
-          forgetWake(event.session, event.ts);
-          const current = sessions.get(event.session);
-          if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
-          bb.log.info(`Slack session ${logSession}: withdrew a held message that was deleted`);
+          // the owner is not asked to confirm words that no longer exist. The
+          // confirm prompt already answered the held wake, so nothing is
+          // uncounted. If nothing waits under the id, the request was already
+          // confirmed: the instruction stands and this deletion is ignored.
+          const withdrawn = await takePending(event.session, wake.heldId);
+          if (withdrawn !== null) {
+            forgetWake(event.session, event.ts);
+            bb.log.info(`Slack session ${logSession}: withdrew a held message that was deleted`);
+          }
           return;
         }
         // A deletion carries no words to hold; nothing to do.
