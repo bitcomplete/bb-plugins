@@ -21,6 +21,7 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   hold: null,
   holdBehind: [],
   waitingOn: null,
+  noWakeSource: false,
   needsUser: false,
   stuck: false,
   status: null,
@@ -50,6 +51,7 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   hold: null,
   holdBehind: [],
   waitingOn: null,
+  noWakeSource: false,
   workers: [],
   needsUser: false,
   stuck: false,
@@ -413,6 +415,20 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     // 8. no report: `the other party` stands in for an external wait with no nextAction.
     expect(effortPhrase(effort({ key: "n", statusActor: "other" }))).toBe("the other party");
     expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
+  });
+
+  // BB-154: the mark reads on line two, ahead of the deployment phrase and the
+  // free-text nextAction, which can look live when nothing will deliver the wait.
+  it("reads waiting, no wake source while marked, after a more specific phrase", () => {
+    expect(effortPhrase(effort({ key: "w", noWakeSource: true, waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
+    expect(effortPhrase(effort({ key: "w2", noWakeSource: true, deployment: "deployed", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
+    // A running worker is a live source, so the count still wins.
+    expect(effortPhrase(effort({ key: "w3", noWakeSource: true, runningWorkers: 1 }))).toBe("1 worker running");
+    // A lost hand-off is more specific and sits ahead of the mark.
+    const finished = [{ threadId: "thr_w", title: "Implement", status: "finished" }];
+    expect(effortPhrase(effort({ key: "w4", noWakeSource: true, waitingOn: "Implement", workers: finished }))).toBe("hand-off lost: worker finished");
+    // Unmarked still reads the next action verbatim.
+    expect(effortPhrase(effort({ key: "w5", waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("the vendor");
   });
 
   it("shows a quiet worker finish over a stale summary, before the external wait (BB-83)", () => {

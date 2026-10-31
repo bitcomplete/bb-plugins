@@ -439,6 +439,20 @@ const holdLine = (binding: Binding, then: string): string =>
     ? "- Hold: none"
     : `- **HOLD: ${binding.hold}**${binding.holdBehind.length === 0 ? "" : ` (behind ${binding.holdBehind.join(", ")}: it lifts itself, and you are woken, once ${binding.holdBehind.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"})`} — ${then}`;
 
+/**
+ * The paragraph a wake carries when the binding is marked waiting with no wake
+ * source (BB-154): what the plugin does not track, and what the steward can do
+ * about it. One paragraph, as the ticket asks.
+ */
+function noWakeSourceLines(binding: Binding): string[] {
+  const wait = binding.status?.waitingOn ?? null;
+  return [
+    "**Waiting with no wake source.** Nothing the plugin tracks will deliver this wait" +
+      (wait === null ? "" : ` (${JSON.stringify(wait)})`) +
+      ": no hold behind anything, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. Name what will — a binding to hold behind, a pull request, a deployment target, a worker — or, if nothing can, the condition is your own to re-examine.",
+  ];
+}
+
 /** Section 3's scheduling lines for a ticket or pull request binding: what it touches, and what is in flight on the same paths. */
 function schedulingLines(binding: Binding, conflicts: Conflict[], escalations: Escalation[]): string[] {
   if (binding.kind !== "ticket" && binding.kind !== "pr") return [];
@@ -511,6 +525,9 @@ export function formatWake(input: WakeInput): string {
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
   out.push(...trialLessonsLines(input.lessons ?? []));
+  // BB-154: a wait with no structured source gets one paragraph, before the
+  // snapshot, so a clipped wake keeps it.
+  if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
   if (binding.ready.declinedSpecHash !== null && binding.declinedSpecObjections.length > 0) {
     out.push("", "**Spec declined.** Address each objection in one revision, so the next review can close them all:", "", ...binding.declinedSpecObjections.map((o) => `- [ ] ${o}`));
   }
@@ -746,6 +763,7 @@ export function formatOpsWake(input: OpsWakeInput): string {
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
   out.push("", "## 3. The look", "");
@@ -851,6 +869,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
   out.push("", "## 3. The alerts", "");
@@ -959,6 +978,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
   out.push("", "## 3. The look", "");
@@ -1180,7 +1200,7 @@ export function formatProjectWake(input: {
     if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions, input.timeZone));
     out.push(
       "",
-      "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding flagged as waiting with no open escalation: find out what it waits for), and today's priorities. " +
+      "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding listed as waiting with no wake source or with a stall escalation: name what will deliver the wait, hold it behind something real, or resolve it), and today's priorities. " +
         "Write it from the record above, not from memory: a question or escalation not listed as open is closed, and a binding listed as ended has ended, whatever an earlier digest said. " +
         "If the digest asks the user something new, record it first with steward_update { ask: { question, context } } (with binding when it concerns one). Your reply is saved as the digest.",
     );
@@ -1297,6 +1317,10 @@ export type DigestRecords = {
   needs?: Array<{ need: Need; binding: Binding }>;
   /** Open `stuck` escalations, wherever they are. */
   stuck: Array<{ escalation: Escalation; from: Binding }>;
+  /** Bindings marked waiting with no wake source (BB-154). */
+  noWakeSource: Binding[];
+  /** Open `stall` escalations: repeated requeue-only wakes with the same wait (BB-154). */
+  stall: Array<{ escalation: Escalation; from: Binding }>;
   /** Open bindings on hold. */
   held: Binding[];
   /** Silent notes queued for this digest (a hold that lifted on finished work), one line each. */
@@ -1358,6 +1382,16 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
+
+  // BB-154: the quiet stall, visible once a day even before the requeue
+  // threshold. A binding can be marked without a stall (the first report), and
+  // a stall can be open with the mark already cleared (the stall is itself a
+  // live source), so the two lists are separate.
+  const noWake = [
+    ...r.noWakeSource.map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting with no wake source${b.status?.waitingOn === null || b.status?.waitingOn === undefined ? "" : `: ${oneLine(b.status.waitingOn)}`}${b.requeueWakeCount > 0 ? ` (${b.requeueWakeCount} requeue-only wake${b.requeueWakeCount === 1 ? "" : "s"})` : ""}`),
+    ...r.stall.map(({ escalation: x, from }) => `- ${from.entityKey}: stall escalation ${x.id} with the project steward, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
+  ];
+  out.push("### Waiting with no wake source", "", ...capped(noWake, "Nothing."), "");
   return out;
 }
 

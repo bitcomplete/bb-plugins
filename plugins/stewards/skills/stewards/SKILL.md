@@ -178,6 +178,21 @@ Two tools are yours; everything else you do with the tools every thread has.
   effort blocked: a hold, an open `stuck` escalation or a needs item does
   (BB-109). The old name `blockedOn` is accepted as an alias for one
   release.
+- **A wait with no wake source, and a stall (BB-154).** Every wait the
+  plugin understands is structured and has a clock it tracks: a
+  `holdBehind`, a deployment watch, a running worker, an open escalation or
+  need, a watched pull request. A free-text `waitingOn` beside them can name
+  something nothing will ever deliver. When you report a wait and none of
+  those sources is live, the binding is marked `noWakeSource`: the row and
+  `bb stewards list`/`show` read `waiting, no wake source`, and your next
+  wake says so and asks you to name what will deliver the wait (a binding to
+  hold behind, a pull request, a deployment target, a worker). Clear it by
+  adding a real source or clearing the wait. If you wake by `requeue` twice
+  in a row with the same wait and no source, the plugin raises one `stall`
+  escalation to the project steward naming the binding, the wait, when you
+  first reported it and the wake count. A wake for another reason, a changed
+  wait or a new source resets the count, and a stall already open is not
+  raised again.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
@@ -332,7 +347,15 @@ overlap is harmless, or the new ticket matters more (then
 hold the other one instead), let it start with `guidance` ("Start now: …")
 + `resolve`; it is not asked again until a new overlap appears. The
 bindings list in every wake shows touches and overlaps, so the same hold
-sequences any two tickets, asked or not. When the user acts on
+sequences any two tickets, asked or not. A `stall` escalation is the
+plugin's too: a binding has woken by requeue several times with the same
+free-text `waitingOn` and no source the plugin tracks will deliver it.
+Answer it the way the wait needs: hold the binding behind something real
+(`steward_update { binding, hold, behind }`), give it guidance naming what
+will deliver the wait, or forward it to the user when only they can;
+resolving it with `guidance` + `resolve` wakes the steward. If nothing can
+deliver the wait, say so and have the steward re-examine the condition.
+When the user acts on
 an entity whose escalation you forwarded to them — edits the ticket,
 comments, moves it — you are woken with the change: if it answers the
 escalation, record it with `guidance` + `resolve`; if not, leave it open.

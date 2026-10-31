@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -451,12 +451,13 @@ describe("the actor rename migration (BB-97)", () => {
   });
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
-    // BB-133 appended the reviewer-model group after the lesson-PR group.
-    const tail = REVIEWER_MODEL_MIGRATIONS.length;
-    expect(MIGRATIONS.slice(-tail)).toEqual([...REVIEWER_MODEL_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + LESSON_PR_MIGRATIONS.length), -tail)).toEqual([...LESSON_PR_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length), -(tail + LESSON_PR_MIGRATIONS.length))).toEqual([...ACTOR_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length + APPROVAL_MARKER_MIGRATIONS.length), -(tail + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length))).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
+    // BB-154 appended the wake-source group after the reviewer-model group.
+    const tail = WAKE_SOURCE_MIGRATIONS.length;
+    expect(MIGRATIONS.slice(-tail)).toEqual([...WAKE_SOURCE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length), -tail)).toEqual([...REVIEWER_MODEL_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length), -(tail + REVIEWER_MODEL_MIGRATIONS.length))).toEqual([...LESSON_PR_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length), -(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length))).toEqual([...ACTOR_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length + APPROVAL_MARKER_MIGRATIONS.length), -(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length))).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
   });
 });
 

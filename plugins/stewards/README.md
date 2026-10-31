@@ -410,6 +410,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   trend and the hand-written units uncited for 90 days; `bb stewards
   drop-lesson <id>` drops one. The digest carries nothing about lessons.
   DESIGN.md §20.
+- **A wait with no wake source (BB-154).** A steward's free-text `waitingOn`
+  can name something the plugin never delivers, so the binding wakes only by
+  requeue. At report time the plugin asks whether any structured source is
+  live on the binding: an open `holdBehind`, a deployment watch in
+  `merged`/`deploying`, a running worker, an open escalation or need, or a
+  pull-request watch. With none, the binding is marked `noWakeSource`: its
+  row reads `waiting, no wake source`, `bb stewards list`/`show` say so, and
+  the next wake carries one paragraph telling the steward to name what will
+  deliver the wait (a binding to hold behind, a pull request, a deployment
+  target, a worker) or re-examine it. The mark clears when a source appears
+  or the wait is cleared. Separately, the plugin counts consecutive wakes
+  whose reason was `requeue` and whose report ended with the same trimmed
+  `waitingOn`; at two (one plugin constant, not a `project.json` key) it
+  raises one `stall` escalation to the project steward naming the binding,
+  the wait, when it was first reported and the wake count. Any other wake
+  reason, a changed wait or a new source resets the run, and a stall already
+  open is not raised again. The nightly digest lists marked bindings and open
+  stalls.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
@@ -484,7 +502,8 @@ switchable from where you are.
 entity key in bold and the title on line one; the kind (`ticket`, `pull
 request`, `review`, `ops`), the entity's phase when it has one, and the status
 phrase on line two (first match wins: `needs you`, a hold,
-`stuck`, `N worker(s) running`, the deployment state, then the report's
+`stuck`, `N worker(s) running`, a lost hand-off, a quiet worker finish,
+`waiting, no wake source`, the deployment state, then the report's
 `nextAction` verbatim). A free-text `waitingOn` is a plain line on the effort
 card, never a block or a phrase prefix (BB-109). A row that needs you adds its prompt and one-click actions
 under line two, in the same row. The glyph is one of four, in precedence order

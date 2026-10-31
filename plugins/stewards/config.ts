@@ -572,8 +572,8 @@ export type Stage = (typeof STAGES)[number];
 
 /** What a steward raises. */
 export const ESCALATION_KINDS = ["blocked", "decision", "scope", "conflict", "stuck"] as const;
-/** Those, and the plugin's own: a ready gate waiting on its approver, and a ready ticket waiting to be scheduled against work already under way. */
-export type EscalationKind = (typeof ESCALATION_KINDS)[number] | "approval" | "schedule";
+/** Those, and the plugin's own: a ready gate waiting on its approver, a ready ticket waiting to be scheduled against work already under way, and a binding that has woken by requeue alone with an unchanged wait (BB-154). */
+export type EscalationKind = (typeof ESCALATION_KINDS)[number] | "approval" | "schedule" | "stall";
 
 const phaseSchema = z
   .object({

@@ -417,6 +417,20 @@ export const LESSON_PR_MIGRATIONS = [`ALTER TABLE lessons ADD COLUMN pr TEXT`, `
 // playbook's reviewer model, exactly as a worker model override does.
 export const REVIEWER_MODEL_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN model_reviewer TEXT`];
 
+// BB-154: a binding whose steward reported a free-text `waitingOn` and has no
+// structured source that will wake it (`no_wake_source`), the wake reason that
+// preceded its last report (`last_wake_reason`), and the consecutive
+// requeue-only wakes with the same wait (`requeue_wake_count`,
+// `requeue_wait_text`, `requeue_first_at`). Additive and defaulted: an old row
+// reads as not marked, with no wake reason and no run under way.
+export const WAKE_SOURCE_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN no_wake_source INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE bindings ADD COLUMN last_wake_reason TEXT`,
+  `ALTER TABLE bindings ADD COLUMN requeue_wake_count INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE bindings ADD COLUMN requeue_wait_text TEXT`,
+  `ALTER TABLE bindings ADD COLUMN requeue_first_at INTEGER`,
+];
+
 // BB-35 step 6: the hand-written guidance's meter. One row per (project, unit,
 // binding): the distinct-binding count is the number of rows, and the newest
 // `last_cited_at` is when it was last cited. The unit's file and text are kept
@@ -466,7 +480,7 @@ export const ACTOR_MIGRATIONS = [
     WHERE CASE WHEN json_valid(status) THEN json_extract(status, '$.actor') END = 'me'`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS];
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -643,6 +657,16 @@ export type Binding = {
   idleWokenAt: number | null;
   /** A worker finish asked for an idle look at once, without the grace (BB-83). */
   idleWakeNow: boolean;
+  /** The steward reported a free-text wait with nothing the plugin tracks to wake it (BB-154). */
+  noWakeSource: boolean;
+  /** The reason the last wake was delivered (BB-154); cleared by the report it produced. */
+  lastWakeReason: string | null;
+  /** Consecutive requeue-only wakes with the same wait (BB-154). */
+  requeueWakeCount: number;
+  /** The trimmed wait the run is counting, or null (BB-154). */
+  requeueWaitText: string | null;
+  /** When the run's first wait was reported, or null (BB-154). */
+  requeueFirstAt: number | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -709,6 +733,11 @@ function rowToBinding(r: BindingRow): Binding {
     idleSince: num("idle_since"),
     idleWokenAt: num("idle_woken_at"),
     idleWakeNow: Number(r.idle_wake_now ?? 0) === 1,
+    noWakeSource: Number(r.no_wake_source ?? 0) === 1,
+    lastWakeReason: str("last_wake_reason"),
+    requeueWakeCount: Number(r.requeue_wake_count ?? 0),
+    requeueWaitText: str("requeue_wait_text"),
+    requeueFirstAt: num("requeue_first_at"),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -766,6 +795,11 @@ const COLUMNS = {
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",
   idleWakeNow: "idle_wake_now",
+  noWakeSource: "no_wake_source",
+  lastWakeReason: "last_wake_reason",
+  requeueWakeCount: "requeue_wake_count",
+  requeueWaitText: "requeue_wait_text",
+  requeueFirstAt: "requeue_first_at",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -795,6 +829,8 @@ const VISIBLE_COLUMNS = [
   "ending",
   "ended_at",
   "thread_id",
+  // BB-154: the mark changes line two's phrase, so its write rings the channel.
+  "no_wake_source",
 ] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;
 
 function toColumn(value: unknown): unknown {
@@ -1415,6 +1451,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         pending: b.pending,
         requeueAt: b.requeueAt,
         waitingOn: b.status?.waitingOn ?? null,
+        noWakeSource: b.noWakeSource,
         // The lost-hand-off phrase (BB-152) reads the worker statuses, so the
         // ring must too; the query is one indexed row set per status write.
         workers: workersFor.all(b.id).map(toWorker),
