@@ -130,6 +130,17 @@ export const sessionFileSchema = z
     name: z.string().max(1000).default(""),
     mimeType: z.string().max(200).default(""),
     size: z.number().int().nonnegative().default(0),
+    /**
+     * Slack's short type label ("png", "python", …). Empty (and omitted) when
+     * the service sent none, so a wake from an older service reads the same.
+     * The plugin classifies a file by this when Slack gave no useful mime type.
+     */
+    filetype: z.string().max(100).default(""),
+    /**
+     * A snippet's short text, when the service sent one. Additive and unused by
+     * Step 2, which forwards the bytes; kept so the field is not dropped.
+     */
+    preview: z.string().max(4000).default(""),
   })
   .loose();
 export type SessionFile = z.infer<typeof sessionFileSchema>;
@@ -366,6 +377,29 @@ export function setTitle(fetchImpl: FetchLike, baseUrl: string, title: SessionTi
   return postJson(fetchImpl, baseUrl, `/v1/slack/sessions/${encodeURIComponent(title.session)}/title`, { connection: title.connection, title: title.title }, okSchema, "the Slack title", signal);
 }
 
+/** One file's bytes as the service served them, with the type it answered. */
+export interface SessionFileBytes {
+  bytes: Uint8Array;
+  mimeType: string;
+}
+
+/**
+ * GET /v1/slack/sessions/{session}/files/{id}: the bytes of one file a wake
+ * named, gated exactly like a reply. The connection is a query parameter, not a
+ * body. The bytes are not logged and the request carries no name or URL; the
+ * caller bounds it with its own signal. Throws HooksRequestError with `code`
+ * "missing-scope" when the bot token lacks `files:read` (503), "not-found"
+ * (404) for an id the session never saw, "too-large" (413) and
+ * "unsupported-type" (415).
+ */
+export async function fetchSessionFile(fetchImpl: FetchLike, baseUrl: string, connection: string, session: string, id: string, signal: AbortSignal): Promise<SessionFileBytes> {
+  const url = new URL(`/v1/slack/sessions/${encodeURIComponent(session)}/files/${encodeURIComponent(id)}`, baseUrl);
+  url.searchParams.set("connection", connection);
+  const response = await fetchImpl(url, { headers: { accept: "*/*" }, signal });
+  if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to the Slack file fetch`, response.status, await response.text().catch(() => ""));
+  return { bytes: new Uint8Array(await response.arrayBuffer()), mimeType: response.headers.get("content-type") ?? "" };
+}
+
 export type SessionEphemeral = {
   connection: string;
   /** The channel the wake delivered to this connection. */
@@ -454,6 +488,8 @@ export interface HooksLoop {
   status(session: string, status: string, signal: AbortSignal): Promise<void>;
   /** Set the assistant conversation title on a Slack session. */
   title(session: string, title: string, signal: AbortSignal): Promise<void>;
+  /** Fetch one file a wake named. Throws HooksRequestError, or an Error when there is no connection. */
+  fetchFile(session: string, id: string, signal: AbortSignal): Promise<SessionFileBytes>;
   /** Post an ephemeral message, visible only to the connection's own bound user. */
   ephemeral(ephemeral: Omit<SessionEphemeral, "connection">, signal: AbortSignal): Promise<void>;
   /** Have the bot join a public channel. Throws HooksRequestError, or an Error when there is no connection. */
@@ -665,6 +701,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
 
     async title(session, title, signal) {
       await setTitle(deps.fetch, deps.baseUrl, { session, connection: requireConnection(), title }, signal);
+    },
+
+    async fetchFile(session, id, signal) {
+      return fetchSessionFile(deps.fetch, deps.baseUrl, requireConnection(), session, id, signal);
     },
 
     async ephemeral(ephemeral, signal) {

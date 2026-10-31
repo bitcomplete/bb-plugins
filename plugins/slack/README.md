@@ -143,6 +143,26 @@ Until both are done, no untagged reply reaches bb. After the reinstall, the
 service receives every message in every channel the bot is in; it acks and
 drops everything that is not in a followed thread.
 
+## Attachments
+
+An image or a small text-like file attached to a Slack message is fetched
+from bb-gate-hooks (`GET /v1/slack/sessions/{session}/files/{id}`) and
+forwarded into the bb thread as an input part with the text, before the turn
+starts. Images (png, jpeg, gif, webp) up to 10 MiB and text-like files up to
+1 MiB are forwarded; a file that is not one of those, or is over its cap, is
+named in the Step 1 line instead: "N files were attached and not forwarded:
+name (type, size), …". A forwardable file whose fetch fails or times out is
+named in a "could not fetch <name>" line. The turn runs either way and is
+never held for a file.
+
+The bytes are uploaded as a bb project attachment and sent as a
+`localImage`/`localFile` input part; the plugin writes no file itself and
+never logs a name, byte or URL. Forwarding needs the bot scope `files:read` on
+the team app, added by hand with a reinstall (the by-hand step is in
+`bb-gate/README.md`). Until that is done the endpoint answers 503
+`missing-scope`, and every file stays on the "not forwarded" line exactly as
+before.
+
 ## Editing and deleting a message
 
 bb-gate-hooks routes an edit or a deletion of a DM to the conversation's
