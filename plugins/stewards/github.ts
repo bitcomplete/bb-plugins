@@ -80,6 +80,12 @@ export interface GithubWriter {
   /** Squash-merge the pull request, with the given commit title and message; returns the merge commit sha when GitHub reports one. */
   squashMerge(repo: string, number: number, title: string, body: string): Promise<{ sha: string | null }>;
   /**
+   * A pull request's title and body, for the squash merge commit (BB-193).
+   * Null when GitHub has no readable title, or when the read fails; the caller
+   * then falls back to its own placeholder title.
+   */
+  pullDetails(repo: string, number: number): Promise<{ title: string; body: string } | null>;
+  /**
    * The repo-relative paths a pull request changes, for the decide list. When
    * absent, or when the read fails, the plugin cannot classify the pull
    * request and treats it as the user's (fail closed).
@@ -149,6 +155,12 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       const merged = (await response.json().catch(() => null)) as { sha?: unknown } | null;
       const sha = merged?.sha;
       return { sha: typeof sha === "string" && sha !== "" ? sha : null };
+    },
+    async pullDetails(repo, number) {
+      const response = await request("GET", `/repos/${repo}/pulls/${number}`, undefined);
+      const body = (await response.json().catch(() => null)) as { title?: unknown; body?: unknown } | null;
+      if (body === null || typeof body.title !== "string" || body.title.trim() === "") return null;
+      return { title: body.title, body: typeof body.body === "string" ? body.body : "" };
     },
     async files(repo, number) {
       const response = await request("GET", `/repos/${repo}/pulls/${number}/files?per_page=100`, undefined);

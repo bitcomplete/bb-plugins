@@ -86,6 +86,8 @@ function world() {
   let pullNumber = 0;
   let createPullError: string | null = null;
   let mergePullError: string | null = null;
+  /** A forced failure for `github.pullDetails`, to exercise the merge title fallback (BB-193). */
+  let pullDetailsError: string | null = null;
   /** The changed paths `github.files` reports, by "owner/repo#n". */
   const githubFiles = new Map<string, string[]>();
   /** Overrides for `github.fileContent`, by "owner/repo#n:path". */
@@ -102,6 +104,15 @@ function world() {
       if (mergePullError !== null) throw new Error(mergePullError);
       githubMerges.push({ repo, number, title, body });
       return { sha: "c".repeat(40) };
+    },
+    // The real writer reads the pull request's title and body from GitHub; the
+    // fake reads the entity the test registered, so a merge test gets the PR's
+    // own title unless it forces a read failure (BB-193).
+    pullDetails: async (repo: string, number: number) => {
+      if (pullDetailsError !== null) throw new Error(pullDetailsError);
+      const entity = entities.get(`${repo}#${number}`);
+      if (entity === undefined || entity.title === null || entity.title.trim() === "") return null;
+      return { title: entity.title, body: entity.description ?? "" };
     },
     files: async (repo: string, number: number) => {
       const explicit = githubFiles.get(`${repo}#${number}`);
@@ -393,7 +404,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -5412,9 +5423,8 @@ describe("needs you items", () => {
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, client);
     expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Merged/u) });
     expect(t.githubMerges).toHaveLength(1);
-    expect(t.githubMerges[0]).toMatchObject({ repo: "acme/web", number: 7, title: "Merge acme/web#7" });
-    expect(t.githubMerges[0]!.body).toMatch(/Merged: owner-reviewed lane, reviewer approved aaaaaaa, checks green, approved by the owner/u);
-    expect(t.githubComments.at(-1)!.body).toMatch(/Merged: owner-reviewed lane/u);
+    expect(t.githubMerges[0]).toMatchObject({ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." });
+    expect(t.githubComments.at(-1)!.body).toMatch(/Merged: owner-reviewed lane, reviewer approved aaaaaaa, checks green, approved by the owner/u);
     expect(t.hooks.store.need(need.id)!.status).toBe("done");
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/What changed[\s\S]*merged from the Stewards page/u);
@@ -10314,7 +10324,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(merged.stdout).toMatch(/Merged: no-review lane, reviewer approved aaaaaaa, checks green/u);
-    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
     const comment = t.githubComments.at(-1)!;
     expect(comment.body).toMatch(/Merged: no-review lane, reviewer approved aaaaaaa, checks green/u);
     expect(comment.body).toMatch(/merge commit cccccccccccccccccccccccccccccccccccccccc/u);
@@ -10328,7 +10338,31 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"], { threadId: "thr_w1", projectId: "p1" });
     expect(merged.exitCode).toBe(0);
-    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
+  });
+
+  it("carries the pull request's title and body into the squash merge, and falls back to the key when they cannot be read (BB-193)", async () => {
+    // The happy path: GitHub's own squash subject, with the PR body as the
+    // message, and no "Merged:" summary in the commit.
+    const t = await withPull([reviewMarker("no-review")]);
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
+    expect(t.githubComments.at(-1)!.body).toMatch(/Merged: no-review lane, reviewer approved aaaaaaa, checks green/u);
+
+    // A read that fails falls back to the old placeholder rather than refusing
+    // a merge whose gate is met.
+    const failed = await withPull([reviewMarker("no-review")]);
+    failed.setPullDetailsError("GitHub rate limited the read");
+    const failedMerge = await failed.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(failedMerge.exitCode).toBe(0);
+    expect(failed.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
+
+    // A pull request GitHub reports with no title falls back the same way.
+    const untitled = await withPull([reviewMarker("no-review")], { entityOver: { title: null } });
+    const untitledMerge = await untitled.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(untitledMerge.exitCode).toBe(0);
+    expect(untitled.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
   });
 
   it("names the approved sha and the since-then line when the head moved past it", async () => {
