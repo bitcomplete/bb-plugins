@@ -1657,8 +1657,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // ---- the settings and sign-in surface ----------------------------------
 
     /**
-     * The projects that have an active provider environment or a checkout on a
-     * connected machine, by project id. The routing editor warns beside a row
+     * The projects that have a machine to run a Slack thread on, by project id.
+     * A personal project has one whenever anything is connected: its
+     * `personal-workspace` environment retires after the thread ends and it
+     * never has a checkout, but `environmentFor` starts it on any connected
+     * machine. Every other project needs an active provider environment or a
+     * checkout on a connected machine. The routing editor warns beside a row
      * whose project is missing from this set: a Slack thread there has no
      * machine it is known to run on.
      */
@@ -1673,6 +1677,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (environment.environmentProviderId !== null && environment.lifecycle.phase === "active" && connected.has(environment.hostId)) ready.add(environment.projectId);
       }
       for (const project of all) {
+        if (project.kind === "personal" && connected.size > 0) ready.add(project.id);
         if (project.sources.some((source) => source.type === "local_path" && connected.has(source.hostId))) ready.add(project.id);
       }
       return ready;
