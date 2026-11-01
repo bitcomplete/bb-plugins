@@ -188,10 +188,15 @@ Repeat until the merge gate below is met:
    - Reviewer **Blockers**: fix each one or, if you believe it is wrong,
      do not change the code and write why in your PR reply. A blocker you
      dispute is still open until the reviewer accepts the argument.
+   - A **PR body correction** the reviewer asks for (the Classification
+     line, a wrong image name, a stale testing note): edit the body and
+     say so in your reply. The marker's lane is what the gate reads, so
+     this never needs a round.
    - Reviewer **Suggestions**, on every round including an `approved`
      one: take the ones that improve the change within the ticket's
      scope; decline the rest with a one-line reason. Every suggestion
-     gets an answer in your PR reply before the merge gate is checked.
+     gets an answer in your PR reply before the merge gate is checked;
+     one line each, and when there were none, say nothing about them.
    - **Human** review comments: address them the same way.
    - **Failing checks**: fix them.
    Reply on the PR with one comment listing each point and what you did
