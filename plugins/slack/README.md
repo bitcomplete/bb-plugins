@@ -51,7 +51,10 @@ on the pod.
   the way to it. The first start after this version hides the threads of the
   conversations already in the map. List the hidden threads with
   `bb thread list --include-hidden`, or bring one back with
-  `bb thread update <id> --visibility visible`.
+  `bb thread update <id> --visibility visible`. A thread spawned from a hidden
+  one inherits the hidden visibility, so a worker a Slack conversation starts
+  is hidden too; pass `--visibility visible` to a `bb thread spawn` that should
+  show in the sidebar.
 - **Replies.** The plugin never holds the bot token. `slack_reply` posts
   through bb-gate-hooks with the connection id and the text; the service posts
   as the app. The text may be Markdown: the plugin converts it to Slack mrkdwn
