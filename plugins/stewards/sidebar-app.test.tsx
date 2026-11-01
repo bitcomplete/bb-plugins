@@ -184,6 +184,11 @@ const glyphOf = (slot: RenderedSlot, title: string): string | null => slot.getBy
 const glyphClassOf = (slot: RenderedSlot, title: string): string => slot.getByText(title).closest("li")!.querySelector("[data-steward-glyph]")!.className;
 const phraseClassOf = (slot: RenderedSlot, title: string): string => slot.getByText(title).closest("li")!.querySelector("[data-sidebar-line-two] span")!.className;
 
+// BB-182: the thread actions a row's hover controls read, in bb's own key shape.
+const archiveEntry = (run: () => void = () => {}) => [
+  { key: "bb--core/archive", pluginId: "bb--core", group: "4_lifecycle", action: { label: "Archive", icon: "Archive", run } },
+];
+
 let app: CapturedPluginApp | null = null;
 const loadApp = async () => {
   app ??= await loadPluginApp(() => import("./app.js"));
@@ -235,7 +240,10 @@ describe("the stewards sidebar list (BB-44)", () => {
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     // Line one: the shortened key and the title, the key stripped from the title.
     expect(slot.getByText("ENG-1")).toBeTruthy();
-    expect(slot.container.querySelector('[title="ENG-1"]')).not.toBeNull();
+    // BB-182: the effort row carries no row-level title (with the hover actions
+    // inside it, a native tooltip would cover the Archive button); the full
+    // title stays on the link text.
+    expect(slot.getByText("Fix login").closest("a")!.getAttribute("title")).toBe("ENG-1: Fix login");
     // Line two: kind, phase, phrase; no stage text anywhere.
     expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · wait for the review");
     expect(slot.queryByText("build")).toBeNull();
@@ -389,6 +397,116 @@ describe("the stewards sidebar list (BB-44)", () => {
     expect(menu).not.toBeNull();
     fireEvent.contextMenu(menu!);
     await waitFor(() => expect(slot.getByRole("menuitem", { name: "Archive" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  // BB-182: stewards rows take bb's own row height, hover/selected tokens and
+  // hover actions, and the effort row's second line lines up with its title.
+  it("gives live-thread rows bb's height, hover tokens and hover actions, and lines up the effort's second line", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: "A one-off thread" })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+      threadActions: () => archiveEntry() as never,
+    });
+    const effortAnchor = (await waitFor(() => slot.getByText("Fix login"))).closest("a")!;
+    const effort = effortAnchor.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    expect(effort.className).toContain("min-h-[var(--bb-sidebar-row-height)]");
+    expect(effort.className).toContain("py-1");
+    expect(effort.className).toContain("bb-sidebar-hover-actions-row");
+    expect(effort.className).toContain("hover:bg-sidebar-accent");
+    expect(effort.className).toContain("text-sidebar-foreground");
+    expect(effort.style.paddingLeft).toBe("8px");
+    // The line two padding is the title's offset: the base 8px plus the two
+    // 16px chevron/status slots and their 4px gaps put the title 40px into the
+    // row's content box, and line two carries exactly that.
+    const lineTwo = effort.querySelector("[data-sidebar-line-two]") as HTMLElement;
+    expect(lineTwo.style.paddingLeft).toBe("40px");
+    expect(parseInt(effort.style.paddingLeft, 10) + parseInt(lineTwo.style.paddingLeft, 10)).toBe(48);
+    // The Archive button and the thread-actions trigger are the only two hover
+    // actions, in bb's reveal wrapper.
+    const actions = effort.querySelector(".bb-sidebar-hover-actions")!;
+    expect(actions.getAttribute("data-sidebar-row-actions")).toBe("");
+    expect(actions.querySelector('[data-thread-action="bb--core/archive"]')!.getAttribute("aria-label")).toBe("Archive");
+    expect(actions.querySelector("[data-thread-actions-trigger]")!.getAttribute("aria-label")).toBe("Thread actions");
+    // A one-line thread row takes bb's fixed height, not the old py-0.5.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    const oneOffAnchor = (await waitFor(() => slot.getByText("A one-off thread"))).closest("a")!;
+    const oneOff = oneOffAnchor.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    expect(oneOff.className).toContain("h-[var(--bb-sidebar-row-height)]");
+    expect(oneOff.className).not.toContain("py-0.5");
+    slot.lifecycle.unmount();
+  });
+
+  it("gives a Recently ended row with no live thread no hover actions", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding()],
+            ended: [{ key: "ENG-0", kind: "ticket", threadId: null, title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }],
+          }),
+      } as never,
+      threadActions: () => archiveEntry() as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
+    const ended = await waitFor(() => slot.getByText("Old work"));
+    const row = ended.closest(".bb-sidebar-hover-actions-row")!;
+    expect(row.querySelector(".bb-sidebar-hover-actions")).toBeNull();
+    expect(row.querySelector('[data-thread-action="bb--core/archive"]')).toBeNull();
+    expect(row.querySelector("[data-thread-actions-trigger]")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps the hover-action buttons from navigating the row", async () => {
+    const archive = vi.fn();
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+      threadActions: () => archiveEntry(archive) as never,
+    });
+    const button = await waitFor(() => slot.getByRole("button", { name: "Archive" }));
+    fireEvent.click(button);
+    expect(archive).toHaveBeenCalledTimes(1);
+    expect(slot.inspection.navigateCalls).toHaveLength(0);
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps the project-steward and ended stamps out from under the hover actions", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_ps", displayTitle: "Project steward" }),
+          thread({ id: "thr_old", displayTitle: "ENG-0: Old work" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding()],
+            projectStewardThreadId: "thr_ps",
+            ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }],
+          }),
+      } as never,
+      threadActions: () => archiveEntry() as never,
+    });
+    // The project-steward label lives inside the title's inset content span, so
+    // the hover actions take the right edge without covering it.
+    const ps = await waitFor(() => slot.getByText("project steward"));
+    expect(ps.closest(".bb-sidebar-hover-actions-inset")).not.toBeNull();
+    // The same for a Recently ended row whose steward thread is still live.
+    fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
+    const ended = await waitFor(() => slot.getByText("Old work"));
+    const row = ended.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    const inset = row.querySelector(".bb-sidebar-hover-actions-inset")!;
+    expect(inset.querySelector("a")).not.toBeNull();
+    expect(inset.textContent).toMatch(/ago/u);
     slot.lifecycle.unmount();
   });
 
@@ -1081,7 +1199,7 @@ describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
     );
     const worker = await waitFor(() => slot.getByText("Implement retry"));
     expect(worker.closest("a")!.getAttribute("aria-current")).toBe("page");
-    expect(worker.closest("a")!.parentElement!.className).toContain("bg-state-active");
+    expect(worker.closest(".bb-sidebar-hover-actions-row")!.className).toContain("bg-state-active");
     slot.lifecycle.unmount();
   });
 
