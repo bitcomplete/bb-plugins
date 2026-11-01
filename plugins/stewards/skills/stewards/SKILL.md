@@ -58,7 +58,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   action waits on one of your own workers, name that worker in `waitingOn`
   (its thread id or its title): the plugin wakes you the moment it finishes,
   even while its pull request is still open, and a `waitingOn` you leave on a
-  finished worker reads `hand-off lost: worker finished`. On a ticket, report the ready
+  finished worker reads `hand-off lost: worker finished`. `cites` names the
+  lessons (`lsn_…`) and hand-written guidance units (`gu_…`) the turn acted
+  on: the plugin counts a hit once per distinct binding and `bb stewards
+  lessons` shows it, an unknown id is ignored and named in the reply, and a
+  citation never counts as a correction. On a ticket, report the ready
   checklist too, each item by its number in the wake
   (`{ item: 1, met: true }`); a paraphrase is refused. Three turns in a row
   without a report raise `stuck`. When only the user can do something — a
@@ -393,11 +397,13 @@ their answer goes against your recommendation you are woken once, in your
 thread, to ask why — one follow-up, then record the reasoning as a lesson
 candidate. That lesson carries the escalation's cluster key and settles the
 cluster for good, so the same why is never asked on the page again even after
-a much later repeat. A resolve carries `cites: [ids]`: the lessons (`lsn_…`)
-and the hand-written guidance units (`gu_…`, a paragraph of `AGENTS.md` or a
-playbook keyed by a hash of its own text) the decision rested on. The plugin
-counts hits (once per distinct binding), corrections and last citation from
-them. Only an anchored `<!-- lesson:<id> -->` block is ever written or
+a much later repeat. A resolve carries `cites: [ids]`, and so does a
+`steward_report` for a turn that acted on lessons: the lessons (`lsn_…`) and
+the hand-written guidance units (`gu_…`, a paragraph of `AGENTS.md` or a
+playbook keyed by a hash of its own text) the decision or turn rested on. The
+plugin counts hits (once per distinct binding) and last citation from them;
+only a project steward's resolve or forward can turn its cites into a
+correction. Only an anchored `<!-- lesson:<id> -->` block is ever written or
 removed; a hand-written unit is never retired. `bb stewards lessons [--all]`
 shows each lesson's counts and `bb stewards lessons --efficacy` prints the
 escalation-to-user trend and the hand-written units uncited for 90 days. A recorded lesson starts as a

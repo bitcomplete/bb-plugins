@@ -1030,7 +1030,7 @@ function trialLessonsLines(lessons: Lesson[]): string[] {
     "",
     "## Lessons (trial)",
     "",
-    "Project rules that are not in `.bb` yet. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.",
+    "Project rules that are not in `.bb` yet. Decide from them, and cite the ones you acted on in `steward_report { cites: [lesson ids] }`, so a lesson a ticket steward applies directly still earns its hits (a resolve or forward carries `cites` too). A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.",
     ...trial.map((l) => `- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`),
   ];
 }
@@ -1046,7 +1046,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
   const out: string[] = [];
   const trial = lessons.filter((l) => l.tier === "trial").slice(0, cap);
   if (trial.length > 0) {
-    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.");
+    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `steward_update { resolve, cites: [lesson ids] }` (or `{ forward, cites }`), or the ones a turn acted on in `steward_report { cites: [lesson ids] }`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.");
     for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`);
   }
   const toLand = lessons.filter((l) => l.tier === "promoted" && l.status === "pending");

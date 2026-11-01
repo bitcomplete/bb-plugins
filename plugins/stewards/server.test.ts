@@ -3882,6 +3882,57 @@ describe("questions to the user", () => {
       expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ corrections: 0 });
       expect(t.hooks.store.escalation(t.esc)).toMatchObject({ correctionsCounted: false });
     });
+
+    /** A project with a recorded lesson and a ticket steward's binding, no citation yet. */
+    async function withLesson() {
+      const t = await adopted();
+      const recorded = await t.tool("steward_update", { lesson: { text: "Close a bb-gate-only merge ticket when the watch times out.", file: "AGENTS.md", scope: "procedure" } }, t.project);
+      return { ...t, lesson: /(lsn_[\w-]+)/u.exec(recorded.text)![1]! };
+    }
+
+    // BB-183: a ticket steward's steward_report carries the same cites as a
+    // project steward's resolve, so a procedure lesson a ticket steward
+    // applies directly still earns its hits. Counts only, never a correction.
+    it("counts a ticket steward's report cite once per distinct binding", async () => {
+      const t = await withLesson();
+      const base = { phase: "In Progress", summary: "Watching the deploy.", nextAction: "Wait", actor: "steward" };
+      const first = await t.tool("steward_report", { ...base, cites: [t.lesson] }, t.steward);
+      expect(first.error).toBe(false);
+      expect(first.text).toMatch(new RegExp(`cited 1 lesson: ${t.lesson} \\(1 binding\\)`, "u"));
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1, corrections: 0, citedBindings: [t.hooks.store.find("ENG-12")!.id] });
+      // A repeat from the same binding refreshes the time but adds no hit.
+      const again = await t.tool("steward_report", { ...base, cites: [t.lesson] }, t.steward);
+      expect(again.error).toBe(false);
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1 });
+      // `bb stewards lessons` shows the hit whichever steward kind cited it.
+      const out = await t.harness.behavior.runCli(["lessons", "--all", "--project", "p1"]);
+      expect(out.stdout).toMatch(/1 binding, 0 corrections/u);
+    });
+
+    it("accepts a report with an unknown cite and names it without failing", async () => {
+      const t = await withLesson();
+      const reported = await t.tool("steward_report", { phase: "Todo", summary: "Specifying.", nextAction: "Wait", actor: "steward", cites: [t.lesson, "lsn_nope"] }, t.steward);
+      expect(reported.error).toBe(false);
+      expect(reported.text).toMatch(/not counted \(no such lesson in this project\): lsn_nope/u);
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1 });
+    });
+
+    it("never counts a ticket steward's report cite as a correction", async () => {
+      const t = await withLesson();
+      // The ticket steward escalates, and the project steward forwards with a
+      // recommendation but no cite, so the escalation is uncited.
+      await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+      const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+      const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc, recommendation: "Leave SSO out." }, t.project);
+      const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+      // The report cites the lesson, but the escalation stays uncited.
+      await t.tool("steward_report", { phase: "Todo", summary: "Wait for the answer.", nextAction: "Wait", actor: "steward", cites: [t.lesson] }, t.steward);
+      expect(t.hooks.store.escalation(esc)).toMatchObject({ citedLessons: [] });
+      // The owner's answer goes against the recommendation; with no citation on
+      // the escalation there is no correction.
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: "No, keep SSO." }, client)).toMatchObject({ ok: true });
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1, corrections: 0 });
+    });
   });
 
   // BB-13: one spec approval, from any surface. The page answer, the project

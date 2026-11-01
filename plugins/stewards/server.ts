@@ -1571,6 +1571,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Count the lessons and hand-written guidance units one decision or report
+     * rested on (BB-35 steps 2 and 6). A lesson's `hits` counts distinct
+     * bindings: a second citation from the same binding refreshes
+     * `lastCitedAt` but does not count again. A citation with no binding — a
+     * project-steward decision about no one binding — counts once per project.
+     * Unknown ids are returned, never counted. Counts only: no tier, no
+     * transition, nothing written to `.bb`.
+     */
+    async function countCitations(projectId: string, bindingId: string, cites: readonly string[]): Promise<{ cited: Lesson[]; citedUnits: GuidanceUnit[]; unknown: string[]; unknownUnits: string[] }> {
+      const unique = [...new Set(cites)];
+      const lessonIds = unique.filter((id) => !id.startsWith(GUIDANCE_UNIT_PREFIX));
+      const guidanceIds = unique.filter((id) => id.startsWith(GUIDANCE_UNIT_PREFIX));
+      const { cited, unknown } = store.recordCitations(projectId, lessonIds, bindingId);
+      const index = guidanceIds.length === 0 ? [] : await guidanceUnits(projectId);
+      const handWritten = new Map(index.filter((u) => u.lessonId === null).map((u) => [u.id, u]));
+      const citedUnits = guidanceIds.map((id) => handWritten.get(id)).filter((u): u is GuidanceUnit => u !== undefined);
+      const unknownUnits = guidanceIds.filter((id) => !handWritten.has(id));
+      if (citedUnits.length > 0) store.recordGuidanceCitations(projectId, citedUnits, bindingId);
+      return { cited, citedUnits, unknown, unknownUnits };
+    }
+
+    /** The "cited …" and "not counted …" lines a citation adds to a tool reply. */
+    function citationLines(result: { cited: Lesson[]; citedUnits: GuidanceUnit[]; unknown: string[]; unknownUnits: string[] }): string[] {
+      const out: string[] = [];
+      if (result.cited.length === 0 && result.citedUnits.length === 0) out.push("no lesson or guidance unit cited");
+      else {
+        const parts: string[] = [];
+        if (result.cited.length > 0) parts.push(`${result.cited.length} lesson${result.cited.length === 1 ? "" : "s"}: ${result.cited.map((l) => `${l.id} (${l.hits} binding${l.hits === 1 ? "" : "s"})`).join(", ")}`);
+        if (result.citedUnits.length > 0) parts.push(`${result.citedUnits.length} guidance unit${result.citedUnits.length === 1 ? "" : "s"}: ${result.citedUnits.map((u) => `${u.id} (${u.file})`).join(", ")}`);
+        out.push(`cited ${parts.join("; ")}`);
+      }
+      if (result.unknown.length > 0) out.push(`not counted (no such lesson in this project): ${result.unknown.join(", ")}`);
+      if (result.unknownUnits.length > 0) out.push(`not counted (no such guidance unit at .bb HEAD): ${result.unknownUnits.join(", ")}`);
+      return out;
+    }
+
+    /**
      * The local, per-project switch, keyed by project id: whether this server
      * stewards the project. It lives in the plugin's kv, so a recreated project
      * (a new id) starts off again, and it is off until switched on. `.bb`'s
@@ -6854,7 +6891,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "steward_report",
       description:
-        "End a steward's turn with its status record: where the entity is, what happens next and who does it, what it waits on, and when to wake it if nothing else does. Also records the ready-gate checklist, voids an approval when the spec changed materially, raises an escalation when something is not yours to decide, and, after a terminal state, keeps the binding open while work remains. Required at the end of every turn you were woken for.",
+        "End a steward's turn with its status record: where the entity is, what happens next and who does it, what it waits on, and when to wake it if nothing else does. Also records the ready-gate checklist, cites the lessons and hand-written guidance units the turn acted on, voids an approval when the spec changed materially, raises an escalation when something is not yours to decide, and, after a terminal state, keeps the binding open while work remains. Required at the end of every turn you were woken for.",
       presentation: { label: { pending: "Reporting status", completed: "Reported status" } },
       parameters: z.object({
         phase: z.string().trim().min(1).max(100).describe("The entity's phase as you understand it, usually its state."),
@@ -6887,6 +6924,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(40)
           .optional()
           .describe('The repo-relative paths this work changes, repo directory first ("bb-plugins/plugins/stewards", "bb-gate/docker/bb-server"); the whole set, replacing what was reported before. The project steward schedules tickets that touch the same paths one after another. Report it once the spec names the affected repos; refine it as pull requests open.'),
+        cites: z
+          .array(z.string().trim().min(1).max(100))
+          .max(20)
+          .optional()
+          .describe("The lesson ids (lsn_…) and hand-written guidance unit ids (gu_…) this turn acted on. A lesson's hits count once per distinct binding, so a repeat from the same binding adds none, and they feed the promotion and retirement thresholds exactly as a resolve's cites do. Unknown ids are ignored and named in the reply; the report never fails because of them. A citation never counts as a correction: corrections stay a project-steward act."),
         noMorePulls: z
           .boolean()
           .optional()
@@ -7280,15 +7322,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             store.note(b.id, START_WORKER_WAKE, false);
             scheduleReconcile(b.id);
           }
+          // BB-35 step 2: a report may cite the lessons and hand-written
+          // guidance units the turn acted on, so a lesson a ticket steward
+          // applies directly still earns its hits. Counts only, and never a
+          // correction: an unknown id is ignored and named, never a failure.
+          const citesNote = input.cites === undefined ? "" : ` ${citationLines(await countCitations(b.projectId, b.id, input.cites)).join("; ")}.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
-            return `Reported.${replacedNote}${recorded}${refusalNote}${escalated} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
+            return `Reported.${replacedNote}${recorded}${refusalNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          return `Reported.${replacedNote}${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+          return `Reported.${replacedNote}${recorded}${refusalNote}${gateNote}${escalated}${citesNote} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
         } catch (error) {
           return toolError(error);
         }
@@ -7650,26 +7697,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // name a lesson (`lsn_…`) or a hand-written guidance unit (`gu_…`),
             // resolved against `.bb` HEAD. Counts only: nothing is promoted,
             // retired or written to `.bb` here.
-            const unique = [...new Set(input.cites)];
-            const lessonIds = unique.filter((id) => !id.startsWith(GUIDANCE_UNIT_PREFIX));
-            const guidanceIds = unique.filter((id) => id.startsWith(GUIDANCE_UNIT_PREFIX));
-            const { cited, unknown } = store.recordCitations(target.projectId, lessonIds, target.id);
+            const result = await countCitations(target.projectId, target.id, input.cites);
             const citeTarget = resolving ?? forwarding;
-            if (citeTarget !== null) store.setEscalationCitations(citeTarget.id, cited.map((l) => l.id));
-            const index = guidanceIds.length === 0 ? [] : await guidanceUnits(target.projectId);
-            const handWritten = new Map(index.filter((u) => u.lessonId === null).map((u) => [u.id, u]));
-            const citedUnits = guidanceIds.map((id) => handWritten.get(id)).filter((u): u is GuidanceUnit => u !== undefined);
-            const unknownUnits = guidanceIds.filter((id) => !handWritten.has(id));
-            if (citedUnits.length > 0) store.recordGuidanceCitations(target.projectId, citedUnits, target.id);
-            if (cited.length === 0 && citedUnits.length === 0) done.push("no lesson or guidance unit cited");
-            else {
-              const parts: string[] = [];
-              if (cited.length > 0) parts.push(`${cited.length} lesson${cited.length === 1 ? "" : "s"}: ${cited.map((l) => `${l.id} (${l.hits} binding${l.hits === 1 ? "" : "s"})`).join(", ")}`);
-              if (citedUnits.length > 0) parts.push(`${citedUnits.length} guidance unit${citedUnits.length === 1 ? "" : "s"}: ${citedUnits.map((u) => `${u.id} (${u.file})`).join(", ")}`);
-              done.push(`cited ${parts.join("; ")}`);
-            }
-            if (unknown.length > 0) done.push(`not counted (no such lesson in this project): ${unknown.join(", ")}`);
-            if (unknownUnits.length > 0) done.push(`not counted (no such guidance unit at .bb HEAD): ${unknownUnits.join(", ")}`);
+            if (citeTarget !== null) store.setEscalationCitations(citeTarget.id, result.cited.map((l) => l.id));
+            done.push(...citationLines(result));
           }
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
