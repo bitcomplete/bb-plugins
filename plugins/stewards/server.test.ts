@@ -4883,7 +4883,7 @@ describe("needs you items", () => {
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, client);
-    expect(res).toMatchObject({ ok: false, message: expect.stringMatching(/worker is still running/u) });
+    expect(res).toMatchObject({ ok: false, message: expect.stringMatching(/Worker thr_w1 is mid-turn/u) });
     expect(t.githubMerges).toEqual([]);
   });
 
@@ -5319,7 +5319,73 @@ describe("needs you items", () => {
     await t.ring("linear", "uuid-12");
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "a worker is still running" });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
+    // A finished worker is a pause between turns, not a running one: the item
+    // is actionable again (BB-175).
+    t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+  });
+
+  it("filing a merge need stops the binding's in-flight workers (BB-175)", async () => {
+    const t = await withPull([marker]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    // The owner approves while the worker's turn is in flight: the plugin
+    // withholds its own merge item, so the steward files one (the HUB-218
+    // shape).
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.binding();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    const report = await t.tool(
+      "steward_report",
+      { ...base, actor: "user", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7" }] },
+      t.steward,
+    );
+    expect(report.error).toBe(false);
+    // Filing the item stopped the worker, in the store and through the SDK.
+    expect(t.hooks.store.workers(b.id).find((w) => w.threadId === "thr_w1")).toMatchObject({ status: "stopped" });
+    expect(t.harness.sdk.callsTo("threads.stop")).toContainEqual([{ threadId: "thr_w1" }]);
+    // With no worker running, the item is actionable.
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ filedBy: "steward" });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+  });
+
+  it("a finished worker does not block a steward-filed merge item; a running one does (BB-175)", async () => {
+    const t = await withPull([marker, owner]);
+    const b = t.binding();
+    // The plugin filed its own item; make it the steward's, as it is when a
+    // worker could not merge and handed the item to a person.
+    t.hooks.store.closeNeedByKey(b.id, "merge", "https://github.com/acme/web/pull/7", "the worker handed it to the steward");
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "steward" });
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    // A running worker's turn can race a push: the item is not actionable and
+    // the shared merge path refuses.
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false });
+    const refused = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stdout).toMatch(/Worker thr_w1 is mid-turn/u);
+    expect(t.githubMerges).toEqual([]);
+    // A finished worker is a pause between turns: the item is actionable and
+    // the merge goes through.
+    t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("the not-actionable reason names the running worker (BB-175)", async () => {
+    const t = await withPull([marker, owner]);
+    const b = t.binding();
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
+    // A finished worker is named by neither state nor thread: the item is
+    // actionable again.
+    t.hooks.store.setWorker("thr_w1", "finished", null);
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
   });
 
   it("lists open needs in the project steward's nightly digest", async () => {
@@ -9491,7 +9557,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     await busy.created("thr_w1", busy.steward, "ENG-12: Implement");
     const running = await busy.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(running.exitCode).toBe(1);
-    expect(running.stdout).toMatch(/A worker is still running on this pull request/u);
+    expect(running.stdout).toMatch(/Worker thr_w1 is mid-turn/u);
     expect(busy.githubMerges).toEqual([]);
 
     const t = await withPull([reviewMarker("no-review")]);

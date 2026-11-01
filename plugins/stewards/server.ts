@@ -68,7 +68,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
 import { latestProjectApprovalMarker, prGate } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
@@ -5835,13 +5835,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The one merge path the Stewards page's Merge button and `bb stewards
      * merge` share: recompute the gate with the project's approval records
      * and the pull request's changed files, refuse with the gate's words when
-     * it is unmet or a worker is in flight, squash-merge, post the "Merged:"
-     * comment, and close the binding's Merge need. The caller reads the pull
-     * request fresh and passes it in; `where` names the surface in the need's
-     * closure. `exceptThreadId` is the worker that is doing the merging: it is
-     * not "another worker in flight", so a worker may merge its own pull
-     * request through the CLI (BB-134). The page passes none, so its Merge
-     * item still refuses while any worker is in flight.
+     * it is unmet or a worker's turn is in progress, squash-merge, post the
+     * "Merged:" comment, and close the binding's Merge need. The caller reads
+     * the pull request fresh and passes it in; `where` names the surface in
+     * the need's closure. `exceptThreadId` is the worker that is doing the
+     * merging: it is not "another worker running", so a worker may merge its
+     * own pull request through the CLI (BB-134). The page passes none, so its
+     * Merge item still refuses while any other worker's turn is in progress.
+     * A `finished` worker is a pause between turns, not a running one, so it
+     * does not block (BB-175).
      */
     async function mergePullRequest(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot, where: string, opts: { exceptThreadId?: string } = {}): Promise<{ ok: true; summary: string; mergeSha: string | null } | { ok: false; message: string }> {
       // The same `prGate` with the project's approvals the page's Merge item
@@ -5849,7 +5851,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // merge` cannot disagree.
       const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
       if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
-      if (anyWorkerInFlight(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId))) return { ok: false, message: "A worker is still running on this pull request." };
+      const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
+      if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
       const summary = mergeSummary(gate);
       const since = sinceApproval(gate);
       const restart = await restartNoteFor(b.projectId, ref.repo);
@@ -6959,6 +6962,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // guarded this way, and filing one the gate cannot hold would be
           // closed again by syncNeeds in this same call, silently.
           const refused: string[] = [];
+          let mergeFiled = false;
           for (const n of input.needs ?? []) {
             // The plugin files the gate items (approve-spec, approve-pr, merge);
             // a credential, a step outside the repos or a decision is an
@@ -6996,7 +7000,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               data: {},
               filedBy: "steward",
             });
+            if (n.kind === "merge") mergeFiled = true;
           }
+          // BB-175: filing a merge item hands the merge to a person, so the
+          // binding's workers are done. Stop them now, keeping each result, so
+          // a `finished` record cannot deadlock the item it was filed to
+          // resolve. A steward that wants a worker to keep going wakes it
+          // instead of filing the item.
+          if (mergeFiled) await stopWorkers(b);
           const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
           if (playbook !== null && b.lastSnapshot !== null) await syncNeeds(b, b.lastSnapshot, playbook, anyWorkerInFlight(store.workers(b.id)));
           // BB-154: the mark and the requeue-only run, over the report's final
@@ -7669,9 +7680,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           actionable = gate?.needsOwnerApproval ?? false;
           why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
         } else {
-          const working = anyWorkerInFlight(store.workers(b.id));
-          actionable = (gate?.gateMet ?? false) && !working;
-          why = actionable ? null : working ? "a worker is still running" : (gate?.missing ?? "the pull request has not been observed yet");
+          // BB-175: only a running turn can race a push; a `finished` worker
+          // is a pause, and a steward-filed merge item exists because it
+          // could not merge, so it must not keep the item not actionable.
+          const busy = runningWorkerReason(store.workers(b.id));
+          actionable = (gate?.gateMet ?? false) && busy === null;
+          why = actionable ? null : busy ?? (gate?.missing ?? "the pull request has not been observed yet");
         }
       } else if (n.kind === "provide-secret") {
         // Always actionable: the page opens a requester thread and the form
@@ -8336,7 +8350,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           merge: cliCommand({
             summary: "Merge a pull request whose lane gate is met, through the same path as the Stewards page",
-            description: "Re-reads the pull request, re-checks the gate with the project's approvals, and refuses with the gate's reason when it is unmet or another worker is in flight. Otherwise squash-merges, posts the \"Merged:\" comment, and closes the binding's Merge item. Exit 1 on a refusal.",
+            description: "Re-reads the pull request, re-checks the gate with the project's approvals, and refuses with the gate's reason when it is unmet or a worker's turn is in progress. Otherwise squash-merges, posts the \"Merged:\" comment, and closes the binding's Merge item. Exit 1 on a refusal.",
             positionals: [{ name: "ref", description: "The pull request, owner/repo#N", required: true }],
             options: { project: PROJECT_OPTION },
             async run(input, ctx) {
