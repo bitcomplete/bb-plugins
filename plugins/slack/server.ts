@@ -72,6 +72,21 @@ export const PENDING_TTL_MS = 10 * 60 * 1000;
 export const FILE_FETCH_TIMEOUT_MS = 10_000;
 
 /**
+ * How long a Slack conversation may sit idle before the archive sweep takes
+ * its bb thread, unless `archiveIdleHours` says otherwise. Half the sweep's
+ * cadence, so a thread is archived within half a day of crossing it.
+ */
+export const DEFAULT_ARCHIVE_IDLE_HOURS = 48;
+/** The archive sweep's cadence. */
+export const ARCHIVE_SWEEP_INTERVAL_MS = 12 * 60 * 60 * 1000;
+/**
+ * How long after plugin start the first archive sweep runs. A restart must not
+ * leave a thread already past the threshold unarchived for up to twelve hours,
+ * but the sweep does not belong in the middle of a load.
+ */
+export const ARCHIVE_SWEEP_STARTUP_DELAY_MS = 60 * 1000;
+
+/**
  * The canned one-line greeting posted when a developer opens the assistant
  * pane. It answers the wake, so the backstop stays quiet, and no bb thread is
  * started until the first real message.
@@ -156,14 +171,21 @@ export interface SlackPluginDeps {
 }
 
 /**
- * The plugin declares no bb settings. The sign-in token and the routing map
- * live in `bb.storage.kv` and are managed only by the plugin's own Slack
- * section. bb core's Configuration section still renders because the plugin
- * registers a settings section, but it renders no declarative settings panel
- * and so no empty box.
+ * The plugin's one declarative setting: how long a Slack conversation may sit
+ * idle before the sweep archives its bb thread (BB-167). The sign-in token and
+ * the routing map are not settings — they live in `bb.storage.kv` and are
+ * managed only by the plugin's own Slack section.
  */
 export function settingDescriptors(_env: Record<string, string | undefined>) {
-  return {} as const;
+  return {
+    archiveIdleHours: {
+      type: "number",
+      label: "Archive a Slack thread after this many idle hours",
+      description:
+        "A bb thread started from a Slack conversation is archived once the conversation has been quiet this long, so it does not keep its lease, session row or capacity slot. Pinned threads, and threads with a message still waiting on your confirmation, are left alone. Set to 0 to never archive automatically.",
+      default: DEFAULT_ARCHIVE_IDLE_HOURS,
+    },
+  } as const;
 }
 
 /**
@@ -333,7 +355,7 @@ type SendOutcome =
 
 export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
-    bb.settings.define(settingDescriptors(deps.env));
+    const settings = bb.settings.define(settingDescriptors(deps.env));
     const hooksUrl = deps.env[HOOKS_URL_ENV]?.trim() ?? "";
     const checkSignal = () => AbortSignal.timeout(30_000);
 
@@ -1652,6 +1674,66 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
     bb.events.on("thread.idle", ({ thread }) => {
       void onThreadIdle(thread.id).catch((error: unknown) => bb.log.warn(`checking thread ${thread.id}'s Slack replies failed: ${errorMessage(error)}`));
+    });
+
+    // ---- the idle archive sweep --------------------------------------------
+    //
+    // The plugin owns the bb threads its Slack conversations spawn (BB-167). A
+    // conversation quiet for `archiveIdleHours` is archived so a hidden thread
+    // (BB-165) does not keep its lease, its kv session row or a capacity slot
+    // for good. The sweep runs on its own timer, not the lease renewal tick:
+    // archiving answers a different question, and it must not wait on the
+    // hooks stream being connected.
+
+    /**
+     * Archive the bb threads whose Slack conversation has gone idle past the
+     * configured threshold. Never throws: it runs from a timer, and one
+     * session that fails is left for the next sweep.
+     */
+    async function archiveIdleThreads(): Promise<void> {
+      let hours: number;
+      try {
+        hours = (await settings.get()).archiveIdleHours;
+      } catch (error) {
+        bb.log.warn(`Slack: could not read the archive setting; skipping this idle-thread sweep: ${errorMessage(error)}`);
+        return;
+      }
+      // 0 (or anything that is not a positive number) turns the sweep off.
+      if (!(hours > 0)) return;
+      const cutoff = deps.now() - hours * 60 * 60 * 1000;
+      // Snapshot the map: archiving fires `thread.archived`, whose handler
+      // mutates it as the sweep walks it.
+      for (const [session, record] of [...sessions]) {
+        const threadId = record.threadId;
+        if (threadId === null || record.eventAt >= cutoff) continue;
+        // A request held for the owner's confirmation may still need this
+        // thread to run, so it waits for the next sweep.
+        if (pendingRequests(session).length > 0) continue;
+        try {
+          const thread = await bb.sdk.threads.get({ threadId });
+          if (thread.archivedAt !== null || thread.deletedAt !== null || thread.pinnedAt !== null) continue;
+          // A thread still active, starting or stopping is left for the next
+          // sweep; only an idle or errored one is finished with the conversation.
+          if (thread.status !== "idle" && thread.status !== "error") continue;
+          await bb.sdk.threads.archive({ threadId });
+          bb.log.info(`Slack: archived thread ${threadId} after ${hours}h idle for session ${sessionLogId(session)}`);
+        } catch (error) {
+          // A read or archive that failed leaves the session in place; the next
+          // sweep retries it.
+          bb.log.warn(`Slack: could not archive idle thread ${threadId} for session ${sessionLogId(session)}: ${errorMessage(error)}`);
+        }
+      }
+    }
+
+    bb.background.service("archive-idle", {
+      async start(signal) {
+        const sweep = () => void archiveIdleThreads().catch((error: unknown) => bb.log.warn(`Slack: idle-thread sweep failed: ${errorMessage(error)}`));
+        const startup = setTimeout(sweep, ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+        const periodic = setInterval(sweep, ARCHIVE_SWEEP_INTERVAL_MS);
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        clearTimeout(startup);
+        clearInterval(periodic);
+      },
     });
 
     // ---- the settings and sign-in surface ----------------------------------

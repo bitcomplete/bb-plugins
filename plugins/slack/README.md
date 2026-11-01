@@ -59,7 +59,12 @@ on the pod.
   Archiving the bb thread drops the session from the renewal set. A session the
   service says another server owns is logged and gets a best-effort backstop
   reply; the other server's live lease makes the service refuse that reply, so
-  the log line is the reliable half.
+  the log line is the reliable half. A conversation that has been quiet for 48
+  hours has its bb thread archived by the plugin's own sweep (the
+  `archiveIdleHours` setting; `bb plugin config slack set archiveIdleHours 0`
+  turns it off), so a finished Slack thread does not keep a lease, a session row
+  or a capacity slot; the next message in that conversation starts a fresh bb
+  thread.
 - **No reply.** If a turn that handled a tagged wake ends without calling
   `slack_reply`, the plugin posts one error reply itself, so every tagged
   message gets an answer. A message that needs no answer (a thanks, or one bb
@@ -72,10 +77,14 @@ on the pod.
 
 ## Settings
 
-The plugin declares no bb settings: the Slack section under
-Settings → Plugins → Slack manages everything, and the sign-in token and the
-routing map live in the plugin's own storage (`bb.storage.kv`), not in the
-settings table. The token is never sent to the settings page or the status RPC.
+The plugin declares one bb setting, `archiveIdleHours`: a bb thread started
+from a Slack conversation is archived once the conversation has been quiet that
+many hours (default 48; `0` turns the sweep off). Change it with
+`bb plugin config slack set archiveIdleHours <n>`. Everything else is managed
+in the Slack section under Settings → Plugins → Slack, and the sign-in token
+and the routing map live in the plugin's own storage (`bb.storage.kv`), not in
+the settings table. The token is never sent to the settings page or the status
+RPC.
 
 | In the Slack section | What it is |
 |---|---|
