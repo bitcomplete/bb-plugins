@@ -476,6 +476,40 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("keeps the project-steward and ended stamps out from under the hover actions", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_ps", displayTitle: "Project steward" }),
+          thread({ id: "thr_old", displayTitle: "ENG-0: Old work" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding()],
+            projectStewardThreadId: "thr_ps",
+            ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }],
+          }),
+      } as never,
+      threadActions: () => archiveEntry() as never,
+    });
+    // The project-steward label lives inside the title's inset content span, so
+    // the hover actions take the right edge without covering it.
+    const ps = await waitFor(() => slot.getByText("project steward"));
+    expect(ps.closest(".bb-sidebar-hover-actions-inset")).not.toBeNull();
+    // The same for a Recently ended row whose steward thread is still live.
+    fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
+    const ended = await waitFor(() => slot.getByText("Old work"));
+    const row = ended.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    const inset = row.querySelector(".bb-sidebar-hover-actions-inset")!;
+    expect(inset.querySelector("a")).not.toBeNull();
+    expect(inset.textContent).toMatch(/ago/u);
+    slot.lifecycle.unmount();
+  });
+
   it("collapses Monitors and Recently ended until opened", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward" }), thread({ id: "thr_ops" })] },
@@ -1165,7 +1199,7 @@ describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
     );
     const worker = await waitFor(() => slot.getByText("Implement retry"));
     expect(worker.closest("a")!.getAttribute("aria-current")).toBe("page");
-    expect(worker.closest("a")!.parentElement!.className).toContain("bg-state-active");
+    expect(worker.closest(".bb-sidebar-hover-actions-row")!.className).toContain("bg-state-active");
     slot.lifecycle.unmount();
   });
 

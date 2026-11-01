@@ -1746,21 +1746,22 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
           <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
             {useStewardGlyph ? <StewardGlyph kind={glyph!} /> : <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />}
           </span>
-          <a
-            href={thread.href}
-            aria-current={selected ? "page" : undefined}
-            className="bb-sidebar-hover-actions-inset min-w-0 flex-1 truncate text-sm"
-            style={HOVER_ACTIONS_INSET_STYLE}
-            title={thread.displayTitle}
-            onClick={(e) => {
-              e.preventDefault();
-              navigate.toThread(thread.id);
-              onNavigate();
-            }}
-          >
-            <ThreadTitle threadId={thread.id} />
-          </a>
-          {meta}
+          <span className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-center gap-1" style={HOVER_ACTIONS_INSET_STYLE}>
+            <a
+              href={thread.href}
+              aria-current={selected ? "page" : undefined}
+              className="min-w-0 flex-1 truncate text-sm"
+              title={thread.displayTitle}
+              onClick={(e) => {
+                e.preventDefault();
+                navigate.toThread(thread.id);
+                onNavigate();
+              }}
+            >
+              <ThreadTitle threadId={thread.id} />
+            </a>
+            {meta}
+          </span>
           <SidebarRowHoverActions target={actionTarget(thread)} />
         </div>
       </ThreadActionsContextMenu>
@@ -1957,22 +1958,23 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
         <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
           <StewardGlyph kind={effort.state} />
         </span>
-        <a
-          href={href}
-          aria-current={selected ? "page" : undefined}
-          className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-baseline gap-1 text-sm"
-          style={HOVER_ACTIONS_INSET_STYLE}
-          title={root?.displayTitle ?? effort.title}
-          onClick={(e) => {
-            e.preventDefault();
-            navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, key) });
-            onNavigate();
-          }}
-        >
-          <span className="shrink-0 font-semibold">{displayKey}</span>
-          <span className="min-w-0 truncate">{title}</span>
-        </a>
-        {trailing}
+        <span className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-center gap-1" style={HOVER_ACTIONS_INSET_STYLE}>
+          <a
+            href={href}
+            aria-current={selected ? "page" : undefined}
+            className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
+            title={root?.displayTitle ?? effort.title}
+            onClick={(e) => {
+              e.preventDefault();
+              navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, key) });
+              onNavigate();
+            }}
+          >
+            <span className="shrink-0 font-semibold">{displayKey}</span>
+            <span className="min-w-0 truncate">{title}</span>
+          </a>
+          {trailing}
+        </span>
         {root === undefined ? null : <SidebarRowHoverActions target={actionTarget(root)} />}
       </div>
       <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: `${rowTitleLeft(0) - rowPaddingLeft(0)}px` }} data-sidebar-line-two="">
