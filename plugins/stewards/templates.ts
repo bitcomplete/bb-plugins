@@ -207,7 +207,7 @@ on its first line, then the findings, then your signature:
 \`\`\`
 
 The plugin reads that marker to decide the lane gate and put the owner's
-Approve or Merge item on the Stewards page, so a round without it is
+Approve item on the Stewards page, so a round without it is
 invisible to the gate. Round 1 is the first review of the pull request; count
 up from there.
 
@@ -227,8 +227,10 @@ one-paragraph summary. Cover only what changed since <sha> when given."
 Request changes when a finding is blocking, with \`verdict=changes-requested\`
 and the lane the change is in. Approve when nothing blocking is left. A change
 that only does what it is meant to and does not modify or remove existing
-behaviour is \`lane=no-review\`: post \`gh pr review --approve\` with the marker,
-and the owner's Stewards page files its Merge item. A change that
+behaviour is \`lane=no-review\`: post \`gh pr review --approve\` with the marker.
+On a teammate's pull request the author merges, so the plugin files no Merge
+item (a project that wants the owner to merge teammates' pull requests sets
+\`owner-merges: true\` on this playbook). A change that
 significantly modifies or removes existing behaviour, or is risky in kind (a
 contract, auth, a migration, a secret, production infrastructure, a big
 decision), is \`lane=owner-reviewed\`: post it as a comment (\`gh pr review

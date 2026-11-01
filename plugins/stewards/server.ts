@@ -5209,6 +5209,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let approvalRaised = false;
       const config = await loadConfig(b.projectId);
       const decisions = config?.file.bigDecisions ?? [];
+      const ownerLogin = config?.githubLogin ?? null;
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         const { gate: g, closed, approvalRaised: raised } = await syncPullApproval(approvalsCtx, b, pull, decisions);
@@ -5217,10 +5218,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           store.closeNeedByKey(b.id, "merge", url, "The pull request is closed.");
           continue;
         }
+        // BB-170: on a teammate's pull request (a review steward), the owner's
+        // approval is their last step and the author merges, so the plugin
+        // files no Merge item. A review binding is a teammate's pull request by
+        // adoption, so this does not depend on reading the login; the owner's
+        // own agent PRs and the dependency watch's bot PRs keep the item, and a
+        // playbook's `owner-merges: true` opts back in. A steward-filed item (a
+        // refused merge) is always left alone.
+        const dependencyBot = pull.author !== null && DEPENDENCY_BOTS.has(lc(pull.author));
+        const foreignOwner =
+          !dependencyBot &&
+          !playbook.ownerMerges &&
+          (b.kind === "review" || (b.kind === "pr" && pull.author !== null && ownerLogin !== null && lc(pull.author) !== lc(ownerLogin)));
         if (g.gateMet) {
           // A steward's own merge item (a refused merge) is left alone while a
           // worker still runs; the plugin files its own only when none does.
-          if (!workerInFlight) {
+          if (foreignOwner) {
+            const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
+            if (open !== undefined) store.closeNeed(open.id, "A teammate's pull request: its author merges after the owner's approval.");
+          } else if (!workerInFlight) {
             store.fileNeed({
               bindingId: b.id,
               kind: "merge",

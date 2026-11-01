@@ -679,11 +679,13 @@ gets a review steward.
 - **Reviews post without asking, approvals included.** The review steward
   requests changes for blocking findings, comments otherwise, and approves
   when nothing blocking is left. Every round opens with a `bb-review` marker
-  naming the lane, so the plugin's gate files the owner's Merge item in the
-  no-review lane, and its Approve item when the change is owner-reviewed —
-  then the review steward comments rather than approves. It posts with
-  `gh pr review`, signed. This makes an approval as you an agent's call; a
-  project that wants branch protection to mean a person looked removes
+  naming the lane, so the plugin's gate files the owner's Approve item when
+  the change is owner-reviewed — then the review steward comments rather
+  than approves. On a teammate's pull request the owner's approval is their
+  last step and the author merges, so the plugin files no Merge item; a
+  playbook that sets `owner-merges: true` files one anyway (BB-170). It posts
+  with `gh pr review`, signed. This makes an approval as you an agent's call;
+  a project that wants branch protection to mean a person looked removes
   `approve` from the review playbook's `may` list and has the steward
   escalate instead.
 - **Authors to skip**, such as dependency bots, are a playbook field.
@@ -904,6 +906,11 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   and the timeout path untouched. The plugin still never evaluates `carries`.
 - **Stages** — `spec`, `build`, `review` — are what the plugin acts on (the
   ready gate blocks `build`). State names are what a person sees.
+- **`owner-merges` keeps the owner's Merge item on a teammate's pull request
+  (BB-170).** Off by default: the owner's approval is their last step and the
+  pull request's author merges. Set it on the review playbook for a project
+  that wants the owner to press Merge anyway. The owner's own agent pull
+  requests and the dependency watch's bot pull requests always file it.
 - **Validation.** Phases must be workflow states of every listed team, labels
   must exist. A playbook that fails is reported by `bb stewards check` and in
   the project steward's digest, and bindings keep running under the last good
@@ -1262,7 +1269,7 @@ requester thread and bb's secure form) or `done`.
 | -- | -- | -- | -- | -- |
 | `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
 | `approve-pr` | plugin, when a `user`-marked owner-reviewed pull request is forwarded to the user, or the project steward's approval is not the gate's | the pull request | owner approval seen in the snapshot | **Approve**: on a teammate's pull request posts an unsigned APPROVED review; on the owner's own (an agent PR) posts the unsigned comment "Approved <sha> from the Stewards page". **Decline** posts a CHANGES_REQUESTED review on a teammate's pull request (a comment when there is no note) and does not ask the same round again |
-| `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
+| `merge` | plugin, when the lane gate is met, no worker is running and the pull request is the owner's own or a dependency bot's (a teammate's pull request files none unless its playbook sets `owner-merges: true`), or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
 | `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it; **Done** is the manual escape hatch |
 | `configure` | steward, for a step outside the repos (install an app, grant a permission, enable an event, set a setting) | the external page where it happens | the user presses Done, or the steward observes it done | **Done** (with an optional note, saved as guidance) |

@@ -5045,6 +5045,88 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
+  // BB-170: on a teammate's pull request the owner's approval is their last
+  // step and the author merges, so the plugin files no Merge item. The owner's
+  // own agent pull requests and the dependency watch's bot pull requests keep
+  // it, and a steward-filed item is left alone.
+  it("files no merge need for a teammate's pull request once the gate is met (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
+  it("files the merge need for the owner's own pull request (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane", comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+  });
+
+  it("files the merge need for a dependabot[bot] pull request (BB-170)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]" }));
+    await t.hooks.sweep();
+    await t.flush();
+    const b = t.hooks.store.find("acme/web#9")!;
+    expect(b).toMatchObject({ kind: "pr", playbook: "deps-prs" });
+    const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [], comments: [noReview] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#9");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+  });
+
+  it("leaves a steward-filed merge need on a teammate's pull request alone (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    const filed = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "steward" });
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ id: filed.id, filedBy: "steward" });
+  });
+
+  it("closes an open plugin-filed merge need on a teammate's pull request (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    // The item a server already had open before this change is closed, not left.
+    const filed = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.need(filed.id)).toMatchObject({ status: "done", resolution: "A teammate's pull request: its author merges after the owner's approval." });
+  });
+
+  it("keeps suppressing the merge need on a review binding when the gh login cannot be read (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    t.viewers.github = null;
+    // The config is cached, so the login has to be re-read before the ring.
+    await t.hooks.loadConfig("p1", true);
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
+  it("files the merge need for a teammate's pull request when the playbook sets owner-merges (BB-170)", async () => {
+    const t = await setup();
+    t.files[playbookPath("github-reviews")] = GITHUB_REVIEWS.replace("skip-authors: [dependabot, \"dependabot[bot]\", \"renovate[bot]\"]", "skip-authors: [dependabot, \"dependabot[bot]\", \"renovate[bot]\"]\nowner-merges: true");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+  });
+
   // BB-151: the worker's gate comment on bb-gate#60 lost its thread id. The
   // plugin filed the need and the escalation and closed both 23 seconds later
   // as "Approval is present."; the owner never approved, and the pull request
