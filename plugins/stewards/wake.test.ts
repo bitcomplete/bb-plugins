@@ -323,7 +323,7 @@ describe("the nightly prompt", () => {
     // ticket or spec says the owner produces or seals it by hand.
     expect(wake).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
     expect(wake).toMatch(/corrected at spec approval/u);
-    expect(STANDING_RULES.join("\n")).toMatch(/even when the ticket or spec says the owner seals it by hand/u);
+    expect(STANDING_RULES.join("\n")).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
   });
 
   it("gives dates in the project's nightly time zone", () => {

@@ -7523,7 +7523,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (route === "me" && !approvalToUser && !prToUser && (resolutionKind === "done" || resolutionKind === "text") && namesCredential(forwarding)) {
               return toolError(
                 new Error(
-                  'A credential must be forwarded with resolution: "secret", naming `variable` and `purpose` and either `writeEnv`/`worker` or `setting`, so bb\'s secure form takes the value. `done` and `text` are refused for it.',
+                  'A credential must be forwarded with resolution: "secret", naming `variable` and `purpose` and either `writeEnv`/`worker` or `setting`, so bb\'s secure form takes the value. `done` and `text` are refused for it; a decision that only mentions a credential variable can be forwarded with `choices` instead.',
                 ),
               );
             }
