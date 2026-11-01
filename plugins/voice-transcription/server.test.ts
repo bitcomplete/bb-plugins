@@ -15,6 +15,12 @@ import {
   redactLine,
   statusFor,
 } from "./server.js";
+import {
+  DEFAULT_MODEL,
+  ENV_API_KEY,
+  ENV_BASE_URL,
+  ENV_MODEL,
+} from "./config.js";
 
 const disposals: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -23,13 +29,16 @@ afterEach(async () => {
 });
 
 /** Load the plugin into the fake host with the given stored settings. */
-async function load(settings: Record<string, string> = {}) {
+async function load(
+  settings: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
+) {
   const host: FakePluginHost = createFakePluginHost({
     pluginId: PLUGIN_ID,
     settings,
   });
   disposals.push(() => host.harness.lifecycle.dispose());
-  await createVoiceTranscriptionPlugin()(host.bb);
+  await createVoiceTranscriptionPlugin(env)(host.bb);
   const service = host.harness.inspection.registrations.aiServiceRegistrations.find(
     (entry) => entry.id === SERVICE_ID,
   );
@@ -106,6 +115,143 @@ describe("status", () => {
     vi.stubGlobal("fetch", fetchMock);
     await service.status!();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A deployment can hand every server one key and endpoint through the
+ * environment; a developer's own settings still win. The environment is read
+ * when the plugin loads, so rotation needs a restart.
+ */
+describe("deployment environment", () => {
+  it("is ready with only the environment's key", async () => {
+    const { service } = await load({}, { [ENV_API_KEY]: "shared-key" });
+    expect(await service.status!()).toEqual({ ready: true });
+  });
+
+  it("sends the environment's key as Bearer", async () => {
+    const { service } = await load({}, { [ENV_API_KEY]: "shared-key" });
+    let captured: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        captured = init;
+        return jsonResponse({ text: "ok" });
+      }),
+    );
+
+    await service.transcribe!(audio(), { signal: signal(), hint: null });
+
+    expect(captured!.headers).toEqual({ Authorization: "Bearer shared-key" });
+  });
+
+  it("lets a stored key win over the environment's", async () => {
+    const { service } = await load({ apiKey: "mine" }, { [ENV_API_KEY]: "shared" });
+    let captured: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        captured = init;
+        return jsonResponse({ text: "ok" });
+      }),
+    );
+
+    await service.transcribe!(audio(), { signal: signal(), hint: null });
+
+    expect(captured!.headers).toEqual({ Authorization: "Bearer mine" });
+  });
+
+  it("uses the environment's base URL and model as defaults and in the request", async () => {
+    const { host, service } = await load(
+      {},
+      {
+        [ENV_API_KEY]: "shared",
+        [ENV_BASE_URL]: "https://shared.test/v1/",
+        [ENV_MODEL]: "shared-model",
+      },
+    );
+    const descriptors = host.harness.inspection.registrations.settingsDescriptors;
+    expect(descriptors.baseUrl.default).toBe("https://shared.test/v1/");
+    expect(descriptors.model.default).toBe("shared-model");
+    let url = "";
+    let captured: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (requested: string | URL, init?: RequestInit) => {
+        url = String(requested);
+        captured = init;
+        return jsonResponse({ text: "ok" });
+      }),
+    );
+
+    await service.transcribe!(audio(), { signal: signal(), hint: null });
+
+    expect(url).toBe("https://shared.test/v1/audio/transcriptions");
+    expect((captured!.body as FormData).get("model")).toBe("shared-model");
+  });
+
+  it("falls back to the plugin's own defaults for blank environment values", async () => {
+    const { host, service } = await load(
+      {},
+      {
+        [ENV_API_KEY]: "shared",
+        [ENV_BASE_URL]: "   ",
+        [ENV_MODEL]: "",
+      },
+    );
+    const descriptors = host.harness.inspection.registrations.settingsDescriptors;
+    expect(descriptors.baseUrl.default).toBe(DEFAULT_BASE_URL);
+    expect(descriptors.model.default).toBe(DEFAULT_MODEL);
+    let url = "";
+    let captured: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (requested: string | URL, init?: RequestInit) => {
+        url = String(requested);
+        captured = init;
+        return jsonResponse({ text: "ok" });
+      }),
+    );
+
+    await service.transcribe!(audio(), { signal: signal(), hint: null });
+
+    expect(url).toBe(`${DEFAULT_BASE_URL}/audio/transcriptions`);
+    expect((captured!.body as FormData).get("model")).toBe(DEFAULT_MODEL);
+  });
+
+  it("behaves exactly as today with no stored key and no environment key", async () => {
+    // Automatic only ever picks a service whose status is ready, so the
+    // not-ready status is what keeps it out of the picker.
+    const { service } = await load({}, {});
+    expect(await service.status!()).toEqual({ ready: false, message: MISSING_KEY_MESSAGE });
+
+    // An empty key is still ready against a non-default endpoint, as before.
+    const custom = await load({ baseUrl: "http://whisper.local:8080/v1" }, {});
+    expect(await custom.service.status!()).toEqual({ ready: true });
+  });
+
+  it("never puts the environment's key in the settings descriptors", async () => {
+    const key = "sk-shared-abcdefghijklmnop";
+    const { host } = await load({}, { [ENV_API_KEY]: key });
+    const descriptors = host.harness.inspection.registrations.settingsDescriptors;
+    expect(JSON.stringify(descriptors)).not.toContain(key);
+    expect(JSON.stringify(descriptors)).not.toContain("abcdefghijklmnop");
+    for (const descriptor of Object.values(descriptors)) {
+      expect(descriptor.default).not.toBe(key);
+    }
+  });
+
+  it("never shows the shared key in status, descriptors or logs", async () => {
+    const key = "sk-shared-abcdefghijklmnop";
+    const { host, service } = await load({}, { [ENV_API_KEY]: key });
+    expect(JSON.stringify(await service.status!())).not.toContain(key);
+    expect(JSON.stringify(host.harness.inspection.registrations.settingsDescriptors)).not.toContain(
+      key,
+    );
+    expect(host.harness.inspection.logEntries.map((entry) => entry.message).join("\n")).not.toContain(
+      key,
+    );
+    expect(host.harness.inspection.needsConfigurationMessages.join("\n")).not.toContain(key);
   });
 });
 

@@ -41,6 +41,26 @@ the endpoint and the first 200 characters of the response body with the key
 removed. The server log gets one line per call — duration, bytes, status —
 and never the audio or the transcript.
 
+## Deployment-wide defaults
+
+A deployment running a server per developer can hand them all one key and
+endpoint instead of each person pasting their own. The server process reads
+these variables at start:
+
+| variable | setting | meaning |
+| -- | -- | -- |
+| `VOICE_TRANSCRIPTION_API_KEY` | `apiKey` | The shared key, sent as `Authorization: Bearer`. It is never a settings default, so it never reaches the frontend. |
+| `VOICE_TRANSCRIPTION_BASE_URL` | `baseUrl` | The default endpoint, used when `baseUrl` is unset. |
+| `VOICE_TRANSCRIPTION_MODEL` | `model` | The default model, used when `model` is unset. |
+
+A developer's own setting still wins. `bb plugin config voice-transcription
+unset apiKey` goes back to the shared key; `unset baseUrl` or `unset model`
+goes back to the deployment's default for that one.
+
+The environment is read once, when the plugin loads, so rotating the shared
+key or endpoint needs a server restart. `bb plugin config voice-transcription
+set apiKey <key>` overrides the shared key on that server until it is unset.
+
 ## Examples
 
 OpenAI:
@@ -97,5 +117,7 @@ bb settings ai-services set voice off
 bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@main --plugin voice-transcription
 ```
 
-The plugin ships with no credential; each developer sets their own `apiKey`
-(or points `baseUrl` at an endpoint that needs none).
+The plugin ships with no credential of its own. A deployment can supply one
+through the environment (see [Deployment-wide defaults](#deployment-wide-defaults));
+otherwise each developer sets their own `apiKey`, or points `baseUrl` at an
+endpoint that needs none.
