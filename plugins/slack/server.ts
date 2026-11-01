@@ -18,6 +18,7 @@ import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES
 import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
 import { toMrkdwn } from "./mrkdwn.js";
 import {
+  appendTranscript,
   channelEntrySchema,
   channelMapFromLegacy,
   channelProject,
@@ -36,12 +37,14 @@ import {
   pendingRecordSchema,
   sessionsSchema,
   STEER_NOTE,
+  transcriptHistory,
   wakeText,
   withFiles,
   type ChannelMap,
   type PendingRequest,
   type Project,
   type SessionRecord,
+  type SessionTranscriptEntry,
   type WakeDelivery,
 } from "./sessions.js";
 import { CONNECTION_CHANGED } from "./channels.js";
@@ -1140,6 +1143,33 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       void saveSessions();
     }
 
+    /**
+     * Remember a delivered message in a session's transcript, so a bb thread
+     * that replaces an archived one opens with the earlier conversation.
+     */
+    function recordTranscript(session: string, entry: SessionTranscriptEntry): void {
+      const r = sessions.get(session);
+      if (r === undefined) return;
+      sessions.set(session, { ...r, transcript: appendTranscript(r.transcript, entry) });
+      void saveSessions();
+    }
+
+    /** The asker message a wake delivers, for the transcript: the held words when the owner confirmed one. */
+    function transcriptAsk(event: SessionEvent, confirmed: PendingRequest | null): { name: string; text: string } {
+      return confirmed === null ? { name: event.asker.name, text: event.comment.text } : { name: confirmed.asker, text: confirmed.text };
+    }
+
+    /**
+     * The prompt a spawn opens with: when this session was handed to a thread
+     * before, the earlier conversation's transcript comes first, framed as
+     * prior context, then the usual wake text. A first wake is unchanged.
+     */
+    function revivedPrompt(record: SessionRecord, text: string): string {
+      if (record.handedAt === null) return text;
+      const history = transcriptHistory(record.transcript);
+      return history === "" ? text : `${history}\n\n${text}`;
+    }
+
     /** The wake a correction's `ts` matches, or null when it produced none. */
     function wakeFor(session: string, ts: string): WakeDelivery | null {
       if (ts === "") return null;
@@ -1460,6 +1490,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         steeredAt: previous?.steeredAt ?? null,
         title: previous?.title ?? null,
         wakes: previous?.wakes ?? [],
+        transcript: previous?.transcript ?? [],
       };
       sessions.set(event.session, record);
       // A wake for the session means the service routed it here again: a
@@ -1530,10 +1561,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // Marked before the thread is touched, so a turn the wake starts is
       // after it and the backstop can tell the handling turn from an older one.
       const handedAt = deps.now();
+      // The delivered message, for the session transcript a later revival reads.
+      const asker = transcriptAsk(event, confirmed);
       try {
         if (record.threadId === null) {
-          if (await spawnThread(event, text, title, handedAt, record, files)) {
+          if (await spawnThread(event, revivedPrompt(record, text), title, handedAt, record, files)) {
             recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+            recordTranscript(event.session, { role: "asker", name: asker.name, text: asker.text, at: deps.now() });
           }
           return;
         }
@@ -1547,14 +1581,17 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           // obligation and its own reply.
           if (taggedWake && (previous?.answered ?? 0) < (previous?.events ?? 0)) await uncountWake(event.session);
           recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+          recordTranscript(event.session, { role: "asker", name: asker.name, text: asker.text, at: deps.now() });
         } else if (outcome.kind === "started") {
           await markHanded(event.session, handedAt);
           recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+          recordTranscript(event.session, { role: "asker", name: asker.name, text: asker.text, at: deps.now() });
         } else if (outcome.kind === "queued") {
           // The message is a queued row whose turn has not started. Record it so
           // a later edit rewrites the row and a later deletion removes it.
           await markHanded(event.session, handedAt);
           recordWake(event.session, { ts: event.ts, state: "queued", queuedMessageId: outcome.queuedMessageId, queuedUpdatedAt: outcome.queuedUpdatedAt, text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+          recordTranscript(event.session, { role: "asker", name: asker.name, text: asker.text, at: deps.now() });
         } else if (outcome.kind === "gone") {
           bb.log.info(`Slack session ${logSession}'s bb thread ${record.threadId} is gone; starting a new one`);
           const after = sessions.get(event.session);
@@ -1562,8 +1599,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
             sessions.set(event.session, { ...after, threadId: null, projectId: null });
             await saveSessions();
           }
-          if (await spawnThread(event, text, title, handedAt, after ?? record, files)) {
+          if (await spawnThread(event, revivedPrompt(after ?? record, text), title, handedAt, after ?? record, files)) {
             recordWake(event.session, { ts: event.ts, state: "started", text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+            recordTranscript(event.session, { role: "asker", name: asker.name, text: asker.text, at: deps.now() });
           }
         } else {
           // A transient error keeps the mapping: the thread still exists and
@@ -1878,6 +1916,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (new TextEncoder().encode(toMrkdwn(text)).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`));
         try {
           const { ephemeral } = await postReply(id, text, signal);
+          recordTranscript(id, { role: "bb", name: "bb", text, at: deps.now() });
           void pushTitle(threadId);
           if (ephemeral) return `Posted only to the asker (session ${id}): the channel does not let bb post, so the message was sent as an ephemeral message visible only to them. That is this message's one reply.`;
           return `Replied in Slack (session ${id}). That is this message's one reply.`;

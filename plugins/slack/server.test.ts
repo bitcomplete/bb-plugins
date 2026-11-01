@@ -463,6 +463,120 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("opens a revived thread with the earlier Slack messages, bb's replies labelled", async () => {
+    let spawned = 0;
+    const s = await live({ token: "xoxp-test", spawn: () => ({ id: `thr-${++spawned}` }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-one" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "also the SSO page", untrusted: false } }));
+    await tick();
+    await s.tool("slack_reply", { text: "Done." }, { threadId: "thr-1" });
+    // The thread is archived; the session is kept and the next message revives it.
+    await s.harness.behavior.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "what next?", untrusted: false } }));
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    const text = promptOf(spawns[1]![0]);
+    expect(text.startsWith("Earlier in this Slack conversation")).toBe(true);
+    // In order, and bb's own reply is labelled.
+    const iBuild = text.indexOf("Alice: build this");
+    const iFollow = text.indexOf("Alice: also the SSO page");
+    const iReply = text.indexOf("bb: Done.");
+    expect(iBuild).toBeGreaterThanOrEqual(0);
+    expect(iFollow).toBeGreaterThan(iBuild);
+    expect(iReply).toBeGreaterThan(iFollow);
+    // The new message is the wake, not repeated inside the history.
+    expect(text.split("what next?").length - 1).toBe(1);
+    expect(text).toContain("session D0123:1712345678.901234");
+    await s.stop();
+  });
+
+  it("drops the oldest messages over the transcript's byte cap and names the count", async () => {
+    let spawned = 0;
+    const s = await live({ token: "xoxp-test", spawn: () => ({ id: `thr-${++spawned}` }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-one" }));
+    await tick();
+    const big = "x".repeat(2_000);
+    for (let i = 1; i <= 8; i += 1) {
+      s.hooks.last().send(s.hooks.session({ comment: { text: `m${i} ${big}`, untrusted: false } }));
+      await tick();
+    }
+    await s.harness.behavior.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "revive", untrusted: false } }));
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    const text = promptOf(spawns[1]![0]);
+    expect(text).toMatch(/\d+ earlier messages omitted\./);
+    // The newest entry is kept; the oldest are dropped.
+    expect(text).toContain("m8");
+    expect(text).not.toContain("m1 ");
+    await s.stop();
+  });
+
+  it("leaves a first wake in a new conversation unchanged", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const text = promptOf(s.harness.sdk.callsTo("threads.spawn")[0]![0]);
+    expect(text).not.toContain("Earlier in this Slack conversation");
+    expect(text).toContain("build this");
+    await s.stop();
+  });
+
+  it("leaves a wake to a live thread unchanged", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "also the SSO page", untrusted: false } }));
+    await tick();
+    const text = promptOf(s.harness.sdk.callsTo("threads.send").at(-1)![0]);
+    expect(text).not.toContain("Earlier in this Slack conversation");
+    expect(text).toContain("also the SSO page");
+    await s.stop();
+  });
+
+  it("keeps an unconfirmed held request out of the session transcript", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-one" }));
+    await tick();
+    // Someone other than the owner writes; the words are held, never delivered.
+    s.hooks.last().send(s.hooks.session({ asker: { id: "U2", name: "Carol" }, fromOwner: false, comment: { text: "halt work", untrusted: true } }));
+    await tick();
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, { transcript: Array<{ text: string }> }>;
+    const texts = stored["D0123:1712345678.901234"]!.transcript.map((t) => t.text);
+    expect(texts).toContain("build this");
+    expect(texts).not.toContain("halt work");
+    await s.stop();
+  });
+
+  it("carries a confirmed held request into a later revival", async () => {
+    let spawned = 0;
+    const s = await live({ token: "xoxp-test", spawn: () => ({ id: `thr-${++spawned}` }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-one" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ asker: { id: "U2", name: "Carol" }, fromOwner: false, comment: { text: "add the docs", untrusted: true } }));
+    await tick();
+    const held = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    const id = /confirm (r-[a-z0-9]+)/u.exec(held)?.[1];
+    expect(id).toBeTruthy();
+    s.hooks.last().send(s.hooks.session({ comment: { text: `confirm ${id}`, untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    await s.harness.behavior.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "what next?", untrusted: false } }));
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    const text = promptOf(spawns[1]![0]);
+    expect(text).toContain("Carol: add the docs");
+    await s.stop();
+  });
+
   it("forwards a message's images and text files as localImage/localFile parts, and still wakes a file-only message", async () => {
     const s = await live();
     const files = [
