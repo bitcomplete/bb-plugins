@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { browserDeps, createUpdateStore, type UpdateStore } from "./server-update";
+import { GET_STARTED_PANEL_ID, GET_STARTED_PATH, shouldOpenGetStarted } from "./onboarding.js";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 
@@ -77,7 +78,7 @@ function Remaining({ steps }: { steps: Status["steps"] }) {
       <Icon name="CircleAlert" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" aria-label="setup incomplete" />
       <span>
         {left.length === 1 ? "One step left" : `${left.length} steps left`} before agents can work here: {left.join(", ")}.{" "}
-        <SettingsLink pluginId="team-setup">Finish setup</SettingsLink>
+        <GetStartedLink>Finish setup</GetStartedLink>
       </span>
     </p>
   );
@@ -88,11 +89,13 @@ function Step({
   title,
   children,
   action,
+  about,
 }: {
   state: StepState;
   title: string;
   children: React.ReactNode;
   action?: React.ReactNode;
+  about?: React.ReactNode;
 }) {
   return (
     <li className="flex items-start gap-3">
@@ -102,7 +105,10 @@ function Step({
           <p className="font-medium">{title}</p>
           {action}
         </div>
-        <div className="flex flex-col gap-2 text-muted-foreground">{children}</div>
+        <div className="flex flex-col gap-2 text-muted-foreground">
+          {about}
+          {children}
+        </div>
       </div>
     </li>
   );
@@ -137,6 +143,16 @@ function SettingsLink({ pluginId, children }: { pluginId: string; children: Reac
   );
 }
 
+/** The home-page one-liner's way to the onboarding page while setup is incomplete. */
+function GetStartedLink({ children }: { children: React.ReactNode }) {
+  const navigate = useBbNavigate();
+  return (
+    <button type="button" className="underline underline-offset-2" onClick={() => navigate.toPluginPanel(GET_STARTED_PATH)}>
+      {children}
+    </button>
+  );
+}
+
 interface ClaudeFlow {
   sessionId: string;
   url: string;
@@ -153,7 +169,11 @@ interface FigmaFlow {
   port: number;
 }
 
-function Checklist({ compact }: { compact: boolean }) {
+type ChecklistMode = "compact" | "settings" | "onboarding";
+
+function Checklist({ mode }: { mode: ChecklistMode }) {
+  const onboarding = mode === "onboarding";
+  const compact = mode === "compact";
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [status, setStatus] = useState<Status | null>(null);
@@ -271,10 +291,24 @@ function Checklist({ compact }: { compact: boolean }) {
 
   return (
     <div className="flex flex-col gap-4 text-sm">
+      {onboarding ? (
+        <p className="text-muted-foreground">
+          bb needs a few things before agents can work here. Each step below says what it is for and what happens once it is
+          done. Linear and Figma are optional; the rest are needed.
+        </p>
+      ) : null}
       <ol className="flex flex-col gap-4">
         <Step
           state={steps.ai}
           title="Claude or Codex"
+          about={
+            onboarding ? (
+              <p>
+                Agents run on your own Claude or ChatGPT subscription through Account Pool. Add at least one account and turn its
+                provider routing on; every thread you start can then use it.
+              </p>
+            ) : undefined
+          }
           action={
             ai.available && claude === null && codex === null ? (
               <div className="flex gap-2">
@@ -376,6 +410,14 @@ function Checklist({ compact }: { compact: boolean }) {
         <Step
           state={steps.github}
           title="GitHub"
+          about={
+            onboarding ? (
+              <p>
+                Machines clone and push as you. Once you sign in here, bb gives every machine the login as GH_TOKEN and a git
+                credential helper.
+              </p>
+            ) : undefined
+          }
           action={
             github.pending === null && github.status !== "disabled" ? (
               github.status === "logged in" ? (
@@ -434,6 +476,11 @@ function Checklist({ compact }: { compact: boolean }) {
         <Step
           state={steps.devbox}
           title="devbox"
+          about={
+            onboarding ? (
+              <p>devbox is what creates and runs your machines. Once connected, bb can make machines in your devbox project.</p>
+            ) : undefined
+          }
           action={
             devbox.available && !devbox.connected ? (
               <Button size="sm" disabled={busy !== null} onClick={() => void run("devbox", async () => {
@@ -457,6 +504,11 @@ function Checklist({ compact }: { compact: boolean }) {
         <Step
           state={steps.linear}
           title="Linear (optional)"
+          about={
+            onboarding ? (
+              <p>Linear lets threads read and update issues as you. Connect it to use Linear in bb; skip it if you do not.</p>
+            ) : undefined
+          }
           action={
             linear.available && linear.configured && !linear.connected ? (
               <Button size="sm" disabled={busy !== null} onClick={() => void run("linear", async () => {
@@ -490,6 +542,11 @@ function Checklist({ compact }: { compact: boolean }) {
         <Step
           state={steps.figma}
           title="Figma (optional)"
+          about={
+            onboarding ? (
+              <p>Figma gives Claude Code design context from a Figma link. Connect it to use Figma; skip it if you do not.</p>
+            ) : undefined
+          }
           action={
             figmaStatus.available && !figmaStatus.authenticated && !figmaStatus.pending ? (
               <Button size="sm" variant={steps.figma === "todo" ? "default" : "outline"} disabled={busy !== null} onClick={() => void run("figma", async () => {
@@ -573,7 +630,15 @@ function Checklist({ compact }: { compact: boolean }) {
           {figmaError !== null ? <p className="text-destructive">{figmaError}</p> : null}
         </Step>
 
-        <Step state={steps.machine} title="A machine">
+        <Step
+          state={steps.machine}
+          title="A machine"
+          about={
+            onboarding ? (
+              <p>Agents run on machines, not on this server. Once one exists, you can start a thread on it.</p>
+            ) : undefined
+          }
+        >
           {machines.names.length > 0 ? (
             <p>
               {machines.names.join(", ")}. <SettingsLink pluginId="devbox-provider">Add another</SettingsLink>
@@ -590,6 +655,30 @@ function Checklist({ compact }: { compact: boolean }) {
           )}
         </Step>
       </ol>
+      {onboarding ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border p-3">
+          <p className="text-muted-foreground">
+            {status.onboarding.dismissed
+              ? "You will not be sent here automatically again. This page stays in the sidebar."
+              : "Done for now? You can skip the rest of setup without being sent back here."}
+          </p>
+          {status.onboarding.dismissed ? null : (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy !== null}
+              onClick={() =>
+                void run("dismiss", async () => {
+                  await rpc.call("dismissOnboarding", { dismissed: true });
+                  refetch();
+                })
+              }
+            >
+              Don't show this again
+            </Button>
+          )}
+        </div>
+      ) : null}
       {error !== null ? <p className="text-destructive">{error}</p> : null}
     </div>
   );
@@ -690,14 +779,75 @@ function ServerUpdateSection() {
 
 const CHANGED_CHANNEL = "changed";
 
+/**
+ * The onboarding page: the same checklist as Settings with an explanation of
+ * each step, reached from the sidebar and from the home one-liner while setup
+ * is incomplete. A nav panel rather than a settings section so it gets a route
+ * of its own, which is also what makes it a redirect target.
+ */
+function GetStartedPage() {
+  return (
+    <div className="h-full overflow-y-auto p-4 md:p-5">
+      <div className="mx-auto w-full max-w-3xl space-y-4">
+        <Checklist mode="onboarding" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Renders nothing. On the first mount of a page load, a developer who landed on
+ * the compose root with required setup still to do and no dismissal on record
+ * is sent to the onboarding page once, replacing the history entry so Back does
+ * not bounce. A deep link (a thread, settings, a plugin page) is left alone,
+ * and optional steps never keep the redirect alive.
+ */
+function GetStartedRedirect() {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const checked = useRef(false);
+  useEffect(() => {
+    if (checked.current) return;
+    checked.current = true;
+    if (window.location.pathname !== "/") return;
+    void rpc.call("status").then(
+      (s) => {
+        if (
+          !shouldOpenGetStarted({
+            pathname: window.location.pathname,
+            dismissed: s.onboarding.dismissed,
+            requiredComplete: s.onboarding.requiredComplete,
+          })
+        ) {
+          return;
+        }
+        navigate.toPluginPanel(GET_STARTED_PATH, { replace: true });
+      },
+      () => {
+        // The home one-liner still points at the page, so a failed check is not
+        // worth retrying inside this mount.
+      },
+    );
+  }, [rpc, navigate]);
+  return null;
+}
+
 export default definePluginApp((app) => {
+  app.slots.navPanel({
+    id: GET_STARTED_PANEL_ID,
+    title: "Get started",
+    icon: "ListTodo",
+    path: GET_STARTED_PATH,
+    component: GetStartedPage,
+  });
+  app.slots.experimental_appOverlay({ id: "get-started-redirect", component: GetStartedRedirect });
   app.slots.homepageSection({
     id: "checklist",
     title: "Team setup",
     component: () => (
       <div className="flex flex-col gap-3">
         <ServerUpdateLine />
-        <Checklist compact />
+        <Checklist mode="compact" />
       </div>
     ),
   });
@@ -711,6 +861,6 @@ export default definePluginApp((app) => {
     id: "checklist",
     title: "Checklist",
     description: "Everything a new server needs before agents can work here.",
-    component: () => <Checklist compact={false} />,
+    component: () => <Checklist mode="settings" />,
   });
 });
