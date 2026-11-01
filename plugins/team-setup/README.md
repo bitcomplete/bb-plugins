@@ -2,9 +2,19 @@
 
 The first-run checklist for a bb server behind
 [bb-gate](https://github.com/bitcomplete/bb-gate). It lives under Settings →
-Plugins → Team setup. The home page carries a one-line summary of it: while
-steps remain, a warning icon, what is left and a link to the checklist; once
-none do, what is set up. The full checklist never renders on the home page.
+Plugins → Team setup and on its own **Get started** page, a nav panel in the
+sidebar. The home page carries a one-line summary of it: while steps remain, a
+warning icon, what is left and a link to the Get started page; once none do,
+what is set up.
+
+A developer who opens a new server on the compose root is sent to the Get
+started page once per page load, while the required steps (Claude or Codex,
+GitHub, devbox and a machine) are still to do and they have not dismissed the
+redirect. The page's "Don't show this again" button stores that choice in the
+plugin's own server state, so it holds across devices and restarts; it is read
+with `status` and written by `dismissOnboarding`. Linear and Figma are optional
+and never keep the redirect alive, and a deep link — a thread, Settings, a
+plugin page — is left alone.
 
 | Step | Owned by | Done when | What the button does |
 |---|---|---|---|

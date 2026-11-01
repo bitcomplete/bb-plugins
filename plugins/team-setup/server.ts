@@ -34,6 +34,18 @@ export const DEVBOX_ID = "devbox-provider";
 export const LINEAR_ID = "linear";
 export const CHANGED = "changed";
 
+// The developer's "Don't show this again" choice for the first-run redirect.
+// It lives on the server, not in browser storage, so it holds across devices
+// and survives a restart.
+export const ONBOARDING_DISMISSED_KEY = "onboarding.dismissed";
+
+// The steps that must be done before the first-run redirect stops. Linear and
+// Figma are optional: a server that never uses them is still worth landing on
+// the compose surface, so they never keep the redirect alive. A step that is
+// `unavailable` (its plugin is off, the server has no OAuth client) is not the
+// developer's to-do either, so only `todo` blocks.
+export const REQUIRED_STEPS = ["ai", "github", "devbox", "machine"] as const;
+
 // Server environment variables copied into the machine environment on every
 // start. Each is a key an agent CLI on the machine reads: Pi's built-in
 // Fireworks provider turns on when FIREWORKS_API_KEY is set, so a server
@@ -123,6 +135,7 @@ export const rpcContract = defineRpcContract({
       machines: z.object({ names: z.array(z.string()) }),
       figma: figmaStatusSchema,
       steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, figma: stepStateSchema, machine: stepStateSchema }),
+      onboarding: z.object({ dismissed: z.boolean(), requiredComplete: z.boolean() }),
       complete: z.boolean(),
     }),
   },
@@ -166,6 +179,11 @@ export const rpcContract = defineRpcContract({
   devboxConnect: { input: z.null(), output: z.object({ url: z.string() }) },
   // Linear: the linear plugin's connect, likewise.
   linearConnect: { input: z.null(), output: z.object({ url: z.string() }) },
+  // The first-run redirect's dismiss flag. `status` reads it; this sets it.
+  dismissOnboarding: {
+    input: z.object({ dismissed: z.boolean() }).strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
 });
 
 export const SETTING_DESCRIPTORS = {
@@ -547,6 +565,7 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           figma: !figma.available ? "unavailable" : figma.authenticated ? "done" : figma.configured || figma.pending ? "todo" : "optional",
           machine: hosts.length > 0 ? "done" : "todo",
         } as const;
+        const onboardingDismissed = (await bb.storage.kv.get<boolean>(ONBOARDING_DISMISSED_KEY)) === true;
         return {
           ai,
           github,
@@ -555,6 +574,7 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           machines: { names: machineNames },
           figma,
           steps,
+          onboarding: { dismissed: onboardingDismissed, requiredComplete: REQUIRED_STEPS.every((key) => steps[key] !== "todo") },
           complete: Object.values(steps).every((s) => s !== "todo"),
         };
       },
@@ -644,6 +664,11 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
       async linearConnect() {
         const { url } = await call(LINEAR_ID, "connect", null, linearConnectSchema);
         return { url };
+      },
+
+      async dismissOnboarding({ dismissed }) {
+        await bb.storage.kv.set(ONBOARDING_DISMISSED_KEY, dismissed);
+        return { ok: true };
       },
     });
   };

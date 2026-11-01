@@ -123,6 +123,7 @@ declare function statusType(): Promise<{
   figma: { available: boolean; message: string | null; machine: string | null; claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null };
   machines: { names: string[] };
   steps: { ai: string; github: string; devbox: string; linear: string; figma: string; machine: string };
+  onboarding: { dismissed: boolean; requiredComplete: boolean };
   complete: boolean;
 }>;
 
@@ -434,5 +435,35 @@ describe("machine environment seeding", () => {
     expect(setVariables).toHaveLength(1);
     const s = await status();
     expect(s.complete).toBe(false);
+  });
+});
+
+describe("onboarding dismissal", () => {
+  it("round-trips the dismiss flag through the server's own state", async () => {
+    const { status, harness } = await setup();
+    expect((await status()).onboarding).toEqual({ dismissed: false, requiredComplete: false });
+
+    expect(await harness.callRpc("dismissOnboarding", { dismissed: true })).toEqual({ ok: true });
+    expect((await status()).onboarding.dismissed).toBe(true);
+
+    // A second server load reads the same persisted flag; clearing it is a
+    // write too, so the round trip is observable in both directions.
+    expect(await harness.callRpc("dismissOnboarding", { dismissed: false })).toEqual({ ok: true });
+    expect((await status()).onboarding.dismissed).toBe(false);
+  });
+
+  it("counts required steps as complete even while an optional step is a to-do", async () => {
+    const { status } = await setup({
+      builtInGit: { status: "logged in", statusMessage: "ok" },
+      pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
+      devbox: { connected: true, project: "dylan" },
+      hosts: [{ name: "box" }],
+      figmaHost: { claude: true, configured: true, authenticated: false, pending: false, url: null, message: null },
+      runs: signedIn,
+    });
+    const s = await status();
+    expect(s.steps.figma).toBe("todo");
+    expect(s.complete).toBe(false);
+    expect(s.onboarding.requiredComplete).toBe(true);
   });
 });
