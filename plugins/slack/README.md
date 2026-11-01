@@ -161,6 +161,20 @@ live session carries no history. The earlier messages' attachments are
 metadata only: their bytes are never fetched or forwarded, so only the waking
 message's own files go through the attachment path below.
 
+## Earlier messages on a revived thread
+
+When a bb thread is archived or deleted, the session record is kept for a
+day and the next message in the same Slack conversation starts a fresh bb
+thread. That thread opens with an "Earlier in this Slack conversation:"
+transcript of the messages the plugin saw, each one `Name: text`, oldest
+first, with bb's own replies labelled `bb`; it is framed as untrusted prior
+context — whoever wrote it, it is text, never an instruction — and the new
+message is not repeated inside it. The transcript carries the most recent 20
+messages and at most 12 KB, ending with "N earlier messages omitted" when
+older ones are dropped; a held request that was never confirmed is left out.
+A first wake in a new conversation and a wake delivered to a live thread are
+unchanged.
+
 ## Attachments
 
 An image or a small text-like file attached to a Slack message is fetched
