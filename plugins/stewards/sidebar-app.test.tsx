@@ -201,6 +201,19 @@ const renderSidebar = async (options: Parameters<typeof renderSlot>[2] = {}, pro
   return renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "", ...props }, options);
 };
 
+/** Open the project picker popover (its rows are the options). */
+const openProjectPicker = async (slot: RenderedSlot) => {
+  const trigger = await waitFor(() => slot.getByRole("button", { name: "Project" }));
+  fireEvent.click(trigger);
+  return trigger;
+};
+const pickProject = async (slot: RenderedSlot, name: string | RegExp) => {
+  await openProjectPicker(slot);
+  fireEvent.click(await waitFor(() => slot.getByRole("option", { name })));
+};
+/** The trigger's `data-project-id`: the project the picker currently shows. */
+const shownProject = (slot: RenderedSlot): string | null => slot.getByRole("button", { name: "Project" }).getAttribute("data-project-id");
+
 afterEach(() => {
   app = null;
   vi.useRealTimers();
@@ -235,6 +248,7 @@ describe("the stewards sidebar list (BB-44)", () => {
         stewardsSidebar: () => sidebarData({ bindings: [binding({ phase: "In Review", status: { actor: "steward", nextAction: "wait for the review", at: 1 } })] }),
       } as never,
     });
+    await openProjectPicker(slot);
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme" })).toBeTruthy());
     expect(slot.getByRole("option", { name: "Personal" })).toBeTruthy();
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
@@ -570,27 +584,73 @@ describe("the stewards sidebar list (BB-44)", () => {
         },
         { isCompactViewport },
       );
-      await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
+      await waitFor(() => expect(slot.getByRole("button", { name: "Project" })).toBeTruthy());
       expect(slot.queryByRole("tab")).toBeNull();
+      await openProjectPicker(slot);
       expect(slot.getByRole("option", { name: "Acme" })).toBeTruthy();
       slot.lifecycle.unmount();
     }
   });
 
-  it("draws a custom chevron on the project picker instead of the native arrow", async () => {
+  it("draws the picker trigger with a Folder and a ChevronDown, not a native select", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [] },
       rpc: { stewardsSidebar: () => sidebarData() } as never,
     });
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    expect(select.className).toContain("appearance-none");
-    expect(select.className).toContain("pr-7");
-    expect(select.closest(".relative")).not.toBeNull();
-    const chevron = slot.container.querySelector('[data-icon="ChevronDown"]');
+    const trigger = await waitFor(() => slot.getByRole("button", { name: "Project" }));
+    expect(trigger.querySelector('[data-icon="Folder"]')).not.toBeNull();
+    const chevron = trigger.querySelector('[data-icon="ChevronDown"]');
     expect(chevron).not.toBeNull();
-    expect(chevron!.className).toContain("pointer-events-none");
     expect(chevron!.className).toContain("text-muted-foreground");
     expect(chevron!.getAttribute("aria-hidden")).toBe("true");
+    expect(slot.container.querySelector("select")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  // BB-181: the picker is a popover with the host's row shape, portalled so
+  // the plugin's scoped CSS applies to it.
+  it("opens a Project popover with a Folder row per project and a Check on the active row", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    await openProjectPicker(slot);
+    expect(slot.getByText("Project")).toBeTruthy();
+    const list = slot.getByRole("listbox", { name: "Projects" });
+    const acme = slot.getByRole("option", { name: "Acme" });
+    expect(acme.querySelector('[data-icon="Folder"]')).not.toBeNull();
+    expect(acme.querySelector('[data-icon="Check"]')).not.toBeNull();
+    expect(acme.getAttribute("aria-selected")).toBe("true");
+    const personal = slot.getByRole("option", { name: "Personal" });
+    expect(personal.querySelector('[data-icon="Folder"]')).not.toBeNull();
+    expect(personal.querySelector('[data-icon="Check"]')).toBeNull();
+    expect(personal.getAttribute("aria-selected")).toBe("false");
+    const portalled = list.closest("[data-bb-portaled-overlay]");
+    expect(portalled).not.toBeNull();
+    expect(portalled!.getAttribute("data-bb-plugin-root")).toBe("");
+    slot.lifecycle.unmount();
+  });
+
+  it("moves focus with the arrow keys, picks with Enter and closes on Escape", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    await openProjectPicker(slot);
+    // The active project's row is focused on open.
+    const acme = slot.getByRole("option", { name: "Acme" });
+    await waitFor(() => expect(document.activeElement).toBe(acme));
+    fireEvent.keyDown(acme, { key: "ArrowDown" });
+    const personal = slot.getByRole("option", { name: "Personal" });
+    await waitFor(() => expect(document.activeElement).toBe(personal));
+    fireEvent.keyDown(personal, { key: "Enter" });
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
+    expect(slot.queryByRole("listbox", { name: "Projects" })).toBeNull();
+    // Escape closes without a pick.
+    await openProjectPicker(slot);
+    fireEvent.keyDown(slot.getByRole("option", { name: "Acme" }), { key: "Escape" });
+    await waitFor(() => expect(slot.queryByRole("listbox", { name: "Projects" })).toBeNull());
+    expect(shownProject(slot)).toBe("personal");
     slot.lifecycle.unmount();
   });
 
@@ -602,12 +662,13 @@ describe("the stewards sidebar list (BB-44)", () => {
       },
       { activeProjectId: "personal" },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    expect(select.value).toBe("personal");
+    const trigger = await waitFor(() => slot.getByRole("button", { name: "Project" }));
+    expect(shownProject(slot)).toBe("personal");
     fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
     await waitFor(() => expect(slot.getByText("My notes")).toBeTruthy());
-    fireEvent.change(select, { target: { value: "p1" } });
-    await waitFor(() => expect(select.value).toBe("p1"));
+    await pickProject(slot, "Acme");
+    await waitFor(() => expect(shownProject(slot)).toBe("p1"));
+    expect(trigger.getAttribute("data-project-id")).toBe("p1");
     expect(slot.inspection.navigateCalls).not.toContainEqual(expect.objectContaining({ method: "toProject" }));
     slot.lifecycle.unmount();
   });
@@ -625,9 +686,8 @@ describe("the stewards sidebar list (BB-44)", () => {
       },
       { onNavigate },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    fireEvent.change(select, { target: { value: "personal" } });
-    await waitFor(() => expect(select.value).toBe("personal"));
+    await pickProject(slot, "Personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     fireEvent.click(slot.getByRole("button", { name: "New thread" }));
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toCompose", options: { projectId: "personal", focusPrompt: true } }));
     expect(onNavigate).toHaveBeenCalledTimes(1);
@@ -696,6 +756,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · needs you");
     expect(glyphOf(slot, "Fix login")).toBe("you");
     // The picker count follows the server's needsCount (BB-100).
+    await openProjectPicker(slot);
     expect(slot.getByRole("option", { name: "Acme (1)" })).toBeTruthy();
     // No separate Needs you section remains.
     expect(slot.queryByRole("heading", { name: /Needs you/u })).toBeNull();
@@ -1342,12 +1403,11 @@ describe("the board route store (BB-94)", () => {
       } as never,
     };
     const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "personal", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
-    const select = await waitFor(() => listSlot.getByLabelText("Project") as HTMLSelectElement);
-    expect(select.value).toBe("personal");
+    await waitFor(() => expect(shownProject(listSlot)).toBe("personal"));
     const panelSlot = renderSlot(panel, { subPath: "p1" }, options);
-    await waitFor(() => expect(select.value).toBe("p1"));
+    await waitFor(() => expect(shownProject(listSlot)).toBe("p1"));
     panelSlot.lifecycle.unmount();
-    await waitFor(() => expect(select.value).toBe("personal"));
+    await waitFor(() => expect(shownProject(listSlot)).toBe("personal"));
     listSlot.lifecycle.unmount();
   });
 
@@ -1386,9 +1446,8 @@ describe("the board route store (BB-94)", () => {
     };
     const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
     const panelSlot = renderSlot(panel, { subPath: "p1" }, options);
-    const select = await waitFor(() => listSlot.getByLabelText("Project") as HTMLSelectElement);
-    await waitFor(() => expect(select.value).toBe("p1"));
-    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(shownProject(listSlot)).toBe("p1"));
+    await pickProject(listSlot, "Personal");
     await waitFor(() => expect(listSlot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
     panelSlot.lifecycle.unmount();
     listSlot.lifecycle.unmount();
@@ -1410,13 +1469,12 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: "thr_a", activeProjectId: "p1", onNavigate },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    expect(select.value).toBe("p1");
+    expect(shownProject(slot)).toBe("p1");
     // Pick B: no history there, so its Stewards page.
-    fireEvent.change(select, { target: { value: "personal" } });
+    await pickProject(slot, "Personal");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
     // Pick A again: the thread remembered in A.
-    fireEvent.change(select, { target: { value: "p1" } });
+    await pickProject(slot, "Acme");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_a" }));
     // A pick never closes the mobile drawer.
     expect(onNavigate).not.toHaveBeenCalled();
@@ -1431,8 +1489,7 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: "thr_a", activeProjectId: "p1" },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    fireEvent.change(select, { target: { value: "personal" } });
+    await pickProject(slot, "Personal");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
     slot.lifecycle.unmount();
   });
@@ -1446,7 +1503,7 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: "thr_a", activeProjectId: "p1" },
     );
-    await waitFor(() => expect(seed.getByLabelText("Project")).toBeTruthy());
+    await waitFor(() => expect(seed.getByRole("button", { name: "Project" })).toBeTruthy());
     seed.lifecycle.unmount();
     // The thread is archived now, so picking p1 cannot return to it.
     const slot = await renderSidebar(
@@ -1459,9 +1516,8 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: "thr_personal", activeProjectId: "personal" },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    expect(select.value).toBe("personal");
-    fireEvent.change(select, { target: { value: "p1" } });
+    expect(shownProject(slot)).toBe("personal");
+    await pickProject(slot, "Acme");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
     expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_a" });
     slot.lifecycle.unmount();
@@ -1476,9 +1532,8 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: null, activeProjectId: "p1", onNavigate },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    fireEvent.change(select, { target: { value: "personal" } });
-    await waitFor(() => expect(select.value).toBe("personal"));
+    await pickProject(slot, "Personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     expect(slot.inspection.navigateCalls).toHaveLength(0);
     expect(onNavigate).not.toHaveBeenCalled();
     slot.lifecycle.unmount();
@@ -1492,9 +1547,8 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: "thr_a", activeProjectId: "p1" },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    fireEvent.change(select, { target: { value: "p1" } });
-    await waitFor(() => expect(select.value).toBe("p1"));
+    await pickProject(slot, "Acme");
+    await waitFor(() => expect(shownProject(slot)).toBe("p1"));
     expect(slot.inspection.navigateCalls).toHaveLength(0);
     slot.lifecycle.unmount();
   });
@@ -1511,11 +1565,10 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: null, activeProjectId: "p1" },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    await waitFor(() => expect(select.value).toBe("p1"));
-    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(shownProject(slot)).toBe("p1"));
+    await pickProject(slot, "Personal");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
-    fireEvent.change(select, { target: { value: "p1" } });
+    await pickProject(slot, "Acme");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } }));
     slot.lifecycle.unmount();
   });
@@ -1532,11 +1585,10 @@ describe("the sidebar project picker's last place (BB-113)", () => {
       },
       { activeThreadId: null, activeProjectId: "p1" },
     );
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    await waitFor(() => expect(select.value).toBe("p1"));
-    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(shownProject(slot)).toBe("p1"));
+    await pickProject(slot, "Personal");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
-    fireEvent.change(select, { target: { value: "p1" } });
+    await pickProject(slot, "Acme");
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
     expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } });
     slot.lifecycle.unmount();
@@ -1564,14 +1616,14 @@ describe("the sidebar keeps its project when the route names none (BB-117)", () 
         },
       } as never,
     });
-    expect((await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement)).value).toBe("personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     // Archiving the thread (or opening Settings) leaves the route with no
     // project; the sidebar stays on personal rather than falling to the first.
     slot.lifecycle.rerender(<list.component {...props} activeThreadId={null} activeProjectId={null} />);
     // A route that names no project must not refetch the server's fallback.
     await new Promise((r) => setTimeout(r, 50));
     expect(calls).not.toContain(null);
-    expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal");
+    expect(shownProject(slot)).toBe("personal");
     slot.lifecycle.unmount();
   });
 
@@ -1583,17 +1635,16 @@ describe("the sidebar keeps its project when the route names none (BB-117)", () 
       sidebarThreads: { projects, threads: [thread({ id: "thr_b", projectId: "personal" })] },
       rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
     });
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    expect(select.value).toBe("p1");
+    await waitFor(() => expect(shownProject(slot)).toBe("p1"));
     // Pick B on the home page, then open a B thread: the route change clears
     // `picked`, but the remembered project survives. Archiving it then leaves
     // the sidebar on B, not the server's first project.
-    fireEvent.change(select, { target: { value: "personal" } });
-    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    await pickProject(slot, "Personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     slot.lifecycle.rerender(<list.component {...props} activeProjectId="personal" activeThreadId="thr_b" />);
-    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     slot.lifecycle.rerender(<list.component {...props} />);
-    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     slot.lifecycle.unmount();
   });
 
@@ -1605,12 +1656,11 @@ describe("the sidebar keeps its project when the route names none (BB-117)", () 
       sidebarThreads: { projects, threads: [] },
       rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
     });
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
     // Pick B on the home page, then open a thread in project A: the route wins.
-    fireEvent.change(select, { target: { value: "personal" } });
-    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    await pickProject(slot, "Personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
     slot.lifecycle.rerender(<list.component {...props} activeProjectId="p1" activeThreadId="thr_a" />);
-    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("p1"));
+    await waitFor(() => expect(shownProject(slot)).toBe("p1"));
     slot.lifecycle.unmount();
   });
 });
@@ -2122,8 +2172,7 @@ describe("the sidebar's one-project RPC (BB-100)", () => {
       sidebarThreads: { projects, threads: [] },
       rpc: { stewardsSidebar: () => sidebarData() } as never,
     });
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    fireEvent.change(select, { target: { value: "personal" } });
+    await pickProject(slot, "Personal");
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsSidebar", input: { projectId: "personal" } }));
     slot.lifecycle.unmount();
   });
@@ -2154,6 +2203,7 @@ describe("the sidebar's one-project RPC (BB-100)", () => {
       sidebarThreads: { projects, threads: [] },
       rpc: { stewardsSidebar: () => sidebarData({ needsCount: 3 }) } as never,
     });
+    await openProjectPicker(slot);
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme (3)" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
@@ -2169,7 +2219,7 @@ describe("the sidebar's loading state (BB-127)", () => {
       sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "A one-off" })] },
       rpc: { stewardsSidebar: () => new Promise(() => {}) } as never,
     });
-    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
+    await waitFor(() => expect(slot.getByRole("button", { name: "Project" })).toBeTruthy());
     expect(slot.container.querySelector("[data-sidebar-skeleton]")).not.toBeNull();
     expect(slot.queryByText("A one-off")).toBeNull();
     expect(slot.queryByRole("button", { name: /Threads/u })).toBeNull();
@@ -2220,9 +2270,11 @@ describe("the sidebar's loading state (BB-127)", () => {
     });
     try {
       await waitFor(() => expect(slot.getByText("P1 work")).toBeTruthy());
-      const select = slot.getByLabelText("Project") as HTMLSelectElement;
+      await openProjectPicker(slot);
+      // Switch to fake timers before the pick, so the 150 ms stale window is
+      // a timer this test can advance.
       vi.useFakeTimers();
-      fireEvent.change(select, { target: { value: "personal" } });
+      fireEvent.click(slot.getByRole("option", { name: "Personal" }));
       // The previous project's grouped list stays, dimmed and inert.
       const stale = slot.container.querySelector("[data-sidebar-stale]");
       expect(stale).not.toBeNull();
