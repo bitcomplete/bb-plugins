@@ -5093,6 +5093,28 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ id: filed.id, filedBy: "steward" });
   });
 
+  it("closes an open plugin-filed merge need on a teammate's pull request (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    // The item a server already had open before this change is closed, not left.
+    const filed = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.need(filed.id)).toMatchObject({ status: "done", resolution: "A teammate's pull request: its author merges after the owner's approval." });
+  });
+
+  it("keeps suppressing the merge need on a review binding when the gh login cannot be read (BB-170)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    t.viewers.github = null;
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
   it("files the merge need for a teammate's pull request when the playbook sets owner-merges (BB-170)", async () => {
     const t = await setup();
     t.files[playbookPath("github-reviews")] = GITHUB_REVIEWS.replace("skip-authors: [dependabot, \"dependabot[bot]\", \"renovate[bot]\"]", "skip-authors: [dependabot, \"dependabot[bot]\", \"renovate[bot]\"]\nowner-merges: true");

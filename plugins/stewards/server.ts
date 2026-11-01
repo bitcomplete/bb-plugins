@@ -5220,16 +5220,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         // BB-170: on a teammate's pull request (a review steward), the owner's
         // approval is their last step and the author merges, so the plugin
-        // files no Merge item. The owner's own agent PRs and the dependency
-        // watch's bot PRs keep it, and a playbook's `owner-merges: true` opts
-        // back in. A steward-filed item (a refused merge) is always left alone.
+        // files no Merge item. A review binding is a teammate's pull request by
+        // adoption, so this does not depend on reading the login; the owner's
+        // own agent PRs and the dependency watch's bot PRs keep the item, and a
+        // playbook's `owner-merges: true` opts back in. A steward-filed item (a
+        // refused merge) is always left alone.
+        const dependencyBot = pull.author !== null && DEPENDENCY_BOTS.has(lc(pull.author));
         const foreignOwner =
-          (b.kind === "pr" || b.kind === "review") &&
-          pull.author !== null &&
-          ownerLogin !== null &&
-          lc(pull.author) !== lc(ownerLogin) &&
-          !DEPENDENCY_BOTS.has(lc(pull.author)) &&
-          !playbook.ownerMerges;
+          !dependencyBot &&
+          !playbook.ownerMerges &&
+          (b.kind === "review" || (b.kind === "pr" && pull.author !== null && ownerLogin !== null && lc(pull.author) !== lc(ownerLogin)));
         if (g.gateMet) {
           // A steward's own merge item (a refused merge) is left alone while a
           // worker still runs; the plugin files its own only when none does.
