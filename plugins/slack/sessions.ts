@@ -111,7 +111,10 @@ export const sessionRecordSchema = z.object({
    * steers into a turn which already replied cannot share that reply, so it
    * is left out of `events` and the turn that ends here owes no backstop; a
    * reply is still allowed while this is set, and a following turn may answer
-   * the steer. Null when no late steer is parked.
+   * the steer. It is cleared by that reply or ack, or by `forgetThread`; it
+   * does not expire on its own while the thread lives, so a stray reply from a
+   * later turn of the same thread may consume it. Null when no late steer is
+   * parked.
    */
   lateSteerAt: z.number().nullable().default(null),
   /** The last Slack conversation title pushed, so it is not pushed twice. */

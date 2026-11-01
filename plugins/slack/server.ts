@@ -1305,6 +1305,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         bb.log.info(`Slack session ${sessionLogId(event.session)}: no bb thread to steer for a ${event.action}; ignored`);
         return;
       }
+      // Read before the send. A reply that lands while the send is in flight
+      // makes an edit look not-late here, so it is not parked: the pre-existing
+      // narrow window where the "already has its reply" failure can return.
       const before = sessions.get(event.session);
       if (options.owesReply && event.tagged) countWake(event);
       const body = `[Slack — session ${event.session}]\n${correction}${options.owesReply ? `\n\nReply in Slack with the slack_reply tool (session ${event.session}). If the message needs no answer, use the slack_ack tool (session ${event.session}) instead.` : `\n\nNo reply is needed for this deletion.`}`;
@@ -1716,6 +1719,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // outcome; clear the thinking status for it once its turn has run, so an
       // older turn's idle does not clear the indicator of a queued wake.
       const untaggedWaiting = mine.filter(([, r]) => r.untagged > 0);
+      // A parked late steer set the thinking indicator for the edit, but the
+      // turn ending here cannot answer it and posts no backstop. Clear the
+      // indicator so it does not outlive the turn; a following turn sets its
+      // own if it replies.
+      for (const [session, r] of mine) {
+        if (r.lateSteerAt !== null && r.lateSteerAt <= idleAt) void hooks.status(session, "", checkSignal()).catch(() => undefined);
+      }
       if (waiting.length === 0 && untaggedWaiting.length === 0) {
         await clearSteered(threadId, idleAt);
         return;

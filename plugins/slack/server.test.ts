@@ -1844,6 +1844,8 @@ describe("Slack plugin", () => {
     await tick();
     // No backstop apology: the turn that ended owed the late steer no reply.
     expect(s.hooks.messages).toHaveLength(1);
+    // The edit's thinking indicator does not outlive the turn.
+    expect(s.hooks.statuses.at(-1)?.body.status).toBe("");
     await s.stop();
   });
 
