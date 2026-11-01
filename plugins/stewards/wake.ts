@@ -1081,7 +1081,7 @@ function needListing(n: Need): string | null {
 export function formatProjectWake(input: {
   reason: string;
   bindings: Array<{ binding: Binding; openEscalations: Escalation[] }>;
-  routed: Array<{ escalation: Escalation; from: Binding; /** The decide-list listing when the escalation is an approval (BB-135). */ listing?: string }>;
+  routed: Array<{ escalation: Escalation; from: Binding; /** The decide-list listing when the escalation is an approval (BB-135). */ listing?: string; /** Whether the reviewer's marker escalated the pull request to the owner (BB-192). */ escalated?: boolean }>;
   /** Escalations forwarded to the user and not yet answered. */
   withUser?: Array<{ escalation: Escalation; from: Binding }>;
   problems: string[];
@@ -1143,6 +1143,11 @@ export function formatProjectWake(input: {
       const rules = input.standingRules ?? [];
       out.push(
         "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        ...(input.routed.some((r) => r.escalation.kind === "approval" && r.escalated === true)
+          ? [
+              "A reviewer can escalate an owner-reviewed pull request to the owner in its `bb-review` marker (`approver=owner`, or no approver at all). When it has, a `bb-approval` does not meet the gate whatever entry matched, so do not post one: forward the request to the user with steward_update { binding, forward, resolution: \"approve-decline\", recommendation, cites: [ids] }. The owner's unsigned approval is the gate.",
+            ]
+          : []),
         "",
         rules.length === 0
           ? "This project has no standing-rules list configured. Add only the limits this change needs, in at most three points, as the guidance; approve with none when nothing needs adding. The guidance written to the binding is your additions only."

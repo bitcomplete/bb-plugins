@@ -238,7 +238,19 @@ export type PrGate = {
   decision: "project" | "user";
   /** Whether the plugin posted a project-steward approval marker on this pull request. */
   projectApproved: boolean;
+  /** Whether the reviewer's latest owner-reviewed marker escalated the pull request to the owner (BB-192). */
+  escalated: boolean;
 };
+
+/**
+ * The refusal a project steward hears when it tries to approve a pull request
+ * whose reviewer marker escalated it to the owner (`approver=owner`, or a
+ * missing/unknown approver, fail closed). A `bb-approval` is not the gate
+ * whatever the decide list matched, so the project steward forwards it instead
+ * (BB-192).
+ */
+export const ESCALATED_APPROVAL_REFUSAL =
+  "The reviewer escalated this pull request to the owner, so the project steward does not decide it: the owner's unsigned approval is the gate. Forward it with steward_update { binding, forward, resolution: \"approve-decline\", recommendation }.";
 
 /** The project steward's side of the gate: the decide mark and the plugin's own approval records. */
 export type PrGateOptions = {
@@ -260,6 +272,13 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // Only an explicit `no-review` marker skips the owner; a marker the plugin
   // cannot read, or an unknown lane, is the user's (fail closed).
   const ownerLane = lane !== "no-review";
+  // A reviewer may escalate an owner-reviewed pull request to the owner in its
+  // marker: `approver=owner`, or a missing/unknown approver (fail closed). The
+  // gate then needs the owner's unsigned approval and a project-steward
+  // `bb-approval` never meets it, whatever `decideFor` says (BB-192). An
+  // `approver=project` marker leaves the decide list in charge; `approver` on a
+  // `no-review` marker is ignored, and no marker can move a `user` match down.
+  const escalated = marker !== null && ownerLane && marker.approver !== "project";
   // The project steward's decision is the plugin's own record AND the marker
   // it posted: only a `bb-approval` comment whose id the plugin recorded
   // counts, so a hand-typed lookalike (a different comment id) never does.
@@ -277,7 +296,7 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // wins; without one, a project approval means the project steward (a
   // project approval is only ever recorded for a `project` entry), and
   // everything else is the user's (fail closed).
-  const decision: "project" | "user" = opts.decision === "project" || (opts.decision === undefined && projectApprovedRaw) ? "project" : "user";
+  const decision: "project" | "user" = escalated ? "user" : opts.decision === "project" || (opts.decision === undefined && projectApprovedRaw) ? "project" : "user";
   const projectApproved = projectApprovedRaw && decision === "project";
   const approved = decision === "project" ? projectApproved : owner.approved;
   const approvalNeeded = ownerLane && markerApproved && checksGreen && !approved;
@@ -293,9 +312,11 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
           : !checksGreen
             ? `checks ${checksState ?? "not run"}`
             : ownerLane && !approved
-              ? decision === "project"
-                ? "project steward approval needed"
-                : "owner approval needed"
+              ? escalated
+                ? "owner approval needed (the reviewer escalated it)"
+                : decision === "project"
+                  ? "project steward approval needed"
+                  : "owner approval needed"
               : "not met";
   return {
     headSha,
@@ -316,6 +337,7 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     needsProjectApproval: approvalNeeded && decision === "project",
     decision,
     projectApproved,
+    escalated,
   };
 }
 

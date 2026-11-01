@@ -180,7 +180,7 @@ Post exactly one comment per round with `gh pr comment <n> --repo <repo>
 parses it, so keep its shape exact:
 
 ```
-<!-- bb-review round=<N> sha=<full head sha> verdict=<verdict> lane=<lane> -->
+<!-- bb-review round=<N> sha=<full head sha> verdict=<verdict> lane=<lane> approver=<owner|project> -->
 ```
 
 `verdict` is `approved` or `changes-requested`. `approved` means: no
@@ -192,14 +192,33 @@ ran pass. Suggestions may still be open; the author decides on those. Use
 as soon as you approve and checks pass, with no human looking, so set it
 only when you have checked every trigger against the diff and found none.
 
+`approver` is `owner` or `project`, and is set only on `lane=owner-reviewed`.
+It is binding: the merge gate reads it and a project-steward `bb-approval`
+never meets an `approver=owner` round, whatever decide-list entry matched.
+Set `approver=owner` when the decide list makes the change the owner's (a
+`user` entry, no matching entry, an entry with no paths, a file list you
+cannot read, or a self-widening change), **or** when your own reading of the
+diff hits a `user`-decided big decision whatever paths matched: a routing,
+session-ownership or sign-in change under the hooks-adapter entry; a
+credential; changing what the requester asked for. Otherwise set
+`approver=project` and the decide list decides. A missing or unknown
+`approver` on an owner-reviewed marker is read as `owner` (fail closed), so
+set it explicitly on every owner-reviewed round. On a `no-review` marker it
+is ignored, and escalation only goes up: no marker can move a `user` match
+down to the project steward or to no-review.
+
 On `owner-reviewed`, put the decision in the owner-review line in the
 round that first assigns the lane and again in the round whose verdict is
 `approved`, and leave it out of intermediate rounds so the notifications
 mean something. Mention the owner, by the login `gh api user -q .login`
-prints (the account this server posts as), only when the decide list makes
-the change the owner's (`user`, no entry, or unreadable files); for a
-`project` entry name the project steward and do not mention the owner,
-because the plugin routes that approval there.
+prints (the account this server posts as), when `approver=owner` — the
+decide list makes it the owner's (`user`, no entry, or unreadable files),
+or your own reading hit a `user`-decided big decision whatever paths
+matched. For `approver=project` name the project steward and do not mention
+the owner, because the plugin routes that approval there. When you set
+`approver=owner`, say the escalation is binding: a project-steward
+`bb-approval` will not meet the gate, and the owner's unsigned approval
+will.
 
 Then the body, in this order, omitting empty sections:
 

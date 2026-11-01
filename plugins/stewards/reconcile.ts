@@ -49,9 +49,12 @@ export function runningWorkerReason(workers: readonly Pick<Worker, "threadId" | 
 /**
  * A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the
  * first line of a comment. `lane` is null when the marker did not name one
- * (the gate then treats the pull request as the owner's).
+ * (the gate then treats the pull request as the owner's). `approver` is the
+ * optional `approver=owner|project` attribute; it is undefined when the marker
+ * did not name one, and the gate then reads it as `owner` (fail closed,
+ * BB-192).
  */
-export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null };
+export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null; approver?: string };
 
 const REVIEW_MARKER = /^<!--\s*bb-review\b([^>]*?)-->/u;
 
@@ -84,6 +87,7 @@ export function reviewMarker(body: string): ReviewMarker | null {
     sha: keyed.get("sha") ?? "",
     verdict: keyed.get("verdict") ?? bare[0] ?? UNREADABLE_VERDICT,
     lane: keyed.get("lane") ?? null,
+    approver: keyed.get("approver"),
   };
 }
 
