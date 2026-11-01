@@ -46,6 +46,19 @@ export function createGhTokenReader(): TokenReader {
     });
 }
 
+/** A recursive tree entry as GitHub's tree API returns it. */
+export interface GithubTreeEntry {
+  path: string;
+  type: string;
+}
+
+/** A branch's protection rule, as the survey reports it. */
+export interface BranchProtection {
+  protected: boolean;
+  requiredApprovingReviewCount: number | null;
+  requiresStatusChecks: boolean;
+}
+
 export interface GithubWriter {
   /**
    * Post a comment as the connected user and return GitHub's node id for it.
@@ -79,6 +92,12 @@ export interface GithubWriter {
    * procedure merge (BB-108).
    */
   fileContent?(repo: string, path: string, ref: string): Promise<string | null>;
+  /** A repository's recursive tree at a ref, for the onboarding survey. */
+  tree?(repo: string, ref: string): Promise<GithubTreeEntry[]>;
+  /** A branch's protection rule, or null when the branch is not protected, for the survey. */
+  branchProtection?(repo: string, branch: string): Promise<BranchProtection | null>;
+  /** A repository's label names, for the survey. */
+  labels?(repo: string): Promise<string[]>;
 }
 
 /** "owner/repo#12" or "https://github.com/owner/repo/pull/12" → { repo, number }. */
@@ -156,6 +175,40 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
         if (error instanceof GithubApiError && / 404 /u.test(error.message)) return null;
         throw error;
       }
+    },
+    async tree(repo, ref) {
+      const response = await request("GET", `/repos/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`, undefined);
+      const body = (await response.json().catch(() => null)) as { tree?: unknown } | null;
+      if (body === null || !Array.isArray(body.tree)) return [];
+      return body.tree.flatMap((entry) => {
+        if (entry === null || typeof entry !== "object") return [];
+        const e = entry as { path?: unknown; type?: unknown };
+        return typeof e.path === "string" && e.path !== "" ? [{ path: e.path, type: typeof e.type === "string" ? e.type : "blob" }] : [];
+      });
+    },
+    async branchProtection(repo, branch) {
+      try {
+        const response = await request("GET", `/repos/${repo}/branches/${encodeURIComponent(branch)}/protection`, undefined);
+        const body = (await response.json().catch(() => null)) as { required_pull_request_reviews?: { required_approving_review_count?: unknown } | null; required_status_checks?: unknown } | null;
+        const count = body?.required_pull_request_reviews?.required_approving_review_count;
+        return {
+          protected: true,
+          requiredApprovingReviewCount: typeof count === "number" ? count : null,
+          requiresStatusChecks: body?.required_status_checks !== null && body?.required_status_checks !== undefined,
+        };
+      } catch (error) {
+        // GitHub answers 404 for a branch with no protection rule: a fact, not a failure.
+        if (error instanceof GithubApiError && / 404 /u.test(error.message)) return null;
+        throw error;
+      }
+    },
+    async labels(repo) {
+      const response = await request("GET", `/repos/${repo}/labels?per_page=100`, undefined);
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (!Array.isArray(body)) return [];
+      return body
+        .flatMap((label) => (label !== null && typeof label === "object" && typeof (label as { name?: unknown }).name === "string" ? [(label as { name: string }).name] : []))
+        .sort((a, b) => a.localeCompare(b));
     },
   };
 }

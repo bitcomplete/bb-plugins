@@ -18,6 +18,7 @@ import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPlugin
 import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
+  DEFAULT_LABEL,
   DEFAULT_PLAYBOOKS,
   DEPS_ALERTS_PLAYBOOK,
   DEPS_PRS_PLAYBOOK,
@@ -93,15 +94,16 @@ import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
-import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
+import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
-import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
+import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
 
@@ -8401,7 +8403,152 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (own !== null && ctx.threadId !== undefined) return { exitCode: 0, stdout: `# Project steward brief\n\n${projectStewardInvariants(ctx.threadId)}` };
               const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
               const config = await loadConfig(b.projectId);
+    // ---- the onboarding survey (BB-180) ----------------------------------------
+
+    /** The workflow states the project's ticket playbook expects, for the survey's Linear section. */
+    function surveyExpectedStates(config: ProjectConfig | null): string[] {
+      const playbook = config?.playbooks.ticket ?? (() => { const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets"); return parsed.ok ? parsed.value : null; })();
+      return playbook === null ? [] : playbookStates(playbook);
+    }
+
+    const surveyUnavailable = (error: string): Available<never> => ({ available: false, error });
+
+    /** Gather one repo's GitHub facts and the text of the files the survey reads. */
+    async function gatherSurveyRepo(entry: { dir: string; url: string }, repo: string | null, otherRepos: { repo: string | null; url: string }[]): Promise<SurveyRepoInput> {
+      const contents = new Map<string, string | null>();
+      if (repo === null) {
+        const error = `${entry.url} is not a GitHub repository`;
+        return { dir: entry.dir, url: entry.url, repo, defaultBranch: null, branchProtection: surveyUnavailable(error), labels: surveyUnavailable(error), tree: null, treeError: error, contents, otherRepos };
+      }
+      let defaultBranch: string | null = null;
+      try {
+        defaultBranch = await github.defaultBranch(repo);
+      } catch {
+        defaultBranch = null;
+      }
+      let branchProtection: Available<BranchProtection>;
+      if (github.branchProtection === undefined) branchProtection = surveyUnavailable("the gh writer does not read branch protection");
+      else if (defaultBranch === null) branchProtection = surveyUnavailable("the repository has no readable default branch");
+      else {
+        try {
+          const rule = await github.branchProtection(repo, defaultBranch);
+          branchProtection = { available: true, value: rule ?? { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: false } };
+        } catch (error) {
+          branchProtection = surveyUnavailable(errorMessage(error));
+        }
+      }
+      let labels: Available<string[]>;
+      if (github.labels === undefined) labels = surveyUnavailable("the gh writer does not read labels");
+      else {
+        try {
+          labels = { available: true, value: await github.labels(repo) };
+        } catch (error) {
+          labels = surveyUnavailable(errorMessage(error));
+        }
+      }
+      let tree: GithubTreeEntry[] | null = null;
+      let treeError: string | null = null;
+      if (github.tree === undefined) treeError = "the gh writer does not read a repository tree";
+      else if (defaultBranch === null) treeError = "the repository has no readable default branch";
+      else {
+        try {
+          tree = await github.tree(repo, defaultBranch);
+        } catch (error) {
+          tree = null;
+          treeError = errorMessage(error);
+        }
+      }
+      if (tree !== null && github.fileContent !== undefined && defaultBranch !== null) {
+        for (const path of surveyWantedPaths(tree)) {
+          try {
+            contents.set(path, await github.fileContent(repo, path, defaultBranch));
+          } catch {
+            contents.set(path, null);
+          }
+        }
+      }
+      return { dir: entry.dir, url: entry.url, repo, defaultBranch, branchProtection, labels, tree, treeError, contents, otherRepos };
+    }
+
+    /** Gather the Linear teams and workflow states the survey reports. */
+    async function gatherSurveyLinear(config: ProjectConfig | null): Promise<SurveyLinear> {
+      const label = config?.file.label ?? DEFAULT_LABEL;
+      const configured = config?.file.linear.teams ?? [];
+      const expected = surveyExpectedStates(config);
+      try {
+        const out = await sourceRpc("linear", "sourceValidate", { units: configured, label, states: expected }, sourceContract.sourceValidate.output);
+        if (out.error !== null) return { available: false, error: out.error };
+        const names = new Map(out.mine.map((m) => [m.unit, m.name]));
+        const units = new Map(out.units.map((u) => [u.unit, u]));
+        const keys = configured.length > 0 ? configured : out.mine.map((m) => m.unit);
+        const teams = keys.map((key) => ({ key, name: names.get(key) ?? key, expectedStates: expected, missingStates: units.get(key)?.missingStates ?? [] }));
+        return { available: true, value: { viewer: out.viewer, teams } };
+      } catch (error) {
+        return { available: false, error: errorMessage(error) };
+      }
+    }
+
+    /** Gather what the project's `.bb` already holds, so adoption can diff rather than start over. */
+    async function gatherSurveyBb(source: ProjectSource, config: ProjectConfig | null, reposError: string | null): Promise<SurveyBb> {
+      const names = new Set<string>(KNOWN_PLAYBOOKS);
+      if (config !== null) for (const name of Object.values(config.file.playbooks)) if (typeof name === "string") names.add(name);
+      const paths = [PROJECT_FILE, ROLES_FILE, "repos.json", ...[...names].map(playbookPath)];
+      let files = new Map<string, string | null>();
+      let error: string | null = null;
+      try {
+        files = await source.readFiles(paths);
+      } catch (e) {
+        error = errorMessage(e);
+      }
+      const rolesText = files.get(ROLES_FILE) ?? null;
+      let projectSteward: string | null = null;
+      if (rolesText !== null) {
+        const parsed = parseRolesFile(rolesText);
+        if (parsed.ok) projectSteward = Object.entries(parsed.value.roles).find(([, role]) => role.projectSteward === true)?.[0] ?? null;
+      }
+      return {
+        projectFile: (files.get(PROJECT_FILE) ?? null) !== null,
+        roles: rolesText !== null,
+        projectSteward,
+        playbooks: [...names].filter((name) => (files.get(playbookPath(name)) ?? null) !== null).sort(),
+        reposJson: (files.get("repos.json") ?? null) !== null,
+        error: error ?? reposError,
+      };
+    }
+
+    /** Read the project and emit the survey the onboarding skill works from. */
+    async function surveyProject(projectId: string): Promise<SurveyReport> {
+      const config = await loadConfig(projectId, true);
+      const source = config?.source ?? (await selectProjectSource(projectId)).source;
+      const set = await source.repoSet();
+      const listed = set.layout === "primary" && set.primary !== null ? [...set.repos, set.primary] : set.repos;
+      const seen = new Set<string>();
+      const entries = listed.filter((entry) => {
+        const key = `${entry.dir}\0${entry.url}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const others = entries.map((entry) => ({ repo: githubRepoOf(entry.url), url: entry.url }));
+      const repos: SurveyRepoInput[] = [];
+      for (const entry of entries) repos.push(await gatherSurveyRepo(entry, githubRepoOf(entry.url), others.filter((o) => o.url !== entry.url)));
+      const linear = await gatherSurveyLinear(config);
+      const bb = await gatherSurveyBb(source, config, set.error);
+      return buildSurvey({ projectId, source: source.kind, layout: set.layout, primary: set.primary, repos, linear, bb });
+    }
+
               const playbook = config === null ? null : bindingPlaybook(config, b);
+          survey: cliCommand({
+            summary: "Emit the mechanical facts about a project's repos, Linear and .bb, for onboarding",
+            description:
+              "Reads each repo's default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, deploy manifests, labels and cross-repo references from GitHub; the Linear teams and workflow states from the linear source; and what .bb already holds. A read that fails is reported as unavailable, never fabricated. --json is stable and is what the onboarding skill works from.",
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const report = await surveyProject(projectOf(input.options.project, ctx));
+              return { exitCode: 0, stdout: input.options.json === true ? JSON.stringify(report, null, 2) : formatSurvey(report) };
+            },
+          }),
+
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
               return {
                 exitCode: 0,

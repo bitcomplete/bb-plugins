@@ -748,6 +748,47 @@ so the gate matches what the steward meant, and it refuses anything else and
 records nothing, listing the numbers. Checklist items can then be as long as
 a project needs.
 
+## Onboarding a project
+
+Setting the mechanics up is `bb stewards init`; writing the project-specific
+content — the dependency graph between repos, what rebuilds or redeploys when,
+how a merge is known live, the test commands, the project steward's login, and
+a decide list whose `paths` make the lane gate work — is an authoring job, not
+a form. It is done by a thread with the **onboarding skill**
+([skills/onboarding/SKILL.md](skills/onboarding/SKILL.md)), which triggers on
+"set up stewards", "onboard this project" and "adopt this project".
+
+`bb stewards survey --json` is the survey the skill works from. It emits the
+mechanical facts about the project's repos (from `repos.json` plus the
+primary): the default branch, branch protection, languages and package
+manifests, the test and typecheck commands CI runs (from `.github/workflows`),
+Dockerfiles and deploy manifests (`kploy`, `bc-prod.yaml`), the repo's labels,
+and which repos reference which. It emits the Linear teams and their workflow
+states, and what `.bb` already holds (project file, roles, playbooks), so
+adoption can diff rather than start over. GitHub is read through the plugin's
+`gh` writer and Linear through the existing source contract; a read that fails
+is reported as `available: false` with the reason, never fabricated. Without
+`--json` it prints the same facts as text.
+
+The flow, in order: survey and read each repo's README; one batched interview
+under ten questions for what only the owner knows; `bb stewards init` for the
+skeleton, then fill `project.json` (`bigDecisions` with repo-dir-prefixed
+`paths`, `deps`), `roles.json` and a short `AGENTS.md`, touching playbooks only
+where the survey found a deviation; `bb stewards check`; then
+`workspace_publish_guidance` and a pull request on the primary repo whose body
+lists every assumption. Stewards read committed `origin/main` only, so nothing
+is live until that pull request merges, and `bb stewards enable` runs only
+after. On a partial `.bb` the same flow proposes additions only, matching
+`init`'s never-overwrite rule, so adopting a project is the same as creating
+one. It is deliberately short on day one; the lessons mechanism grows `.bb`
+from real decisions afterwards.
+
+The Stewards settings page offers **Set up stewards** on a project's row when
+it has no `stewards/project.json`, or a `roles.json` with no `projectSteward`.
+The action spawns an ordinary thread (never the project steward thread) with
+the onboarding skill loaded; the overview lists every project, not only the
+configured ones, so a project with no stewards content still gets a row.
+
 ## Enforcement
 
 None beyond the playbook's word. A steward acts with the user's credentials
