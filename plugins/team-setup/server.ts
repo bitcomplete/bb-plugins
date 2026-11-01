@@ -10,6 +10,7 @@
 //   devbox   devbox-provider's connection. Started here, finished by its own
 //            callback.
 //   Linear   the linear plugin's connection, the same shape as devbox's.
+//   Slack    the slack plugin's per-developer sign-in. Optional like Linear.
 //   machine  Any machine at all. Created from devbox-provider's section.
 //
 // It also carries deployment-wide machine variables: a key the operator
@@ -32,6 +33,7 @@ import { figmaHostContract, type FigmaHostState } from "./figma-contract.js";
 export const ACCOUNT_POOL_ID = "account-pool";
 export const DEVBOX_ID = "devbox-provider";
 export const LINEAR_ID = "linear";
+export const SLACK_ID = "slack";
 export const CHANGED = "changed";
 
 // The developer's "Don't show this again" choice for the first-run redirect.
@@ -132,9 +134,17 @@ export const rpcContract = defineRpcContract({
         user: z.string().nullable(),
         organization: z.string().nullable(),
       }),
+      slack: z.object({
+        available: z.boolean(),
+        message: z.string().nullable(),
+        signedIn: z.boolean(),
+        configured: z.boolean(),
+        connected: z.boolean(),
+        user: z.string().nullable(),
+      }),
       machines: z.object({ names: z.array(z.string()) }),
       figma: figmaStatusSchema,
-      steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, figma: stepStateSchema, machine: stepStateSchema }),
+      steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, slack: stepStateSchema, figma: stepStateSchema, machine: stepStateSchema }),
       onboarding: z.object({ dismissed: z.boolean(), requiredComplete: z.boolean() }),
       complete: z.boolean(),
     }),
@@ -179,6 +189,9 @@ export const rpcContract = defineRpcContract({
   devboxConnect: { input: z.null(), output: z.object({ url: z.string() }) },
   // Linear: the linear plugin's connect, likewise.
   linearConnect: { input: z.null(), output: z.object({ url: z.string() }) },
+  // Slack: the slack plugin's "Sign in with Slack" start; its own callback
+  // finishes the flow and holds the token.
+  slackConnect: { input: z.null(), output: z.object({ url: z.string() }) },
   // The first-run redirect's dismiss flag. `status` reads it; this sets it.
   dismissOnboarding: {
     input: z.object({ dismissed: z.boolean() }).strict(),
@@ -247,6 +260,14 @@ const linearStatusSchema = z
   })
   .loose();
 const linearConnectSchema = z.object({ url: z.string() }).loose();
+const slackStatusSchema = z
+  .object({
+    signedIn: z.boolean(),
+    user: z.object({ id: z.string(), name: z.string() }).loose().nullable(),
+    hooks: z.object({ configured: z.boolean(), connected: z.boolean(), state: z.string() }).loose(),
+  })
+  .loose();
+const slackConnectSchema = z.object({ url: z.string() }).loose();
 
 interface PendingLogin {
   process: GhProcess;
@@ -465,10 +486,11 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
 
     bb.rpc.register(rpcContract, {
       async status() {
-        const [poolState, devboxState, linearState, github, hosts] = await Promise.all([
+        const [poolState, devboxState, linearState, slackState, github, hosts] = await Promise.all([
           pluginState(ACCOUNT_POOL_ID),
           pluginState(DEVBOX_ID),
           pluginState(LINEAR_ID),
+          pluginState(SLACK_ID),
           githubStatus(),
           bb.sdk.hosts.list().then(
             (list) => list,
@@ -518,6 +540,20 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           }
         }
 
+        const slack = { ...slackState, signedIn: false, configured: false, connected: false, user: null as string | null };
+        if (slackState.available) {
+          try {
+            const sl = await call(SLACK_ID, "status", null, slackStatusSchema);
+            slack.signedIn = sl.signedIn;
+            slack.configured = sl.hooks.configured;
+            slack.connected = sl.hooks.connected;
+            slack.user = sl.user?.name ?? null;
+          } catch (error) {
+            slack.available = false;
+            slack.message = `Slack did not answer: ${errorMessage(error)}`;
+          }
+        }
+
         const aiReady = ai.accounts.some((a) => a.enabled && ai.routing[a.provider]);
         // The Figma step runs on the machine that runs Claude Code, so it can
         // only be offered while one is connected and only be acted on while
@@ -560,6 +596,10 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           // cannot connect, and that is not the developer's to-do. Even when
           // it can, Linear is optional: not connecting it is not incomplete.
           linear: !linear.available || !linear.configured ? "unavailable" : linear.connected ? "done" : "optional",
+          // Slack is optional for the same reason: a server that never signs in
+          // is still complete. Without the bb-gate-hooks service it cannot be
+          // signed in at all, which is the operator's gap, not the developer's.
+          slack: !slack.available || !slack.configured ? "unavailable" : slack.signedIn ? "done" : "optional",
           // Figma is optional while it is not configured; once it is, or while
           // a sign-in waits for its callback, finishing it is a to-do.
           figma: !figma.available ? "unavailable" : figma.authenticated ? "done" : figma.configured || figma.pending ? "todo" : "optional",
@@ -571,6 +611,7 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           github,
           devbox,
           linear,
+          slack,
           machines: { names: machineNames },
           figma,
           steps,
@@ -663,6 +704,10 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
       },
       async linearConnect() {
         const { url } = await call(LINEAR_ID, "connect", null, linearConnectSchema);
+        return { url };
+      },
+      async slackConnect() {
+        const { url } = await call(SLACK_ID, "signinStart", null, slackConnectSchema);
         return { url };
       },
 

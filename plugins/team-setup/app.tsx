@@ -66,6 +66,7 @@ const STEP_TITLES: Record<keyof Status["steps"], string> = {
   github: "GitHub",
   devbox: "devbox",
   linear: "Linear",
+  slack: "Slack",
   figma: "Figma",
   machine: "a machine",
 };
@@ -264,7 +265,7 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
     return <p className="text-sm text-muted-foreground">{error ?? "Checking…"}</p>;
   }
 
-  const { ai, github, devbox, linear, machines, steps, figma: figmaStatus } = status;
+  const { ai, github, devbox, linear, slack, machines, steps, figma: figmaStatus } = status;
 
   if (compact && !complete) return <Remaining steps={steps} />;
 
@@ -279,6 +280,7 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
         {github.login !== null ? `GitHub as ${github.login}; ` : steps.github === "done" ? "GitHub; " : ""}
         {devbox.project !== null ? `devbox project ${devbox.project}; ` : steps.devbox === "done" ? "devbox; " : ""}
         {linear.user !== null ? `Linear as ${linear.user}; ` : steps.linear === "done" ? "Linear; " : ""}
+        {slack.user !== null ? `Slack as ${slack.user}; ` : steps.slack === "done" ? "Slack; " : ""}
         {steps.figma === "done" ? "Figma; " : ""}
         {machines.names.length === 1 ? "1 machine" : `${machines.names.length} machines`}.{" "}
         <SettingsLink pluginId="team-setup">Details</SettingsLink>
@@ -294,7 +296,7 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
       {onboarding ? (
         <p className="text-muted-foreground">
           bb needs a few things before agents can work here. Each step below says what it is for and what happens once it is
-          done. Linear and Figma are optional; the rest are needed.
+          done. Linear, Slack and Figma are optional; the rest are needed.
         </p>
       ) : null}
       <ol className="flex flex-col gap-4">
@@ -537,6 +539,45 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
               here. Skip it if you do not use Linear.
             </p>
           )}
+        </Step>
+
+        <Step
+          state={steps.slack}
+          title="Slack (optional)"
+          about={
+            onboarding ? (
+              <p>Slack lets a DM or a channel mention of the team's bb app reach this server and answer in Slack. Connect it to use Slack in bb; skip it if you do not.</p>
+            ) : undefined
+          }
+          action={
+            slack.available && slack.configured && !slack.signedIn ? (
+              <Button size="sm" disabled={busy !== null || !slack.connected} onClick={() => void run("slack", async () => {
+                const { url } = await rpc.call("slackConnect");
+                open(url);
+              })}>
+                Sign in with Slack
+              </Button>
+            ) : null
+          }
+        >
+          {!slack.available ? (
+            <p>{slack.message ?? "Slack is unavailable."} <SettingsLink pluginId="slack">Slack settings</SettingsLink></p>
+          ) : !slack.configured ? (
+            <p>
+              This server has no bb-gate-hooks service (BB_HOOKS_URL is not set), so the Slack app cannot reach it.{" "}
+              <SettingsLink pluginId="slack">Slack settings</SettingsLink>
+            </p>
+          ) : slack.signedIn ? (
+            <p>Signed in as {slack.user ?? "you"}. DMs and channel mentions of the team's bb app reach this server and answer in Slack.</p>
+          ) : (
+            <p>
+              Sign in with Slack once so a DM or a channel mention of the team's bb app reaches your bb. You approve it on Slack,
+              which sends you back to the Slack settings page. Skip it if you do not use Slack.
+            </p>
+          )}
+          {slack.configured && !slack.connected ? (
+            <p className="text-muted-foreground">This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again.</p>
+          ) : null}
         </Step>
 
         <Step
