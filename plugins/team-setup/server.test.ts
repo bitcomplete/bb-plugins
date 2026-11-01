@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { GhProcess, GhResult, GhRunner } from "./gh.js";
-import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, SEEDED_NOTE } from "./server.js";
+import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, ONBOARDING_DISMISSED_KEY, SEEDED_NOTE } from "./server.js";
 
 // A gh whose `auth login` the test drives: print lines, then exit.
 function fakeGh(runs: Record<string, GhResult> = {}) {
@@ -110,9 +110,10 @@ async function setup(world: World = {}) {
     return args.outputSchema.parse(answers[key]);
   });
   let now = 1_000_000;
-  await createTeamSetupPlugin({ gh: gh.runner, now: () => now, env: world.env ?? {} })(bb);
+  const factory = createTeamSetupPlugin({ gh: gh.runner, now: () => now, env: world.env ?? {} });
+  await factory(bb);
   const status = async () => (await harness.callRpc("status", null)) as Awaited<ReturnType<typeof statusType>>;
-  return { bb, harness, gh, rpcCalls, hostCalls, status, setVariables, advance: (ms: number) => (now += ms) };
+  return { bb, harness, factory, gh, rpcCalls, hostCalls, status, setVariables, advance: (ms: number) => (now += ms) };
 }
 // Only for the inferred return type above.
 declare function statusType(): Promise<{
@@ -440,16 +441,22 @@ describe("machine environment seeding", () => {
 
 describe("onboarding dismissal", () => {
   it("round-trips the dismiss flag through the server's own state", async () => {
-    const { status, harness } = await setup();
+    const { status, harness, factory } = await setup();
     expect((await status()).onboarding).toEqual({ dismissed: false, requiredComplete: false });
 
     expect(await harness.callRpc("dismissOnboarding", { dismissed: true })).toEqual({ ok: true });
     expect((await status()).onboarding.dismissed).toBe(true);
 
-    // A second server load reads the same persisted flag; clearing it is a
-    // write too, so the round trip is observable in both directions.
-    expect(await harness.callRpc("dismissOnboarding", { dismissed: false })).toEqual({ ok: true });
-    expect((await status()).onboarding.dismissed).toBe(false);
+    // A reload keeps the kv, so the flag survives a server restart. Read the
+    // stored key directly: the reloaded harness has no SDK stubs, and the flag
+    // is the plugin's own state.
+    const next = await harness.lifecycle.reload(factory);
+    expect(await next.bb.storage.kv.get(ONBOARDING_DISMISSED_KEY)).toBe(true);
+
+    // Clearing it is a write too, so the round trip is observable in both directions.
+    expect(await next.harness.callRpc("dismissOnboarding", { dismissed: false })).toEqual({ ok: true });
+    expect(await next.bb.storage.kv.get(ONBOARDING_DISMISSED_KEY)).toBe(false);
+    await next.harness.lifecycle.dispose();
   });
 
   it("counts required steps as complete even while an optional step is a to-do", async () => {
