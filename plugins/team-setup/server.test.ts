@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { GhProcess, GhResult, GhRunner } from "./gh.js";
-import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, ONBOARDING_DISMISSED_KEY, SEEDED_NOTE } from "./server.js";
+import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, ONBOARDING_DISMISSED_KEY, SEEDED_NOTE, SLACK_ID } from "./server.js";
 
 // A gh whose `auth login` the test drives: print lines, then exit.
 function fakeGh(runs: Record<string, GhResult> = {}) {
@@ -44,6 +44,7 @@ interface World {
   pool?: unknown;
   devbox?: unknown;
   linear?: unknown;
+  slack?: unknown;
   hosts?: Array<{ id?: string; name: string; status?: string }>;
   figmaHost?: { claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null; message: string | null };
   figmaComplete?: { ok: boolean; message: string | null };
@@ -71,7 +72,7 @@ async function setup(world: World = {}) {
     },
   });
   harness.sdk.stub("plugins.list", async () => ({
-    plugins: (world.plugins ?? [{ id: ACCOUNT_POOL_ID, enabled: true }, { id: DEVBOX_ID, enabled: true }, { id: LINEAR_ID, enabled: true }]).map((p) => ({ ...p, name: p.id })),
+    plugins: (world.plugins ?? [{ id: ACCOUNT_POOL_ID, enabled: true }, { id: DEVBOX_ID, enabled: true }, { id: LINEAR_ID, enabled: true }, { id: SLACK_ID, enabled: true }]).map((p) => ({ ...p, name: p.id })),
   }));
   harness.sdk.stub("system.machineEnvironment", async () => ({
     builtInGit: world.builtInGit ?? { status: "not logged in", statusMessage: "gh is not logged in on the server" },
@@ -105,6 +106,8 @@ async function setup(world: World = {}) {
       [`${DEVBOX_ID}:connect`]: { url: "https://devbox.example/connect/authorize?state=s" },
       [`${LINEAR_ID}:status`]: world.linear ?? { connected: false, configured: true, user: null, organization: null },
       [`${LINEAR_ID}:connect`]: { url: "https://linear.example/oauth/authorize?state=s" },
+      [`${SLACK_ID}:status`]: world.slack ?? { signedIn: false, user: null, hooks: { configured: true, connected: true, state: "connected" } },
+      [`${SLACK_ID}:signinStart`]: { url: "https://slack.example/signin?state=s" },
     };
     if (!(key in answers)) throw new Error(`no answer for ${key}`);
     return args.outputSchema.parse(answers[key]);
@@ -121,9 +124,10 @@ declare function statusType(): Promise<{
   github: { status: string; login: string | null; orgMember: boolean | null; pending: { code: string; url: string } | null; lastError: string | null };
   devbox: { available: boolean; connected: boolean; project: string | null; message: string | null };
   linear: { available: boolean; connected: boolean; configured: boolean; user: string | null; organization: string | null; message: string | null };
+  slack: { available: boolean; signedIn: boolean; configured: boolean; connected: boolean; user: string | null; message: string | null };
   figma: { available: boolean; message: string | null; machine: string | null; claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null };
   machines: { names: string[] };
-  steps: { ai: string; github: string; devbox: string; linear: string; figma: string; machine: string };
+  steps: { ai: string; github: string; devbox: string; linear: string; slack: string; figma: string; machine: string };
   onboarding: { dismissed: boolean; requiredComplete: boolean };
   complete: boolean;
 }>;
@@ -137,7 +141,7 @@ describe("status", () => {
   it("starts with everything to do", async () => {
     const { status } = await setup();
     const s = await status();
-    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "optional", figma: "unavailable", machine: "todo" });
+    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "optional", slack: "optional", figma: "unavailable", machine: "todo" });
     expect(s.complete).toBe(false);
     expect(s.github.login).toBeNull();
   });
@@ -148,13 +152,15 @@ describe("status", () => {
       pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
       devbox: { connected: true, project: "dylan" },
       linear: { connected: true, configured: true, user: { id: "u1", name: "jane", email: null }, organization: { name: "Acme", urlKey: "acme" } },
+      slack: { signedIn: true, user: { id: "u2", name: "dylan" }, hooks: { configured: true, connected: true, state: "connected" } },
       hosts: [{ name: "box" }],
       runs: signedIn,
     });
     const s = await status();
-    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "done", linear: "done", figma: "optional", machine: "done" });
+    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "done", linear: "done", slack: "done", figma: "optional", machine: "done" });
     expect(s.complete).toBe(true);
     expect(s.linear).toMatchObject({ connected: true, user: "jane", organization: "Acme" });
+    expect(s.slack).toMatchObject({ signedIn: true, user: "dylan" });
     expect(s.github.login).toBe("octocat");
     expect(s.github.orgMember).toBe(true);
     // Identity is cached between status calls.
@@ -179,7 +185,7 @@ describe("status", () => {
     const s = await status();
     expect(s.devbox.available).toBe(false);
     expect(s.devbox.message).toContain("turned off");
-    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", linear: "unavailable", figma: "optional", machine: "done" });
+    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", linear: "unavailable", slack: "unavailable", figma: "optional", machine: "done" });
     expect(s.complete).toBe(true);
   });
 
@@ -335,6 +341,62 @@ describe("Account Pool and devbox flows", () => {
     expect(s.ai.message).toContain("boom");
     expect(s.devbox.available).toBe(false);
     expect(s.linear.available).toBe(false);
+    expect(s.slack.available).toBe(false);
+  });
+});
+
+describe("Slack step", () => {
+  it("is optional when the slack plugin is configured but not signed in", async () => {
+    const { status } = await setup();
+    const s = await status();
+    expect(s.steps.slack).toBe("optional");
+    expect(s.slack).toMatchObject({ available: true, configured: true, connected: true, signedIn: false, user: null });
+  });
+
+  it("is done once the developer is signed in, and the user is in the status", async () => {
+    const { status } = await setup({
+      builtInGit: { status: "logged in", statusMessage: "ok" },
+      pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
+      devbox: { connected: true, project: "dylan" },
+      linear: { connected: true, configured: true, user: { id: "u1", name: "jane", email: null }, organization: { name: "Acme", urlKey: "acme" } },
+      slack: { signedIn: true, user: { id: "u2", name: "dylan" }, hooks: { configured: true, connected: true, state: "connected" } },
+      hosts: [{ name: "box" }],
+      runs: signedIn,
+    });
+    const s = await status();
+    expect(s.steps.slack).toBe("done");
+    expect(s.slack).toMatchObject({ signedIn: true, user: "dylan" });
+    expect(s.complete).toBe(true);
+  });
+
+  it("is unavailable when the server has no bb-gate-hooks service", async () => {
+    const { status } = await setup({ slack: { signedIn: false, user: null, hooks: { configured: false, connected: false, state: "unconfigured" } } });
+    const s = await status();
+    expect(s.steps.slack).toBe("unavailable");
+    expect(s.slack).toMatchObject({ available: true, configured: false, connected: false });
+  });
+
+  it("is unavailable when the slack plugin is not installed, and does not block completion", async () => {
+    const { status } = await setup({
+      plugins: [{ id: ACCOUNT_POOL_ID, enabled: true }, { id: DEVBOX_ID, enabled: true }, { id: LINEAR_ID, enabled: true }],
+      builtInGit: { status: "logged in", statusMessage: "ok" },
+      pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
+      devbox: { connected: true, project: "dylan" },
+      linear: { connected: true, configured: true, user: { id: "u1", name: "jane", email: null }, organization: { name: "Acme", urlKey: "acme" } },
+      hosts: [{ name: "box" }],
+      runs: signedIn,
+    });
+    const s = await status();
+    expect(s.steps.slack).toBe("unavailable");
+    expect(s.slack.available).toBe(false);
+    expect(s.slack.message).toContain("not installed");
+    expect(s.complete).toBe(true);
+  });
+
+  it("starts the slack plugin's sign-in and returns its URL", async () => {
+    const { harness, rpcCalls } = await setup();
+    expect(await harness.callRpc("slackConnect", null)).toEqual({ url: "https://slack.example/signin?state=s" });
+    expect(rpcCalls.map((c) => `${c.pluginId}:${c.method}`)).toContain(`${SLACK_ID}:signinStart`);
   });
 });
 

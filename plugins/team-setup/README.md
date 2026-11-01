@@ -12,9 +12,9 @@ started page once per page load, while the required steps (Claude or Codex,
 GitHub, devbox and a machine) are still to do and they have not dismissed the
 redirect. The page's "Don't show this again" button stores that choice in the
 plugin's own server state, so it holds across devices and restarts; it is read
-with `status` and written by `dismissOnboarding`. Linear and Figma are optional
-and never keep the redirect alive, and a deep link — a thread, Settings, a
-plugin page — is left alone.
+with `status` and written by `dismissOnboarding`. Linear, Slack and Figma
+are optional and never keep the redirect alive, and a deep link — a thread,
+Settings, a plugin page — is left alone.
 
 | Step | Owned by | Done when | What the button does |
 |---|---|---|---|
@@ -22,6 +22,7 @@ plugin page — is left alone.
 | GitHub | gh on the server host, read by bb core | The built-in GitHub row in Environment variables is "logged in" (or overridden by your own `GH_TOKEN`) | Runs `gh auth login --web` on the server, shows the device code, waits for GitHub to approve it. |
 | devbox | devbox-provider | Connected | Starts devbox-provider's connect; its callback finishes it. |
 | Linear | linear | Connected. Optional: a server without it is still complete (unavailable until the server has an OAuth client ID) | Starts the linear plugin's connect; its callback finishes it. |
+| Slack | slack | Signed in. Optional: a server that never signs in is still complete (unavailable with no bb-gate-hooks service) | Starts the slack plugin's "Sign in with Slack"; its callback finishes it. |
 | Figma | Claude Code on the developer's machine | `figma` is configured at user scope and signed in. Optional: a server that never configures it is still complete (unavailable with no machine, or no `claude` on it) | Runs `claude mcp add --scope user` and `claude mcp login` on the machine, shows the authorization URL, and replays the pasted `http://localhost:<port>/callback` URL against Claude Code's listener. |
 | A machine | bb | Any machine exists | Links to Devbox machines. |
 
@@ -35,7 +36,8 @@ sign-in it checks membership of the `githubOrg` setting (default
 
 No credential passes through this plugin: Claude and Codex tokens go to
 Account Pool through its RPCs, the devbox token to devbox-provider, the
-Linear tokens to the linear plugin, and the GitHub token to gh's own file.
+Linear tokens to the linear plugin, the Slack token to the slack plugin, and
+the GitHub token to gh's own file.
 
 ## Figma
 
