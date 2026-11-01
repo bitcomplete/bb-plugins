@@ -4097,8 +4097,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const watch of rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file))) {
         if (lc(watch.repo) !== lc(e.unit)) continue;
         const m = watch.match;
-        if (m.title !== undefined && (e.title === null || e.title === undefined || !watchPatternMatches(m.title, e.title))) continue;
-        if (m.branch !== undefined && (e.branch === null || e.branch === undefined || !watchPatternMatches(m.branch, e.branch))) continue;
+        if (m.title !== undefined && e.title !== undefined && (e.title === null || !watchPatternMatches(m.title, e.title))) continue;
+        if (m.branch !== undefined && e.branch !== undefined && (e.branch === null || !watchPatternMatches(m.branch, e.branch))) continue;
         if (m.author !== undefined) {
           if (e.author === null || !watchPatternMatches(m.author, e.author)) continue;
         } else if (e.author === null || config.githubLogin === null || lc(e.author) !== lc(config.githubLogin)) continue;

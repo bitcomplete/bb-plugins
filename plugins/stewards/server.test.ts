@@ -2949,6 +2949,18 @@ describe("role-owned pull watches (BB-164)", () => {
     expect(list.stdout).toMatch(/role ops/);
   });
 
+  it("adopts a title/branch watch from the sweep's permissive list, not only from a doorbell", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.entities.set("acme/web#7", syncPr());
+    // The sweep's adoptable list carries neither title nor branch; the watch
+    // must still match there and be decided on the full snapshot (BB-164).
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("acme/web#7")).toMatchObject({ playbook: "sync-prs", adoptedBy: "sync-prs@acme/web" });
+  });
+
   it("does not adopt another author's pull request when the watch names no author, and adopts one it names", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[ROLES_FILE] = roleWithWatch(watch);
