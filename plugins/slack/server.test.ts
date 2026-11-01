@@ -233,6 +233,8 @@ async function setup(
     /** What the dispatch hook reports for a `threads.send`: joined or started. */
     sendAttempt?: "join-turn" | "start-turn";
     get?: (args: { threadId: string }) => unknown;
+    /** What a `threads.update` returns; a throw simulates a failed update. */
+    update?: (args: { threadId: string; visibility?: "hidden" | "visible" }) => unknown;
     /** What a `threads.archive` returns; a throw simulates a failed archive. */
     archive?: (args: { threadId: string }) => unknown;
   } = {},
@@ -286,6 +288,7 @@ async function setup(
           delete: async (args: { threadId: string; queuedMessageId: string }) => options.deleteQueued?.(args) ?? { ok: true },
         },
         get: async (args: { threadId: string }) => options.get?.(args) ?? { title: "Build BB-38", titleFallback: null },
+        update: async (args: { threadId: string; visibility?: "hidden" | "visible" }) => options.update?.(args) ?? { ok: true },
         archive: async (args: { threadId: string }) => options.archive?.(args) ?? { ok: true },
       },
     },
@@ -410,6 +413,7 @@ describe("Slack plugin", () => {
     // provider, with its inputs, on its machine; never the pod's own host.
     expect(spawns[0]![0]).toMatchObject({
       projectId: "prj-2",
+      visibility: "hidden",
       environment: { type: "provider", environmentProviderId: "multi-repo-workspace", inputs: { repos: ["a"] }, machine: { type: "existing", hostId: "host_on" } },
     });
     expect(promptOf(spawns[0]![0])).toContain("session D0123:1712345678.901234");
@@ -421,6 +425,24 @@ describe("Slack plugin", () => {
     expect(sends).toHaveLength(1);
     expect(sends[0]![0]).toMatchObject({ threadId: "thr-1", mode: "steer" });
     expect(JSON.stringify(sends[0]![0])).toContain("also the SSO page");
+    await s.stop();
+  });
+
+  it("spawns every Slack conversation thread hidden, including a revived one", async () => {
+    let spawned = 0;
+    const s = await live({ spawn: () => ({ id: `thr-${++spawned}` }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-one" }));
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { visibility?: string }).visibility).toBe("hidden");
+    // Archiving the thread and writing again revives the conversation as a new
+    // bb thread; it too is hidden.
+    await s.harness.behavior.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "what next?", untrusted: false } }));
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    expect((spawns[1]![0] as { visibility?: string }).visibility).toBe("hidden");
     await s.stop();
   });
 
@@ -883,11 +905,86 @@ describe("Slack plugin", () => {
     const spawns = s.harness.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(2);
     expect((spawns[1]![0] as { projectId: string }).projectId).toBe("prj-2");
+    // The revived thread is hidden too.
+    expect((spawns[1]![0] as { visibility?: string }).visibility).toBe("hidden");
     // And the reply still lands in the same Slack conversation.
     await s.tool("slack_reply", { text: "yes" }, { threadId: "thr-2" });
     expect(s.hooks.messages.at(-1)?.session).toBe(session);
     service.controller.abort();
     await service.done;
+    await s.stop();
+  });
+
+  it("hides the thread of every session once, skipping gone and already-hidden ones (BB-165)", async () => {
+    let spawned = 0;
+    const threads: Record<string, { archivedAt: number | null; deletedAt: number | null; visibility: string }> = {
+      "thr-1": { archivedAt: null, deletedAt: null, visibility: "visible" },
+      "thr-2": { archivedAt: 5, deletedAt: null, visibility: "visible" },
+      "thr-3": { archivedAt: null, deletedAt: 5, visibility: "visible" },
+      "thr-4": { archivedAt: null, deletedAt: null, visibility: "hidden" },
+    };
+    const s = await live({
+      spawn: () => ({ id: `thr-${++spawned}` }),
+      get: ({ threadId }) => threads[threadId] ?? { title: "x", titleFallback: null },
+    });
+    const wake = async (session: string, over: Record<string, unknown> = {}) => {
+      const [channel, thread] = session.split(":");
+      s.hooks.last().send(s.hooks.session({ session, channel, thread, capability: `cap-${session}`, ...over }));
+      await tick();
+    };
+    await wake("D1:1.1");
+    await wake("D2:2.2");
+    await wake("D3:3.3");
+    await wake("D4:4.4");
+    // A pane open maps a session with no thread; it has nothing to hide.
+    await wake("D5:5.5", { action: "assistant_thread_started", comment: { text: "", untrusted: false } });
+
+    const service = s.harness.runService("hide-existing");
+    await tick();
+    // Only the visible, live thread is hidden: archived, deleted, already
+    // hidden and threadless sessions are left alone.
+    expect(s.harness.sdk.callsTo("threads.update").map(([args]) => args)).toEqual([{ threadId: "thr-1", visibility: "hidden" }]);
+    expect(await s.bb.storage.kv.get("migrations/hide-existing-threads")).toBeDefined();
+    service.controller.abort();
+    await service.done;
+
+    // The marker is recorded: a second start does nothing even though a thread
+    // is visible again.
+    threads["thr-1"] = { archivedAt: null, deletedAt: null, visibility: "visible" };
+    const updates = s.harness.sdk.callsTo("threads.update").length;
+    const again = s.harness.runService("hide-existing");
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.update")).toHaveLength(updates);
+    again.controller.abort();
+    await again.done;
+    await s.stop();
+  });
+
+  it("retries the one-time hide after a failed update, and a throwing update still lets start complete (BB-165)", async () => {
+    const s = await live({ get: () => ({ archivedAt: null, deletedAt: null, visibility: "visible" }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap" }));
+    await tick();
+
+    // The update throws: the marker is not written, so the next start retries.
+    s.harness.sdk.stub("threads.update", async () => {
+      throw new Error("the API is down");
+    });
+    const failed = s.harness.runService("hide-existing");
+    await tick();
+    expect(await s.bb.storage.kv.get("migrations/hide-existing-threads")).toBeUndefined();
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).toContain("could not hide thread");
+    failed.controller.abort();
+    // The failure is caught, not thrown out of the service's start.
+    await expect(failed.done).resolves.toBeUndefined();
+
+    // The API works now: a later start hides the thread and records the marker.
+    s.harness.sdk.stub("threads.update", async () => ({ ok: true }));
+    const retry = s.harness.runService("hide-existing");
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.update").map(([args]) => args).at(-1)).toEqual({ threadId: "thr-1", visibility: "hidden" });
+    expect(await s.bb.storage.kv.get("migrations/hide-existing-threads")).toBeDefined();
+    retry.controller.abort();
+    await retry.done;
     await s.stop();
   });
 

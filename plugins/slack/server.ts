@@ -1111,7 +1111,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const body = withFiles(text, prepared.notForwarded, prepared.failed);
       let thread: { id: string };
       try {
-        thread = await bb.sdk.threads.spawn({ projectId: project.id, environment, input: [{ type: "text", text: body, mentions: [] }, ...prepared.parts], title });
+        thread = await bb.sdk.threads.spawn({ projectId: project.id, environment, input: [{ type: "text", text: body, mentions: [] }, ...prepared.parts], title, visibility: "hidden" });
       } catch (error) {
         // Core can still pick its own host daemon (a bb-gate pod has none),
         // even though this environment names a connected machine. Answer the
@@ -1805,6 +1805,65 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
         clearTimeout(startup);
         clearInterval(periodic);
+      },
+    });
+
+    // ---- the one-time hide of existing conversation threads ----------------
+    //
+    // Before BB-165 the plugin spawned Slack conversation threads visible, and
+    // they pile up in the sidebar beside real work. New ones spawn hidden; the
+    // first start after the upgrade hides the thread of every conversation
+    // already in the session map. The marker lives in the plugin's kv store, so
+    // a later start does nothing.
+
+    const HIDE_ONCE_KEY = "migrations/hide-existing-threads";
+
+    /**
+     * The one-time hide (BB-165). Every thread a session points at is hidden
+     * once; a session with no thread, and a thread that is archived, deleted or
+     * already hidden, is left alone. A failed read or update leaves the marker
+     * unset so the next start retries rather than leaving a thread visible for
+     * good.
+     */
+    async function hideExistingOnce(): Promise<void> {
+      if ((await bb.storage.kv.get<string>(HIDE_ONCE_KEY)) != null) return;
+      let failed = false;
+      for (const record of sessions.values()) {
+        const threadId = record.threadId;
+        if (threadId === null) continue;
+        if (!(await hideIfVisible(threadId))) failed = true;
+      }
+      // A transient failure must not burn the one-time marker: leaving it unset
+      // makes the next start retry. Only a clean pass records it.
+      if (!failed) await bb.storage.kv.set(HIDE_ONCE_KEY, String(deps.now()));
+    }
+
+    /** Hide a visible thread; false when the read or update failed, so the caller can retry. */
+    async function hideIfVisible(threadId: string): Promise<boolean> {
+      let info: { archivedAt?: number | null; deletedAt?: number | null; visibility?: string | null };
+      try {
+        info = await bb.sdk.threads.get({ threadId });
+      } catch (error) {
+        // A thread that is gone (deleted) has nothing left to hide.
+        const e = error as { code?: string; status?: number };
+        if (e.code === "NOT_FOUND" || e.status === 404 || e.status === 410) return true;
+        bb.log.warn(`Slack: could not read thread ${threadId} to hide it: ${errorMessage(error)}`);
+        return false;
+      }
+      if ((info.archivedAt ?? null) !== null || (info.deletedAt ?? null) !== null || info.visibility === "hidden") return true;
+      try {
+        await bb.sdk.threads.update({ threadId, visibility: "hidden" });
+        return true;
+      } catch (error) {
+        bb.log.warn(`Slack: could not hide thread ${threadId}: ${errorMessage(error)}`);
+        return false;
+      }
+    }
+
+    bb.background.service("hide-existing", {
+      async start(signal) {
+        await hideExistingOnce().catch((error: unknown) => bb.log.warn(`Slack: one-time hide of existing threads: ${errorMessage(error)}`));
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
       },
     });
 
