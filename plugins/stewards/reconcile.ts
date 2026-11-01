@@ -28,6 +28,25 @@ export const workerInFlight = (w: Pick<Worker, "status">): boolean => w.status =
 export const anyWorkerInFlight = (workers: readonly Pick<Worker, "status">[]): boolean => workers.some(workerInFlight);
 
 /**
+ * A worker whose turn is in progress. A `finished` worker is a pause between
+ * turns, not a running one: it can no longer race a push, so a merge item
+ * must not deadlock behind it (BB-175).
+ */
+export const workerRunning = (w: Pick<Worker, "status">): boolean => w.status === "running";
+
+/**
+ * Why a merge item is not actionable while a worker's turn is in progress,
+ * naming each such worker so the page says something true (BB-175). Null when
+ * none is running; a `finished` worker does not count.
+ */
+export function runningWorkerReason(workers: readonly Pick<Worker, "threadId" | "status">[]): string | null {
+  const running = workers.filter(workerRunning);
+  if (running.length === 0) return null;
+  const names = running.map((w) => w.threadId);
+  return names.length === 1 ? `worker ${names[0]} is mid-turn` : `workers ${names.join(", ")} are mid-turn`;
+}
+
+/**
  * A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the
  * first line of a comment. `lane` is null when the marker did not name one
  * (the gate then treats the pull request as the owner's).
