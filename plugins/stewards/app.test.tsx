@@ -9,6 +9,13 @@ import { PROJECT_CHANGED } from "./channels.js";
 import { needActions, questionActions } from "./server.js";
 import { THREAD_NAV_RETRY_MS, THREAD_NAV_WAIT_MS } from "./app.js";
 
+/** Open the project picker popover (its rows are the options). */
+const openProjectPicker = async (slot: RenderedSlot) => {
+  const trigger = await waitFor(() => slot.getByRole("button", { name: "Project" }));
+  fireEvent.click(trigger);
+  return trigger;
+};
+
 /** One action in a needs-you view, as the server builds it (BB-122). */
 type NeedAction = ReturnType<typeof needActions>["actions"][number];
 
@@ -530,6 +537,7 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
         { ...sidebarThread("thr_child", "p2"), parentThreadId: "thr_root", isUnread: true },
       ],
     );
+    await openProjectPicker(slot);
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
     expect(slot.getByRole("option", { name: "Beta (2)" })).toBeTruthy();
     expect(slot.queryByLabelText("3 waiting on you")).toBeNull();
@@ -542,10 +550,11 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("sizes the picker and the New thread button as h-8 controls", async () => {
+  it("sizes the picker trigger and the New thread button as h-8 controls", async () => {
     const slot = await renderSidebar({ stewardsSidebar: () => sidebarData() });
-    const select = await waitFor(() => slot.getByLabelText("Project"));
-    expect(select.className).toContain("h-8");
+    const trigger = await waitFor(() => slot.getByRole("button", { name: "Project" }));
+    expect(trigger.className).toContain("h-8");
+    expect(trigger.querySelector('[data-icon="Folder"]')).not.toBeNull();
     const button = slot.getByRole("button", { name: "New thread" });
     expect(button.className).toContain("size-8");
     expect(button.className).toContain("shrink-0");

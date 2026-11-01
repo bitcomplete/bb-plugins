@@ -1626,7 +1626,8 @@ A **lesson** makes the answer a record and, for most of them, lands it.
 
 An opt-in replacement for bb's own sidebar list, registered through the
 exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One
-project dropdown in the live view; the sections top to bottom are **Blocked**
+project picker popover in the live view (BB-181, matching the host's
+`ProjectSelector`); the sections top to bottom are **Blocked**
 (needs-you rows first, then blocked), **In flight** (running before quiet),
 **Threads** (one-off threads, collapsed), **Monitors** (the `ops`, Dependabot
 and Sentry bindings, collapsed), **Recently ended** (collapsed), and the
@@ -1785,8 +1786,8 @@ the row. There is no **Details** button: the row
 itself opens the effort's detail view (BB-85), where the free-text answer and
 the secret form live. The inline block adds no write path the page does not
 already make. The
-project dropdown carries each project's count in its option label. That count is
-the server's needs-you binding count (`needsCount`, the open bindings with
+project picker popover (BB-181) carries each project's count in its row. That
+count is the server's needs-you binding count (`needsCount`, the open bindings with
 `needsUser`, so the stewarded half and the yellow rows cannot disagree) plus the
 project's unread one-off thread roots, computed on the client from the host's
 live thread view so every option gets it (BB-160). The RPC carries, per project,

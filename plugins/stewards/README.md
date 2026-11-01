@@ -537,7 +537,7 @@ marked read, so they are almost always unread and the row would otherwise sit
 open.
 
 **The needs-you items and the picker count (BB-46, BB-85).** The project
-dropdown shows each project's count in its option label: the yellow effort rows
+picker popover (BB-181) shows each project's count in its row: the yellow effort rows
 (the server's needs-you bindings, `needsCount`) plus the project's unread
 one-off thread roots. The unread half is computed on the client from the host's
 live thread view, so every project option gets it; the RPC names each project's

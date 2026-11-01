@@ -10,7 +10,8 @@
 // item's button. Settings → Plugins → Stewards: which projects are stewarded
 // and whether their configuration is healthy, then every open steward and
 // where it stands. Steering stays with the project steward and the CLI.
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import * as PopoverPrimitive from "@radix-ui/react-popover";
 import {
   Markdown,
   ThreadTitle,
@@ -35,6 +36,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { PROJECT_CHANGED } from "./channels.js";
+import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { readLastPlace, writeLastPlace } from "./last-place.js";
 import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
@@ -2090,37 +2092,110 @@ const SidebarCollapsible = memo(function SidebarCollapsible({ title, count, reve
 });
 
 /**
- * The project dropdown, always a native `<select>`, with the per-project needs
- * count in each option. The compose button opens the composer on the dropdown's
- * project — the host's own New thread button cannot be retargeted from a thread
- * list — then closes the mobile drawer.
+ * The project picker: a popover matching the host's `ProjectSelector`, with the
+ * per-project needs count in each row. The compose button opens the composer on
+ * the picker's project — the host's own New thread button cannot be retargeted
+ * from a thread list — then closes the mobile drawer. A plain list (no cmdk, no
+ * search): ArrowUp/ArrowDown move focus, Enter picks the focused row, Escape
+ * closes through Radix's own dismissal. Presentational only: `onPick` is the
+ * parent's stable callback, so the memo (BB-95) still holds.
  */
 const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
-  const activeName = tabs.find((t) => t.projectId === activeId)?.name;
+  const activeIndex = tabs.findIndex((t) => t.projectId === activeId);
+  const active = tabs[activeIndex === -1 ? 0 : activeIndex];
+  const activeCount = active === undefined ? 0 : counts.get(active.projectId) ?? 0;
+  const activeLabel = active === undefined ? "" : activeCount > 0 ? `${active.name} (${activeCount})` : active.name;
+  const activeName = active?.name;
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
+  const scope = usePortalScopeProps();
+  const rows = () => Array.from(listRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? []);
+  // Move focus to the row `delta` away from the focused one, wrapping. The
+  // highlighted row is the active project when the popover opens.
+  const move = (delta: number) => {
+    const list = rows();
+    if (list.length === 0) return;
+    const current = list.indexOf(document.activeElement as HTMLButtonElement);
+    const base = current === -1 ? highlight : current;
+    const next = (base + delta + list.length) % list.length;
+    setHighlight(next);
+    list[next]?.focus();
+  };
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ArrowDown") { event.preventDefault(); move(1); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); move(-1); }
+    else if (event.key === "Enter") {
+      // Pick the focused row. Handled here (and the default suppressed) so the
+      // focused button's own click does not fire a second time.
+      const projectId = (document.activeElement as HTMLElement | null)?.getAttribute("data-project-id");
+      if (projectId) { event.preventDefault(); onPick(projectId); setOpen(false); }
+    }
+  };
   return (
     <div className="flex items-center gap-1 px-2 py-1.5">
-      <div className="relative min-w-0 flex-1">
-        <select
-          aria-label="Project"
-          className="h-8 w-full min-w-0 appearance-none rounded-md border border-input bg-transparent pl-3 pr-7 text-sm"
-          value={activeId ?? ""}
-          onChange={(e) => onPick(e.target.value)}
-        >
-          {tabs.map((t) => {
-            const count = counts.get(t.projectId) ?? 0;
-            return (
-              <option key={t.projectId} value={t.projectId}>
-                {count > 0 ? `${t.name} (${count})` : t.name}
-              </option>
-            );
-          })}
-        </select>
-        <Icon
-          name="ChevronDown"
-          className="pointer-events-none absolute right-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
-          aria-hidden
-        />
-      </div>
+      <PopoverPrimitive.Root
+        open={open}
+        onOpenChange={(next) => {
+          setOpen(next);
+          if (next) setHighlight(activeIndex === -1 ? 0 : activeIndex);
+        }}
+      >
+        <PopoverPrimitive.Trigger asChild>
+          <button
+            type="button"
+            aria-label="Project"
+            data-project-id={activeId ?? ""}
+            className="flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md border border-input bg-transparent px-2 text-sm hover:bg-state-hover"
+          >
+            <Icon name="Folder" className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            <span className="min-w-0 flex-1 truncate text-left">{activeLabel}</span>
+            <Icon name="ChevronDown" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+          </button>
+        </PopoverPrimitive.Trigger>
+        <PopoverPrimitive.Portal>
+          <PopoverPrimitive.Content
+            {...scope}
+            align="start"
+            side="bottom"
+            sideOffset={4}
+            collisionPadding={8}
+            onOpenAutoFocus={(event) => {
+              event.preventDefault();
+              rows()[activeIndex === -1 ? 0 : activeIndex]?.focus();
+            }}
+            onKeyDown={onKeyDown}
+            className="z-50 w-[--radix-popover-trigger-width] min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
+          >
+            <p className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Project</p>
+            <div ref={listRef} role="listbox" aria-label="Projects" className="flex flex-col">
+              {tabs.map((t, index) => {
+                const count = counts.get(t.projectId) ?? 0;
+                const isActive = t.projectId === activeId;
+                return (
+                  <button
+                    key={t.projectId}
+                    type="button"
+                    role="option"
+                    aria-selected={isActive}
+                    data-project-id={t.projectId}
+                    onMouseMove={() => { if (index !== highlight) setHighlight(index); }}
+                    onClick={() => {
+                      onPick(t.projectId);
+                      setOpen(false);
+                    }}
+                    className={`relative flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-[0.3125rem] text-left text-xs outline-none max-md:pointer-coarse:py-2 ${index === highlight ? "bg-accent text-accent-foreground" : "hover:bg-accent hover:text-accent-foreground"}`}
+                  >
+                    <Icon name="Folder" className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                    <span className="min-w-0 flex-1 truncate">{count > 0 ? `${t.name} (${count})` : t.name}</span>
+                    {isActive ? <Icon name="Check" className="size-4 shrink-0" aria-hidden /> : null}
+                  </button>
+                );
+              })}
+            </div>
+          </PopoverPrimitive.Content>
+        </PopoverPrimitive.Portal>
+      </PopoverPrimitive.Root>
       {tabs.length > 0 ? (
         <button
           type="button"
