@@ -414,7 +414,9 @@ function ProjectStatus({ project: p, now, refetch }: { project: Project; now: nu
         <p className="text-muted-foreground">Set up stewards started in thread <ThreadLink threadId={onboard.started}>{onboard.started}</ThreadLink>. It surveys the repos, interviews you, and opens the guidance pull request; stewards stay off until that pull request merges.</p>
       ) : null}
       {typeof onboard === "object" && "error" in onboard ? <p className="text-xs text-destructive">{onboard.error}</p> : null}
-      {!p.configured ? (
+      {!p.configured && (p.stewards.length > 0 || p.endedCount > 0) ? (
+        <p className="text-muted-foreground">This project has stewards but no readable stewards/project.json any more. They keep their bindings; nothing new is adopted. Restore the file rather than onboarding again.</p>
+      ) : !p.configured ? (
         <p className="text-muted-foreground">No stewards/project.json in this project's .bb yet. Set up stewards to survey the repos, write the project's guidance and open the pull request that turns stewards on.</p>
       ) : (
         <dl className="flex flex-col gap-1">

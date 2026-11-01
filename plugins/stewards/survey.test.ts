@@ -8,7 +8,7 @@ const repo = (over: Partial<SurveyRepoInput> = {}): SurveyRepoInput => ({
   url: "https://github.com/acme/web",
   repo: "acme/web",
   defaultBranch: "main",
-  branchProtection: { available: true, value: { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: false } },
+  branchProtection: { available: true, value: { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: null } },
   labels: { available: true, value: ["bb-managed", "bug"] },
   tree: tree("package.json", "tsconfig.json", "src/index.ts", ".github/workflows/ci.yaml", "Dockerfile", "kploy/deployment.yaml", "bc-prod.yaml", "README.md"),
   treeError: null,
@@ -31,7 +31,7 @@ describe("the onboarding survey's per-repo derivation", () => {
 
   it("reports an unprotected branch as a fact and a failed read as unavailable", () => {
     const unprotected = deriveRepo(repo());
-    expect(unprotected.branchProtection).toEqual({ available: true, value: { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: false } });
+    expect(unprotected.branchProtection).toEqual({ available: true, value: { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: null } });
     const failed = deriveRepo(repo({ branchProtection: { available: false, error: "gh is not signed in" }, labels: { available: false, error: "gh is not signed in" } }));
     expect(failed.branchProtection).toEqual({ available: false, error: "gh is not signed in" });
     expect(failed.labels).toEqual({ available: false, error: "gh is not signed in" });

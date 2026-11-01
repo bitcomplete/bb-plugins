@@ -8432,7 +8432,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       else {
         try {
           const rule = await github.branchProtection(repo, defaultBranch);
-          branchProtection = { available: true, value: rule ?? { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: false } };
+          branchProtection = { available: true, value: rule ?? { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: null } };
         } catch (error) {
           branchProtection = surveyUnavailable(errorMessage(error));
         }

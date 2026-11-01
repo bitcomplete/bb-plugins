@@ -19,8 +19,8 @@ export type BranchProtection = {
   protected: boolean;
   /** Required approving reviews, when the branch protection rule names a number. */
   requiredApprovingReviewCount: number | null;
-  /** Whether a status check is required before merging. */
-  requiresStatusChecks: boolean;
+  /** Whether a status check is required, or null when the token cannot read the rule's details. */
+  requiresStatusChecks: boolean | null;
 };
 
 /** One repo's raw inputs, as the caller read them. */
@@ -393,7 +393,7 @@ export function formatSurvey(report: SurveyReport): string {
     lines.push(`  default branch: ${repo.defaultBranch ?? "unknown"}`);
     lines.push(
       repo.branchProtection.available
-        ? `  branch protection: ${repo.branchProtection.value.protected ? `protected (reviews ${repo.branchProtection.value.requiredApprovingReviewCount ?? "?"}, status checks ${repo.branchProtection.value.requiresStatusChecks ? "required" : "no"})` : "none"}`
+        ? `  branch protection: ${repo.branchProtection.value.protected ? `protected (reviews ${repo.branchProtection.value.requiredApprovingReviewCount ?? "?"}, status checks ${repo.branchProtection.value.requiresStatusChecks === null ? "unknown" : repo.branchProtection.value.requiresStatusChecks ? "required" : "no"})` : "none"}`
         : `  branch protection: unavailable (${repo.branchProtection.error})`,
     );
     lines.push(`  languages: ${repo.languages.join(", ") || "(none)"}`);

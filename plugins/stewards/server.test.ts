@@ -3486,6 +3486,16 @@ describe("bb stewards survey and Set up stewards", () => {
     expect(report.bb.projectSteward).toBeNull();
   });
 
+  it("surveys a project with no project file at all (the skill's starting state)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = null;
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    const out = await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    const report = JSON.parse(out.stdout) as { bb: { projectFile: boolean; roles: boolean; playbooks: string[]; reposJson: boolean } };
+    expect(report.bb).toMatchObject({ projectFile: false, roles: false, playbooks: [], reposJson: false });
+  });
+
   it("shows the Set up stewards action for a project with no project file and for one with no project steward", async () => {
     const none = await setup();
     none.files[PROJECT_FILE] = null;

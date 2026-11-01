@@ -52,11 +52,16 @@ export interface GithubTreeEntry {
   type: string;
 }
 
-/** A branch's protection rule, as the survey reports it. */
+/**
+ * A branch's protection rule, as the survey reports it. `protected` comes from
+ * the branch endpoint, which needs no admin; the two detail fields come from
+ * the protection endpoint, which does, and are null when the token cannot read
+ * it (the details are unknown, not false).
+ */
 export interface BranchProtection {
   protected: boolean;
   requiredApprovingReviewCount: number | null;
-  requiresStatusChecks: boolean;
+  requiresStatusChecks: boolean | null;
 }
 
 export interface GithubWriter {
@@ -187,6 +192,12 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       });
     },
     async branchProtection(repo, branch) {
+      // The branch endpoint works with plain read access and reports
+      // `protected`; the protection endpoint needs admin, so a 404 there must
+      // not be read as "unprotected".
+      const branchResponse = await request("GET", `/repos/${repo}/branches/${encodeURIComponent(branch)}`, undefined);
+      const branchBody = (await branchResponse.json().catch(() => null)) as { protected?: unknown } | null;
+      if (branchBody?.protected !== true) return null;
       try {
         const response = await request("GET", `/repos/${repo}/branches/${encodeURIComponent(branch)}/protection`, undefined);
         const body = (await response.json().catch(() => null)) as { required_pull_request_reviews?: { required_approving_review_count?: unknown } | null; required_status_checks?: unknown } | null;
@@ -197,18 +208,24 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
           requiresStatusChecks: body?.required_status_checks !== null && body?.required_status_checks !== undefined,
         };
       } catch (error) {
-        // GitHub answers 404 for a branch with no protection rule: a fact, not a failure.
-        if (error instanceof GithubApiError && / 404 /u.test(error.message)) return null;
+        // Protected, but this token cannot read the rule's details: report the
+        // fact we have and leave the details unknown rather than guessing.
+        if (error instanceof GithubApiError && / 404 /u.test(error.message)) return { protected: true, requiredApprovingReviewCount: null, requiresStatusChecks: null };
         throw error;
       }
     },
     async labels(repo) {
-      const response = await request("GET", `/repos/${repo}/labels?per_page=100`, undefined);
-      const body = (await response.json().catch(() => null)) as unknown;
-      if (!Array.isArray(body)) return [];
-      return body
-        .flatMap((label) => (label !== null && typeof label === "object" && typeof (label as { name?: unknown }).name === "string" ? [(label as { name: string }).name] : []))
-        .sort((a, b) => a.localeCompare(b));
+      const names: string[] = [];
+      // GitHub paginates labels; follow the `Link: rel="next"` header, capped.
+      for (let page = 1; page <= 10; page += 1) {
+        const response = await request("GET", `/repos/${repo}/labels?per_page=100&page=${page}`, undefined);
+        const body = (await response.json().catch(() => null)) as unknown;
+        if (!Array.isArray(body)) break;
+        names.push(...body.flatMap((label) => (label !== null && typeof label === "object" && typeof (label as { name?: unknown }).name === "string" ? [(label as { name: string }).name] : [])));
+        const link = response.headers.get("link") ?? "";
+        if (body.length === 0 || !/rel="next"/u.test(link)) break;
+      }
+      return names.sort((a, b) => a.localeCompare(b));
     },
   };
 }
