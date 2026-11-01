@@ -2165,7 +2165,7 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, 
               rows()[activeIndex === -1 ? 0 : activeIndex]?.focus();
             }}
             onKeyDown={onKeyDown}
-            className="z-50 w-[--radix-popover-trigger-width] min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
+            className="z-50 w-[var(--radix-popover-trigger-width)] min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
           >
             <p className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Project</p>
             <div ref={listRef} role="listbox" aria-label="Projects" className="flex flex-col">
