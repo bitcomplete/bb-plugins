@@ -285,6 +285,18 @@ export type NeedAction = z.infer<typeof needActionSchema>;
 /** An http(s) URL, or null for anything else (a Linear key, a lesson id). */
 const httpUrl = (url: string | null): string | null => (url !== null && /^https?:\/\//iu.test(url) ? url : null);
 
+/**
+ * A credential's variable name, as it appears in an escalation's question or
+ * context (e.g. `VOICE_TRANSCRIPTION_API_KEY`). A forward that carries one is
+ * refused as `done` or `text`, so the value always reaches the user as bb's
+ * secure form, whatever the ticket or spec says (BB-176).
+ */
+const CREDENTIAL_VARIABLE = /\b[A-Z][A-Z0-9_]*_(?:API_KEY|SECRET|TOKEN|PASSWORD)\b/u;
+
+/** Whether an escalation names a credential variable in its question or context. */
+const namesCredential = (escalation: Escalation): boolean =>
+  CREDENTIAL_VARIABLE.test(escalation.question) || (escalation.context !== null && CREDENTIAL_VARIABLE.test(escalation.context));
+
 // One row each in the board's "waiting on you" section. The sidebar reuses
 // these shapes, tagged, for its "Needs you" list, so the two surfaces cannot
 // disagree about what an item is.
@@ -7491,23 +7503,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
+            const resolutionKind = input.resolution ?? (forwarding.choices.length > 0 ? "choice" : "text");
+            // A forwarded approval is the user's to decide exactly as
+            // `approval: me` is: file the page's `approve-spec` need and keep
+            // the escalation open, linked to it, instead of a free-text
+            // question. A forwarded decision stays a question. Computed here,
+            // before the await below, so the escalation cannot be resolved in
+            // between and leave the need or question open, and before the
+            // credential refusal so an approval is not mistaken for a
+            // credential ask just because its question names one.
+            const prToUser = route === "me" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
+            const approvalToUser = route === "me" && forwarding.kind === "approval" && !prToUser;
+            // BB-176: a credential always reaches the user through bb's secure
+            // form. A forward that names a credential variable is never a
+            // `done`/`text` item, whatever the ticket or spec says. The error
+            // names the resolution and its fields and never repeats the
+            // question or context, so no secret is echoed. Refused before any
+            // state changes, so a refused forward is not half-applied.
+            if (route === "me" && !approvalToUser && !prToUser && (resolutionKind === "done" || resolutionKind === "text") && namesCredential(forwarding)) {
+              return toolError(
+                new Error(
+                  'A credential must be forwarded with resolution: "secret", naming `variable` and `purpose` and either `writeEnv`/`worker` or `setting`, so bb\'s secure form takes the value. `done` and `text` are refused for it; a decision that only mentions a credential variable can be forwarded with `choices` instead.',
+                ),
+              );
+            }
             // Keep the chain: each forwarding hop, with the forwarder's
             // rewording, so the bindings between get their quiet note and the
             // originator can be answered directly (BB-30).
             store.addHop(forwarding.id, { threadId, bindingId: target.id, rewording: recommendation });
             store.reroute(forwarding.id, route, recommendation);
-            // A forwarded approval is the user's to decide exactly as
-            // `approval: me` is: file the page's `approve-spec` need and keep
-            // the escalation open, linked to it, instead of a free-text
-            // question. A forwarded decision stays a question. Made before the
-            // await below, so the escalation cannot be resolved in between and
-            // leave the need or question open.
-            const prToUser = route === "me" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
-            const approvalToUser = route === "me" && forwarding.kind === "approval" && !prToUser;
             if (route === "me" && !approvalToUser && !prToUser && input.resolution === undefined) {
               return toolError(new Error("Forwarding to the user needs a resolution: choice (with choices), text, approve-decline, secret or done. It is what the page's ask looks like; the plugin assigns the route, but the human boundary is yours to describe."));
             }
-            const resolutionKind = input.resolution ?? (forwarding.choices.length > 0 ? "choice" : "text");
             if (resolutionKind === "choice" && forwarding.choices.length < 2) {
               return toolError(new Error("A choice question needs 2-6 choices for the page's buttons; escalate a decision with choices, or forward as text."));
             }

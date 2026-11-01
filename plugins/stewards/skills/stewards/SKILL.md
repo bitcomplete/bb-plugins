@@ -95,8 +95,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   and either the `writeEnv` dotenv path (or the `worker`) or the `setting`
   of one of the stewards plugin's own `secret: true` settings; the project
   steward forwards it and the plugin spawns a requester thread that opens
-  bb's secure form in its first turn. Never paste a secret, and never route
-  the user to a script to run.
+  bb's secure form in its first turn. `secret` is the only resolution for a
+  credential, even when the ticket or spec says the owner produces or seals
+  it by hand; such spec wording is corrected at spec approval, never
+  followed. Never paste a secret, and never route the user to a script to
+  run.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
   ticket needs (a credential, an access, a contract), is escalated as a

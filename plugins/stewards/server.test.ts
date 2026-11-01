@@ -5046,6 +5046,62 @@ describe("needs you items", () => {
     expect(t.hooks.store.need(sec.id)!.status).toBe("done");
   });
 
+  it("refuses a credential forward as done or text, whatever the ticket says (BB-176)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const project = t.spawns[0]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    // The variable-shaped name is in the question.
+    await t.tool("steward_report", { ...base, actor: "user", escalate: { kind: "decision", question: "Provide VOICE_TRANSCRIPTION_API_KEY.", meanwhile: "Wait." } }, steward);
+    const inQuestion = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Provide VOICE_TRANSCRIPTION_API_KEY.")!;
+    for (const resolution of ["done", "text"] as const) {
+      const out = await t.tool("steward_update", { binding: "ENG-12", forward: inQuestion.id, resolution }, project);
+      expect(out.error).toBe(true);
+      // The error names the resolution and its fields, and echoes neither the
+      // question nor the context, so no secret leaks into it.
+      expect(out.text).toMatch(/resolution: "secret"/u);
+      expect(out.text).toMatch(/variable/u);
+      expect(out.text).toMatch(/purpose/u);
+      expect(out.text).toMatch(/writeEnv/u);
+      expect(out.text).toMatch(/setting/u);
+      expect(out.text).not.toContain("VOICE_TRANSCRIPTION_API_KEY");
+    }
+    // The variable-shaped name is in the context only.
+    await t.tool("steward_report", { ...base, actor: "user", escalate: { kind: "decision", question: "Provide the shared key.", context: "variable SENTRY_TOKEN, for reading production errors.", meanwhile: "Wait." } }, steward);
+    const inContext = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Provide the shared key.")!;
+    const refused = await t.tool("steward_update", { binding: "ENG-12", forward: inContext.id, resolution: "text" }, project);
+    expect(refused.error).toBe(true);
+    expect(refused.text).not.toContain("SENTRY_TOKEN");
+    expect(refused.text).not.toContain("Provide the shared key");
+    // A credential named in prose, with no variable-shaped name, is an
+    // ordinary text question and goes through.
+    await t.tool("steward_report", { ...base, actor: "user", escalate: { kind: "decision", question: "Wire the SSO client secret.", meanwhile: "Wait." } }, steward);
+    const prose = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Wire the SSO client secret.")!;
+    const through = await t.tool("steward_update", { binding: "ENG-12", forward: prose.id, resolution: "text" }, project);
+    expect(through.error).toBe(false);
+    // `secret` passes with the variable named, even though `done` and `text`
+    // were refused for it.
+    const asSecret = await t.tool("steward_update", { binding: "ENG-12", forward: inQuestion.id, resolution: "secret", variable: "VOICE_TRANSCRIPTION_API_KEY", purpose: "voice transcription" }, project);
+    expect(asSecret.error).toBe(false);
+  });
+
+  it("does not mistake an approval whose question names a credential for a credential ask (BB-176)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const project = t.spawns[0]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    // A spec approval that names a credential variable in its question is
+    // still the user's Approve/Decline item, not a credential to forward as
+    // `secret`.
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the plan that seals VOICE_TRANSCRIPTION_API_KEY.", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
+    const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, project);
+    expect(out.error).toBe(false);
+    expect(out.text).toMatch(/approve-spec item/u);
+  });
+
   it("ask and forward require a resolution (BB-30)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
