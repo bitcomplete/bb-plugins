@@ -308,7 +308,7 @@ describe("the nightly prompt", () => {
     expect(wake).not.toContain(`- ${lessons[2]!.id} `);
   });
 
-  it("names the five resolution kinds and how a credential is forwarded (BB-51)", () => {
+  it("names the five resolution kinds and how a credential is forwarded (BB-51, BB-176)", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");
     const x = s.escalate({ bindingId: b.id, kind: "decision", question: "Provide API_TOKEN.", meanwhile: "Wait.", route: "project", recommendation: null });
@@ -319,6 +319,11 @@ describe("the nightly prompt", () => {
     expect(wake).toContain("purpose");
     expect(wake).toContain("writeEnv");
     expect(wake).toContain("setting");
+    // BB-176: `secret` is the only resolution for a credential, even when the
+    // ticket or spec says the owner produces or seals it by hand.
+    expect(wake).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
+    expect(wake).toMatch(/corrected at spec approval/u);
+    expect(STANDING_RULES.join("\n")).toMatch(/even when the ticket or spec says the owner seals it by hand/u);
   });
 
   it("gives dates in the project's nightly time zone", () => {
