@@ -2773,7 +2773,7 @@ describe("pull requests", () => {
     t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9" }, { draft: true }));
     for (const id of ["acme/web#7", "acme/web#8", "acme/web#9"]) await t.ring("github", id);
     expect(await t.list()).toMatchObject([{ key: "acme/web#7", kind: "review" }]);
-    expect(t.spawns[1]).toMatchObject({ title: "Review acme/web#7: Add login retry", model: "claude-haiku-5-5", parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
+    expect(t.spawns[1]).toMatchObject({ title: "Review acme/web#7: Add login retry", model: "claude-sonnet-5-5", parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
   });
 
   it("adopts a labelled pull request as a pr binding", async () => {
