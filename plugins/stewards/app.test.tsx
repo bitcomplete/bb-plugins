@@ -8,6 +8,7 @@ import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } 
 import { PROJECT_CHANGED } from "./channels.js";
 import { needActions, questionActions } from "./server.js";
 import { THREAD_NAV_RETRY_MS, THREAD_NAV_WAIT_MS } from "./app.js";
+import { setStewardsSidebarCommand } from "./sidebar-command.js";
 
 /** Open the project picker popover (its rows are the options). */
 const openProjectPicker = async (slot: RenderedSlot) => {
@@ -138,6 +139,7 @@ const renderBoard = async (needs: Need[], questions: Question[]): Promise<Render
 
 afterEach(() => {
   app = null;
+  setStewardsSidebarCommand(null);
 });
 
 describe("the Stewards page's decide items and questions (BB-20)", () => {
@@ -679,6 +681,22 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(calls).toBe(2);
     slot.lifecycle.unmount();
+  });
+});
+
+// BB-188: the switch-project command's palette registration shape.
+describe("the switch-project command's registration (BB-188)", () => {
+  it("registers one palette command with the ⌘⇧K default and both callbacks", async () => {
+    const captured = await loadApp();
+    const commands = (captured as unknown as { commandPaletteActions: Array<Record<string, unknown>> }).commandPaletteActions;
+    const command = commands.find((c) => c.id === "switch-project");
+    expect(command).toMatchObject({
+      target: "app",
+      title: "Stewards: switch project",
+      defaultShortcut: { key: "k", mod: true, shift: true },
+    });
+    expect(typeof command?.run).toBe("function");
+    expect(typeof command?.isAvailable).toBe("function");
   });
 });
 
