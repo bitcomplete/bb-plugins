@@ -1899,11 +1899,12 @@ const SidebarCollapsible = memo(function SidebarCollapsible({ title, count, reve
 
 /**
  * The project dropdown, always a native `<select>`, with the per-project needs
- * count in each option. The plus button opens the composer on the dropdown's
+ * count in each option. The compose button opens the composer on the dropdown's
  * project — the host's own New thread button cannot be retargeted from a thread
  * list — then closes the mobile drawer.
  */
 const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
+  const activeName = tabs.find((t) => t.projectId === activeId)?.name;
   return (
     <div className="flex items-center gap-1 px-2 py-1.5">
       <div className="relative min-w-0 flex-1">
@@ -1932,11 +1933,11 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, 
         <button
           type="button"
           aria-label="New thread"
-          title="New thread"
+          title={activeName === undefined ? "New thread" : `New thread in ${activeName}`}
           className="flex size-8 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-state-hover hover:text-foreground"
           onClick={onNewThread}
         >
-          <Icon name="Plus" className="size-4" />
+          <Icon name="MessageSquarePlus" className="size-4" />
         </button>
       ) : null}
     </div>
