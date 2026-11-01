@@ -654,10 +654,11 @@ describe("the stewards overview's refresh (BB-90)", () => {
 
 // BB-112: the per-project switch on each settings-page project row.
 describe("the stewards overview's per-project switch (BB-112)", () => {
-  const project = (enabled: boolean) => ({
+  const project = (enabled: boolean, over: Record<string, unknown> = {}) => ({
     projectId: "p1",
     name: "Acme",
     configured: true,
+    onboard: false,
     enabled,
     source: "multi-repo",
     label: "bb-managed",
@@ -672,6 +673,7 @@ describe("the stewards overview's per-project switch (BB-112)", () => {
     digestAt: null,
     endedCount: 0,
     stewards: [],
+    ...over,
   });
 
   it("turns a project's stewards on from its row", async () => {
@@ -714,6 +716,46 @@ describe("the stewards overview's per-project switch (BB-112)", () => {
     expect(toggle.getAttribute("aria-checked")).toBe("true");
     fireEvent.click(toggle);
     await waitFor(() => expect(calls).toEqual([{ projectId: "p1", enabled: false }]));
+    slot.lifecycle.unmount();
+  });
+
+  // BB-180: Set up stewards shows only when the project has no project file or
+  // no project steward, and starts the onboarding thread.
+  it("offers Set up stewards when the project needs onboarding, and starts it", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[0]!;
+    const calls: Array<{ projectId: string }> = [];
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => ({ paused: false, lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} }, projects: [project(false, { configured: false, onboard: true })] }),
+        stewardsOnboard: (args: { projectId: string }) => {
+          calls.push(args);
+          return { ok: true, threadId: "thr_onboard", message: "started" };
+        },
+        stewardsCheck: () => ({ ok: true, lines: [] }),
+        stewardsSetProjectEnabled: () => ({ ok: true, message: "on", enabled: true }),
+      },
+    } as never);
+    const button = await waitFor(() => slot.getByRole("button", { name: "Set up stewards" }));
+    expect(slot.queryByRole("switch", { name: "Stewards for Acme" })).toBeNull();
+    fireEvent.click(button);
+    await waitFor(() => expect(calls).toEqual([{ projectId: "p1" }]));
+    await waitFor(() => expect(slot.getByText(/Set up stewards started in thread/u)).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("does not offer Set up stewards once a project steward is configured", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[0]!;
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => ({ paused: false, lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} }, projects: [project(true, { onboard: false })] }),
+        stewardsCheck: () => ({ ok: true, lines: [] }),
+        stewardsSetProjectEnabled: () => ({ ok: true, message: "on", enabled: true }),
+      },
+    } as never);
+    await waitFor(() => slot.getByRole("switch", { name: "Stewards for Acme" }));
+    expect(slot.queryByRole("button", { name: "Set up stewards" })).toBeNull();
     slot.lifecycle.unmount();
   });
 });

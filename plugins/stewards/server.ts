@@ -130,6 +130,13 @@ export const BRIEF_MAX_CHARS = 3800;
  */
 export const THREAD_BRIEFS_OFF = false;
 
+/**
+ * The first turn of a "Set up stewards" thread. The onboarding skill carries
+ * the procedure; this only says what the thread is for, and that it is an
+ * ordinary thread, not the project steward.
+ */
+export const ONBOARDING_INTRO = `Set up stewards for this project. Follow the onboarding skill: run \`bb stewards survey --json\` first and read each repo's README, then ask one batched interview under ten questions. Write a minimal \`.bb\` (\`bb stewards init\`, then fill project.json with repo-dir-prefixed bigDecisions paths, roles.json and a short AGENTS.md), validate it with \`bb stewards check\`, and land it with \`workspace_publish_guidance\` and a pull request on the primary repo that lists every assumption. Run \`bb stewards enable\` only after that pull request merges. You are an ordinary thread, not the project steward.`;
+
 export interface Timing {
   /** Rings for one entity within this long are one look. */
   debounceMs: number;
@@ -528,6 +535,8 @@ export const rpcContract = defineRpcContract({
           projectId: z.string(),
           name: z.string(),
           configured: z.boolean(),
+          /** No project file, or no project steward in roles.json: offer the onboarding action. */
+          onboard: z.boolean(),
           /** Whether this server stewards the project: its local, per-project switch. */
           enabled: z.boolean(),
           /** Which project source reads this project's `.bb`: multi-repo or native git (BB-107). */
@@ -591,6 +600,11 @@ export const rpcContract = defineRpcContract({
   stewardsSetProjectEnabled: {
     input: z.object({ projectId: z.string().min(1).max(100), enabled: z.boolean() }),
     output: z.object({ ok: z.boolean(), message: z.string(), enabled: z.boolean() }),
+  },
+  // The Stewards page's "Set up stewards": spawn an ordinary thread with the onboarding skill.
+  stewardsOnboard: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), threadId: z.string().nullable(), message: z.string() }),
   },
   // The stewards page: one project's board. A null projectId picks the first project.
   stewardsBoard: {
@@ -5983,9 +5997,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         };
       },
       async stewardsOverview() {
-        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
-        const configsById = new Map((await configuredProjects()).map((c) => [c.projectId, c] as const));
-        const ids = projectIds(configsById.keys());
+        const list = await bb.sdk.projects.list();
+        const named = new Map(list.map((p) => [p.id, p.name] as const));
+        const configsById = new Map((await configuredProjects(false, list)).map((c) => [c.projectId, c] as const));
+        // Every project, not only the configured ones: a project with no `.bb`
+        // stewards content still gets a row and the Set up stewards action.
+        const ids = [...new Set([...list.map((p) => p.id), ...projectIds(configsById.keys())])];
         const projects = ids.map((projectId) => {
           const config = configsById.get(projectId) ?? null;
           const row = store.project(projectId);
@@ -5995,6 +6012,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectId,
             name: named.get(projectId) ?? projectId,
             configured: config !== null,
+            onboard: !hasProjectSteward(config),
             enabled: config?.enabled ?? false,
             source: config?.source.kind ?? null,
             label: config?.file.label ?? null,
@@ -6047,6 +6065,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsSetProjectEnabled({ projectId, enabled }) {
         return setProjectEnabledForUser(projectId, enabled);
+      },
+      async stewardsOnboard({ projectId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("Set up stewards is started from the Stewards page");
+        try {
+          return await onboardProject(projectId);
+        } catch (error) {
+          return { ok: false, threadId: null, message: errorMessage(error) };
+        }
       },
       async stewardsBoard({ projectId: wanted }) {
         const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
@@ -6557,6 +6583,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     bb.agents.configure((context) => {
+      // The onboarding thread is an ordinary thread, not a steward; the skill
+      // carries the whole procedure. It is identified by the metadata this
+      // plugin set at spawn, before any binding lookup.
+      if (context.pluginMetadata.role === "onboarding") return { tools: [], skills: ["onboarding"], instructions: ONBOARDING_INTRO };
       const role = roleOf(context.thread.id);
       if (role === null) return { tools: [], skills: ["stewards"] };
       if (role.kind === "project") {
@@ -8341,6 +8371,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { ok: !lines.some((l) => l.startsWith("problem:")), lines };
     }
 
+    /** Whether a project file names a project steward in roles.json, so it needs no onboarding. */
+    function hasProjectSteward(config: ProjectConfig | null): boolean {
+      return config !== null && config.roles !== null && Object.values(config.roles.roles).some((role) => role.projectSteward === true);
+    }
+
+    /** Spawn the ordinary thread that onboards a project, with the onboarding skill loaded. */
+    async function onboardProject(projectId: string): Promise<{ ok: boolean; threadId: string | null; message: string }> {
+      const source = (await selectProjectSource(projectId)).source;
+      const hostId = await projectHost(projectId);
+      const thread = await bb.sdk.threads.spawn({
+        projectId,
+        environment: freshEnvironment(source, hostId),
+        prompt: ONBOARDING_INTRO,
+        title: "Set up stewards",
+        pluginMetadata: { role: "onboarding", threadBriefs: THREAD_BRIEFS_OFF },
+      });
+      bb.log.info(`stewards: started a Set up stewards thread for ${projectId} (${thread.id})`);
+      return { ok: true, threadId: thread.id, message: `Started a Set up stewards thread (${thread.id}).` };
+    }
+
     /** What `bb stewards check` says about one ops target: readable or not, and whether its logs are. */
     function opsAccessLines(key: string, a: OpsAccess): string[] {
       if (a.error !== null) return [`problem: ops: cannot read the target ${key}: ${a.error}`];
@@ -8353,56 +8403,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return lines;
     }
 
-    const stewardsCommands: Record<string, PluginCliCommand> = {
-          init: cliCommand({
-            summary: "Write stewards/project.json and the default playbooks into a .bb checkout",
-            description:
-              "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. Then commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself); stewards reads committed HEAD only.",
-            options: {
-              teams: { type: "string", description: "Linear team keys, comma-separated; the teams you belong to when left out" },
-              dir: { type: "string", description: "The .bb directory to write into" },
-              force: { type: "boolean", description: "Overwrite existing files" },
-            },
-            async run(input, ctx) {
-              let teams = (input.options.teams ?? "").split(",").map((t) => t.trim().toUpperCase()).filter((t) => t !== "");
-              if (teams.length === 0) {
-                try {
-                  const out = await rpc("linear", "sourceValidate", { units: [], label: "bb-managed", states: [] }, sourceContract.sourceValidate.output);
-                  teams = out.mine.map((m) => m.unit);
-                } catch (error) {
-                  throw new PluginCliError(`Could not ask Linear for your teams: ${errorMessage(error)}`, { code: "linear_unavailable", hint: "Pass --teams ENG,OPS." });
-                }
-              }
-              const dir = input.options.dir ?? (ctx.cwd === undefined ? undefined : `${ctx.cwd.replace(/\/$/u, "")}/.bb`);
-              if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
-              // Write on the thread's machine, else the project's: left to core, the
-              // write lands on the server's own daemon, which bb-gate's servers lack.
-              const threadHost = ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null);
-              const hostId = threadHost ?? (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ?? undefined;
-              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [playbookPath(name), text] as [string, string])];
-              const lines: string[] = [];
-              for (const [rel, content] of files) {
-                const path = `${dir}/${rel}`;
-                await bb.sdk.files.mkdir({ path: path.slice(0, path.lastIndexOf("/")), recursive: true, ...(hostId === undefined ? {} : { hostId }) } as never).catch(() => undefined);
-                const result = (await bb.sdk.files.write({ path, content, ...(input.options.force ? {} : { expectedSha256: null }), ...(hostId === undefined ? {} : { hostId }) } as never)) as { outcome: string };
-                lines.push(`${result.outcome === "written" ? "wrote" : "kept existing"} ${rel}`);
-              }
-              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), merge the guidance branch, then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
-              return { exitCode: 0, stdout: lines.join("\n") };
-            },
-          }),
-
-          brief: cliCommand({
-            summary: "A steward's invariants: thread id, allowed actions, phase instructions, ready gate, guidance and holds, the standing rules, and the worker spawn command",
-            description:
-              "Run this on any turn that is not a wake, and after your context was compacted. It defaults to the binding of the invoking thread. The plugin also injects a bounded form of it as per-turn system context, so it survives compaction.",
-            positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
-            options: { project: PROJECT_OPTION },
-            async run(input, ctx) {
-              const own = input.positionals.binding === undefined || input.positionals.binding === "" ? (ctx.threadId === undefined ? null : store.projectByThread(ctx.threadId)) : null;
-              if (own !== null && ctx.threadId !== undefined) return { exitCode: 0, stdout: `# Project steward brief\n\n${projectStewardInvariants(ctx.threadId)}` };
-              const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
-              const config = await loadConfig(b.projectId);
     // ---- the onboarding survey (BB-180) ----------------------------------------
 
     /** The workflow states the project's ticket playbook expects, for the survey's Linear section. */
@@ -8537,7 +8537,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return buildSurvey({ projectId, source: source.kind, layout: set.layout, primary: set.primary, repos, linear, bb });
     }
 
-              const playbook = config === null ? null : bindingPlaybook(config, b);
+    const stewardsCommands: Record<string, PluginCliCommand> = {
           survey: cliCommand({
             summary: "Emit the mechanical facts about a project's repos, Linear and .bb, for onboarding",
             description:
@@ -8549,6 +8549,56 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             },
           }),
 
+          init: cliCommand({
+            summary: "Write stewards/project.json and the default playbooks into a .bb checkout",
+            description:
+              "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. Then commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself); stewards reads committed HEAD only.",
+            options: {
+              teams: { type: "string", description: "Linear team keys, comma-separated; the teams you belong to when left out" },
+              dir: { type: "string", description: "The .bb directory to write into" },
+              force: { type: "boolean", description: "Overwrite existing files" },
+            },
+            async run(input, ctx) {
+              let teams = (input.options.teams ?? "").split(",").map((t) => t.trim().toUpperCase()).filter((t) => t !== "");
+              if (teams.length === 0) {
+                try {
+                  const out = await rpc("linear", "sourceValidate", { units: [], label: "bb-managed", states: [] }, sourceContract.sourceValidate.output);
+                  teams = out.mine.map((m) => m.unit);
+                } catch (error) {
+                  throw new PluginCliError(`Could not ask Linear for your teams: ${errorMessage(error)}`, { code: "linear_unavailable", hint: "Pass --teams ENG,OPS." });
+                }
+              }
+              const dir = input.options.dir ?? (ctx.cwd === undefined ? undefined : `${ctx.cwd.replace(/\/$/u, "")}/.bb`);
+              if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
+              // Write on the thread's machine, else the project's: left to core, the
+              // write lands on the server's own daemon, which bb-gate's servers lack.
+              const threadHost = ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null);
+              const hostId = threadHost ?? (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ?? undefined;
+              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [playbookPath(name), text] as [string, string])];
+              const lines: string[] = [];
+              for (const [rel, content] of files) {
+                const path = `${dir}/${rel}`;
+                await bb.sdk.files.mkdir({ path: path.slice(0, path.lastIndexOf("/")), recursive: true, ...(hostId === undefined ? {} : { hostId }) } as never).catch(() => undefined);
+                const result = (await bb.sdk.files.write({ path, content, ...(input.options.force ? {} : { expectedSha256: null }), ...(hostId === undefined ? {} : { hostId }) } as never)) as { outcome: string };
+                lines.push(`${result.outcome === "written" ? "wrote" : "kept existing"} ${rel}`);
+              }
+              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), merge the guidance branch, then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
+              return { exitCode: 0, stdout: lines.join("\n") };
+            },
+          }),
+
+          brief: cliCommand({
+            summary: "A steward's invariants: thread id, allowed actions, phase instructions, ready gate, guidance and holds, the standing rules, and the worker spawn command",
+            description:
+              "Run this on any turn that is not a wake, and after your context was compacted. It defaults to the binding of the invoking thread. The plugin also injects a bounded form of it as per-turn system context, so it survives compaction.",
+            positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const own = input.positionals.binding === undefined || input.positionals.binding === "" ? (ctx.threadId === undefined ? null : store.projectByThread(ctx.threadId)) : null;
+              if (own !== null && ctx.threadId !== undefined) return { exitCode: 0, stdout: `# Project steward brief\n\n${projectStewardInvariants(ctx.threadId)}` };
+              const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
+              const config = await loadConfig(b.projectId);
+              const playbook = config === null ? null : bindingPlaybook(config, b);
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
               return {
                 exitCode: 0,

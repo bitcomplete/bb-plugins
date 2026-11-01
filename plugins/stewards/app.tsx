@@ -300,7 +300,7 @@ function StatusSection() {
       ) : null}
       {overview.projects.length === 0 ? (
         <p className="text-muted-foreground">
-          No project has a <code>stewards/project.json</code> in its <code>.bb</code>. Run <code>bb stewards init</code> from a thread in a multi-repo project, commit and publish it, and merge the guidance branch.
+          No projects yet. Create a project, then use <strong>Set up stewards</strong> on its row to survey the repos, write its <code>.bb</code> and open the guidance pull request.
         </p>
       ) : (
         overview.projects.map((p) => <ProjectStatus key={p.projectId} project={p} now={now} refetch={refetch} />)
@@ -338,7 +338,15 @@ function ProjectStatus({ project: p, now, refetch }: { project: Project; now: nu
   const rpc = useRpc<typeof rpcContract>();
   const [check, setCheck] = useState<CheckResult | "running" | { error: string } | null>(null);
   const [toggle, setToggle] = useState<"idle" | "running" | { error: string }>("idle");
+  const [onboard, setOnboard] = useState<"idle" | "running" | { error: string } | { started: string }>("idle");
   const healthy = p.configured && p.problems.length === 0;
+  const startOnboarding = () => {
+    setOnboard("running");
+    rpc.call("stewardsOnboard", { projectId: p.projectId }).then(
+      (r) => setOnboard(r.ok ? { started: r.threadId ?? "" } : { error: r.message }),
+      (e: unknown) => setOnboard({ error: message(e) }),
+    );
+  };
   const setEnabled = (enabled: boolean) => {
     setToggle("running");
     rpc.call("stewardsSetProjectEnabled", { projectId: p.projectId, enabled }).then(
@@ -362,6 +370,16 @@ function ProjectStatus({ project: p, now, refetch }: { project: Project; now: nu
           {p.configured ? <Badge tone={p.enabled ? "muted" : "warn"}>{p.enabled ? "on" : "off"}</Badge> : null}
         </p>
         <div className="flex items-center gap-2">
+          {p.onboard ? (
+            <button
+              type="button"
+              disabled={onboard === "running"}
+              className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
+              onClick={startOnboarding}
+            >
+              {onboard === "running" ? "Starting…" : "Set up stewards"}
+            </button>
+          ) : null}
           {p.configured ? (
             <button
               type="button"
@@ -392,8 +410,12 @@ function ProjectStatus({ project: p, now, refetch }: { project: Project; now: nu
       </div>
       {!p.enabled && p.configured ? <p className="text-muted-foreground">Stewards are off for this project on this server: nothing is adopted and no steward is woken. Turn it on to resume.</p> : null}
       {typeof toggle === "object" ? <p className="text-xs text-destructive">{toggle.error}</p> : null}
+      {typeof onboard === "object" && "started" in onboard ? (
+        <p className="text-muted-foreground">Set up stewards started in thread <ThreadLink threadId={onboard.started}>{onboard.started}</ThreadLink>. It surveys the repos, interviews you, and opens the guidance pull request; stewards stay off until that pull request merges.</p>
+      ) : null}
+      {typeof onboard === "object" && "error" in onboard ? <p className="text-xs text-destructive">{onboard.error}</p> : null}
       {!p.configured ? (
-        <p className="text-muted-foreground">This project has stewards but no readable stewards/project.json any more. They keep their bindings; nothing new is adopted.</p>
+        <p className="text-muted-foreground">No stewards/project.json in this project's .bb yet. Set up stewards to survey the repos, write the project's guidance and open the pull request that turns stewards on.</p>
       ) : (
         <dl className="flex flex-col gap-1">
           <Row label="Linear teams">{p.linearTeams.join(", ") || "none"}</Row>
@@ -414,6 +436,7 @@ function ProjectStatus({ project: p, now, refetch }: { project: Project; now: nu
           <Row label="Project steward">
             {p.projectStewardThreadId === null ? <span className="text-muted-foreground">not started yet; it starts with the first steward</span> : <ThreadLink threadId={p.projectStewardThreadId}>Open thread</ThreadLink>}
           </Row>
+          {p.onboard ? <p className="text-muted-foreground">No project steward in roles.json yet. Set up stewards to finish the configuration.</p> : null}
           <Row label="Page">
             <PageLink projectId={p.projectId}>Open the stewards page</PageLink>
           </Row>
@@ -670,7 +693,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           <Loading error={error} />
         ) : data.projects.length === 0 ? (
           <None>
-            No project is stewarded. Run <code>bb stewards init</code> from a thread in a multi-repo project, commit and publish it, and merge the guidance branch.
+            No project is stewarded. Use <strong>Set up stewards</strong> on a project's row in Settings → Plugins → Stewards to survey it, write its <code>.bb</code> and open the guidance pull request.
           </None>
         ) : (
           <>
