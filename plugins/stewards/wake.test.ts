@@ -382,6 +382,19 @@ describe("the nightly prompt", () => {
     expect(none).toMatch(/no standing-rules list configured/u);
     expect(none).toMatch(/Add only the limits this change needs, in at most three points/u);
   });
+
+  it("tells the project steward a reviewer escalated an owner-reviewed pull request to the owner (BB-192)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const x = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve acme/web#7", meanwhile: "Wait.", route: "project", recommendation: null, resolutionKind: "approve-decline", url: "https://github.com/acme/web/pull/7" });
+    const escalated = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b, escalated: true }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(escalated).toMatch(/reviewer can escalate an owner-reviewed pull request to the owner/u);
+    expect(escalated).toMatch(/do not post one/u);
+    expect(escalated).toMatch(/forward the request to the user/u);
+    // Without the escalation the line is absent, so a routine approval is unchanged.
+    const plain = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(plain).not.toMatch(/reviewer can escalate an owner-reviewed pull request to the owner/u);
+  });
 });
 
 describe("the decide-list listing in the wakes (BB-135)", () => {

@@ -794,6 +794,16 @@ keeps its comment id in the store and wakes the worker, or forwards it to
 you for a `user` one. Only a marker whose comment id the store recorded
 counts, so a hand-typed lookalike never does, and an approval is of the
 pull request, so a later head is covered unless the worker added scope.
+The reviewer can escalate to you in its `bb-review` marker with
+`approver=owner` (BB-192). The escalation is binding: the gate then needs
+your unsigned approval and a project-steward `bb-approval` never meets it,
+whatever entry matched; `approver=project` leaves the decide list in
+charge, a missing or unknown approver is read as `owner` (fail closed), and
+the attribute is ignored on a `no-review` marker. The project steward's
+`approve` RPC and the approval wake refuse an escalated pull request and
+forward it to you, and `bb stewards gate` prints the escalation beside the
+decide-list winner. Escalation only goes up: no marker can move a `user`
+match down.
 A missing entry, an unknown mark, a `user` entry, or a change to the
 decide list, `bigDecisions`, `prGate` or the
 approval code is always yours, whatever the list says; a signed comment

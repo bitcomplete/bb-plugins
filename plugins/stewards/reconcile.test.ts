@@ -422,12 +422,16 @@ describe("the stuck backstop", () => {
 
 describe("the pull request gate (build-tickets)", () => {
   const head = "aaaaaaa1";
-  const marker = (sha: string, verdict: string, lane: string) =>
-    comment({ id: `m-${sha}-${verdict}-${lane}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  // Existing gate tests predate `approver=`: their owner-reviewed markers test
+  // the decide-list path, which is `approver=project`, so the default keeps
+  // them testing what they always did. A test that wants the escalation, or
+  // wants the missing attribute, passes it explicitly (`null` for missing).
+  const marker = (sha: string, verdict: string, lane: string, approver: string | null = lane === "no-review" ? null : "project") =>
+    comment({ id: `m-${sha}-${verdict}-${lane}${approver === null ? "" : `-${approver}`}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane}${approver === null ? "" : ` approver=${approver}`} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
   const owner = (body: string) => comment({ id: `oa-${body}`, author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
   /** A review steward's signed review: the marker on the first line, the thread's signature at the end (BB-118). */
   const reviewWithMarker = (sha: string, verdict: string, lane: string, at: string) =>
-    comment({ id: `rev-${verdict}-${lane}`, author: "jane", did: "reviewed", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->\n\nFindings.\n\n_— from bb thread thr_review_`, signedBy: "thr_review", createdAt: at });
+    comment({ id: `rev-${verdict}-${lane}`, author: "jane", did: "reviewed", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane}${lane === "no-review" ? "" : " approver=project"} -->\n\nFindings.\n\n_— from bb thread thr_review_`, signedBy: "thr_review", createdAt: at });
   const approval = (sha: string, entry: string | null, verdict: "approved" | "declined" = "approved", id = `ap-${sha}-${verdict}`, createdAt = "2026-10-14T16:10:00Z") =>
     comment({ id, author: "trotterdylan", body: approvalMarkerLine({ sha, entry, verdict }), signedBy: "thr_project", createdAt });
   const record = (commentId: string, verdict: "approved" | "declined" = "approved"): ProjectApprovalRecord => ({ commentId, verdict });
@@ -493,6 +497,42 @@ describe("the pull request gate (build-tickets)", () => {
     expect(prGate(ownerApproved, { decision: "user" }).gateMet).toBe(true);
     // No project approval means the owner's.
     expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green), { projectApprovals: [] }).needsOwnerApproval).toBe(true);
+  });
+
+  it("binds the gate to the owner when the reviewer escalates in the marker, whatever the decide list matched (BB-192)", () => {
+    const ap = approval(head, "A cross-repo contract");
+    // `approver=owner`: a recorded project-steward approval does not meet the
+    // gate, whatever `decideFor` says, and `missing` names the escalation.
+    const escalated = pull({ comments: [marker(head, "approved", "owner-reviewed", "owner"), ap] }, green);
+    expect(prGate(escalated, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({
+      escalated: true,
+      decision: "user",
+      projectApproved: false,
+      needsOwnerApproval: true,
+      needsProjectApproval: false,
+      gateMet: false,
+      missing: "owner approval needed (the reviewer escalated it)",
+    });
+    // The owner's unsigned approval meets it.
+    const ownerApproved = pull({ comments: [marker(head, "approved", "owner-reviewed", "owner"), owner("LGTM")] }, green);
+    expect(prGate(ownerApproved, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ escalated: true, gateMet: true });
+    // `approver=project` leaves the decide list in charge: a `project` entry's
+    // project-steward approval is still the gate, and a `user` entry is still
+    // the owner's.
+    const project = pull({ comments: [marker(head, "approved", "owner-reviewed", "project"), ap] }, green);
+    expect(prGate(project, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ escalated: false, decision: "project", gateMet: true });
+    expect(prGate(project, { decision: "user", projectApprovals: [record(ap.id)] })).toMatchObject({ escalated: false, decision: "user", projectApproved: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    // A missing or unknown approver on an owner-reviewed marker is read as the
+    // owner's (fail closed).
+    for (const approver of [null, "something"]) {
+      const missing = pull({ comments: [marker(head, "approved", "owner-reviewed", approver), ap] }, green);
+      expect(prGate(missing, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ escalated: true, gateMet: false, missing: "owner approval needed (the reviewer escalated it)" });
+    }
+    // `approver` on a `no-review` marker is ignored: escalation only goes up.
+    expect(prGate(pull({ comments: [marker(head, "approved", "no-review", "owner")] }, green))).toMatchObject({ escalated: false, gateMet: true, needsOwnerApproval: false });
+    // The parser reads the attribute, and leaves it undefined when absent.
+    expect(reviewMarker("<!-- bb-review round=1 sha=abc verdict=approved lane=owner-reviewed approver=owner -->")?.approver).toBe("owner");
+    expect(reviewMarker("<!-- bb-review round=1 sha=abc verdict=approved lane=owner-reviewed -->")?.approver).toBeUndefined();
   });
 
   it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {

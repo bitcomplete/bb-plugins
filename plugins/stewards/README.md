@@ -314,16 +314,17 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   <owner/repo#N> [--json]` reads the pull request fresh and prints the same
   verdict the page and the wake use (`prGate`): the lane, the latest
   `bb-review` marker and its sha, the matched decide-list entry and who
-  decides, the approval found (owner comment, owner review or `bb-approval`
-  marker) and its sha, the checks, the binding's open items, and `gate met:
-  yes|no`, exiting 0 when met and 1 when not. `bb stewards merge
-  <owner/repo#N>` runs the page's Merge action through one shared function: it
-  re-reads the pull request, re-checks the gate, refuses with the gate's
-  reason when it is unmet or another worker is in flight, and otherwise
-  squash-merges, posts the "Merged:" comment (lane, approved sha, a "since
-  then" line when the head moved past it, the merge commit, and a restart
-  note when the project's guidance says a merge there restarts servers), and
-  closes the Merge item.
+  decides, the escalation the reviewer's marker carries (BB-192), the
+  approval found (owner comment, owner review or `bb-approval` marker) and
+  its sha, the checks, the binding's open items, and `gate met: yes|no`,
+  exiting 0 when met and 1 when not. `bb stewards merge <owner/repo#N>` runs
+  the page's Merge action through one shared function: it re-reads the pull
+  request, re-checks the gate, refuses with the gate's reason when it is
+  unmet or another worker is in flight, and otherwise squash-merges, posts
+  the "Merged:" comment (lane, approved sha, a "since then" line when the
+  head moved past it, an escalation line when the reviewer escalated it to
+  the owner, the merge commit, and a restart note when the project's
+  guidance says a merge there restarts servers), and closes the Merge item.
 - **The worker and reviewer skills (BB-134).** The plugin ships `build-tickets`
   (the worker's end-to-end loop: build, test, open the PR, spawn one reviewer,
   address its findings, merge by the lane gate, end at merge) and `pr-reviewer`
@@ -350,6 +351,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   each entry `decide: project | user`): the project steward approves a
   `project` entry (recorded in the store, bound to the pull request's head
   sha, never a GitHub comment or review) and forwards a `user` one to you.
+  The reviewer's marker carries an optional `approver=owner|project`
+  attribute on the owner-reviewed lane (BB-192). `approver=owner` — or a
+  missing or unknown approver, fail closed — binds the gate to your
+  unsigned approval: a project-steward `bb-approval` does not meet it
+  whatever decide-list entry matched, and the project steward's `approve`
+  RPC and approval wake refuse it and forward it to you. `approver=project`
+  leaves the decide list in charge. The attribute is ignored on a
+  `no-review` marker, and escalation only goes up.
   An unsigned comment or review whose first line carries a `bb-review` or
   `bb-approval` marker is a thread's, never the owner's approval, whether or
   not it is signed (BB-110).

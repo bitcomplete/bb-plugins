@@ -73,7 +73,7 @@ import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
-import { latestProjectApprovalMarker, prGate } from "./gate.js";
+import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
   SOURCE_PLUGIN_IDS,
@@ -4235,7 +4235,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (r.escalation.kind !== "approval") return r;
           const pull = r.from.lastSnapshot === null ? undefined : observedPulls(r.from, r.from.lastSnapshot).find((p) => (p.url ?? p.key) === r.escalation.url);
           if (pull === undefined) return r;
-          return { ...r, listing: formatDecisionListing(explainDecision(await pullChangedFiles(pull), config.file.bigDecisions)) };
+          return {
+            ...r,
+            listing: formatDecisionListing(explainDecision(await pullChangedFiles(pull), config.file.bigDecisions)),
+            // A reviewer's owner call makes the approval the owner's, whatever
+            // the decide list matched, so the wake says so and the project
+            // steward forwards rather than approves (BB-192).
+            escalated: prGate(pull, { projectApprovals: projectApprovalsFor(r.from) }).escalated,
+          };
         }),
       );
       const coveredWithUser = new Set(store.openQuestionEscalationIds(projectId));
@@ -5832,6 +5839,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       approval: { kind: "owner-comment" | "owner-review" | "project-marker"; sha: string | null; at: string | null } | null;
       checks: { state: string | null; green: boolean };
       openItems: string[];
+      /** Whether the reviewer's marker escalated the pull request to the owner (BB-192). */
+      escalated: boolean;
       missing: string | null;
       gateMet: boolean;
     };
@@ -5898,6 +5907,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         approval: approvalDetail(b, pull, gate),
         checks: { state: gate.checksState, green: gate.checksGreen },
         openItems: openPullItems(b, pull.url ?? pull.key),
+        escalated: gate.escalated,
         missing: gate.missing,
         gateMet: gate.gateMet,
       };
@@ -5909,11 +5919,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}: ${r.decision.why})` : `"${r.decision.entry}" (${r.decision.decide})`;
       const listing = r.decision.listing.split("\n").map((l) => `  ${l}`).join("\n");
       const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}`;
+      // The reviewer's owner call is printed beside the decide-list winner: the
+      // decide list may still name a `project` entry, but the escalation binds
+      // the gate to the owner's approval (BB-192).
+      const escalation = r.escalated ? "owner — the reviewer escalated it" : "none";
       return [
         `${r.ref}${r.binding === "" ? "" : ` — ${r.binding}`}`,
         `head ${shortSha(r.headSha)}; lane ${r.lane ?? "(none)"}`,
         `reviewer: ${marker}`,
         `decide list: ${decision}`,
+        `escalation: ${escalation}`,
         listing,
         `approval: ${approval}`,
         `checks: ${r.checks.state ?? "none"}${r.checks.green ? " (green)" : ""}`,
@@ -5927,7 +5942,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lane = gate.lane ?? "no-review";
       const approved = gate.marker?.sha ?? gate.headSha;
       const by = gate.projectApproved ? ", approved by the project steward" : gate.ownerApproved ? ", approved by the owner" : "";
-      return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}.`;
+      const escalation = gate.escalated ? ", escalated by the reviewer to the owner" : "";
+      return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}${escalation}.`;
     }
 
     function sinceApproval(gate: ReturnType<typeof prGate>): string | null {
@@ -7527,6 +7543,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (config === null) return toolError(new Error("The project file could not be read, so no project-steward approval can be recorded."));
               const observed = target.lastSnapshot;
               const pull = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === prApproval.url) ?? null;
+              // A reviewer's owner call in the marker is binding: the project
+              // steward does not decide it, whatever entry the decide list
+              // matched, and never posts a `bb-approval` on it (BB-192).
+              if (pull !== null && prGate(pull, { projectApprovals: projectApprovalsFor(target) }).escalated) {
+                return toolError(new Error(ESCALATED_APPROVAL_REFUSAL));
+              }
               const files = pull === null ? null : await pullChangedFiles(pull);
               const decision = decideFor(files, input.entry ?? null, config.file.bigDecisions);
               if (decision !== "project") {

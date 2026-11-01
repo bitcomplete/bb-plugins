@@ -247,7 +247,13 @@ The conditions it checks:
    the project's guidance and the `stewards` skill ("When a human must
    approve"). `bb stewards gate` prints the matched entry and who decides,
    and the approval it found — the owner's unsigned GitHub approval, or
-   the project steward's `bb-approval` marker. You open the PR from the
+   the project steward's `bb-approval` marker. When the reviewer's latest
+   marker carries `approver=owner` (or no `approver` at all, which is read
+   as `owner`), the reviewer escalated the pull request to the owner: the
+   owner's unsigned approval is the gate and a project-steward
+   `bb-approval` does not meet it, whatever decide-list entry matched.
+   `bb stewards gate` prints the escalation beside the decide-list winner,
+   and your merge comment names it. You open the PR from the
    owner's account, so GitHub records the owner's approval as a COMMENTED
    review; a signed review or comment never counts, whatever it says. The
    newest project-steward marker decides: a decline is a change request
@@ -293,8 +299,9 @@ bb stewards merge <owner/repo#N>
 It re-reads the pull request, re-checks the lane gate, refuses with the
 gate's reason when it is unmet or another worker is still running on the
 pull request, and otherwise squash-merges, posts the "Merged:" comment
-(lane, approved sha, a "since then" line when the head moved past it, the
-merge commit, and the restart note when the project's guidance says a merge
+(lane, approved sha, a "since then" line when the head moved past it, an
+escalation line when the reviewer escalated it to the owner, the merge
+commit, and the restart note when the project's guidance says a merge
 there restarts servers), and closes the Merge item. If it refuses, do not
 look for another way: fix the gate, or if the thread's permission system
 refuses the command (or a direct `gh pr merge`), take the hand-off path

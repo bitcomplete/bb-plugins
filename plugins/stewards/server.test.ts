@@ -4897,7 +4897,9 @@ describe("needs you items", () => {
   const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
   const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
   const head = "aaaaaaa1";
-  const marker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  // Existing tests predate `approver=`: their owner-reviewed marker tests the
+  // decide-list path, which is `approver=project` (BB-192).
+  const marker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
   const owner = comment({ id: "oa", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
 
   /** A bound ticket with one linked pull request, observed. */
@@ -4987,7 +4989,7 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeUndefined();
     expect(t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")).toBeUndefined();
     // A new reviewer round on the same head is a new ask.
-    const later = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=2 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
+    const later = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=2 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
     t.entities.set("acme/web#7", pull({ comments: [marker, later] }, { checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeDefined();
@@ -5952,7 +5954,7 @@ describe("needs you items", () => {
     await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" }, steward);
     expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "approval")).toEqual([]);
     // A new reviewer marker on the same head raises a new request.
-    const marker2 = comment({ id: "m2", author: "trotterdylan", body: "<!-- bb-review round=2 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
+    const marker2 = comment({ id: "m2", author: "trotterdylan", body: "<!-- bb-review round=2 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=project -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
     t.entities.set("acme/web#7", pull({ comments: [marker, marker2] }, { checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     const again = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")!;
@@ -9882,7 +9884,10 @@ describe("strict owner dispatch (BB-115)", () => {
 
 describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   const head = "aaaaaaa1";
-  const reviewMarker = (lane: string, id = "m1") => comment({ id, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  // Existing tests predate `approver=`: an owner-reviewed marker tests the
+  // decide-list path, which is `approver=project` (BB-192).
+  const reviewMarker = (lane: string, id = "m1") => comment({ id, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=${lane}${lane === "no-review" ? "" : " approver=project"} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const reviewMarkerApprover = (lane: string, approver: string, id = "m1") => comment({ id, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=${lane} approver=${approver} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 
   /** A bound ticket with one linked pull request, observed. */
   async function withPull(comments: ReturnType<typeof comment>[], over: { repo?: string; number?: number; pullOver?: Record<string, unknown>; entityOver?: Record<string, unknown>; files?: string[]; project?: Record<string, unknown> } = {}) {
@@ -9986,6 +9991,29 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(json.decision.listing).toContain("Rule: a `user` entry wins");
     // The project steward's approval is still needed, so the gate is not met.
     expect(json.gateMet).toBe(false);
+  });
+
+  it("prints the reviewer's escalation to the owner beside the decide-list winner (BB-192)", async () => {
+    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { files: ["bb-gate/docs/hooks.md"] });
+    const out = await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1"]);
+    expect(out.exitCode).toBe(1);
+    expect(out.stdout).toMatch(/decide list: "A cross-repo contract other repos implement" \(project\)/u);
+    expect(out.stdout).toMatch(/escalation: owner — the reviewer escalated it/u);
+    expect(out.stdout).toMatch(/gate met: no — owner approval needed \(the reviewer escalated it\)/u);
+    const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { escalated: boolean; decision: { decide: string }; gateMet: boolean; missing: string };
+    expect(json).toMatchObject({ escalated: true, decision: { decide: "project" }, gateMet: false });
+    expect(json.missing).toMatch(/owner approval needed \(the reviewer escalated it\)/u);
+  });
+
+  it("refuses the project steward's approve RPC when the reviewer escalated to the owner (BB-192)", async () => {
+    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { files: ["bb-gate/docs/hooks.md"] });
+    // The decide list still matches a project entry, but the reviewer's owner
+    // call binds the gate: no bb-approval may be posted.
+    const update = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(update.error, update.text).toBe(true);
+    expect(update.text).toMatch(/reviewer escalated this pull request to the owner/u);
+    expect(update.text).toMatch(/Forward it/u);
+    expect(t.githubComments.filter((c) => c.body.startsWith("<!-- bb-approval"))).toHaveLength(0);
   });
 
   it("refuses a project-steward approve, with the listing, when a user entry also matched (BB-135)", async () => {

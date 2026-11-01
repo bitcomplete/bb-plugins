@@ -8,7 +8,7 @@
 // The functions take an `ApprovalsContext` rather than the server's whole
 // closure, so nothing here reads the plugin's config or snapshots on its own.
 import { type BigDecision, explainDecision, formatDecisionListing } from "./decisions.js";
-import { approvalMarkerLine, prGate, reviewWorkerThread, type PrGate } from "./gate.js";
+import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, reviewWorkerThread, type PrGate } from "./gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
 import { workerInFlight } from "./reconcile.js";
 import { signatureLine, type EntitySnapshot, type Source } from "./source-contract.js";
@@ -81,9 +81,13 @@ export async function deliverProjectApproval(ctx: ApprovalsContext, b: Binding, 
  * Post and record one project-steward decision in the order the gate needs:
  * the marker first, so a GitHub failure leaves nothing recorded and the
  * request open to retry. Used by `steward_update { approve }` and the decline
- * that resolves an `approve-decline` escalation.
+ * that resolves an `approve-decline` escalation. A reviewer's owner call in
+ * the marker (`approver=owner`, or a missing/unknown approver) is refused: the
+ * project steward does not decide an escalated pull request, whatever the
+ * decide list matched (BB-192).
  */
 export async function recordProjectDecision(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, threadId: string, fields: { headSha: string; entry: string | null; verdict: "approved" | "declined"; reasoning: string }): Promise<{ commentId: string }> {
+  if (prGate(pull).escalated) throw new Error(ESCALATED_APPROVAL_REFUSAL);
   const commentId = await postApprovalMarker(ctx, pull, threadId, fields);
   ctx.store.recordProjectApproval({ bindingId: b.id, headSha: fields.headSha, entry: fields.entry, byThread: threadId, commentId, verdict: fields.verdict });
   return { commentId };
