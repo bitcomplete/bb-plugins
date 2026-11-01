@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { decideEntrySchema, defaultDecideList } from "./decisions.js";
+import { decideEntrySchema, defaultDecideList, globError } from "./decisions.js";
 import { SENTRY_SLUG, opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
 
@@ -18,6 +18,13 @@ export const ROLES_FILE = `${STEWARDS_DIR}/roles.json`;
 export const playbookPath = (name: string) => `${STEWARDS_DIR}/playbooks/${name}.md`;
 
 export const DEFAULT_LABEL = "bb-managed";
+
+/**
+ * Authors whose pull requests the dependency watch adopts under deps-prs
+ * (BB-164). The synthesized Dependabot watch names them as its `match.author`,
+ * so the bot path and a declared watch are the same matcher.
+ */
+export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
 
 // ---- durations ------------------------------------------------------------------
 
@@ -345,7 +352,39 @@ const roleSentrySchema = z
   .strict()
   .default({ projects: [], resolveOnDone: false });
 
-/** A role's watches: namespaces, Sentry projects, Dependabot repos, and where its tickets file. */
+/** One pull-request watch's match fields: every given field must match, and `paths` means every changed file matches one of its globs. */
+export const pullMatchSchema = z
+  .object({
+    title: z.string().trim().min(1).max(300).optional(),
+    branch: z.string().trim().min(1).max(300).optional(),
+    author: z.string().trim().min(1).max(100).optional(),
+    paths: z.array(z.string().trim().min(1).max(300)).min(1).max(200).optional(),
+  })
+  .strict();
+
+/**
+ * One pull-request watch a role declares (BB-164): PRs in `repo` whose shape
+ * matches, adopted under `playbook` on the holder's server alone. `match` is
+ * a glob per field, using the decide list's `*`/`**` dialect.
+ */
+export const pullWatchSchema = z.object({ repo: dependabotRepoSchema, match: pullMatchSchema.default({}), playbook: playbookName }).strict();
+
+/**
+ * A pull watch as the matcher reads it. `author` is a string on a declared
+ * watch; the synthesized Dependabot watch names every bot login, so the type
+ * allows a list there.
+ */
+export type PullMatch = { title?: string; branch?: string; author?: string | string[]; paths?: string[] };
+export type PullWatch = { repo: string; match: PullMatch; playbook: string };
+
+/**
+ * The stable id of a watch, recorded on the binding it adopts as `adoptedBy`
+ * and shown by `bb stewards list` (BB-164): `<playbook>@<repo>`. It is what a
+ * binding reads to know a watch, not a label or review path, adopted it.
+ */
+export const pullWatchId = (watch: Pick<PullWatch, "repo" | "playbook">): string => `${watch.playbook}@${watch.repo.toLowerCase()}`;
+
+/** A role's watches: namespaces, Sentry projects, Dependabot repos, pull watches, and where its tickets file. */
 export const roleOpsSchema = z
   .object({
     k8sNamespaces: z.array(z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production")).max(50).default([]),
@@ -357,6 +396,8 @@ export const roleOpsSchema = z
     sentry: roleSentrySchema,
     /** Repos whose Dependabot alerts this person watches; `"all"` is every repo in repos.json less github.exclude. */
     dependabot: z.union([z.literal("all"), z.array(dependabotRepoSchema).max(200)]).optional(),
+    /** Pull requests this role's server adopts by shape, under a playbook, with no label (BB-164). */
+    pulls: z.array(pullWatchSchema).max(50).default([]),
   })
   .strict();
 export type RoleOps = z.infer<typeof roleOpsSchema>;
@@ -445,6 +486,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
   const autoAdopt: RoleOps["autoAdopt"] = [];
   const projects: RoleOps["sentry"]["projects"] = [];
   const dependabot: string[] = [];
+  const pulls: RoleOps["pulls"] = [];
   let dependabotAll = false;
   let context: string | undefined;
   let team: string | undefined;
@@ -458,13 +500,19 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
     if (def.sentry.resolveOnDone) resolveOnDone = true;
     if (def.dependabot === "all") dependabotAll = true;
     else if (Array.isArray(def.dependabot)) for (const repo of def.dependabot) if (!dependabot.includes(repo)) dependabot.push(repo);
+    for (const watch of def.pulls) if (!pulls.some((w) => samePullWatch(w, watch))) pulls.push(watch);
   }
-  const ops: RoleOps = { k8sNamespaces, autoAdopt, sentry: { projects, resolveOnDone } };
+  const ops: RoleOps = { k8sNamespaces, autoAdopt, sentry: { projects, resolveOnDone }, pulls };
   if (context !== undefined) ops.context = context;
   if (team !== undefined) ops.team = team;
   if (dependabotAll) ops.dependabot = "all";
   else if (dependabot.length > 0) ops.dependabot = dependabot;
   return ops;
+}
+
+/** Whether two watches are the same declaration, so a holder of several roles does not double them. */
+function samePullWatch(a: PullWatch, b: PullWatch): boolean {
+  return a.repo.toLowerCase() === b.repo.toLowerCase() && a.playbook === b.playbook && JSON.stringify(a.match) === JSON.stringify(b.match);
 }
 
 /** The effective role a holder runs: the merge of the roles it holds, and whether one is `projectSteward`. */
@@ -525,6 +573,20 @@ export const roleOpsTargets = (role: Role | null): OpsTarget[] => [...roleK8sTar
 export function roleDepsTargets(role: Role | null, repos: readonly string[]): DependabotTarget[] {
   const dep = role?.ops?.dependabot;
   return (dep === "all" ? [...repos] : dep ?? []).map((repo) => ({ kind: "dependabot" as const, repo }));
+}
+
+/** The pull watches a role declares, in the order the file lists them. */
+export const rolePulls = (role: Role | null): PullWatch[] => role?.ops?.pulls ?? [];
+
+/**
+ * Every pull watch a role's server runs: the Dependabot watches synthesized
+ * from `dependabot` first, then the role's declared watches, first match wins
+ * (BB-164). A synthesized watch names every bot login as its `match.author`
+ * and runs the deps-prs playbook.
+ */
+export function rolePullWatches(role: Role | null, repos: readonly string[], depsPrsName: string): PullWatch[] {
+  const synthesized: PullWatch[] = roleDepsTargets(role, repos).map((t) => ({ repo: t.repo, match: { author: [...DEPENDENCY_BOTS] }, playbook: depsPrsName }));
+  return [...synthesized, ...rolePulls(role)];
 }
 
 /** The Linear team a role's ops steward files in (the first of linear.teams when the role names none). */
@@ -598,6 +660,7 @@ export function legacyRole(project: ProjectFile): Role {
       autoAdopt: [...project.ops.autoAdopt],
       sentry: { projects: sentryTargets(project).map((t) => ({ org: t.org, project: t.project })), resolveOnDone: project.ops.sentry.resolveOnDone },
       dependabot: explicit.length > 0 ? explicit : "all",
+      pulls: [],
     },
   };
 }
@@ -661,6 +724,47 @@ export function watchProblems(project: ProjectFile, roles: RolesFile, repos: rea
 }
 
 /**
+ * The `check` problems of every declared pull watch (BB-164): its repo must be
+ * one the project leases (in `repos.json`, not in `github.exclude`), its
+ * playbook must exist and be kind `pr`, its globs must parse, and no two roles
+ * with holders may declare a watch on the same repo — an error, not a warning,
+ * since it is the only place two servers adopting the same pull request can be
+ * caught. `playbooks` holds every watch playbook that parsed; a missing one was
+ * already reported where it was read.
+ */
+export function pullWatchProblems(roles: RolesFile, repos: readonly string[], excluded: readonly string[], playbooks: ReadonlyMap<string, Playbook>): string[] {
+  const problems: string[] = [];
+  const repoOwners = new Map<string, string[]>();
+  for (const [login, role] of Object.entries(roles.roles)) {
+    for (const watch of rolePulls(role)) {
+      const where = `roles.json: the pull watch on ${watch.repo} for ${JSON.stringify(login)}`;
+      if (excluded.some((r) => r.toLowerCase() === watch.repo.toLowerCase())) problems.push(`${where}: the repo is in github.exclude, so it is not stewarded`);
+      else if (!repos.some((r) => r.toLowerCase() === watch.repo.toLowerCase())) problems.push(`${where}: the repo is not in repos.json, so the project has no lease for it and gets no doorbells`);
+      const playbook = playbooks.get(watch.playbook);
+      if (playbook !== undefined && playbook.kind !== "pr") problems.push(`${where}: the playbook ${JSON.stringify(watch.playbook)} is a ${playbook.kind} playbook, not a pr playbook`);
+      for (const [field, value] of [
+        ["match.title", watch.match.title],
+        ["match.branch", watch.match.branch],
+        ["match.author", Array.isArray(watch.match.author) ? undefined : watch.match.author],
+      ] as const) {
+        const bad = value === undefined ? null : globError(value);
+        if (bad !== null) problems.push(`${where}: ${field} is not a glob: ${bad}`);
+      }
+      for (const pattern of watch.match.paths ?? []) {
+        const bad = globError(pattern);
+        if (bad !== null) problems.push(`${where}: match.paths ${bad}`);
+      }
+      const owners = repoOwners.get(watch.repo.toLowerCase()) ?? [];
+      if (!owners.includes(login)) repoOwners.set(watch.repo.toLowerCase(), [...owners, login]);
+    }
+  }
+  for (const [repo, owners] of repoOwners) {
+    if (owners.length > 1) problems.push(`two roles with holders declare pull watches on ${repo}: ${owners.join(", ")} — only one server can adopt a pull request, so remove one`);
+  }
+  return problems;
+}
+
+/**
  * The role names whose definitions produce each of a holder's target keys: what
  * `bb stewards list` and the board attribute a binding to. A login with no
  * roles, or a target no role owns, maps to nothing.
@@ -675,6 +779,12 @@ export function bindingRoles(roles: RolesFile | null, login: string | null, repo
     const role: Role = { projectSteward: false, ops: definition };
     for (const target of [...roleOpsTargets(role), ...roleDepsTargets(role, repos)]) {
       const key = opsTargetKey(target);
+      const list = out.get(key) ?? [];
+      if (!list.includes(name)) out.set(key, [...list, name]);
+    }
+    // A pull binding is keyed by the watch that adopted it, not a target key.
+    for (const watch of rolePulls(role)) {
+      const key = pullWatchId(watch);
       const list = out.get(key) ?? [];
       if (!list.includes(name)) out.set(key, [...list, name]);
     }

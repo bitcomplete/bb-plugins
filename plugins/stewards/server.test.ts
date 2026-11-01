@@ -2927,6 +2927,127 @@ describe("pull requests", () => {
   });
 });
 
+describe("role-owned pull watches (BB-164)", () => {
+  const SYNC_PRS = GITHUB_PRS.replace("name: github-prs", "name: sync-prs");
+  const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => JSON.stringify({ version: 2, roles: definitions, holders });
+  const roleWithWatch = (watch: Record<string, unknown>, extra: Record<string, unknown> = {}) => v2({ ops: { ...extra, pulls: [watch] } }, { jane: ["ops"] });
+  const watch = { repo: "acme/web", match: { title: "Update */bc-prod.yaml", branch: "update-*", paths: ["projects/*/bc-prod.yaml"] }, playbook: "sync-prs" };
+  const syncPr = (over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNullable<EntitySnapshot["pull"]>> = {}) => pull({ author: "jane", title: "Update acme/bc-prod.yaml", labels: [], ...over }, { head: "update-acme-bc-prod-yaml-1", files: ["projects/acme/bc-prod.yaml"], ...pullOver });
+
+  it("adopts a pull request matching a role's watch under its playbook, with no label, and records the watch", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.entities.set("acme/web#7", syncPr());
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b).toMatchObject({ kind: "pr", playbook: "sync-prs", adoptedBy: "sync-prs@acme/web", endedAt: null });
+    // No label is needed: the steward is spawned and the binding is live.
+    expect(b.threadId).not.toBeNull();
+    const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
+    expect(list.stdout).toMatch(/adopted by sync-prs@acme\/web/);
+    expect(list.stdout).toMatch(/role ops/);
+  });
+
+  it("does not adopt another author's pull request when the watch names no author, and adopts one it names", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    // sam's PR matches title, branch and paths, but the watch names no author.
+    t.entities.set("acme/web#7", syncPr({ author: "sam" }, { requestedReviewers: [] }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("acme/web#7")).toBeNull();
+    // A watch that names sam adopts it.
+    t.files[ROLES_FILE] = roleWithWatch({ ...watch, match: { ...watch.match, author: "sam" } });
+    t.hooks.forgetConfigs();
+    t.entities.set("acme/web#8", syncPr({ id: "acme/web#8", key: "acme/web#8", author: "sam" }, { requestedReviewers: [] }));
+    await t.ring("github", "acme/web#8");
+    expect(t.hooks.store.find("acme/web#8")).toMatchObject({ playbook: "sync-prs", adoptedBy: "sync-prs@acme/web" });
+  });
+
+  it("does not adopt a pull request that matches title and branch but changes a file outside paths, or has 100 files", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.entities.set("acme/web#7", syncPr({}, { files: ["src/index.ts"] }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("acme/web#7")).toBeNull();
+    // 100 files, one of which matches the path glob: never matches (fail closed).
+    t.entities.set("acme/web#8", syncPr({ id: "acme/web#8", key: "acme/web#8" }, { files: [...Array(99).fill("src/x.ts"), "projects/acme/bc-prod.yaml"] }));
+    await t.ring("github", "acme/web#8");
+    expect(t.hooks.store.find("acme/web#8")).toBeNull();
+  });
+
+  it("keeps a watched pull request with its watch when it also carries the label", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.entities.set("acme/web#7", syncPr({ labels: ["bb-managed"] }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("acme/web#7")).toMatchObject({ playbook: "sync-prs", adoptedBy: "sync-prs@acme/web" });
+  });
+
+  it("adopts a bot pull request through the synthesized Dependabot watch, before a declared watch on the same repo", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch({ repo: "acme/web", match: { author: "dependabot*" }, playbook: "sync-prs" }, { dependabot: "all" });
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", title: "deps: bump", labels: [] }, { head: "dependabot/npm/group" }));
+    await t.ring("github", "acme/web#9");
+    expect(t.hooks.store.find("acme/web#9")).toMatchObject({ playbook: "deps-prs", adoptedBy: "deps-prs@acme/web" });
+  });
+
+  it("does not adopt a watched pull request when the watch's playbook is missing or not a pr playbook", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    // No sync-prs playbook.
+    t.entities.set("acme/web#7", syncPr());
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("acme/web#7")).toBeNull();
+    // A watch naming a ticket playbook is not adopted either.
+    t.files[ROLES_FILE] = roleWithWatch({ ...watch, playbook: "linear-tickets" });
+    t.hooks.forgetConfigs();
+    t.entities.set("acme/web#8", syncPr({ id: "acme/web#8", key: "acme/web#8" }));
+    await t.ring("github", "acme/web#8");
+    expect(t.hooks.store.find("acme/web#8")).toBeNull();
+  });
+
+  it("keeps a pre-upgrade deps-prs binding with no adoptedBy behaving as a watch", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    const b = t.hooks.store.create({ projectId: "p1", source: "github", entityId: "acme/web#9", entityKey: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump", kind: "pr", playbook: "deps-prs", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
+    expect(b.adoptedBy).toBeNull();
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", title: "deps: bump", labels: [] }, { head: "dependabot/npm/group" }));
+    await t.ring("github", "acme/web#9");
+    // No label, yet the binding is not detached or ended: the fallback reads it as a watch.
+    expect(t.hooks.store.find("acme/web#9")).toMatchObject({ endedAt: null, ending: null });
+  });
+
+  it("ends a pre-upgrade deps-prs binding as unconfigured when its playbook is gone", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.hooks.store.create({ projectId: "p1", source: "github", entityId: "acme/web#9", entityKey: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump", kind: "pr", playbook: "deps-prs", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", labels: [] }));
+    await t.ring("github", "acme/web#9");
+    expect(t.hooks.store.find("acme/web#9")).toMatchObject({ endedAt: expect.any(Number), endReason: "unconfigured" });
+  });
+
+  it("check reports a watch on a repo outside repos.json, a missing or non-pr playbook, and two held roles on one repo", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v2(
+      { a: { pulls: [{ repo: "acme/gone", match: {}, playbook: "sync-prs" }, { repo: "acme/web", match: {}, playbook: "sync-prs" }] }, b: { pulls: [{ repo: "acme/web", match: {}, playbook: "linear-tickets" }] } },
+      { jane: ["a"], sam: ["b"] },
+    );
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toMatch(/problem: stewards\/playbooks\/sync-prs\.md does not exist/);
+    expect(check.stdout).toMatch(/acme\/gone.*the repo is not in repos\.json/);
+    expect(check.stdout).toMatch(/the playbook "linear-tickets" is a ticket playbook, not a pr playbook/);
+    expect(check.stdout).toMatch(/two roles with holders declare pull watches on acme\/web: jane, sam/);
+  });
+});
+
 describe("stewards waiting on others", () => {
   const waiting = { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", waitingOn: "sam" };
 

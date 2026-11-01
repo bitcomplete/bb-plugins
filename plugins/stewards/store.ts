@@ -490,7 +490,14 @@ export const SERVER_SETTINGS_MIGRATIONS = [
    )`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS];
+// BB-164: the pull watch that adopted a binding (`<playbook>@<repo>`), so a
+// watch binding is told apart from a label or review one without re-deriving
+// it from the playbook name. Null on every binding from before the upgrade,
+// and on label and review bindings; the deps-prs fallback keeps an old
+// Dependabot binding behaving as a watch.
+export const PULL_WATCH_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN adopted_by TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -602,6 +609,13 @@ export type Binding = {
   kind: BindingKind;
   playbook: string;
   playbookVersion: string;
+  /**
+   * The pull watch that adopted this binding (`<playbook>@<repo>`), or null
+   * for a binding adopted by the label or review path. Null on bindings from
+   * before BB-164; a deps-prs binding with null keeps today's watch behaviour
+   * through the fallback in `bindingPlaybook`.
+   */
+  adoptedBy: string | null;
   threadId: string | null;
   parentBindingId: string | null;
   phase: string | null;
@@ -700,6 +714,7 @@ function rowToBinding(r: BindingRow): Binding {
     kind: String(r.kind) as BindingKind,
     playbook: String(r.playbook),
     playbookVersion: String(r.playbook_version),
+    adoptedBy: str("adopted_by"),
     threadId: str("thread_id"),
     parentBindingId: str("parent_binding_id"),
     phase: str("phase"),
@@ -762,6 +777,7 @@ const COLUMNS = {
   title: "title",
   playbook: "playbook",
   playbookVersion: "playbook_version",
+  adoptedBy: "adopted_by",
   threadId: "thread_id",
   parentBindingId: "parent_binding_id",
   phase: "phase",
@@ -850,7 +866,7 @@ function toColumn(value: unknown): unknown {
   return value;
 }
 
-export type NewBinding = Pick<Binding, "projectId" | "source" | "entityId" | "entityKey" | "url" | "title" | "kind" | "playbook" | "playbookVersion" | "parentBindingId" | "phase" | "stage">;
+export type NewBinding = Pick<Binding, "projectId" | "source" | "entityId" | "entityKey" | "url" | "title" | "kind" | "playbook" | "playbookVersion" | "parentBindingId" | "phase" | "stage"> & { adoptedBy?: string | null };
 
 // ---- escalations, actions, workers --------------------------------------------------------
 
@@ -1122,8 +1138,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const children = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE parent_binding_id = ? AND ended_at IS NULL ORDER BY created_at");
   const dueRequeue = db.prepare<[number], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL AND requeue_at IS NOT NULL AND requeue_at <= ? ORDER BY requeue_at");
   const insertBinding = db.prepare(
-    `INSERT INTO bindings (id, project_id, source, entity_id, entity_key, url, title, kind, playbook, playbook_version, parent_binding_id, phase, stage, created_at)
-     VALUES (@id, @project_id, @source, @entity_id, @entity_key, @url, @title, @kind, @playbook, @playbook_version, @parent_binding_id, @phase, @stage, @created_at)`,
+    `INSERT INTO bindings (id, project_id, source, entity_id, entity_key, url, title, kind, playbook, playbook_version, adopted_by, parent_binding_id, phase, stage, created_at)
+     VALUES (@id, @project_id, @source, @entity_id, @entity_key, @url, @title, @kind, @playbook, @playbook_version, @adopted_by, @parent_binding_id, @phase, @stage, @created_at)`,
   );
 
   const insertEscalation = db.prepare(
@@ -1713,6 +1729,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         kind: fields.kind,
         playbook: fields.playbook,
         playbook_version: fields.playbookVersion,
+        adopted_by: fields.adoptedBy ?? null,
         parent_binding_id: fields.parentBindingId,
         phase: fields.phase,
         stage: fields.stage,

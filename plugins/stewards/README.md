@@ -656,7 +656,14 @@ under `holders`:
       "team": "OPS",
       "autoAdopt": ["urgent"],
       "sentry": { "projects": [{ "org": "acme", "project": "web" }], "resolveOnDone": false },
-      "dependabot": "all"
+      "dependabot": "all",
+      "pulls": [
+        { "repo": "bitcomplete/bc-prod",
+          "match": { "title": "Update */bc-prod.yaml",
+                     "branch": "update-*-bc-prod-yaml-*",
+                     "paths": ["projects/*/bc-prod.yaml"] },
+          "playbook": "sync-prs" }
+      ]
     }
   },
   "holders": { "alice": ["ops", "projectSteward"] }
@@ -677,7 +684,8 @@ the Linear assignee, the GitHub author and the GitHub requested reviewer, with
 or without a `roles.json`, and a login that cannot be read adopts nothing and
 shows one problem line. A role definition is
 `{ k8sNamespaces, context?, team?, autoAdopt?, sentry?: { projects: [{ org,
-project }], resolveOnDone? }, dependabot?: [repo, …] | "all" }`; the fields
+project }], resolveOnDone? }, dependabot?: [repo, …] | "all", pulls?: [{ repo, match,
+playbook }] }`; the fields
 mean what they did in version 1. `k8sNamespaces` are watched with kubectl on
 that person's machine (their kubeconfig `context` when named); `team` is
 where their ops tickets are filed (the first of `linear.teams` by default,
@@ -699,6 +707,45 @@ lists the repos whose alerts that person watches, or `"all"` for every repo in
 `repos.json` not in `github.exclude`. `ops-watch.md` is read only when a role
 watches a namespace or a Sentry project.
 
+`pulls` (BB-164) declares pull requests the holder's server adopts by shape,
+under a playbook, with no label: each entry is `{ repo, match, playbook }`,
+where `match` names any of `title`, `branch`, `author` and `paths` and every
+one given must match. A field is a glob in the decide list's `*` (within a
+path segment) and `**` (across segments) dialect, so `title: "Update
+*/bc-prod.yaml"` matches the sync PRs the bc-prod-github-app opens. `paths`
+means every changed file matches one of its globs; it is checked only at
+adoption, on the full snapshot (GitHub lists the first 100 changed files, so a
+pull request with 100 or more files never matches a `paths` watch — fail
+closed). `title`, `branch` and `author` are checked whenever the plugin has
+them; the half-hourly sweep's list carries only the repo and author, so it is
+permissive there and the full snapshot decides. A watch with no `match.author`
+matches only a pull request authored by the role holder's own GitHub login;
+any other author must be named, as the synthesized Dependabot watch names the
+bot logins. The playbook must exist and be kind `pr`; it is read like any
+other playbook, so a missing one is a `check` problem and its bindings end
+`unconfigured` rather than falling back to a merge-capable playbook.
+
+Dependabot is expressed on the same matcher: `dependabot: "all"` or a list
+compiles into one synthesized watch per repo, with `match.author` set to the
+bot logins and playbook `deps-prs`, prepended to the role's declared watches
+(`DEPENDENCY_BOTS` stays the source of the bot list). Adoption is first match
+wins: the synthesized Dependabot watches, then the declared watches, then the
+labelled-author path, then the review path. So a watched pull request that
+later gains `bb-managed` stays with its watch, and a Dependabot pull request
+labelled by hand keeps `deps-prs`. The binding records the watch that adopted
+it (`adoptedBy`, `<playbook>@<repo>`); `bb stewards list` and the board show
+it, and it is what tells a watch binding from a label or review one. A
+Dependabot pull request adopted before this column existed (no `adoptedBy`)
+keeps today's behaviour through a fallback to the `deps-prs` playbook name.
+
+A watched pull request is laned from the decide list like any other: there is
+no per-watch lane override, and roles.json is not the decide list. Because a
+pull request matching no entry is the owner's, a project that wants its
+steward to merge watched pull requests adds a `decide: project` entry whose
+`paths` cover them; the playbook's merge step still escalates anything the
+guidance does not settle. A per-watch lane in roles.json would be a way for a
+role to widen its own gate, and is rejected for that reason.
+
 A version 1 `roles.json` (keyed by GitHub login, `projectSteward: true` plus
 an inline `ops`) keeps parsing: each login becomes one synthesized role named
 after the login, held by it alone, so nothing changes, and `bb stewards check`
@@ -711,8 +758,12 @@ watch".
 The project steward's server reports cross-server configuration problems: a
 watch nobody runs, a watch two holders run, and no or two project stewards.
 Version 2 adds an error for an unknown role name, a warning for a role no
-holder names, and an error for a holder's roles disagreeing on `context` or
-`team`. These are `check` and problem lines only: they never drop, merge or
+holder names, an error for a holder's roles disagreeing on `context` or
+`team`, and (BB-164) a `check` error for each pull watch on a repo that is not
+in `repos.json` or is in `github.exclude`, one whose playbook is missing or
+not kind `pr`, one whose globs do not parse, and two roles with holders that
+declare watches on the same repo (the only place two servers adopting the same
+pull request can be caught). These are `check` and problem lines only: they never drop, merge or
 reassign a binding, so a file with overlapping holders keeps running exactly
 what it ran before. A role whose credential is missing on a machine (no
 kubectl, no Sentry token) is that server's own `bb stewards check` line, not

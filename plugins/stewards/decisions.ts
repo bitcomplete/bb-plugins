@@ -88,13 +88,27 @@ export const SELF_WIDENING_PATHS: readonly string[] = [
 ];
 
 /** A glob with `*` (within a path segment) and `**` (across segments). */
-function globMatches(pattern: string, path: string): boolean {
+export function globMatches(pattern: string, path: string): boolean {
   const source = pattern
     .replace(/[.+^${}()|[\]\\]/gu, "\\$&")
     .replace(/\*\*/gu, "\u0000")
     .replace(/\*/gu, "[^/]*")
     .replace(/\u0000/gu, ".*");
   return new RegExp(`^${source}$`, "u").test(path);
+}
+
+/**
+ * Why a glob cannot be used, or null. The dialect is `*` and `**` and every
+ * other character literal, so the only bad globs are empty ones, control
+ * characters, and a backslash (which the dialect has no meaning for and a
+ * path never carries). Reused wherever a glob is written by a person, so the
+ * rules for a `pulls` watch are the decide list's own (BB-164).
+ */
+export function globError(pattern: string): string | null {
+  if (pattern.trim() === "") return "an empty glob";
+  if (/[\u0000-\u001f\u007f]/u.test(pattern)) return `${JSON.stringify(pattern)} contains a control character`;
+  if (pattern.includes("\\")) return `${JSON.stringify(pattern)} contains a backslash; the glob dialect is only * and **`;
+  return null;
 }
 
 /** Drop a leading repo directory (`bb-plugins/plugins/…` → `plugins/…`), for matching a repo-relative GitHub filename. */

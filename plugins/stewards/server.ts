@@ -20,6 +20,7 @@ import {
   DEFAULT_FOLLOW_THROUGH_MS,
   DEFAULT_LABEL,
   DEFAULT_PLAYBOOKS,
+  DEPENDENCY_BOTS,
   DEPS_ALERTS_PLAYBOOK,
   DEPS_PRS_PLAYBOOK,
   ESCALATION_KINDS,
@@ -43,11 +44,15 @@ import {
   playbookPath,
   playbookStates,
   projectStewardProblem,
+  pullWatchId,
+  pullWatchProblems,
   roleDepsTargets,
   roleK8sTargets,
   roleOpsTargets,
   roleOpsTeam,
   roleProblems,
+  rolePullWatches,
+  rolePulls,
   roleSentryTargets,
   roleUsesOps,
   roleWarnings,
@@ -60,10 +65,11 @@ import {
   type ModelSpec,
   type Playbook,
   type ProjectFile,
+  type PullWatch,
   type Role as StewardRole,
   type RolesFile,
 } from "./config.js";
-import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type BigDecision } from "./decisions.js";
+import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
@@ -872,6 +878,8 @@ type ProjectConfig = {
   depsAlerts: Playbook | null;
   /** The Dependabot pull request playbook, when it parses. */
   depsPrs: Playbook | null;
+  /** The playbooks a role's declared pull watches name, by name, when they parse (BB-164). */
+  watchPlaybooks: Map<string, Playbook>;
   /** GitHub repos from the project's repos.json, as owner/repo, less github.exclude. */
   repos: string[];
   /** Whether this server stewards the project: a local, per-project setting, off until switched on. */
@@ -902,8 +910,9 @@ function objectionLines(text: string): string[] {
 /** An objection compared for "the same objection": case and punctuation ignored. */
 const normObjection = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/gu, " ").trim();
 
-/** Authors whose pull requests the dependency watch adopts under deps-prs. */
-export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
+// BB-164 moved DEPENDENCY_BOTS into config.ts, where the synthesized watch is
+// built; re-exported here so existing callers and tests keep reading it.
+export { DEPENDENCY_BOTS };
 
 /**
  * Fixed choices on a `decide` need or an escalation: two to six short,
@@ -1469,7 +1478,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
-      const texts = await source.readFiles([...new Set([...names.values(), depsAlertsName, depsPrsName])].map(playbookPath));
+      // The playbooks a role's declared pull watches name (BB-164). They are
+      // read with the rest so one `.bb` read serves every playbook, and parsed
+      // into `watchPlaybooks` below.
+      const watchNames = new Set<string>();
+      for (const r of Object.values(roles?.roles ?? {})) for (const watch of rolePulls(r)) watchNames.add(watch.playbook);
+      const texts = await source.readFiles([...new Set([...names.values(), depsAlertsName, depsPrsName, ...watchNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       for (const [kind, name] of names) {
         const text = texts.get(playbookPath(name)) ?? null;
@@ -1517,6 +1531,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const depsAlerts = await loadOptional(depsAlertsName);
       const depsPrs = await loadOptional(depsPrsName);
 
+      /**
+       * A role's declared pull-watch playbooks (BB-164). A name that is
+       * already a kind or dependency playbook reuses it; a new one is parsed
+       * like any playbook, with a problem on failure and the last good copy
+       * kept. The check reports a watch whose playbook did not parse.
+       */
+      const watchPlaybooks = new Map<string, Playbook>();
+      if (roles !== null && watchNames.size > 0) {
+        const known = new Map<string, Playbook>();
+        for (const p of Object.values(playbooks)) if (p !== undefined) known.set(p.name, p);
+        if (depsAlerts !== null) known.set(depsAlerts.name, depsAlerts);
+        if (depsPrs !== null) known.set(depsPrs.name, depsPrs);
+        for (const name of watchNames) {
+          const reused = known.get(name);
+          if (reused !== undefined) {
+            watchPlaybooks.set(name, reused);
+            continue;
+          }
+          const text = texts.get(playbookPath(name)) ?? null;
+          const goodKey = `good/${projectId}/playbook/${name}`;
+          let result = text === null ? ({ ok: false, error: `${playbookPath(name)} does not exist` } as const) : parsePlaybook(text, name);
+          if (result.ok) {
+            watchPlaybooks.set(name, result.value);
+            await bb.storage.kv.set(goodKey, text!);
+            continue;
+          }
+          problems.push(result.error);
+          const last = await bb.storage.kv.get<string>(goodKey);
+          const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
+          if (lastParsed !== null && lastParsed.ok) {
+            watchPlaybooks.set(name, lastParsed.value);
+            problems.push(`the pull watch playbook ${name} keeps running under the last good version (${lastParsed.value.version}).`);
+          }
+        }
+      }
+
       let repos: string[] = [];
       try {
         const set = await source.repoSet();
@@ -1554,8 +1604,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // the missing project steward rather than only the "No role" line.
           problems.push(stewardProblem);
         }
+        // Every server reports its own pull watches' problems, not only the
+        // project steward: a watch on a repo the project does not lease, an
+        // unknown or non-pr playbook, a bad glob, or two held roles on one
+        // repo (BB-164).
+        problems.push(...pullWatchProblems(roles, repos, file.github.exclude, watchPlaybooks));
       }
-      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, depsAlerts, depsPrs, repos, enabled, problems, warnings, hints, loadedAt: now() };
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -1580,6 +1635,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           for (const playbook of Object.values(config.playbooks)) if (playbook !== null && playbook !== undefined) names.add(playbook.name);
           if (config.depsAlerts !== null) names.add(config.depsAlerts.name);
           if (config.depsPrs !== null) names.add(config.depsPrs.name);
+          for (const name of config.watchPlaybooks.keys()) names.add(name);
           const paths = ["AGENTS.md", ...[...names].map(playbookPath)];
           const files = await config.source.readFiles(paths);
           for (const path of paths) {
@@ -1669,16 +1725,47 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const playbookFor = (config: ProjectConfig, kind: BindingKind) => config.playbooks[kind] ?? null;
 
     /**
-     * The playbook a binding runs under. A Dependabot alert target uses the
-     * deps-alerts playbook; a pull request the dependency watch adopted uses
-     * deps-prs; everything else uses its kind's playbook.
+     * The watch that adopted a binding: the recorded `adoptedBy`, or, for a
+     * Dependabot pull request adopted before BB-164 added the column, the
+     * deps-prs playbook name (the fallback addition #2 asks for). Null means
+     * the label or review path adopted it.
      */
-    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId">): Playbook | null {
+    function adoptedByWatch(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "adoptedBy">): string | null {
+      if (b.adoptedBy !== null) return b.adoptedBy;
+      if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file)) return depsPrsPlaybookName(config.file);
+      return null;
+    }
+
+    /**
+     * The playbook a pull watch names, or null when it is not readable. A
+     * watch may name the project's own pr playbook; a name that is neither a
+     * loaded watch playbook nor that one is missing, not a fallback to a
+     * different playbook the watch did not ask for (BB-164).
+     */
+    function playbookForWatchName(config: ProjectConfig, name: string): Playbook | null {
+      let found: Playbook | null;
+      if (name === depsPrsPlaybookName(config.file)) found = config.depsPrs;
+      else {
+        found = config.watchPlaybooks.get(name) ?? null;
+        if (found === null) {
+          const pr = playbookFor(config, "pr");
+          found = pr !== null && pr.name === name ? pr : null;
+        }
+      }
+      return found !== null && found.kind === "pr" ? found : null;
+    }
+
+    /**
+     * The playbook a binding runs under. A Dependabot alert target uses the
+     * deps-alerts playbook; a pull request a watch adopted uses the playbook
+     * its watch named; everything else uses its kind's playbook.
+     */
+    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId" | "adoptedBy">): Playbook | null {
       if (b.kind === "ops") {
         const target = parseOpsTargetKey(b.entityId);
         if (target?.kind === "dependabot") return config.depsAlerts;
       }
-      if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file)) return config.depsPrs;
+      if (b.kind === "pr" && adoptedByWatch(config, b) !== null) return playbookForWatchName(config, b.playbook);
       return playbookFor(config, b.kind);
     }
 
@@ -2797,10 +2884,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!config.enabled) return;
       const playbook = bindingPlaybook(config, b);
       if (playbook === null) {
-        // A dependency bot's pull request runs under deps-prs only. With the
-        // playbook gone, the binding ends rather than falling back to a
-        // merge-capable playbook the ticket says must never merge.
-        if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file) && b.endedAt === null) await finishEnding(b, "unconfigured");
+        // A pull request a watch adopted runs under its watch's playbook only.
+        // With that playbook gone, the binding ends rather than falling back
+        // to a merge-capable playbook the watch says must never merge.
+        if (b.kind === "pr" && adoptedByWatch(config, b) !== null && b.endedAt === null) await finishEnding(b, "unconfigured");
         return;
       }
       if (b.source === "ops") {
@@ -2894,13 +2981,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const awaitingDeploy = deployTargets.length > 0 && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 
-      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file), owner: config.linearLogin });
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner: config.linearLogin });
       // A binding with no steward thread is still awaiting adoption: a first
       // wake lost to a transient read is retried on the next reconcile, as the
       // ops, deps and sentry paths already do (BB-92).
       let reason: WakeReason | null = force ?? (b.threadId === null ? "adopted" : null);
       if (life.kind === "stay-ended") {
-        const labelled = b.kind === "review" || b.playbook === depsPrsPlaybookName(config.file) || hasLabel(entity, config.file.label);
+        const labelled = b.kind === "review" || adoptedByWatch(config, b) !== null || hasLabel(entity, config.file.label);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
         return;
       }
@@ -3989,21 +4076,64 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const projectFor = (configs: ProjectConfig[], entity: Pick<EntitySnapshot, "source" | "unit">) =>
       configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null;
 
+    /** Whether one glob (or the bot logins on the synthesized watch) matches a value, ignoring case. */
+    function watchPatternMatches(pattern: string | string[], value: string): boolean {
+      const patterns = Array.isArray(pattern) ? pattern : [pattern];
+      return patterns.some((p) => globMatches(lc(p), lc(value)));
+    }
+
+    /**
+     * The first pull watch a pull request matches, or null (BB-164). The
+     * synthesized Dependabot watches come first, then the role's declared
+     * ones, so first match wins. A watch with no `match.author` matches only a
+     * pull request authored by the role holder's own GitHub login; any other
+     * author must be named. `title`, `branch` and `author` are checked when the
+     * caller has them (the full snapshot; the nightly list carries only repo
+     * and author); `paths` only on the full snapshot, where a pull request with
+     * 100 or more changed files never matches (fail closed: GitHub lists the
+     * first 100 only).
+     */
+    function matchPullWatch(config: ProjectConfig, e: { unit: string; title?: string | null; branch?: string | null; author: string | null; files?: string[] }): PullWatch | null {
+      for (const watch of rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file))) {
+        if (lc(watch.repo) !== lc(e.unit)) continue;
+        const m = watch.match;
+        if (m.title !== undefined && (e.title === null || e.title === undefined || !watchPatternMatches(m.title, e.title))) continue;
+        if (m.branch !== undefined && (e.branch === null || e.branch === undefined || !watchPatternMatches(m.branch, e.branch))) continue;
+        if (m.author !== undefined) {
+          if (e.author === null || !watchPatternMatches(m.author, e.author)) continue;
+        } else if (e.author === null || config.githubLogin === null || lc(e.author) !== lc(config.githubLogin)) continue;
+        if (m.paths !== undefined && e.files !== undefined) {
+          if (e.files.length === 0 || e.files.length >= 100) continue;
+          if (!e.files.every((f) => m.paths!.some((p) => globMatches(p, f)))) continue;
+        }
+        return watch;
+      }
+      return null;
+    }
+
+    /** The playbook a matched pull watch runs under, or null when it is not readable. */
+    function pullWatchPlaybook(config: ProjectConfig, watch: PullWatch): Playbook | null {
+      return playbookForWatchName(config, watch.playbook);
+    }
+
     /**
      * Which kind of binding an entity wants in this project, or null for none.
-     * `assignees` and `requestedReviewers` are absent on the nightly pass's
-     * list, which is permissive: `maybeAdopt` re-checks with the full snapshot.
+     * `assignees`, `requestedReviewers`, `title`, `branch` and `files` are
+     * absent on the nightly pass's list, which is permissive: `maybeAdopt`
+     * re-checks with the full snapshot. The pull watches run first, then the
+     * labelled-author path, then the review path (BB-164).
      *
      * Adoption follows one human-set owner per kind of work (BB-115): a ticket
      * is this server's when its Linear login is an assignee, a labelled pull
      * request when its GitHub login is the author, and a teammate's review only
-     * where its GitHub login is a requested reviewer. The rule is the same
-     * with or without a roles.json project steward; a login that cannot be read
-     * adopts nothing.
+     * where its GitHub login is a requested reviewer. A pull request matching a
+     * role's watch is adopted under that watch's playbook on that holder's
+     * server only, with no label. The rule is the same with or without a
+     * roles.json project steward; a login that cannot be read adopts nothing.
      */
     function adoptionKind(
       config: ProjectConfig,
-      e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string; assignees?: string[]; requestedReviewers?: string[] },
+      e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string; title?: string | null; branch?: string | null; files?: string[]; assignees?: string[]; requestedReviewers?: string[] },
       viewer: string | null,
     ): BindingKind | null {
       const labelled = e.labels.some((l) => lc(l) === lc(config.file.label));
@@ -4025,13 +4155,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (e.kind !== "pull") return null;
       // A login that cannot be read adopts nothing (BB-115, addendum 2).
       if (config.rolesUnreadable) return null;
-      // The dependency watch adopts the bot's version-update pull requests in
-      // the repos it watches, whether or not they are labelled. deps-prs
-      // reviews them and escalates for a human merge; it never merges. This
-      // runs before the labelled-author check so a bot PR a human labelled
-      // `bb-managed` keeps its deps-prs steward rather than being adopted
-      // nowhere: the label does not change the dependency watch's ownership.
-      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && roleDepsTargets(config.role, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
+      // A role's pull watches run before the label and review paths, first
+      // match wins: the synthesized Dependabot watch first, then the declared
+      // watches, so a bot PR a human labelled `bb-managed` keeps its watch's
+      // steward rather than being adopted nowhere (BB-164).
+      if (matchPullWatch(config, e) !== null) return "pr";
       // A labelled pull request is this server's own work only when its author
       // is this server's GitHub login; another author's is handled on the
       // author's server. An unlabelled pull request of my own falls through to
@@ -4073,10 +4201,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const config = projectFor(projects, entity);
       if (config === null) return null;
       if (store.byEntity(entity.source, entity.id) !== null) return null;
-      const kind = adoptionKind(config, { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [] }, entity.viewer);
+      const full = { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [], title: entity.title, branch: entity.pull?.head ?? null, files: entity.pull?.files };
+      const watch = matchPullWatch(config, { unit: entity.unit, title: entity.title, branch: entity.pull?.head ?? null, author: entity.author, files: entity.pull?.files });
+      const kind = adoptionKind(config, full, entity.viewer);
       if (kind === null) return null;
-      const depBot = kind === "pr" && entity.author !== null && DEPENDENCY_BOTS.has(lc(entity.author));
-      const playbook = (depBot ? config.depsPrs : null) ?? playbookFor(config, kind);
+      const playbook = watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind);
       if (playbook === null) return null;
       const parent = kind === "ticket" ? await managedAncestor(entity) : null;
       const { phase, stage } = phaseAndStage(playbook, entity.state);
@@ -4092,6 +4221,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           kind,
           playbook: playbook.name,
           playbookVersion: playbook.version,
+          adoptedBy: watch === null ? null : pullWatchId(watch),
           parentBindingId: parent?.id ?? null,
           phase,
           stage,
@@ -6159,7 +6289,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               title: b.title,
               kind: b.kind,
               phase: b.phase,
-              roles: roleMap.get(b.entityId) ?? [],
+              roles: rolesForBinding(roleMap, b),
               threadId: b.threadId,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
@@ -6258,7 +6388,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               phase: b.phase,
               // Ops bindings have no stage of their own; the page groups them as watching.
               stage: b.kind === "ops" ? "watch" : b.stage,
-              roles: roleMap.get(b.entityId) ?? [],
+              roles: rolesForBinding(roleMap, b),
               threadId: b.threadId,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
@@ -7988,6 +8118,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
     }
 
+    /**
+     * The roles a binding is attributed to: its target key (a namespace,
+     * Sentry project or Dependabot alert), or the pull watch that adopted it
+     * (BB-164).
+     */
+    const rolesForBinding = (roleMap: Map<string, string[]>, b: Binding): string[] => roleMap.get(b.entityId) ?? (b.adoptedBy === null ? [] : roleMap.get(b.adoptedBy)) ?? [];
+
     /** `rolesFor` names the role(s) whose definition owns a binding's target, for `bb stewards list` (BB-163). */
     function formatBindings(rows: Binding[], rolesFor?: (b: Binding) => string[]): string {
       if (rows.length === 0) return "No bindings.";
@@ -8009,7 +8146,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   ? `cannot read the target: ${sentry.error}`
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -8458,6 +8595,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       lines.push(`deps-alerts: ${config.depsAlerts === null ? `no playbook (${depsAlertsPlaybookName(config.file)}); the dependency watch is off` : `${config.depsAlerts.name}@${config.depsAlerts.version}`}`);
       lines.push(`deps-prs: ${config.depsPrs === null ? `no playbook (${depsPrsPlaybookName(config.file)}); Dependabot pull requests are not adopted` : `${config.depsPrs.name}@${config.depsPrs.version}`}`);
+      // The pull watches this server runs, synthesized Dependabot first, so
+      // `check` shows the shape and `list` shows which one adopted a binding
+      // (BB-164).
+      const watches = rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file));
+      if (watches.length > 0) lines.push(`pulls: ${watches.map((w) => pullWatchId(w)).join(", ")}`);
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
         try {
@@ -8870,7 +9012,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // Each binding is attributed to the role whose definition owns its
               // target, so a holder of several roles reads which role each is.
               const roleMaps = new Map(configs.map((c) => [c.projectId, bindingRoles(c.roles, c.githubLogin === null ? null : lc(c.githubLogin), c.repos)]));
-              const rolesFor = (b: Binding): string[] => roleMaps.get(b.projectId)?.get(b.entityId) ?? [];
+              const rolesFor = (b: Binding): string[] => rolesForBinding(roleMaps.get(b.projectId) ?? new Map(), b);
               const lessons = projectId === undefined ? [] : store.lessons(projectId).filter((l) => l.tier !== "retired");
               const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
               return { exitCode: 0, stdout: [...offLine, ...roleLine, formatBindings(rows, rolesFor), ...lessonLines].join("\n") };
@@ -8957,7 +9099,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
               const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
-              const lines = [formatBindings([b], (x) => roleMap.get(x.entityId) ?? []), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
+              const lines = [formatBindings([b], (x) => rolesForBinding(roleMap, x)), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
               if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
               if (b.kind !== "ops") {
                 const conflicts = conflictsOf(b, store.open(b.projectId));
