@@ -1755,13 +1755,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       if (waiting.length === 0) return;
       let starts: Array<{ createdAt: number; data: unknown }>;
       try {
-        starts = (await bb.sdk.threads.events.list({ threadId, types: ["client/turn/start"], order: "desc", limit: "10" })) as Array<{ createdAt: number; data: unknown }>;
+        starts = (await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "10" })) as Array<{ createdAt: number; data: unknown }>;
       } catch (error) {
         bb.log.warn(`could not read thread ${threadId}'s turns to check its Linear replies: ${errorMessage(error)}`);
         return;
       }
       for (const [session, r] of waiting) {
-        const handled = starts.some((e) => e.createdAt >= r.handedAt! && JSON.stringify(e.data ?? {}).includes(session));
+        const handled = starts.some((e) => e.createdAt >= r.handedAt! && JSON.stringify((e.data as { input?: unknown } | null | undefined)?.input ?? {}).includes(session));
         if (!handled) continue;
         bb.log.warn(`thread ${threadId} ended the turn that handled Linear agent session ${session} without replying; answering for it`);
         const url = threadUrl(r.projectId, threadId);

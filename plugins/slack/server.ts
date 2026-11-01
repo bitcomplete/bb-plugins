@@ -1671,9 +1671,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     /**
      * The backstop for "one reply per message": a bb turn that handled a wake
-     * ended without `slack_reply`. The turn that handled it is the one whose
-     * input named the session, or, for a steer, the turn the wake joined
-     * (`steeredAt`). The title is pushed from the bb thread's own title here.
+     * ended without `slack_reply`. A wake is handled once its turn has run: a
+     * session whose wake is still waiting in the thread's queued-message list
+     * has not been handled yet, and a steer (`steeredAt`) is handled by the
+     * turn it joined. The title is pushed from the bb thread's own title here.
      */
     async function onThreadIdle(threadId: string): Promise<void> {
       const idleAt = deps.now();
@@ -1681,31 +1682,54 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const mine = [...sessions].filter(([, r]) => r.threadId === threadId);
       const waiting = mine.filter(([, r]) => !taggedAnswered(r));
       // An untagged wake does not owe a reply, so a silent turn is the expected
-      // outcome and never clears the thinking status; clear it for those
-      // sessions, but only once the turn that handled the wake has run, so an
+      // outcome; clear the thinking status for it once its turn has run, so an
       // older turn's idle does not clear the indicator of a queued wake.
       const untaggedWaiting = mine.filter(([, r]) => r.untagged > 0);
       if (waiting.length === 0 && untaggedWaiting.length === 0) {
         await clearSteered(threadId, idleAt);
         return;
       }
-      let starts: Array<{ createdAt: number; data: unknown }>;
+      // A wake whose row is still in the thread's queue has not had its turn
+      // yet, so this idle belongs to an older turn and must leave it alone.
+      // Read the queue, not the turn events: bb records a turn request, not the
+      // session it came from, so an event list cannot say which wake it handled.
+      let queuedIds: Set<string>;
       try {
-        starts = (await bb.sdk.threads.events.list({ threadId, types: ["client/turn/start"], order: "desc", limit: "10" })) as Array<{ createdAt: number; data: unknown }>;
+        const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+        queuedIds = new Set(queued.map((row) => row.id));
       } catch (error) {
-        bb.log.warn(`could not read thread ${threadId}'s turns to check its Slack replies: ${errorMessage(error)}`);
+        bb.log.warn(`could not read thread ${threadId}'s queued messages to check its Slack replies: ${errorMessage(error)}`);
         return;
       }
-      // A wake whose dispatch was a join was consumed by the turn that just
-      // ended, whichever turn that was; `steeredAt` says so, because the turn's
-      // own input may not name the session.
-      const handled = (session: string, r: SessionRecord) => r.steeredAt !== null || starts.some((e) => e.createdAt >= (r.handedAt ?? 0) && JSON.stringify(e.data ?? {}).includes(session));
+      const stillQueued = (r: SessionRecord) => r.wakes.some((w) => w.state === "queued" && w.queuedMessageId !== "" && queuedIds.has(w.queuedMessageId));
+      // A steer joined the turn that just ended, whichever turn that was;
+      // `steeredAt` says so even when the turn's own input never named it. A
+      // steer or wake newer than this idle belongs to the next one, so this
+      // idle must not answer for it either.
+      const handled = (r: SessionRecord) => {
+        if (r.steeredAt !== null) return r.steeredAt <= idleAt;
+        if (r.handedAt !== null && r.handedAt > idleAt) return false;
+        return !stillQueued(r);
+      };
       for (const [session, r] of untaggedWaiting) {
-        if (!handled(session, r)) continue;
+        if (!handled(r)) continue;
         void hooks.status(session, "", checkSignal()).catch(() => undefined);
+        if (stillQueued(r)) {
+          // A steered wake handled this session, but an untagged wake's row is
+          // still queued: drop only the one this idle answered.
+          markAnswered(session, "untagged");
+        } else {
+          // Every delivered untagged wake has been handled once its row is
+          // gone, so drop the whole count, or a later idle would clear it again.
+          const current = sessions.get(session);
+          if (current !== undefined && current.untagged > 0) {
+            sessions.set(session, { ...current, untagged: 0 });
+            void saveSessions();
+          }
+        }
       }
       for (const [session, r] of waiting) {
-        if (!handled(session, r)) continue;
+        if (!handled(r)) continue;
         bb.log.warn(`thread ${threadId} ended the turn that handled Slack session ${sessionLogId(session)} without replying; answering for it`);
         await backstop(session, "The bb thread finished its turn without sending a reply here. Send another message to try again.", "tagged");
       }

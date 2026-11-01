@@ -224,6 +224,8 @@ async function setup(
     allEnvironments?: TestEnvironment[];
     spawn?: () => unknown;
     send?: (args: { threadId: string; input: Array<{ type: string; text?: string }>; pluginSubmission?: unknown }) => unknown;
+    /** The thread's live queued rows; `threads.queuedMessages.list` returns them. */
+    queued?: Array<{ id: string }>;
     /** What a `threads.queuedMessages.update` returns; a throw simulates a row that moved on. */
     updateQueued?: (args: { threadId: string; queuedMessageId: string; expectedUpdatedAt: number; input: Array<{ type: string; text?: string }> }) => unknown;
     /** What a `threads.queuedMessages.delete` returns; a throw simulates a row that moved on. */
@@ -233,7 +235,6 @@ async function setup(
     get?: (args: { threadId: string }) => unknown;
     /** What a `threads.archive` returns; a throw simulates a failed archive. */
     archive?: (args: { threadId: string }) => unknown;
-    turns?: Array<{ createdAt: number; data: unknown }>;
   } = {},
 ) {
   const hooks = options.hooks ?? fakeHooks();
@@ -280,12 +281,12 @@ async function setup(
           return options.send?.(args) ?? { delivery: "sent" };
         },
         queuedMessages: {
+          list: async () => options.queued ?? [],
           update: async (args: { threadId: string; queuedMessageId: string; expectedUpdatedAt: number; input: Array<{ type: string; text?: string }> }) => options.updateQueued?.(args) ?? { id: args.queuedMessageId, updatedAt: args.expectedUpdatedAt + 1 },
           delete: async (args: { threadId: string; queuedMessageId: string }) => options.deleteQueued?.(args) ?? { ok: true },
         },
         get: async (args: { threadId: string }) => options.get?.(args) ?? { title: "Build BB-38", titleFallback: null },
         archive: async (args: { threadId: string }) => options.archive?.(args) ?? { ok: true },
-        events: { list: async () => options.turns ?? [] },
       },
     },
   });
@@ -1444,7 +1445,7 @@ describe("Slack plugin", () => {
   });
 
   it("logs a backstop reply that was shown only to the asker", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     s.hooks.state.message = () => Response.json({ ok: true, ephemeral: true, reason: "channel-restricted" });
     s.hooks.last().send(s.hooks.session());
     await tick();
@@ -1490,7 +1491,7 @@ describe("Slack plugin", () => {
   });
 
   it("posts no backstop after an ack", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     s.hooks.last().send(s.hooks.session());
     await tick();
     await s.tool("slack_ack", {}, { threadId: "thr-1" });
@@ -1556,7 +1557,7 @@ describe("Slack plugin", () => {
   });
 
   it("answers for a turn that ended without a reply, and pushes the bb thread's title", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     s.hooks.last().send(s.hooks.session());
     await tick();
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
@@ -1569,7 +1570,7 @@ describe("Slack plugin", () => {
   it("does not post a backstop for an untagged wake whose turn ends without a reply", async () => {
     // A turn that names the session would be caught by the backstop for a
     // tagged wake; an untagged one is not counted, so it must not be.
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     s.hooks.last().send(
       s.hooks.session({
         session: "C0123:1712345678.901234",
@@ -1624,7 +1625,7 @@ describe("Slack plugin", () => {
   it("still posts a backstop for a tagged wake, and a missing tagged field counts as tagged", async () => {
     // `session()` sends no `tagged` field at all: the schema defaults it to
     // true, exactly as it does for an older service.
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     s.hooks.last().send(s.hooks.session());
     await tick();
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
@@ -1639,7 +1640,6 @@ describe("Slack plugin", () => {
     // dispatch. The turn's one reply covers both Slack messages.
     const s = await live({
       sendAttempt: "join-turn",
-      turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }],
     });
     s.hooks.last().send(s.hooks.session());
     await tick();
@@ -1688,7 +1688,6 @@ describe("Slack plugin", () => {
   it("posts exactly one backstop when a turn ends silent after a steer", async () => {
     const s = await live({
       sendAttempt: "join-turn",
-      turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }],
     });
     s.hooks.last().send(s.hooks.session());
     await tick();
@@ -1735,7 +1734,7 @@ describe("Slack plugin", () => {
     // drain the row joins a turn started by something other than this wake, so
     // that turn's input never names the session; `steeredAt` is what tells the
     // backstop the turn handled the wake.
-    const s = await live({ turns: [] });
+    const s = await live();
     s.hooks.last().send(s.hooks.session());
     await tick();
     s.hooks.last().send(s.hooks.session({ comment: { text: "wait", untrusted: false } }));
@@ -2009,7 +2008,7 @@ describe("Slack plugin", () => {
   });
 
   it("does not let an untagged hold prompt consume a tagged wake's reply slot", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     // A tagged owner wake, unanswered.
     s.hooks.last().send(s.hooks.session({ session: "C0123:1712345678.901234", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
     await tick();
@@ -2102,35 +2101,105 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("does not answer a turn that did not handle the wake", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_000, data: { initiator: "client" } }] });
-    s.hooks.last().send(s.hooks.session());
+  it("leaves a wake alone while its queued row is still in the thread's queue", async () => {
+    // The wake's row is still queued: its turn has not started, so an older
+    // turn's idle must not answer for it.
+    const s = await live({ queued: [{ id: "q-1" }], send: () => ({ delivery: "queued", queuedMessage: { id: "q-1", updatedAt: 5 } }) });
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
     await tick();
+    s.hooks.last().send(s.hooks.session({ ts: "1.2", comment: { text: "also the docs", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, { wakes: Array<{ state: string; queuedMessageId: string }> }>;
+    expect(stored["D0123:1712345678.901234"]!.wakes.at(-1)).toMatchObject({ state: "queued", queuedMessageId: "q-1" });
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
     expect(s.hooks.messages).toEqual([]);
     await s.stop();
   });
 
-  it("clears an untagged wake's thinking status only after the turn that handled it has run", async () => {
-    // The wake's own turn has not started: an older turn's idle must not clear
-    // the indicator just set for the queued wake.
-    const queued = await live({ turns: [{ createdAt: 999_999_999_999, data: { request: { params: { input: [{ type: "text", text: "session C0123:1.2" }] } } } }] });
-    queued.hooks.last().send(queued.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+  it("leaves an untagged wake's status alone while its queued row is still in the thread's queue", async () => {
+    // The untagged wake's row is still queued, so its turn has not started and
+    // an older turn's idle must not clear the indicator it set.
+    const s = await live({ queued: [{ id: "q-1" }], send: () => ({ delivery: "queued", queuedMessage: { id: "q-1", updatedAt: 5 } }) });
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
     await tick();
-    await queued.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    s.hooks.last().send(s.hooks.session({ ts: "1.2", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
     await tick();
-    expect(queued.hooks.statuses.map((s) => s.body.status)).not.toContain("");
-    await queued.stop();
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, { wakes: Array<{ state: string; queuedMessageId: string }>; untagged: number }>;
+    expect(stored["D0123:1712345678.901234"]!.wakes.at(-1)).toMatchObject({ state: "queued", queuedMessageId: "q-1" });
+    expect(stored["D0123:1712345678.901234"]!.untagged).toBe(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.statuses.map((x) => x.body.status)).not.toContain("");
+    const after = (await s.bb.storage.kv.get("sessions")) as Record<string, { untagged: number }>;
+    expect(after["D0123:1712345678.901234"]!.untagged).toBe(1);
+    await s.stop();
+  });
 
-    // The silent untagged turn ran and ended: the indicator is cleared.
-    const done = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1.2" }] } } } }] });
-    done.hooks.last().send(done.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+  it("clears a silent untagged turn's status and its untagged count on idle", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
     await tick();
-    await done.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    const before = (await s.bb.storage.kv.get("sessions")) as Record<string, { untagged: number }>;
+    expect(before["C0123:1.2"]!.untagged).toBe(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
-    expect(done.hooks.statuses.map((s) => s.body.status)).toContain("");
-    await done.stop();
+    expect(s.hooks.statuses.map((x) => x.body.status)).toContain("");
+    expect(s.hooks.messages).toEqual([]);
+    const after = (await s.bb.storage.kv.get("sessions")) as Record<string, { untagged: number }>;
+    expect(after["C0123:1.2"]!.untagged).toBe(0);
+    await s.stop();
+  });
+
+  it("clears the untagged count to 0 when a turn handles two untagged wakes", async () => {
+    // The first untagged wake spawns the thread; the second steers into the
+    // running turn, so both are handled by the one turn that ends here.
+    const s = await live({ sendAttempt: "join-turn" });
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "and the third one?", untrusted: false } }));
+    await tick();
+    const before = (await s.bb.storage.kv.get("sessions")) as Record<string, { untagged: number }>;
+    expect(before["C0123:1.2"]!.untagged).toBe(2);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    const after = (await s.bb.storage.kv.get("sessions")) as Record<string, { untagged: number }>;
+    expect(after["C0123:1.2"]!.untagged).toBe(0);
+    await s.stop();
+  });
+
+  it("does not answer a wake handed to the thread after the idle fired", async () => {
+    let releaseTitle!: () => void;
+    const titleGate = new Promise<void>((resolve) => { releaseTitle = resolve; });
+    // The idle blocks reading the title before it reads sessions, so a wake can
+    // be handed to the thread in that window.
+    const s = await live({ get: async () => { await titleGate; return { title: "Build BB-38", titleFallback: null }; } });
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    s.advance(1000);
+    s.hooks.last().send(s.hooks.session({ ts: "1.2", comment: { text: "and the docs", untrusted: false } }));
+    await tick();
+    releaseTitle();
+    await tick();
+    // This idle belongs to the older turn, so it does not answer for the newer wake.
+    expect(s.hooks.messages).toEqual([]);
+    await s.stop();
+  });
+
+  it("posts the backstop for a silent tagged turn that was not steered", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
+    await s.stop();
   });
 
   it("runs the thread in the project's checkout on its connected machine when it has no environment there", async () => {
@@ -2328,7 +2397,7 @@ describe("Slack plugin", () => {
   });
 
   it("greets on an assistant pane open without spawning a thread, a status, or a backstop", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     s.hooks.last().send(s.hooks.session({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
     await tick();
     expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
@@ -2345,7 +2414,7 @@ describe("Slack plugin", () => {
   });
 
   it("answers a pane-open wake on a conversation that already has a thread, so a turn's idle cannot trip the backstop", async () => {
-    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    const s = await live();
     // The first message maps the session to thr-1, and its turn replies.
     s.hooks.last().send(s.hooks.session());
     await tick();
