@@ -1959,20 +1959,23 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("flags only the projects with no checkout or environment on a connected machine", async () => {
-    const s = await live({ sources: [] });
+  it("counts Personal as having a machine on a connected machine, but not a repo project with no checkout or environment", async () => {
+    const s = await live({ environments: [], sources: [] });
     const status = (await s.harness.callRpc("status")) as { projects: Array<{ id: string; name: string; kind: string; hasMachine: boolean }> };
     expect(status.projects).toEqual([
-      { id: "prj-1", name: "Project One", kind: "standard", hasMachine: true },
-      { id: "prj-2", name: "Personal", kind: "personal", hasMachine: false },
+      { id: "prj-1", name: "Project One", kind: "standard", hasMachine: false },
+      { id: "prj-2", name: "Personal", kind: "personal", hasMachine: true },
     ]);
     await s.stop();
   });
 
-  it("flags every project when no machine is connected", async () => {
+  it("flags every project, Personal included, when no machine is connected", async () => {
     const s = await live({ environments: [], sources: [], hosts: [{ id: "host_off", status: "disconnected" }] });
-    const status = (await s.harness.callRpc("status")) as { projects: Array<{ hasMachine: boolean }> };
-    expect(status.projects.every((project) => !project.hasMachine)).toBe(true);
+    const status = (await s.harness.callRpc("status")) as { projects: Array<{ id: string; name: string; kind: string; hasMachine: boolean }> };
+    expect(status.projects).toEqual([
+      { id: "prj-1", name: "Project One", kind: "standard", hasMachine: false },
+      { id: "prj-2", name: "Personal", kind: "personal", hasMachine: false },
+    ]);
     await s.stop();
   });
 
