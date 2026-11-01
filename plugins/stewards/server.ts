@@ -7504,13 +7504,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
             const resolutionKind = input.resolution ?? (forwarding.choices.length > 0 ? "choice" : "text");
+            // A forwarded approval is the user's to decide exactly as
+            // `approval: me` is: file the page's `approve-spec` need and keep
+            // the escalation open, linked to it, instead of a free-text
+            // question. A forwarded decision stays a question. Computed here,
+            // before the await below, so the escalation cannot be resolved in
+            // between and leave the need or question open, and before the
+            // credential refusal so an approval is not mistaken for a
+            // credential ask just because its question names one.
+            const prToUser = route === "me" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
+            const approvalToUser = route === "me" && forwarding.kind === "approval" && !prToUser;
             // BB-176: a credential always reaches the user through bb's secure
             // form. A forward that names a credential variable is never a
             // `done`/`text` item, whatever the ticket or spec says. The error
             // names the resolution and its fields and never repeats the
             // question or context, so no secret is echoed. Refused before any
             // state changes, so a refused forward is not half-applied.
-            if (route === "me" && (resolutionKind === "done" || resolutionKind === "text") && namesCredential(forwarding)) {
+            if (route === "me" && !approvalToUser && !prToUser && (resolutionKind === "done" || resolutionKind === "text") && namesCredential(forwarding)) {
               return toolError(
                 new Error(
                   'A credential must be forwarded with resolution: "secret", naming `variable` and `purpose` and either `writeEnv`/`worker` or `setting`, so bb\'s secure form takes the value. `done` and `text` are refused for it.',
@@ -7522,14 +7532,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // originator can be answered directly (BB-30).
             store.addHop(forwarding.id, { threadId, bindingId: target.id, rewording: recommendation });
             store.reroute(forwarding.id, route, recommendation);
-            // A forwarded approval is the user's to decide exactly as
-            // `approval: me` is: file the page's `approve-spec` need and keep
-            // the escalation open, linked to it, instead of a free-text
-            // question. A forwarded decision stays a question. Made before the
-            // await below, so the escalation cannot be resolved in between and
-            // leave the need or question open.
-            const prToUser = route === "me" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
-            const approvalToUser = route === "me" && forwarding.kind === "approval" && !prToUser;
             if (route === "me" && !approvalToUser && !prToUser && input.resolution === undefined) {
               return toolError(new Error("Forwarding to the user needs a resolution: choice (with choices), text, approve-decline, secret or done. It is what the page's ask looks like; the plugin assigns the route, but the human boundary is yours to describe."));
             }

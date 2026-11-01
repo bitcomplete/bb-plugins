@@ -5087,6 +5087,21 @@ describe("needs you items", () => {
     expect(asSecret.error).toBe(false);
   });
 
+  it("does not mistake an approval whose question names a credential for a credential ask (BB-176)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const project = t.spawns[0]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    // A spec approval that names a credential variable in its question is
+    // still the user's Approve/Decline item, not a credential to forward as
+    // `secret`.
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the plan that seals VOICE_TRANSCRIPTION_API_KEY.", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
+    const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, project);
+    expect(out.error).toBe(false);
+    expect(out.text).toMatch(/approve-spec item/u);
+  });
+
   it("ask and forward require a resolution (BB-30)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
