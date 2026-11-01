@@ -313,17 +313,28 @@ describe("the sidebar-footer toggle (BB-45)", () => {
   type UiPrefEntry = { value: string; revision: number };
   type SetArgs = { key: string; value: string; expectedRevision: number };
 
-  /** A `uiPreferences.list()` answer with just the one preference the toggle reads. */
-  const listed = (entry: UiPrefEntry | null) => ({ preferences: entry === null ? {} : { "sidebar.threadListProvider": entry } }) as never;
+  /** A `uiPreferences.list()` answer with the two preferences the toggle reads. */
+  const listed = (thread: UiPrefEntry | null, navigation: UiPrefEntry | null) =>
+    ({ preferences: { ...(thread === null ? {} : { "sidebar.threadListProvider": thread }), ...(navigation === null ? {} : { "sidebar.navigationProvider": navigation }) } }) as never;
 
-  const renderToggle = async (options: { entry: UiPrefEntry | null; set: (args: SetArgs) => Promise<unknown> }) => {
+  const renderToggle = async (options: { thread: UiPrefEntry | null; navigation?: UiPrefEntry | null; stored?: string | null; set: (args: SetArgs) => Promise<unknown> }) => {
     const captured = await loadApp();
     const item = captured.experimentalSidebarFooterItems[0]!;
     if (item.kind !== "disclosure") throw new Error("the sidebar footer item is not a disclosure");
-    const list = vi.fn(async () => listed(options.entry));
+    const list = vi.fn(async () => listed(options.thread, options.navigation ?? null));
     const set = vi.fn(options.set);
-    const slot = renderSlot({ component: item.component }, { dismiss: () => {} }, { pluginId: "stewards", sdk: { system: { uiPreferences: { list, set } } } as never });
-    return { slot, set };
+    let stored: string | null = options.stored ?? null;
+    const setRestore = vi.fn(async ({ value }: { value: string }) => {
+      stored = value;
+      return { ok: true };
+    });
+    const getRestore = vi.fn(async () => ({ value: stored }));
+    const slot = renderSlot({ component: item.component }, { dismiss: () => {} }, {
+      pluginId: "stewards",
+      sdk: { system: { uiPreferences: { list, set } } } as never,
+      rpc: { stewardsNavigationRestore: getRestore, stewardsSetNavigationRestore: setRestore } as never,
+    });
+    return { slot, set, setRestore, getRestore };
   };
 
   const echo = async (args: SetArgs) => ({ key: args.key, value: args.value, revision: args.expectedRevision + 1 });
@@ -335,45 +346,75 @@ describe("the sidebar-footer toggle (BB-45)", () => {
   });
 
   it("shows the switch off for bb's list and on for the stewards list", async () => {
-    const off = await renderToggle({ entry: { value: "thread-list/thread-list", revision: 7 }, set: echo });
+    const off = await renderToggle({ thread: { value: "thread-list/thread-list", revision: 7 }, navigation: { value: "navigation/rail", revision: 2 }, set: echo });
     const offSwitch = await waitFor(() => off.slot.getByRole("switch", { name: "Stewards sidebar" }));
     expect(offSwitch.getAttribute("aria-checked")).toBe("false");
     off.slot.lifecycle.unmount();
 
-    const on = await renderToggle({ entry: { value: "stewards/sidebar", revision: 7 }, set: echo });
+    const on = await renderToggle({ thread: { value: "stewards/sidebar", revision: 7 }, navigation: { value: "stewards/navigation", revision: 2 }, set: echo });
     const onSwitch = await waitFor(() => on.slot.getByRole("switch", { name: "Stewards sidebar" }));
     expect(onSwitch.getAttribute("aria-checked")).toBe("true");
     on.slot.lifecycle.unmount();
   });
 
   it("reads an unpinned provider as on, the effective stewards list", async () => {
-    for (const entry of [null, { value: "__automatic__", revision: 0 }]) {
-      const { slot } = await renderToggle({ entry, set: echo });
+    for (const thread of [null, { value: "__automatic__", revision: 0 }]) {
+      const { slot } = await renderToggle({ thread, set: echo });
       const toggle = await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" }));
       expect(toggle.getAttribute("aria-checked")).toBe("true");
       slot.lifecycle.unmount();
     }
   });
 
-  it("turns the stewards list on with the stewards list id and the listed revision", async () => {
-    const { slot, set } = await renderToggle({ entry: { value: "thread-list/thread-list", revision: 7 }, set: echo });
+  it("turns the stewards list on, writing both providers and remembering the navigation", async () => {
+    const { slot, set, setRestore } = await renderToggle({ thread: { value: "thread-list/thread-list", revision: 7 }, navigation: { value: "navigation/top-list", revision: 5 }, set: echo });
     fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
-    await waitFor(() => expect(set).toHaveBeenCalledTimes(1));
-    expect(set.mock.calls[0]![0]).toEqual({ key: "sidebar.threadListProvider", value: "stewards/sidebar", expectedRevision: 7 });
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    expect(setRestore).toHaveBeenCalledWith({ value: "navigation/top-list" });
+    expect(set.mock.calls.map(([args]) => args)).toEqual([
+      { key: "sidebar.threadListProvider", value: "stewards/sidebar", expectedRevision: 7 },
+      { key: "sidebar.navigationProvider", value: "stewards/navigation", expectedRevision: 5 },
+    ]);
     await waitFor(() => expect(slot.getByRole("switch", { name: "Stewards sidebar" }).getAttribute("aria-checked")).toBe("true"));
     slot.lifecycle.unmount();
   });
 
-  it("turns the stewards list off by setting bb's own list", async () => {
-    const { slot, set } = await renderToggle({ entry: { value: "stewards/sidebar", revision: 3 }, set: echo });
+  it("keeps the remembered navigation when the navigation already reads as the stewards one", async () => {
+    const { slot, set, setRestore, getRestore } = await renderToggle({ thread: { value: "thread-list/thread-list", revision: 7 }, navigation: { value: "stewards/navigation", revision: 5 }, stored: "navigation/top-list", set: echo });
     fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
-    await waitFor(() => expect(set).toHaveBeenCalledTimes(1));
-    expect(set.mock.calls[0]![0]).toEqual({ key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 3 });
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    // The list was turned off in Settings with the navigation left on Stewards:
+    // the real previous value is not overwritten.
+    expect(setRestore).not.toHaveBeenCalled();
+    fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(4));
+    expect(getRestore).toHaveBeenCalled();
+    expect(set.mock.calls[3]![0]).toEqual({ key: "sidebar.navigationProvider", value: "navigation/top-list", expectedRevision: 6 });
+    slot.lifecycle.unmount();
+  });
+
+  it("turns the stewards list off and restores the remembered navigation", async () => {
+    const { slot, set, getRestore } = await renderToggle({ thread: { value: "stewards/sidebar", revision: 3 }, navigation: { value: "stewards/navigation", revision: 8 }, stored: "navigation/top-list", set: echo });
+    fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    expect(getRestore).toHaveBeenCalled();
+    expect(set.mock.calls.map(([args]) => args)).toEqual([
+      { key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 3 },
+      { key: "sidebar.navigationProvider", value: "navigation/top-list", expectedRevision: 8 },
+    ]);
     await waitFor(() => expect(slot.getByRole("switch", { name: "Stewards sidebar" }).getAttribute("aria-checked")).toBe("false"));
     slot.lifecycle.unmount();
   });
 
-  it("re-lists and retries once when the set hits a revision conflict", async () => {
+  it("turns the stewards list off with nothing stored, restoring bb's rail", async () => {
+    const { slot, set } = await renderToggle({ thread: { value: "stewards/sidebar", revision: 3 }, navigation: { value: "stewards/navigation", revision: 8 }, set: echo });
+    fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    expect(set.mock.calls[1]![0]).toEqual({ key: "sidebar.navigationProvider", value: "navigation/rail", expectedRevision: 8 });
+    slot.lifecycle.unmount();
+  });
+
+  it("re-lists and retries once when the second write hits a revision conflict", async () => {
     let sets = 0;
     let lists = 0;
     const captured = await loadApp();
@@ -386,22 +427,24 @@ describe("the sidebar-footer toggle (BB-45)", () => {
           uiPreferences: {
             list: async () => {
               lists += 1;
-              return listed({ value: "thread-list/thread-list", revision: lists === 1 ? 7 : 9 });
+              return listed({ value: "thread-list/thread-list", revision: 7 }, { value: "navigation/rail", revision: lists === 1 ? 5 : 9 });
             },
             set: async (args: SetArgs) => {
               sets += 1;
-              if (sets === 1) throw Object.assign(new Error("revision conflict"), { status: 409 });
+              if (sets === 2) throw Object.assign(new Error("revision conflict"), { status: 409 });
               return { key: args.key, value: args.value, revision: args.expectedRevision + 1 };
             },
           },
         },
       } as never,
+      rpc: { stewardsNavigationRestore: async () => ({ value: null }), stewardsSetNavigationRestore: async () => ({ ok: true }) } as never,
     });
     fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
-    await waitFor(() => expect(sets).toBe(2));
+    await waitFor(() => expect(sets).toBe(3));
     expect(slot.inspection.sdkCalls.filter((c) => c.method === "system.uiPreferences.set")).toEqual([
       { method: "system.uiPreferences.set", args: [{ key: "sidebar.threadListProvider", value: "stewards/sidebar", expectedRevision: 7 }] },
-      { method: "system.uiPreferences.set", args: [{ key: "sidebar.threadListProvider", value: "stewards/sidebar", expectedRevision: 9 }] },
+      { method: "system.uiPreferences.set", args: [{ key: "sidebar.navigationProvider", value: "stewards/navigation", expectedRevision: 5 }] },
+      { method: "system.uiPreferences.set", args: [{ key: "sidebar.navigationProvider", value: "stewards/navigation", expectedRevision: 9 }] },
     ]);
     expect(lists).toBe(2);
     slot.lifecycle.unmount();

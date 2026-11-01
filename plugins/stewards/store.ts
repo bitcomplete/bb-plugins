@@ -480,7 +480,17 @@ export const ACTOR_MIGRATIONS = [
     WHERE CASE WHEN json_valid(status) THEN json_extract(status, '$.actor') END = 'me'`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS];
+// BB-184: one string per server, for the footer toggle's remembered navigation
+// provider. The key/value shape leaves room for the next server-level
+// preference without another migration.
+export const SERVER_SETTINGS_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS server_settings (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL
+   )`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -2346,6 +2356,18 @@ export function createStore(db: Database.Database, now: () => number, options: S
         .prepare<[], { project_id: string }>("SELECT project_id FROM project_stewards UNION SELECT project_id FROM bindings")
         .all()
         .map((r) => r.project_id);
+    },
+
+    // the server's own string settings (BB-184): the footer toggle remembers
+    // the navigation provider it replaced, keyed per server.
+    /** One server setting, or null when it was never written. */
+    serverSetting(key: string): string | null {
+      const r = db.prepare<[string], { value: string }>("SELECT value FROM server_settings WHERE key = ?").get(key);
+      return r === undefined ? null : r.value;
+    },
+    /** Write one server setting, replacing any previous value. */
+    setServerSetting(key: string, value: string): void {
+      db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
     },
     /**
      * Forget a deleted project: its bindings and everything keyed by them

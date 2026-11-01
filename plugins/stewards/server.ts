@@ -99,7 +99,7 @@ import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_W
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
-import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
+import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
@@ -221,32 +221,47 @@ function turnText(input: unknown): string | null {
   return parts.length === 0 ? null : parts.join("\n");
 }
 
+/** The server setting the footer toggle stores the replaced navigation in (BB-184). */
+export const NAVIGATION_RESTORE_KEY = "sidebar.navigationRestore";
+
 /**
- * BB-45: pin bb's own sidebar thread list for clients that have not opted in.
+ * BB-45/BB-184: pin bb's own sidebar thread list and navigation for clients
+ * that have not opted in.
  *
  * BB-44 registers the stewards list through the exclusive
- * `experimental_threadList` slot, and bb resolves an unset (`__automatic__`)
- * provider to the first installed list other than the bundled
- * `thread-list/thread-list` — the stewards list. Without this pin the sidebar
- * would change for everyone the moment BB-44 lands. Set the preference to the
- * bundled list on load; an explicit value (including the stewards list the
- * footer toggle writes) is left alone. `bb.onInstall` does not run for plugins
- * baked into the `bb-server` image, so this runs on load. Best-effort: a
- * failure is logged and the sidebar keeps working.
+ * `experimental_threadList` slot, and BB-184 registers the stewards navigation
+ * through `experimental_sidebarNavigation`. bb resolves an unset
+ * (`__automatic__`) provider to the first installed provider other than the
+ * bundled one — the stewards plugin's — so both would win by default the
+ * moment the image rolls, for people with the stewards list off too. Set each
+ * preference to the bundled id on load; an explicit value (including the
+ * stewards ids the footer toggle writes) is left alone. `bb.onInstall` does
+ * not run for plugins baked into the `bb-server` image, so this runs on load.
+ * Best-effort: a failure is logged and the sidebar keeps working.
  */
 export async function pinSidebarThreadListProvider(bb: BbPluginApi): Promise<void> {
   try {
     const { preferences } = await bb.sdk.system.uiPreferences.list();
-    const entry = preferences[THREAD_LIST_PROVIDER_KEY];
-    if (entry !== undefined && entry.value !== AUTOMATIC_THREAD_LIST_PROVIDER) return;
-    await bb.sdk.system.uiPreferences.set({
-      key: THREAD_LIST_PROVIDER_KEY,
-      value: BUILTIN_THREAD_LIST_ID,
-      expectedRevision: entry?.revision ?? 0,
-    });
-    bb.log.info(`stewards: pinned the sidebar thread list to ${BUILTIN_THREAD_LIST_ID}; the footer toggle switches it to ${STEWARDS_PLUGIN_ID}/sidebar`);
+    const threadList = preferences[THREAD_LIST_PROVIDER_KEY];
+    if (threadList === undefined || threadList.value === AUTOMATIC_THREAD_LIST_PROVIDER) {
+      await bb.sdk.system.uiPreferences.set({
+        key: THREAD_LIST_PROVIDER_KEY,
+        value: BUILTIN_THREAD_LIST_ID,
+        expectedRevision: threadList?.revision ?? 0,
+      });
+      bb.log.info(`stewards: pinned the sidebar thread list to ${BUILTIN_THREAD_LIST_ID}; the footer toggle switches it to ${STEWARDS_PLUGIN_ID}/sidebar`);
+    }
+    const navigation = preferences[NAVIGATION_PROVIDER_KEY];
+    if (navigation === undefined || navigation.value === AUTOMATIC_NAVIGATION_PROVIDER) {
+      await bb.sdk.system.uiPreferences.set({
+        key: NAVIGATION_PROVIDER_KEY,
+        value: BUILTIN_NAVIGATION_ID,
+        expectedRevision: navigation?.revision ?? 0,
+      });
+      bb.log.info(`stewards: pinned the sidebar navigation to ${BUILTIN_NAVIGATION_ID}; the footer toggle switches it to ${STEWARDS_PLUGIN_ID}/navigation`);
+    }
   } catch (error) {
-    bb.log.warn(`stewards: could not pin the sidebar thread list: ${errorMessage(error)}`);
+    bb.log.warn(`stewards: could not pin the sidebar providers: ${errorMessage(error)}`);
   }
 }
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}… (${text.length - max} more characters)`);
@@ -600,6 +615,16 @@ export const rpcContract = defineRpcContract({
   stewardsCheck: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
     output: z.object({ ok: z.boolean(), lines: z.array(z.string()) }),
+  },
+  // BB-184: the footer toggle's remembered navigation provider, so turning the
+  // stewards list off restores what the user had. One value per server.
+  stewardsNavigationRestore: {
+    input: z.null(),
+    output: z.object({ value: z.string().nullable() }),
+  },
+  stewardsSetNavigationRestore: {
+    input: z.object({ value: z.string().min(1).max(200) }),
+    output: z.object({ ok: z.boolean() }),
   },
   // The settings page's per-project toggle: this server's local switch for a project.
   stewardsSetProjectEnabled: {
@@ -6162,6 +6187,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsCheck({ projectId }) {
         return check(projectId);
+      },
+      async stewardsNavigationRestore() {
+        return { value: store.serverSetting(NAVIGATION_RESTORE_KEY) };
+      },
+      async stewardsSetNavigationRestore({ value }) {
+        store.setServerSetting(NAVIGATION_RESTORE_KEY, value);
+        return { ok: true };
       },
       async stewardsSetProjectEnabled({ projectId, enabled }) {
         return setProjectEnabledForUser(projectId, enabled);

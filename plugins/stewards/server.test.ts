@@ -396,16 +396,18 @@ function world() {
   return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
-async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
+async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
   const w = world();
   if (seedProvider === null) w.uiPreferences.delete("sidebar.threadListProvider");
-  else if (seedProvider === "fail-list") w.sdk.system.uiPreferences.list = async () => {
+  else if (seedProvider !== undefined && seedProvider !== "fail-list" && seedProvider !== "fail-set") w.uiPreferences.set("sidebar.threadListProvider", { value: seedProvider, revision: 4 });
+  if (seedNavigation === null) w.uiPreferences.delete("sidebar.navigationProvider");
+  else if (seedNavigation !== undefined && seedNavigation !== "fail-list" && seedNavigation !== "fail-set") w.uiPreferences.set("sidebar.navigationProvider", { value: seedNavigation, revision: 4 });
+  if (seedProvider === "fail-list" || seedNavigation === "fail-list") w.sdk.system.uiPreferences.list = async () => {
     throw new Error("the preferences store is down");
   };
-  else if (seedProvider === "fail-set") w.sdk.system.uiPreferences.set = async () => {
+  if (seedProvider === "fail-set" || seedNavigation === "fail-set") w.sdk.system.uiPreferences.set = async () => {
     throw new Error("the preferences store is down");
   };
-  else if (seedProvider !== undefined) w.uiPreferences.set("sidebar.threadListProvider", { value: seedProvider, revision: 4 });
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards", "onboarding"], settings });
   await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
@@ -8783,30 +8785,46 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
 // BB-45: BB-44's dev-server check found that an unset `sidebar.threadListProvider`
 // resolves to the stewards list, so the plugin pins bb's own list on load and
 // leaves any explicit choice alone.
-describe("the load-time sidebar thread-list pin (BB-45)", () => {
-  it("pins bb's own list when the preference is unset or automatic", async () => {
-    const unset = await setup({}, {}, null);
+describe("the load-time sidebar provider pin (BB-45/BB-184)", () => {
+  it("pins bb's own thread list and navigation when each is unset or automatic", async () => {
+    const unset = await setup({}, {}, null, null);
     expect(unset.uiPreferences.get("sidebar.threadListProvider")).toMatchObject({ value: "thread-list/thread-list" });
-    expect(unset.uiPreferencesWrites).toEqual([{ key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 0 }]);
+    expect(unset.uiPreferences.get("sidebar.navigationProvider")).toMatchObject({ value: "navigation/rail" });
+    expect(unset.uiPreferencesWrites).toEqual([
+      { key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 0 },
+      { key: "sidebar.navigationProvider", value: "navigation/rail", expectedRevision: 0 },
+    ]);
 
-    const automatic = await setup({}, {}, "__automatic__");
+    const automatic = await setup({}, {}, "__automatic__", "__automatic__");
     expect(automatic.uiPreferences.get("sidebar.threadListProvider")).toMatchObject({ value: "thread-list/thread-list" });
-    expect(automatic.uiPreferencesWrites).toEqual([{ key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 4 }]);
+    expect(automatic.uiPreferences.get("sidebar.navigationProvider")).toMatchObject({ value: "navigation/rail" });
+    expect(automatic.uiPreferencesWrites).toEqual([
+      { key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 4 },
+      { key: "sidebar.navigationProvider", value: "navigation/rail", expectedRevision: 4 },
+    ]);
   });
 
-  it("leaves an explicit provider alone, including the stewards list", async () => {
+  it("leaves an explicit provider alone, including the stewards ones", async () => {
     for (const value of ["thread-list/thread-list", "stewards/sidebar"]) {
-      const t = await setup({}, {}, value);
+      const t = await setup({}, {}, value, "navigation/top-list");
       expect(t.uiPreferences.get("sidebar.threadListProvider")).toEqual({ value, revision: 4 });
+      expect(t.uiPreferences.get("sidebar.navigationProvider")).toEqual({ value: "navigation/top-list", revision: 4 });
       expect(t.uiPreferencesWrites).toEqual([]);
     }
   });
 
+  it("pins only the unset half, leaving the explicit one alone", async () => {
+    const t = await setup({}, {}, "stewards/sidebar", "__automatic__");
+    expect(t.uiPreferences.get("sidebar.threadListProvider")).toEqual({ value: "stewards/sidebar", revision: 4 });
+    expect(t.uiPreferencesWrites).toEqual([{ key: "sidebar.navigationProvider", value: "navigation/rail", expectedRevision: 4 }]);
+  });
+
   it("logs and carries on when the preference cannot be read or written", async () => {
     for (const seed of ["fail-list", "fail-set"] as const) {
-      const t = await setup({}, {}, seed);
+      const t = await setup({}, {}, seed, seed);
       expect(t.uiPreferences.get("sidebar.threadListProvider")).toEqual({ value: "__automatic__", revision: 0 });
-      expect(t.harness.logEntries.some((entry) => entry.level === "warn" && entry.message.includes("could not pin the sidebar thread list"))).toBe(true);
+      expect(t.uiPreferences.get("sidebar.navigationProvider")).toBeUndefined();
+      expect(t.harness.logEntries.some((entry) => entry.level === "warn" && entry.message.includes("could not pin the sidebar providers"))).toBe(true);
     }
   });
 });
