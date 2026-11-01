@@ -353,6 +353,9 @@ function world() {
                   ...(threads.get(threadId)?.model === undefined
                     ? []
                     : [{ id: "t", seq: 1, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { execution: { model: threads.get(threadId)!.model, reasoningLevel: threads.get(threadId)!.reasoningLevel ?? "none", permissionMode: "auto", serviceTier: "default", source: "client/turn/requested" } } }]),
+                  // A spawn's prompt is the thread's first turn, recorded as the
+                  // user's by bb, so it is a plugin send too (BB-178).
+                  ...spawns.filter((s) => s.id === threadId && typeof s.prompt === "string").map((s, i) => ({ id: `p${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, input: [{ type: "text", text: s.prompt as string }] } })),
                   // The plugin's own sends are turns too: bb records them with
                   // `initiator: "user"` and no sender thread, so the text is the
                   // only thing telling them from the owner's (BB-178).
@@ -1016,6 +1019,39 @@ describe("a Linear ticket steward", () => {
     t.userTurns.push({ threadId: steward, text: "Looks right — go ahead.", at: t.now() });
     t.advance(25 * 60 * 60_000);
     expect((await t.tool("steward_update", { approve: true, quote: "go ahead" }, steward)).error).toBe(true);
+  });
+
+  it("does not count a turn from before the plugin started recording its sends", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // A wake from before this build started tracking sends is indistinguishable
+    // from the owner's own words, so it never counts (BB-178).
+    t.userTurns.push({ threadId: steward, text: "Looks right — go ahead.", at: t.now() - 1 });
+    expect((await t.tool("steward_update", { approve: true, quote: "go ahead" }, steward)).error).toBe(true);
+  });
+
+  it("does not read the entity description quoted in a steward's spawn prompt", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The steward's first turn is the spawn prompt, which quotes the description.
+    expect(t.spawns.find((s) => s.id === steward)!.prompt).toContain("Users cannot log in.");
+    expect((await t.tool("steward_update", { approve: true, quote: "Users cannot log in" }, steward)).error).toBe(true);
+  });
+
+  it("prunes recorded send hashes older than the lookback on the sweep", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.entities.set("uuid-12", issue({ description: "Users cannot log in. Go ahead and ship it." }));
+    await t.ring("linear", "uuid-12");
+    expect((await t.bb.storage.kv.list("sent/")).length).toBeGreaterThan(0);
+    t.advance(25 * 60 * 60_000);
+    await t.hooks.sweep();
+    expect(await t.bb.storage.kv.list("sent/")).toEqual([]);
   });
 
   // HUB-196: the steward posted a new spec, met the checklist, and only said in

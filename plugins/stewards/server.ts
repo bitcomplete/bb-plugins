@@ -1003,6 +1003,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const fetchImpl = deps.fetch ?? globalThis.fetch;
     const env = deps.env ?? process.env;
 
+    // BB-178: the moment this plugin started recording the texts it sends. A
+    // turn older than this cannot be told from the owner's own words — the
+    // plugin's wakes before a restart were recorded with `initiator: "user"`
+    // too — so `userSaid` ignores them. Set once, on the first load that tracks.
+    const sentSince = await (async () => {
+      const stored = await bb.storage.kv.get<number>("sent-since");
+      if (typeof stored === "number") return stored;
+      const at = now();
+      await bb.storage.kv.set("sent-since", at);
+      return at;
+    })();
+
     // The in-memory per-method handler table (BB-100). bb core's own handler
     // stat is keyed by plugin id only, so RPCs, doorbells, CLI commands and the
     // nightly schedule share one bucket and a core change is out of scope; this
@@ -6704,6 +6716,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
       for (const row of rows) {
         if (now() - row.createdAt > timing.approvalLookbackMs) break;
+        // A turn from before this plugin started recording its sends cannot be
+        // told from the plugin's own wakes, so it is never the owner's (BB-178).
+        if (row.createdAt < sentSince) continue;
         const data = row.data as { initiator?: string; input?: unknown };
         if (data.initiator !== "user") continue;
         const text = turnText(data.input);
@@ -7986,8 +8001,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /** Drop the recorded send hashes older than the approval lookback; `userSaid` never reads them (BB-178). */
+    async function pruneSentHashes(): Promise<void> {
+      const cutoff = now() - timing.approvalLookbackMs;
+      for (const key of await bb.storage.kv.list("sent/")) {
+        const at = await bb.storage.kv.get<number>(key);
+        if (typeof at === "number" && at < cutoff) await bb.storage.kv.delete(key);
+      }
+    }
+
     async function sweep(): Promise<void> {
       lastSweepAt = now();
+      await quietly("prune the recorded sent-message hashes", pruneSentHashes);
       await flushDeliveries();
       // One list for the stewarded projects and for the deleted ones below; a
       // failed read throws here, so a transient error never purges anything.
