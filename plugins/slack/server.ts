@@ -402,7 +402,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /** Whether every tagged wake has its reply; the backstop's condition. */
     const taggedAnswered = (r: SessionRecord) => r.answered >= r.events;
     /** Whether no reply may be posted: every tagged wake answered and no untagged one waiting. */
-    const answered = (r: SessionRecord) => taggedAnswered(r) && r.untagged === 0;
+    const answered = (r: SessionRecord) => taggedAnswered(r) && r.untagged === 0 && r.lateSteerAt === null;
     /**
      * Which wake a posted reply answers. The agent's own `slack_reply` is
      * `"any"` (the oldest tagged wake first, then an untagged one); a
@@ -416,8 +416,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const takeTagged = r.answered < r.events ? { ...r, answered: r.answered + 1 } : null;
       const takeUntagged = r.untagged > 0 ? { ...r, untagged: r.untagged - 1 } : null;
       const next = slot === "tagged" ? (takeTagged ?? takeUntagged) : slot === "untagged" ? (takeUntagged ?? takeTagged) : (takeTagged ?? takeUntagged);
-      if (next === null) return;
-      sessions.set(session, next);
+      if (next === null) {
+        // A late steer's parked allowance: the reply answers it even though the
+        // counters are level, so consume the mark and let the reply through.
+        if (r.lateSteerAt !== null) {
+          sessions.set(session, { ...r, lateSteerAt: null });
+          void saveSessions();
+        }
+        return;
+      }
+      sessions.set(session, { ...next, lateSteerAt: null });
       void saveSessions();
     }
     /** The conversation this thread is answering, when a tool leaves the session out. */
@@ -1079,6 +1087,19 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Park a late steer for a following turn. The turn it joined had already
+     * replied, so its one reply cannot cover the edit and the turn that ends
+     * here must not owe a backstop; the edit is left out of `events` and its
+     * steer mark is cleared. `lateSteerAt` still lets the next turn answer it.
+     */
+    async function parkLateSteer(session: string): Promise<void> {
+      const r = sessions.get(session);
+      if (r === undefined) return;
+      sessions.set(session, { ...r, steeredAt: null, lateSteerAt: deps.now() });
+      await saveSessions();
+    }
+
+    /**
      * Forget the steer marks on a thread's sessions. Called when the thread
      * goes idle: the turn a steer joined has ended, so the mark has done its
      * job and must not make a later idle look handled. A mark newer than the
@@ -1284,6 +1305,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         bb.log.info(`Slack session ${sessionLogId(event.session)}: no bb thread to steer for a ${event.action}; ignored`);
         return;
       }
+      // Read before the send. A reply that lands while the send is in flight
+      // makes an edit look not-late here, so it is not parked: the pre-existing
+      // narrow window where the "already has its reply" failure can return.
       const before = sessions.get(event.session);
       if (options.owesReply && event.tagged) countWake(event);
       const body = `[Slack — session ${event.session}]\n${correction}${options.owesReply ? `\n\nReply in Slack with the slack_reply tool (session ${event.session}). If the message needs no answer, use the slack_ack tool (session ${event.session}) instead.` : `\n\nNo reply is needed for this deletion.`}`;
@@ -1303,8 +1327,17 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return;
       }
       if (options.owesReply && event.tagged) {
-        if (outcome.kind === "steered" && (before?.answered ?? 0) < (before?.events ?? 0)) await uncountWake(event.session);
-        else if (outcome.kind !== "steered") await markHanded(event.session, handedAt);
+        if (outcome.kind === "steered") {
+          // A steer joins the running turn, whose one reply covers it, so the
+          // edit must not add an unanswered reply. If that turn had already
+          // replied, the reply cannot cover the edit: leave it uncounted and
+          // park it for a following turn, clearing the steer mark so the turn
+          // ending here owes no backstop.
+          await uncountWake(event.session);
+          if ((before?.answered ?? 0) >= (before?.events ?? 0)) await parkLateSteer(event.session);
+        } else {
+          await markHanded(event.session, handedAt);
+        }
       } else if (!options.owesReply) {
         // A deletion owes no reply: drop the original wake's obligation if the
         // turn it belonged to has not replied yet.
@@ -1511,6 +1544,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         untagged: (previous?.untagged ?? 0) + (untaggedWake ? 1 : 0),
         handedAt: previous?.handedAt ?? null,
         steeredAt: previous?.steeredAt ?? null,
+        lateSteerAt: previous?.lateSteerAt ?? null,
         title: previous?.title ?? null,
         wakes: previous?.wakes ?? [],
         transcript: previous?.transcript ?? [],
@@ -1661,7 +1695,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       let changed = false;
       for (const [session, r] of sessions) {
         if (r.threadId !== threadId) continue;
-        sessions.set(session, { ...r, threadId: null, projectId: null, steeredAt: null });
+        sessions.set(session, { ...r, threadId: null, projectId: null, steeredAt: null, lateSteerAt: null });
         changed = true;
       }
       if (changed) void saveSessions();
@@ -1685,6 +1719,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // outcome; clear the thinking status for it once its turn has run, so an
       // older turn's idle does not clear the indicator of a queued wake.
       const untaggedWaiting = mine.filter(([, r]) => r.untagged > 0);
+      // A parked late steer set the thinking indicator for the edit, but the
+      // turn ending here cannot answer it and posts no backstop. Clear the
+      // indicator so it does not outlive the turn; a following turn sets its
+      // own if it replies. A newer wake still queued behind this turn owns its
+      // own indicator, so leave that one alone.
+      for (const [session, r] of mine) {
+        if (r.lateSteerAt === null || r.lateSteerAt > idleAt) continue;
+        if (r.wakes.some((w) => w.state === "queued" && w.queuedMessageId !== "")) continue;
+        void hooks.status(session, "", checkSignal()).catch(() => undefined);
+      }
       if (waiting.length === 0 && untaggedWaiting.length === 0) {
         await clearSteered(threadId, idleAt);
         return;
