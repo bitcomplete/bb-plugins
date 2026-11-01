@@ -5111,6 +5111,8 @@ describe("needs you items", () => {
     const b = t.hooks.store.find("acme/web#7")!;
     expect(b.kind).toBe("review");
     t.viewers.github = null;
+    // The config is cached, so the login has to be re-read before the ring.
+    await t.hooks.loadConfig("p1", true);
     await t.ring("github", "acme/web#7");
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
