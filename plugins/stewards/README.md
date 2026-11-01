@@ -752,7 +752,8 @@ stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`
 slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last
 part is the level only when it names one), `requeue-default`,
 `follow-through` (how long a terminal binding may be kept open, 6h by
-default), `skip-authors`, `deployment`.
+default), `skip-authors`, `owner-merges` (off by default; file the owner's
+Merge item on a teammate's pull request too, BB-170), `deployment`.
 
 `deployment` names where a merge is confirmed live (BB-53, BB-132): one
 target or a list of them. A target has `name` (optional; reports and wakes

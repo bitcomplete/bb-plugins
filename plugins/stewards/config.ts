@@ -902,6 +902,12 @@ export const frontMatterSchema = z
     "follow-through": durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
     /** Reviews: pull request authors no review steward is made for (bots). */
     "skip-authors": z.array(z.string().trim().min(1).max(100)).default([]),
+    /**
+     * Reviews: file the owner's Merge item on a teammate's pull request too
+     * (BB-170). Off by default: the owner's approval is their last step and
+     * the author merges. Set on the review playbook.
+     */
+    "owner-merges": z.boolean().default(false),
     /** Where a merge is confirmed live, when the project has a deployment source (BB-53): one target or a list. */
     deployment: deploymentsFieldSchema.optional(),
   })
@@ -922,6 +928,8 @@ export type Playbook = {
   idleGraceMs: number;
   followThroughMs: number;
   skipAuthors: string[];
+  /** Whether a teammate's pull request still files the owner's Merge item (BB-170; off by default). */
+  ownerMerges: boolean;
   /** Where a merge is confirmed live, or empty when the playbook names no deployment target. */
   deployments: DeploymentTarget[];
   /** The text before the first `## ` heading: instructions for every phase. */
@@ -993,6 +1001,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       idleGraceMs: fm["idle-grace"],
       followThroughMs: fm["follow-through"],
       skipAuthors: fm["skip-authors"],
+      ownerMerges: fm["owner-merges"],
       deployments: fm.deployment === undefined ? [] : Array.isArray(fm.deployment) ? fm.deployment : [fm.deployment],
       general,
       sections,
