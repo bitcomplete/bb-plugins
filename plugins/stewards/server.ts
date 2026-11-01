@@ -13,7 +13,7 @@
 // Configuration lives in the project's `.bb`, read through a project source
 // (project-source.ts): multi-repo's RPCs when it is installed, native git on
 // the project checkout when it is not. Nothing here reads a file.
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -183,6 +183,31 @@ export interface StewardsDeps {
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** The comparable form of a message: whitespace collapsed, trimmed, lowercased. */
+const normalizeText = (text: string) => text.replace(/\s+/gu, " ").trim().toLowerCase();
+
+/**
+ * The key a text the plugin sent is recorded under, so the ready gate can tell
+ * the plugin's own wakes from the owner's words (BB-178). Content, not the
+ * thread: the same wake to two stewards is the same plugin text.
+ */
+const sentHash = (text: string) => createHash("sha256").update(normalizeText(text)).digest("hex");
+
+/**
+ * The text parts of a `client/turn/requested` event's input, joined; null when
+ * it carries none. bb stores a turn's input as parts under `data.input`, with
+ * the words in the `text` parts (BB-178).
+ */
+function turnText(input: unknown): string | null {
+  if (!Array.isArray(input)) return null;
+  const parts = input.flatMap((part) => {
+    if (typeof part !== "object" || part === null) return [];
+    const p = part as { type?: unknown; text?: unknown };
+    return p.type === "text" && typeof p.text === "string" ? [p.text] : [];
+  });
+  return parts.length === 0 ? null : parts.join("\n");
+}
 
 /**
  * BB-45: pin bb's own sidebar thread list for clients that have not opted in.
@@ -1903,8 +1928,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return typeof e.message === "string" && /environment is unavailable/iu.test(e.message);
     }
 
+    /**
+     * Record the hash of a text the plugin sends to a thread, so `userSaid` can
+     * skip the plugin's own wakes: bb records them with `initiator: "user"` and
+     * a wake quotes the entity's comments verbatim, so only the text tells them
+     * from the owner's words (BB-178). Best-effort, but recorded before the
+     * send, so a crash cannot leave a plugin turn looking like the owner's.
+     */
+    async function recordPluginSend(text: string): Promise<void> {
+      try {
+        await bb.storage.kv.set(`sent/${sentHash(text)}`, now());
+      } catch (error) {
+        bb.log.warn(`stewards: could not record the hash of a message the plugin sent: ${errorMessage(error)}`);
+      }
+    }
+
     /** Message a thread; "gone" when it no longer exists, "unavailable" when its environment cannot run it. */
     async function send(threadId: string, text: string): Promise<"sent" | "gone" | "failed" | "unavailable"> {
+      await recordPluginSend(text);
       try {
         await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
         return "sent";
@@ -2282,6 +2323,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         }
         const title = await projectStewardTitle(config.projectId);
+        await recordPluginSend(PROJECT_STEWARD_INTRO);
         const thread = await bb.sdk.threads.spawn({
           projectId: config.projectId,
           environment: freshEnvironment(config.source, await projectHost(config.projectId)),
@@ -2372,6 +2414,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         pluginMetadata: { role: "steward", bindingId: b.id, threadBriefs: THREAD_BRIEFS_OFF },
       };
       let thread: { id: string };
+      await recordPluginSend(prompt);
       try {
         thread = await bb.sdk.threads.spawn({ ...base, environment: env === null ? freshEnvironment(config.source, await projectHost(b.projectId)) : { type: "reuse", environmentId: env } });
       } catch (error) {
@@ -2427,10 +2470,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const writeEnv = await requesterWriteEnv(need, hostId);
       const variable = secretVariable(need);
       const title = `Provide ${variable} for ${b.entityKey}`;
+      const prompt = requesterPrompt(b, need, writeEnv);
+      await recordPluginSend(prompt);
       const thread = await bb.sdk.threads.spawn({
         projectId: b.projectId,
         environment: freshEnvironment(config?.source ?? null, hostId),
-        prompt: requesterPrompt(b, need, writeEnv),
+        prompt,
         title,
         ...modelArgs(model),
         pluginMetadata: { role: "requester", bindingId: b.id, needId: need.id },
@@ -6653,15 +6698,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       scheduleReconcile(target.id);
     }
 
-    /** Whether the user said these words in this thread lately. */
+    /** Whether the user said these words in this thread lately, in their own turn rather than the plugin's own wake (BB-178). */
     async function userSaid(threadId: string, quote: string): Promise<boolean> {
-      const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
-      const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/start"], order: "desc", limit: "30" });
+      const want = normalizeText(quote);
+      const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
       for (const row of rows) {
         if (now() - row.createdAt > timing.approvalLookbackMs) break;
-        const data = row.data as { initiator?: string; request?: { params?: unknown } };
+        const data = row.data as { initiator?: string; input?: unknown };
         if (data.initiator !== "user") continue;
-        if (JSON.stringify(data.request?.params ?? {}).replace(/\\n/gu, " ").replace(/\s+/gu, " ").toLowerCase().includes(want)) return true;
+        const text = turnText(data.input);
+        if (text === null) continue;
+        if (!normalizeText(text).includes(want)) continue;
+        // A wake the plugin sent is recorded under its text's hash; it quotes
+        // the entity verbatim and must never count as the owner's approval.
+        if ((await bb.storage.kv.get(`sent/${sentHash(text)}`)) !== undefined) continue;
+        return true;
       }
       return false;
     }
