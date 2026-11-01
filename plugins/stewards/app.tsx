@@ -17,10 +17,12 @@ import {
   ThreadTitle,
   definePluginApp,
   experimental_Icon as Icon,
+  experimental_SidebarNavigationIcon as SidebarNavigationIcon,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
   experimental_ThreadActionsMenu as ThreadActionsMenu,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
   experimental_usePluginId,
+  experimental_useSidebarNavigation,
   experimental_useSidebarThreads,
   experimental_useThreadActions,
   useBbNavigate,
@@ -29,6 +31,8 @@ import {
   useSdk,
   useSidebarThreadDraft,
   useSidebarThreadRowStatus,
+  type ExperimentalBadge,
+  type ExperimentalSidebarNavigationItem,
   type PluginSidebarThread,
   type PluginThreadActionTarget,
   type PluginThreadActionsTriggerProps,
@@ -40,7 +44,16 @@ import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { readLastPlace, writeLastPlace } from "./last-place.js";
 import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
-import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
+import {
+  AUTOMATIC_NAVIGATION_PROVIDER,
+  AUTOMATIC_THREAD_LIST_PROVIDER,
+  BUILTIN_NAVIGATION_ID,
+  BUILTIN_THREAD_LIST_ID,
+  NAVIGATION_PROVIDER_KEY,
+  THREAD_LIST_PROVIDER_KEY,
+  stewardsNavigationId,
+  stewardsThreadListId,
+} from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
 type Overview = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: unknown; lastSweepAt: unknown }> : never;
@@ -2640,6 +2653,113 @@ function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: Plugin
   );
 }
 
+// ---- The stewards navigation provider (BB-184) -------------------------------------------------
+
+/**
+ * The stewards navigation provider (BB-184): while the stewards list is on,
+ * draw bb's own navigation items in the user's saved order, except New thread.
+ * The stewards list has its own compose button beside the project picker, so
+ * the host row would be a second one; the `thread.new` shortcut, the home
+ * screen and that button keep New thread reachable. Items the user hid stay
+ * reachable under **More**. Drag-to-split, per-item menus and shortcut pills
+ * belong to the host's Customize editor and Settings, so they are not drawn
+ * here, and the deprecated `experimental_Original` is not rendered.
+ */
+const NEW_THREAD_ITEM_ID = "__bb__/new-thread";
+
+/**
+ * The badge tone as the host's neutral/warning/critical colors. SDK 0.6.80
+ * exports the `ExperimentalBadge` shape but no `experimental_Badge`
+ * component, so the pill is drawn here; the row's accessible name carries
+ * `badge.label`.
+ */
+function NavigationBadge({ badge }: { badge: ExperimentalBadge }) {
+  const tone = badge.tone ?? "neutral";
+  const colors = tone === "critical" ? "bg-destructive/15 text-destructive" : tone === "warning" ? "bg-attention/15 text-attention" : "bg-state-hover text-muted-foreground";
+  const text = badge.count !== undefined ? (badge.count > 99 ? "99+" : String(badge.count)) : (badge.text ?? "•");
+  return <span aria-hidden="true" className={`ml-auto shrink-0 rounded-full px-1.5 py-0.5 text-[10px] leading-none ${colors}`}>{text}</span>;
+}
+
+/** One navigation row, shared by the list and the **More** menu. */
+function SidebarNavigationRow({ item, activeItemId, onActivate }: { item: ExperimentalSidebarNavigationItem; activeItemId: string | null; onActivate: (id: string) => void }) {
+  const active = item.id === activeItemId;
+  // The badge is decorative; its label carries its meaning to assistive tech.
+  const name = item.badge === null ? item.label : `${item.label} ${item.badge.label}`;
+  return (
+    <button
+      type="button"
+      data-navigation-item={item.id}
+      aria-current={active ? "page" : undefined}
+      aria-label={name}
+      aria-busy={item.isLoading || undefined}
+      disabled={item.isDisabled}
+      className={`flex w-full items-center gap-2 rounded-md px-2 text-left text-sm ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${active ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS} disabled:pointer-events-none disabled:opacity-50`}
+      onClick={() => onActivate(item.id)}
+    >
+      <SidebarNavigationIcon icon={item.icon} className="size-4 shrink-0" />
+      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+      {item.badge === null ? null : <NavigationBadge badge={item.badge} />}
+    </button>
+  );
+}
+
+function StewardsNavigation() {
+  const { items, activeItemId, actions } = experimental_useSidebarNavigation();
+  const [moreOpen, setMoreOpen] = useState(false);
+  const scope = usePortalScopeProps();
+  const visible = items.filter((item) => item.isVisible && item.id !== NEW_THREAD_ITEM_ID);
+  const hidden = items.filter((item) => !item.isVisible && item.id !== NEW_THREAD_ITEM_ID);
+  const activate = (id: string) => actions.activate(id, { target: "current" });
+  return (
+    <div className="flex flex-col p-1">
+      <div className="flex flex-col gap-0.5">
+        {visible.map((item) => (
+          <SidebarNavigationRow key={item.id} item={item} activeItemId={activeItemId} onActivate={activate} />
+        ))}
+      </div>
+      {hidden.length > 0 ? (
+        <PopoverPrimitive.Root open={moreOpen} onOpenChange={setMoreOpen}>
+          <PopoverPrimitive.Trigger asChild>
+            <button
+              type="button"
+              aria-haspopup="menu"
+              className={`flex w-full items-center gap-2 rounded-md px-2 text-left text-sm ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${ROW_INTERACTIVE_CLASS}`}
+            >
+              <Icon name="MoreHorizontal" className="size-4 shrink-0" aria-hidden />
+              <span className="min-w-0 flex-1 truncate">More</span>
+            </button>
+          </PopoverPrimitive.Trigger>
+          <PopoverPrimitive.Portal>
+            <PopoverPrimitive.Content
+              {...scope}
+              align="start"
+              side="bottom"
+              sideOffset={4}
+              collisionPadding={8}
+              className="z-50 w-[var(--radix-popover-trigger-width)] min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
+            >
+              <div className="flex flex-col">
+                {hidden.map((item) => (
+                  <SidebarNavigationRow
+                    key={item.id}
+                    item={item}
+                    activeItemId={activeItemId}
+                    onActivate={(id) => {
+                      activate(id);
+                      setMoreOpen(false);
+                    }}
+                  />
+                ))}
+              </div>
+            </PopoverPrimitive.Content>
+          </PopoverPrimitive.Portal>
+        </PopoverPrimitive.Root>
+      ) : null}
+      <div role="separator" className="mx-2 my-1 border-t border-border" />
+    </div>
+  );
+}
+
 // ---- The sidebar-footer toggle -----------------------------------------------------------------
 //
 // BB-45: an icon in the sidebar footer that opens a small panel above the
@@ -2655,28 +2775,64 @@ function isRevisionConflict(error: unknown): boolean {
   return status === 409 || /\bHTTP\s*409\b/u.test(String(error));
 }
 
-type ThreadListProviderState = { status: "loading" } | { status: "ready"; on: boolean; revision: number } | { status: "error"; message: string };
+type ThreadListProviderState =
+  | { status: "loading" }
+  | { status: "ready"; on: boolean; threadRevision: number; navigationRevision: number; navigationValue: string | undefined }
+  | { status: "error"; message: string };
+
+/** What one read of the two preferences reports. */
+type ProviderRead = { on: boolean; threadRevision: number; navigationRevision: number; navigationValue: string | undefined };
+
+/** The two UI preference keys this toggle writes. */
+type ProviderKey = typeof THREAD_LIST_PROVIDER_KEY | typeof NAVIGATION_PROVIDER_KEY;
 
 /**
- * The disclosure's body: a switch that writes `sidebar.threadListProvider`.
- * The preference is read when the disclosure opens (the component mounts) and
+ * The disclosure's body: a switch that writes `sidebar.threadListProvider`
+ * and, in step with it, `sidebar.navigationProvider` (BB-184). The
+ * preferences are read when the disclosure opens (the component mounts) and
  * again after a conflict. `__automatic__` (the value while nothing is pinned)
  * means bb picks the stewards list, so it reads as on until the load-time pin
- * has made the choice explicit.
+ * has made the choice explicit. Turning the list on saves the navigation it
+ * replaced in the plugin's store and points the navigation at the stewards
+ * provider; turning it off restores the saved value (or bb's rail).
  */
 function SidebarToggle() {
   const sdk = useSdk();
+  const rpc = useRpc<typeof rpcContract>();
   const pluginId = experimental_usePluginId();
   const onId = stewardsThreadListId(pluginId);
+  const navigationId = stewardsNavigationId(pluginId);
   const [state, setState] = useState<ThreadListProviderState>({ status: "loading" });
   const [busy, setBusy] = useState(false);
 
-  const read = useCallback(async (): Promise<{ on: boolean; revision: number }> => {
+  const read = useCallback(async (): Promise<ProviderRead> => {
     const { preferences } = await sdk.system.uiPreferences.list();
-    const entry = preferences[THREAD_LIST_PROVIDER_KEY];
-    const value = entry?.value;
-    return { on: value === onId || value === undefined || value === AUTOMATIC_THREAD_LIST_PROVIDER, revision: entry?.revision ?? 0 };
+    const thread = preferences[THREAD_LIST_PROVIDER_KEY];
+    const navigation = preferences[NAVIGATION_PROVIDER_KEY];
+    const value = thread?.value;
+    return {
+      on: value === onId || value === undefined || value === AUTOMATIC_THREAD_LIST_PROVIDER,
+      threadRevision: thread?.revision ?? 0,
+      navigationRevision: navigation?.revision ?? 0,
+      navigationValue: navigation?.value,
+    };
   }, [sdk, onId]);
+
+  // Write one preference, re-listing and retrying once on a revision conflict
+  // (another window changed it between our list and our set).
+  const writePreference = useCallback(
+    async (key: ProviderKey, value: string, expectedRevision: number): Promise<number> => {
+      try {
+        return (await sdk.system.uiPreferences.set({ key, value, expectedRevision })).revision;
+      } catch (error) {
+        if (!isRevisionConflict(error)) throw error;
+        const fresh = await read();
+        const revision = key === THREAD_LIST_PROVIDER_KEY ? fresh.threadRevision : fresh.navigationRevision;
+        return (await sdk.system.uiPreferences.set({ key, value, expectedRevision: revision })).revision;
+      }
+    },
+    [read, sdk],
+  );
 
   useEffect(() => {
     let live = true;
@@ -2696,27 +2852,28 @@ function SidebarToggle() {
   const flip = useCallback(async () => {
     if (state.status !== "ready" || busy) return;
     const next = !state.on;
-    const value = next ? onId : BUILTIN_THREAD_LIST_ID;
     setBusy(true);
     try {
-      let revision: number;
-      try {
-        revision = (await sdk.system.uiPreferences.set({ key: THREAD_LIST_PROVIDER_KEY, value, expectedRevision: state.revision })).revision;
-      } catch (error) {
-        // Another window changed the preference between our list and our set:
-        // re-list and retry once with the fresh revision. Anything else is a
-        // real failure.
-        if (!isRevisionConflict(error)) throw error;
-        const fresh = await read();
-        revision = (await sdk.system.uiPreferences.set({ key: THREAD_LIST_PROVIDER_KEY, value, expectedRevision: fresh.revision })).revision;
+      let restore: string;
+      if (next) {
+        // Remember the navigation the user had, treating the unpinned value as
+        // bb's rail (the load-time pin normally makes it explicit already).
+        restore = state.navigationValue === undefined || state.navigationValue === AUTOMATIC_NAVIGATION_PROVIDER ? BUILTIN_NAVIGATION_ID : state.navigationValue;
+        await rpc.call("stewardsSetNavigationRestore", { value: restore });
+      } else {
+        const saved = await rpc.call("stewardsNavigationRestore", null);
+        restore = saved.value ?? BUILTIN_NAVIGATION_ID;
       }
-      setState({ status: "ready", on: next, revision });
+      const threadRevision = await writePreference(THREAD_LIST_PROVIDER_KEY, next ? onId : BUILTIN_THREAD_LIST_ID, state.threadRevision);
+      const navigationValue = next ? navigationId : restore;
+      const navigationRevision = await writePreference(NAVIGATION_PROVIDER_KEY, navigationValue, state.navigationRevision);
+      setState({ status: "ready", on: next, threadRevision, navigationRevision, navigationValue });
     } catch (error) {
       setState({ status: "error", message: message(error) });
     } finally {
       setBusy(false);
     }
-  }, [state, busy, onId, read, sdk]);
+  }, [state, busy, onId, navigationId, writePreference, rpc]);
 
   const on = state.status === "ready" && state.on;
   return (
@@ -2756,6 +2913,15 @@ export default definePluginApp((app) => {
     title: "Stewards",
     description: "Threads grouped by project and in-flight effort, with stages, workers and reviewers.",
     component: StewardsSidebar,
+  });
+  // BB-184: while the stewards list is on, bb's navigation is drawn by this
+  // plugin too, so the host's New thread row can be dropped (the list has its
+  // own compose button). The footer toggle keeps the two preferences in step.
+  app.slots.experimental_sidebarNavigation({
+    id: "navigation",
+    title: "Stewards",
+    placement: "list",
+    component: StewardsNavigation,
   });
   // The footer disclosure that writes the provider preference, so the list
   // above can be turned on and off without Settings → Appearance.

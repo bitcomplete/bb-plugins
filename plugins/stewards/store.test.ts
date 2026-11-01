@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -451,13 +451,14 @@ describe("the actor rename migration (BB-97)", () => {
   });
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
-    // BB-154 appended the wake-source group after the reviewer-model group.
-    const tail = WAKE_SOURCE_MIGRATIONS.length;
-    expect(MIGRATIONS.slice(-tail)).toEqual([...WAKE_SOURCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length), -tail)).toEqual([...REVIEWER_MODEL_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length), -(tail + REVIEWER_MODEL_MIGRATIONS.length))).toEqual([...LESSON_PR_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length), -(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length))).toEqual([...ACTOR_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length + APPROVAL_MARKER_MIGRATIONS.length), -(tail + REVIEWER_MODEL_MIGRATIONS.length + LESSON_PR_MIGRATIONS.length + ACTOR_MIGRATIONS.length))).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
+    // Newest group first; each sits immediately before the one appended after
+    // it. BB-184 appended the server-settings group after BB-154's wake source.
+    const groups = [SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    let end = MIGRATIONS.length;
+    for (const group of groups) {
+      expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
+      end -= group.length;
+    }
   });
 });
 
@@ -809,5 +810,19 @@ describe("answers go straight to the originator (BB-30)", () => {
     s.resolve(x.id, "Answer.", "project");
     expect(s.binding(binding.id)!.guidance).toMatchObject([{ text: "Answer.", by: "project" }]);
     expect(s.pendingDeliveries()).toEqual([]);
+  });
+});
+
+// BB-184: the footer toggle remembers the navigation provider it replaced in
+// one string setting per server, so turning the stewards list off restores it.
+describe("the server settings", () => {
+  it("keep one value per key and replace it on write", () => {
+    const { s } = store();
+    expect(s.serverSetting("sidebar.navigationRestore")).toBeNull();
+    s.setServerSetting("sidebar.navigationRestore", "navigation/top-list");
+    expect(s.serverSetting("sidebar.navigationRestore")).toBe("navigation/top-list");
+    s.setServerSetting("sidebar.navigationRestore", "navigation/rail");
+    expect(s.serverSetting("sidebar.navigationRestore")).toBe("navigation/rail");
+    expect(s.serverSetting("another-key")).toBeNull();
   });
 });
