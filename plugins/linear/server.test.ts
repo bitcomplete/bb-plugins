@@ -1528,11 +1528,13 @@ describe("agent sessions", () => {
       handed.push(args.input as Record<string, unknown>);
       return route(args.input as Record<string, unknown>);
     });
-    const list = vi.fn(async ({ threadId }: { threadId: string }) =>
-      turns
-        .filter((t) => t.threadId === threadId)
-        .reverse()
-        .map((t, i) => ({ id: `e${i}`, threadId, createdAt: t.createdAt, type: "client/turn/start", data: { initiator: "plugin", request: { params: { input: [{ type: "text", text: t.text }] } } } })),
+    const list = vi.fn(async ({ threadId, types }: { threadId: string; types?: string[] }) =>
+      types !== undefined && !types.includes("client/turn/requested")
+        ? []
+        : turns
+            .filter((t) => t.threadId === threadId)
+            .reverse()
+            .map((t, i) => ({ id: `e${i}`, threadId, createdAt: t.createdAt, type: "client/turn/requested", data: { initiator: "plugin", input: [{ type: "text", text: t.text }] } })),
     );
     const s = await setup({ token: "at-0", env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer }, hooks, sdk: { plugins: { callRpc }, threads: { events: { list } } } as never });
     await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS });
@@ -1773,6 +1775,20 @@ describe("agent sessions", () => {
     await s.tool("linear_session_reply", { session: "sess-2", kind: "response", body: "Done." }, { threadId: "thr-steward", projectId: "prj-1" });
     await s.idle("thr-steward");
     expect(s.hooks.replies.map((r) => r.session)).toEqual(["sess-1", "sess-2"]);
+    await s.stop();
+  });
+
+  it("reads the handling turn from a client/turn/requested event's input", async () => {
+    // bb records a turn request with its input under `data.input`, so the
+    // backstop must find the session there, not in the old `request.params`.
+    const s = await sessions();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    s.turn("thr-steward", "# Linear mention: ENG-123 … session sess-1 …");
+    await s.idle("thr-steward");
+    expect(s.hooks.replies.map((r) => r.body.kind)).toEqual(["error"]);
+    const listed = s.harness.sdk.callsTo("threads.events.list");
+    expect(listed.some((args) => (args[0] as { types?: string[] }).types?.includes("client/turn/requested"))).toBe(true);
     await s.stop();
   });
 
