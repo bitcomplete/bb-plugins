@@ -9,12 +9,19 @@
 // `bb.experimental_aiServices` (bb desktop-v0.44.0 and later; plugin services
 // are listed in Automatic since desktop-v0.45.0).
 import type { BbPluginApi, PluginAiServiceStatus } from "@get-bb/plugin-sdk";
+import {
+  DEFAULT_BASE_URL,
+  DEFAULT_MODEL,
+  resolveApiKey,
+  settingDefaults,
+  type Env,
+} from "./config.js";
+
+export { DEFAULT_BASE_URL, DEFAULT_MODEL };
 
 export const PLUGIN_ID = "voice-transcription";
 /** Stable service id: the picker names it `voice-transcription:openai-compatible`. */
 export const SERVICE_ID = "openai-compatible";
-/** The OpenAI endpoint. Left here, an empty key is refused (see `statusFor`). */
-export const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 /** Appended to `baseUrl`; both carry no trailing slash. */
 export const TRANSCRIBE_PATH = "/audio/transcriptions";
 /** OpenAI's audio limit; refused before anything is sent. */
@@ -26,37 +33,45 @@ export const NOT_CONFIGURED_MESSAGE =
 export const MISSING_KEY_MESSAGE =
   "Set the API key in Settings → Plugins → Voice transcription";
 
-export const SETTING_DESCRIPTORS = {
-  baseUrl: {
-    type: "string",
-    label: "Endpoint base URL",
-    description:
-      "No trailing slash; /audio/transcriptions is appended. Defaults to OpenAI; point it at Groq, Mistral, OpenRouter, Fireworks or a self-hosted Whisper server to use those.",
-    default: DEFAULT_BASE_URL,
-  },
-  apiKey: {
-    type: "string",
-    label: "API key",
-    description:
-      "Sent only as `Authorization: Bearer` to the endpoint above, and never to the frontend. Leave empty for a self-hosted server with no auth.",
-    secret: true,
-    default: "",
-  },
-  model: {
-    type: "string",
-    label: "Model",
-    description:
-      "Passed through verbatim: gpt-4o-transcribe, gpt-4o-mini-transcribe, whisper-1, whisper-large-v3-turbo, voxtral-mini-latest, …",
-    default: "gpt-4o-transcribe",
-  },
-  language: {
-    type: "string",
-    label: "Language",
-    description:
-      "ISO-639-1 code such as `en`. Empty lets the endpoint auto-detect.",
-    default: "",
-  },
-} as const;
+/**
+ * The settings form's descriptors, with the deployment's base URL and model
+ * as defaults. The key has no default and is never read from the environment
+ * here: it is resolved at use, in `status` and `transcribe`, so its value
+ * never reaches the frontend. See `config.ts`.
+ */
+export function settingDescriptors(env: Env) {
+  const defaults = settingDefaults(env);
+  return {
+    baseUrl: {
+      type: "string",
+      label: "Endpoint base URL",
+      description:
+        "No trailing slash; /audio/transcriptions is appended. Defaults to OpenAI; point it at Groq, Mistral, OpenRouter, Fireworks or a self-hosted Whisper server to use those. Unset, the server's VOICE_TRANSCRIPTION_BASE_URL is used when the deployment sets one.",
+      default: defaults.baseUrl,
+    },
+    apiKey: {
+      type: "string",
+      label: "API key",
+      description:
+        "Sent only as `Authorization: Bearer` to the endpoint above, and never to the frontend. Leave empty for a self-hosted server with no auth. Unset, the server's VOICE_TRANSCRIPTION_API_KEY is used when the deployment sets one.",
+      secret: true,
+    },
+    model: {
+      type: "string",
+      label: "Model",
+      description:
+        "Passed through verbatim: gpt-4o-transcribe, gpt-4o-mini-transcribe, whisper-1, whisper-large-v3-turbo, voxtral-mini-latest, … Unset, the server's VOICE_TRANSCRIPTION_MODEL is used when the deployment sets one.",
+      default: defaults.model,
+    },
+    language: {
+      type: "string",
+      label: "Language",
+      description:
+        "ISO-639-1 code such as `en`. Empty lets the endpoint auto-detect.",
+      default: "",
+    },
+  } as const;
+}
 
 /** The extensions a Whisper-family server reads to pick a decoder. */
 const AUDIO_EXTENSION_BY_MIME: Record<string, string> = {
@@ -157,12 +172,16 @@ function retryable(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-export function createVoiceTranscriptionPlugin() {
+export function createVoiceTranscriptionPlugin(env: Env = process.env) {
   return async function plugin(bb: BbPluginApi): Promise<void> {
-    const settings = bb.settings.define(SETTING_DESCRIPTORS);
+    const settings = bb.settings.define(settingDescriptors(env));
 
     async function status(): Promise<PluginAiServiceStatus> {
-      return statusFor(await settings.get());
+      const values = await settings.get();
+      return statusFor({
+        ...values,
+        apiKey: resolveApiKey(values.apiKey, env) ?? "",
+      });
     }
 
     async function transcribe(
@@ -178,7 +197,7 @@ export function createVoiceTranscriptionPlugin() {
           `Recordings over ${MAX_AUDIO_BYTES / (1024 * 1024)} MB are too large for ${baseUrl}`,
         );
       }
-      const apiKey = values.apiKey.trim();
+      const apiKey = resolveApiKey(values.apiKey, env) ?? "";
       const language = values.language.trim();
       const file = new File([audio], audioFileName(audio), { type: audio.type });
       const form = new FormData();
