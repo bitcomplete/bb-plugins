@@ -551,6 +551,15 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("uses the compose glyph and names the active project in the New thread tooltip (BB-171)", async () => {
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData() });
+    const button = await waitFor(() => slot.getByRole("button", { name: "New thread" }));
+    expect(button.getAttribute("title")).toBe("New thread in Acme");
+    expect(button.querySelector('[data-icon="MessageSquarePlus"]')).not.toBeNull();
+    expect(button.querySelector('[data-icon="Plus"]')).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   it("offers the same action labels on the page and in the sidebar for one item (BB-122)", async () => {
     const item = need({ id: "need_spec", kind: "approve-spec", key: "ENG-1", what: "Approve the spec", entityUrl: "https://linear.app/acme/issue/ENG-1" });
     const page = await renderBoard([item], []);
