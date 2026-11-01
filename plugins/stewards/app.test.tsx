@@ -379,6 +379,20 @@ describe("the sidebar-footer toggle (BB-45)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("keeps the remembered navigation when the navigation already reads as the stewards one", async () => {
+    const { slot, set, setRestore, getRestore } = await renderToggle({ thread: { value: "thread-list/thread-list", revision: 7 }, navigation: { value: "stewards/navigation", revision: 5 }, stored: "navigation/top-list", set: echo });
+    fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    // The list was turned off in Settings with the navigation left on Stewards:
+    // the real previous value is not overwritten.
+    expect(setRestore).not.toHaveBeenCalled();
+    fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(4));
+    expect(getRestore).toHaveBeenCalled();
+    expect(set.mock.calls[3]![0]).toEqual({ key: "sidebar.navigationProvider", value: "navigation/top-list", expectedRevision: 6 });
+    slot.lifecycle.unmount();
+  });
+
   it("turns the stewards list off and restores the remembered navigation", async () => {
     const { slot, set, getRestore } = await renderToggle({ thread: { value: "stewards/sidebar", revision: 3 }, navigation: { value: "stewards/navigation", revision: 8 }, stored: "navigation/top-list", set: echo });
     fireEvent.click(await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" })));

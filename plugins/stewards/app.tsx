@@ -2854,18 +2854,24 @@ function SidebarToggle() {
     const next = !state.on;
     setBusy(true);
     try {
-      let restore: string;
+      let navigationValue: string;
       if (next) {
         // Remember the navigation the user had, treating the unpinned value as
-        // bb's rail (the load-time pin normally makes it explicit already).
-        restore = state.navigationValue === undefined || state.navigationValue === AUTOMATIC_NAVIGATION_PROVIDER ? BUILTIN_NAVIGATION_ID : state.navigationValue;
-        await rpc.call("stewardsSetNavigationRestore", { value: restore });
+        // bb's rail (the load-time pin normally makes it explicit already). When
+        // the navigation already reads as the stewards provider (the list was
+        // turned off in Settings and the navigation left alone), keep whatever
+        // the store remembers rather than saving the stewards id over it, or a
+        // later off could never bring the host New thread row back.
+        if (state.navigationValue !== navigationId) {
+          const remembered = state.navigationValue === undefined || state.navigationValue === AUTOMATIC_NAVIGATION_PROVIDER ? BUILTIN_NAVIGATION_ID : state.navigationValue;
+          await rpc.call("stewardsSetNavigationRestore", { value: remembered });
+        }
+        navigationValue = navigationId;
       } else {
         const saved = await rpc.call("stewardsNavigationRestore", null);
-        restore = saved.value ?? BUILTIN_NAVIGATION_ID;
+        navigationValue = saved.value ?? BUILTIN_NAVIGATION_ID;
       }
       const threadRevision = await writePreference(THREAD_LIST_PROVIDER_KEY, next ? onId : BUILTIN_THREAD_LIST_ID, state.threadRevision);
-      const navigationValue = next ? navigationId : restore;
       const navigationRevision = await writePreference(NAVIGATION_PROVIDER_KEY, navigationValue, state.navigationRevision);
       setState({ status: "ready", on: next, threadRevision, navigationRevision, navigationValue });
     } catch (error) {
