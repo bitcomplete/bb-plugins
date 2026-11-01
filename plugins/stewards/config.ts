@@ -660,6 +660,28 @@ export function watchProblems(project: ProjectFile, roles: RolesFile, repos: rea
   return problems;
 }
 
+/**
+ * The role names whose definitions produce each of a holder's target keys: what
+ * `bb stewards list` and the board attribute a binding to. A login with no
+ * roles, or a target no role owns, maps to nothing.
+ */
+export function bindingRoles(roles: RolesFile | null, login: string | null, repos: readonly string[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  if (roles === null || login === null) return out;
+  for (const name of roles.holders[login] ?? []) {
+    if (name === PROJECT_STEWARD_ROLE) continue;
+    const definition = roles.definitions[name];
+    if (definition === undefined) continue;
+    const role: Role = { projectSteward: false, ops: definition };
+    for (const target of [...roleOpsTargets(role), ...roleDepsTargets(role, repos)]) {
+      const key = opsTargetKey(target);
+      const list = out.get(key) ?? [];
+      if (!list.includes(name)) out.set(key, [...list, name]);
+    }
+  }
+  return out;
+}
+
 /** The project steward count problem, or null when exactly one holder holds it. */
 export function projectStewardProblem(roles: RolesFile): string | null {
   const stewards = Object.entries(roles.roles).filter(([, role]) => role.projectSteward).map(([login]) => login);

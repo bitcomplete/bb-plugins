@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  bindingRoles,
   depsTargets,
   isTerminal,
   k8sTargets,
@@ -552,6 +553,14 @@ describe("roles.json version 2 (BB-163)", () => {
     const parsed = v2({ ops: { k8sNamespaces: ["prod"] }, unused: {} }, { alice: ["ops"] });
     if (!parsed.ok) throw new Error(parsed.error);
     expect(roleWarnings(parsed.value)).toEqual(['role "unused" has no holder']);
+  });
+
+  it("attributes each target key to the role whose definition owns it", () => {
+    const parsed = v2({ web: { k8sNamespaces: ["web-production"] }, db: { k8sNamespaces: ["db-production"] } }, { alice: ["web", "db"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    const map = bindingRoles(parsed.value, "alice", []);
+    expect(map.get("k8s-namespace/web-production")).toEqual(["web"]);
+    expect(map.get("k8s-namespace/db-production")).toEqual(["db"]);
   });
 
   it("refuses a definition for the built-in projectSteward role, a missing holders map, and an empty holder list", () => {

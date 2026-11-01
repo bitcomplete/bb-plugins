@@ -658,7 +658,9 @@ no definition. A login's effective role is the merge of the roles it holds,
 and every server runs only its own effective role: a login with no entry runs
 no watches and is not the project steward for the project, and its home page
 says `No role for <login> in roles.json`. `bb stewards check`, `bb stewards
-list` and the Stewards page name the roles a server runs, not only its login.
+list` and the Stewards page name the roles a server runs, and `list` and the
+page attribute each ops or Dependabot binding to the role whose definition
+owns its target, not only the login.
 Ticket, labelled-pull-request and review adoption need no entry: they follow
 the Linear assignee, the GitHub author and the GitHub requested reviewer, with
 or without a `roles.json`, and a login that cannot be read adopts nothing and

@@ -9619,6 +9619,21 @@ describe("roles.json version 2 (BB-163)", () => {
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { roleNames: string[] } };
     expect(board.board.roleNames).toEqual(["ops", "projectSteward"]);
   });
+
+  it("attributes each binding to the role whose definition owns its target", async () => {
+    const t = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v2({ web: { k8sNamespaces: ["web-production"] }, db: { k8sNamespaces: ["db-production"] } }, { jane: ["web", "db", "projectSteward"] });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
+    expect(list.stdout).toMatch(/k8s-namespace\/web-production — ops, watching, role web/u);
+    expect(list.stdout).toMatch(/k8s-namespace\/db-production — ops, watching, role db/u);
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; roles: string[] }> } };
+    const byKey = new Map(board.board.stewards.map((s) => [s.key, s.roles]));
+    expect(byKey.get("k8s-namespace/web-production")).toEqual(["web"]);
+    expect(byKey.get("k8s-namespace/db-production")).toEqual(["db"]);
+  });
 });
 
 // BB-115: adoption follows one human-set owner per kind of work, with or

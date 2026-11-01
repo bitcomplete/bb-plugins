@@ -26,6 +26,7 @@ import {
   KINDS,
   PROJECT_FILE,
   ROLES_FILE,
+  bindingRoles,
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
   durationSchema,
@@ -585,6 +586,8 @@ export const rpcContract = defineRpcContract({
               ending: z.string().nullable(),
               statusAt: z.number().nullable(),
               createdAt: z.number(),
+              /** The role name(s) whose definition owns this binding's target (BB-163); empty for a binding under no role. Optional so a client built from the previous image still validates. */
+              roles: z.array(z.string()).optional(),
               /** The running-worker count; the query already filters to workers whose status is running. */
               workers: z.number(),
               escalations: z.array(z.object({ kind: z.string(), route: z.string(), question: z.string() })),
@@ -698,6 +701,8 @@ export const rpcContract = defineRpcContract({
               /** The last wake, shown on an ops monitor row. */
               wokeAt: z.number().nullable(),
               advancedAt: z.number().nullable(),
+              /** The role name(s) whose definition owns this binding's target (BB-163); empty for a binding under no role. Optional so a client built from the previous image still validates. */
+              roles: z.array(z.string()).optional(),
               /** The running workers, each a link; the count is their length. */
               workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
             }),
@@ -6030,6 +6035,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const row = store.project(projectId);
           const bindings = store.all(projectId);
           const open = bindings.filter((b) => b.endedAt === null);
+          const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
           return {
             projectId,
             name: named.get(projectId) ?? projectId,
@@ -6059,6 +6065,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               title: b.title,
               kind: b.kind,
               phase: b.phase,
+              roles: roleMap.get(b.entityId) ?? [],
               threadId: b.threadId,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
@@ -6117,6 +6124,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = all.filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS).sort((a, b) => b.endedAt! - a.endedAt!).slice(0, 30);
+        const boardConfig = configs.find((c) => c.projectId === projectId) ?? null;
+        const roleMap = bindingRoles(boardConfig?.roles ?? null, boardConfig?.githubLogin === null || boardConfig?.githubLogin === undefined ? null : lc(boardConfig.githubLogin), boardConfig?.repos ?? []);
         return {
           projects,
           board: {
@@ -6125,7 +6134,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             enabled: picked.enabled,
             paused: (await settings.get()).paused,
             projectStewardThreadId: row.threadId,
-            roleNames: configs.find((c) => c.projectId === projectId)?.roleNames ?? [],
+            roleNames: boardConfig?.roleNames ?? [],
             stages: [...STAGES],
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
             questions,
@@ -6148,6 +6157,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               phase: b.phase,
               // Ops bindings have no stage of their own; the page groups them as watching.
               stage: b.kind === "ops" ? "watch" : b.stage,
+              roles: roleMap.get(b.entityId) ?? [],
               threadId: b.threadId,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
@@ -7877,11 +7887,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
     }
 
-    function formatBindings(rows: Binding[]): string {
+    /** `rolesFor` names the role(s) whose definition owns a binding's target, for `bb stewards list` (BB-163). */
+    function formatBindings(rows: Binding[], rolesFor?: (b: Binding) => string[]): string {
       if (rows.length === 0) return "No bindings.";
       return rows
         .map((b) => {
           const s = b.status;
+          const roles = rolesFor?.(b) ?? [];
           const open = store.openEscalations(b.id);
           const look = b.opsLook;
           const sentry = b.sentryLook;
@@ -7897,7 +7909,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
           const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
-          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
+          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
     }
@@ -8743,9 +8755,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // With a project, its own line; without one, name every configured
               // project this server has switched off, so a bare list still says.
               const config = projectId === undefined ? null : await loadConfig(projectId);
+              const configs = projectId === undefined ? await configuredProjects() : config === null ? [] : [config];
               const offProjects =
                 projectId === undefined
-                  ? (await configuredProjects()).filter((c) => !c.enabled).map((c) => c.projectId)
+                  ? configs.filter((c) => !c.enabled).map((c) => c.projectId)
                   : config?.enabled === false
                     ? [projectId]
                     : [];
@@ -8753,9 +8766,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // The role this server runs, so the bindings below are read under
               // their role name, not only the login (BB-163).
               const roleLine = config === null ? [] : [`roles: ${roleSummary(config)}`];
+              // Each binding is attributed to the role whose definition owns its
+              // target, so a holder of several roles reads which role each is.
+              const roleMaps = new Map(configs.map((c) => [c.projectId, bindingRoles(c.roles, c.githubLogin === null ? null : lc(c.githubLogin), c.repos)]));
+              const rolesFor = (b: Binding): string[] => roleMaps.get(b.projectId)?.get(b.entityId) ?? [];
               const lessons = projectId === undefined ? [] : store.lessons(projectId).filter((l) => l.tier !== "retired");
               const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
-              return { exitCode: 0, stdout: [...offLine, ...roleLine, formatBindings(rows), ...lessonLines].join("\n") };
+              return { exitCode: 0, stdout: [...offLine, ...roleLine, formatBindings(rows, rolesFor), ...lessonLines].join("\n") };
             },
           }),
 
@@ -8838,7 +8855,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const config = await loadConfig(b.projectId);
               const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
-              const lines = [formatBindings([b]), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
+              const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
+              const lines = [formatBindings([b], (x) => roleMap.get(x.entityId) ?? []), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
               if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
               if (b.kind !== "ops") {
                 const conflicts = conflictsOf(b, store.open(b.projectId));
