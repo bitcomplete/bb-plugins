@@ -674,6 +674,31 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("archives an errored thread but skips one already archived or deleted", async () => {
+    let spawned = 0;
+    const threads: Record<string, unknown> = {
+      "thr-1": { status: "error", archivedAt: null, deletedAt: null, pinnedAt: null },
+      "thr-2": { status: "idle", archivedAt: 5, deletedAt: null, pinnedAt: null },
+      "thr-3": { status: "idle", archivedAt: null, deletedAt: 5, pinnedAt: null },
+    };
+    const s = await live({
+      spawn: () => ({ id: `thr-${++spawned}` }),
+      get: ({ threadId }) => threads[threadId] ?? { title: "x", titleFallback: null },
+    });
+    for (const session of ["D1:1.1", "D2:2.2", "D3:3.3"]) {
+      const [channel, thread] = session.split(":");
+      s.hooks.last().send(s.hooks.session({ session, channel, thread, capability: `cap-${session}` }));
+      await tick();
+    }
+    s.advance(49 * 60 * 60 * 1000);
+    const service = s.harness.runService("archive-idle");
+    await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+    expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }]);
+    service.controller.abort();
+    await service.done;
+    await s.stop();
+  });
+
   it("does not archive when archiveIdleHours is 0", async () => {
     const s = await live({ get: () => ({ status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null }) });
     s.hooks.last().send(s.hooks.session({ capability: "cap" }));
@@ -735,9 +760,8 @@ describe("Slack plugin", () => {
     const service = s.harness.runService("archive-idle");
     await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
     expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }]);
-    // Archiving fires the event that clears the conversation's mapping.
-    await s.harness.behavior.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
-    await tick();
+    // The sweep clears the conversation's mapping itself; the test does not
+    // emit `thread.archived`, so revival does not depend on that event arriving.
     // A follow-up in the same conversation starts a new bb thread.
     s.hooks.last().send(s.hooks.session({ capability: "cap", comment: { text: "still there?", untrusted: false } }));
     await tick();

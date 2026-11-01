@@ -73,8 +73,9 @@ export const FILE_FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * How long a Slack conversation may sit idle before the archive sweep takes
- * its bb thread, unless `archiveIdleHours` says otherwise. Half the sweep's
- * cadence, so a thread is archived within half a day of crossing it.
+ * its bb thread, unless `archiveIdleHours` says otherwise. The sweep runs
+ * every twelve hours, so a thread is archived within half a day of crossing
+ * the threshold.
  */
 export const DEFAULT_ARCHIVE_IDLE_HOURS = 48;
 /** The archive sweep's cadence. */
@@ -1715,7 +1716,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           // A thread still active, starting or stopping is left for the next
           // sweep; only an idle or errored one is finished with the conversation.
           if (thread.status !== "idle" && thread.status !== "error") continue;
+          // A message that arrived while the thread was being read refreshed the
+          // session (or moved it to a new thread). Leave it for the next sweep
+          // rather than archive a thread that is in use again.
+          const current = sessions.get(session);
+          if (current === undefined || current.threadId !== threadId || current.eventAt !== record.eventAt) continue;
           await bb.sdk.threads.archive({ threadId });
+          // Do not depend on core delivering `thread.archived` back to the
+          // plugin that asked for the archive: clear the mapping here too. The
+          // event handler is idempotent, so a later event changes nothing.
+          forgetThread(threadId);
           bb.log.info(`Slack: archived thread ${threadId} after ${hours}h idle for session ${sessionLogId(session)}`);
         } catch (error) {
           // A read or archive that failed leaves the session in place; the next
