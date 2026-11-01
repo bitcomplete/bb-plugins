@@ -1,6 +1,6 @@
 import { createFakePluginHost, makeMessageDispatchHookContext } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, FILE_FETCH_TIMEOUT_MS, legacySettingDescriptors, projectPromptBlocks, SET_PROJECT_ACTION, SET_PROJECT_BUTTON_ACTION } from "./server.js";
+import serverEntry, { ARCHIVE_SWEEP_INTERVAL_MS, ARCHIVE_SWEEP_STARTUP_DELAY_MS, ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, FILE_FETCH_TIMEOUT_MS, legacySettingDescriptors, projectPromptBlocks, SET_PROJECT_ACTION, SET_PROJECT_BUTTON_ACTION } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
@@ -230,7 +230,9 @@ async function setup(
     deleteQueued?: (args: { threadId: string; queuedMessageId: string }) => unknown;
     /** What the dispatch hook reports for a `threads.send`: joined or started. */
     sendAttempt?: "join-turn" | "start-turn";
-    get?: () => unknown;
+    get?: (args: { threadId: string }) => unknown;
+    /** What a `threads.archive` returns; a throw simulates a failed archive. */
+    archive?: (args: { threadId: string }) => unknown;
     turns?: Array<{ createdAt: number; data: unknown }>;
   } = {},
 ) {
@@ -281,7 +283,8 @@ async function setup(
           update: async (args: { threadId: string; queuedMessageId: string; expectedUpdatedAt: number; input: Array<{ type: string; text?: string }> }) => options.updateQueued?.(args) ?? { id: args.queuedMessageId, updatedAt: args.expectedUpdatedAt + 1 },
           delete: async (args: { threadId: string; queuedMessageId: string }) => options.deleteQueued?.(args) ?? { ok: true },
         },
-        get: async () => options.get?.() ?? { title: "Build BB-38", titleFallback: null },
+        get: async (args: { threadId: string }) => options.get?.(args) ?? { title: "Build BB-38", titleFallback: null },
+        archive: async (args: { threadId: string }) => options.archive?.(args) ?? { ok: true },
         events: { list: async () => options.turns ?? [] },
       },
     },
@@ -741,6 +744,149 @@ describe("Slack plugin", () => {
     await s.harness.behavior.emitThreadEvent("thread.deleted", { thread: { id: "thr-2" } as never });
     await tick(30 * 60 * 1000);
     expect(s.hooks.subscribes).toHaveLength(before);
+    await s.stop();
+  });
+
+  it("archives an idle session's thread, leaving a younger, a pinned, an active and a held one", async () => {
+    let spawned = 0;
+    const threads: Record<string, unknown> = {
+      // thr-1 is the only one that may be archived: thr-2 is pinned, thr-3 is
+      // still active, thr-4 has a request waiting on the owner and thr-5's
+      // conversation is younger than the threshold.
+      "thr-1": { status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null },
+      "thr-2": { status: "idle", archivedAt: null, deletedAt: null, pinnedAt: 5 },
+      "thr-3": { status: "active", archivedAt: null, deletedAt: null, pinnedAt: null },
+      "thr-4": { status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null },
+      "thr-5": { status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null },
+    };
+    const s = await live({
+      spawn: () => ({ id: `thr-${++spawned}` }),
+      get: ({ threadId }) => threads[threadId] ?? { title: "x", titleFallback: null },
+    });
+    const wake = async (session: string, over: Record<string, unknown> = {}) => {
+      const [channel, thread] = session.split(":");
+      s.hooks.last().send(s.hooks.session({ session, channel, thread, capability: `cap-${session}`, ...over }));
+      await tick();
+    };
+    await wake("D1:1.1");
+    await wake("D3:3.3");
+    await wake("D4:4.4");
+    await wake("D5:5.5");
+    // D5 gets a message from someone other than the owner, held for confirmation.
+    s.hooks.last().send(s.hooks.session({ session: "D5:5.5", channel: "D5", thread: "5.5", capability: "cap-D5:5.5", fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "halt", untrusted: true } }));
+    await tick();
+    // A younger conversation an hour later.
+    s.advance(60 * 60 * 1000);
+    await wake("D2:2.2");
+    // Forty-eight more hours: the four are past the threshold, D2 is exactly on it.
+    s.advance(48 * 60 * 60 * 1000);
+    const service = s.harness.runService("archive-idle");
+    await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+    expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }]);
+    service.controller.abort();
+    await service.done;
+    await s.stop();
+  });
+
+  it("archives an errored thread but skips one already archived or deleted", async () => {
+    let spawned = 0;
+    const threads: Record<string, unknown> = {
+      "thr-1": { status: "error", archivedAt: null, deletedAt: null, pinnedAt: null },
+      "thr-2": { status: "idle", archivedAt: 5, deletedAt: null, pinnedAt: null },
+      "thr-3": { status: "idle", archivedAt: null, deletedAt: 5, pinnedAt: null },
+    };
+    const s = await live({
+      spawn: () => ({ id: `thr-${++spawned}` }),
+      get: ({ threadId }) => threads[threadId] ?? { title: "x", titleFallback: null },
+    });
+    for (const session of ["D1:1.1", "D2:2.2", "D3:3.3"]) {
+      const [channel, thread] = session.split(":");
+      s.hooks.last().send(s.hooks.session({ session, channel, thread, capability: `cap-${session}` }));
+      await tick();
+    }
+    s.advance(49 * 60 * 60 * 1000);
+    const service = s.harness.runService("archive-idle");
+    await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+    expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }]);
+    service.controller.abort();
+    await service.done;
+    await s.stop();
+  });
+
+  it("does not archive when archiveIdleHours is 0", async () => {
+    const s = await live({ get: () => ({ status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap" }));
+    await tick();
+    await s.harness.behavior.setSettings({ archiveIdleHours: 0 });
+    s.advance(49 * 60 * 60 * 1000);
+    const service = s.harness.runService("archive-idle");
+    await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+    expect(s.harness.sdk.callsTo("threads.archive")).toEqual([]);
+    service.controller.abort();
+    await service.done;
+    await s.stop();
+  });
+
+  it("leaves a session for the next sweep when reading or archiving its thread fails", async () => {
+    let mode: "get-fails" | "archive-fails" | "ok" = "get-fails";
+    const s = await live({
+      get: () => {
+        if (mode === "get-fails") throw new Error("read failed");
+        return { status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null };
+      },
+      archive: () => {
+        if (mode === "archive-fails") throw new Error("archive failed");
+        return { ok: true };
+      },
+    });
+    s.hooks.last().send(s.hooks.session({ capability: "cap" }));
+    await tick();
+    s.advance(49 * 60 * 60 * 1000);
+    const service = s.harness.runService("archive-idle");
+    await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+    // The read failed: nothing archived, and the failure is logged, not thrown.
+    expect(s.harness.sdk.callsTo("threads.archive")).toEqual([]);
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).toContain("could not archive idle thread");
+    // The read works now but the archive fails; the session stays for the next sweep.
+    mode = "archive-fails";
+    await tick(ARCHIVE_SWEEP_INTERVAL_MS);
+    expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }]);
+    // The sweep after that archives it.
+    mode = "ok";
+    await tick(ARCHIVE_SWEEP_INTERVAL_MS);
+    expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }, { threadId: "thr-1" }]);
+    service.controller.abort();
+    await service.done;
+    await s.stop();
+  });
+
+  it("revives an archived conversation as a new thread and replies in the same Slack thread", async () => {
+    let spawned = 0;
+    const s = await live({
+      spawn: () => ({ id: `thr-${++spawned}` }),
+      get: () => ({ status: "idle", archivedAt: null, deletedAt: null, pinnedAt: null }),
+    });
+    const session = "D0123:1712345678.901234";
+    s.hooks.last().send(s.hooks.session({ capability: "cap" }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    s.advance(49 * 60 * 60 * 1000);
+    const service = s.harness.runService("archive-idle");
+    await tick(ARCHIVE_SWEEP_STARTUP_DELAY_MS);
+    expect(s.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: "thr-1" }]);
+    // The sweep clears the conversation's mapping itself; the test does not
+    // emit `thread.archived`, so revival does not depend on that event arriving.
+    // A follow-up in the same conversation starts a new bb thread.
+    s.hooks.last().send(s.hooks.session({ capability: "cap", comment: { text: "still there?", untrusted: false } }));
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    expect((spawns[1]![0] as { projectId: string }).projectId).toBe("prj-2");
+    // And the reply still lands in the same Slack conversation.
+    await s.tool("slack_reply", { text: "yes" }, { threadId: "thr-2" });
+    expect(s.hooks.messages.at(-1)?.session).toBe(session);
+    service.controller.abort();
+    await service.done;
     await s.stop();
   });
 
@@ -2310,7 +2456,7 @@ describe("Slack plugin", () => {
     expect(old.channels).toBe(JSON.stringify([{ channel: "C0123", project: "Project Two" }, { channel: "dm", project: "Personal" }]));
   });
 
-  it("never puts the token in the status or a settings RPC, and declares no settings after the migration", async () => {
+  it("never puts the token in the status or a settings RPC, and declares only its own setting after the migration", async () => {
     const s = await live({ token: "xoxp-secret-token" });
     const status = (await s.harness.callRpc("status")) as Record<string, unknown>;
     expect(status).not.toHaveProperty("token");
@@ -2319,9 +2465,10 @@ describe("Slack plugin", () => {
     expect(JSON.stringify(await s.harness.callRpc("setMap", { fallback: "Project One", channels: [] }))).not.toContain("xoxp-secret-token");
     expect(JSON.stringify(await s.harness.callRpc("searchChannels", { query: "" }))).not.toContain("xoxp-secret-token");
     // The migration declares the old descriptors only on its own load; a later
-    // load declares none, so bb core's declarative settings panel is empty.
+    // load declares only the plugin's own setting, so the token and the map are
+    // not in bb core's declarative settings panel.
     const next = await s.harness.lifecycle.reload(s.factory);
-    expect(next.harness.registrations.settingsDescriptors).toEqual({});
+    expect(Object.keys(next.harness.registrations.settingsDescriptors)).toEqual(["archiveIdleHours"]);
     await s.stop();
   });
 });
