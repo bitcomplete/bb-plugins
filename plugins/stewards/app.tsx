@@ -17,6 +17,7 @@ import {
   ThreadTitle,
   definePluginApp,
   experimental_Icon as Icon,
+  experimental_ShortcutHint as ShortcutHint,
   experimental_SidebarNavigationIcon as SidebarNavigationIcon,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
   experimental_ThreadActionsMenu as ThreadActionsMenu,
@@ -42,6 +43,7 @@ import type { rpcContract } from "./server";
 import { PROJECT_CHANGED } from "./channels.js";
 import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
+import { setStewardsSidebarCommand, getStewardsSidebarCommand } from "./sidebar-command.js";
 import { readLastPlace, writeLastPlace } from "./last-place.js";
 import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import {
@@ -2113,7 +2115,7 @@ const SidebarCollapsible = memo(function SidebarCollapsible({ title, count, reve
  * closes through Radix's own dismissal. Presentational only: `onPick` is the
  * parent's stable callback, so the memo (BB-95) still holds.
  */
-const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
+const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompactViewport, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; isCompactViewport: boolean; onPick: (projectId: string) => void; onNewThread: () => void }) {
   const activeIndex = tabs.findIndex((t) => t.projectId === activeId);
   const active = tabs[activeIndex === -1 ? 0 : activeIndex];
   const activeCount = active === undefined ? 0 : counts.get(active.projectId) ?? 0;
@@ -2122,8 +2124,25 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, 
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
+  // BB-188: where focus was when the command opened the picker, restored on
+  // close. Null for a click-open, so Radix's own focus return to the trigger
+  // stands.
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
   const scope = usePortalScopeProps();
   const rows = () => Array.from(listRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? []);
+  // Open the picker and move focus into it (BB-188). The command runs outside
+  // React, so `ProjectTabs` publishes this through the module store.
+  const openPicker = useCallback(() => {
+    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setHighlight(activeIndex === -1 ? 0 : activeIndex);
+    setOpen(true);
+  }, [activeIndex]);
+  // BB-188: the plugin's commands read the picker and the compose path from
+  // here; a null handle while the list is unmounted is `isAvailable`'s test.
+  useEffect(() => {
+    setStewardsSidebarCommand({ projectId: activeId, openPicker, compose: onNewThread });
+    return () => setStewardsSidebarCommand(null);
+  }, [activeId, openPicker, onNewThread]);
   // Move focus to the row `delta` away from the focused one, wrapping. The
   // highlighted row is the active project when the popover opens.
   const move = (delta: number) => {
@@ -2143,6 +2162,16 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, 
       // focused button's own click does not fire a second time.
       const projectId = (document.activeElement as HTMLElement | null)?.getAttribute("data-project-id");
       if (projectId) { event.preventDefault(); onPick(projectId); setOpen(false); }
+    } else if (/^[1-9]$/u.test(event.key)) {
+      // BB-188: the digit picks the row at that position. A digit past the
+      // last project is not consumed; one that names a row stops propagating
+      // so the host's own digit bindings never see it.
+      const target = tabs[Number(event.key) - 1];
+      if (target === undefined) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onPick(target.projectId);
+      setOpen(false);
     }
   };
   return (
@@ -2177,6 +2206,17 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, 
               event.preventDefault();
               rows()[activeIndex === -1 ? 0 : activeIndex]?.focus();
             }}
+            onCloseAutoFocus={(event) => {
+              // BB-188: an Escape (or pick) after the command returns focus to
+              // where it was before the command ran; a click-open leaves the
+              // ref null and Radix focuses the trigger as before.
+              const restore = restoreFocusRef.current;
+              restoreFocusRef.current = null;
+              if (restore !== null && restore.isConnected) {
+                event.preventDefault();
+                restore.focus();
+              }
+            }}
             onKeyDown={onKeyDown}
             className="z-50 w-[var(--radix-popover-trigger-width)] min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
           >
@@ -2202,6 +2242,11 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, 
                     <Icon name="Folder" className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                     <span className="min-w-0 flex-1 truncate">{count > 0 ? `${t.name} (${count})` : t.name}</span>
                     {isActive ? <Icon name="Check" className="size-4 shrink-0" aria-hidden /> : null}
+                    {!isCompactViewport && index < 9 ? (
+                      <span aria-hidden="true" className="shrink-0">
+                        <ShortcutHint shortcut={{ ariaKeyshortcuts: String(index + 1), label: String(index + 1) }} />
+                      </span>
+                    ) : null}
                   </button>
                 );
               })}
@@ -2314,11 +2359,13 @@ function SidebarSkeleton() {
 function StewardsSidebarCore({
   activeProjectId,
   activeThreadId,
+  isCompactViewport,
   onNavigate,
   onNewThread,
 }: {
   activeProjectId: string | null;
   activeThreadId: string | null;
+  isCompactViewport: boolean;
   onNavigate: () => void;
   onNewThread: (projectId: string) => void;
 }) {
@@ -2620,6 +2667,7 @@ function StewardsSidebarCore({
         tabs={tabs}
         counts={counts}
         activeId={active?.projectId ?? null}
+        isCompactViewport={isCompactViewport}
         onPick={pick}
         onNewThread={newThread}
       />
@@ -2638,12 +2686,13 @@ function StewardsSidebarCore({
 }
 
 /** The opt-in sidebar thread list (BB-44): the shared list with the route's active thread. */
-function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: PluginThreadListProps) {
+function StewardsSidebar({ activeProjectId, activeThreadId, isCompactViewport, onNavigate }: PluginThreadListProps) {
   const navigate = useBbNavigate();
   return (
     <StewardsSidebarCore
       activeProjectId={activeProjectId}
       activeThreadId={activeThreadId}
+      isCompactViewport={isCompactViewport}
       onNavigate={onNavigate}
       onNewThread={(projectId) => {
         navigate.toCompose({ projectId, focusPrompt: true });
@@ -2905,6 +2954,18 @@ function SidebarToggle() {
 }
 
 export default definePluginApp((app) => {
+  // BB-188: a keyboard path to the project picker. The list publishes the
+  // picker through `sidebar-command.ts` because `run` executes outside React,
+  // and a null handle means the stewards list is not the sidebar.
+  app.commands.register({
+    id: "switch-project",
+    title: "Stewards: switch project",
+    defaultShortcut: { key: "k", mod: true, shift: true },
+    isAvailable: () => getStewardsSidebarCommand() !== null,
+    run: () => {
+      getStewardsSidebarCommand()?.openPicker();
+    },
+  });
   app.slots.navPanel({
     id: "board",
     title: "Stewards",

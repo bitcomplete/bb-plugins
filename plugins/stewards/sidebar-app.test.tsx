@@ -8,6 +8,7 @@ import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } 
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
 import { setBoardRoute } from "./board-route.js";
+import { setStewardsSidebarCommand } from "./sidebar-command.js";
 import { resetOpenPrHandoff, rowRenderCounts } from "./app.js";
 import { needActions, questionActions } from "./server.js";
 
@@ -219,6 +220,7 @@ afterEach(() => {
   vi.useRealTimers();
   resetOpenPrHandoff();
   setBoardRoute({ projectId: null, key: null });
+  setStewardsSidebarCommand(null);
   window.localStorage.clear();
   delete (document as unknown as { startViewTransition?: unknown }).startViewTransition;
 });
@@ -2296,5 +2298,167 @@ describe("the sidebar's loading state (BB-127)", () => {
       vi.useRealTimers();
       slot.lifecycle.unmount();
     }
+  });
+});
+
+// BB-188: ⌘⇧K opens and focuses the project picker, and digits 1–9 pick the
+// project at that position. The command runs outside React, so the list
+// publishes the picker through `sidebar-command.ts`.
+describe("the switch-project command (BB-188)", () => {
+  type CommandContext = { threadId: string | null; projectId: string | null; openPanel: (options: never) => boolean };
+  type CapturedCommand = {
+    id: string;
+    title: string;
+    defaultShortcut: Record<string, unknown> | null;
+    isAvailable?: (context: CommandContext) => boolean;
+    run: (context: CommandContext) => void;
+  };
+  const context: CommandContext = { threadId: null, projectId: null, openPanel: () => false };
+  const switchProjectCommand = async (): Promise<CapturedCommand> => {
+    const captured = await loadApp();
+    const commands = (captured as unknown as { commandPaletteActions: CapturedCommand[] }).commandPaletteActions;
+    const command = commands.find((c) => c.id === "switch-project");
+    if (command === undefined) throw new Error("switch-project is not registered");
+    return command;
+  };
+
+  it("registers switch-project with the ⌘⇧K shortcut", async () => {
+    const command = await switchProjectCommand();
+    expect(command.title).toBe("Stewards: switch project");
+    expect(command.defaultShortcut).toMatchObject({ key: "k", mod: true, shift: true });
+  });
+
+  it("opens the picker and focuses the active row when the command runs", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const command = await switchProjectCommand();
+    expect(command.isAvailable?.(context)).toBe(true);
+    act(() => command.run(context));
+    const listbox = await waitFor(() => slot.getByRole("listbox", { name: "Projects" }));
+    expect(listbox).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(slot.getByRole("option", { name: "Acme" })));
+    slot.lifecycle.unmount();
+  });
+
+  it("picks the second project on digit 2 and closes the picker", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: (input: { projectId: string | null }) => sidebarData({ projectId: input.projectId ?? "p1" }) } as never,
+    });
+    const command = await switchProjectCommand();
+    act(() => command.run(context));
+    const acme = await waitFor(() => slot.getByRole("option", { name: "Acme" }));
+    fireEvent.keyDown(acme, { key: "2" });
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
+    expect(slot.queryByRole("listbox", { name: "Projects" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("does not navigate when the digit names the active project", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { activeThreadId: null, activeProjectId: "p1" },
+    );
+    const command = await switchProjectCommand();
+    act(() => command.run(context));
+    const acme = await waitFor(() => slot.getByRole("option", { name: "Acme" }));
+    fireEvent.keyDown(acme, { key: "1" });
+    expect(shownProject(slot)).toBe("p1");
+    expect(slot.inspection.navigateCalls).toHaveLength(0);
+    slot.lifecycle.unmount();
+  });
+
+  it("ignores a digit past the last project", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const command = await switchProjectCommand();
+    act(() => command.run(context));
+    const acme = await waitFor(() => slot.getByRole("option", { name: "Acme" }));
+    fireEvent.keyDown(acme, { key: "3" });
+    expect(slot.queryByRole("listbox", { name: "Projects" })).not.toBeNull();
+    expect(shownProject(slot)).toBe("p1");
+    slot.lifecycle.unmount();
+  });
+
+  it("stops propagation of a digit it consumes", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const command = await switchProjectCommand();
+    act(() => command.run(context));
+    const acme = await waitFor(() => slot.getByRole("option", { name: "Acme" }));
+    const seen: string[] = [];
+    const listener = (event: globalThis.KeyboardEvent) => { seen.push(event.key); };
+    document.addEventListener("keydown", listener);
+    try {
+      fireEvent.keyDown(acme, { key: "1" });
+    } finally {
+      document.removeEventListener("keydown", listener);
+    }
+    expect(seen).not.toContain("1");
+    slot.lifecycle.unmount();
+  });
+
+  it("closes on Escape and restores the focus the command took over", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const newThread = await waitFor(() => slot.getByRole("button", { name: "New thread" }));
+    newThread.focus();
+    const command = await switchProjectCommand();
+    act(() => command.run(context));
+    const acme = await waitFor(() => slot.getByRole("option", { name: "Acme" }));
+    await waitFor(() => expect(document.activeElement).toBe(acme));
+    fireEvent.keyDown(acme, { key: "Escape" });
+    await waitFor(() => expect(slot.queryByRole("listbox", { name: "Projects" })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(newThread));
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the digit on the first nine rows and none on a compact viewport", async () => {
+    const many = Array.from({ length: 10 }, (_, i) => ({ id: `p${i + 1}`, name: `Project ${i + 1}`, isPersonal: false, href: `/projects/p${i + 1}`, settingsHref: `/projects/p${i + 1}/settings` }));
+    const wide = await renderSidebar({
+      sidebarThreads: { projects: many, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    await openProjectPicker(wide);
+    const rows = wide.getAllByRole("option");
+    expect(rows).toHaveLength(10);
+    for (let i = 0; i < 9; i += 1) {
+      expect(rows[i]!.querySelector("kbd")?.textContent).toBe(String(i + 1));
+    }
+    expect(rows[9]!.querySelector("kbd")).toBeNull();
+    wide.lifecycle.unmount();
+
+    const compact = await renderSidebar(
+      { sidebarThreads: { projects: many, threads: [] }, rpc: { stewardsSidebar: () => sidebarData() } as never },
+      { isCompactViewport: true },
+    );
+    await openProjectPicker(compact);
+    for (const row of compact.getAllByRole("option")) {
+      expect(row.querySelector("kbd")).toBeNull();
+    }
+    compact.lifecycle.unmount();
+  });
+
+  it("reports isAvailable false while the stewards list is not mounted", async () => {
+    const command = await switchProjectCommand();
+    expect(command.isAvailable?.(context)).toBe(false);
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    expect(command.isAvailable?.(context)).toBe(true);
+    slot.lifecycle.unmount();
+    expect(command.isAvailable?.(context)).toBe(false);
   });
 });
