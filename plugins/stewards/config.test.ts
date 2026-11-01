@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   bindingRoles,
+  DEPENDENCY_BOTS,
   depsTargets,
   isTerminal,
   k8sTargets,
@@ -15,11 +16,15 @@ import {
   phaseOf,
   playbookStates,
   projectStewardProblem,
+  pullWatchId,
+  pullWatchProblems,
   roleDepsTargets,
   roleK8sTargets,
   roleOpsTargets,
   roleOpsTeam,
   roleProblems,
+  rolePullWatches,
+  rolePulls,
   roleSentryTargets,
   roleUsesOps,
   roleWarnings,
@@ -568,5 +573,64 @@ describe("roles.json version 2 (BB-163)", () => {
     expect(parseRolesFile(JSON.stringify({ version: 2, roles: {} }))).toMatchObject({ ok: false });
     expect(parseRolesFile(JSON.stringify({ version: 2, roles: {}, holders: { alice: [] } }))).toMatchObject({ ok: false });
     expect(parseRolesFile(JSON.stringify({ version: 2, roles: { ops: {} }, holders: { Jane: ["ops"], jane: ["ops"] } }))).toMatchObject({ ok: false, error: expect.stringMatching(/same login as another entry/u) });
+  });
+});
+
+describe("role pull watches (BB-164)", () => {
+  const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => parseRolesFile(JSON.stringify({ version: 2, roles: definitions, holders }));
+  const playbooks = () => {
+    const prs = parsePlaybook(GITHUB_PRS, "github-prs");
+    const deps = parsePlaybook(DEPS_PRS, "deps-prs");
+    const tickets = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!prs.ok || !deps.ok || !tickets.ok) throw new Error("playbook parse failed");
+    return new Map([
+      ["github-prs", prs.value],
+      ["deps-prs", deps.value],
+      ["linear-tickets", tickets.value],
+    ]);
+  };
+
+  it("parses a role's pull watches and compiles the Dependabot watch first", () => {
+    const parsed = v2({ ops: { dependabot: ["acme/web"], pulls: [{ repo: "acme/web", match: { title: "Update *", branch: "update-*", paths: ["projects/*/bc-prod.yaml"] }, playbook: "sync-prs" }] } }, { jane: ["ops"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    const role = parsed.value.roles["jane"]!;
+    expect(rolePulls(role)).toEqual([{ repo: "acme/web", match: { title: "Update *", branch: "update-*", paths: ["projects/*/bc-prod.yaml"] }, playbook: "sync-prs" }]);
+    const watches = rolePullWatches(role, ["acme/web", "acme/other"], "deps-prs");
+    expect(watches.map((w) => pullWatchId(w))).toEqual(["deps-prs@acme/web", "sync-prs@acme/web"]);
+    expect(watches[0]!.match.author).toEqual([...DEPENDENCY_BOTS]);
+  });
+
+  it("merges a holder's roles' watches without duplicating an identical one", () => {
+    const watch = { repo: "acme/web", match: { title: "Update *" }, playbook: "sync-prs" };
+    const parsed = v2({ a: { pulls: [watch] }, b: { pulls: [watch, { repo: "acme/other", match: {}, playbook: "sync-prs" }] } }, { jane: ["a", "b"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(rolePulls(parsed.value.roles["jane"]!)).toHaveLength(2);
+  });
+
+  it("reports a watch on a repo outside repos.json or in github.exclude, a bad playbook, a bad glob, and two roles on one repo", () => {
+    const parsed = v2(
+      {
+        a: { pulls: [{ repo: "acme/gone", match: {}, playbook: "sync-prs" }, { repo: "acme/web", match: { title: "x\\y" }, playbook: "linear-tickets" }] },
+        b: { pulls: [{ repo: "acme/web", match: {}, playbook: "sync-prs" }] },
+      },
+      { jane: ["a"], sam: ["b"] },
+    );
+    if (!parsed.ok) throw new Error(parsed.error);
+    const problems = pullWatchProblems(parsed.value, ["acme/web"], ["acme/web"], playbooks());
+    expect(problems).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/acme\/gone.*the repo is not in repos\.json/),
+        expect.stringMatching(/acme\/web.*the repo is in github\.exclude/),
+        expect.stringMatching(/the playbook "linear-tickets" is a ticket playbook, not a pr playbook/),
+        expect.stringMatching(/match\.title is not a glob: .*backslash/),
+        expect.stringMatching(/two roles with holders declare pull watches on acme\/web: jane, sam/),
+      ]),
+    );
+  });
+
+  it("attributes a pull binding to the role that declared its watch", () => {
+    const parsed = v2({ ops: { pulls: [{ repo: "acme/web", match: {}, playbook: "sync-prs" }] } }, { jane: ["ops"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(bindingRoles(parsed.value, "jane", []).get("sync-prs@acme/web")).toEqual(["ops"]);
   });
 });

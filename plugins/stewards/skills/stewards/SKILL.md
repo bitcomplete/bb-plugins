@@ -14,6 +14,7 @@ steward** per project sits above all of them.
 |---|---|---|
 | `ticket` | the label (default `bb-managed`) is on a Linear issue in a listed team and this server's Linear login is an assignee | `linear-tickets` |
 | `pr` | the label is on a pull request in one of the project's repos and this server's GitHub login is its author | `github-prs` |
+| `pr` (watch) | a pull request matches a `pulls` watch on this server's `roles.json` role, with no label needed (BB-164) | the watch's playbook |
 | `review` | a teammate opens, or marks ready, a pull request in one of the project's repos and this server's GitHub login is a requested reviewer (checked once, at adoption) | `github-reviews` |
 | `ops` | this server's `roles.json` entry watches a namespace or Sentry project | `ops-watch` |
 
@@ -477,14 +478,28 @@ when asked to "set up stewards".
    ```json
    {
      "version": 2,
-     "roles": { "ops": { "k8sNamespaces": ["bb-gate-production"], "sentry": { "projects": [{ "org": "acme", "project": "web" }] }, "dependabot": "all" } },
+     "roles": { "ops": { "k8sNamespaces": ["bb-gate-production"], "sentry": { "projects": [{ "org": "acme", "project": "web" }] }, "dependabot": "all", "pulls": [{ "repo": "bitcomplete/bc-prod", "match": { "title": "Update */bc-prod.yaml", "branch": "update-*-bc-prod-yaml-*", "paths": ["projects/*/bc-prod.yaml"] }, "playbook": "sync-prs" }] } },
      "holders": { "alice": ["ops", "projectSteward"] }
    }
    ```
 
    `roles` holds today's ops-style definition once per name (`k8sNamespaces`,
-   `context?`, `team?`, `autoAdopt?`, `sentry`, `dependabot?`); `holders`
-   maps a GitHub login to the role names it holds. A login's effective role
+   `context?`, `team?`, `autoAdopt?`, `sentry`, `dependabot?`, `pulls?`);
+   `holders` maps a GitHub login to the role names it holds. `pulls` declares
+   pull requests the holder's server adopts by shape (`title`, `branch`,
+   `author` and `paths`, each an optional `*`/`**` glob, every one given must
+   match; `paths` means every changed file matches one of its globs, checked
+   at adoption on the first 100 changed files, so 100 or more never matches)
+   under the named `pr` playbook, with no label. A watch with no `match.author`
+   matches only the holder's own pull requests; any other author must be named.
+   `dependabot` compiles into a synthesized watch per repo, with the bot logins
+   as its author and `deps-prs`, tried before the declared watches; adoption is
+   first match wins, then the label, then the review. A watched pull request is
+   laned from the decide list like any other, so a project whose steward should
+   merge them adds a `decide: project` entry covering their paths. `check`
+   reports a watch on a repo not in `repos.json` or in `github.exclude`, a
+   missing or non-`pr` playbook, a bad glob, and two held roles watching the
+   same repo. A login's effective role
    is the merge of the roles it holds, and `check`, `list` and the Stewards
    page name those roles, not only the login. `projectSteward` is a built-in
    role with no definition; a role no holder names is a `check` warning, and

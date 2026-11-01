@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -297,6 +297,7 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     expect(s.lesson("lsn_old")).toMatchObject({
       id: "lsn_old",
@@ -340,6 +341,7 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -401,6 +403,7 @@ describe("the actor rename migration (BB-97)", () => {
     // The current store prepares its lesson-PR statement, so the column has to
     // exist; it is not part of what this test exercises.
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     return db;
   };
   const insert = (db: ReturnType<typeof legacy>, id: string, key: string, status: string | null) =>
@@ -452,8 +455,8 @@ describe("the actor rename migration (BB-97)", () => {
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
     // Newest group first; each sits immediately before the one appended after
-    // it. BB-184 appended the server-settings group after BB-154's wake source.
-    const groups = [SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // it. BB-164 appended the pull-watch group after BB-184's server settings.
+    const groups = [PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -477,6 +480,7 @@ describe("the rationale migration (BB-35 step 4)", () => {
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -524,6 +528,7 @@ describe("the validation migration (BB-35 step 5)", () => {
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -577,6 +582,7 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
     // The current store prepares its lesson-PR statement, so the column has to
     // exist; it is not part of what this test exercises.
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
              VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
     return db;
@@ -674,7 +680,7 @@ describe("a worker's pending model check", () => {
 
   it("reads workers from before the column existed as not pending", () => {
     const db = new Database(":memory:");
-    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...LESSON_PR_MIGRATIONS]) db.exec(sql);
+    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...PULL_WATCH_MIGRATIONS]) db.exec(sql);
     db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
              VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
     db.exec(`INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES ('thr_old', 'bnd_1', 'ENG-12: Implement', 'running', 1000)`);
@@ -740,6 +746,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
+    for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }

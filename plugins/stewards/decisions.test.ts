@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseProjectFile } from "./config.js";
-import { decideFor, decideForEntry, decideForPull, decideForRefusal, defaultDecideList, explainDecision, formatDecisionListing, isSelfWidening, SELF_WIDENING_PATHS, touchesAny, type BigDecision } from "./decisions.js";
+import { decideFor, decideForEntry, decideForPull, decideForRefusal, defaultDecideList, explainDecision, formatDecisionListing, globError, isSelfWidening, SELF_WIDENING_PATHS, touchesAny, type BigDecision } from "./decisions.js";
 
 const decisions: BigDecision[] = [
   { text: "Changing what a ticket's requester asked for", decide: "user", paths: [] },
@@ -310,5 +310,17 @@ describe("no self-widening", () => {
     expect(touchesAny(["bb-plugins/plugins/linear/store.ts"], ["bb-plugins/plugins/*/store.ts"])).toBe(true);
     expect(touchesAny(["bb-plugins/plugins/linear/server.ts"], ["bb-plugins/plugins/*/store.ts"])).toBe(false);
     expect(touchesAny(["bb-gate/docker/bb-server/Dockerfile"], ["bb-gate/docker/bb-server/**"])).toBe(true);
+  });
+});
+
+describe("globError (BB-164)", () => {
+  it("accepts the * and ** dialect and rejects an empty, control-character or backslash glob", () => {
+    expect(globError("Update */bc-prod.yaml")).toBeNull();
+    expect(globError("update-*-bc-prod-yaml-*")).toBeNull();
+    expect(globError("projects/*/bc-prod.yaml")).toBeNull();
+    expect(globError("bb-gate/docker/bb-server/**")).toBeNull();
+    expect(globError("")).toMatch(/empty glob/);
+    expect(globError("a\\b")).toMatch(/backslash/);
+    expect(globError("a\nb")).toMatch(/control character/);
   });
 });
