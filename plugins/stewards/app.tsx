@@ -2966,6 +2966,20 @@ export default definePluginApp((app) => {
       getStewardsSidebarCommand()?.openPicker();
     },
   });
+  // BB-189: the compose sibling of switch-project, the keyboard path to the
+  // button beside the project picker. It reads the same handle's bound compose
+  // callback (compose on the picked project, then close the drawer); a null
+  // project means the list is mounted but has nothing to compose on, so the
+  // palette row is hidden and the shortcut is inert.
+  app.commands.register({
+    id: "new-thread-in-project",
+    title: "Stewards: new thread in current project",
+    defaultShortcut: { key: "u", mod: true, shift: true },
+    isAvailable: () => getStewardsSidebarCommand()?.projectId != null,
+    run: () => {
+      getStewardsSidebarCommand()?.compose();
+    },
+  });
   app.slots.navPanel({
     id: "board",
     title: "Stewards",
