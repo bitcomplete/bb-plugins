@@ -1722,9 +1722,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // A parked late steer set the thinking indicator for the edit, but the
       // turn ending here cannot answer it and posts no backstop. Clear the
       // indicator so it does not outlive the turn; a following turn sets its
-      // own if it replies.
+      // own if it replies. A newer wake still queued behind this turn owns its
+      // own indicator, so leave that one alone.
       for (const [session, r] of mine) {
-        if (r.lateSteerAt !== null && r.lateSteerAt <= idleAt) void hooks.status(session, "", checkSignal()).catch(() => undefined);
+        if (r.lateSteerAt === null || r.lateSteerAt > idleAt) continue;
+        if (r.wakes.some((w) => w.state === "queued" && w.queuedMessageId !== "")) continue;
+        void hooks.status(session, "", checkSignal()).catch(() => undefined);
       }
       if (waiting.length === 0 && untaggedWaiting.length === 0) {
         await clearSteered(threadId, idleAt);
