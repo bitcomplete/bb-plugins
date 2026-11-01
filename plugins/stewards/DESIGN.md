@@ -1686,8 +1686,9 @@ Blocked, In flight or Monitors and a Recently ended row are real links to the
 effort's detail view (`board/<project>/<key>`, §16); a worker or reviewer child
 row, a one-off thread and the project steward row still open their thread. An
 effort row is highlighted while the board shows that effort's detail, and a
-thread row is highlighted while its thread page is the route (`bg-state-active`,
-with `aria-current="page"` on the anchor). When navigation lands on a row
+thread row is highlighted while its thread page is the route
+(`bg-state-active bb-sidebar-selected-row`, with `aria-current="page"` on the
+anchor). When navigation lands on a row
 inside a collapsed parent, the parent expands so the row is revealed: the
 effort's row for a worker or reviewer, the **Threads** section for a one-off
 thread, and **Monitors** or **Recently ended** for their rows. An unread
@@ -1715,6 +1716,25 @@ root is on screen (no `[inert]` ancestor and `checkVisibility` true), and the
 page and overview polls, which have no named rows, never start one. Otherwise
 the sidebar's rows flashed over the Stewards page and thread pages on a phone
 for the length of the crossfade.
+
+**bb's row chrome and hover actions (BB-182).** Every row takes bb's own
+single-row height (`--bb-sidebar-row-height`, 2.5rem on coarse pointers via
+`--bb-sidebar-row-height-coarse`): a one-line thread row is exactly that tall,
+and the two-line effort row uses it as a minimum with `py-1`. Hover is bb's
+`hover:bg-sidebar-accent hover:text-sidebar-accent-foreground` and the selected
+row is `bg-state-active bb-sidebar-selected-row`, with the row text on
+`text-sidebar-foreground`. A row backed by a live thread also carries bb's two
+hover actions — the live thread's **Archive** action and its thread-actions
+menu, revealed by bb's `bb-sidebar-hover-actions-row` /
+`bb-sidebar-hover-actions` host classes and kept open while the menu is open —
+and the title reserves their width with `bb-sidebar-hover-actions-inset`
+(`--bb-sidebar-hover-actions-inset: calc(var(--spacing) * 15)` for the two
+actions) so it truncates instead of running under them. The wrapper is hidden
+where the pointer cannot hover, so touch keeps the context menu. A Recently
+ended row whose thread is gone has no hover actions, as before. The base left
+inset is bb's 8px (`pl-2`), nested worker and reviewer rows keep the 14px
+per-level indent, and the effort row's second line and its inline needs block
+are derived from the same title offset so they stay under the title.
 
 **Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer

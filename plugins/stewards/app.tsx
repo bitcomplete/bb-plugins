@@ -10,16 +10,18 @@
 // item's button. Settings → Plugins → Stewards: which projects are stewarded
 // and whether their configuration is healthy, then every open steward and
 // where it stands. Steering stays with the project steward and the CLI.
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import {
   Markdown,
   ThreadTitle,
   definePluginApp,
   experimental_Icon as Icon,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
+  experimental_ThreadActionsMenu as ThreadActionsMenu,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
   experimental_usePluginId,
   experimental_useSidebarThreads,
+  experimental_useThreadActions,
   useBbNavigate,
   useRealtime,
   useRpc,
@@ -28,6 +30,7 @@ import {
   useSidebarThreadRowStatus,
   type PluginSidebarThread,
   type PluginThreadActionTarget,
+  type PluginThreadActionsTriggerProps,
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -1578,6 +1581,111 @@ function sameThreadRowProps(a: SidebarThreadRowProps, b: SidebarThreadRowProps):
   );
 }
 
+/**
+ * bb's row geometry, in pixels (BB-182): the base left inset, the per-level
+ * indent for nested worker and reviewer rows, and the fixed chevron/status
+ * slots and gaps the title follows. The title offset is derived from them so
+ * the effort row's line two and its inline needs block line up with the title
+ * wherever the base moves.
+ */
+const ROW_BASE_PADDING_PX = 8;
+const ROW_DEPTH_STEP_PX = 14;
+const ROW_SLOT_PX = 16;
+const ROW_GAP_PX = 4;
+function rowPaddingLeft(depth: number): number {
+  return ROW_BASE_PADDING_PX + depth * ROW_DEPTH_STEP_PX;
+}
+function rowTitleLeft(depth: number): number {
+  return rowPaddingLeft(depth) + ROW_SLOT_PX + ROW_GAP_PX + ROW_SLOT_PX + ROW_GAP_PX;
+}
+
+/**
+ * bb's row state and text classes, inlined from bb core's
+ * `SIDEBAR_ROW_INTERACTIVE_STATE_CLASS` and `SIDEBAR_ROW_SELECTED_STATE_CLASS`
+ * (BB-182). The selected state keeps `bg-state-active` (bb's
+ * `CONTEXT_SELECTION_SURFACE_CLASS`) and adds `bb-sidebar-selected-row` for the
+ * host's sticky-tier treatment.
+ */
+const ROW_TEXT_CLASS = "text-sidebar-foreground";
+const ROW_INTERACTIVE_CLASS = "cursor-pointer hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
+const ROW_SELECTED_CLASS = "bg-state-active bb-sidebar-selected-row";
+
+/** bb's fixed one-line sidebar row height, coarse-pointer height included. */
+const ROW_HEIGHT_CLASS = "h-[var(--bb-sidebar-row-height)] max-md:pointer-coarse:h-[var(--bb-sidebar-row-height-coarse)]";
+
+/**
+ * Two hover actions at 7.5 spacing units each, as bb's `ThreadRow` reserves
+ * (BB-182). The title's inset class reads this variable on row hover or while
+ * the menu is open, so the title truncates instead of running under the
+ * buttons.
+ */
+const HOVER_ACTIONS_INSET_STYLE = { "--bb-sidebar-hover-actions-inset": "calc(var(--spacing) * 15)" } as CSSProperties;
+
+/** One ghost icon button, sized like bb's sidebar row controls (BB-182). */
+const ROW_ACTION_CLASS =
+  "flex h-7 w-7 shrink-0 items-center justify-center rounded-md p-0 text-subtle-foreground hover:bg-state-hover hover:text-foreground active:bg-state-active data-[state=open]:bg-state-active max-md:pointer-coarse:h-9 max-md:pointer-coarse:w-9";
+
+/** bb's thread-actions menu trigger: a ghost icon button that merges the host's
+ * props and className so the menu opens (BB-182). */
+function renderThreadActionsTrigger(props: PluginThreadActionsTriggerProps) {
+  return (
+    <button
+      {...props}
+      type="button"
+      className={`${props.className ?? ""} ${ROW_ACTION_CLASS}`}
+      aria-label="Thread actions"
+      data-thread-actions-trigger=""
+      onClick={(event) => {
+        props.onClick?.(event);
+        event.stopPropagation();
+      }}
+    >
+      <Icon name="MoreHorizontal" className="size-4 max-md:pointer-coarse:size-5" />
+    </button>
+  );
+}
+
+/**
+ * The two hover actions bb's own rows carry (BB-182): the live thread's Archive
+ * action and its thread-actions menu. Only rows backed by a live thread render
+ * it, so a Recently ended row whose thread is gone keeps none. The wrapper
+ * carries bb's hover-actions classes; the host CSS reveals it on row hover or
+ * focus, or while the menu is open, and hides it where the pointer cannot
+ * hover.
+ */
+function SidebarRowHoverActions({ target }: { target: PluginThreadActionTarget }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const archive = experimental_useThreadActions(target, { keys: ["bb--core/archive"] });
+  return (
+    <span
+      data-sidebar-row-actions=""
+      data-sidebar-hover-actions-open={menuOpen ? "true" : undefined}
+      className="bb-sidebar-hover-actions absolute inset-y-0 right-0 z-10 flex items-center gap-0.5 [@media(hover:none)]:hidden"
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {archive.map((entry) => (
+        <button
+          key={entry.key}
+          type="button"
+          aria-label={entry.action.label}
+          data-thread-action={entry.key}
+          disabled={entry.action.disabled}
+          className={ROW_ACTION_CLASS}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void entry.action.run();
+          }}
+        >
+          <Icon name={entry.action.icon} className="size-4 max-md:pointer-coarse:size-5" />
+        </button>
+      ))}
+      <ThreadActionsMenu thread={target} trigger={renderThreadActionsTrigger} side="right" align="start" sideOffset={8} onOpenChange={setMenuOpen} />
+    </span>
+  );
+}
+
 /** One thread row: a glyph, title and context menu, expanding into its children. */
 const SidebarThreadRow = memo(function SidebarThreadRow({
   thread,
@@ -1614,7 +1722,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
   return (
     <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
-        <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
+        <div
+          className={`bb-sidebar-hover-actions-row relative flex items-center gap-1 rounded-md pr-1 ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${selected ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS}`}
+          style={{ paddingLeft: `${rowPaddingLeft(depth)}px` }}
+          title={titleAttr}
+        >
           {count > 0 ? (
             <button
               type="button"
@@ -1637,7 +1749,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
           <a
             href={thread.href}
             aria-current={selected ? "page" : undefined}
-            className="min-w-0 flex-1 truncate text-sm"
+            className="bb-sidebar-hover-actions-inset min-w-0 flex-1 truncate text-sm"
+            style={HOVER_ACTIONS_INSET_STYLE}
             title={thread.displayTitle}
             onClick={(e) => {
               e.preventDefault();
@@ -1648,6 +1761,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
             <ThreadTitle threadId={thread.id} />
           </a>
           {meta}
+          <SidebarRowHoverActions target={actionTarget(thread)} />
         </div>
       </ThreadActionsContextMenu>
       {open && children.length > 0 ? (
@@ -1822,8 +1936,11 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   const open = userOpen ?? false;
   const href = boardHref(pluginId, projectId, key);
   const body = (
-    <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
-      <div className="flex items-center gap-1">
+    <div
+      className={`bb-sidebar-hover-actions-row relative flex min-h-[var(--bb-sidebar-row-height)] flex-col rounded-md py-1 pr-1 max-md:pointer-coarse:min-h-[var(--bb-sidebar-row-height-coarse)] ${ROW_TEXT_CLASS} ${selected ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS}`}
+      style={{ paddingLeft: `${rowPaddingLeft(0)}px` }}
+    >
+      <div className="relative flex items-center gap-1">
         {count > 0 ? (
           <button
             type="button"
@@ -1843,7 +1960,8 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
         <a
           href={href}
           aria-current={selected ? "page" : undefined}
-          className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
+          className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-baseline gap-1 text-sm"
+          style={HOVER_ACTIONS_INSET_STYLE}
           title={root?.displayTitle ?? effort.title}
           onClick={(e) => {
             e.preventDefault();
@@ -1855,8 +1973,9 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
           <span className="min-w-0 truncate">{title}</span>
         </a>
         {trailing}
+        {root === undefined ? null : <SidebarRowHoverActions target={actionTarget(root)} />}
       </div>
-      <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: "36px" }} data-sidebar-line-two="">
+      <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: `${rowTitleLeft(0) - rowPaddingLeft(0)}px` }} data-sidebar-line-two="">
         {kindLabel(effort.kind)}
         {effort.phase !== null ? ` · ${effort.phase}` : ""}
         {" · "}
@@ -1868,7 +1987,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
     <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
-        <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
+        <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: `${rowTitleLeft(0)}px` }}>
           {mine.map((item) => (
             <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} projectId={projectId} effortKey={key} onChanged={onChanged} />
           ))}
