@@ -10,7 +10,7 @@ import { guidanceUnitId } from "./guidance.js";
 import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, sourceContract, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
+import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { STANDING_RULES } from "./wake.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
@@ -55,6 +55,8 @@ function world() {
   const writes: Array<{ path: string; hostId?: string }> = [];
   /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
   const fileContents = new Map<string, string>();
+  /** Files `bb stewards init` wrote, by absolute path, so a test can apply and re-read them. */
+  const writtenContent = new Map<string, string>();
   const fileKey = (hostId: string | undefined, path: string) => `${hostId ?? ""}:${path}`;
   const sections: Array<{ id: string; name: string }> = [];
   /** What `projects.list` answers; a test empties it to delete the project. */
@@ -77,6 +79,10 @@ function world() {
   const githubPulls: Array<{ repo: string; head: string; base: string; title: string; body: string; url: string; number: number }> = [];
   const githubClosedPulls: Array<{ repo: string; number: number }> = [];
   const githubDefaultBranches = new Map<string, string>();
+  /** The survey's GitHub reads: a recursive tree, branch protection, labels and file text. */
+  const githubTrees = new Map<string, Array<{ path: string; type: string }>>();
+  const githubBranchProtection = new Map<string, { protected: boolean; requiredApprovingReviewCount: number | null; requiresStatusChecks: boolean }>();
+  const githubLabels = new Map<string, string[]>();
   let pullNumber = 0;
   let createPullError: string | null = null;
   let mergePullError: string | null = null;
@@ -115,6 +121,9 @@ function world() {
       return m === null || path !== `.bb/${m[1]}` ? null : pr.body;
     },
     defaultBranch: async (repo: string) => githubDefaultBranches.get(repo) ?? "main",
+    tree: async (repo: string) => githubTrees.get(repo.toLowerCase()) ?? [],
+    branchProtection: async (repo: string, branch: string) => githubBranchProtection.get(`${repo.toLowerCase()} ${branch}`) ?? null,
+    labels: async (repo: string) => githubLabels.get(repo.toLowerCase()) ?? [],
     createPull: async (repo: string, args: { head: string; base: string; title: string; body: string }) => {
       if (createPullError !== null) throw new Error(createPullError);
       const number = ++pullNumber;
@@ -215,8 +224,12 @@ function world() {
     },
     files: {
       mkdir: async () => ({}),
-      write: async (args: { path: string; hostId?: string }) => {
+      write: async (args: { path: string; hostId?: string; content?: string; expectedSha256?: string | null }) => {
         writes.push({ path: args.path, hostId: args.hostId });
+        // `expectedSha256: null` is the never-overwrite guard: a file already there is kept.
+        const existed = writtenContent.has(args.path);
+        if (existed && args.expectedSha256 === null) return { outcome: "kept existing" };
+        writtenContent.set(args.path, args.content ?? "");
         return { outcome: "written" };
       },
       read: async (args: { path: string; hostId?: string }) => {
@@ -380,7 +393,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -393,7 +406,7 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     throw new Error("the preferences store is down");
   };
   else if (seedProvider !== undefined) w.uiPreferences.set("sidebar.threadListProvider", { value: seedProvider, revision: 4 });
-  const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"], settings });
+  const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards", "onboarding"], settings });
   await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
   // The local per-project switch is off by default; tests that are not about
@@ -3402,6 +3415,183 @@ describe("bb stewards init", () => {
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
     expect(t.writes.length).toBe(7);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
+  });
+});
+
+// BB-180: the onboarding survey, the overview's onboard flag, and the page
+// action that starts the onboarding thread.
+describe("bb stewards survey and Set up stewards", () => {
+  const blob = (path: string) => ({ path, type: "blob" });
+  const CI = ["name: CI", "on: [push]", "jobs:", "  build:", "    steps:", "      - uses: actions/checkout@v4", "      - run: npm ci", "      - run: npm run typecheck", "      - run: npm test"].join("\n");
+
+  async function surveyed() {
+    const t = await setup();
+    t.githubTrees.set("acme/web", [blob("package.json"), blob("tsconfig.json"), blob("src/index.ts"), blob(".github/workflows/ci.yaml"), blob("Dockerfile"), blob("kploy/deployment.yaml"), blob("bc-prod.yaml"), blob("README.md")]);
+    t.githubFileContents.set("acme/web#main:package.json", JSON.stringify({ name: "web", devDependencies: { typescript: "^5" } }));
+    t.githubFileContents.set("acme/web#main:.github/workflows/ci.yaml", CI);
+    t.githubFileContents.set("acme/web#main:README.md", "Consumes https://github.com/acme/bb");
+    t.githubBranchProtection.set("acme/web main", { protected: true, requiredApprovingReviewCount: 1, requiresStatusChecks: true });
+    t.githubLabels.set("acme/web", ["bb-managed", "bug"]);
+    return t;
+  }
+
+  it("emits every field as stable --json, including the .bb diff inputs", async () => {
+    const t = await surveyed();
+    const out = await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    const report = JSON.parse(out.stdout) as {
+      source: string;
+      layout: string;
+      repos: Array<Record<string, unknown>>;
+      linear: { available: boolean; value?: { teams: Array<{ key: string; name: string; missingStates: string[] }> } };
+      bb: { projectFile: boolean; roles: boolean; projectSteward: string | null; playbooks: string[]; reposJson: boolean };
+    };
+    expect(report.source).toBe("multi-repo");
+    expect(report.layout).toBe("primary");
+    const web = report.repos.find((r) => r.dir === "web")!;
+    expect(web).toMatchObject({
+      repo: "acme/web",
+      defaultBranch: "main",
+      branchProtection: { available: true, value: { protected: true, requiredApprovingReviewCount: 1, requiresStatusChecks: true } },
+      labels: { available: true, value: ["bb-managed", "bug"] },
+      languages: ["TypeScript"],
+      manifests: ["package.json", "tsconfig.json"],
+      testCommands: ["npm test"],
+      typecheckCommands: ["npm run typecheck"],
+      dockerfiles: ["Dockerfile"],
+      deployManifests: ["bc-prod.yaml", "kploy/deployment.yaml"],
+      references: [{ repo: "acme/bb", files: ["README.md"] }],
+    });
+    expect(report.linear.available).toBe(true);
+    expect(report.linear.value!.teams).toMatchObject([{ key: "ENG", name: "Engineering" }]);
+    expect(report.bb).toMatchObject({ projectFile: true, roles: false, projectSteward: null, reposJson: false });
+    expect(report.bb.playbooks).toEqual(expect.arrayContaining(["linear-tickets", "github-prs", "github-reviews"]));
+  });
+
+  it("renders a human summary without --json", async () => {
+    const t = await surveyed();
+    const out = await t.harness.behavior.runCli(["survey", "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain("Project p1 (multi-repo, primary)");
+    expect(out.stdout).toContain("test commands: npm test");
+    expect(out.stdout).toContain("Existing .bb: project.json");
+  });
+
+  it("diffs a partial .bb: roles.json with no projectSteward", async () => {
+    const t = await setup();
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { ops: { k8sNamespaces: ["bb-gate-production"] } } } });
+    const out = await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"]);
+    const report = JSON.parse(out.stdout) as { bb: { roles: boolean; projectSteward: string | null } };
+    expect(report.bb.roles).toBe(true);
+    expect(report.bb.projectSteward).toBeNull();
+  });
+
+  it("surveys a project with no project file at all (the skill's starting state)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = null;
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    const out = await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    const report = JSON.parse(out.stdout) as { bb: { projectFile: boolean; roles: boolean; playbooks: string[]; reposJson: boolean } };
+    expect(report.bb).toMatchObject({ projectFile: false, roles: false, playbooks: [], reposJson: false });
+  });
+
+  it("shows the Set up stewards action for a project with no project file and for one with no project steward", async () => {
+    const none = await setup();
+    none.files[PROJECT_FILE] = null;
+    const noneOverview = (await none.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; configured: boolean; onboard: boolean }> };
+    expect(noneOverview.projects).toMatchObject([{ projectId: "p1", configured: false, onboard: true }]);
+
+    const noSteward = await setup();
+    noSteward.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { ops: { k8sNamespaces: ["bb-gate-production"] } } } });
+    const noStewardOverview = (await noSteward.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ configured: boolean; onboard: boolean }> };
+    expect(noStewardOverview.projects).toMatchObject([{ configured: true, onboard: true }]);
+  });
+
+  it("does not show it once roles.json names a project steward", async () => {
+    const t = await setup();
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { projectSteward: true } } });
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ configured: boolean; onboard: boolean }> };
+    expect(overview.projects).toMatchObject([{ configured: true, onboard: false }]);
+  });
+
+  it("does not show it for a project whose project file went away but whose bindings persist", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.files[PROJECT_FILE] = null;
+    t.hooks.forgetConfigs();
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ configured: boolean; onboard: boolean }> };
+    expect(overview.projects).toMatchObject([{ configured: false, onboard: false }]);
+  });
+
+  it("starts an ordinary thread with the onboarding skill, never the project steward", async () => {
+    const t = await setup();
+    const result = (await t.harness.callRpc("stewardsOnboard", { projectId: "p1" })) as { ok: boolean; threadId: string | null };
+    expect(result.ok).toBe(true);
+    const threadId = result.threadId!;
+    expect(t.metadata.get(threadId)).toMatchObject({ role: "onboarding" });
+    expect(t.spawns.at(-1)).toMatchObject({ projectId: "p1", title: "Set up stewards" });
+    // Never the project steward thread.
+    expect(t.hooks.store.projectByThread(threadId)).toBeNull();
+    expect(t.hooks.store.byThread(threadId)).toBeNull();
+    const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata: { role: "onboarding" }, thread: { id: threadId, title: null, parentThreadId: null, sourceThreadId: null } }));
+    expect(config.skills).toContain("onboarding");
+    expect(config.tools).toEqual([]);
+  });
+
+  it("init's skeleton passes check, and a second init keeps it (the manual onboarding loop)", async () => {
+    const t = await setup();
+    // Start from an empty .bb: no project file and no playbooks.
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    const first = await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(first.exitCode).toBe(0);
+    // Apply what init wrote, as bb would, then check the project.
+    for (const [path, content] of t.writtenContent) {
+      if (path.startsWith("/w/.bb/")) t.files[path.slice("/w/.bb/".length)] = content;
+    }
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.exitCode).toBe(0);
+    // A second init keeps every file: the additions-only rule.
+    const before = t.writes.length;
+    const second = await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout.match(/kept existing/gu)?.length).toBe(7);
+    expect(t.writes.length).toBe(before + 7);
+  });
+
+  it("accepts the skill's hand-filled project.json and roles.json in check", async () => {
+    const t = await setup();
+    // Start from init's playbooks, then replace the skeleton with what the skill writes.
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    for (const [path, content] of t.writtenContent) {
+      if (path.startsWith("/w/.bb/")) t.files[path.slice("/w/.bb/".length)] = content;
+    }
+    // A hand-filled file: repo-dir-prefixed bigDecisions paths, deps, nightly, standing rules.
+    t.files[PROJECT_FILE] = JSON.stringify({
+      version: 1,
+      linear: { teams: ["ENG"] },
+      github: { exclude: [] },
+      label: "bb-managed",
+      nightly: { at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 },
+      projectSteward: { model: "claude/claude-opus-5-5/high" },
+      bigDecisions: [
+        { text: "Changing what a ticket's requester asked for, beyond clarifying it", decide: "user", paths: [] },
+        { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi/**"] },
+        { text: "A new dependency", decide: "project", paths: ["web/package.json", "web/package-lock.json"] },
+      ],
+      standingRules: ["Tests and typecheck must be green before a merge."],
+      deps: { sla: { critical: "asap", high: "1d", medium: "7d", low: "30d" }, batch: { medium: "7d", low: "30d" }, autoAdopt: ["critical", "high"] },
+    });
+    // The role carries the Dependabot watch the playbook's repos need, so check has no watchProblems.
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { projectSteward: true, ops: { dependabot: "all" } } } });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.exitCode).toBe(0);
   });
 });
 

@@ -454,6 +454,13 @@ workers on bb's own `project-default` environment. `bb stewards check` and
 comes from `bb stewards spawn-flags` (or the wake): never hand-write an
 `--environment-provider`.
 
+Setting up a project for the first time — the dependency graph, shipping
+paths, decide-list `paths`, project steward login — is the **onboarding
+skill**'s job: `bb stewards survey --json` first, one batched interview, a
+minimal `.bb`, then a guidance pull request that is reviewed before anything
+is live. The steps below are the mechanics it runs; read the onboarding skill
+when asked to "set up stewards".
+
 1. From a thread in the project: `bb stewards init` writes
    `.bb/stewards/project.json` (Linear teams you belong to, or `--teams
    ENG,OPS`) and the four default playbooks into the workspace's `.bb`.
@@ -485,6 +492,7 @@ project.
 |---|---|
 | `bb stewards brief [<binding>] [--project <id>]` | The invariants for a steward: thread id, allowed actions, phase instructions, ready gate, guidance and holds, standing rules, and the worker spawn command. Defaults to the binding of the invoking thread |
 | `bb stewards spawn-flags [<binding>] [--project <id>]` | The full runnable `bb thread spawn …` command for a steward's workers, from the playbook's `models.worker` and the project environment |
+| `bb stewards survey [--json] [--project <id>]` | The mechanical facts onboarding works from: per repo the default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, deploy manifests, labels and cross-repo references; the Linear teams and workflow states; and what `.bb` already holds. A failed read is `available: false` |
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
 | `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
 | `bb stewards needs [--all] [--json]` | What waits on the user, in the sidebar's order: open questions, escalations with the user, then needs; each line ends with the `bb stewards done` command that answers it. `--all` is the closed-needs diagnostic |

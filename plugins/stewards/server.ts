@@ -18,6 +18,7 @@ import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPlugin
 import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
+  DEFAULT_LABEL,
   DEFAULT_PLAYBOOKS,
   DEPS_ALERTS_PLAYBOOK,
   DEPS_PRS_PLAYBOOK,
@@ -93,15 +94,16 @@ import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
-import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
+import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
-import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
+import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
 
@@ -127,6 +129,13 @@ export const BRIEF_MAX_CHARS = 3800;
  * worker or reviewer — so thread-briefs writes no brief for any of them.
  */
 export const THREAD_BRIEFS_OFF = false;
+
+/**
+ * The first turn of a "Set up stewards" thread. The onboarding skill carries
+ * the procedure; this only says what the thread is for, and that it is an
+ * ordinary thread, not the project steward.
+ */
+export const ONBOARDING_INTRO = `Set up stewards for this project. Follow the onboarding skill: run \`bb stewards survey --json\` first and read each repo's README, then ask one batched interview under ten questions. Write a minimal \`.bb\` (\`bb stewards init\`, then fill project.json with repo-dir-prefixed bigDecisions paths, roles.json and a short AGENTS.md), validate it with \`bb stewards check\`, and land it with \`workspace_publish_guidance\` and a pull request on the primary repo that lists every assumption. Run \`bb stewards enable\` only after that pull request merges. You are an ordinary thread, not the project steward.`;
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */
@@ -526,6 +535,8 @@ export const rpcContract = defineRpcContract({
           projectId: z.string(),
           name: z.string(),
           configured: z.boolean(),
+          /** No project file, or no project steward in roles.json: offer the onboarding action. */
+          onboard: z.boolean(),
           /** Whether this server stewards the project: its local, per-project switch. */
           enabled: z.boolean(),
           /** Which project source reads this project's `.bb`: multi-repo or native git (BB-107). */
@@ -589,6 +600,11 @@ export const rpcContract = defineRpcContract({
   stewardsSetProjectEnabled: {
     input: z.object({ projectId: z.string().min(1).max(100), enabled: z.boolean() }),
     output: z.object({ ok: z.boolean(), message: z.string(), enabled: z.boolean() }),
+  },
+  // The Stewards page's "Set up stewards": spawn an ordinary thread with the onboarding skill.
+  stewardsOnboard: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), threadId: z.string().nullable(), message: z.string() }),
   },
   // The stewards page: one project's board. A null projectId picks the first project.
   stewardsBoard: {
@@ -5981,9 +5997,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         };
       },
       async stewardsOverview() {
-        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
-        const configsById = new Map((await configuredProjects()).map((c) => [c.projectId, c] as const));
-        const ids = projectIds(configsById.keys());
+        const list = await bb.sdk.projects.list();
+        const named = new Map(list.map((p) => [p.id, p.name] as const));
+        const configsById = new Map((await configuredProjects(false, list)).map((c) => [c.projectId, c] as const));
+        // Every project, not only the configured ones: a project with no `.bb`
+        // stewards content still gets a row and the Set up stewards action.
+        const ids = [...new Set([...list.map((p) => p.id), ...projectIds(configsById.keys())])];
         const projects = ids.map((projectId) => {
           const config = configsById.get(projectId) ?? null;
           const row = store.project(projectId);
@@ -5993,6 +6012,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectId,
             name: named.get(projectId) ?? projectId,
             configured: config !== null,
+            // A project that still has bindings was stewarded before: restoring
+            // its project.json is the fix, not onboarding it again.
+            onboard: !hasProjectSteward(config) && bindings.length === 0,
             enabled: config?.enabled ?? false,
             source: config?.source.kind ?? null,
             label: config?.file.label ?? null,
@@ -6045,6 +6067,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsSetProjectEnabled({ projectId, enabled }) {
         return setProjectEnabledForUser(projectId, enabled);
+      },
+      async stewardsOnboard({ projectId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("Set up stewards is started from the Stewards page");
+        try {
+          return await onboardProject(projectId);
+        } catch (error) {
+          return { ok: false, threadId: null, message: errorMessage(error) };
+        }
       },
       async stewardsBoard({ projectId: wanted }) {
         const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
@@ -6555,6 +6585,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     bb.agents.configure((context) => {
+      // The onboarding thread is an ordinary thread, not a steward; the skill
+      // carries the whole procedure. It is identified by the metadata this
+      // plugin set at spawn, before any binding lookup.
+      if (context.pluginMetadata.role === "onboarding") return { tools: [], skills: ["onboarding"], instructions: ONBOARDING_INTRO };
       const role = roleOf(context.thread.id);
       if (role === null) return { tools: [], skills: ["stewards"] };
       if (role.kind === "project") {
@@ -8339,6 +8373,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { ok: !lines.some((l) => l.startsWith("problem:")), lines };
     }
 
+    /** Whether a project file names a project steward in roles.json, so it needs no onboarding. */
+    function hasProjectSteward(config: ProjectConfig | null): boolean {
+      return config !== null && config.roles !== null && Object.values(config.roles.roles).some((role) => role.projectSteward === true);
+    }
+
+    /** Spawn the ordinary thread that onboards a project, with the onboarding skill loaded. */
+    async function onboardProject(projectId: string): Promise<{ ok: boolean; threadId: string | null; message: string }> {
+      const source = (await selectProjectSource(projectId)).source;
+      const hostId = await projectHost(projectId);
+      const thread = await bb.sdk.threads.spawn({
+        projectId,
+        environment: freshEnvironment(source, hostId),
+        prompt: ONBOARDING_INTRO,
+        title: "Set up stewards",
+        pluginMetadata: { role: "onboarding", threadBriefs: THREAD_BRIEFS_OFF },
+      });
+      bb.log.info(`stewards: started a Set up stewards thread for ${projectId} (${thread.id})`);
+      return { ok: true, threadId: thread.id, message: `Started a Set up stewards thread (${thread.id}).` };
+    }
+
     /** What `bb stewards check` says about one ops target: readable or not, and whether its logs are. */
     function opsAccessLines(key: string, a: OpsAccess): string[] {
       if (a.error !== null) return [`problem: ops: cannot read the target ${key}: ${a.error}`];
@@ -8351,7 +8405,152 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return lines;
     }
 
+    // ---- the onboarding survey (BB-180) ----------------------------------------
+
+    /** The workflow states the project's ticket playbook expects, for the survey's Linear section. */
+    function surveyExpectedStates(config: ProjectConfig | null): string[] {
+      const playbook = config?.playbooks.ticket ?? (() => { const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets"); return parsed.ok ? parsed.value : null; })();
+      return playbook === null ? [] : playbookStates(playbook);
+    }
+
+    const surveyUnavailable = (error: string): Available<never> => ({ available: false, error });
+
+    /** Gather one repo's GitHub facts and the text of the files the survey reads. */
+    async function gatherSurveyRepo(entry: { dir: string; url: string }, repo: string | null, otherRepos: { repo: string | null; url: string }[]): Promise<SurveyRepoInput> {
+      const contents = new Map<string, string | null>();
+      if (repo === null) {
+        const error = `${entry.url} is not a GitHub repository`;
+        return { dir: entry.dir, url: entry.url, repo, defaultBranch: null, branchProtection: surveyUnavailable(error), labels: surveyUnavailable(error), tree: null, treeError: error, contents, otherRepos };
+      }
+      let defaultBranch: string | null = null;
+      try {
+        defaultBranch = await github.defaultBranch(repo);
+      } catch {
+        defaultBranch = null;
+      }
+      let branchProtection: Available<BranchProtection>;
+      if (github.branchProtection === undefined) branchProtection = surveyUnavailable("the gh writer does not read branch protection");
+      else if (defaultBranch === null) branchProtection = surveyUnavailable("the repository has no readable default branch");
+      else {
+        try {
+          const rule = await github.branchProtection(repo, defaultBranch);
+          branchProtection = { available: true, value: rule ?? { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: null } };
+        } catch (error) {
+          branchProtection = surveyUnavailable(errorMessage(error));
+        }
+      }
+      let labels: Available<string[]>;
+      if (github.labels === undefined) labels = surveyUnavailable("the gh writer does not read labels");
+      else {
+        try {
+          labels = { available: true, value: await github.labels(repo) };
+        } catch (error) {
+          labels = surveyUnavailable(errorMessage(error));
+        }
+      }
+      let tree: GithubTreeEntry[] | null = null;
+      let treeError: string | null = null;
+      if (github.tree === undefined) treeError = "the gh writer does not read a repository tree";
+      else if (defaultBranch === null) treeError = "the repository has no readable default branch";
+      else {
+        try {
+          tree = await github.tree(repo, defaultBranch);
+        } catch (error) {
+          tree = null;
+          treeError = errorMessage(error);
+        }
+      }
+      if (tree !== null && github.fileContent !== undefined && defaultBranch !== null) {
+        for (const path of surveyWantedPaths(tree)) {
+          try {
+            contents.set(path, await github.fileContent(repo, path, defaultBranch));
+          } catch {
+            contents.set(path, null);
+          }
+        }
+      }
+      return { dir: entry.dir, url: entry.url, repo, defaultBranch, branchProtection, labels, tree, treeError, contents, otherRepos };
+    }
+
+    /** Gather the Linear teams and workflow states the survey reports. */
+    async function gatherSurveyLinear(config: ProjectConfig | null): Promise<SurveyLinear> {
+      const label = config?.file.label ?? DEFAULT_LABEL;
+      const configured = config?.file.linear.teams ?? [];
+      const expected = surveyExpectedStates(config);
+      try {
+        const out = await sourceRpc("linear", "sourceValidate", { units: configured, label, states: expected }, sourceContract.sourceValidate.output);
+        if (out.error !== null) return { available: false, error: out.error };
+        const names = new Map(out.mine.map((m) => [m.unit, m.name]));
+        const units = new Map(out.units.map((u) => [u.unit, u]));
+        const keys = configured.length > 0 ? configured : out.mine.map((m) => m.unit);
+        const teams = keys.map((key) => ({ key, name: names.get(key) ?? key, expectedStates: expected, missingStates: units.get(key)?.missingStates ?? [] }));
+        return { available: true, value: { viewer: out.viewer, teams } };
+      } catch (error) {
+        return { available: false, error: errorMessage(error) };
+      }
+    }
+
+    /** Gather what the project's `.bb` already holds, so adoption can diff rather than start over. */
+    async function gatherSurveyBb(source: ProjectSource, config: ProjectConfig | null, reposError: string | null): Promise<SurveyBb> {
+      const names = new Set<string>(KNOWN_PLAYBOOKS);
+      if (config !== null) for (const name of Object.values(config.file.playbooks)) if (typeof name === "string") names.add(name);
+      const paths = [PROJECT_FILE, ROLES_FILE, "repos.json", ...[...names].map(playbookPath)];
+      let files = new Map<string, string | null>();
+      let error: string | null = null;
+      try {
+        files = await source.readFiles(paths);
+      } catch (e) {
+        error = errorMessage(e);
+      }
+      const rolesText = files.get(ROLES_FILE) ?? null;
+      let projectSteward: string | null = null;
+      if (rolesText !== null) {
+        const parsed = parseRolesFile(rolesText);
+        if (parsed.ok) projectSteward = Object.entries(parsed.value.roles).find(([, role]) => role.projectSteward === true)?.[0] ?? null;
+      }
+      return {
+        projectFile: (files.get(PROJECT_FILE) ?? null) !== null,
+        roles: rolesText !== null,
+        projectSteward,
+        playbooks: [...names].filter((name) => (files.get(playbookPath(name)) ?? null) !== null).sort(),
+        reposJson: (files.get("repos.json") ?? null) !== null,
+        error: error ?? reposError,
+      };
+    }
+
+    /** Read the project and emit the survey the onboarding skill works from. */
+    async function surveyProject(projectId: string): Promise<SurveyReport> {
+      const config = await loadConfig(projectId, true);
+      const source = config?.source ?? (await selectProjectSource(projectId)).source;
+      const set = await source.repoSet();
+      const listed = set.layout === "primary" && set.primary !== null ? [...set.repos, set.primary] : set.repos;
+      const seen = new Set<string>();
+      const entries = listed.filter((entry) => {
+        const key = `${entry.dir}\0${entry.url}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const others = entries.map((entry) => ({ repo: githubRepoOf(entry.url), url: entry.url }));
+      const repos: SurveyRepoInput[] = [];
+      for (const entry of entries) repos.push(await gatherSurveyRepo(entry, githubRepoOf(entry.url), others.filter((o) => o.url !== entry.url)));
+      const linear = await gatherSurveyLinear(config);
+      const bb = await gatherSurveyBb(source, config, set.error);
+      return buildSurvey({ projectId, source: source.kind, layout: set.layout, primary: set.primary, repos, linear, bb });
+    }
+
     const stewardsCommands: Record<string, PluginCliCommand> = {
+          survey: cliCommand({
+            summary: "Emit the mechanical facts about a project's repos, Linear and .bb, for onboarding",
+            description:
+              "Reads each repo's default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, deploy manifests, labels and cross-repo references from GitHub; the Linear teams and workflow states from the linear source; and what .bb already holds. A read that fails is reported as unavailable, never fabricated. --json is stable and is what the onboarding skill works from.",
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const report = await surveyProject(projectOf(input.options.project, ctx));
+              return { exitCode: 0, stdout: input.options.json === true ? JSON.stringify(report, null, 2) : formatSurvey(report) };
+            },
+          }),
+
           init: cliCommand({
             summary: "Write stewards/project.json and the default playbooks into a .bb checkout",
             description:

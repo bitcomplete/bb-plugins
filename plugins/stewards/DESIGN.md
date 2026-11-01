@@ -1846,6 +1846,63 @@ own server behind bb-gate, so it is per developer in practice.
 
 
 
+## 22. Onboarding a project (BB-180)
+
+The mechanics of stewards are generic; the content is not. `bb stewards init`
+writes a skeleton (`project.json` with the default decide list and six default
+playbooks), and every project-specific fact — the dependency graph between
+repos, what rebuilds or redeploys when, how a merge is known live, the test
+commands, the project steward's login, and the decide-list `paths` the lane
+gate matches — is left blank. On bb-gate that gap was closed by hand over
+weeks. A new or adopted project cannot run stewards safely without it.
+
+Onboarding is an authoring job, so it is a skill on a thread, not a wizard.
+Three pieces, in order:
+
+1. **`bb stewards survey --json`** ([survey.ts](survey.ts), server.ts). A CLI
+   command that emits the mechanical facts the skill would otherwise
+   re-derive. Per repo (from `repos.json` plus the primary): the default
+   branch, branch protection, languages and package manifests, the test and
+   typecheck commands CI runs (parsed out of `.github/workflows`), Dockerfiles
+   and deploy manifests (`kploy`, `bc-prod.yaml`), the repo's labels, and the
+   other repos its files reference by name or URL. From Linear: the teams and
+   their workflow states. From `.bb`: whether `project.json`, `roles.json`,
+   `repos.json` and each playbook are already there, and which login
+   `roles.json` marks as the project steward, so adoption can diff rather than
+   start over. GitHub is read through the plugin's own `gh` writer
+   ([github.ts](github.ts), `tree`, `branchProtection`, `labels`,
+   `fileContent`); Linear through the existing source contract. A read that
+   fails is reported `available: false` with the reason, never fabricated.
+   The derivation is pure and fixture-tested (`survey.test.ts`), so every
+   field is covered without a network.
+2. **The onboarding skill** ([skills/onboarding/SKILL.md](skills/onboarding/SKILL.md)).
+   It ships in the plugin directory, so it reaches every developer's server in
+   the `bb-server` image. It triggers on "set up stewards", "onboard this
+   project" and "adopt this project". Its procedure is fixed: survey first
+   and read each repo's README; one batched interview under ten questions for
+   what only the owner knows (project steward login, the owner's decisions
+   versus the project steward's with candidate `paths`, how a merge is known
+   live, label, nightly window, ops watches, repos to exclude); `bb stewards
+   init` for the skeleton and then fill `project.json` (repo-dir-prefixed
+   `bigDecisions.paths`, `deps`), `roles.json` and a short `AGENTS.md`,
+   touching playbooks only where the survey found a deviation; `bb stewards
+   check`; `workspace_publish_guidance` and a pull request on the primary
+   whose body lists every assumption, so review is the second interview. It
+   runs `bb stewards enable` only after that pull request merges, because
+   stewards read committed `origin/main` only. On a partial `.bb` the same
+   flow proposes additions only, matching `init`'s never-overwrite rule, so
+   adopting a project is the same as creating one. It is short on day one by
+   design: the lessons mechanism grows `.bb` from real decisions.
+3. **The page entry point.** The Stewards settings overview
+   (`stewardsOverview`) now lists every project, not only the configured ones,
+   and each row carries `onboard: true` when the project has no
+   `project.json` or a `roles.json` with no `projectSteward`. Those rows show
+   a **Set up stewards** button that calls `stewardsOnboard`, which spawns an
+   ordinary thread (identified by `pluginMetadata.role === "onboarding"`, so
+   it is never the project steward thread) with the onboarding skill loaded
+   through `bb.agents.configure` and the project's own environment. The
+   button is page-only (`caller.kind === "client"`).
+
 ## Known limits
 
 - **Multi-repo projects only.** A bb project whose source is a single

@@ -46,6 +46,24 @@ export function createGhTokenReader(): TokenReader {
     });
 }
 
+/** A recursive tree entry as GitHub's tree API returns it. */
+export interface GithubTreeEntry {
+  path: string;
+  type: string;
+}
+
+/**
+ * A branch's protection rule, as the survey reports it. `protected` comes from
+ * the branch endpoint, which needs no admin; the two detail fields come from
+ * the protection endpoint, which does, and are null when the token cannot read
+ * it (the details are unknown, not false).
+ */
+export interface BranchProtection {
+  protected: boolean;
+  requiredApprovingReviewCount: number | null;
+  requiresStatusChecks: boolean | null;
+}
+
 export interface GithubWriter {
   /**
    * Post a comment as the connected user and return GitHub's node id for it.
@@ -79,6 +97,12 @@ export interface GithubWriter {
    * procedure merge (BB-108).
    */
   fileContent?(repo: string, path: string, ref: string): Promise<string | null>;
+  /** A repository's recursive tree at a ref, for the onboarding survey. */
+  tree?(repo: string, ref: string): Promise<GithubTreeEntry[]>;
+  /** A branch's protection rule, or null when the branch is not protected, for the survey. */
+  branchProtection?(repo: string, branch: string): Promise<BranchProtection | null>;
+  /** A repository's label names, for the survey. */
+  labels?(repo: string): Promise<string[]>;
 }
 
 /** "owner/repo#12" or "https://github.com/owner/repo/pull/12" → { repo, number }. */
@@ -156,6 +180,52 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
         if (error instanceof GithubApiError && / 404 /u.test(error.message)) return null;
         throw error;
       }
+    },
+    async tree(repo, ref) {
+      const response = await request("GET", `/repos/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`, undefined);
+      const body = (await response.json().catch(() => null)) as { tree?: unknown } | null;
+      if (body === null || !Array.isArray(body.tree)) return [];
+      return body.tree.flatMap((entry) => {
+        if (entry === null || typeof entry !== "object") return [];
+        const e = entry as { path?: unknown; type?: unknown };
+        return typeof e.path === "string" && e.path !== "" ? [{ path: e.path, type: typeof e.type === "string" ? e.type : "blob" }] : [];
+      });
+    },
+    async branchProtection(repo, branch) {
+      // The branch endpoint works with plain read access and reports
+      // `protected`; the protection endpoint needs admin, so a 404 there must
+      // not be read as "unprotected".
+      const branchResponse = await request("GET", `/repos/${repo}/branches/${encodeURIComponent(branch)}`, undefined);
+      const branchBody = (await branchResponse.json().catch(() => null)) as { protected?: unknown } | null;
+      if (branchBody?.protected !== true) return null;
+      try {
+        const response = await request("GET", `/repos/${repo}/branches/${encodeURIComponent(branch)}/protection`, undefined);
+        const body = (await response.json().catch(() => null)) as { required_pull_request_reviews?: { required_approving_review_count?: unknown } | null; required_status_checks?: unknown } | null;
+        const count = body?.required_pull_request_reviews?.required_approving_review_count;
+        return {
+          protected: true,
+          requiredApprovingReviewCount: typeof count === "number" ? count : null,
+          requiresStatusChecks: body?.required_status_checks !== null && body?.required_status_checks !== undefined,
+        };
+      } catch (error) {
+        // Protected, but this token cannot read the rule's details: report the
+        // fact we have and leave the details unknown rather than guessing.
+        if (error instanceof GithubApiError && / 404 /u.test(error.message)) return { protected: true, requiredApprovingReviewCount: null, requiresStatusChecks: null };
+        throw error;
+      }
+    },
+    async labels(repo) {
+      const names: string[] = [];
+      // GitHub paginates labels; follow the `Link: rel="next"` header, capped.
+      for (let page = 1; page <= 10; page += 1) {
+        const response = await request("GET", `/repos/${repo}/labels?per_page=100&page=${page}`, undefined);
+        const body = (await response.json().catch(() => null)) as unknown;
+        if (!Array.isArray(body)) break;
+        names.push(...body.flatMap((label) => (label !== null && typeof label === "object" && typeof (label as { name?: unknown }).name === "string" ? [(label as { name: string }).name] : [])));
+        const link = response.headers.get("link") ?? "";
+        if (body.length === 0 || !/rel="next"/u.test(link)) break;
+      }
+      return names.sort((a, b) => a.localeCompare(b));
     },
   };
 }
