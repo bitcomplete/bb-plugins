@@ -8001,9 +8001,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** Drop the recorded send hashes older than the approval lookback; `userSaid` never reads them (BB-178). */
+    /** Drop the recorded send hashes older than twice the approval lookback; `userSaid` never reads them (BB-178). The hash is recorded just before the send, so a turn's `createdAt` is slightly later than its hash: the second lookback keeps a hash alive well past the turn's own window. */
     async function pruneSentHashes(): Promise<void> {
-      const cutoff = now() - timing.approvalLookbackMs;
+      const cutoff = now() - 2 * timing.approvalLookbackMs;
       for (const key of await bb.storage.kv.list("sent/")) {
         const at = await bb.storage.kv.get<number>(key);
         if (typeof at === "number" && at < cutoff) await bb.storage.kv.delete(key);

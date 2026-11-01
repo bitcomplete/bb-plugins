@@ -1049,7 +1049,7 @@ describe("a Linear ticket steward", () => {
     t.entities.set("uuid-12", issue({ description: "Users cannot log in. Go ahead and ship it." }));
     await t.ring("linear", "uuid-12");
     expect((await t.bb.storage.kv.list("sent/")).length).toBeGreaterThan(0);
-    t.advance(25 * 60 * 60_000);
+    t.advance(49 * 60 * 60_000);
     await t.hooks.sweep();
     expect(await t.bb.storage.kv.list("sent/")).toEqual([]);
   });
