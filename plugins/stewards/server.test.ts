@@ -3515,6 +3515,16 @@ describe("bb stewards survey and Set up stewards", () => {
     expect(overview.projects).toMatchObject([{ configured: true, onboard: false }]);
   });
 
+  it("does not show it for a project whose project file went away but whose bindings persist", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.files[PROJECT_FILE] = null;
+    t.hooks.forgetConfigs();
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ configured: boolean; onboard: boolean }> };
+    expect(overview.projects).toMatchObject([{ configured: false, onboard: false }]);
+  });
+
   it("starts an ordinary thread with the onboarding skill, never the project steward", async () => {
     const t = await setup();
     const result = (await t.harness.callRpc("stewardsOnboard", { projectId: "p1" })) as { ok: boolean; threadId: string | null };
@@ -3550,6 +3560,38 @@ describe("bb stewards survey and Set up stewards", () => {
     expect(second.exitCode).toBe(0);
     expect(second.stdout.match(/kept existing/gu)?.length).toBe(7);
     expect(t.writes.length).toBe(before + 7);
+  });
+
+  it("accepts the skill's hand-filled project.json and roles.json in check", async () => {
+    const t = await setup();
+    // Start from init's playbooks, then replace the skeleton with what the skill writes.
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    for (const [path, content] of t.writtenContent) {
+      if (path.startsWith("/w/.bb/")) t.files[path.slice("/w/.bb/".length)] = content;
+    }
+    // A hand-filled file: repo-dir-prefixed bigDecisions paths, deps, nightly, standing rules.
+    t.files[PROJECT_FILE] = JSON.stringify({
+      version: 1,
+      linear: { teams: ["ENG"] },
+      github: { exclude: [] },
+      label: "bb-managed",
+      nightly: { at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 },
+      projectSteward: { model: "claude/claude-opus-5-5/high" },
+      bigDecisions: [
+        { text: "Changing what a ticket's requester asked for, beyond clarifying it", decide: "user", paths: [] },
+        { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi/**"] },
+        { text: "A new dependency", decide: "project", paths: ["web/package.json", "web/package-lock.json"] },
+      ],
+      standingRules: ["Tests and typecheck must be green before a merge."],
+      deps: { sla: { critical: "asap", high: "1d", medium: "7d", low: "30d" }, batch: { medium: "7d", low: "30d" }, autoAdopt: ["critical", "high"] },
+    });
+    // The role carries the Dependabot watch the playbook's repos need, so check has no watchProblems.
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { projectSteward: true, ops: { dependabot: "all" } } } });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.exitCode).toBe(0);
   });
 });
 

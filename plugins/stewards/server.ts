@@ -6012,7 +6012,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectId,
             name: named.get(projectId) ?? projectId,
             configured: config !== null,
-            onboard: !hasProjectSteward(config),
+            // A project that still has bindings was stewarded before: restoring
+            // its project.json is the fix, not onboarding it again.
+            onboard: !hasProjectSteward(config) && bindings.length === 0,
             enabled: config?.enabled ?? false,
             source: config?.source.kind ?? null,
             label: config?.file.label ?? null,
