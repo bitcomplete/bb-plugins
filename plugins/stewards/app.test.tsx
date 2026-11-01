@@ -3,10 +3,11 @@
 // choices as one button per choice plus Other…, and a text-only one with
 // Answer rather than Done.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { PROJECT_CHANGED } from "./channels.js";
 import { needActions, questionActions } from "./server.js";
+import { THREAD_NAV_RETRY_MS, THREAD_NAV_WAIT_MS } from "./app.js";
 
 /** One action in a needs-you view, as the server builds it (BB-122). */
 type NeedAction = ReturnType<typeof needActions>["actions"][number];
@@ -748,7 +749,7 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[]; lessons?: unknown[]; lessonCounts?: unknown; digest?: unknown; ended?: unknown[]; stuck?: unknown[] } = {}): Promise<RenderedSlot> => {
+const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[]; lessons?: unknown[]; lessonCounts?: unknown; digest?: unknown; ended?: unknown[]; stuck?: unknown[]; sidebarThreads?: { threads?: unknown[]; status?: "error" | "loading" | "ready" }; threadId?: string | null } = {}): Promise<RenderedSlot> => {
   const captured = await loadApp();
   const panel = captured.navPanels[0]!;
   return renderSlot(panel, { subPath: over.subPath ?? "" }, {
@@ -774,9 +775,10 @@ const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; q
         },
       }),
       stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
-      stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      stewardsNeedAction: () => ({ ok: true, message: "done", ...(over.threadId === undefined ? {} : { threadId: over.threadId }) }),
     } as never,
-  });
+    ...(over.sidebarThreads === undefined ? {} : { sidebarThreads: over.sidebarThreads }),
+  } as never);
 };
 
 const glyphIn = (slot: RenderedSlot, title: string): string | null => slot.getByText(title).closest("li")!.querySelector("[data-steward-glyph]")?.getAttribute("data-steward-glyph") ?? null;
@@ -1083,6 +1085,66 @@ describe("the Stewards page's off-project notice (BB-119)", () => {
     const beta = slot.getByRole("button", { name: /Beta/u });
     expect(acme.textContent).toContain("off");
     expect(beta.textContent).not.toContain("off");
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-177: Provide spawns the requester thread on the server, but the thread
+// reaches the client through the thread-list subscription, not the RPC reply.
+// Navigate only once the live list knows it, so the steward's sidebar row is
+// there to expand and highlight.
+describe("the Stewards page's Provide navigation (BB-177)", () => {
+  const provideBoard = {
+    subPath: "p1/ENG-1",
+    stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, summary: "Waiting on you" })],
+    needs: [need({ id: "need_secret", key: "ENG-1", kind: "provide-secret", what: "Add the token", destination: "the dotenv" })],
+  };
+
+  it("returns the requester thread id and navigates once it is in the live list", async () => {
+    const slot = await renderBoardWith({ ...provideBoard, threadId: "thr_requester", sidebarThreads: { threads: [sidebarThread("thr_requester")] } });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Provide" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Provide" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_secret", action: "provide", note: null } }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_requester" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("waits for a late subscription before navigating, then navigates when the thread appears", async () => {
+    const threads: unknown[] = [];
+    const slot = await renderBoardWith({ ...provideBoard, threadId: "thr_requester", sidebarThreads: { threads } });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Provide" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Provide" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_secret", action: "provide", note: null } }));
+    // The reply is in, but the list has not delivered the thread yet.
+    await new Promise((r) => setTimeout(r, THREAD_NAV_RETRY_MS / 2));
+    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_requester" });
+    threads.push(sidebarThread("thr_requester"));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_requester" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("navigates anyway once the bounded wait elapses", async () => {
+    const slot = await renderBoardWith({ ...provideBoard, threadId: "thr_requester", sidebarThreads: { threads: [] } });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Provide" })).toBeTruthy());
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(slot.getByRole("button", { name: "Provide" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(THREAD_NAV_WAIT_MS + THREAD_NAV_RETRY_MS);
+      });
+      expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_requester" });
+    } finally {
+      vi.useRealTimers();
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("does not navigate when the action returns no thread id", async () => {
+    const slot = await renderBoardWith({ ...provideBoard, threadId: null, sidebarThreads: { threads: [] } });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Done" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_secret", action: "done", note: null } }));
+    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_requester" });
     slot.lifecycle.unmount();
   });
 });

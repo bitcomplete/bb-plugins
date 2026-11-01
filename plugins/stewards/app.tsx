@@ -57,6 +57,10 @@ const REFETCH_DEBOUNCE_MS = 300;
 const OPEN_PR_HANDOFF_MS = 500;
 /** How long a project switch keeps the previous list dimmed before the skeleton (BB-127). */
 const STALE_LIST_MS = 150;
+/** How long Provide waits for the spawned requester thread to reach the client's list before navigating anyway (BB-177). */
+export const THREAD_NAV_WAIT_MS = 5_000;
+/** How often that wait re-checks the live thread list (BB-177). */
+export const THREAD_NAV_RETRY_MS = 100;
 
 /** Stable empties, so a memoised row's props keep their identity (BB-95). */
 const EMPTY_NEEDS: readonly SidebarNeedItem[] = [];
@@ -1280,11 +1284,43 @@ function ActionButtons({
 function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
+  // A thread the server spawns (Provide's requester) reaches the client
+  // through the thread-list subscription, separately from the RPC reply
+  // (BB-177). Read the live list so the navigation below can wait for it.
+  const { threads } = experimental_useSidebarThreads();
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
+  const navTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (navTimer.current !== null) clearTimeout(navTimer.current);
+    },
+    [],
+  );
   const [note, setNote] = useState("");
   // With choices, the text box answers a choice's note until Other… turns it
   // into the free-text answer.
   const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
+  /**
+   * BB-177: navigating to a thread the client does not know yet leaves the
+   * steward's sidebar row collapsed and routes to nowhere useful. Wait,
+   * bounded, for the spawned thread to reach the live list, then navigate; if
+   * it never does, navigate anyway so the user still lands in the requester.
+   */
+  const navigateToThreadWhenKnown = (threadId: string) => {
+    if (navTimer.current !== null) clearTimeout(navTimer.current);
+    const deadline = Date.now() + THREAD_NAV_WAIT_MS;
+    const attempt = () => {
+      navTimer.current = null;
+      if (threadsRef.current.some((t) => t.id === threadId) || Date.now() >= deadline) {
+        navigate.toThread(threadId);
+        return;
+      }
+      navTimer.current = setTimeout(attempt, THREAD_NAV_RETRY_MS);
+    };
+    attempt();
+  };
   const act = (a: BoardActionButton) => {
     setState("running");
     rpc
@@ -1292,8 +1328,11 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
       .then(
         (r) => {
           if (!r.ok) return setState({ error: r.message });
+          // Navigate before the board refetch, and only once the thread is
+          // known client-side; both the new-requester and the
+          // existing-requester replies carry a thread id here (BB-177).
+          if (r.threadId !== null && r.threadId !== undefined) navigateToThreadWhenKnown(r.threadId);
           onDone();
-          if (r.threadId !== null && r.threadId !== undefined) navigate.toThread(r.threadId);
         },
         (e: unknown) => setState({ error: message(e) }),
       );
