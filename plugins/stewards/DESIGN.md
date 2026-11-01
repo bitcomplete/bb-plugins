@@ -208,6 +208,16 @@ labelled ticket is adopted nowhere and is listed read-only in the digest.
 }
 ```
 
+Version 2 (BB-163) names each role once under `roles` and lists holders
+separately (`holders`: login → role names); `projectSteward` is a built-in
+role with no definition, and a login's effective role is the merge of the
+roles it holds, so every consumer of the old `config.role` is unchanged. A
+version 1 file keeps parsing and maps to one synthesized role per login.
+`check` reports an unknown role, zero or two project stewards, two holders
+whose targets overlap, and a holder's roles disagreeing on `context` or
+`team`; a role no holder names is a warning. These are reported only and
+never change what runs.
+
 - A login with no entry runs no watches and is not the project steward for
   the project; the home page says `No role for <login> in roles.json`. A file
   that is present but whose login cannot be read runs no roles — never every

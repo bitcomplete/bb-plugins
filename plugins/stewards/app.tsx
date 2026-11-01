@@ -569,6 +569,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
         title={s.title}
         extra={
           <>
+            {s.roles !== undefined && s.roles.length > 0 ? <Badge tone="muted">role {s.roles.join(", ")}</Badge> : null}
             {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
             {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
             {s.escalations.length > 0 ? <Badge tone={mine.length > 0 ? "bad" : "warn"}>{s.escalations.length === 1 ? "1 escalation" : `${s.escalations.length} escalations`}</Badge> : null}
@@ -897,6 +898,11 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
           <ThreadLink threadId={b.projectStewardThreadId}>Open the project steward</ThreadLink>
         )}
       </div>
+      {(b.roleNames ?? []).length > 0 ? (
+        <p className="text-muted-foreground">
+          This server runs {(b.roleNames ?? []).length === 1 ? "role" : "roles"}: {(b.roleNames ?? []).join(", ")}.
+        </p>
+      ) : null}
       {b.paused ? (
         <p className="flex items-start gap-2">
           <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-attention" aria-label="paused" />
@@ -1017,6 +1023,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
             {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
           </p>
           {s.waitingOn !== null ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
+          {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}
           <p className="text-xs text-muted-foreground">

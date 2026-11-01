@@ -631,23 +631,49 @@ version. Project file fields beyond the design: `nightly.until`,
 defaults in [config.ts](config.ts)) and `deps` (below). `project.json` holds
 conventions only; the watches that need an owner live in `roles.json`.
 
-`roles.json` (BB-105) assigns what each person's server runs. It is keyed by
-the signed-in GitHub login the github plugin reads, and every server runs only
-its own entry: no entry means no watches and no project steward for that
-server, and its home page says `No role for <login> in roles.json`. Ticket,
-labelled-pull-request and review adoption need no entry: they follow the
-Linear assignee, the GitHub author and the GitHub requested reviewer, with or
-without a `roles.json`, and a login that cannot be read adopts nothing and
-shows one problem line. An entry
-is `{ projectSteward?: boolean, ops?: { k8sNamespaces, context?, team?,
-autoAdopt?, sentry?: { projects: [{ org, project }], resolveOnDone? },
-dependabot?: [repo, …] | "all" } }`. `k8sNamespaces` are watched with
-kubectl on that person's machine (their kubeconfig `context` when named);
-`team` is where their ops tickets are filed (the first of `linear.teams` by
-default, and it must be one of them); `autoAdopt` names the Linear priorities
-whose tickets the ops steward labels for a steward itself when it files them;
-every ticket a watch files is assigned to this server's owner, the login the
-role belongs to, and never to anyone else.
+`roles.json` (BB-105, version 2 in BB-163) assigns what each person's server
+runs. Version 2 names each role once under `roles` and lists its holders
+under `holders`:
+
+```jsonc
+{
+  "version": 2,
+  "roles": {
+    "ops": {
+      "k8sNamespaces": ["bb-gate-production"],
+      "context": "bc-prod",
+      "team": "OPS",
+      "autoAdopt": ["urgent"],
+      "sentry": { "projects": [{ "org": "acme", "project": "web" }], "resolveOnDone": false },
+      "dependabot": "all"
+    }
+  },
+  "holders": { "alice": ["ops", "projectSteward"] }
+}
+```
+
+`roles` holds today's ops-style body once per name; `holders` maps a GitHub
+login to the role names it holds. `projectSteward` is a built-in role with
+no definition. A login's effective role is the merge of the roles it holds,
+and every server runs only its own effective role: a login with no entry runs
+no watches and is not the project steward for the project, and its home page
+says `No role for <login> in roles.json`. `bb stewards check`, `bb stewards
+list` and the Stewards page name the roles a server runs, and `list` and the
+page attribute each ops or Dependabot binding to the role whose definition
+owns its target, not only the login.
+Ticket, labelled-pull-request and review adoption need no entry: they follow
+the Linear assignee, the GitHub author and the GitHub requested reviewer, with
+or without a `roles.json`, and a login that cannot be read adopts nothing and
+shows one problem line. A role definition is
+`{ k8sNamespaces, context?, team?, autoAdopt?, sentry?: { projects: [{ org,
+project }], resolveOnDone? }, dependabot?: [repo, …] | "all" }`; the fields
+mean what they did in version 1. `k8sNamespaces` are watched with kubectl on
+that person's machine (their kubeconfig `context` when named); `team` is
+where their ops tickets are filed (the first of `linear.teams` by default,
+and it must be one of them); `autoAdopt` names the Linear priorities whose
+tickets the ops steward labels for a steward itself when it files them; every
+ticket a watch files is assigned to this server's owner, the login the role
+belongs to, and never to anyone else.
 `sentry.projects` watches Sentry projects with the plugin's **Sentry token**
 setting (a user auth token with `project:read`, `event:read` and
 `event:write`; `Sentry API` for a self-hosted server), rung by bb-gate-hooks
@@ -662,14 +688,27 @@ lists the repos whose alerts that person watches, or `"all"` for every repo in
 `repos.json` not in `github.exclude`. `ops-watch.md` is read only when a role
 watches a namespace or a Sentry project.
 
+A version 1 `roles.json` (keyed by GitHub login, `projectSteward: true` plus
+an inline `ops`) keeps parsing: each login becomes one synthesized role named
+after the login, held by it alone, so nothing changes, and `bb stewards check`
+prints a one-line hint to move to version 2. Holders are edited in `.bb` and
+land by a guidance pull request like every other `.bb` change, not a local
+setting: no server can see another's settings, and the file is the only place
+`check` can say "no one is the project steward" or "two holders run the same
+watch".
+
 The project steward's server reports cross-server configuration problems: a
-watch nobody runs, a watch two logins run, and no or two project stewards. A
-role whose credential is missing on a machine (no kubectl, no Sentry token)
-is that server's own `bb stewards check` line, not a project-wide problem.
-A `project.json` that still carries `ops` runs exactly as before on every
-server and adds one problem line saying the watches now belong in
-`roles.json`; once `roles.json` is present it wins, and the migration line
-stays.
+watch nobody runs, a watch two holders run, and no or two project stewards.
+Version 2 adds an error for an unknown role name, a warning for a role no
+holder names, and an error for a holder's roles disagreeing on `context` or
+`team`. These are `check` and problem lines only: they never drop, merge or
+reassign a binding, so a file with overlapping holders keeps running exactly
+what it ran before. A role whose credential is missing on a machine (no
+kubectl, no Sentry token) is that server's own `bb stewards check` line, not
+a project-wide problem. A `project.json` that still carries `ops` runs
+exactly as before on every server and adds one problem line saying the
+watches now belong in `roles.json`; once `roles.json` is present it wins, and
+the migration line stays.
 
 Each server keeps its own bindings, so the project steward's server does not
 see another server's. An escalation routed to `project` on a server that is
