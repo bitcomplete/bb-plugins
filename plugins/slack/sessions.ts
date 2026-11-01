@@ -106,6 +106,14 @@ export const sessionRecordSchema = z.object({
    * no wake has joined a running turn.
    */
   steeredAt: z.number().nullable().default(null),
+  /**
+   * When a late steer was parked for a following turn. A tagged edit that
+   * steers into a turn which already replied cannot share that reply, so it
+   * is left out of `events` and the turn that ends here owes no backstop; a
+   * reply is still allowed while this is set, and a following turn may answer
+   * the steer. Null when no late steer is parked.
+   */
+  lateSteerAt: z.number().nullable().default(null),
   /** The last Slack conversation title pushed, so it is not pushed twice. */
   title: z.string().nullable().default(null),
   /**

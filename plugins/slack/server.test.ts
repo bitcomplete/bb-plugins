@@ -1825,6 +1825,63 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("does not backstop a late steer whose turn already replied", async () => {
+    // The tagged wake's turn replies, then the owner edits that message and
+    // the edit steers into the still-running turn. That turn's one reply cannot
+    // cover the edit, so the edit is left uncounted and the idle posts nothing.
+    const s = await live({ sendAttempt: "join-turn" });
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    expect(s.hooks.messages).toHaveLength(1);
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "1.1", comment: { text: "actually the other one", untrusted: false } }));
+    await tick();
+    // The edit is uncounted, and its steer mark is cleared.
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, { events: number; answered: number; steeredAt: number | null }>;
+    expect(stored["D0123:1712345678.901234"]).toMatchObject({ events: 1, answered: 1, steeredAt: null });
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    // No backstop apology: the turn that ended owed the late steer no reply.
+    expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("lets a following turn ack a late steer after the idle", async () => {
+    // The provider runs the late steer as its own turn once the previous one
+    // has ended. That turn's slack_ack succeeds, and consumes the allowance.
+    const s = await live({ sendAttempt: "join-turn" });
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
+    await tick();
+    await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "1.1", comment: { text: "actually the other one", untrusted: false } }));
+    await tick();
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(1);
+    const ack = await s.tool("slack_ack", { session: "D0123:1712345678.901234" }, { threadId: "thr-1" });
+    expect(s.text(ack)).toContain("Acknowledged");
+    // The allowance is spent: the session has nothing left to answer.
+    const again = await s.tool("slack_reply", { text: "More." }, { threadId: "thr-1" });
+    expect(s.text(again)).toContain("already has its reply");
+    await s.stop();
+  });
+
+  it("lets a following turn reply to a late steer after the idle", async () => {
+    const s = await live({ sendAttempt: "join-turn" });
+    s.hooks.last().send(s.hooks.session({ ts: "1.1" }));
+    await tick();
+    await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    s.hooks.last().send(s.hooks.session({ action: "edited", ts: "1.1", comment: { text: "actually the other one", untrusted: false } }));
+    await tick();
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    const reply = await s.tool("slack_reply", { text: "Changed it." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("Replied in Slack");
+    expect(s.hooks.messages).toHaveLength(2);
+    await s.stop();
+  });
+
   it("posts one backstop when a queued steer later joins a turn that does not name the session", async () => {
     // `threads.send` can resolve `queued` (a turn was starting, or a plugin
     // held it), so the hook has not run and the plugin reads no attempt. At

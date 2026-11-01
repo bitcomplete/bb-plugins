@@ -377,6 +377,8 @@ describe("sessionsSchema", () => {
     expect(parsed.a?.untagged).toBe(0);
     // An older record has no steer mark either.
     expect(parsed.a?.steeredAt).toBeNull();
+    // An older record has no parked late steer either.
+    expect(parsed.a?.lateSteerAt).toBeNull();
     // An older record has no transcript, read as none.
     expect(parsed.a?.transcript).toEqual([]);
     expect(sessionsSchema.parse("nonsense")).toEqual({});
