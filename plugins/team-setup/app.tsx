@@ -572,7 +572,8 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
           ) : (
             <p>
               Sign in with Slack once so a DM or a channel mention of the team's bb app reaches your bb. You approve it on Slack,
-              which sends you back to the Slack settings page. Skip it if you do not use Slack.
+              which lands on a page that says you can close the tab; this row then shows you signed in. Skip it if you do not use
+              Slack.
             </p>
           )}
           {slack.configured && !slack.connected ? (
