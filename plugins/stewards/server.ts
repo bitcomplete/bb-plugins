@@ -46,8 +46,10 @@ import {
   roleK8sTargets,
   roleOpsTargets,
   roleOpsTeam,
+  roleProblems,
   roleSentryTargets,
   roleUsesOps,
+  roleWarnings,
   STAGES,
   usesKind,
   watchProblems,
@@ -620,6 +622,8 @@ export const rpcContract = defineRpcContract({
           enabled: z.boolean(),
           paused: z.boolean(),
           projectStewardThreadId: z.string().nullable(),
+          /** The role names this server's login holds, shown beside the project (BB-163). Optional so a client built from the previous image still validates. */
+          roleNames: z.array(z.string()).optional(),
           /** The playbook schema's stages, in order: the page groups in-flight stewards by them. */
           stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
@@ -831,6 +835,8 @@ type ProjectConfig = {
   linearLogin: string | null;
   /** The role this server runs: its login's entry, a legacy project.ops role, or null. */
   role: StewardRole | null;
+  /** The role names this server's login holds (version 2), or the synthesized login (version 1); empty with no entry. */
+  roleNames: string[];
   playbooks: Partial<Record<BindingKind, Playbook>>;
   /** The dependency watch's alert playbook, when it parses. */
   depsAlerts: Playbook | null;
@@ -842,6 +848,10 @@ type ProjectConfig = {
   enabled: boolean;
   /** What is wrong with the configuration, in sentences; bindings keep running under the last good playbook. */
   problems: string[];
+  /** Non-error lines a `check` shows, such as a role with no holder or the version 1 migration hint. */
+  warnings: string[];
+  /** One-line hints a `check` shows without marking the project unhealthy. */
+  hints: string[];
   loadedAt: number;
 };
 
@@ -1324,6 +1334,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function readConfig(projectId: string): Promise<ProjectConfig | null> {
       const problems: string[] = [];
+      const warnings: string[] = [];
+      const hints: string[] = [];
       const selected = await selectProjectSource(projectId);
       const enabled = await projectEnabled(projectId);
       const source = selected.source;
@@ -1384,6 +1396,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let githubLogin: string | null = null;
       let linearLogin: string | null = null;
       let role: StewardRole | null;
+      let roleNames: string[] = [];
       let rolesUnreadable = false;
       // The logins are read whether or not roles.json is present: a ticket is
       // adopted only where this server's Linear login is an assignee, and a
@@ -1404,9 +1417,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       } else if (rolesPresent) {
         role = roles?.roles[lc(githubLogin)] ?? null;
+        roleNames = roles?.holders[lc(githubLogin)] ?? [];
         if (roles !== null && role === null) problems.push(`No role for ${githubLogin} in ${ROLES_FILE}`);
       } else {
         role = legacyRole(file);
+      }
+      if (roles !== null) {
+        // Version 2 validation and the version 1 migration hint. The
+        // problems never change what runs: a holder's roles are already
+        // merged into `role`, and an unknown name is simply ignored there.
+        problems.push(...roleProblems(roles));
+        warnings.push(...roleWarnings(roles));
+        if (roles.version === 1) hints.push(`hint: ${ROLES_FILE} is version 1; version 2 defines named roles once under "roles" and lists who holds them under "holders" (see the stewards README).`);
       }
       // The migration line stays whether or not roles.json is present: the
       // legacy ops no longer runs once roles.json wins, but the watch is not
@@ -1503,7 +1525,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           problems.push(stewardProblem);
         }
       }
-      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, playbooks, depsAlerts, depsPrs, repos, enabled, problems, loadedAt: now() };
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, depsAlerts, depsPrs, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -6103,6 +6125,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             enabled: picked.enabled,
             paused: (await settings.get()).paused,
             projectStewardThreadId: row.threadId,
+            roleNames: configs.find((c) => c.projectId === projectId)?.roleNames ?? [],
             stages: [...STAGES],
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
             questions,
@@ -8296,19 +8319,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { ok: true, message: `Stewards are off for ${config.file.label}; open bindings are ending.`, enabled: false };
     }
 
+    /** How a `check` or `list` line names the role this server runs. */
+    function roleSummary(config: ProjectConfig): string {
+      if (!config.rolesPresent) return "none (legacy project.ops, run on every server)";
+      const who = config.githubLogin ?? "(login unreadable)";
+      if (config.role === null) return `${who} has no entry`;
+      // Version 1 keeps its exact wording: its role name is the login itself,
+      // so it only adds the project-steward note. Version 2 names the roles.
+      if (config.roles !== null && config.roles.version === 1) return `${who}${config.role.projectSteward ? " (project steward)" : ""}`;
+      return `${who} (${config.roleNames.length > 0 ? config.roleNames.join(", ") : "no roles"})`;
+    }
+
     async function check(projectId: string): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
-      const lines: string[] = [...config.problems.map((p) => `problem: ${p}`)];
+      const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
       if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
       const ticket = config.playbooks.ticket;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
-      lines.push(
-        config.rolesPresent
-          ? `roles: ${config.githubLogin ?? "(login unreadable)"}${config.role === null ? " has no entry" : config.role.projectSteward ? " (project steward)" : ""}`
-          : "roles: none (legacy project.ops, run on every server)",
-      );
+      lines.push(`roles: ${roleSummary(config)}`);
       for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
         const p = config.playbooks[kind];
         lines.push(`${kind}: ${p === undefined ? `no usable playbook (${playbookNameFor(config.file, kind)})` : `${p.name}@${p.version}`}`);
@@ -8712,16 +8742,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) };
               // With a project, its own line; without one, name every configured
               // project this server has switched off, so a bare list still says.
+              const config = projectId === undefined ? null : await loadConfig(projectId);
               const offProjects =
                 projectId === undefined
                   ? (await configuredProjects()).filter((c) => !c.enabled).map((c) => c.projectId)
-                  : (await loadConfig(projectId))?.enabled === false
+                  : config?.enabled === false
                     ? [projectId]
                     : [];
               const offLine = offProjects.length === 0 ? [] : [`Stewards are off on this server for ${offProjects.join(", ")}. Switch on with bb stewards enable --project <id>.`];
+              // The role this server runs, so the bindings below are read under
+              // their role name, not only the login (BB-163).
+              const roleLine = config === null ? [] : [`roles: ${roleSummary(config)}`];
               const lessons = projectId === undefined ? [] : store.lessons(projectId).filter((l) => l.tier !== "retired");
               const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
-              return { exitCode: 0, stdout: [...offLine, formatBindings(rows), ...lessonLines].join("\n") };
+              return { exitCode: 0, stdout: [...offLine, ...roleLine, formatBindings(rows), ...lessonLines].join("\n") };
             },
           }),
 

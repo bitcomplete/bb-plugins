@@ -465,15 +465,35 @@ when asked to "set up stewards".
    `.bb/stewards/project.json` (Linear teams you belong to, or `--teams
    ENG,OPS`) and the four default playbooks into the workspace's `.bb`.
    The project file holds conventions only. Each person's watches go in
-   `.bb/stewards/roles.json`, keyed by GitHub login: `projectSteward: true`
-   on one login, and `ops.k8sNamespaces` / `ops.sentry.projects` /
-   `ops.dependabot` for the namespaces, Sentry projects and Dependabot repos
-   that server watches (`ops.sentry` needs the plugin's Sentry token
-   setting). A login with no entry runs no watches and is not the project
-   steward; its home page says so. Until `roles.json` exists, the legacy
-   `ops.targets` in `project.json` still runs on every server, with one
-   problem line saying it now belongs in `roles.json`. Nothing per-server is
-   written under `.bb`.
+   `.bb/stewards/roles.json`. Version 2 names each role once and lists who
+   holds it:
+
+   ```json
+   {
+     "version": 2,
+     "roles": { "ops": { "k8sNamespaces": ["bb-gate-production"], "sentry": { "projects": [{ "org": "acme", "project": "web" }] }, "dependabot": "all" } },
+     "holders": { "alice": ["ops", "projectSteward"] }
+   }
+   ```
+
+   `roles` holds today's ops-style definition once per name (`k8sNamespaces`,
+   `context?`, `team?`, `autoAdopt?`, `sentry`, `dependabot?`); `holders`
+   maps a GitHub login to the role names it holds. A login's effective role
+   is the merge of the roles it holds, and `check`, `list` and the Stewards
+   page name those roles, not only the login. `projectSteward` is a built-in
+   role with no definition; a role no holder names is a `check` warning, and
+   two holders with overlapping targets, an unknown role name, zero or two
+   `projectSteward` holders, and a holder's roles disagreeing on `context` or
+   `team` are `check` problems (reported only, never changing what runs). A
+   login with no entry runs no watches and is not the project steward; its
+   home page says so. A version 1 file (one entry per login,
+   `projectSteward: true` plus an inline `ops`) keeps parsing unchanged, with
+   a one-line hint to move to version 2. Until `roles.json` exists, the
+   legacy `ops.targets` in `project.json` still runs on every server, with
+   one problem line saying it now belongs in `roles.json`. Holders are part
+   of `.bb`: edit the file, commit and publish it as a guidance pull request
+   like every other `.bb` change — never a per-server setting. Nothing
+   per-server is written under `.bb`.
 2. Review them, commit inside `.bb`, publish with
    `workspace_publish_guidance`, and merge the `guidance-<thread>` branch.
    Edits take effect only once merged.

@@ -365,17 +365,42 @@ export type RoleOps = z.infer<typeof roleOpsSchema>;
 export const roleSchema = z.object({ projectSteward: z.boolean().default(false), ops: roleOpsSchema.optional() }).strict();
 export type Role = z.infer<typeof roleSchema>;
 
-export type RolesFile = { version: 1; roles: Record<string, Role> };
+/** The built-in role name for the project steward. It has no `roles` definition. */
+export const PROJECT_STEWARD_ROLE = "projectSteward";
 
-const rolesFileRawSchema = z.object({ version: z.literal(1), roles: z.record(z.string(), roleSchema) }).strict();
+/** A named role in a version 2 file. */
+const roleNameSchema = z.string().min(1).max(63).regex(/^[A-Za-z][A-Za-z0-9_-]*$/u, "a role name such as ops");
+
+/**
+ * The normalized roles file. Both versions read into this shape: `roles` is
+ * the effective role each login runs (the merge of every role it holds), so
+ * every consumer of `config.role` is unchanged. `holders` keeps the role
+ * names a login holds for display and validation, and `definitions` keeps
+ * the named definitions so `check` can report an unknown or unheld one.
+ */
+export type RolesFile = {
+  /** 1 for the login-keyed shape, 2 for named role definitions and holders. */
+  version: 1 | 2;
+  /** login -> the effective role: the merge of every role it holds. */
+  roles: Record<string, Role>;
+  /** login -> the role names it holds, in order. Version 1 synthesizes the login itself. */
+  holders: Record<string, string[]>;
+  /** role name -> its ops definition. Version 1 synthesizes one per login. `projectSteward` is never a key. */
+  definitions: Record<string, RoleOps>;
+};
+
+const rolesFileV1RawSchema = z.object({ version: z.literal(1), roles: z.record(z.string(), roleSchema) }).strict();
 
 /**
  * Folds every login to lower case and refuses two keys that name the same
  * login ignoring case. Duplicate JSON keys are collapsed by `JSON.parse`
- * before this runs; the check catches `Jane` and `jane` in one file.
+ * before this runs; the check catches `Jane` and `jane` in one file. Each
+ * login becomes one synthesized role named after the login, held by it alone.
  */
-export const rolesFileSchema = rolesFileRawSchema.transform((file, ctx): RolesFile => {
+const rolesFileV1Schema = rolesFileV1RawSchema.transform((file, ctx): RolesFile => {
   const roles: Record<string, Role> = {};
+  const holders: Record<string, string[]> = {};
+  const definitions: Record<string, RoleOps> = {};
   for (const [key, role] of Object.entries(file.roles)) {
     const parsed = githubLogin.safeParse(key);
     if (!parsed.success) {
@@ -387,9 +412,86 @@ export const rolesFileSchema = rolesFileRawSchema.transform((file, ctx): RolesFi
       ctx.addIssue({ code: "custom", path: ["roles", key], message: `${key} names the same login as another entry, ignoring case` });
       return z.NEVER;
     }
+    holders[login] = [login, ...(role.projectSteward ? [PROJECT_STEWARD_ROLE] : [])];
+    if (role.ops !== undefined) definitions[login] = role.ops;
     roles[login] = role;
   }
-  return { version: 1, roles };
+  return { version: 1, roles, holders, definitions };
+});
+
+const rolesFileV2RawSchema = z
+  .object({
+    version: z.literal(2),
+    /** The named role definitions: today's `roleOpsSchema` body, once per name. */
+    roles: z.record(roleNameSchema, roleOpsSchema),
+    /** login -> the role names it holds. `projectSteward` is a built-in name. */
+    holders: z.record(z.string(), z.array(roleNameSchema).min(1).max(50)),
+  })
+  .strict()
+  .superRefine((file, ctx) => {
+    if (Object.prototype.hasOwnProperty.call(file.roles, PROJECT_STEWARD_ROLE)) {
+      ctx.addIssue({ code: "custom", path: ["roles", PROJECT_STEWARD_ROLE], message: `${PROJECT_STEWARD_ROLE} is a built-in role with no definition; remove it from roles` });
+    }
+  });
+
+/**
+ * The merge of a holder's role definitions, in the order the holder lists
+ * them. List fields are unioned; `context` and `team` take the first defined
+ * value (a disagreement is a `check` problem, never a runtime change);
+ * `dependabot: "all"` wins over an explicit list.
+ */
+function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
+  const k8sNamespaces: string[] = [];
+  const autoAdopt: RoleOps["autoAdopt"] = [];
+  const projects: RoleOps["sentry"]["projects"] = [];
+  const dependabot: string[] = [];
+  let dependabotAll = false;
+  let context: string | undefined;
+  let team: string | undefined;
+  let resolveOnDone = false;
+  for (const def of defs) {
+    for (const name of def.k8sNamespaces) if (!k8sNamespaces.includes(name)) k8sNamespaces.push(name);
+    for (const priority of def.autoAdopt) if (!autoAdopt.includes(priority)) autoAdopt.push(priority);
+    for (const project of def.sentry.projects) if (!projects.some((p) => p.org === project.org && p.project === project.project)) projects.push(project);
+    if (def.context !== undefined && context === undefined) context = def.context;
+    if (def.team !== undefined && team === undefined) team = def.team;
+    if (def.sentry.resolveOnDone) resolveOnDone = true;
+    if (def.dependabot === "all") dependabotAll = true;
+    else if (Array.isArray(def.dependabot)) for (const repo of def.dependabot) if (!dependabot.includes(repo)) dependabot.push(repo);
+  }
+  const ops: RoleOps = { k8sNamespaces, autoAdopt, sentry: { projects, resolveOnDone } };
+  if (context !== undefined) ops.context = context;
+  if (team !== undefined) ops.team = team;
+  if (dependabotAll) ops.dependabot = "all";
+  else if (dependabot.length > 0) ops.dependabot = dependabot;
+  return ops;
+}
+
+/** The effective role a holder runs: the merge of the roles it holds, and whether one is `projectSteward`. */
+function effectiveRole(names: readonly string[], definitions: Record<string, RoleOps>): Role {
+  const defs = names.filter((name) => name !== PROJECT_STEWARD_ROLE).map((name) => definitions[name]).filter((def): def is RoleOps => def !== undefined);
+  return { projectSteward: names.includes(PROJECT_STEWARD_ROLE), ...(defs.length === 0 ? {} : { ops: mergeRoleOps(defs) }) };
+}
+
+/** Folds holder logins to lower case and refuses two that name the same login ignoring case. */
+const rolesFileV2Schema = rolesFileV2RawSchema.transform((file, ctx): RolesFile => {
+  const holders: Record<string, string[]> = {};
+  for (const [key, names] of Object.entries(file.holders)) {
+    const parsed = githubLogin.safeParse(key);
+    if (!parsed.success) {
+      ctx.addIssue({ code: "custom", path: ["holders", key], message: `${JSON.stringify(key)} is not a GitHub login` });
+      return z.NEVER;
+    }
+    const login = parsed.data.toLowerCase();
+    if (holders[login] !== undefined) {
+      ctx.addIssue({ code: "custom", path: ["holders", key], message: `${key} names the same login as another entry, ignoring case` });
+      return z.NEVER;
+    }
+    holders[login] = [...new Set(names)];
+  }
+  const roles: Record<string, Role> = {};
+  for (const [login, names] of Object.entries(holders)) roles[login] = effectiveRole(names, file.roles);
+  return { version: 2, roles, holders, definitions: file.roles };
 });
 
 export function parseRolesFile(text: string): Parsed<RolesFile> {
@@ -399,7 +501,8 @@ export function parseRolesFile(text: string): Parsed<RolesFile> {
   } catch (error) {
     return { ok: false, error: `${ROLES_FILE} is not JSON: ${error instanceof Error ? error.message : String(error)}` };
   }
-  const parsed = rolesFileSchema.safeParse(raw);
+  const version = typeof raw === "object" && raw !== null ? (raw as { version?: unknown }).version : undefined;
+  const parsed = (version === 2 ? rolesFileV2Schema : rolesFileV1Schema).safeParse(raw);
   return parsed.success ? { ok: true, value: parsed.data } : { ok: false, error: `${ROLES_FILE}: ${zodMessage(parsed.error)}` };
 }
 
@@ -557,12 +660,51 @@ export function watchProblems(project: ProjectFile, roles: RolesFile, repos: rea
   return problems;
 }
 
-/** The project steward count problem, or null when exactly one login holds it. */
+/** The project steward count problem, or null when exactly one holder holds it. */
 export function projectStewardProblem(roles: RolesFile): string | null {
   const stewards = Object.entries(roles.roles).filter(([, role]) => role.projectSteward).map(([login]) => login);
-  if (stewards.length === 0) return "no one is the project steward: set projectSteward: true on one login in roles.json";
-  if (stewards.length > 1) return `two people are the project steward: ${stewards.join(", ")}`;
+  if (stewards.length === 0) {
+    return roles.version === 2
+      ? `no one holds ${PROJECT_STEWARD_ROLE}: give one holder the ${PROJECT_STEWARD_ROLE} role in roles.json`
+      : "no one is the project steward: set projectSteward: true on one login in roles.json";
+  }
+  if (stewards.length > 1) {
+    return roles.version === 2 ? `two people hold ${PROJECT_STEWARD_ROLE}: ${stewards.join(", ")}` : `two people are the project steward: ${stewards.join(", ")}`;
+  }
   return null;
+}
+
+/**
+ * The version 2 validation errors a `check` reports: a holder names a role
+ * that is neither defined nor the built-in `projectSteward`, or a holder's
+ * roles disagree on `context` or `team`. The runtime never acts on these: the
+ * effective role is merged deterministically and the same file keeps running.
+ */
+export function roleProblems(roles: RolesFile): string[] {
+  if (roles.version !== 2) return [];
+  const problems: string[] = [];
+  for (const [login, names] of Object.entries(roles.holders)) {
+    for (const name of names) {
+      if (name !== PROJECT_STEWARD_ROLE && roles.definitions[name] === undefined) {
+        problems.push(`${login} holds an unknown role ${JSON.stringify(name)}: define it under roles, or use ${PROJECT_STEWARD_ROLE}`);
+      }
+    }
+    const defs = names.map((name) => roles.definitions[name]).filter((def): def is RoleOps => def !== undefined);
+    const contexts = [...new Set(defs.map((def) => def.context).filter((value): value is string => value !== undefined))];
+    if (contexts.length > 1) problems.push(`${login} holds roles with conflicting context (${contexts.join(", ")}): a holder's roles must agree on one context`);
+    const teams = [...new Set(defs.map((def) => def.team).filter((value): value is string => value !== undefined))];
+    if (teams.length > 1) problems.push(`${login} holds roles with conflicting team (${teams.join(", ")}): a holder's roles must agree on one team`);
+  }
+  return problems;
+}
+
+/** The version 2 warnings a `check` reports: a defined role no holder names. */
+export function roleWarnings(roles: RolesFile): string[] {
+  if (roles.version !== 2) return [];
+  const held = new Set(Object.values(roles.holders).flat());
+  return Object.keys(roles.definitions)
+    .filter((name) => !held.has(name))
+    .map((name) => `role ${JSON.stringify(name)} has no holder`);
 }
 
 // ---- playbooks ---------------------------------------------------------------------

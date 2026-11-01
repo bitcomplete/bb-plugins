@@ -897,6 +897,11 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
           <ThreadLink threadId={b.projectStewardThreadId}>Open the project steward</ThreadLink>
         )}
       </div>
+      {(b.roleNames ?? []).length > 0 ? (
+        <p className="text-muted-foreground">
+          This server runs {(b.roleNames ?? []).length === 1 ? "role" : "roles"}: {(b.roleNames ?? []).join(", ")}.
+        </p>
+      ) : null}
       {b.paused ? (
         <p className="flex items-start gap-2">
           <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-attention" aria-label="paused" />

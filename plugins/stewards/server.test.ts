@@ -9529,6 +9529,98 @@ describe("roles.json (BB-105)", () => {
   });
 });
 
+// BB-163: roles.json version 2 names role definitions once and lists their
+// holders. Version 1 keeps reading, mapped to one synthesized role per login.
+describe("roles.json version 2 (BB-163)", () => {
+  const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => JSON.stringify({ version: 2, roles: definitions, holders });
+  const v1 = (entries: Record<string, unknown>) => JSON.stringify({ version: 1, roles: entries });
+  const problemsOf = async (t: Awaited<ReturnType<typeof setup>>): Promise<string[]> => {
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ problems: string[] }> };
+    return overview.projects[0]!.problems;
+  };
+  const kubectl = async (args: string[]): Promise<KubectlResult> => {
+    const a = args.filter((x) => !x.startsWith("--"));
+    if (a[0] === "auth") return { exitCode: 1, stdout: "no\n", stderr: "" };
+    if (a[0] === "get") return { exitCode: 0, stdout: a.includes("json") ? JSON.stringify({ items: [] }) : "", stderr: "" };
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  it("shows a one-line migration hint when it reads a version 1 file", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v1({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/hint: stewards\/roles\.json is version 1; version 2 defines named roles/u);
+    // Version 1 keeps its exact wording; only the hint line is new.
+    expect(check.stdout).toMatch(/roles: Jane \(project steward\)/u);
+    // The hint is not a problem: it never marks the project unhealthy.
+    expect(await problemsOf(t)).not.toContainEqual(expect.stringMatching(/version 1/u));
+  });
+
+  it("adopts the same binding from a version 2 file as from the equivalent version 1 file", async () => {
+    const one = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    one.files[ROLES_FILE] = v1({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    one.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await one.hooks.sweep();
+    await one.flush();
+    const before = await one.list();
+
+    const two = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    two.files[ROLES_FILE] = v2({ ops: { k8sNamespaces: ["bb-gate-production"] } }, { jane: ["ops", "projectSteward"] });
+    two.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await two.hooks.sweep();
+    await two.flush();
+    const shape = (rows: Awaited<ReturnType<typeof one.list>>) => rows.map((r) => ({ key: r.key, kind: r.kind, ended: r.ended, escalations: r.escalations, needs: r.needs, summary: r.summary }));
+    expect(shape(await two.list())).toEqual(shape(before));
+  });
+
+  it("reports an unknown role and a conflicting merge, and keeps the known watches running", async () => {
+    const t = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v2({ ops: { k8sNamespaces: ["bb-gate-production"], context: "bc-prod" }, extra: { context: "other" } }, { jane: ["ops", "extra", "bogus", "projectSteward"] });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/problem: jane holds an unknown role "bogus"/u);
+    expect(check.stdout).toMatch(/problem: jane holds roles with conflicting context \(bc-prod, other\)/u);
+    // The unknown name is ignored, the conflict takes the first context, and the watch still runs.
+    expect(await t.list()).toMatchObject([{ key: "k8s-namespace/bb-gate-production", kind: "ops" }]);
+  });
+
+  it("warns, without marking the project unhealthy, about a role no holder names", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v2({ ops: { k8sNamespaces: ["prod"] }, unused: {} }, { jane: ["ops", "projectSteward"] });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/warning: role "unused" has no holder/u);
+    expect(await problemsOf(t)).not.toContainEqual(expect.stringMatching(/has no holder/u));
+  });
+
+  it("reports overlapping holders as a problem, without changing either holder's binding", async () => {
+    const t = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v2({ web: { k8sNamespaces: ["web-production"] }, db: { k8sNamespaces: ["web-production"] } }, { jane: ["web", "projectSteward"], bob: ["db"] });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect((await problemsOf(t)).some((p) => p.includes("two people run the web-production watch: jane, bob"))).toBe(true);
+    // jane's server still adopts her role's watch; nothing is dropped or merged.
+    expect(await t.list()).toMatchObject([{ key: "k8s-namespace/web-production", kind: "ops" }]);
+  });
+
+  it("shows the role names in check, list and on the board", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = v2({ ops: { k8sNamespaces: ["bb-gate-production"] } }, { jane: ["ops", "projectSteward"] });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/roles: Jane \(ops, projectSteward\)/u);
+    const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
+    expect(list.stdout).toMatch(/roles: Jane \(ops, projectSteward\)/u);
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { roleNames: string[] } };
+    expect(board.board.roleNames).toEqual(["ops", "projectSteward"]);
+  });
+});
+
 // BB-115: adoption follows one human-set owner per kind of work, with or
 // without a roles.json project steward. A ticket is this server's only when
 // its Linear login is an assignee, a labelled pull request only when its

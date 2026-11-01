@@ -16,9 +16,12 @@ import {
   projectStewardProblem,
   roleDepsTargets,
   roleK8sTargets,
+  roleOpsTargets,
   roleOpsTeam,
+  roleProblems,
   roleSentryTargets,
   roleUsesOps,
+  roleWarnings,
   sentryTargets,
   usesKind,
   watchProblems,
@@ -467,5 +470,94 @@ describe("roles.json (BB-105)", () => {
     expect(problems).toContain("nobody runs the Sentry watch for acme/web");
     expect(problems).toContain("nobody runs the Dependabot watch for acme/web");
     expect(problems).toContain("nobody runs the Dependabot watch for acme/other");
+  });
+});
+
+describe("roles.json version 2 (BB-163)", () => {
+  const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => parseRolesFile(JSON.stringify({ version: 2, roles: definitions, holders }));
+  const project = () => {
+    const parsed = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "web-production" }] } }));
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parsed.value;
+  };
+
+  it("parses named roles and holders, merges a holder's roles, and keeps the built-in projectSteward", () => {
+    const parsed = v2(
+      {
+        ops: { k8sNamespaces: ["bb-gate-production"], team: "eng", sentry: { projects: [{ org: " Acme ", project: "Web-API" }] }, dependabot: "all" },
+        deps: { dependabot: ["acme/web"], autoAdopt: ["urgent"] },
+      },
+      { "Jane-Doe": ["ops", "deps", "projectSteward"], Bob: ["ops"] },
+    );
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(Object.keys(parsed.value.roles)).toEqual(["jane-doe", "bob"]);
+    expect(parsed.value.holders["jane-doe"]).toEqual(["ops", "deps", "projectSteward"]);
+    const role = parsed.value.roles["jane-doe"]!;
+    expect(role.projectSteward).toBe(true);
+    expect(role.ops).toMatchObject({ k8sNamespaces: ["bb-gate-production"], team: "ENG", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web-api" }], resolveOnDone: false }, dependabot: "all" });
+    // bob holds only ops: no projectSteward, and the same watches jane's ops role gives.
+    expect(parsed.value.roles["bob"]!.projectSteward).toBe(false);
+    expect(roleOpsTargets(parsed.value.roles["bob"]!)).toEqual(roleOpsTargets(role));
+    expect(roleDepsTargets(parsed.value.roles["bob"]!, ["acme/web", "acme/other"])).toEqual(roleDepsTargets(role, ["acme/web", "acme/other"]));
+  });
+
+  it("gives the same bindings, target keys and check result as the equivalent version 1 file", () => {
+    const entry = { k8sNamespaces: ["prod"], context: "bc-prod", team: "ENG", sentry: { projects: [{ org: "acme", project: "web" }] }, dependabot: ["acme/web"] };
+    const v1 = parseRolesFile(JSON.stringify({ version: 1, roles: { jane: { projectSteward: true, ops: entry } } }));
+    const modern = v2({ ops: entry }, { jane: ["ops", "projectSteward"] });
+    if (!v1.ok || !modern.ok) throw new Error("parse failed");
+    expect(modern.value.roles["jane"]).toEqual(v1.value.roles["jane"]);
+    expect(roleOpsTargets(modern.value.roles["jane"]!)).toEqual(roleOpsTargets(v1.value.roles["jane"]!));
+    expect(roleDepsTargets(modern.value.roles["jane"]!, ["acme/web", "acme/other"])).toEqual(roleDepsTargets(v1.value.roles["jane"]!, ["acme/web", "acme/other"]));
+    expect(roleOpsTeam(modern.value.roles["jane"]!, project())).toBe(roleOpsTeam(v1.value.roles["jane"]!, project()));
+    expect(projectStewardProblem(modern.value)).toBeNull();
+    expect(watchProblems(project(), modern.value, [], false)).toEqual(watchProblems(project(), v1.value, [], false));
+  });
+
+  it("reports two holders of overlapping targets, and keeps both running unchanged", () => {
+    const parsed = v2({ web: { k8sNamespaces: ["web-production"] }, db: { k8sNamespaces: ["web-production"] } }, { alice: ["web"], bob: ["db"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(watchProblems(project(), parsed.value, [], false)).toContain("two people run the web-production watch: alice, bob");
+    // Both roles still resolve to their own holder: nothing is dropped or merged at runtime.
+    expect(roleK8sTargets(parsed.value.roles["alice"]!)).toEqual([{ kind: "k8s-namespace", name: "web-production" }]);
+    expect(roleK8sTargets(parsed.value.roles["bob"]!)).toEqual([{ kind: "k8s-namespace", name: "web-production" }]);
+  });
+
+  it("reports zero or two project stewards", () => {
+    const none = v2({ ops: {} }, { alice: ["ops"] });
+    if (!none.ok) throw new Error(none.error);
+    expect(projectStewardProblem(none.value)).toMatch(/no one holds projectSteward/u);
+    const two = v2({ ops: {} }, { alice: ["ops", "projectSteward"], bob: ["projectSteward"] });
+    if (!two.ok) throw new Error(two.error);
+    expect(projectStewardProblem(two.value)).toMatch(/two people hold projectSteward: alice, bob/u);
+  });
+
+  it("reports an unknown role name, and ignores it at runtime", () => {
+    const parsed = v2({ ops: { k8sNamespaces: ["prod"] } }, { alice: ["ops", "bogus"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(roleProblems(parsed.value)).toEqual(['alice holds an unknown role "bogus": define it under roles, or use projectSteward']);
+    expect(roleOpsTargets(parsed.value.roles["alice"]!)).toEqual([{ kind: "k8s-namespace", name: "prod" }]);
+  });
+
+  it("reports a conflicting context or team on merge, and takes the first at runtime", () => {
+    const parsed = v2({ a: { context: "bc-prod", team: "ENG" }, b: { context: "other", team: "OPS" } }, { alice: ["a", "b"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    const problems = roleProblems(parsed.value);
+    expect(problems).toContain("alice holds roles with conflicting context (bc-prod, other): a holder's roles must agree on one context");
+    expect(problems).toContain("alice holds roles with conflicting team (ENG, OPS): a holder's roles must agree on one team");
+    expect(parsed.value.roles["alice"]!.ops).toMatchObject({ context: "bc-prod", team: "ENG" });
+  });
+
+  it("warns about a role no holder names", () => {
+    const parsed = v2({ ops: { k8sNamespaces: ["prod"] }, unused: {} }, { alice: ["ops"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(roleWarnings(parsed.value)).toEqual(['role "unused" has no holder']);
+  });
+
+  it("refuses a definition for the built-in projectSteward role, a missing holders map, and an empty holder list", () => {
+    expect(parseRolesFile(JSON.stringify({ version: 2, roles: { projectSteward: {} }, holders: { alice: ["projectSteward"] } }))).toMatchObject({ ok: false });
+    expect(parseRolesFile(JSON.stringify({ version: 2, roles: {} }))).toMatchObject({ ok: false });
+    expect(parseRolesFile(JSON.stringify({ version: 2, roles: {}, holders: { alice: [] } }))).toMatchObject({ ok: false });
+    expect(parseRolesFile(JSON.stringify({ version: 2, roles: { ops: {} }, holders: { Jane: ["ops"], jane: ["ops"] } }))).toMatchObject({ ok: false, error: expect.stringMatching(/same login as another entry/u) });
   });
 });
