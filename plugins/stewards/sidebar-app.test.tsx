@@ -2462,3 +2462,86 @@ describe("the switch-project command (BB-188)", () => {
     expect(command.isAvailable?.(context)).toBe(false);
   });
 });
+
+// BB-189: ⌘⇧U is the keyboard path to the compose button beside the project
+// picker. It reuses the BB-188 store's bound compose callback, so it composes
+// on the picked project and closes the drawer exactly as the button does.
+describe("the new-thread-in-project command (BB-189)", () => {
+  type CommandContext = { threadId: string | null; projectId: string | null; openPanel: (options: never) => boolean };
+  type CapturedCommand = {
+    id: string;
+    title: string;
+    defaultShortcut: Record<string, unknown> | null;
+    isAvailable?: (context: CommandContext) => boolean;
+    run: (context: CommandContext) => void;
+  };
+  const context: CommandContext = { threadId: null, projectId: null, openPanel: () => false };
+  const newThreadCommand = async (): Promise<CapturedCommand> => {
+    const captured = await loadApp();
+    const commands = (captured as unknown as { commandPaletteActions: CapturedCommand[] }).commandPaletteActions;
+    const command = commands.find((c) => c.id === "new-thread-in-project");
+    if (command === undefined) throw new Error("new-thread-in-project is not registered");
+    return command;
+  };
+
+  it("registers new-thread-in-project with the ⌘⇧U shortcut", async () => {
+    const command = await newThreadCommand();
+    expect(command.title).toBe("Stewards: new thread in current project");
+    expect(command.defaultShortcut).toMatchObject({ key: "u", mod: true, shift: true });
+  });
+
+  it("composes on the picked project, then closes the drawer", async () => {
+    let slot!: RenderedSlot;
+    let composeSeenAtNavigate = false;
+    const onNavigate = vi.fn(() => {
+      composeSeenAtNavigate = slot.inspection.navigateCalls.some((c) => c.method === "toCompose");
+    });
+    slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { onNavigate },
+    );
+    const command = await newThreadCommand();
+    await waitFor(() => expect(command.isAvailable?.(context)).toBe(true));
+    act(() => command.run(context));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toCompose", options: { projectId: "p1", focusPrompt: true } }));
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    expect(composeSeenAtNavigate).toBe(true);
+    slot.lifecycle.unmount();
+  });
+
+  it("composes on the project the picker switched to", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: (input: { projectId: string | null }) => sidebarData({ projectId: input.projectId ?? "p1" }) } as never,
+    });
+    const command = await newThreadCommand();
+    await pickProject(slot, "Personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
+    act(() => command.run(context));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toCompose", options: { projectId: "personal", focusPrompt: true } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("reports isAvailable false while the list is not mounted or has no project", async () => {
+    const command = await newThreadCommand();
+    expect(command.isAvailable?.(context)).toBe(false);
+
+    const empty = await renderSidebar({
+      sidebarThreads: { projects: [], threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    await waitFor(() => expect(command.isAvailable?.(context)).toBe(false));
+    empty.lifecycle.unmount();
+
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    await waitFor(() => expect(command.isAvailable?.(context)).toBe(true));
+    slot.lifecycle.unmount();
+    expect(command.isAvailable?.(context)).toBe(false);
+  });
+});

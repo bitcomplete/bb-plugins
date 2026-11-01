@@ -700,6 +700,22 @@ describe("the switch-project command's registration (BB-188)", () => {
   });
 });
 
+// BB-189: the compose command's palette registration shape.
+describe("the new-thread-in-project command's registration (BB-189)", () => {
+  it("registers one palette command with the ⌘⇧U default and both callbacks", async () => {
+    const captured = await loadApp();
+    const commands = (captured as unknown as { commandPaletteActions: Array<Record<string, unknown>> }).commandPaletteActions;
+    const command = commands.find((c) => c.id === "new-thread-in-project");
+    expect(command).toMatchObject({
+      target: "app",
+      title: "Stewards: new thread in current project",
+      defaultShortcut: { key: "u", mod: true, shift: true },
+    });
+    expect(typeof command?.run).toBe("function");
+    expect(typeof command?.isAvailable).toBe("function");
+  });
+});
+
 // BB-90: the overview (Settings → Plugins → Stewards → Status) polled only, so
 // it now subscribes to the widened channel too.
 describe("the stewards overview's refresh (BB-90)", () => {
