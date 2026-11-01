@@ -6192,9 +6192,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const summary = mergeSummary(gate);
       const since = sinceApproval(gate);
       const restart = await restartNoteFor(b.projectId, ref.repo);
+      // BB-193: GitHub's own squash subject is "<PR title> (#<n>)" with the PR
+      // body as the message; the plugin used to override both with a
+      // placeholder and the gate summary. Read them fresh from GitHub and fall
+      // back to the old placeholder when the read fails, so a read never blocks
+      // a merge whose gate is met. The "Merged:" summary stays in the PR
+      // comment, not the commit.
+      let commitTitle = `Merge ${pull.key}`;
+      let commitBody = summary;
+      try {
+        const details = await github.pullDetails(ref.repo, ref.number);
+        if (details !== null) {
+          commitTitle = `${details.title} (#${ref.number})`;
+          commitBody = details.body;
+        }
+      } catch (error) {
+        bb.log.warn(`stewards: could not read ${ref.repo}#${ref.number} for the squash merge title: ${errorMessage(error)}`);
+      }
       let mergeSha: string | null = null;
       try {
-        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, `Merge ${pull.key}`, summary));
+        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, commitTitle, commitBody));
         const body = [summary, ...(since === null ? [] : [since]), `merge commit ${mergeSha ?? "?"}`, ...(restart === null ? [] : [restart])].join("\n");
         await github.comment(ref.repo, ref.number, body).catch(() => undefined);
       } catch (error) {
