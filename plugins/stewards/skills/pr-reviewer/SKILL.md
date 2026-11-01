@@ -17,7 +17,9 @@ signed") or the project steward when the matching entry is
 thorough on substance and quiet on style.
 
 **Thorough is about what you check, not what you write.** The comment
-is as long as its findings. A clean PR gets the marker, the lane line,
+is as long as its findings. A review with no blockers and no suggestions
+is under 600 characters; a round with findings is the findings plus the
+lane line plus one "Ran:" line. A clean PR gets the marker, the lane line,
 one line naming what you ran, and "Looks good." Do not list things that
 did not happen (suites you did not run because the diff does not touch
 them, migrations a diff has none of, sections with "None" in them), do
@@ -214,32 +216,46 @@ or
 1. **<file>:<line>** — what is wrong, why it matters, what would fix it.
 
 ### Suggestions
-- Non-blocking improvements. The author may decline with a reason.
+- Improvements the author may decline with a reason.
 
 ### Resolved since round <N-1>
 - Blocker 1 from round 1: resolved by <short sha> / unresolved because ...
 
 ### Checked
 - Ran: <the repo's test command> (pass; not in the CI matrix) ...
-- Verified against ticket: <only the criteria that are not met, or that took real work to verify and how>
+- Verified against ticket: <criteria not met, if any>
 ```
 
 The Checked section is an exceptions list, not a transcript. Name the
-command you ran and its result. An acceptance criterion gets a line
-only when it is not met, or when confirming it took something a reader
-cannot see from the diff (a run against a live service, a throwaway
-test, a read of another repo); a criterion the diff plainly satisfies
-gets no line. Leave out rollout notes when there is no migration, no
-new dependency and no contract change, and leave out walkthrough
-sections when there is no UI. In a later round, do not repeat round 1's
-Checked list: say what you re-ran and what the new diff is, and nothing
-about criteria that did not change.
+command you ran and its result. An acceptance criterion gets a line only
+when it is not met, or when verifying it needed something not in the diff
+and not in the repo: a run against a live service or server, a read of
+another repo, a check against the SDK or CLI. Reading the PR's own tests
+or code never qualifies. **Never list a criterion as "met", in any
+round.** Writing "spawn carries the flag, with a test asserting it: met"
+is exactly the recital this forbids. The round-1 shape is one "Ran:"
+line, zero or more unmet criteria, and any off-diff verification, and
+nothing else. Leave out rollout notes when there is no migration, no new
+dependency and no contract change, and leave out walkthrough sections
+when there is no UI. In a later round, the Resolved section is the only
+place that talks about round 1's items: its Checked is one "Ran:" line,
+and nothing about criteria that did not change. A round whose diff is
+docs or wording only says so in one sentence and does not re-list
+anything.
 
 A blocker is something that would be wrong to merge: a bug, a missing
 piece of the ticket, a failing or missing test for the behaviour, a
-security, data-safety or contract problem. A suggestion is a change you
-want the author to make in this PR and would not block the merge on. If
-you would not want it made, do not post it: nothing out of the ticket's
+security, data-safety or contract problem. A missing test for behaviour
+the PR adds is a blocker, not an optional suggestion. A suggestion is a
+change you want the author to make in this PR and would not block the
+merge on. Before posting one, apply the test: post it only if you would
+mark the PR `changes-requested` were it the only finding and the author
+refused it without a reason. A suggestion carrying any of "optional",
+"non-blocking", "pre-existing", "predates this PR", "out of scope",
+"follow-up", "harmless", "rare", "nothing rides on it" or "if you touch
+it again" is not posted. An observation about code the PR did not change
+is never a suggestion. A missing comment in a test is not posted. If you
+would not want it made, do not post it: nothing out of the ticket's
 scope, nothing you have already called harmless or unreachable, nothing
 that only "would be tighter", no rewording of a sentence that reads
 fine, no follow-up idea for another ticket (file that on the ticket, in
