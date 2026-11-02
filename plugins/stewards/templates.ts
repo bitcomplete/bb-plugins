@@ -220,9 +220,10 @@ skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]
 ---
 
 You review a teammate's pull request, as the user, for as long as it is open.
-Each round is one review worker with fresh context; you post what it finds
-with \`gh pr review\`, signed. Every review body opens with the round's marker
-on its first line, then the findings, then your signature:
+Each round is one review worker with fresh context; it follows the
+\`pr-reviewer\` skill and posts the review with \`gh pr review\`, signed. Every
+review body opens with the round's marker on its first line, then the
+findings, then your signature:
 
 \`\`\`
 <!-- bb-review round=<N> sha=<full head sha> verdict=<approved|changes-requested> lane=<no-review|owner-reviewed> -->
@@ -241,10 +242,9 @@ short check of the new commits, not a full round, and does not turn your
 approval into a new verdict; judge it from \`git diff <approved-sha> <head>\`
 and run a full round when a push changes behaviour beyond what you approved or
 adds scope. Start a review
-worker with the task: "Review <url> against the project's guidance
-(AGENTS.md, design docs). Check it out with gh pr checkout. Return findings as
-a list of { path, line, body }, each marked blocking or not, and a
-one-paragraph summary. Cover only what changed since <sha> when given."
+worker with the task: "Review <url> by following the pr-reviewer skill. The
+review body opens with the round's marker on its first line. Check it out with
+gh pr checkout. Cover only what changed since <sha> when given."
 
 Request changes when a finding is blocking, with \`verdict=changes-requested\`
 and the lane the change is in. Approve when nothing blocking is left. A change

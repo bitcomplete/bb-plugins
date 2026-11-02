@@ -263,6 +263,17 @@ describe("playbooks", () => {
     expect(reviews.value.general).toMatch(/the plugin files the owner's\s+Approve item/u);
   });
 
+  it("points the github-reviews worker at the shipped pr-reviewer skill and its marker (BB-206)", () => {
+    const reviews = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+    if (!reviews.ok) throw new Error(reviews.error);
+    // The playbook says the worker follows the skill, and the worker task names it.
+    expect(reviews.value.general).toMatch(/follows the\s+`pr-reviewer` skill/u);
+    expect(reviews.value.general).toMatch(/by following the pr-reviewer skill/u);
+    // The review body opens with the round marker, and the marker's shape is stated.
+    expect(reviews.value.general).toMatch(/review body opens with the round's marker\s+on its first line/u);
+    expect(reviews.value.general).toMatch(/<!-- bb-review round=<N>/u);
+  });
+
   it("maps states to phases and stages, ignoring case, and splits sections", () => {
     const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!parsed.ok) throw new Error(parsed.error);
