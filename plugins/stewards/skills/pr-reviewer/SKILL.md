@@ -256,6 +256,26 @@ plugin parse it, so keep its shape exact:
   fails, retry once with `comments: []`, then fall back to `gh pr review`
   and say in your final line that the inline comments were lost.
 
+  When a round's verdict is `approved` and you do not submit an APPROVED
+  review — a teammate's PR on `lane=owner-reviewed`, where the action is
+  `--comment`, not `--approve` — GitHub keeps an earlier Request Changes
+  from the same login in state `CHANGES_REQUESTED`, so the PR still reads
+  "changes requested" although this round found no blockers. Dismiss your
+  own most recent such review. List the PR's reviews
+  (`gh api repos/<repo>/pulls/<n>/reviews --paginate`) and take the newest
+  one whose `state` is `CHANGES_REQUESTED` and whose body is yours: it
+  carries a `bb-review` marker or the `_— from bb thread …_` signature.
+  Dismiss only a review you posted, never a person's, even though you post
+  from the owner's login:
+
+  ```sh
+  gh api -X PUT repos/{owner}/{repo}/pulls/{n}/reviews/{id}/dismissals -f message="Dismissed: round N at <sha> found no blockers" -f event=DISMISS
+  ```
+
+  `changes-requested` rounds are unchanged. Skip quietly when no review you
+  posted is still in state `CHANGES_REQUESTED`. The round's signed comment
+  says which earlier review was dismissed, by round and id.
+
 `verdict` is `approved` or `changes-requested`. `approved` means: no
 blockers remain, the change does what the ticket asks, and the tests you
 ran pass. Suggestions may still be open; the author decides on those. Use
