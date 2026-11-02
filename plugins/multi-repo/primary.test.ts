@@ -423,6 +423,25 @@ describe("seeding a new primary project", () => {
     expect(result.message).toMatch(/committed locally only/u);
   });
 
+  it("pushes the seed branch when a pull request is asked for", async () => {
+    const primary = await makeRepo("primary");
+    const path_ = path.join(scratch, "primary-clone");
+    const result = await preparePrimaryProjectSource({
+      url: primary,
+      path: path_,
+      seed: EMPTY_REPOS,
+      branch: "bb/seed-bb-pushed",
+      openPullRequest: true,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.seeded).toBe(true);
+    // The branch reaches the remote so a pull request can be opened from it...
+    expect(await gitLine(primary, ["rev-parse", "--verify", "--quiet", "bb/seed-bb-pushed"])).not.toBeNull();
+    // ...and the local-path remote makes `gh` unable to, which is reported.
+    expect(result.prUrl).toBeNull();
+    expect(result.warnings.join(" ")).toMatch(/pull request/u);
+  });
+
   it("uses a repo that already carries .bb/ as it is", async () => {
     const primary = await makeRepo("primary");
     await commitDefinition(primary, "existing\n");

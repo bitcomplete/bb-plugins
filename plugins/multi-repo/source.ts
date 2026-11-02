@@ -1654,6 +1654,7 @@ export async function preparePrimaryProjectSource(
   // fast-forward the checked-out default branch, or advance the local default
   // branch when it is not checked out and the seed descends from it. A diverged
   // default branch is left alone — the seed waits on its pull request.
+  let seedLocation = defaultBranch;
   const checkedOut = await gitLine(args.path, ["rev-parse", "--abbrev-ref", "HEAD"], options);
   if (checkedOut === defaultBranch) {
     const merged = await gitIn(args.path, ["merge", "--ff-only", "--quiet", seedSha], options);
@@ -1667,6 +1668,7 @@ export async function preparePrimaryProjectSource(
       const updated = await gitIn(args.path, ["update-ref", localRef, seedSha], options);
       if (updated.code !== 0) warnings.push(`Could not advance ${defaultBranch} to the seed: ${firstProblemLine(updated)}`);
     } else {
+      seedLocation = args.branch;
       warnings.push(
         args.openPullRequest
           ? `${defaultBranch} has diverged from origin; the seed is only on ${args.branch} until it merges.`
@@ -1704,7 +1706,7 @@ export async function preparePrimaryProjectSource(
     prUrl,
     warnings,
     message: !args.openPullRequest
-      ? `Seeded .bb/ in ${args.path} on ${defaultBranch}; committed locally only, no pull request.`
+      ? `Seeded .bb/ in ${args.path} on ${seedLocation}; committed locally only, no pull request.`
       : prUrl === null
         ? `Seeded .bb/ in ${args.path} on ${args.branch}; open a pull request to land it.`
         : `Opened ${prUrl}.`,
