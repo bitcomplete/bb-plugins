@@ -10506,3 +10506,138 @@ describe("a wait with no wake source (BB-154)", () => {
     expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(0);
   });
 });
+
+// BB-203: the plugin writes the binding's status from events it observed
+// itself, before the steward's next turn, and quiets a running worker's own
+// pull request activity only while nothing the user must act on is open.
+describe("mechanical status and quiet notes (BB-203)", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  const marker = comment({
+    id: "m1",
+    author: "trotterdylan",
+    body: `<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=project -->`,
+    signedBy: "thr_reviewer",
+    createdAt: "2026-10-14T16:00:00Z",
+  });
+  const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+  const base = { phase: "In Review", summary: "Waiting on approval.", nextAction: "Wait for the owner", actor: "user" as const, waitingOn: "the owner" };
+
+  /** A bound ticket with one linked, owner-lane pull request and a steward. */
+  async function withPull(comments: ReturnType<typeof comment>[] = [marker]) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ comments }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward, binding: () => t.hooks.store.find("ENG-12")!, stewardSends: () => t.sends.filter((s) => s.threadId === steward).length };
+  }
+
+  it("writes the approved status on the page approve, before any steward turn runs", async () => {
+    const t = await withPull();
+    await t.tool("steward_report", { ...base }, t.steward);
+    const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
+    const before = t.stewardSends();
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
+    expect(res).toMatchObject({ ok: true });
+    // The status moved with no wake: the page and sidebar are current now.
+    expect(t.binding().status).toMatchObject({ summary: "Approved acme/web#7.", nextAction: "The worker merges it.", actor: "steward" });
+    expect(t.stewardSends()).toBe(before);
+  });
+
+  it("writes the merged status when an own pull request merges", async () => {
+    const t = await withPull();
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.tool("steward_report", { phase: "In Review", summary: "Approved.", nextAction: "The worker merges it.", actor: "steward" }, t.steward);
+    t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true, headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.binding().status).toMatchObject({ summary: "Merged acme/web#7.", nextAction: "Awaiting deployment." });
+  });
+
+  it("writes the deployed status when the plugin settles a structured carries watch", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/bb-gate\n  environment: production\n  carries:\n    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }\n  timeout: 1h',
+    );
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", ...linked }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "In Review", summary: "Merged.", nextAction: "Awaiting deployment.", actor: "other" }, steward);
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await t.harness.callRpc("stewardsRing", { source: "github", id: "acme/bb-gate#7", deployment: { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: null } }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    expect(t.hooks.store.find("ENG-12")!.status).toMatchObject({ summary: "Deployed acme/web#7.", nextAction: "Close the ticket." });
+  });
+
+  it("quiets a reviewer round on the worker's own pull request and keeps it as a note", async () => {
+    const t = await withPull([]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const before = t.stewardSends();
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.stewardSends()).toBe(before);
+    // The round is not lost: a teammate's comment on the ticket wakes the
+    // steward, and the wake carries the round the cursor kept.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked, comments: [comment({ createdAt: "2026-10-14T17:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.stewardSends()).toBe(before + 1);
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/acme\/web#7: 1 new comment/u);
+  });
+
+  it("wakes for the same reviewer round once no worker is running", async () => {
+    const t = await withPull([]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    t.hooks.store.setWorker("thr_w1", "stopped", null);
+    const before = t.stewardSends();
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.stewardSends()).toBe(before + 1);
+  });
+
+  it("does not wake for checks finishing on the worker's own pull request", async () => {
+    const t = await withPull([]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const before = t.stewardSends();
+    t.entities.set("acme/web#7", pull({}, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.stewardSends()).toBe(before);
+  });
+
+  it("wakes for a reviewer round while the user has an open need", async () => {
+    const t = await withPull([]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    t.hooks.store.fileNeed({ bindingId: t.binding().id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7", how: null, data: {}, filedBy: "plugin" });
+    const before = t.stewardSends();
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.stewardSends()).toBe(before + 1);
+  });
+
+  it("wakes for a human comment on the worker's own pull request", async () => {
+    const t = await withPull([]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const before = t.stewardSends();
+    t.entities.set("acme/web#7", pull({ comments: [comment({ id: "h1", author: "lee", body: "Please rebase." })] }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.stewardSends()).toBe(before + 1);
+  });
+
+  it("writes the approved status on the project steward's approval", async () => {
+    const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker, workerComment] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    // The change touches a `project` entry, so the project steward decides it.
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool("steward_report", { phase: "In Review", summary: "Waiting on the project steward.", nextAction: "Wait", actor: "other" }, steward);
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the project steward.");
+    const res = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, project);
+    expect(res.error, res.text).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.status).toMatchObject({ summary: "Approved acme/web#7.", nextAction: "The worker merges it.", actor: "steward" });
+  });
+});

@@ -469,6 +469,45 @@ Plugin code. No model turn.
    changed is kept as a quiet note and shown with the next turn something
    else makes due.
 
+#### Status the plugin writes itself (BB-203)
+
+The status record is no longer written only by a steward turn. When the
+plugin observes one of these itself, it patches the record in the same
+reconcile, without a model turn, so the Stewards page and the sidebar are
+current within a refetch (`reconcile.ts` `mechanicalStatus`, applied by
+`server.ts`):
+
+- an `approve-pr` item closed because an approval is present — by the owner
+  on the page, by the project steward's `bb-approval`, or observed on GitHub
+  — reads `Approved <pr>.` with `The worker merges it.`;
+- an own pull request going open → merged reads `Merged <pr>.` with
+  `Awaiting deployment.`;
+- checks finishing on an own pull request fold into the phrase
+  (`nextAction`), leaving the steward's `summary` alone;
+- a deployment watch settling to `deployed` reads `Deployed <pr>.` with
+  `Close the ticket.`
+
+The write keeps the steward's phase, `waitingOn`, conditions and resources,
+and goes through `patch`, so the realtime channel rings. `actor` follows the
+standing rule — `user` only while a need or a `me` escalation is open — and
+the approval event does not count the approval escalation it answers, so an
+approval reads as the steward's worker merging, not as the user's. A binding
+with no status record gets none: a mechanical write never invents the
+steward's first report.
+
+Which events still wake the steward is unchanged except where a running
+worker already owns the next step. A new pull request comment, a checks
+result, a link or follow, and a project-steward decision the worker was
+told about by `tell` are quiet notes while a worker is in flight on that
+pull request and nothing the user must act on is open. An open need or `me`
+escalation keeps them loud, so the steward can reconcile the item it is
+holding for the user. A human (non-reviewer, non-worker) comment, a
+`changes-requested` or blocker marker with no worker in flight, a worker's
+question or error, and anything that opens a need stay loud. The mechanical
+status writes do not replace a wake that is otherwise due: they run before
+it, so the page is right and the steward still makes the decision the turn
+exists for.
+
 Holds that wait behind other bindings (`holdBehind`) lift by state, not
 only by the event that finishes the work. On every reconcile of a waiter,
 when every binding it waits behind satisfies `finished` — every linked pull
