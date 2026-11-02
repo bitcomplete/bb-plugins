@@ -79,6 +79,17 @@ describe("recording merged pull requests", () => {
     expect(after["acme/web#20"]).toMatchObject({ mergeSha: "base0001", prRepo: "acme/web", files: ["plugins/stewards/a.ts", "plugins/stewards/b.ts"] });
   });
 
+  it("applies the landedIn override only to the pull request that merged into the base (BB-215)", () => {
+    const stacked = pull({ key: "acme/web#20" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked" });
+    const direct = pull({ key: "acme/web#21" }, { merged: true, mergeCommit: "direct1", base: "main", head: "feature-direct" });
+    const first = recordMerged({}, { entity: stacked, pulls: [direct] }, [target], NOW);
+    const base = { mergeSha: "base0001", prRepo: "acme/web", files: ["plugins/stewards/a.ts"] };
+    const after = recordMerged(first, { entity: stacked, pulls: [direct] }, [target], NOW + 1000, (p) => (p.pull?.base === "feature-base" ? base : null));
+    // The stacked pull request follows the base; the direct one keeps its own merge.
+    expect(after["acme/web#20"]).toMatchObject({ mergeSha: "base0001" });
+    expect(after["acme/web#21"]).toMatchObject({ mergeSha: "direct1" });
+  });
+
   it("stores the merge commit, not the head, and notes an unknown oid", () => {
     const merged = pull({ key: "acme/web#9" }, { merged: true, headSha: "headsha1", mergeCommit: "mergesha" });
     const deployments = recordMerged({}, { entity: merged, pulls: [] }, [target], NOW);

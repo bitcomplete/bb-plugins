@@ -1726,7 +1726,7 @@ describe("scheduling overlapping work", () => {
     expect(toProject()).toHaveLength(1);
     const wake = toProject()[0]!.text;
     expect(wake).toMatch(/^# Project steward: scheduling requested for ENG-13/u);
-    expect(wake).toMatch(/from ENG-13 \(schedule\): Schedule ENG-13 \(Add SSO\)\? Its ready gate has passed, and it overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry\. Hold it behind that work with steward_update \{ binding: "ENG-13", hold: "<why>", behind: \["ENG-12"\] \}/u);
+    expect(wake).toMatch(/from ENG-13 \(schedule\): Schedule ENG-13 \(Add SSO\)\? Its ready gate has passed, and it overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry\. The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update \{ binding: "ENG-13", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" \}; when it has no pull request yet, steward_update \{ binding: "ENG-13", hold: "<why>", stack: \["ENG-12"\] \}/u);
     expect(wake).toMatch(/A schedule escalation is the plugin's/u);
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): .*\[touches web\/src\/login\]/u);
     expect(wake).toMatch(/- ENG-13 \(ticket, Todo\): .*\[touches web\/src; file-level overlap: ENG-12 on web\/src\/login \(its pull request acme\/web#7 is open on retry\); 1 escalation\(s\): schedule→project\]/u);
@@ -1790,7 +1790,7 @@ describe("scheduling overlapping work", () => {
     await t.tool("steward_report", { ...building, touches: ["web/src/audit"] }, third);
     await t.tool("steward_report", ready, second);
     expect(toProject()).toHaveLength(2);
-    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13 \(Add SSO\)\? .* overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry; ENG-14 \(In Progress; 0 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/audit\. Hold it behind that work with steward_update \{ binding: "ENG-13", hold: "<why>", behind: \["ENG-12", "ENG-14"\] \}, and it starts by itself once their pull requests merge or they end/u);
+    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13 \(Add SSO\)\? .* overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry; ENG-14 \(In Progress; 0 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/audit\. The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update \{ binding: "ENG-13", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" \}; when it has no pull request yet, steward_update \{ binding: "ENG-13", hold: "<why>", stack: \["ENG-12", "ENG-14"\] \}/u);
 
     // Held behind both; ENG-14 is canceled, ENG-12 ends: the hold lifts when the last one goes.
     await t.tool("steward_update", { binding: "ENG-13", hold: "After the login and audit work", behind: ["ENG-12", "ENG-14"] }, project);
@@ -2123,6 +2123,41 @@ describe("scheduling overlapping work", () => {
     t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { head: "eng-12-login", merged: false }));
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-13")).toMatchObject({ hold: "After ENG-12 merges", holdBehind: ["ENG-12"], holdStack: [] });
+  });
+
+  it("lifts a stack-wait when its target ends without opening a pull request (BB-215)", async () => {
+    const { t, project, toSecond } = await stackable();
+    await t.tool("steward_update", { binding: "ENG-13", hold: "Stacked on ENG-12", stack: ["ENG-12"] }, project);
+    await t.flush();
+    const wakes = toSecond().length;
+    t.entities.set("uuid-12", issue({ state: "Canceled", stateType: "canceled" }));
+    await t.ring("linear", "uuid-12");
+    const b13 = t.hooks.store.find("ENG-13")!;
+    expect(b13.hold).toBeNull();
+    expect(b13.holdStack).toEqual([]);
+    expect(toSecond().length).toBeGreaterThanOrEqual(wakes + 1);
+    expect(toSecond().at(-1)!.text).toMatch(/Stack-wait lifted: ENG-12 reached Canceled without a pull request to stack on\. Start now on the default branch\./u);
+  });
+
+  it("re-stacks the second of two overlapping waiters released by one open pull request (BB-215)", async () => {
+    const { t, project } = await stackable();
+    t.entities.set("uuid-14", issue({ id: "uuid-14", key: "ENG-14", title: "Audit log" }));
+    await t.ring("linear", "uuid-14");
+    const third = t.spawns[3]!.id;
+    await t.tool("steward_report", { ...ready, touches: ["web/src/login.ts"] }, third);
+    await t.tool("steward_update", { binding: "ENG-13", hold: "Stacked on ENG-12", stack: ["ENG-12"] }, project);
+    await t.tool("steward_update", { binding: "ENG-14", hold: "Stacked on ENG-12", stack: ["ENG-12"] }, project);
+    await t.flush();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { head: "eng-12-login", merged: false }));
+    await t.ring("linear", "uuid-12");
+    const b13 = t.hooks.store.find("ENG-13")!;
+    const b14 = t.hooks.store.find("ENG-14")!;
+    const started = [b13, b14].filter((b) => b.hold === null);
+    const reheld = [b13, b14].filter((b) => b.hold !== null);
+    expect(started).toHaveLength(1);
+    expect(reheld).toHaveLength(1);
+    expect(reheld[0]!.holdStack).toEqual([started[0]!.entityKey]);
   });
 });
 
@@ -9221,8 +9256,8 @@ describe("deployment watching (BB-53)", () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
     t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
-    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1" }));
-    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked" }));
+    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", head: "feature-base" }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     // Before the report the watch carries the stacked merge.

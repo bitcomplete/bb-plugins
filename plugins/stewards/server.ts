@@ -2997,13 +2997,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-215: a stacked pull request whose ticket reported the base pull
         // request it landed in is carried by the base's merge on the default
         // branch, because a squash rewrote the stacked merge. Read the base
-        // fresh so the watch re-points as soon as the base merges.
-        let landedOverride: { mergeSha: string | null; prRepo: string; files: string[] } | null = null;
+        // fresh so the watch re-points as soon as the base merges, and apply
+        // the override only to the pull request that actually merged into the
+        // base branch, never to another merged pull request on the ticket.
+        let landedOverride: ((p: EntitySnapshot) => { mergeSha: string | null; prRepo: string; files: string[] } | null) | undefined;
         if (b.landedIn !== null) {
           const base = await snapshot("github", b.landedIn).catch(() => null);
-          if (base !== null && base.pull !== null && base.pull.merged) landedOverride = { mergeSha: base.pull.mergeCommit ?? null, prRepo: base.unit, files: base.pull.files ?? [] };
+          if (base !== null && base.pull !== null && base.pull.merged && base.pull.head !== null && base.pull.head !== "") {
+            const baseUnit = base.unit;
+            const baseHead = base.pull.head;
+            const override = { mergeSha: base.pull.mergeCommit ?? null, prRepo: base.unit, files: base.pull.files ?? [] };
+            landedOverride = (p) => (p.unit === baseUnit && p.pull?.base === baseHead ? override : null);
+          }
         }
-        deployments = recordMerged(deployments, observed, deployTargets, now(), () => landedOverride);
+        deployments = recordMerged(deployments, observed, deployTargets, now(), landedOverride);
         if (deployments !== beforeDeploy) {
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
           // A reconcile can also only drop a not-applicable watch (BB-132
@@ -3280,16 +3287,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       // BB-215: a stack-wait lifts the moment the work it waits for opens a
-      // pull request, not when it merges. Both directions are checked here:
-      // this binding's own open pull request releases its waiters, and this
-      // binding's own stack-wait releases if its targets already have one
-      // (level-triggered, so a hold placed after the pull request opened lifts
-      // on the next look rather than at an edge that has already passed).
-      if (openPull(b, observed) !== null) await releaseStack(b, observed);
+      // pull request, or when that work ends without one. Both directions are
+      // checked here: this binding's own open pull request (or ending) releases
+      // its waiters, and this binding's own stack-wait releases if its targets
+      // are open or finished (level-triggered, so a hold placed after the
+      // pull request opened or the target ended lifts on the next look).
+      await releaseStack(b, observed);
       if (b.holdStack.length > 0) {
         const projectId = b.projectId;
         const targets = b.holdStack.map((k) => store.find(k, projectId)).filter((t): t is Binding => t !== null);
-        for (const t of targets) if (t.lastSnapshot !== null) await releaseStack(t, t.lastSnapshot);
+        for (const t of targets) await releaseStack(t, t.lastSnapshot);
         b = store.binding(b.id) ?? b;
       }
       const scheduling = await syncScheduleRequest(b, playbook);
@@ -5359,10 +5366,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         kind: "schedule",
         question:
           `Schedule ${b.entityKey}${b.title === null ? "" : ` (${b.title})`}? Its ready gate has passed, and it overlaps at file level with what is already being changed by ${overlap}. ` +
-          `Hold it behind that work with steward_update { binding: "${b.entityKey}", hold: "<why>", behind: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, and it starts by itself once ${keys.length === 1 ? "that ticket's pull requests merge or it ends" : "their pull requests merge or they end"}; ` +
-          `stack it with steward_update { binding: "${b.entityKey}", hold: "<why>", stack: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, and it starts by itself, branched from that pull request, as soon as it opens; ` +
-          `when an earlier pull request is already open, let it start stacked with steward_update { binding: "${b.entityKey}", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" }; ` +
-          `or let it start now with steward_update { binding: "${b.entityKey}", guidance: "Start now: <why>", resolve: "<this escalation>" }.`,
+          `The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update { binding: "${b.entityKey}", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" }; when it has no pull request yet, steward_update { binding: "${b.entityKey}", hold: "<why>", stack: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, which lifts as soon as that pull request opens and wakes the steward with its head branch. ` +
+          `Use a behind hold only when that work must land on the default branch first: steward_update { binding: "${b.entityKey}", hold: "<why>", behind: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, which lifts once its pull requests merge or it ends. ` +
+          `When the overlap is harmless or the new ticket matters more (then consider holding the other one instead), let it start now with steward_update { binding: "${b.entityKey}", guidance: "Start now: <why>", resolve: "<this escalation>" }.`,
         meanwhile: "Waiting: no implementation workers start until it is scheduled.",
         route: "project",
         recommendation: null,
@@ -5389,6 +5395,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * work asks to be scheduled again on its next look.
      */
     async function releaseBehind(b: Binding, how: string): Promise<void> {
+      // A stack-wait on this binding lifts on the same endings: the work it
+      // waited to stack on will not open a pull request now.
+      await releaseStack(b, b.lastSnapshot, how);
       const key = lc(b.entityKey);
       const waiting = store.open(b.projectId).filter((h) => h.id !== b.id && h.holdBehind.some((k) => lc(k) === key));
       if (waiting.length === 0) return;
@@ -5441,32 +5450,56 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const shortSha = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
 
     /**
-     * The work a stack-wait waits for now has an open pull request (BB-215):
-     * lift the wait and wake the waiting steward with the pull request's key
-     * and head branch, so it branches from that branch and opens its own pull
-     * request with that branch as the base. A `behind` hold lifts when its
-     * target merges or ends; this one lifts the moment the pull request opens,
-     * which is what lets a stacked ticket start before the base lands.
+     * The work a stack-wait waits for now has an open pull request (BB-215),
+     * or it is finished/ended without one: lift the wait and wake the waiting
+     * steward with the pull request's key and head branch, so it branches from
+     * that branch and opens its own pull request with that branch as the base.
+     * A `behind` hold lifts when its target merges or ends; this one lifts the
+     * moment the pull request opens, which is what lets a stacked ticket start
+     * before the base lands. The `how` argument is for the end paths, which
+     * know why the target is gone; the level check judges `finished` instead,
+     * so a hold placed after the target already ended still lifts.
      */
-    async function releaseStack(target: Binding, observed: Observed): Promise<void> {
-      const open = openPull(target, observed);
-      if (open === null) return;
+    async function releaseStack(target: Binding, observed: Observed | null, how?: string): Promise<void> {
+      const open = observed === null ? null : openPull(target, observed);
+      const done =
+        how ??
+        (open === null && observed !== null && target.lastSnapshot !== null && finished(target, target.lastSnapshot) ? howFinished(target) : null);
+      if (open === null && done === null) return;
       const key = lc(target.entityKey);
       const waiting = store.open(target.projectId).filter((h) => h.id !== target.id && h.holdStack.some((k) => lc(k) === key));
       if (waiting.length === 0) return;
-      const branch = open.head === null || open.head === "" ? "(its head branch)" : open.head;
-      for (const h of waiting) {
+      const branch = open === null ? null : open.head === null || open.head === "" ? null : open.head;
+      const where =
+        open === null
+          ? `${target.entityKey} ${done} without a pull request to stack on`
+          : `${target.entityKey}'s pull request ${open.key} is open${branch === null ? "" : ` on ${branch}`}`;
+      const start = branch === null ? "Start now on the default branch." : `Start now, branch from ${branch} with that branch as PR base.`;
+      // One lift can free several waiters that overlap each other. Release the
+      // first by priority, then age; re-stack the rest on it, so two branches
+      // do not start into the same files in one tick (BB-215).
+      const order = [...waiting].sort((x, y) => (PRIORITY_ORDER[x.priority ?? "normal"] ?? 2) - (PRIORITY_ORDER[y.priority ?? "normal"] ?? 2) || x.createdAt - y.createdAt);
+      const released: Binding[] = [];
+      for (const h of order) {
         const rest = h.holdStack.filter((k) => lc(k) !== key);
         if (rest.length > 0) {
           store.patch(h.id, { holdStack: rest });
-          store.note(h.id, `${target.entityKey}'s pull request ${open.key} is open on ${branch}; your stack-wait stays until ${rest.join(", ")} ${rest.length === 1 ? "also has one" : "also have one"}.`, true);
+          store.note(h.id, `${where}; your stack-wait stays until ${rest.join(", ")} ${rest.length === 1 ? "also has one" : "also have one"}.`, true);
+          continue;
+        }
+        const blocker = released.find((r) => touchesOverlap(r.touches, h.touches).length > 0);
+        if (blocker !== undefined) {
+          store.patch(h.id, { holdStack: [blocker.entityKey] });
+          store.note(h.id, `Stack-wait lifted from ${target.entityKey}, but it overlaps ${blocker.entityKey}, which is starting first: the wait now stacks on ${blocker.entityKey} and lifts when its pull request opens.`, true);
           continue;
         }
         store.patch(h.id, { hold: null, holdStack: [] });
-        store.note(h.id, `Stack-wait lifted: ${target.entityKey}'s pull request ${open.key} is open on ${branch}. Start now, branch from ${branch} with that branch as PR base.`);
+        store.note(h.id, `Stack-wait lifted: ${where}. ${start}`);
         scheduleReconcile(h.id);
+        released.push(h);
       }
-      bb.log.info(`stewards: ${target.entityKey}'s pull request ${open.key} is open; released the stack-wait on ${waiting.map((h) => h.entityKey).join(", ")}`);
+      const lifted = released.map((h) => h.entityKey);
+      bb.log.info(`stewards: ${target.entityKey} ${open === null ? done : `opened ${open.key}`}; ${lifted.length === 0 ? "no stack-wait lifted" : `released the stack-wait on ${lifted.join(", ")}`}`);
     }
 
     /**
