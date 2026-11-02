@@ -28,6 +28,7 @@ import {
   detectProjectLayout,
   mergeGuidance,
   preparePrimaryProjectSource,
+  probeRemote,
   projectSourceBranch,
   projectSourceRemote,
   projectSourceUnpushed,
@@ -127,6 +128,14 @@ export function createMultiRepoHostEntry() {
 
       async suggestProjectSourcePath(input) {
         return defaultProjectSourcePath(input.name);
+      },
+
+      async probeRemote(input, context) {
+        return probeRemote({
+          dataDir: context.experimental_paths.dataDir,
+          url: input.url,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        });
       },
 
       async writeProjectSourceRepos(input, context) {

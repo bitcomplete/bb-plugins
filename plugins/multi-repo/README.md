@@ -33,12 +33,28 @@ Then pick **Multi-repo workspace** as the environment when creating a thread.
 
 ## Getting started
 
-Open the **Repos** panel and press **New project**. One form: a name, the
-machine the project's `.bb` checkout lives on, where it goes (suggested as
-`~/bb/<name>`, editable), and either the repos to start with or the URL of an
-existing `.bb` repo to clone. The plugin initializes or clones the checkout,
-commits it, and creates the project pointing at it. Then pick **Multi-repo
-workspace** as the environment when you start a thread there.
+Open the **Repos** panel and press **New project**. The form starts with a
+git remote (or an absolute path to a checkout already on the machine). The
+name and the `.bb` location are derived from it — the URL's last component,
+then `~/bb/<name>` — and both stay editable, left alone once you edit them.
+On blur or Enter the plugin probes the remote's default branch (through the
+per-machine object cache) and says what it found:
+
+- a root `repos.json` — a **standalone `.bb` repo**, cloned as the project
+  source;
+- `.bb/repos.json` — a **primary repo** carrying the definition, cloned and
+  linked;
+- neither — a **plain repo**, cloned and made a single-repo project. A
+  **Seed `.bb/` and open a pull request** checkbox, off by default, decides
+  whether the seed is published for review or only committed locally;
+- an absolute path that is already a checkout — adopted as the project
+  source, nothing cloned.
+
+Create does not wait for the probe: if it has not finished, the host
+re-probes on submit and lands in the right mode. **A new repo set from
+scratch** (no URL) is the secondary link and keeps the old empty-directory
+flow. Then pick **Multi-repo workspace** as the environment when you start a
+thread there.
 
 The same two ways in exist without the panel, and are identical afterwards.
 
@@ -108,7 +124,7 @@ parse fails the launch with a message naming the offending entry.
 
 | Where | What |
 |---|---|
-| **Repos** nav panel | The repo set as a list — add by URL with completions from local checkouts, change a base branch inline, remove — each change one commit in `.bb`. A **New project** form that creates a multi-repo project in one step. `repos.json` as text behind a disclosure, which opens itself when the file does not parse. |
+| **Repos** nav panel | The repo set as a list — add by URL with completions from local checkouts, change a base branch inline, remove — each change one commit in `.bb`. A **New project** form whose first field is a git remote (or local checkout), from which it derives the name, location and mode. `repos.json` as text behind a disclosure, which opens itself when the file does not parse. |
 | **Changes** thread panel | Per-repo diff and pull request. Opened from the thread panel's Actions list. |
 | Composer banner | One row above the composer naming the repos that changed, their file counts and the `+`/`−` totals. Click it to open the Changes panel. Hidden when nothing has changed. |
 | `bb repos` | `list`, `add`, `remove` (each takes `--project`), `adopt <primary>`, and `status` for the current thread. |

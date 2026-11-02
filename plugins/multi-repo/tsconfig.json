@@ -32,6 +32,7 @@
     "server.ts",
     "repos-panel.tsx",
     "new-project-form.tsx",
+    "new-project-derive.ts",
     "add-repo-row.tsx",
     "changes-panel.tsx",
     "app.tsx",

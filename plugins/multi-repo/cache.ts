@@ -176,7 +176,7 @@ async function cloneCache(args: EnsureCacheArgs & { repoPath: string; key: strin
   const signalOption = args.signal === undefined ? {} : { signal: args.signal };
   if (mirror !== null) {
     args.report?.step(`Copying ${args.url} from ${mirror}`);
-    const local = await git(["clone", "--bare", "--quiet", mirror, args.repoPath], {
+    const local = await git(["clone", "--bare", "--quiet", "--", mirror, args.repoPath], {
       timeoutMs: CLONE_TIMEOUT_MS,
       ...signalOption,
     });
@@ -190,7 +190,7 @@ async function cloneCache(args: EnsureCacheArgs & { repoPath: string; key: strin
   }
 
   args.report?.step(`Cloning ${args.url}`);
-  await gitOrThrow(["clone", "--bare", "--quiet", args.url, args.repoPath], {
+  await gitOrThrow(["clone", "--bare", "--quiet", "--", args.url, args.repoPath], {
     timeoutMs: CLONE_TIMEOUT_MS,
     ...signalOption,
   });
