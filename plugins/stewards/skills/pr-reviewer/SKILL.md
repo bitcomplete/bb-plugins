@@ -328,6 +328,17 @@ the owner, because the plugin routes that approval there. When you set
 `bb-approval` will not meet the gate, and the owner's unsigned approval
 will.
 
+On an approved round, when the owner's unsigned approval is already on the
+pull request and every push since was a rebase, a merge of the base
+branch, a fix you suggested or a small fix of the author's own, do not ask
+the owner again. Say in the owner-review line that the owner's approval of
+<date> stands (the approval is of the pull request), and do not mention the
+owner. Ask again only when a push added scope, changed behaviour beyond
+what was approved, or brought in an owner-reviewed trigger the approved
+change did not have; owner-reviewed files byte-identical after a rebase or
+squash are the example that needs no fresh ask. This is the same rule as
+Later rounds step 4.
+
 Then the body, in this order, omitting empty sections:
 
 ```
@@ -336,6 +347,8 @@ Then the body, in this order, omitting empty sections:
 **Owner review required:** yes — <trigger>; decide list entry "<entry text>" is decide: project, so the project steward approves.
 or
 **Owner review required:** yes — <trigger>. @<owner login>, this one needs your approval.
+or
+**Owner review required:** yes — <trigger>; the owner's approval of <date> stands (the approval is of the pull request).
 or
 **Owner review required:** no — none of the owner-reviewed triggers apply.
 
