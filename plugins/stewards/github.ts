@@ -91,6 +91,12 @@ export interface GithubWriter {
    * request and treats it as the user's (fail closed).
    */
   files?(repo: string, number: number): Promise<string[]>;
+  /**
+   * Dispatch a GitHub Actions workflow (the `workflow_dispatch` event) as the
+   * connected user. `workflow` is the workflow's file name or id; `ref` the
+   * branch or tag to run it on. Used after a merge (BB-216); a refusal throws.
+   */
+  dispatchWorkflow(repo: string, workflow: string, ref: string, inputs: Record<string, string>): Promise<void>;
   /** A repository's default branch, for the base of a lesson's pull request (BB-108). */
   defaultBranch(repo: string): Promise<string | null>;
   /** Open a pull request and return its URL and number (BB-108). */
@@ -172,6 +178,9 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       const response = await request("GET", `/repos/${repo}`, undefined);
       const body = (await response.json().catch(() => null)) as { default_branch?: unknown } | null;
       return typeof body?.default_branch === "string" && body.default_branch !== "" ? body.default_branch : null;
+    },
+    async dispatchWorkflow(repo, workflow, ref, inputs) {
+      await request("POST", `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, { ref, inputs });
     },
     async createPull(repo, args) {
       const response = await request("POST", `/repos/${repo}/pulls`, { head: args.head, base: args.base, title: args.title, body: args.body });

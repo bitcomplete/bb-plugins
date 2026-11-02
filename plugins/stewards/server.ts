@@ -6535,6 +6535,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Dispatch the workflows the project configures for a merged repo
+     * (BB-216). Each `.bb/stewards/project.json` `mergeDispatch` entry whose
+     * `repo` is the merged one is dispatched through the same GitHub writer
+     * the merge used; an entry with no `ref` runs on the workflow repo's
+     * default branch. Best-effort: a dispatch that fails is reported and
+     * logged, never fails or undoes the merge. With nothing configured for
+     * the repo, nothing is dispatched and the merge behaves as before.
+     */
+    async function mergeDispatches(b: Binding, repo: string): Promise<string[]> {
+      const entries = (await loadConfig(b.projectId))?.file.mergeDispatch.filter((d) => lc(d.repo) === lc(repo)) ?? [];
+      const lines: string[] = [];
+      for (const entry of entries) {
+        const workflowRepo = entry.workflowRepo ?? entry.repo;
+        const ref = entry.ref ?? (await github.defaultBranch(workflowRepo).catch(() => null)) ?? undefined;
+        if (ref === undefined) {
+          const line = `dispatch of ${entry.workflow} on ${workflowRepo} failed: could not read its default branch`;
+          bb.log.warn(`stewards: ${line}`);
+          lines.push(line);
+          continue;
+        }
+        try {
+          await github.dispatchWorkflow(workflowRepo, entry.workflow, ref, entry.inputs);
+          lines.push(`dispatched ${entry.workflow} on ${workflowRepo}@${ref}`);
+        } catch (error) {
+          const line = `dispatch of ${entry.workflow} on ${workflowRepo} failed: ${errorMessage(error)}`;
+          bb.log.warn(`stewards: ${line}`);
+          lines.push(line);
+        }
+      }
+      return lines;
+    }
+
+    /**
      * The one merge path the Stewards page's Merge button and `bb stewards
      * merge` share: recompute the gate with the project's approval records
      * and the pull request's changed files, refuse with the gate's words when
@@ -6579,13 +6612,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let mergeSha: string | null = null;
       try {
         ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, commitTitle, commitBody));
-        const body = [summary, ...(since === null ? [] : [since]), `merge commit ${mergeSha ?? "?"}`, ...(restart === null ? [] : [restart])].join("\n");
-        await github.comment(ref.repo, ref.number, body).catch(() => undefined);
       } catch (error) {
         return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
       }
+      // BB-216: after the merge, dispatch the workflows the project configures
+      // for this repo. Best-effort: a failed dispatch is reported in the
+      // "Merged:" comment and the result, and never fails or undoes the merge.
+      const dispatches = await mergeDispatches(b, ref.repo);
+      const body = [summary, ...(since === null ? [] : [since]), `merge commit ${mergeSha ?? "?"}`, ...(restart === null ? [] : [restart]), ...dispatches].join("\n");
+      await github.comment(ref.repo, ref.number, body).catch(() => undefined);
       store.closeNeedByKey(b.id, "merge", pull.url ?? pull.key, `Merged ${where}.`);
-      return { ok: true, summary, mergeSha };
+      return { ok: true, summary: [summary, ...dispatches].join("\n"), mergeSha };
     }
 
     const rawRpcHandlers: ExperimentalPluginRpcHandlersWithContext<typeof rpcContract> = {

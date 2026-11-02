@@ -75,6 +75,8 @@ function world() {
   const githubComments: Array<{ repo: string; number: number; body: string }> = [];
   const githubReviews: Array<{ repo: string; number: number; event: string; body: string }> = [];
   const githubMerges: Array<{ repo: string; number: number; title: string; body: string }> = [];
+  /** Workflow dispatches the fake github serves, in order (BB-216). */
+  const githubDispatches: Array<{ repo: string; workflow: string; ref: string; inputs: Record<string, string> }> = [];
   /** Every lesson pull request the plugin opened, and every one it closed (BB-108). */
   const githubPulls: Array<{ repo: string; head: string; base: string; title: string; body: string; url: string; number: number }> = [];
   const githubClosedPulls: Array<{ repo: string; number: number }> = [];
@@ -86,6 +88,8 @@ function world() {
   let pullNumber = 0;
   let createPullError: string | null = null;
   let mergePullError: string | null = null;
+  /** A forced failure for `github.dispatchWorkflow`, to exercise the best-effort dispatch after a merge (BB-216). */
+  let mergeDispatchError: string | null = null;
   /** A forced failure for `github.pullDetails`, to exercise the merge title fallback (BB-193). */
   let pullDetailsError: string | null = null;
   /** The changed paths `github.files` reports, by "owner/repo#n". */
@@ -132,6 +136,10 @@ function world() {
       return m === null || path !== `.bb/${m[1]}` ? null : pr.body;
     },
     defaultBranch: async (repo: string) => githubDefaultBranches.get(repo) ?? "main",
+    dispatchWorkflow: async (repo: string, workflow: string, ref: string, inputs: Record<string, string>) => {
+      if (mergeDispatchError !== null) throw new Error(mergeDispatchError);
+      githubDispatches.push({ repo, workflow, ref, inputs });
+    },
     tree: async (repo: string) => githubTrees.get(repo.toLowerCase()) ?? [],
     branchProtection: async (repo: string, branch: string) => githubBranchProtection.get(`${repo.toLowerCase()} ${branch}`) ?? null,
     labels: async (repo: string) => githubLabels.get(repo.toLowerCase()) ?? [],
@@ -404,7 +412,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -10923,6 +10931,53 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"], { threadId: "thr_w1", projectId: "p1" });
     expect(merged.exitCode).toBe(0);
     expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
+  });
+
+  it("dispatches the configured workflow once after a merge, through the CLI and the page, and says so (BB-216)", async () => {
+    const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] };
+    const t = await withPull([reviewMarker("no-review")], { project });
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubDispatches).toEqual([{ repo: "bitcomplete/bb-gate", workflow: "bb-server.yaml", ref: "main", inputs: { only_if_moved: "true" } }]);
+    expect(merged.stdout).toMatch(/dispatched bb-server\.yaml on bitcomplete\/bb-gate@main/u);
+    expect(t.githubComments.at(-1)!.body).toMatch(/dispatched bb-server\.yaml on bitcomplete\/bb-gate@main/u);
+
+    // The Stewards page's Merge item takes the same shared path.
+    const page = await withPull([reviewMarker("no-review")], { project });
+    const b = page.binding();
+    const need = page.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
+    const res = await page.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: true });
+    expect(page.githubDispatches).toEqual([{ repo: "bitcomplete/bb-gate", workflow: "bb-server.yaml", ref: "main", inputs: { only_if_moved: "true" } }]);
+  });
+
+  it("reads the ref from the workflow repo's default branch when the entry names none (BB-216)", async () => {
+    const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "build.yaml", workflowRepo: "acme/infra", inputs: { only_if_moved: "true" } }] };
+    const t = await withPull([reviewMarker("no-review")], { project });
+    t.githubDefaultBranches.set("acme/infra", "trunk");
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubDispatches).toEqual([{ repo: "acme/infra", workflow: "build.yaml", ref: "trunk", inputs: { only_if_moved: "true" } }]);
+  });
+
+  it("dispatches nothing when the project configures no mergeDispatch, so the merge path is unchanged (BB-216)", async () => {
+    const t = await withPull([reviewMarker("no-review")]);
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubDispatches).toEqual([]);
+    expect(t.githubComments.at(-1)!.body).not.toMatch(/dispatch/u);
+  });
+
+  it("reports a failed dispatch but still merges (BB-216)", async () => {
+    const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] };
+    const t = await withPull([reviewMarker("no-review")], { project });
+    t.setMergeDispatchError("workflow dispatch refused: 403");
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubMerges).toHaveLength(1);
+    expect(merged.stdout).toMatch(/dispatch of bb-server\.yaml on bitcomplete\/bb-gate failed: workflow dispatch refused: 403/u);
+    expect(t.githubComments.at(-1)!.body).toMatch(/Merged: no-review lane/u);
+    expect(t.githubComments.at(-1)!.body).toMatch(/dispatch of bb-server\.yaml on bitcomplete\/bb-gate failed/u);
   });
 
   it("carries the pull request's title and body into the squash merge, and falls back to the key when they cannot be read (BB-193)", async () => {
