@@ -5064,14 +5064,15 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     expect(signalsSince(t, before)).toEqual([one]);
   });
 
-  it("stays silent when a status rewrite leaves the derived phrase unchanged", async () => {
+  it("rings when a status rewrite changes only the summary (BB-205)", async () => {
     const { t, b } = await bound();
     const status = { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward" as const, waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() };
     t.hooks.store.patch(b.id, { status, statusAt: t.now() });
     const before = t.harness.inspection.realtimeSignals.length;
-    // Same actor and next action: the row's phrase does not change.
+    // The same actor and next action, a different summary: the phrase gate is
+    // gone, so the status write rings the refetch channel (BB-205).
     t.hooks.store.patch(b.id, { status: { ...status, summary: "Still building.", at: t.now() + 1 }, statusAt: t.now() + 1 });
-    expect(signalsSince(t, before)).toEqual([]);
+    expect(signalsSince(t, before)).toEqual([one]);
   });
 
   it("stays silent when only advanced_at changes", async () => {
@@ -5081,11 +5082,11 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     expect(signalsSince(t, before)).toEqual([]);
   });
 
-  it("stays silent when a non-phrase pending note is queued", async () => {
+  it("rings when a pending note is queued (BB-205)", async () => {
     const { t, b } = await bound();
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.patch(b.id, { pending: [...b.pending, { at: 1, text: "a queued note" }] });
-    expect(signalsSince(t, before)).toEqual([]);
+    expect(signalsSince(t, before)).toEqual([one]);
   });
 });
 

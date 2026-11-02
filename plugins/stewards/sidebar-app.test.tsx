@@ -2628,3 +2628,93 @@ describe("the new-thread-in-project command (BB-189)", () => {
     expect(command.isAvailable?.(context)).toBe(false);
   });
 });
+
+// BB-205: the sidebar shows how old its data is, retries a failed fetch on a
+// backoff, and refetches when the page wakes.
+describe("the stewards sidebar's data age and refresh (BB-205)", () => {
+  const renderSidebarRpc = (handler: () => unknown): RenderedSlot => {
+    const list = app!.threadLists[0]!;
+    return renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, {
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: handler },
+    } as never);
+  };
+
+  it("shows the data's age when it is stale", async () => {
+    await loadApp();
+    let calls = 0;
+    vi.useFakeTimers();
+    try {
+      const slot = renderSidebarRpc(() => {
+        calls += 1;
+        return calls === 1 ? sidebarData() : new Promise(() => {});
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(1);
+      expect(slot.queryByText(/Updated/u)).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(slot.getByText(/Updated 2m ago · refreshing/u)).toBeTruthy();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the failure banner, retries on a backoff and clears when a fetch succeeds", async () => {
+    await loadApp();
+    let calls = 0;
+    vi.useFakeTimers();
+    try {
+      const slot = renderSidebarRpc(() => {
+        calls += 1;
+        if (calls === 1 || calls >= 3) return sidebarData();
+        throw new Error("offline");
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(1);
+      await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(calls).toBe(2);
+      expect(slot.getByText(/Refresh failed, retrying/u)).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(calls).toBe(3);
+      expect(slot.queryByText(/Refresh failed/u)).toBeNull();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refetches on pageshow, focus and online, not just the poll", async () => {
+    await loadApp();
+    let calls = 0;
+    const slot = renderSidebarRpc(() => {
+      calls += 1;
+      return sidebarData();
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    act(() => {
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await waitFor(() => expect(calls).toBe(2));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(calls).toBe(3));
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await waitFor(() => expect(calls).toBe(4));
+    slot.lifecycle.unmount();
+  });
+});

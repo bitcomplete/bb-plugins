@@ -67,6 +67,8 @@ type CheckResult = { ok: boolean; lines: string[] };
 const BOARD_PATH = "board";
 
 const POLL_MS = 30_000;
+/** How old the polled payload may get before a view shows its age (BB-205). */
+const STALE_MS = 90_000;
 /** How long a burst of refetch requests is coalesced into one RPC (BB-95). */
 const REFETCH_DEBOUNCE_MS = 300;
 /** How long the sidebar's Open PR handoff waits for the detail page before opening externally (BB-102). */
@@ -145,16 +147,48 @@ function ago(at: number | null, now: number): string {
   return `${Math.round(s / 86_400)}d ago`;
 }
 
+/** One clock for "ago" labels, ticking once a minute so they advance with no data change (BB-205). */
+function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return now;
+}
+
+/**
+ * The top-of-view data-age banner (BB-205): shown when the payload is older
+ * than `STALE_MS` or the last fetch failed, and cleared by the next success.
+ * It replaces the old bottom "Refresh failed" line and names the age of the
+ * data on screen even while retries are failing.
+ */
+function DataAgeBanner({ fetchedAt, failing, now }: { fetchedAt: number | null; failing: boolean; now: number }) {
+  if (!failing && (fetchedAt === null || now - fetchedAt < STALE_MS)) return null;
+  const age = fetchedAt === null ? "never" : ago(fetchedAt, now);
+  return (
+    <p data-data-age-banner="" className="text-xs text-muted-foreground">
+      {failing ? `Refresh failed, retrying · updated ${age}` : `Updated ${age} · refreshing…`}
+    </p>
+  );
+}
+
 /**
  * What `load` returns, refetched every half minute while the page is visible,
  * and on demand. A burst of `refetch()` calls — a steward turn publishing
  * several signals — is coalesced over `REFETCH_DEBOUNCE_MS`, so the burst makes
  * one RPC; a payload deep-equal to the current one is dropped, so an unchanged
- * answer re-renders nothing. The 30 s poll stays the fallback (BB-95).
+ * answer re-renders nothing. The 30 s poll stays the fallback (BB-95). A failed
+ * fetch is retried on a backoff of 1 s, 2 s, 4 s … capped at `POLL_MS`, reset on
+ * success; `fetchedAt` is the last success and `failing` whether the last fetch
+ * failed, so a view can show the data's age (BB-205).
  */
-function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; loaded: boolean; refetch: () => void } {
+function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; fetchedAt: number | null; failing: boolean; loaded: boolean; refetch: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // When the last fetch succeeded, and whether the last one failed (BB-205).
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null);
+  const [failing, setFailing] = useState(false);
   // True once a load has been on screen for a paint, so the first load's rows
   // do not all animate in at once (BB-91).
   const [loaded, setLoaded] = useState(false);
@@ -164,12 +198,27 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
   // The payload last committed, so a byte-identical answer is dropped (BB-95).
   const current = useRef<T | null>(null);
   const pending = useRef<number | null>(null);
+  // The retry timer and the consecutive failure count, for the backoff (BB-205).
+  const retry = useRef<number | null>(null);
+  const failures = useRef(0);
   const run = useCallback(() => {
     pending.current = null;
+    // A manual refetch or poll supersedes a pending backoff retry.
+    if (retry.current !== null) {
+      window.clearTimeout(retry.current);
+      retry.current = null;
+    }
     const call = ++latest.current;
     load().then(
       (o) => {
         if (!mounted.current || call !== latest.current) return;
+        failures.current = 0;
+        if (retry.current !== null) {
+          window.clearTimeout(retry.current);
+          retry.current = null;
+        }
+        setFetchedAt(Date.now());
+        setFailing(false);
         if (current.current !== null && JSON.stringify(current.current) === JSON.stringify(o)) {
           setError(null);
           return;
@@ -179,7 +228,17 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
         setError(null);
       },
       (e: unknown) => {
-        if (mounted.current && call === latest.current) setError(message(e));
+        if (!mounted.current || call !== latest.current) return;
+        setError(message(e));
+        setFailing(true);
+        // 1 s, 2 s, 4 s … capped at the poll interval, reset on success.
+        const delay = Math.min(POLL_MS, 1_000 * 2 ** failures.current);
+        failures.current += 1;
+        if (retry.current !== null) window.clearTimeout(retry.current);
+        retry.current = window.setTimeout(() => {
+          retry.current = null;
+          if (document.visibilityState === "visible") run();
+        }, delay);
       },
     );
   }, [load]);
@@ -205,27 +264,37 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
     const onVisibility = () => {
       if (document.visibilityState === "visible") run();
     };
+    // A page restored from the back/forward cache, a window regaining focus and
+    // the network coming back refetch at once (BB-205).
+    const wake = () => run();
     document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", wake);
+    window.addEventListener("focus", wake);
+    window.addEventListener("online", wake);
     return () => {
       mounted.current = false;
       window.clearInterval(poll);
       if (pending.current !== null) window.clearTimeout(pending.current);
+      if (retry.current !== null) window.clearTimeout(retry.current);
       document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", wake);
+      window.removeEventListener("focus", wake);
+      window.removeEventListener("online", wake);
     };
   }, [run]);
-  return { data, error, loaded, refetch };
+  return { data, error, fetchedAt, failing, loaded, refetch };
 }
 
-function useOverview(): { overview: Overview | null; error: string | null; refetch: () => void } {
+function useOverview(): { overview: Overview | null; error: string | null; fetchedAt: number | null; failing: boolean; refetch: () => void } {
   const rpc = useRpc<typeof rpcContract>();
-  const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsOverview", null), [rpc]));
+  const { data, error, fetchedAt, failing, refetch } = usePolled(useCallback(() => rpc.call("stewardsOverview", null), [rpc]));
   // The overview covers every project, so any project's visible change
   // refetches it; the half-minute poll stays the fallback.
   useRealtime(
     PROJECT_CHANGED,
     useCallback(() => refetch(), [refetch]),
   );
-  return { overview: data, error, refetch };
+  return { overview: data, error, fetchedAt, failing, refetch };
 }
 
 function Loading({ error }: { error: string | null }) {
@@ -278,7 +347,7 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 // ---- Status ---------------------------------------------------------------------------------------
 
 /** The plugin's in-memory per-method stat (BB-100), shown in the Status section. */
-function MethodStats({ title, rows }: { title: string; rows: Record<string, { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null }> }) {
+function MethodStats({ title, rows, now }: { title: string; rows: Record<string, { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null }>; now: number }) {
   const entries = Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0]));
   return (
     <div>
@@ -290,7 +359,7 @@ function MethodStats({ title, rows }: { title: string; rows: Record<string, { co
           {entries.map(([name, s]) => (
             <li key={name}>
               {name}: {s.count} call{s.count === 1 ? "" : "s"}, total {s.totalMs}ms, max {s.maxMs}ms, last {s.lastMs}ms
-              {s.lastAt === null ? "" : ` (${ago(s.lastAt, Date.now())})`}
+              {s.lastAt === null ? "" : ` (${ago(s.lastAt, now)})`}
             </li>
           ))}
         </ul>
@@ -300,11 +369,13 @@ function MethodStats({ title, rows }: { title: string; rows: Record<string, { co
 }
 
 function StatusSection() {
-  const { overview, error, refetch } = useOverview();
+  const { overview, error, fetchedAt, failing, refetch } = useOverview();
+  // Called before the early return, so the hook order stays stable (BB-205).
+  const now = useNow();
   if (overview === null) return <Loading error={error} />;
-  const now = Date.now();
   return (
     <div className="flex flex-col gap-4 text-sm">
+      <DataAgeBanner fetchedAt={fetchedAt} failing={failing} now={now} />
       {overview.paused ? (
         <p className="flex items-start gap-2">
           <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-attention" aria-label="paused" />
@@ -322,8 +393,8 @@ function StatusSection() {
       <details className="rounded-lg border border-border p-3 text-xs">
         <summary className="cursor-pointer font-medium text-muted-foreground">Handler stats (this process)</summary>
         <div className="mt-2 flex flex-col gap-2">
-          <MethodStats title="RPC methods" rows={overview.stats.rpc} />
-          <MethodStats title="CLI commands" rows={overview.stats.cli} />
+          <MethodStats title="RPC methods" rows={overview.stats.rpc} now={now} />
+          <MethodStats title="CLI commands" rows={overview.stats.cli} now={now} />
           <div>
             <p className="font-medium">Signals published in the last hour</p>
             {Object.keys(overview.stats.signals).length === 0 ? (
@@ -342,7 +413,6 @@ function StatusSection() {
           </div>
         </div>
       </details>
-      {error !== null ? <p className="text-xs text-destructive">Refresh failed: {error}</p> : null}
     </div>
   );
 }
@@ -540,8 +610,9 @@ function overviewEffortStatus(s: Steward): EffortStatus {
 
 function StewardsSection() {
   const { overview, error } = useOverview();
+  // Called before the early return, so the hook order stays stable (BB-205).
+  const now = useNow();
   if (overview === null) return <Loading error={error} />;
-  const now = Date.now();
   const projects = overview.projects.filter((p) => p.stewards.length > 0 || p.endedCount > 0);
   if (projects.length === 0) return <p className="text-sm text-muted-foreground">No stewards yet. Label a Linear ticket or pull request in a stewarded project to adopt it.</p>;
   return (
@@ -684,7 +755,8 @@ function BoardPage({ subPath }: { subPath: string }) {
     setBoardRoute({ projectId: wanted, key });
   }, [wanted, key]);
   useEffect(() => () => setBoardRoute({ projectId: null, key: null }), []);
-  const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsBoard", { projectId: wanted }), [rpc, wanted]));
+  const { data, error, fetchedAt, failing, refetch } = usePolled(useCallback(() => rpc.call("stewardsBoard", { projectId: wanted }), [rpc, wanted]));
+  const now = useNow();
   const boardProjectId = data?.board?.projectId ?? null;
   // A path with no project takes the server's choice, replacing rather than
   // pushing so the sidebar follows without a back-button trap.
@@ -713,6 +785,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           </None>
         ) : (
           <>
+            <DataAgeBanner fetchedAt={fetchedAt} failing={failing} now={now} />
             {data.projects.length > 1 ? (
               <nav className="flex flex-wrap gap-1 border-b border-border">
                 {data.projects.map((p) => {
@@ -741,7 +814,6 @@ function BoardPage({ subPath }: { subPath: string }) {
             ) : (
               <EffortDetail board={data.board} effortKey={key} refetch={refetch} />
             )}
-            {error !== null ? <p className="text-xs text-destructive">Refresh failed: {error}</p> : null}
           </>
         )}
       </div>
@@ -864,7 +936,7 @@ function boardCountLine(efforts: readonly BoardEffort[], ended: number): string 
  * with no open binding, one count line, the digest and the collapsed lessons.
  */
 function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void }) {
-  const now = Date.now();
+  const now = useNow();
   const rpc = useRpc<typeof rpcContract>();
   const [turnOn, setTurnOn] = useState<"idle" | "running" | { error: string }>("idle");
   const { efforts, orphans } = boardEfforts(b);
@@ -988,7 +1060,7 @@ function LessonsBlock({ lessons, counts, now }: { lessons: Board["lessons"]; cou
  * the status report, the threads and the lessons the effort wrote.
  */
 function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKey: string; refetch: () => void }) {
-  const now = Date.now();
+  const now = useNow();
   const navigate = useBbNavigate();
   // BB-102: the sidebar's Open PR button leaves the PR URL in the one-shot
   // handoff; this page is inside a pane, so its `openUrl` reaches the in-app
@@ -2445,7 +2517,7 @@ function StewardsSidebarCore({
   // A route that names a project wins over the remembered one, and a pick wins
   // until the next route change (BB-117).
   const wanted = picked ?? routeProject ?? lastProject.current;
-  const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
+  const { data, fetchedAt, failing, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
   // BB-127: the body is pending until the RPC has data for the project on
   // screen. A null `data.projectId` is a landed answer for a project with no
   // stewards config (`server.ts` returns it for an unconfigured or absent
@@ -2545,7 +2617,7 @@ function StewardsSidebarCore({
   // The requested project's needs items, only while the data matches the tab on
   // screen; a stale answer for a previous project shows nothing (BB-100).
   const needsFor = (tab: SidebarTab) => (data?.projectId === tab.projectId ? data.needs.items : EMPTY_NEEDS);
-  const now = Date.now();
+  const now = useNow();
   const activeKey = boardRoute.key;
   const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
   const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
@@ -2711,7 +2783,7 @@ function StewardsSidebarCore({
       ) : (
         <SidebarSkeleton />
       )}
-      {error !== null ? <p className="px-2 py-1 text-xs text-destructive">Refresh failed: {error}</p> : null}
+      <DataAgeBanner fetchedAt={fetchedAt} failing={failing} now={now} />
     </div>
   );
 }

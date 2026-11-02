@@ -1836,12 +1836,17 @@ free of bb. The channel string is unchanged from the narrower "needs you"
 signal (BB-90), so a server and client built from different images keep
 talking across a restart. `patch` compares the binding before and after and
 fires when a sidebar/board-visible column changed (`stage`, `phase`, `hold`,
-`hold_behind`, `status`, `pending`, `requeue_at`, `advanced_at`,
-`deployments`, `title`, `url`, `ending`, `ended_at`, `thread_id`), staying
+`hold_behind`, `status`, `pending`, `requeue_at`, `deployments`, `title`,
+`url`, `ending`, `ended_at`, `thread_id`, `no_wake_source`), staying
 silent for per-turn bookkeeping (`lastJudgmentAt`, `lastSnapshot`, `wokeAt`,
 `awaitingReport`, `missedReports`, `archiveWhenIdle`, `manualDetach`, the
 model-check flags) and same-value writes; `addWorker` and `setWorker` fire
-too. `note()` writes its queued-notes column without a signal — a note is a
+too. `status` and `pending` ring like any other visible column (BB-205): the
+BB-95 phrase gate is gone, because a report that changes only the summary,
+next action or `waitingOn` is still visible in the effort's Status card, and
+the ring stays bounded by the turn-level coalescing, the client's
+`REFETCH_DEBOUNCE_MS` debounce and `usePolled`'s deep-equal payload drop.
+`note()` writes its queued-notes column without a signal — a note is a
 reason for the next judgment turn, and its one visible effect, the "worker
 finished" phrase, is published by `setWorker` when the worker's status
 changes. The callback also fires from the needs-you mutation points — a
@@ -1855,6 +1860,18 @@ resolves its escalation). Every open sidebar refetches when the event names the
 project it shows, the board page refetches when it names its project, and the
 overview (which covers every project) refetches on any event; the half-minute
 poll remains the fallback.
+
+**Data age and retry (BB-205).** `usePolled` keeps the time of the last
+successful fetch and whether the last fetch failed, and retries a failure on
+a backoff of 1 s, 2 s, 4 s … capped at `POLL_MS`, reset on the next success.
+It refetches on `visibilitychange` (visible), `pageshow`, window `focus` and
+`online`, not just the 30 s poll. The project and effort views (and the
+sidebar, in its old refresh-failed spot) show a top banner when the payload
+is older than ~90 s or the last fetch failed — "Updated 24m ago ·
+refreshing…" or "Refresh failed, retrying · updated 24m ago" — which clears
+on success and replaces the old bottom "Refresh failed" line. A shared
+`useNow` hook ticks once a minute so the "ago" labels advance with no data
+change.
 
 **The default provider, checked (BB-44 criterion 1).** With
 `sidebar.threadListProvider` unset it is `__automatic__`, which bb resolves to
