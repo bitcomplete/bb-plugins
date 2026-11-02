@@ -10,9 +10,8 @@ A ticket handed to this skill has a settled spec. Usually its **steward**
 following the project's `linear-tickets` playbook) wrote it, moved the
 ticket to **In Progress**, and spawned this thread with the ticket key,
 the spec, its acceptance criteria and the slice this PR covers. Nobody is
-watching the thread in real time. Questions go to the steward: comment the
-question on the ticket, end your turn, and put the question in your final
-message; the steward is woken with it and answers with `bb thread tell`.
+watching the thread in real time. Questions go to the steward, as below; the
+steward is woken with the question and answers with `bb thread tell`.
 
 A worker never uses the interactive question tool (`AskUserQuestion`, or any
 prompt that waits for a click): it parks the thread until a person answers,
