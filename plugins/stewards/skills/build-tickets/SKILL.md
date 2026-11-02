@@ -60,9 +60,11 @@ repos is one PR per repo, consumed repo first; the task says which one is
 yours.
 
 Keep the change to what the ticket asks. Store migrations are append-only:
-add a statement at the end of `MIGRATIONS`, never edit one. A change to a
-cross-repo contract changes every side in the same PR or in ordered PRs,
-as the project's guidance says.
+a new migration is a new group appended after the last one in `MIGRATIONS`,
+never a statement added to an earlier group, and its hash is appended to
+`plugins/stewards/migrations.snapshot.json`; `migrations.test.ts` fails
+otherwise. A change to a cross-repo contract changes every side in the same
+PR or in ordered PRs, as the project's guidance says.
 
 **Split the decision from the feature.** When a change touches an
 owner-reviewed trigger that has its own seam in the code — a shared

@@ -5,6 +5,10 @@
 - If a browser tool cannot be configured to run headless, use a headless Playwright script instead. Use a visible browser only when the user explicitly requests it.
 - Quit the Playwright browser after testing, including on failure. Use `try/finally` with `await browser.close()` in scripts; do not leave browser processes or test windows running.
 
+# Store migrations
+
+- A plugin that declares SDK storage migrations keeps a hash snapshot test; use `plugins/stewards/migrations.test.ts` as the model.
+
 # Diff Explorer dependencies
 
 - Use pnpm 10.34.6 in `plugins/diff-explorer`. Install with `pnpm install --frozen-lockfile`.
