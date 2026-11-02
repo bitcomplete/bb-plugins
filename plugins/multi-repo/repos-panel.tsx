@@ -43,7 +43,7 @@ import {
 import type { CacheEntry, DiscoveredCheckout, RepoSeed, RepoSetView, rpcContract } from "./contract.js";
 import { AddRepoRow } from "./add-repo-row.js";
 import { NewProjectForm } from "./new-project-form.js";
-import { REPOS_CHANGED_CHANNEL } from "./shared.js";
+import { opensNewProjectForm, REPOS_CHANGED_CHANNEL } from "./shared.js";
 
 function relativeTime(at: number): string {
   const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
@@ -294,13 +294,13 @@ function PrimaryRepoRow({
   );
 }
 
-export function ReposPanel() {
+export function ReposPanel({ subPath = "" }: { subPath?: string }) {
   const { projects, projectId, choose, reload } = useProjectChoice();
   const rpc = useRpc<typeof rpcContract>();
   const [view, setView] = useState<RepoSetView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [suggestions, setSuggestions] = useState<DiscoveredCheckout[]>([]);
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(opensNewProjectForm(subPath));
   const [notice, setNotice] = useState<string[] | null>(null);
   const [published, setPublished] = useState<string | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
@@ -312,6 +312,14 @@ export function ReposPanel() {
   const [adoptPath, setAdoptPath] = useState("");
   const [adoptBusy, setAdoptBusy] = useState(false);
   const [adoptResult, setAdoptResult] = useState<string[] | null>(null);
+
+  // A deep link — team-setup's "Create a project from a git URL" — opens the
+  // New project form. The panel's own New project button flips the same
+  // state; a later subPath change back to the form reopens it. Cancelling
+  // leaves the URL alone, so the panel does not fight the user's click.
+  useEffect(() => {
+    if (opensNewProjectForm(subPath)) setCreating(true);
+  }, [subPath]);
 
   // Only the latest request may land. Loads overlap whenever the project
   // changes under a realtime refresh — creating a project publishes the change

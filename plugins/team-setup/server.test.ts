@@ -52,6 +52,8 @@ interface World {
   settings?: Record<string, string>;
   env?: Record<string, string | undefined>;
   setVariable?: (input: { name: string; value: string; note: string | null }) => Promise<unknown>;
+  /** What `bb.sdk.projects.list` answers. */
+  projects?: Array<{ id: string; name: string }>;
 }
 
 const FIGMA_OPTIONAL = { claude: true, configured: false, authenticated: false, pending: false, url: null, message: null };
@@ -79,6 +81,7 @@ async function setup(world: World = {}) {
     variables: [],
   }));
   harness.sdk.stub("hosts.list", async () => (world.hosts ?? []).map((host, index) => ({ id: host.id ?? `host-${index}`, name: host.name, status: host.status ?? "connected" })));
+  harness.sdk.stub("projects.list", async () => (world.projects ?? []).map((project) => ({ ...project })));
   const setVariables: Array<{ name: string; value: string; note: string | null }> = [];
   harness.sdk.stub("system.setMachineEnvironmentVariable", async (input: { name: string; value: string; note: string | null }) => {
     setVariables.push(input);
@@ -127,6 +130,7 @@ declare function statusType(): Promise<{
   slack: { available: boolean; signedIn: boolean; configured: boolean; connected: boolean; user: string | null; message: string | null };
   figma: { available: boolean; message: string | null; machine: string | null; claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null };
   machines: { names: string[] };
+  projects: { count: number };
   steps: { ai: string; github: string; devbox: string; linear: string; slack: string; figma: string; machine: string };
   complete: boolean;
 }>;
@@ -142,6 +146,21 @@ describe("status", () => {
     expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "optional", slack: "optional", figma: "unavailable", machine: "todo" });
     expect(s.complete).toBe(false);
     expect(s.github.login).toBeNull();
+  });
+
+  it("reports no projects on a fresh server", async () => {
+    const { status } = await setup();
+    expect((await status()).projects).toEqual({ count: 0 });
+  });
+
+  it("counts the projects that exist, for the create-project entry", async () => {
+    const { status } = await setup({
+      projects: [
+        { id: "p1", name: "Acme" },
+        { id: "p2", name: "Beta" },
+      ],
+    });
+    expect((await status()).projects).toEqual({ count: 2 });
   });
 
   it("is complete when every step is done", async () => {
