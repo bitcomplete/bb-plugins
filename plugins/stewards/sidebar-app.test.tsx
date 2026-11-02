@@ -370,6 +370,7 @@ describe("the stewards sidebar list (BB-44)", () => {
           thread({ id: "thr_draft_child", displayTitle: "Draft child", parentThreadId: "thr_parent", indicator: "draft" }),
         ],
       },
+      sidebarDraftThreadIds: ["thr_draft_child"],
       rpc: {
         stewardsSidebar: () =>
           sidebarData({
@@ -391,13 +392,16 @@ describe("the stewards sidebar list (BB-44)", () => {
     fireEvent.click(slot.getByRole("button", { name: /Expand Unread worker/u }));
     await waitFor(() => expect(slot.getByText("Busy reviewer")).toBeTruthy());
     expect(glyphOf(slot, "Busy reviewer")).toBe("running");
-    // A one-off thread's children share the glyphs: idle grey, draft bb's own.
+    // A one-off thread's children share the glyphs: idle grey, and a draft
+    // keeps the steward glyph with a pencil beside it, never bb's own (BB-195).
     fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
     fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Expand One-off parent/u })));
     await waitFor(() => expect(slot.getByText("Idle child")).toBeTruthy());
     expect(glyphOf(slot, "Idle child")).toBe("quiet");
-    expect(glyphOf(slot, "Draft child")).toBeNull();
-    expect(slot.container.querySelector('[data-thread-status-glyph="draft"]')).not.toBeNull();
+    expect(glyphOf(slot, "Draft child")).toBe("quiet");
+    const draftRow = slot.getByText("Draft child").closest("li")!;
+    expect(draftRow.querySelector("[data-steward-draft]")).not.toBeNull();
+    expect(draftRow.querySelector("[data-thread-status-glyph]")).toBeNull();
     slot.lifecycle.unmount();
   });
 
@@ -572,6 +576,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     const old = await waitFor(() => slot.getByText("Old work"));
     expect(lineTwo(slot, "Old work")).toBe("ticket · Done · terminal");
     expect(glyphOf(slot, "Old work")).toBe("quiet");
+    expect(old.closest("li")!.querySelector("[data-thread-status-glyph]")).toBeNull();
     expect(old.closest("li")!.textContent).toMatch(/2d ago/u);
     expect(old.closest("a")!.getAttribute("href")).toContain("/board/p1/ENG-0");
     slot.lifecycle.unmount();
@@ -970,7 +975,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows yellow, blue and grey one-off thread glyphs, keeping bb's draft glyph", async () => {
+  it("shows yellow, blue and grey one-off thread glyphs, and draws the draft pencil beside the steward glyph", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -978,9 +983,11 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
           thread({ id: "thr_unread", displayTitle: "Unread reply", indicator: "unread-success" }),
           thread({ id: "thr_running", displayTitle: "Running agent", status: "active" }),
           thread({ id: "thr_quiet", displayTitle: "Read and idle" }),
-          thread({ id: "thr_draft", displayTitle: "Has a draft", indicator: "draft" }),
+          thread({ id: "thr_draft", displayTitle: "Has a draft" }),
+          thread({ id: "thr_working_draft", displayTitle: "Busy with a draft", status: "active" }),
         ],
       },
+      sidebarDraftThreadIds: ["thr_draft", "thr_working_draft"],
       rpc: { stewardsSidebar: () => sidebarData() } as never,
     });
     // BB-80: the unread one-off opens the Threads section by default.
@@ -989,9 +996,15 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     expect(glyphOf(slot, "Unread reply")).toBe("you");
     expect(glyphOf(slot, "Running agent")).toBe("running");
     expect(glyphOf(slot, "Read and idle")).toBe("quiet");
-    // A draft keeps bb's own glyph, not the four-glyph component.
-    expect(glyphOf(slot, "Has a draft")).toBeNull();
-    expect(slot.container.querySelector('[data-thread-status-glyph="draft"]')).not.toBeNull();
+    // BB-195: an unsent draft keeps the steward glyph — grey when idle, the
+    // running ring when busy — and adds a pencil, never bb's own glyph.
+    expect(glyphOf(slot, "Has a draft")).toBe("quiet");
+    expect(glyphOf(slot, "Busy with a draft")).toBe("running");
+    for (const title of ["Has a draft", "Busy with a draft"]) {
+      const row = slot.getByText(title).closest("li")!;
+      expect(row.querySelector("[data-steward-draft]")).not.toBeNull();
+      expect(row.querySelector("[data-thread-status-glyph]")).toBeNull();
+    }
     slot.lifecycle.unmount();
   });
 

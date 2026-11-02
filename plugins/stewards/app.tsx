@@ -1595,7 +1595,8 @@ type SidebarThreadRowProps = {
   /** The full binding key, kept on the row's `title` attribute when the row is an effort. */
   titleAttr?: string;
   /** The four-glyph component for a one-off thread or its child, an effort's
-   * worker/reviewer child, or the project steward row; drafts keep bb's glyph. */
+   * worker/reviewer child, or the project steward row; an unsent draft draws a
+   * pencil beside it, never bb's own glyph (BB-195). */
   glyph?: SidebarEffortState;
   /** The route's thread, so the row is highlighted while its page is showing (BB-85). */
   activeThreadId: string | null;
@@ -1764,9 +1765,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
   // manual toggle always wins.
   const open = userOpen ?? hasUnread(children, byId);
   // The array-wide indicator never reports a draft; the row folds in the
-  // client-local one, as bb's own row does.
+  // client-local one for the bb-glyph fallback only (BB-195).
   const indicator = draft.hasUnsubmittedDraft && thread.indicator === "none" ? (isBusy(thread.status) ? "working-draft" : "draft") : thread.indicator;
-  const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
+  // A row given a steward glyph always draws it: bb's glyph slot is where
+  // thread-briefs paints its stage ring, and an unsent draft must not hand the
+  // slot back to it (BB-195). The draft is a pencil beside the steward glyph.
+  const useStewardGlyph = glyph !== undefined;
   const count = countThreads(children);
   return (
     <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
@@ -1792,8 +1796,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
           {/* A fixed-width slot keeps the title column put whatever the glyph
               (none, dot, spinner) or its width. The spinner at size="compact"
               is the widest, so size-4 is the slot. */}
-          <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
-            {useStewardGlyph ? <StewardGlyph kind={glyph!} /> : <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />}
+          <span data-sidebar-status-slot="" className="relative flex size-4 shrink-0 items-center justify-center">
+            {useStewardGlyph ? (
+              <>
+                <StewardGlyph kind={glyph!} />
+                {draft.hasUnsubmittedDraft ? (
+                  <span data-steward-draft="" className="pointer-events-none absolute -bottom-0.5 -right-0.5 flex items-center justify-center">
+                    <Icon name="Edit" className="size-2.5 text-muted-foreground" aria-label="Unsubmitted draft" />
+                  </span>
+                ) : null}
+              </>
+            ) : (
+              <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
+            )}
           </span>
           <span className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-center gap-1" style={HOVER_ACTIONS_INSET_STYLE}>
             <a
@@ -1899,6 +1914,10 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
  */
 type SidebarEffortRowProps = {
   effort: SidebarEffort;
+  /** The four-glyph component for the row; defaults to the effort's own state.
+   * A Recently ended row passes `quiet`, so its glyph is the grey ring however
+   * the effort's state is derived (BB-195). */
+  glyph?: SidebarEffortState;
   needs: readonly SidebarNeedItem[];
   byId: ReadonlyMap<string, PluginSidebarThread>;
   projectId: string;
@@ -1928,6 +1947,7 @@ type SidebarEffortRowProps = {
 function sameEffortRowProps(a: SidebarEffortRowProps, b: SidebarEffortRowProps): boolean {
   if (
     a.effort !== b.effort ||
+    a.glyph !== b.glyph ||
     a.projectId !== b.projectId ||
     a.activeKey !== b.activeKey ||
     a.activeThreadId !== b.activeThreadId ||
@@ -1950,6 +1970,7 @@ function sameEffortRowProps(a: SidebarEffortRowProps, b: SidebarEffortRowProps):
 
 const SidebarEffortRow = memo(function SidebarEffortRow({
   effort,
+  glyph,
   needs,
   byId,
   projectId,
@@ -2005,7 +2026,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
           <span className="flex size-4 shrink-0 items-center justify-center" />
         )}
         <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
-          <StewardGlyph kind={effort.state} />
+          <StewardGlyph kind={glyph ?? effort.state} />
         </span>
         <span className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-center gap-1" style={HOVER_ACTIONS_INSET_STYLE}>
           <a
@@ -2625,6 +2646,7 @@ function StewardsSidebarCore({
               <SidebarEffortRow
                 key={`${e.key}-${e.endedAt}`}
                 effort={e}
+                glyph="quiet"
                 needs={needsFor(tab)}
                 byId={byId}
                 projectId={tab.projectId}

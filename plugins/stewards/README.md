@@ -522,8 +522,10 @@ under line two, in the same row. The glyph is one of four, in precedence order
 empty red ring when blocked, a blue ring that pulses slowly while a worker or
 reviewer runs (CSS only, off under `prefers-reduced-motion`), and an empty grey
 ring when quiet. One-off threads use the same four glyphs — yellow when unread,
-blue animated while their agent runs, grey otherwise — except a draft, which
-keeps bb's own glyph. A worker or reviewer child row under an effort, and a
+blue animated while their agent runs, grey otherwise; an unsent draft draws a
+small pencil beside the glyph and leaves its state alone (BB-195), so bb's own
+glyph slot — where thread-briefs paints its stage ring — is never used. A
+worker or reviewer child row under an effort, and a
 one-off thread's children, share those glyphs and carry no role tag. An `ops`
 binding that needs you or is blocked moves from Monitors into Blocked. A
 **Recently ended** row is the same two-line effort row (BB-88): the grey quiet
