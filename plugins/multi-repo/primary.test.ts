@@ -400,7 +400,7 @@ describe("adopting a standalone .bb into a primary repo", () => {
 });
 
 describe("seeding a new primary project", () => {
-  it("seeds .bb/ on the default branch and publishes a seed branch", async () => {
+  it("seeds .bb/ on the default branch and pushes nothing when no pull request is asked for", async () => {
     const primary = await makeRepo("primary");
     const path_ = path.join(scratch, "primary-clone");
     const result = await preparePrimaryProjectSource({
@@ -413,10 +413,14 @@ describe("seeding a new primary project", () => {
     expect(result.ok).toBe(true);
     expect(result.layout).toBe("primary");
     expect(result.seeded).toBe(true);
+    expect(result.prUrl).toBeNull();
     // On the default branch so the first thread can provision...
     expect(await gitLine(path_, ["show", "main:.bb/repos.json"])).toContain("other");
-    // ...and published for review on a branch.
+    // ...kept on a local branch so the commit stays reachable...
     expect(await gitLine(path_, ["show", "bb/seed-bb-test:.bb/AGENTS.md"])).not.toBeNull();
+    // ...and never pushed: a local seed must not leave a branch on the remote.
+    expect(await gitLine(primary, ["rev-parse", "--verify", "--quiet", "bb/seed-bb-test"])).toBeNull();
+    expect(result.message).toMatch(/committed locally only/u);
   });
 
   it("uses a repo that already carries .bb/ as it is", async () => {

@@ -157,6 +157,13 @@ export async function probeRemote(args: ProbeRemoteArgs): Promise<ProbeRemoteRes
   const { url, dataDir, signal } = args;
   const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
 
+  if (url.startsWith("-")) throw new Error(`${JSON.stringify(url)} is not a git URL.`);
+  if (!path.isAbsolute(url) && (url.startsWith("~") || url.startsWith("."))) {
+    throw new Error(
+      `${url} is not an absolute path; a local checkout must be absolute (for example /home/you/code/repo), or use a git URL.`,
+    );
+  }
+
   if (path.isAbsolute(url) && (await isGitRepo(url))) {
     const layout = await detectProjectLayout(url, signal);
     const ref = await resolveDefaultBranchRef(url, signal);
@@ -1625,13 +1632,22 @@ export async function preparePrimaryProjectSource(
 
   const branchCreated = await gitIn(args.path, ["update-ref", `refs/heads/${args.branch}`, seedSha], options);
   if (branchCreated.code !== 0) warnings.push(`Could not create ${args.branch}: ${firstProblemLine(branchCreated)}`);
-  const pushed = await gitIn(
-    args.path,
-    ["push", "--quiet", "--force-with-lease", "origin", `refs/heads/${args.branch}`],
-    options,
-  );
-  if (pushed.code !== 0) {
-    warnings.push(`The seed branch was committed locally but not pushed: ${firstProblemLine(pushed)}`);
+  // The branch exists locally either way — it keeps the seed commit reachable
+  // when the default branch has diverged — but it only reaches `origin` when a
+  // pull request was asked for. A local-only seed must not leave a stray
+  // branch on someone's remote.
+  let pushed = false;
+  if (args.openPullRequest) {
+    const push = await gitIn(
+      args.path,
+      ["push", "--quiet", "--force-with-lease", "origin", `refs/heads/${args.branch}`],
+      options,
+    );
+    if (push.code === 0) {
+      pushed = true;
+    } else {
+      warnings.push(`The seed branch was committed locally but not pushed: ${firstProblemLine(push)}`);
+    }
   }
 
   // Make the seed visible to provisioning without touching a feature branch:
@@ -1651,12 +1667,16 @@ export async function preparePrimaryProjectSource(
       const updated = await gitIn(args.path, ["update-ref", localRef, seedSha], options);
       if (updated.code !== 0) warnings.push(`Could not advance ${defaultBranch} to the seed: ${firstProblemLine(updated)}`);
     } else {
-      warnings.push(`${defaultBranch} has diverged from origin; the seed is only on ${args.branch} until it merges.`);
+      warnings.push(
+        args.openPullRequest
+          ? `${defaultBranch} has diverged from origin; the seed is only on ${args.branch} until it merges.`
+          : `${defaultBranch} has diverged from origin; the seed is only on the local branch ${args.branch}.`,
+      );
     }
   }
 
   let prUrl: string | null = null;
-  if (args.openPullRequest && pushed.code === 0) {
+  if (args.openPullRequest && pushed) {
     const pr = await run(
       "gh",
       [
@@ -1683,8 +1703,10 @@ export async function preparePrimaryProjectSource(
     seeded: true,
     prUrl,
     warnings,
-    message: prUrl === null
-      ? `Seeded .bb/ in ${args.path} on ${args.branch}; open a pull request to land it.`
-      : `Opened ${prUrl}.`,
+    message: !args.openPullRequest
+      ? `Seeded .bb/ in ${args.path} on ${defaultBranch}; committed locally only, no pull request.`
+      : prUrl === null
+        ? `Seeded .bb/ in ${args.path} on ${args.branch}; open a pull request to land it.`
+        : `Opened ${prUrl}.`,
   };
 }

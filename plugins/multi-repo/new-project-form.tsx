@@ -23,6 +23,7 @@ import type { FormEvent, KeyboardEvent } from "react";
 import { experimental_Icon as Icon, useRpc } from "@get-bb/plugin-sdk/app";
 import type { DiscoveredCheckout, ProbeRemoteResult, RepoSeed, rpcContract } from "./contract.js";
 import { AddRepoRow } from "./add-repo-row.js";
+import { deriveName, locationFrozen } from "./new-project-derive.js";
 import { dirFromUrl } from "./names.js";
 
 interface HostOption {
@@ -57,6 +58,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   const [hostId, setHostId] = useState<string | null>(null);
   const [path, setPath] = useState("");
   const [pathEdited, setPathEdited] = useState(false);
+  const [pathAdopted, setPathAdopted] = useState(false);
   const [pathExists, setPathExists] = useState(false);
   const [probe, setProbe] = useState<Probe>({ status: "idle" });
   const [seedPr, setSeedPr] = useState(false);
@@ -91,8 +93,8 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
 
   // The name follows the URL's last component until the user edits it.
   useEffect(() => {
-    if (formMode !== "url" || nameEdited) return;
-    setName(dirFromUrl(url) ?? "");
+    if (formMode !== "url") return;
+    setName((current) => deriveName(url, current, nameEdited));
   }, [url, nameEdited, formMode]);
 
   // The suggested location follows the name and machine until it is edited.
@@ -100,7 +102,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   // sequenced so a slow early answer cannot overwrite a fast later one.
   const suggestionSeq = useRef(0);
   useEffect(() => {
-    if (pathEdited || hostId === null || name.trim().length === 0) return;
+    if (locationFrozen(pathEdited, pathAdopted) || hostId === null || name.trim().length === 0) return;
     const seq = ++suggestionSeq.current;
     const timer = window.setTimeout(() => {
       void rpc
@@ -115,7 +117,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
         });
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [rpc, hostId, name, pathEdited]);
+  }, [rpc, hostId, name, pathEdited, pathAdopted]);
 
   // Local checkouts on the chosen machine, for the URL field's completions
   // (and, in "from scratch" mode, for the add row). Keyed on the path so the
@@ -137,13 +139,15 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   }, [rpc, hostId, path]);
 
   // A local path that is already a checkout is adopted as the project source,
-  // so show where it is. This freezes the location until the URL changes.
+  // so show where it is. This freezes the location the way an edit does, but
+  // only until the URL changes — see `onUrlChanged`.
   useEffect(() => {
-    if (formMode !== "url" || probe.status !== "done" || probe.result.outcome !== "checkout" || pathEdited) return;
+    if (formMode !== "url" || probe.status !== "done" || probe.result.outcome !== "checkout") return;
+    if (locationFrozen(pathEdited, pathAdopted)) return;
     setPath(url.trim());
     setPathExists(true);
-    setPathEdited(true);
-  }, [formMode, probe, url, pathEdited]);
+    setPathAdopted(true);
+  }, [formMode, probe, url, pathEdited, pathAdopted]);
 
   const probeSeq = useRef(0);
   const runProbe = useCallback(() => {
@@ -164,6 +168,13 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
         });
       });
   }, [rpc, hostId, url, formMode]);
+
+  // Invalidate any in-flight probe, so a result for the old URL or machine
+  // cannot land as the answer for the new one.
+  const resetProbe = useCallback(() => {
+    probeSeq.current += 1;
+    setProbe({ status: "idle" });
+  }, []);
 
   const existing = useMemo(
     () => repos.map((repo) => ({ dir: repo.dir ?? dirFromUrl(repo.url) ?? repo.url, url: repo.url })),
@@ -274,9 +285,10 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
             onBlur={runProbe}
             onChange={(event) => {
               setUrl(event.target.value);
-              // A new URL re-derives the location unless the user froze it.
-              setPathEdited(false);
-              setProbe({ status: "idle" });
+              // A new URL re-derives the location, but only the freeze a
+              // previous checkout adoption put on it — never a hand edit.
+              setPathAdopted(false);
+              resetProbe();
             }}
           />
           <datalist id={suggestionsListId}>
@@ -321,7 +333,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
               disabled={submitting}
               onChange={(event) => {
                 setHostId(event.target.value);
-                setProbe({ status: "idle" });
+                resetProbe();
               }}
             >
               {hosts.map((entry) => (
@@ -351,6 +363,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
           onChange={(event) => {
             setPath(event.target.value);
             setPathEdited(true);
+            setPathAdopted(false);
             setPathExists(false);
           }}
         />
@@ -440,7 +453,10 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
           type="button"
           className="text-muted-foreground hover:text-foreground text-xs underline"
           disabled={submitting}
-          onClick={() => setFormMode((current) => (current === "url" ? "fresh" : "url"))}
+          onClick={() => {
+            setFormMode((current) => (current === "url" ? "fresh" : "url"));
+            resetProbe();
+          }}
         >
           {formMode === "url" ? "A new repo set from scratch" : "Use a git remote instead"}
         </button>

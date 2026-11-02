@@ -103,6 +103,12 @@ describe("probing a remote", () => {
     expect(message).toMatch(/private/u);
     expect(message).toMatch(/credential/u);
   });
+
+  it("refuses a URL that reads as an option, and a relative local path", async () => {
+    await expect(probeRemote({ dataDir, url: "--upload-pack=x" })).rejects.toThrow(/not a git URL/u);
+    await expect(probeRemote({ dataDir, url: "~/code/repo" })).rejects.toThrow(/must be absolute/u);
+    await expect(probeRemote({ dataDir, url: "./repo" })).rejects.toThrow(/must be absolute/u);
+  });
 });
 
 describe("createProject's URL-first modes", () => {
