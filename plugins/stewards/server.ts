@@ -98,7 +98,7 @@ import {
   type WorkflowRun,
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
-import { evaluateCarries, type CarriesReader } from "./carries.js";
+import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
@@ -2963,6 +2963,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               bb.log.info(`stewards: carries ${verdict.kind} for ${label}: ${verdict.note}`);
             }
           } else {
+            // A missing rule wakes once (BB-204); a later read of the same
+            // target must not wake the steward again. A failed read still
+            // wakes each time.
+            if (matchCarriesRule(target.carries, watch.prRepo, watch.files) === null && noRuleNoted(watch.note)) continue;
             deployments = { ...deployments, [id]: { ...watch, note: verdict.note } };
             b = store.patch(b.id, { deployments });
             b = store.note(b.id, `Carries not decided for ${label}: ${verdict.note}`, false);
@@ -4244,28 +4248,83 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * "owner/repo#<deployment id>" and the deployment object carries the
      * environment and state. Every open binding whose playbook names that repo
      * and environment as a deployment target and is awaiting one hears it; the
-     * steward decides from the playbook's rule whether it carries the merge.
+     * plugin evaluates a structured carries rule itself (BB-132) and wakes the
+     * steward only when the verdict settles a watch or is the first
+     * undecidable one (BB-204).
      */
     async function onDeploymentDoorbell(id: string, deployment: Deployment): Promise<void> {
       const hash = id.lastIndexOf("#");
       const repo = hash === -1 ? "" : id.slice(0, hash);
       if (repo === "") return;
+      const state = deployment.state === "" ? "created" : deployment.state;
+      const failed = state === "failure" || state === "error";
+      const final = failed || state === "success";
       const projects = await stewardedProjects();
       for (const config of projects) {
-        for (const b of store.open(config.projectId)) {
+        for (let b of store.open(config.projectId)) {
           const playbook = bindingPlaybook(config, b);
           if (playbook === null || playbook === undefined) continue;
           for (const target of playbook.deployments) {
             if (lc(target.repo) !== lc(repo) || lc(target.environment) !== lc(deployment.environment)) continue;
             const watches = Object.values(b.deployments).filter((w) => lc(w.repo) === lc(target.repo) && lc(w.environment) === lc(target.environment) && w.state !== "deployed" && w.state !== "failed");
             if (watches.length === 0) continue;
-            const applied = applyDeployment(b.deployments, target, deployment, now());
-            if (applied.changed.length === 0) continue;
-            store.patch(b.id, { deployments: applied.deployments });
-            const state = deployment.state === "" ? "created" : deployment.state;
-            store.note(b.id, `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}${typeof target.carries === "string" ? `; the playbook's rule: ${target.carries}` : ""}`, false);
-            bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);
-            scheduleReconcile(b.id);
+            const line = `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}${typeof target.carries === "string" ? `; the playbook's rule: ${target.carries}` : ""}`;
+            // A deployment that has not reached a final status has not applied
+            // the image yet, so no watch can move: a quiet note records it and
+            // no reconcile is scheduled (BB-204).
+            if (!final) {
+              store.note(b.id, line, true);
+              continue;
+            }
+            const before = b.deployments;
+            const applied = applyDeployment(before, target, deployment, now());
+            const moved = Object.keys(applied.deployments).filter((wid) => before[wid] !== applied.deployments[wid]);
+            if (moved.length === 0) continue;
+            if (failed) {
+              b = store.patch(b.id, { deployments: applied.deployments });
+              store.note(b.id, line, false);
+              bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} failed ${applied.changed.join(", ")}`);
+              scheduleReconcile(b.id);
+              continue;
+            }
+            // A success: evaluate the carries rule mechanically and wake the
+            // steward only for a settled watch or the first undecidable one.
+            let wake = typeof target.carries === "string";
+            const notes: string[] = [];
+            let deployments = applied.deployments;
+            for (const wid of moved) {
+              const watch = deployments[wid]!;
+              if (typeof target.carries === "string") continue;
+              const label = `${watch.key}${target.name === undefined ? "" : ` (${target.name})`}`;
+              const verdict = await evaluateCarries(target, { merge: watch.mergeSha, prRepo: watch.prRepo, files: watch.files, ref: watch.ref }, carriesReader());
+              if (verdict === null) {
+                wake = true;
+                continue;
+              }
+              if (verdict.kind === "deployed" || verdict.kind === "not-yet") {
+                const settled = reportDeployment(deployments, { state: verdict.kind, key: watch.key, ...(watch.target === "" ? {} : { target: watch.target }), note: verdict.note }, now(), target.timeout);
+                if (settled.changed !== null) {
+                  deployments = settled.deployments;
+                  notes.push(`Carries ${verdict.kind} for ${label}: ${verdict.note}`);
+                  if (verdict.kind === "deployed") wake = true;
+                }
+              } else {
+                // A rule that matches but whose read failed still wakes; no
+                // matching rule wakes only the first time, then the watch
+                // stays `deploying` and quiet until a report, the timeout, or
+                // a playbook that adds a rule (BB-204).
+                const noRule = matchCarriesRule(target.carries, watch.prRepo, watch.files) === null;
+                deployments = { ...deployments, [wid]: { ...watch, note: verdict.note } };
+                notes.push(`Carries not decided for ${label}: ${verdict.note}`);
+                if (!noRule || before[wid]?.state === "merged") wake = true;
+              }
+            }
+            b = store.patch(b.id, { deployments });
+            store.note(b.id, [line, ...notes].join("; "), !wake);
+            if (wake) {
+              bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);
+              scheduleReconcile(b.id);
+            }
           }
         }
       }
@@ -8661,6 +8720,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       lines.push(`deps: sla critical=${slaText(deps.sla.critical)} high=${slaText(deps.sla.high)} medium=${slaText(deps.sla.medium)} low=${slaText(deps.sla.low)}; batch medium=${formatDuration(deps.batch.medium)} low=${formatDuration(deps.batch.low)}; autoAdopt ${deps.autoAdopt.join(", ") || "(none)"}`);
       const deployTargets = deploymentTargets(config);
       if (deployTargets.length > 0) lines.push(`deployment: ${deployTargets.map((t) => `${t.repo} ${t.environment} (timeout ${formatDuration(t.timeout)})`).join(", ")}`);
+      // A watch whose repo matches no structured carries rule cannot be
+      // decided by the plugin, so the steward is woken for it. Report the repo
+      // so a rule can be added (BB-204). A deployment target whose own repo
+      // has no rule is the same gap before a watch exists.
+      const ruleGaps = new Set<string>();
+      for (const target of deployTargets) {
+        if (typeof target.carries === "string") continue;
+        if (!target.carries.some((r) => r.when.repo.toLowerCase() === target.repo.toLowerCase())) ruleGaps.add(target.repo);
+      }
+      for (const b of store.open(projectId)) {
+        for (const w of Object.values(b.deployments)) {
+          if (w.prRepo === "") continue;
+          const target = deployTargets.find((t) => (w.target === "" ? matchesTarget(t, w.repo, w.environment) : targetKeyOf(t) === w.target));
+          if (target === undefined || typeof target.carries === "string") continue;
+          if (matchCarriesRule(target.carries, w.prRepo, w.files) === null) ruleGaps.add(w.prRepo);
+        }
+      }
+      for (const repo of [...ruleGaps].sort()) lines.push(`problem: repo ${repo} has a deployment target but no carries rule`);
       const depsRepos = roleDepsTargets(config.role, config.repos);
       if (config.depsAlerts !== null && depsRepos.length > 0) {
         lines.push(`deps: watching ${depsRepos.length} repo${depsRepos.length === 1 ? "" : "s"} for alerts: ${depsRepos.map((t) => t.repo).join(", ")}`);

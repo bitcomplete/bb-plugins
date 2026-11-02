@@ -198,14 +198,20 @@ export const matchesTarget = (target: Pick<DeploymentTarget, "repo" | "environme
   target.repo.toLowerCase() === repo.toLowerCase() && target.environment.toLowerCase() === environment.toLowerCase();
 
 /**
- * Apply a deployment doorbell to a binding's watches: every watch for the
- * target that is not settled moves to `deploying` with the deployment's facts
- * (or `failed` on a failure/error state). Returns the keys that moved.
+ * Apply a deployment doorbell to a binding's watches. Only a deployment that
+ * reached a final status can move a watch: a `failure` or `error` settles it
+ * `failed`; a `success` moves it to `deploying` for the caller to evaluate
+ * against the target's carries rule (BB-132). An `in_progress`, `created` or
+ * other non-final deployment has not applied the image yet, so it changes no
+ * watch: the caller records a quiet note and does not wake the steward
+ * (BB-204). Returns the keys that moved; the caller compares the watch
+ * objects to find which map ids they are.
  */
 export function applyDeployment(deployments: Deployments, target: Pick<DeploymentTarget, "repo" | "environment" | "timeout">, deployment: Deployment, now: number): { deployments: Deployments; changed: string[] } {
+  const failed = deployment.state === "failure" || deployment.state === "error";
+  if (!failed && deployment.state !== "success") return { deployments, changed: [] };
   const next = { ...deployments };
   const changed: string[] = [];
-  const failed = deployment.state === "failure" || deployment.state === "error";
   for (const [id, watch] of Object.entries(next)) {
     if (watch.state === "deployed" || watch.state === "failed") continue;
     if (!matchesTarget(target, watch.repo, watch.environment)) continue;
@@ -229,7 +235,7 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
     };
     changed.push(watch.key);
   }
-  return { deployments: next, changed };
+  return changed.length === 0 ? { deployments, changed } : { deployments: next, changed };
 }
 
 /**
