@@ -176,8 +176,11 @@ worker that spawned you.
      the last one in `MIGRATIONS`, never a statement added to an earlier
      group), safe on a live database, and readable by the previous build?
      Does it need a way back? Check that the diff to
-     `migrations.snapshot.json` is appended lines only; any changed or
-     removed line is a blocker.
+     `migrations.snapshot.json` is appended lines only: every existing
+     hash keeps its line and position, new hashes appear only after the
+     last one, and the comma added to the previous last line is the one
+     permitted change. Any other changed, removed or reordered line is a
+     blocker.
    - Contracts: anything another repo depends on, as the project's
      guidance names them (a shared contract file and its copies, a webhook
      doorbell and subscribe body, an API and client registry, a Dockerfile's
