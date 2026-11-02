@@ -9171,6 +9171,41 @@ describe("deployment watching (BB-53)", () => {
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
   });
 
+  // BB-204 review: a watch left `deploying` by a failed carries read is
+  // retried on the next sweep.
+  it("retries a failed carries read on the sweep (BB-204 review)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", note: expect.stringMatching(/could not compare/u) });
+    // The read is now available; the next sweep settles the watch.
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", note: expect.stringMatching(/contains merge/u) });
+  });
+
+  // BB-204 review: a playbook that adds a rule settles a watch left `deploying`
+  // by the missing one.
+  it("settles a no-rule watch on the sweep after the playbook gains a rule (BB-204 review)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/other }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", note: expect.stringMatching(/No carries rule matches/u) });
+    // The playbook gains a rule for the watched repo; the next sweep evaluates it.
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+  });
+
   it("reports a watched repo with no carries rule as a configuration problem (BB-204)", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/other }\n      strategy: { kind: ref-contains-merge }');

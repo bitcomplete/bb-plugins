@@ -49,6 +49,9 @@ const short = (sha: string | null | undefined): string => (sha === null || sha =
  */
 export const NO_RULE_PREFIX = "No carries rule matches";
 
+/** Whether a watch's note is the one a missing `carries` rule leaves. */
+export const noRuleNoted = (note: string | null | undefined): boolean => (note ?? "").startsWith(NO_RULE_PREFIX);
+
 /** Whether a compare status means `head` contains `base`: identical, or ahead of it. */
 export const containsStatus = (status: CompareStatus | null): boolean => status === "ahead" || status === "identical";
 

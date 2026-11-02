@@ -98,7 +98,7 @@ import {
   type WorkflowRun,
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
-import { evaluateCarries, matchCarriesRule, type CarriesReader } from "./carries.js";
+import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
@@ -2977,6 +2977,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // doorbell was missed, on the first read and on every sweep. Read
         // before the timeout check so an existing deployment wins over the
         // deadline; with none, the timeout path is exactly as before.
+        const evaluatedIds = new Set<string>();
         for (const target of deployTargets) {
           if (!Object.values(deployments).some((w) => (w.state === "merged" || w.state === "deploying") && matchesTarget(target, w.repo, w.environment))) continue;
           const read = await readDeployments(target);
@@ -3007,10 +3008,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // BB-132/BB-204: evaluate a success before deciding to wake, so a
           // missed-doorbell not-yet or a repeat no-rule stays quiet.
           const evaluated = await evaluateAppliedDeployment(applied.deployments, beforeRead, target, movedIds, now());
+          for (const wid of movedIds) evaluatedIds.add(wid);
           deployments = evaluated.deployments;
           b = store.patch(b.id, { deployments });
           b = store.note(b.id, [line, ...evaluated.notes].join("; "), !evaluated.wake);
           if (evaluated.wake) bb.log.info(`stewards: deployment ${applied.deployment.id} (${state}) on ${target.repo} ${target.environment} concerns ${applied.changed.join(", ")} (read)`);
+        }
+        // BB-132/BB-204: a watch left `deploying` by an earlier pass is
+        // re-evaluated, so a transient read failure is retried, a playbook
+        // that adds a rule settles a no-rule watch, and a re-resolved merge
+        // commit is picked up. A watch the read just evaluated is skipped, and
+        // a missing rule already noted does not wake again.
+        const reader = carriesReader();
+        for (const [id, watch] of Object.entries(deployments)) {
+          if (watch.state !== "deploying") continue;
+          if (evaluatedIds.has(id)) continue;
+          const target = deployTargets.find((t) => (watch.target === "" ? matchesTarget(t, watch.repo, watch.environment) : targetKeyOf(t) === watch.target));
+          if (target === undefined || typeof target.carries === "string") continue;
+          const verdict = await evaluateCarries(target, { merge: watch.mergeSha, prRepo: watch.prRepo, files: watch.files, ref: watch.ref }, reader);
+          if (verdict === null) continue;
+          const label = `${watch.key}${target.name === undefined ? "" : ` (${target.name})`}`;
+          if (verdict.kind === "deployed" || verdict.kind === "not-yet") {
+            const settled = reportDeployment(deployments, { state: verdict.kind, key: watch.key, ...(watch.target === "" ? {} : { target: watch.target }), note: verdict.note }, now(), target.timeout);
+            if (settled.changed !== null) {
+              deployments = settled.deployments;
+              b = store.patch(b.id, { deployments });
+              bb.log.info(`stewards: carries ${verdict.kind} for ${label}: ${verdict.note}`);
+            }
+          } else {
+            if (matchCarriesRule(target.carries, watch.prRepo, watch.files) === null && noRuleNoted(watch.note)) continue;
+            deployments = { ...deployments, [id]: { ...watch, note: verdict.note } };
+            b = store.patch(b.id, { deployments });
+            b = store.note(b.id, `Carries not decided for ${label}: ${verdict.note}`, false);
+          }
         }
         const late = timeoutsDue(deployments, now());
         if (late.length > 0) {
