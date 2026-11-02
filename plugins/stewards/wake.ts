@@ -544,8 +544,12 @@ export function formatWake(input: WakeInput): string {
   out.push("", "## Waiting on you", "");
   if (needs.length === 0) out.push("Nothing is filed for the user.");
   else {
-    for (const n of needs) out.push(`- ${n.id} (${n.kind}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${choicesNote(needChoices(n))}${n.how === null ? "" : `\n  ${n.how}`}`);
+    for (const n of needs) out.push(`- ${n.id} (${n.kind}${n.data.autoFiled === true ? ", auto-filed" : ""}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${choicesNote(needChoices(n))}${n.how === null ? "" : `\n  ${n.how}`}`);
     out.push("", "These are on the Stewards page with their own buttons. Do not ask the user about them in prose; the page is where they act.");
+    // BB-213: an item the plugin auto-filed from the report's `nextAction` is
+    // there only because nothing specific was filed, so the steward is told to
+    // file the real item next time and the auto one closes.
+    if (needs.some((n) => n.data.autoFiled === true)) out.push("", "An auto-filed item was created from your report's `nextAction` because it named the user but filed no item. If the real ask is a specific item (`approve-pr`) or an escalation, file that instead next time; the auto item then closes.");
   }
 
   out.push("", "## 3. Guidance, priority, holds and scheduling", "");
