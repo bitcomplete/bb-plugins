@@ -147,12 +147,29 @@ function ago(at: number | null, now: number): string {
   return `${Math.round(s / 86_400)}d ago`;
 }
 
-/** One clock for "ago" labels, ticking once a minute so they advance with no data change (BB-205). */
+/**
+ * One clock for "ago" labels, ticking once a minute so they advance with no
+ * data change. It also re-reads the clock when the page wakes, because a
+ * suspended webview freezes the interval and would otherwise keep showing the
+ * age from before the suspension (BB-205).
+ */
 function useNow(): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
-    return () => window.clearInterval(timer);
+    const tick = () => setNow(Date.now());
+    const timer = window.setInterval(tick, 60_000);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", tick);
+    window.addEventListener("focus", tick);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", tick);
+      window.removeEventListener("focus", tick);
+    };
   }, []);
   return now;
 }
@@ -161,13 +178,14 @@ function useNow(): number {
  * The top-of-view data-age banner (BB-205): shown when the payload is older
  * than `STALE_MS` or the last fetch failed, and cleared by the next success.
  * It replaces the old bottom "Refresh failed" line and names the age of the
- * data on screen even while retries are failing.
+ * data on screen even while retries are failing. A failed fetch keeps its
+ * message in the tooltip, since the banner no longer prints it.
  */
-function DataAgeBanner({ fetchedAt, failing, now }: { fetchedAt: number | null; failing: boolean; now: number }) {
+function DataAgeBanner({ fetchedAt, failing, error, now }: { fetchedAt: number | null; failing: boolean; error?: string | null; now: number }) {
   if (!failing && (fetchedAt === null || now - fetchedAt < STALE_MS)) return null;
   const age = fetchedAt === null ? "never" : ago(fetchedAt, now);
   return (
-    <p data-data-age-banner="" className="text-xs text-muted-foreground">
+    <p data-data-age-banner="" title={failing && error ? error : undefined} className={`text-xs ${failing ? "text-destructive" : "text-muted-foreground"}`}>
       {failing ? `Refresh failed, retrying · updated ${age}` : `Updated ${age} · refreshing…`}
     </p>
   );
@@ -262,11 +280,12 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
       if (document.visibilityState === "visible") run();
     }, POLL_MS);
     const onVisibility = () => {
-      if (document.visibilityState === "visible") run();
+      if (document.visibilityState === "visible") refetch();
     };
     // A page restored from the back/forward cache, a window regaining focus and
-    // the network coming back refetch at once (BB-205).
-    const wake = () => run();
+    // the network coming back refetch at once. They share the refetch debounce
+    // so a mobile resume's three events make one RPC (BB-205).
+    const wake = () => refetch();
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("pageshow", wake);
     window.addEventListener("focus", wake);
@@ -281,7 +300,7 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
       window.removeEventListener("focus", wake);
       window.removeEventListener("online", wake);
     };
-  }, [run]);
+  }, [run, refetch]);
   return { data, error, fetchedAt, failing, loaded, refetch };
 }
 
@@ -375,7 +394,7 @@ function StatusSection() {
   if (overview === null) return <Loading error={error} />;
   return (
     <div className="flex flex-col gap-4 text-sm">
-      <DataAgeBanner fetchedAt={fetchedAt} failing={failing} now={now} />
+      <DataAgeBanner fetchedAt={fetchedAt} failing={failing} error={error} now={now} />
       {overview.paused ? (
         <p className="flex items-start gap-2">
           <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-attention" aria-label="paused" />
@@ -785,7 +804,7 @@ function BoardPage({ subPath }: { subPath: string }) {
           </None>
         ) : (
           <>
-            <DataAgeBanner fetchedAt={fetchedAt} failing={failing} now={now} />
+            <DataAgeBanner fetchedAt={fetchedAt} failing={failing} error={error} now={now} />
             {data.projects.length > 1 ? (
               <nav className="flex flex-wrap gap-1 border-b border-border">
                 {data.projects.map((p) => {
@@ -2517,7 +2536,7 @@ function StewardsSidebarCore({
   // A route that names a project wins over the remembered one, and a pick wins
   // until the next route change (BB-117).
   const wanted = picked ?? routeProject ?? lastProject.current;
-  const { data, fetchedAt, failing, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
+  const { data, error, fetchedAt, failing, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
   // BB-127: the body is pending until the RPC has data for the project on
   // screen. A null `data.projectId` is a landed answer for a project with no
   // stewards config (`server.ts` returns it for an unconfigured or absent
@@ -2783,7 +2802,7 @@ function StewardsSidebarCore({
       ) : (
         <SidebarSkeleton />
       )}
-      <DataAgeBanner fetchedAt={fetchedAt} failing={failing} now={now} />
+      <DataAgeBanner fetchedAt={fetchedAt} failing={failing} error={error} now={now} />
     </div>
   );
 }

@@ -1865,13 +1865,16 @@ poll remains the fallback.
 successful fetch and whether the last fetch failed, and retries a failure on
 a backoff of 1 s, 2 s, 4 s … capped at `POLL_MS`, reset on the next success.
 It refetches on `visibilitychange` (visible), `pageshow`, window `focus` and
-`online`, not just the 30 s poll. The project and effort views (and the
-sidebar, in its old refresh-failed spot) show a top banner when the payload
-is older than ~90 s or the last fetch failed — "Updated 24m ago ·
+`online`, not just the 30 s poll; the wakes share the refetch debounce, so a
+mobile resume's three events make one RPC. The project and effort views (and
+the sidebar, in its old refresh-failed spot) show a top banner when the
+payload is older than ~90 s or the last fetch failed — "Updated 24m ago ·
 refreshing…" or "Refresh failed, retrying · updated 24m ago" — which clears
 on success and replaces the old bottom "Refresh failed" line. A shared
 `useNow` hook ticks once a minute so the "ago" labels advance with no data
-change.
+change, and re-reads the clock on the same wake events, so a suspended
+webview that missed its interval shows the real age on resume rather than
+the clock from before the suspension.
 
 **The default provider, checked (BB-44 criterion 1).** With
 `sidebar.threadListProvider` unset it is `__automatic__`, which bb resolves to

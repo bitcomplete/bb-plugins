@@ -1346,7 +1346,7 @@ describe("the Stewards page's data age and refresh (BB-205)", () => {
         rpc: {
           stewardsBoard: () => {
             calls += 1;
-            if (calls === 1 || calls >= 3) return boardPayload();
+            if (calls === 1 || calls >= 4) return boardPayload();
             throw new Error("offline");
           },
         },
@@ -1363,12 +1363,50 @@ describe("the Stewards page's data age and refresh (BB-205)", () => {
       });
       expect(calls).toBe(2);
       expect(slot.getByText(/Refresh failed, retrying/u)).toBeTruthy();
-      // The first retry is 1 s after the failure, and it succeeds.
+      // The first retry is 1 s after the failure, and it fails too.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1_000);
       });
       expect(calls).toBe(3);
+      expect(slot.getByText(/Refresh failed, retrying/u)).toBeTruthy();
+      // The second retry is 2 s later, and it succeeds, clearing the banner.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(calls).toBe(4);
       expect(slot.queryByText(/Refresh failed/u)).toBeNull();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the real age after a resume, without waiting for the minute tick", async () => {
+    await loadApp();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-02T12:00:00Z"));
+    try {
+      let calls = 0;
+      const slot = await renderBoardRpc(() => {
+        calls += 1;
+        if (calls === 1) return boardPayload();
+        throw new Error("offline");
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(1);
+      expect(slot.queryByText(/Updated/u)).toBeNull();
+      // The page was suspended for 24 minutes: the clock moves but no timer
+      // fires, so only a wake handler can refresh the age.
+      vi.setSystemTime(new Date("2026-11-02T12:24:00Z"));
+      act(() => {
+        window.dispatchEvent(new Event("pageshow"));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(slot.getByText(/updated 24m ago/u)).toBeTruthy();
       slot.lifecycle.unmount();
     } finally {
       vi.useRealTimers();

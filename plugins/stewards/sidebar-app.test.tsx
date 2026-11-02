@@ -2671,7 +2671,7 @@ describe("the stewards sidebar's data age and refresh (BB-205)", () => {
     try {
       const slot = renderSidebarRpc(() => {
         calls += 1;
-        if (calls === 1 || calls >= 3) return sidebarData();
+        if (calls === 1 || calls >= 4) return sidebarData();
         throw new Error("offline");
       });
       await act(async () => {
@@ -2688,6 +2688,11 @@ describe("the stewards sidebar's data age and refresh (BB-205)", () => {
         await vi.advanceTimersByTimeAsync(1_000);
       });
       expect(calls).toBe(3);
+      expect(slot.getByText(/Refresh failed, retrying/u)).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(calls).toBe(4);
       expect(slot.queryByText(/Refresh failed/u)).toBeNull();
       slot.lifecycle.unmount();
     } finally {
