@@ -125,9 +125,11 @@ describe("needs you items", () => {
 describe("countNeedsUser (BB-104)", () => {
   // The same predicate `needsUser` in server.ts evaluates from the store's own
   // reads, so the SQL count and the yellow rows cannot drift. Only a route-`me`
-  // escalation counts (BB-208); project, steward and parent ones do not.
+  // escalation counts (BB-208); project, steward and parent ones do not. The
+  // status actor does not count by itself (BB-213): the report files a need, so
+  // the actor is true only through the open row, and a badge always has an item.
   const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
-    b.status?.actor === "user" || s.openEscalations(b.id).some((x) => x.route === "me") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
+    s.openEscalations(b.id).some((x) => x.route === "me") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
 
   const add = (s: ReturnType<typeof store>["s"], n: number) =>
     s.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
@@ -136,8 +138,11 @@ describe("countNeedsUser (BB-104)", () => {
 
   it("counts exactly the open bindings needsUser flags: each condition once, and once when a binding has all four", () => {
     const { s, binding } = store();
-    // The base binding: actor `user`.
+    // The base binding: actor `user` alone does not count (BB-213); the need the
+    // report files from it does.
     s.patch(binding.id, { status: userStatus(1_000) });
+    expect(needsUser(s, s.binding(binding.id)!)).toBe(false);
+    s.fileNeed({ bindingId: binding.id, kind: "decide", url: "", what: "Do the thing", how: null, data: { autoFiled: true } });
     // One binding per remaining condition. The escalation that counts is the
     // one routed to the user; escalations routed elsewhere are added below.
     const escalation = add(s, 13);
@@ -171,7 +176,7 @@ describe("countNeedsUser (BB-104)", () => {
 
     const open = s.open("p1");
     const expected = open.filter((b) => needsUser(s, b)).length;
-    expect(expected).toBe(5); // actor user, escalation, need, question, and all four
+    expect(expected).toBe(5); // auto-filed need, escalation, need, question, and all four
     expect(s.countNeedsUser("p1")).toBe(expected);
     expect(s.countNeedsUser("p1")).not.toBe(s.countNeedsUser("p2"));
     expect(s.countNeedsUser("p2")).toBe(1);

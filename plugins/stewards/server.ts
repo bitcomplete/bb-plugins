@@ -467,6 +467,14 @@ export function needActions(n: { kind: string; data: Record<string, unknown>; ur
       actions.push({ label: "Done", action: "done", choice: null, primary: false, note: false });
       return { actions, freeText: false };
     case "decide": {
+      // BB-213: a need the plugin auto-filed from an actor-`user` report is a
+      // plain "Done" item. Its `nextAction` is prose, not a question, so it has
+      // no choices, no text box and no other button; Done resolves it and wakes
+      // the steward like any other closed item.
+      if (n.data.autoFiled === true) {
+        actions.push({ label: "Done", action: "done", choice: null, primary: true, note: false });
+        return { actions, freeText: false };
+      }
       const choices = needChoices(n);
       // A boundary lesson's Review PR/Drop are its only choices: no free-text
       // "Other…", and no note box (BB-35 step 5, BB-108).
@@ -2367,21 +2375,72 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Whether anything on a binding needs the user: the steward said the user
-     * acts next, an escalation routed to the user (route `me`) is open, a
-     * question about it is unanswered, or a needs item is on the Stewards page.
-     * An escalation routed to the project steward, the binding's own steward or
-     * its parent does not: the owner has nothing to press for it (BB-208). Such
-     * a steward's row stays visible and unread; a "nothing to do yet" turn is
+     * Whether anything on a binding needs the user: an escalation routed to the
+     * user (route `me`) is open, a question about it is unanswered, or a needs
+     * item is on the Stewards page. An escalation routed to the project
+     * steward, the binding's own steward or its parent does not: the owner has
+     * nothing to press for it (BB-208). A report whose `actor` is `user` does
+     * not count by itself (BB-213): the report files a need from its
+     * `nextAction`, so the actor is true only as far as that item makes it true,
+     * and a "needs you" row always has a non-empty "Needs you" section. Such a
+     * steward's row stays visible and unread; a "nothing to do yet" turn is
      * neither.
      */
     function needsUser(b: Binding): boolean {
       return (
-        b.status?.actor === "user" ||
         store.openEscalations(b.id).some((x) => x.route === "me") ||
         store.openNeeds(b.id).length > 0 ||
         store.openQuestions(b.projectId).some((q) => q.bindingId === b.id)
       );
+    }
+
+    /**
+     * The `decide` need the plugin auto-files from a report whose actor is
+     * `user` (BB-213), marked in `data` so the page's single "Done" button, the
+     * wake's note and this reconciliation all agree on which item it is.
+     */
+    function isAutoFiledNeed(n: Pick<Need, "data">): boolean {
+      return n.data.autoFiled === true;
+    }
+
+    /**
+     * Reconcile the need auto-filed from a report whose actor is `user`
+     * (BB-213). A report that names the user but files nothing for them gets a
+     * `decide` item from its `nextAction`, so the sidebar badge, the picker
+     * count and the effort page's "Needs you" section agree. It is deduped by
+     * (binding, kind, url) like every need, so a re-report updates the wording
+     * rather than adding a row. A later report with another actor, or one that
+     * files its own item, raises an escalation or leaves an open question or
+     * route-`me` escalation, closes it. Returns the item it filed or refreshed,
+     * null otherwise.
+     */
+    function reconcileAutoNeed(b: Binding, actor: string, filedOwn: boolean): Need | null {
+      const open = store.openNeeds(b.id);
+      const url = b.url ?? "";
+      const autos = open.filter(isAutoFiledNeed);
+      const auto = autos.find((n) => n.url === url) ?? null;
+      // A report that changed the entity's link leaves the old row behind; it
+      // is the same auto item, so close the stale one rather than keep two.
+      for (const stale of autos) if (stale.id !== auto?.id) store.closeNeed(stale.id, "Superseded by a newer report.", "plugin");
+      const other = open.filter((n) => n.id !== auto?.id);
+      const userItem =
+        filedOwn ||
+        other.length > 0 ||
+        store.openQuestions(b.projectId).some((q) => q.bindingId === b.id) ||
+        store.openEscalations(b.id).some((x) => x.route === "me");
+      if (actor !== "user" || userItem) {
+        if (auto !== null) store.closeNeed(auto.id, actor === "user" ? "A later report filed its own item for the user." : "A later report named a different actor.", "plugin");
+        return null;
+      }
+      return store.fileNeed({
+        bindingId: b.id,
+        kind: "decide",
+        url,
+        what: b.status?.nextAction ?? "The user has the next action.",
+        how: "The report named the user as the actor but filed no item for them, so this was filed from its `nextAction`. File the specific item (`approve-pr`) or raise an escalation if that is the real ask.",
+        data: { autoFiled: true },
+        filedBy: "plugin",
+      });
     }
 
     /**
@@ -7566,7 +7625,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (input.blockedOn !== undefined && input.waitingOn === undefined) bb.log.info(`stewards: steward_report blockedOn is renamed to waitingOn; recording this report's wait (thread ${threadId}).`);
           // A status that waits on the user, the owner or a human has to say so
           // with an item, not only in prose: the item is what reaches the page.
-          if (waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).length === 0 && (input.needs ?? []).length === 0) {
+          // An auto-filed need does not satisfy this: it is filed from prose,
+          // not the item the user acts on, so a wait naming the user still
+          // needs a real item or escalation (BB-213).
+          if (waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
                 `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,
@@ -7704,6 +7766,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (mergeFiled) await stopWorkers(b);
           const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
           if (playbook !== null && b.lastSnapshot !== null) await syncNeedsFresh(b, playbook);
+          // BB-213: a report whose actor is `user` but that filed nothing for
+          // them gets one `decide` item from its `nextAction`, so the badge and
+          // the effort page's "Needs you" section agree. A re-report updates
+          // the same item; a later report with another actor, or one that files
+          // its own item (including an escalation, which `raised` names), closes
+          // it.
+          const autoFiled = reconcileAutoNeed(b, actor, raised !== null);
+          const autoNote =
+            autoFiled === null
+              ? ""
+              : ` Nothing else was filed for the user, so ${autoFiled.id} (${autoFiled.kind}) is on the Stewards page from your nextAction, with Done as its only button. If the real ask is a specific item (approve-pr) or an escalation, file that next time.`;
+          const filingNote = `${refusalNote}${autoNote}`;
           // BB-154: the mark and the requeue-only run, over the report's final
           // set of sources (an escalation this turn raised, a need it filed, a
           // gate item syncNeeds filed, a worker it started).
@@ -7803,14 +7877,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // correction: an unknown id is ignored and named, never a failure.
           const citesNote = input.cites === undefined ? "" : ` ${citationLines(await countCitations(b.projectId, b.id, input.cites)).join("; ")}.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
-            return `Reported.${replacedNote}${recorded}${refusalNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
+            return `Reported.${replacedNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          return `Reported.${replacedNote}${recorded}${refusalNote}${gateNote}${escalated}${citesNote} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+          return `Reported.${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
         } catch (error) {
           return toolError(error);
         }
