@@ -115,8 +115,6 @@ export const rpcContract = defineRpcContract({
         status: githubStatusSchema,
         message: z.string().nullable(),
         login: z.string().nullable(),
-        org: z.string(),
-        orgMember: z.boolean().nullable(),
         pending: pendingLoginSchema.nullable(),
         lastError: z.string().nullable(),
       }),
@@ -199,15 +197,6 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-export const SETTING_DESCRIPTORS = {
-  githubOrg: {
-    type: "string",
-    label: "GitHub organization",
-    description: "Checked after GitHub sign-in: an account outside this organization cannot reach its repos. Empty skips the check.",
-    default: "bitcomplete",
-  },
-} as const;
-
 export interface TeamSetupDeps {
   gh: GhRunner;
   now: () => number;
@@ -281,15 +270,11 @@ interface PendingLogin {
 
 interface Identity {
   login: string | null;
-  orgMember: boolean | null;
-  org: string;
   at: number;
 }
 
 export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
-    const settings = bb.settings.define(SETTING_DESCRIPTORS);
-
     // ---- deployment-wide machine variables ---------------------------------
 
     for (const name of SEEDED_VARIABLES) {
@@ -346,25 +331,15 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
     }
 
     async function githubIdentity(): Promise<Identity> {
-      const org = (await settings.get()).githubOrg.trim();
-      if (identity !== null && identity.org === org && deps.now() - identity.at < IDENTITY_TTL_MS) return identity;
+      if (identity !== null && deps.now() - identity.at < IDENTITY_TTL_MS) return identity;
       let login: string | null = null;
-      let orgMember: boolean | null = null;
       const user = await deps.gh.run(["api", "--hostname", "github.com", "user", "--jq", ".login"], GH_TIMEOUT_MS);
       if (user.exitCode === 0 && user.stdout.trim() !== "") login = user.stdout.trim();
-      if (login !== null && org !== "") {
-        const membership = await deps.gh.run(
-          ["api", "--hostname", "github.com", `user/memberships/orgs/${org}`, "--jq", ".state"],
-          GH_TIMEOUT_MS,
-        );
-        orgMember = membership.exitCode === 0 && membership.stdout.trim() === "active";
-      }
-      identity = { login, orgMember, org, at: deps.now() };
+      identity = { login, at: deps.now() };
       return identity;
     }
 
     async function githubStatus() {
-      const org = (await settings.get()).githubOrg.trim();
       let status: z.infer<typeof githubStatusSchema> = "unknown";
       let message: string | null = null;
       try {
@@ -374,13 +349,11 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
       } catch (error) {
         message = `Could not read the machine environment: ${errorMessage(error)}`;
       }
-      const id = status === "logged in" ? await githubIdentity() : { login: null, orgMember: null, org, at: 0 };
+      const id = status === "logged in" ? await githubIdentity() : { login: null, at: 0 };
       return {
         status,
         message,
         login: id.login,
-        org,
-        orgMember: id.orgMember,
         pending: pending === null ? null : { code: pending.code, url: pending.url, expiresAt: pending.expiresAt },
         lastError,
       };

@@ -121,7 +121,7 @@ async function setup(world: World = {}) {
 // Only for the inferred return type above.
 declare function statusType(): Promise<{
   ai: { available: boolean; message: string | null; accounts: Array<{ label: string }> };
-  github: { status: string; login: string | null; orgMember: boolean | null; pending: { code: string; url: string } | null; lastError: string | null };
+  github: { status: string; login: string | null; pending: { code: string; url: string } | null; lastError: string | null };
   devbox: { available: boolean; connected: boolean; project: string | null; message: string | null };
   linear: { available: boolean; connected: boolean; configured: boolean; user: string | null; organization: string | null; message: string | null };
   slack: { available: boolean; signedIn: boolean; configured: boolean; connected: boolean; user: string | null; message: string | null };
@@ -134,7 +134,6 @@ declare function statusType(): Promise<{
 
 const signedIn = {
   "api --hostname github.com user --jq .login": { exitCode: 0, stdout: "octocat\n", stderr: "" },
-  "api --hostname github.com user/memberships/orgs/bitcomplete --jq .state": { exitCode: 0, stdout: "active\n", stderr: "" },
 };
 
 describe("status", () => {
@@ -162,10 +161,9 @@ describe("status", () => {
     expect(s.linear).toMatchObject({ connected: true, user: "jane", organization: "Acme" });
     expect(s.slack).toMatchObject({ signedIn: true, user: "dylan" });
     expect(s.github.login).toBe("octocat");
-    expect(s.github.orgMember).toBe(true);
     // Identity is cached between status calls.
     await status();
-    expect(gh.runner.run).toHaveBeenCalledTimes(2);
+    expect(gh.runner.run).toHaveBeenCalledTimes(1);
   });
 
   it("does not count an account whose provider routing is off", async () => {
@@ -210,17 +208,19 @@ describe("status", () => {
     expect(s.linear).toMatchObject({ available: true, configured: false });
   });
 
-  it("warns about an account outside the organization", async () => {
-    const { status } = await setup({
+  it("keeps loading and reading status when a stored githubOrg setting remains", async () => {
+    // Before the setting was removed, a server could have `githubOrg` stored.
+    // The SDK's settings store only reads declared descriptors, so an
+    // undeclared key is ignored and the plugin and its settings page load.
+    const { status, gh, harness } = await setup({
       builtInGit: { status: "logged in", statusMessage: "ok" },
-      runs: { ...signedIn, "api --hostname github.com user/memberships/orgs/bitcomplete --jq .state": { exitCode: 1, stdout: "", stderr: "404" } },
+      runs: signedIn,
+      settings: { githubOrg: "bitcomplete" },
     });
-    expect((await status()).github.orgMember).toBe(false);
-  });
-
-  it("skips the organization check when the setting is empty", async () => {
-    const { status, gh } = await setup({ builtInGit: { status: "logged in", statusMessage: "ok" }, runs: signedIn, settings: { githubOrg: "" } });
-    expect((await status()).github.orgMember).toBeNull();
+    const s = await status();
+    expect(s.github.login).toBe("octocat");
+    expect(harness.registrations.settingsDescriptors).toEqual({});
+    // Only the login lookup runs; there is no membership call.
     expect(gh.runner.run).toHaveBeenCalledTimes(1);
   });
 });

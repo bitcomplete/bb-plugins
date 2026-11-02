@@ -30,9 +30,7 @@ The GitHub step is the point. bb core forwards the server host's gh login to
 every machine as `GH_TOKEN`, a git credential helper and a commit identity,
 but a bb-gate server has no terminal to run `gh auth login` in. The plugin
 spawns it headless, parses the one-time code gh prints, and the login lands
-in `GH_CONFIG_DIR` on the data volume where it survives restarts. After
-sign-in it checks membership of the `githubOrg` setting (default
-`bitcomplete`) and warns about a personal account.
+in `GH_CONFIG_DIR` on the data volume where it survives restarts.
 
 No credential passes through this plugin: Claude and Codex tokens go to
 Account Pool through its RPCs, the devbox token to devbox-provider, the
@@ -108,12 +106,6 @@ the page when the server is back. A bb that is not behind bb-gate gets a
 404 there and the section says so. No RPC is involved: the endpoint is
 on bb's own host, so the request carries the tailnet assertion the gateway
 adds, and the plugin's server side knows nothing about it.
-
-## Settings
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `githubOrg` | `bitcomplete` | Organization membership checked after GitHub sign-in. Empty skips it. |
 
 ## Development
 
