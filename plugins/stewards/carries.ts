@@ -42,6 +42,16 @@ export type CarriesVerdict =
 /** The short sha a note names. */
 const short = (sha: string | null | undefined): string => (sha === null || sha === undefined || sha === "" ? "?" : sha.slice(0, 7));
 
+/**
+ * The note a missing `carries` rule leaves on a watch. A later deployment of
+ * the same target must recognise it and stay quiet rather than wake the
+ * steward again (BB-204).
+ */
+export const NO_RULE_PREFIX = "No carries rule matches";
+
+/** Whether a watch's note is the one a missing `carries` rule leaves. */
+export const noRuleNoted = (note: string | null | undefined): boolean => (note ?? "").startsWith(NO_RULE_PREFIX);
+
 /** Whether a compare status means `head` contains `base`: identical, or ahead of it. */
 export const containsStatus = (status: CompareStatus | null): boolean => status === "ahead" || status === "identical";
 
@@ -98,7 +108,7 @@ export async function evaluateCarries(target: DeploymentTarget, context: Carries
   if (context.ref === null || context.ref === "") return { kind: "not-yet", note: "The deployment has no ref yet" };
   const merge = context.merge;
   const rule = matchCarriesRule(target.carries, context.prRepo, context.files);
-  if (rule === null) return { kind: "undecided", note: `No carries rule matches ${context.prRepo}${context.files.length === 0 ? "" : ` (${context.files.slice(0, 5).join(", ")}${context.files.length > 5 ? ", …" : ""})`}` };
+  if (rule === null) return { kind: "undecided", note: `${NO_RULE_PREFIX} ${context.prRepo}${context.files.length === 0 ? "" : ` (${context.files.slice(0, 5).join(", ")}${context.files.length > 5 ? ", …" : ""})`}` };
 
   if (rule.strategy.kind === "ref-contains-merge") {
     const { status, error } = await reader.compare(target.repo, merge, context.ref);

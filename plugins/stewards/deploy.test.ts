@@ -185,6 +185,18 @@ describe("applying a deployment doorbell", () => {
     }
   });
 
+  // BB-204: a deployment that has not reached a final status has not applied
+  // the image yet, so it must not move the watch or wake the steward.
+  it("leaves a watch alone for an in_progress, created or empty-state deployment", () => {
+    const deployments = recordMerged({}, observed(), [target], NOW);
+    for (const state of ["in_progress", "created", ""]) {
+      const applied = applyDeployment(deployments, target, deployment({ state }), NOW + 1000);
+      expect(applied.changed).toEqual([]);
+      expect(applied.deployments).toBe(deployments);
+      expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentId: null, deploymentState: null });
+    }
+  });
+
   it("ignores a doorbell for another repo or environment, and one for a settled watch", () => {
     const deployments = recordMerged({}, observed(), [target], NOW);
     expect(applyDeployment(deployments, target, deployment({ environment: "staging" }), NOW).changed).toEqual([]);

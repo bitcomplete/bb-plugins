@@ -839,9 +839,16 @@ the workflow run it numbers, and compares the merge against what that run
 built: the run's head sha without `job`; with `job`, the default branch as of
 the job's `started_at`, or, with `consumer` (`dockerfile`, `pinArg`, `repo`),
 the pin in the Dockerfile at that time, compared in the consumer's repo. The
-plugin reports `deployed`/`not-yet` itself and wakes the steward only when a
-read fails or no rule matches; the watch's `merge <sha>` is now the merge
-commit (`mergeCommit.oid`), not the head. The steward reports a verdict with
+plugin reports `deployed`/`not-yet` itself. A doorbell, and a deployment
+discovered on the sweep, is applied mechanically: an `in_progress` or
+`created` deployment, and a `success` that does not carry the merge yet,
+change no watch and leave a quiet note rather than a steward turn. The steward is woken only when a verdict settles a watch
+(`deployed` or `failed`) or the first time no carries rule matches the merge
+(BB-204). A watch no rule matches stays `deploying` with the missing rule as
+its note, and is not woken again until a `steward_report`, the timeout, or a
+playbook that adds a rule; `bb stewards check` reports `repo X has a
+deployment target but no carries rule`. The watch's `merge <sha>` is now the
+merge commit (`mergeCommit.oid`), not the head. The steward reports a verdict with
 `steward_report { deployment: { state, key?, target? } }`; a failure/error
 deployment or a timeout wakes it with the run URL. With no `deployment`, the
 playbook behaves exactly as before.
