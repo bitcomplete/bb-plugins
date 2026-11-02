@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -462,8 +462,10 @@ describe("the actor rename migration (BB-97)", () => {
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
     // Newest group first; each sits immediately before the one appended after
-    // it. BB-164 appended the pull-watch group after BB-184's server settings.
-    const groups = [PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // it. BB-164 appended the pull-watch group after BB-184's server settings,
+    // and BB-215's stack group follows it (migrations.test.ts pins the whole
+    // list, this only checks the group order).
+    const groups = [STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);

@@ -212,12 +212,6 @@ export const BASE_MIGRATIONS = [
      need_id TEXT NOT NULL,
      created_at INTEGER NOT NULL
    )`,
-  // Stack scheduling (BB-215): the open bindings whose pull request this hold
-  // waits for (a stack-wait; `hold_behind` waits for a merge or an end), and
-  // the base pull request a stacked pull request landed in, so the deployment
-  // carries-check follows that merge on the default branch.
-  `ALTER TABLE bindings ADD COLUMN hold_stack TEXT NOT NULL DEFAULT '[]'`,
-  `ALTER TABLE bindings ADD COLUMN landed_in TEXT`,
 ];
 
 // ---- the one escalation chain (BB-30) -----------------------------------------------
@@ -502,7 +496,19 @@ export const SERVER_SETTINGS_MIGRATIONS = [
 // Dependabot binding behaving as a watch.
 export const PULL_WATCH_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN adopted_by TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS];
+// Stack scheduling (BB-215): the open bindings whose pull request this hold
+// waits for (a stack-wait; `hold_behind` waits for a merge or an end), and
+// the base pull request a stacked pull request landed in, so the deployment
+// carries-check follows that merge on the default branch.
+//
+// The SDK records each migration's hash by index and refuses to start the
+// plugin when an index no longer matches, so a new group goes at the END of
+// MIGRATIONS, never into an earlier group: #239 put these two in
+// BASE_MIGRATIONS, shifted every later index, and no existing server could
+// open its store. `migrations.test.ts` pins the recorded prefix.
+export const STACK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN hold_stack TEXT NOT NULL DEFAULT '[]'`, `ALTER TABLE bindings ADD COLUMN landed_in TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
