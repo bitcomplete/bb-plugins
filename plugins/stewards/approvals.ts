@@ -10,7 +10,7 @@
 import { type BigDecision, explainDecision, formatDecisionListing } from "./decisions.js";
 import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, reviewWorkerThread, type PrGate } from "./gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
-import { workerInFlight } from "./reconcile.js";
+import { workerInFlight, type MechanicalEvent } from "./reconcile.js";
 import { signatureLine, type EntitySnapshot, type Source } from "./source-contract.js";
 import type { Binding, Need, Observed, Store } from "./store.js";
 
@@ -35,6 +35,8 @@ export type ApprovalsContext = {
   pullChangedFiles: (entity: EntitySnapshot) => Promise<string[] | null>;
   loadDecisions: (projectId: string) => Promise<readonly BigDecision[]>;
   observedPulls: (b: Binding, observed: Observed) => EntitySnapshot[];
+  /** Write the status the plugin observed itself, without a steward turn (BB-203). */
+  mechanicalStatus: (b: Binding, event: MechanicalEvent) => void;
 };
 
 /**
@@ -64,6 +66,9 @@ export async function deliverProjectApproval(ctx: ApprovalsContext, b: Binding, 
   const thread = (signed !== null && ctx.store.worker(signed)?.bindingId === b.id ? signed : null) ?? [...ctx.store.workers(b.id)].reverse().find((w) => workerInFlight(w))?.threadId ?? null;
   const info = thread === null ? null : await ctx.threadInfo(thread).catch(() => null);
   const label = decision.verdict === "approved" ? "approved" : "declined";
+  // The project steward's approval is a mechanical status event: the page and
+  // sidebar are current before the ticket steward's next turn (BB-203).
+  if (decision.verdict === "approved") ctx.mechanicalStatus(b, { kind: "approved", pull: entity.key });
   const entry = decision.entry === null ? "" : ` (entry ${JSON.stringify(decision.entry)})`;
   const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets, The merge gate), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
   if (info !== null && info.deletedAt === null && info.archivedAt === null) {
@@ -316,6 +321,7 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
       return { ok: false, message: `GitHub refused the review: ${errorMessage(error)}` };
     }
     ctx.store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
+    ctx.mechanicalStatus(b, { kind: "approved", pull: pull.key });
     after(`The user approved ${pull.key} from the Stewards page.`);
     return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
   }
@@ -326,6 +332,7 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
     return { ok: false, message: `GitHub refused the comment: ${errorMessage(error)}` };
   }
   ctx.store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
+  ctx.mechanicalStatus(b, { kind: "approved", pull: pull.key });
   after(`The user approved ${pull.key} from the Stewards page: "${body}".`);
   return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
 }

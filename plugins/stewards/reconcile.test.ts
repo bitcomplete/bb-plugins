@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownPullClosed, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, ownerApproval, prGate, projectApprovalMarker, reviewWorkerThread, type ProjectApprovalRecord } from "./gate.js";
-import { readyStateSchema } from "./store.js";
+import { readyStateSchema, statusRecordSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
 const tickets = (() => {
@@ -845,5 +845,93 @@ describe("idle in an active stage (BB-83)", () => {
     expect(ownPullClosed(merged, merged, own)).toBe(false);
     // A foreign pull request closing is not the binding's own event.
     expect(ownPullClosed(before, { entity: issue({ state: "In Review" }), pulls: [pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "merged" })] }, own)).toBe(false);
+  });
+});
+
+// BB-203: the plugin writes the status it observed itself, and quiets a
+// worker's own pull request activity only while nothing the user must act on
+// is open.
+describe("mechanical status and the user's open items (BB-203)", () => {
+  const status = (over: Record<string, unknown> = {}) =>
+    statusRecordSchema.parse({
+      phase: "In Progress",
+      summary: "Building.",
+      nextAction: "Wait for the worker",
+      actor: "steward",
+      waitingOn: "the worker",
+      requeueAfterMs: null,
+      conditions: [],
+      resources: { workers: [], pullRequests: [], children: [] },
+      at: 1,
+      ...over,
+    });
+
+  it("names the new state for approved, merged and deployed, and folds checks into the phrase", () => {
+    const approved = mechanicalStatus(status(), { kind: "approved", pull: "acme/web#7" }, false, 5)!;
+    expect(approved).toMatchObject({ summary: "Approved acme/web#7.", nextAction: "The worker merges it.", actor: "steward", at: 5 });
+    // Everything the steward last reported survives the mechanical write.
+    expect(approved).toMatchObject({ phase: "In Progress", waitingOn: "the worker" });
+    expect(mechanicalStatus(status(), { kind: "merged", pull: "acme/web#7" }, false, 5)).toMatchObject({ summary: "Merged acme/web#7.", nextAction: "Awaiting deployment.", actor: "other" });
+    expect(mechanicalStatus(status(), { kind: "deployed", pull: "acme/web#7" }, false, 5)).toMatchObject({ summary: "Deployed acme/web#7.", nextAction: "Close the ticket.", actor: "steward" });
+    // Checks fold into the phrase and leave the summary alone.
+    expect(mechanicalStatus(status(), { kind: "checks", pull: "acme/web#7", state: "success", failing: [] }, false, 5)).toMatchObject({ summary: "Building.", nextAction: "checks passed" });
+    expect(checksPhrase("failure", ["ci"])).toBe("checks failure (failing: ci)");
+  });
+
+  it("keeps actor user only while a need or me escalation is open, and never invents a first report", () => {
+    expect(mechanicalStatus(status(), { kind: "approved", pull: "acme/web#7" }, true, 5)!.actor).toBe("user");
+    expect(mechanicalStatus(status(), { kind: "merged", pull: "acme/web#7" }, true, 5)!.actor).toBe("user");
+    expect(mechanicalStatus(null, { kind: "approved", pull: "acme/web#7" }, false, 5)).toBeNull();
+  });
+
+  it("finds the own pull request that merged, and the checks that settled on one", () => {
+    const own = new Set(["acme/web#7", "https://github.com/acme/web/pull/7"]);
+    const open = { entity: issue({ state: "In Progress" }), pulls: [pull({ state: "open" })] };
+    const merged = { entity: issue({ state: "In Progress" }), pulls: [pull({ state: "merged" }, { merged: true })] };
+    expect(ownPullMerged(open, merged, own)).toEqual({ pull: "acme/web#7" });
+    // A pull request the plugin cannot tie to the worker is not its own.
+    expect(ownPullMerged(open, merged, new Set())).toBeNull();
+    // Already merged is not a new transition.
+    expect(ownPullMerged(merged, merged, own)).toBeNull();
+    const checked = { entity: issue({ state: "In Progress" }), pulls: [pull({}, { checks: { state: "success", failing: [] } })] };
+    expect(ownChecksFinished(open, checked, own)).toEqual({ pull: "acme/web#7", state: "success", failing: [] });
+    expect(ownChecksFinished(checked, checked, own)).toBeNull();
+  });
+
+  it("finds a deployment watch that settled to deployed", () => {
+    const deploying = { "acme/web#7": { key: "acme/web#7", state: "deploying" } } as never;
+    const deployed = { "acme/web#7": { key: "acme/web#7", state: "deployed" } } as never;
+    expect(deploymentSettled(deploying, deployed)).toEqual({ pull: "acme/web#7" });
+    expect(deploymentSettled(deployed, deployed)).toBeNull();
+  });
+
+  it("keeps the worker's own linked pull request quiet, and loud while the user has an item", () => {
+    const own = new Set(["acme/web#7"]);
+    const before = { entity: issue({ state: "In Progress" }), pulls: [] };
+    const after = {
+      entity: issue({ state: "In Progress", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }),
+      pulls: [pull({ author: "jane" }, { headAuthor: "jane" })],
+    };
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true, ownPulls: own }))).toEqual([]);
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true, userWaiting: true, ownPulls: own }))).toEqual([
+      "Pull request linked: acme/web#7",
+      "acme/web#7: now followed (open)",
+    ]);
+  });
+
+  it("keeps a running worker's own pull request activity loud while the user has an open need", () => {
+    const own = new Set(["acme/web#7"]);
+    const before = { entity: issue({ state: "In Progress" }), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
+    const after = {
+      entity: issue({ state: "In Progress" }),
+      pulls: [pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } })],
+    };
+    // With nothing open, the worker's own round and checks are quiet notes.
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true, ownPulls: own }))).toEqual([]);
+    // An open need (or `me` escalation) is the user's, so the same events wake.
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true, userWaiting: true, ownPulls: own }))).toEqual([
+      "acme/web#7: Checks finished: success",
+      "acme/web#7: 1 new comment from jane",
+    ]);
   });
 });

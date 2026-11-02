@@ -78,7 +78,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent } from "./reconcile.js";
 import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
@@ -2846,6 +2846,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.note(b.id, `The steward was respawned from ${respawned.from ?? "(none)"} to ${respawned.to}: its environment could not deliver the wake.`);
     }
 
+    /**
+     * Write the status the plugin observed itself, without a steward turn
+     * (BB-203): the page and sidebar are current before the next wake, and the
+     * write goes through `patch` so the realtime channel rings. `actor` follows
+     * the standing rule (`user` only while a need or a `me` escalation is open),
+     * and the record keeps the steward's phase, wait, conditions and resources.
+     */
+    function patchMechanicalStatus(b: Binding, event: MechanicalEvent): Binding {
+      // The approval event is itself the answer to an open approval escalation,
+      // so that one does not keep `actor` on the user (BB-203).
+      const userWaiting =
+        store.openNeeds(b.id).length > 0 ||
+        store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "me" && !(event.kind === "approved" && x.kind === "approval"));
+      const status = mechanicalStatus(b.status, event, userWaiting, now());
+      if (status === null) return b;
+      const moved = advanced(b.status, status);
+      return store.patch(b.id, { status, statusAt: now(), ...(moved ? { advancedAt: now() } : {}) });
+    }
+
     /** Wake the steward, spawning its thread on the first wake. */
     async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<boolean> {
       const gate = gateState(playbook, b.ready, specHashFor(b, observed.entity));
@@ -3109,7 +3128,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // diff only quiets them while one is, and the idle rule (BB-83) needs the
       // set for a binding whose worker has finished its turn.
       const ownPulls = await ownPullKeys(b, workers, observed);
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
+      // BB-203: an open need or `me` escalation keeps the worker's own pull
+      // request activity loud, so the steward can reconcile the user's item.
+      const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "me");
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
       changes.push(...fresh);
       changes.push(...deploymentChanges);
       // BB-83: a binding in a build or review stage with nothing to wait on is
@@ -3206,7 +3228,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.scheduleAsked.length > 0) clear.scheduleAsked = [];
         if (Object.keys(clear).length > 0) b = store.patch(b.id, clear);
       }
-      await syncNeeds(b, observed, playbook, workerInFlight);
+      const approvalEvents = await syncNeeds(b, observed, playbook, workerInFlight);
+      // BB-203: write the status the plugin observed itself, without a steward
+      // turn, before the wake, so the page and sidebar are current within one
+      // refetch. Checks fold into the phrase; approved, merged and deployed
+      // name the new state. Applied in that order, so the newest wins.
+      const mechanical: MechanicalEvent[] = [];
+      if (prev !== null) {
+        const checks = ownChecksFinished(prev, observed, ownPulls);
+        if (checks !== null) mechanical.push({ kind: "checks", ...checks });
+        const merged = ownPullMerged(prev, observed, ownPulls);
+        if (merged !== null) mechanical.push({ kind: "merged", ...merged });
+      }
+      mechanical.push(...approvalEvents);
+      const settled = deploymentSettled(deploymentsBefore, deployments);
+      if (settled !== null) mechanical.push({ kind: "deployed", ...settled });
+      for (const event of mechanical) b = patchMechanicalStatus(b, event);
       // The work this binding was holding others behind has landed: lift them.
       if (allPullsMerged(b, observed) && (prev === null || !allPullsMerged(b, prev))) await releaseBehind(b, "merged its pull requests");
       // BB-89: level-triggered, so a hold placed after its targets finished, or
@@ -5376,6 +5413,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       pullChangedFiles,
       loadDecisions: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? [],
       observedPulls,
+      mechanicalStatus: patchMechanicalStatus,
     };
 
     /** Every pull request a binding observes: a pr binding's own entity, and a ticket's linked pulls. */
@@ -5493,7 +5531,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * every look, so the page only offers a button while it is true. The
      * `approve-pr` half lives in approvals.ts (BB-153).
      */
-    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean): Promise<void> {
+    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean): Promise<MechanicalEvent[]> {
+      // BB-203: an `approve-pr` item this call closes because an approval is
+      // present is a mechanical status event. The page and project-steward
+      // paths write it at once; this catches an approval observed on GitHub.
+      const events: MechanicalEvent[] = [];
       const mode = playbook.ready?.approval ?? null;
       const current = specHashFor(b, observed.entity);
       const gate = gateState(playbook, b.ready, current);
@@ -5519,8 +5561,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ownerLogin = config?.githubLogin ?? null;
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
+        const hadApprove = store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url);
         const { gate: g, closed, approvalRaised: raised } = await syncPullApproval(approvalsCtx, b, pull, decisions);
         if (raised) approvalRaised = true;
+        if (hadApprove && !closed && (g.ownerApproved || g.projectApproved) && !store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url)) {
+          events.push({ kind: "approved", pull: pull.key });
+        }
         if (closed) {
           store.closeNeedByKey(b.id, "merge", url, "The pull request is closed.");
           continue;
@@ -5559,6 +5605,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
+      return events;
     }
 
     /**

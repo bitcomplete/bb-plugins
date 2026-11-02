@@ -7,9 +7,10 @@
 // decision is made from. Every function here compares two states.
 import { createHash } from "node:crypto";
 import { isTerminal, phaseOf, type Playbook } from "./config.js";
+import type { Deployments } from "./deploy.js";
 import { isMarkerComment } from "./gate.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Need, Observed, ReadyState, Worker } from "./store.js";
+import type { Binding, Escalation, Need, Observed, ReadyState, StatusRecord, Worker } from "./store.js";
 
 /**
  * One line of "what changed", and whether it alone makes a judgment turn due.
@@ -294,7 +295,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
     // rewriting a description it signed earlier usually keeps the line.
     const signer = descriptionSignedBy(after);
     const own = signer !== null && ctx.own.has(signer) && descriptionSignedBy(before) !== signer;
-    const ownWork = ctx.workerInFlight && after.pull !== null && ownPull(after.key, after.url, ctx.ownPulls);
+    const ownWork = after.pull !== null && quietOwn(ctx, after);
     changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !ownWork, ...(own ? { own } : {}) });
   }
 
@@ -320,14 +321,26 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
   for (const l of added) {
     // BB-52 rule 2: while a worker is in flight, only its own pull request is
     // quiet; a foreign one wakes the steward. With no worker in flight the
-    // link is a quiet note as before.
-    const foreign = ctx.workerInFlight && !ownPull(l.key, l.url, ctx.ownPulls);
-    changes.push({ text: `${p}Pull request linked${foreign ? " (not this ticket's worker)" : ""}: ${l.key ?? l.url}`, actionable: foreign });
+    // link is a quiet note as before. BB-203 keeps the worker's own link loud
+    // while the user has an open item, so the steward can reconcile it.
+    const own = ownPull(l.key, l.url, ctx.ownPulls);
+    const foreign = ctx.workerInFlight && !own;
+    const quiet = ctx.workerInFlight && own && ctx.userWaiting !== true;
+    changes.push({ text: `${p}Pull request linked${foreign ? " (not this ticket's worker)" : ""}: ${l.key ?? l.url}`, actionable: ctx.workerInFlight && !quiet });
   }
 
-  if (before.pull !== null && after.pull !== null) changes.push(...diffPull(before, after, ctx, ctx.workerInFlight && ownPull(after.key, after.url, ctx.ownPulls)));
+  if (before.pull !== null && after.pull !== null) changes.push(...diffPull(before, after, ctx, quietOwn(ctx, after)));
   return changes;
 }
+
+/**
+ * Whether a worker in flight owns this pull request's activity and nothing the
+ * user must act on is open (BB-203). An open need or `me` escalation keeps the
+ * activity loud, so the steward can reconcile the item it is holding for the
+ * user. BB-52's in-flight rule is unchanged for everything else.
+ */
+const quietOwn = (ctx: { workerInFlight: boolean; userWaiting?: boolean; ownPulls: ReadonlySet<string> }, e: EntitySnapshot): boolean =>
+  ctx.workerInFlight && ctx.userWaiting !== true && ownPull(e.key, e.url, ctx.ownPulls);
 
 const SETTLED = new Set(["success", "failure", "error"]);
 
@@ -383,6 +396,8 @@ export type ObservedDiffContext = {
   /** The stage an entity state maps to in this binding's playbook, for the build/review move (rule 1). */
   stageOf?: (state: string) => string | null;
   userThread?: (threadId: string) => boolean;
+  /** An open need or `me` escalation: the user is being asked, so own-PR work is not quiet (BB-203). */
+  userWaiting?: boolean;
 };
 
 export function diffObserved(before: Observed, after: Observed, ctx: ObservedDiffContext): Change[] {
@@ -396,9 +411,11 @@ export function diffObserved(before: Observed, after: Observed, ctx: ObservedDif
     if (was === undefined) {
       // Rule 2 again: while a worker is in flight, a first sight of its own
       // pull request is quiet and a foreign one wakes (the link line already
-      // names it); with no worker in flight it is quiet as before.
-      const foreign = ctx.workerInFlight && !ownPull(pull.key, pull.url, ownPulls);
-      changes.push({ text: `${prefix}now followed (${pull.state})`, actionable: foreign });
+      // names it); with no worker in flight it is quiet as before. BB-203 keeps
+      // the worker's own follow loud while the user has an open item.
+      const own = ownPull(pull.key, pull.url, ownPulls);
+      const quiet = ctx.workerInFlight && own && ctx.userWaiting !== true;
+      changes.push({ text: `${prefix}now followed (${pull.state})`, actionable: ctx.workerInFlight && !quiet });
     } else changes.push(...diffEntity(was, pull, { ...ctx, prefix, viewer: pull.viewer, ownPulls }));
   }
   // Comments are compared with what the steward was last shown, not with the
@@ -412,7 +429,7 @@ export function diffObserved(before: Observed, after: Observed, ctx: ObservedDif
     // and its reviewers': they post as the developer, often unsigned. The
     // reviewer's markers are the worker's business too, whoever posts them;
     // a round that changes the lane is not.
-    const ownWork = ctx.workerInFlight && e.pull !== null && ownPull(e.key, e.url, ownPulls);
+    const ownWork = e.pull !== null && quietOwn({ ...ctx, ownPulls }, e);
     const people = ownWork ? fresh.filter((c) => reviewMarker(c.body) === null && lc(c.author) !== lc(e.viewer)) : fresh;
     if (fresh.length > 0) changes.push({ text: commentNews(prefix, fresh), actionable: people.length > 0 });
     if (ownWork) {
@@ -612,6 +629,80 @@ export function idleInActiveStage(b: IdleBinding, observed: Observed): boolean {
   if (b.escalations.some((x) => x.status === "open" && x.route === "me")) return false;
   if (b.needs.length > 0) return false;
   return true;
+}
+
+// ---- mechanical status (BB-203) ------------------------------------------------------
+
+/** A status update the plugin writes from an event it observed itself, without a steward turn. */
+export type MechanicalEvent =
+  | { kind: "approved"; pull: string }
+  | { kind: "merged"; pull: string }
+  | { kind: "checks"; pull: string; state: string; failing: readonly string[] }
+  | { kind: "deployed"; pull: string };
+
+/** The phrase a checks result folds into (BB-203): the summary stays the steward's. */
+export const checksPhrase = (state: string, failing: readonly string[]): string =>
+  state === "success" ? "checks passed" : `checks ${state}${failing.length === 0 ? "" : ` (failing: ${failing.join(", ")})`}`;
+
+/**
+ * The status record the plugin writes on an event it observed itself (BB-203),
+ * built from the last report the steward made so the phase, wait, conditions
+ * and resources survive. Checks fold into the phrase and leave the summary;
+ * the others name the new state. `actor` follows the standing rule: `user`
+ * only while a need or a `me` escalation is open. Null when there is no report
+ * to build on: a mechanical write never invents the steward's first report.
+ */
+export function mechanicalStatus(prev: StatusRecord | null, event: MechanicalEvent, userWaiting: boolean, at: number): StatusRecord | null {
+  if (prev === null) return null;
+  const actor: StatusRecord["actor"] = userWaiting ? "user" : event.kind === "merged" ? "other" : "steward";
+  const base = { ...prev, actor, at };
+  switch (event.kind) {
+    case "approved":
+      return { ...base, summary: `Approved ${event.pull}.`, nextAction: "The worker merges it." };
+    case "merged":
+      return { ...base, summary: `Merged ${event.pull}.`, nextAction: "Awaiting deployment." };
+    case "checks":
+      return { ...base, nextAction: checksPhrase(event.state, event.failing) };
+    case "deployed":
+      return { ...base, summary: `Deployed ${event.pull}.`, nextAction: "Close the ticket." };
+  }
+}
+
+/** The own pull request that went open → merged between two observations, if any (BB-203). */
+export function ownPullMerged(before: Observed, after: Observed, ownPulls: ReadonlySet<string>): { pull: string } | null {
+  const wasOpen = new Set<string>();
+  for (const e of [before.entity, ...before.pulls]) {
+    if (e.pull !== null && e.key !== "" && pullOpen(e)) wasOpen.add(e.key.toLowerCase());
+  }
+  for (const e of [after.entity, ...after.pulls]) {
+    if (e.pull === null || e.key === "") continue;
+    if (!(e.state === "merged" || e.pull.merged === true) || !ownPull(e.key, e.url, ownPulls)) continue;
+    if (wasOpen.has(e.key.toLowerCase())) return { pull: e.key };
+  }
+  return null;
+}
+
+/** Checks that settled on an own pull request between two observations, if any (BB-203). */
+export function ownChecksFinished(before: Observed, after: Observed, ownPulls: ReadonlySet<string>): { pull: string; state: string; failing: string[] } | null {
+  const was = new Map<string, EntitySnapshot>();
+  for (const e of [before.entity, ...before.pulls]) if (e.pull !== null) was.set(e.key.toLowerCase(), e);
+  for (const e of [after.entity, ...after.pulls]) {
+    if (e.pull === null || !ownPull(e.key, e.url, ownPulls)) continue;
+    const prev = was.get(e.key.toLowerCase());
+    const bChecks = prev?.pull?.checks?.state ?? null;
+    const aChecks = e.pull.checks?.state ?? null;
+    if (aChecks === null || !SETTLED.has(aChecks)) continue;
+    if (bChecks !== aChecks || !same(prev?.pull?.checks?.failing ?? [], e.pull.checks?.failing ?? [])) return { pull: e.key, state: aChecks, failing: e.pull.checks?.failing ?? [] };
+  }
+  return null;
+}
+
+/** A deployment watch that settled to `deployed` between two reads, if any (BB-203). */
+export function deploymentSettled(before: Deployments, after: Deployments): { pull: string } | null {
+  for (const [id, watch] of Object.entries(after)) {
+    if (watch.state === "deployed" && before[id]?.state !== "deployed") return { pull: watch.key };
+  }
+  return null;
 }
 
 /**
