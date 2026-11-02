@@ -5587,6 +5587,41 @@ describe("needs you items", () => {
     expect(esc).toMatchObject({ route: "user" });
   });
 
+  it("names the product reason in the approve-pr item for a substantial review binding (BB-207)", async () => {
+    const t = await setup();
+    const signed = comment({ id: "rev", author: "jane", did: "reviewed", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->\n\nFindings.\n\n_— from bb thread thr_review_`, signedBy: "thr_review", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [signed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    // Nothing reports `substantial` yet, so the item is the ordinary one.
+    const before = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(before.how).not.toMatch(/substantial and references no ticket/u);
+    // The reviewer's substantial verdict, with no referenced ticket carrying
+    // an approved spec, asks the owner to ack the Product section.
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, substantial: true, why: "a new outbound integration" } });
+    await t.ring("github", "acme/web#7");
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(need.how).toMatch(/substantial and references no ticket with an approved spec/u);
+    expect(need.how).toMatch(/\*\*Product\*\* section/u);
+    // It is still the owner's item and escalation, not the project steward's.
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(esc).toMatchObject({ route: "user" });
+  });
+
+  it("refuses a project-steward approval of a substantial pull request with no approved spec (BB-207)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // The ticket is substantial and has no spec approval, so the product
+    // reason binds the gate to the owner even though a project entry matched.
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, substantial: true } });
+    await t.ring("linear", "uuid-12");
+    const update = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract" }, t.project);
+    expect(update.error, update.text).toBe(true);
+    expect(update.text).toMatch(/substantial and references no ticket with an approved spec/u);
+    expect(t.githubComments.filter((c) => c.body.startsWith("<!-- bb-approval"))).toHaveLength(0);
+  });
+
   it("files approve-pr and the user's approval escalation for an unsigned reviewer marker (BB-110)", async () => {
     // The reviewer posts as the connected user. When it leaves the signature
     // off, its marker comment still carries the marker, so it is a thread's,

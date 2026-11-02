@@ -78,8 +78,8 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent } from "./reconcile.js";
-import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate } from "./gate.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent } from "./reconcile.js";
+import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate, PRODUCT_APPROVAL_REFUSAL } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
   SOURCE_PLUGIN_IDS,
@@ -4718,7 +4718,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A reviewer's owner call makes the approval the owner's, whatever
             // the decide list matched, so the wake says so and the project
             // steward forwards rather than approves (BB-192).
-            escalated: prGate(pull, { projectApprovals: projectApprovalsFor(r.from) }).escalated,
+            escalated: prGate(pull, { projectApprovals: projectApprovalsFor(r.from), ...productGateOptions(r.from) }).escalated,
           };
         }),
       );
@@ -6410,6 +6410,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       openItems: string[];
       /** Whether the reviewer's marker escalated the pull request to the owner (BB-192). */
       escalated: boolean;
+      /** The product reason (BB-207) when the reviewer judged it substantial with no approved spec; null otherwise. */
+      reason: "product" | null;
       missing: string | null;
       gateMet: boolean;
     };
@@ -6465,7 +6467,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The verdict is `prGate` with the project's approvals, exactly as the
       // page's Merge item and the wake compute it; the decide-list entry above
       // is what the plugin asks the owner or project steward for (BB-133).
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
       return {
         ref: `${ref.repo}#${ref.number}`,
         binding: b.entityKey,
@@ -6477,6 +6479,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         checks: { state: gate.checksState, green: gate.checksGreen },
         openItems: openPullItems(b, pull.url ?? pull.key),
         escalated: gate.escalated,
+        reason: gate.reason,
         missing: gate.missing,
         gateMet: gate.gateMet,
       };
@@ -6491,7 +6494,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The reviewer's owner call is printed beside the decide-list winner: the
       // decide list may still name a `project` entry, but the escalation binds
       // the gate to the owner's approval (BB-192).
-      const escalation = r.escalated ? "owner — the reviewer escalated it" : "none";
+      const escalation = r.reason === "product" ? "owner — the product reason (a substantial pull request with no approved spec)" : r.escalated ? "owner — the reviewer escalated it" : "none";
       return [
         `${r.ref}${r.binding === "" ? "" : ` — ${r.binding}`}`,
         `head ${shortSha(r.headSha)}; lane ${r.lane ?? "(none)"}`,
@@ -6511,7 +6514,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lane = gate.lane ?? "no-review";
       const approved = gate.marker?.sha ?? gate.headSha;
       const by = gate.projectApproved ? ", approved by the project steward" : gate.ownerApproved ? ", approved by the owner" : "";
-      const escalation = gate.escalated ? ", escalated by the reviewer to the owner" : "";
+      const escalation = gate.reason === "product" ? ", the owner acked the product" : gate.escalated ? ", escalated by the reviewer to the owner" : "";
       return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}${escalation}.`;
     }
 
@@ -6595,7 +6598,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The same `prGate` with the project's approvals the page's Merge item
       // and the wake use, so the page, `bb stewards gate` and `bb stewards
       // merge` cannot disagree.
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
       if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
       const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
       if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
@@ -7810,7 +7813,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
               const decision = pull === undefined ? "user" : decideForPull(await pullChangedFiles(pull), config?.file.bigDecisions ?? []);
-              const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b) });
+              const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
                 refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
@@ -8220,9 +8223,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const pull = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === prApproval.url) ?? null;
               // A reviewer's owner call in the marker is binding: the project
               // steward does not decide it, whatever entry the decide list
-              // matched, and never posts a `bb-approval` on it (BB-192).
-              if (pull !== null && prGate(pull, { projectApprovals: projectApprovalsFor(target) }).escalated) {
-                return toolError(new Error(ESCALATED_APPROVAL_REFUSAL));
+              // matched, and never posts a `bb-approval` on it (BB-192). The
+              // product reason (BB-207) binds it the same way.
+              const approvalGate = pull === null ? null : prGate(pull, { projectApprovals: projectApprovalsFor(target), ...productGateOptions(target) });
+              if (approvalGate !== null && approvalGate.escalated) {
+                return toolError(new Error(approvalGate.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL));
               }
               const files = pull === null ? null : await pullChangedFiles(pull);
               const decision = decideFor(files, input.entry ?? null, config.file.bigDecisions);
@@ -8553,7 +8558,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (n.kind === "approve-pr" || n.kind === "merge") {
         const observed = b.lastSnapshot;
         const target = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === n.url || e.key === n.url) ?? null;
-        const gate = target === null ? null : prGate(target, { projectApprovals: projectApprovalsFor(b) });
+        const gate = target === null ? null : prGate(target, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
         if (n.kind === "approve-pr") {
           actionable = gate?.needsOwnerApproval ?? false;
           why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");

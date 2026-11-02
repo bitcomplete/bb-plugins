@@ -6,7 +6,7 @@
 // owner's, whatever the decide list says (BB-153). It reads the reviewer marker
 // and the approval words from reconcile.ts; reconcile.ts reads `isMarkerComment`
 // back, the one cycle, which ESM function hoisting makes safe.
-import { classifyApproval, latestReviewMarker, reviewMarker, type ReviewMarker } from "./reconcile.js";
+import { classifyApproval, latestReviewMarker, productReason, reviewMarker, type ReviewMarker } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 
 // ---- the merge gate -------------------------------------------------------------------
@@ -240,6 +240,13 @@ export type PrGate = {
   projectApproved: boolean;
   /** Whether the reviewer's latest owner-reviewed marker escalated the pull request to the owner (BB-192). */
   escalated: boolean;
+  /**
+   * The product reason (BB-207) when the reviewer judged the pull request
+   * substantial and no referenced ticket has an approved spec; null otherwise.
+   * It makes the pull request the owner's and a project-steward `bb-approval`
+   * never meets it.
+   */
+  reason: "product" | null;
 };
 
 /**
@@ -252,12 +259,25 @@ export type PrGate = {
 export const ESCALATED_APPROVAL_REFUSAL =
   "The reviewer escalated this pull request to the owner, so the project steward does not decide it: the owner's unsigned approval is the gate. Forward it with steward_update { binding, forward, resolution: \"approve-decline\", recommendation }.";
 
+/**
+ * The refusal a project steward hears when it tries to approve a pull request
+ * whose product reason (BB-207) makes it the owner's: it is substantial and
+ * references no ticket with an approved spec, so the owner's unsigned approval
+ * of the Product section is the gate and a `bb-approval` never meets it.
+ */
+export const PRODUCT_APPROVAL_REFUSAL =
+  "This pull request is substantial and references no ticket with an approved spec, so the owner decides it: the owner's unsigned approval of the Product section is the gate, and a `bb-approval` never meets it. Forward it with steward_update { binding, forward, resolution: \"approve-decline\", recommendation }.";
+
 /** The project steward's side of the gate: the decide mark and the plugin's own approval records. */
 export type PrGateOptions = {
   /** The mark for the entry the project steward classified the pull request under; omitted is `user` (fail closed). */
   decision?: "project" | "user";
   /** The plugin's own `project_approvals` records for this binding, matched to the marker by comment id. */
   projectApprovals?: readonly ProjectApprovalRecord[];
+  /** The review binding's substantial judgment (BB-207); omitted or null is unjudged, so no product reason and every lane as before. */
+  substantial?: boolean | null;
+  /** Whether a ticket the pull request references has an approved spec (BB-207); that is the ack, so the owner is not asked again. */
+  ticketApprovedSpec?: boolean;
 };
 
 export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate {
@@ -269,16 +289,26 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   const checksGreen = pull !== null && (pull.checks === null || pull.checks.state === "success");
   const owner = ownerApproval(entity);
   const markerApproved = marker !== null && marker.verdict === "approved";
+  // BB-207: a substantial pull request with no approved spec on a referenced
+  // ticket is the owner's, whatever lane the reviewer assigned, and a
+  // project-steward `bb-approval` never meets it. Substantial false or
+  // unjudged (null) leaves every lane as before, which is what keeps the
+  // change inert until a reviewer reports a verdict.
+  const reason = productReason(opts.substantial ?? null, opts.ticketApprovedSpec ?? false);
+  const product = reason !== null;
+
   // Only an explicit `no-review` marker skips the owner; a marker the plugin
-  // cannot read, or an unknown lane, is the user's (fail closed).
-  const ownerLane = lane !== "no-review";
+  // cannot read, or an unknown lane, is the user's (fail closed). The product
+  // reason raises a `no-review` marker to the owner lane.
+  const ownerLane = lane !== "no-review" || product;
   // A reviewer may escalate an owner-reviewed pull request to the owner in its
   // marker: `approver=owner`, or a missing/unknown approver (fail closed). The
   // gate then needs the owner's unsigned approval and a project-steward
   // `bb-approval` never meets it, whatever `decideFor` says (BB-192). An
   // `approver=project` marker leaves the decide list in charge; `approver` on a
   // `no-review` marker is ignored, and no marker can move a `user` match down.
-  const escalated = marker !== null && ownerLane && marker.approver !== "project";
+  // The product reason escalates the same way, so it is folded in here.
+  const escalated = product || (marker !== null && ownerLane && marker.approver !== "project");
   // The project steward's decision is the plugin's own record AND the marker
   // it posted: only a `bb-approval` comment whose id the plugin recorded
   // counts, so a hand-typed lookalike (a different comment id) never does.
@@ -312,11 +342,13 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
           : !checksGreen
             ? `checks ${checksState ?? "not run"}`
             : ownerLane && !approved
-              ? escalated
-                ? "owner approval needed (the reviewer escalated it)"
-                : decision === "project"
-                  ? "project steward approval needed"
-                  : "owner approval needed"
+              ? product
+                ? "owner approval needed (product)"
+                : escalated
+                  ? "owner approval needed (the reviewer escalated it)"
+                  : decision === "project"
+                    ? "project steward approval needed"
+                    : "owner approval needed"
               : "not met";
   return {
     headSha,
@@ -338,6 +370,7 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     decision,
     projectApproved,
     escalated,
+    reason,
   };
 }
 

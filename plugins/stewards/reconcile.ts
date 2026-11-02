@@ -117,6 +117,32 @@ export function markerLaneChange(before: readonly SnapshotComment[], after: read
   return { from: b.lane, to: a.lane };
 }
 
+/**
+ * The product reason a pull request's owner lane carries (BB-207): the review
+ * binding was judged `substantial` from the diff, and no ticket it references
+ * has an approved spec. `substantial` is the binding's ready-gate judgment;
+ * null (unjudged) and false leave every lane exactly as today, which is what
+ * keeps the change inert until a reviewer reports a verdict. A referenced
+ * ticket with an approved spec is the existing ack, so the owner is not asked
+ * again. The reason is a property of the pull request, never of a commit: a
+ * later push only re-asks when it changed scope or behaviour.
+ */
+export function productReason(substantial: boolean | null, ticketApprovedSpec: boolean): "product" | null {
+  return substantial === true && !ticketApprovedSpec ? "product" : null;
+}
+
+/**
+ * The product inputs `prGate` reads from a binding (BB-207). A ticket
+ * binding's referenced ticket is itself, so its approved spec is the ready
+ * gate's approval; a review binding has no approved spec of its own, and the
+ * reviewer reports the referenced ticket's separately.
+ */
+export function productGateOptions(b: Pick<Binding, "kind" | "ready">): { substantial: boolean | null; ticketApprovedSpec: boolean } {
+  // `ready` is always present on a stored binding; the guard keeps a partial
+  // caller (a unit test's stub) from throwing, and unjudged stays null.
+  const ready: ReadyState | null | undefined = b.ready;
+  return { substantial: ready?.substantial ?? null, ticketApprovedSpec: b.kind === "ticket" && ready?.approval != null };
+}
 
 /**
  * A spec comment is a signed comment that starts by saying so. The steward's
