@@ -4405,6 +4405,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // one.
               const evaluated = await evaluateAppliedDeployment(applied.deployments, before, target, moved, now());
               b = store.patch(b.id, { deployments: evaluated.deployments });
+              // BB-203 regression: a doorbell settles the watch here, so the
+              // reconcile that follows sees no edge and never writes the
+              // deployed status. Write it at the settle instead.
+              const settled = deploymentSettled(before, evaluated.deployments);
+              if (settled !== null) b = patchMechanicalStatus(b, { kind: "deployed", ...settled });
               b = store.note(b.id, [line, ...evaluated.notes].join("; "), !evaluated.wake);
               if (evaluated.wake) {
                 bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);

@@ -699,6 +699,29 @@ describe("the pull request gate (build-tickets)", () => {
     expect(prGate(entity)).toMatchObject({ lane: "owner-reviewed", checksGreen: true, ownerApproved: false, needsOwnerApproval: true, missing: "owner approval needed" });
   });
 
+  // BB-206: teammate mode posts a real `gh pr review`; github-watcher flattens
+  // the review into a comment with `did: "approved"` (or "requested changes")
+  // and the body, so the marker is read from the review body as well as from a
+  // plain PR comment.
+  it("reads the reviewer's marker from a real GitHub review body (BB-206)", () => {
+    const at = "2026-10-14T16:00:00Z";
+    const review = comment({
+      id: "PRR_206",
+      author: "jane",
+      did: "approved",
+      body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->\n\nLooks good.\n\n_— from bb thread thr_review_`,
+      signedBy: "thr_review",
+      createdAt: at,
+      url: "https://github.com/acme/web/pull/9#pullrequestreview-206",
+    });
+    const entity = pull({ comments: [review] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: at, commit: head }] });
+    const gate = prGate(entity);
+    expect(gate.marker).toMatchObject({ round: 1, sha: head, verdict: "approved", lane: "no-review" });
+    expect(gate).toMatchObject({ lane: "no-review", checksGreen: true, gateMet: true });
+    // The signed review is the reviewer's round, never the owner's own approval.
+    expect(ownerApproval(entity).approved).toBe(false);
+  });
+
   it("never reads a review steward's signed APPROVED review as the owner's approval (BB-118)", () => {
     const at = "2026-10-14T16:00:00Z";
     const review = reviewWithMarker(head, "approved", "no-review", at);

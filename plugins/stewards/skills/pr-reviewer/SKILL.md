@@ -1,18 +1,23 @@
 ---
 name: pr-reviewer
-description: Review a pull request in one of the project's repos as an independent reviewer thread spawned by the agent that wrote it - read the diff against the ticket, run the tests the CI does not, classify the PR into a lane, post one structured PR comment per round with a machine-readable verdict marker, and re-review when the author pushes fixes. Use when a thread was spawned with "follow the pr-reviewer skill" or asked to review a PR for an author thread.
+description: Review a pull request in one of the project's repos as an independent reviewer thread - an agent's PR or a teammate's - read the diff against the ticket, run the tests the CI does not, classify the PR into a lane, and post one structured review per round with a machine-readable verdict marker, re-reviewing when the author pushes fixes. The posting mode is decided mechanically from the PR author. Use when a thread was spawned with "follow the pr-reviewer skill" or asked to review a PR.
 ---
 
 # PR reviewer
 
-You are the second pair of eyes on a pull request another agent wrote. The
-author thread (your parent) implemented a Linear ticket, tested it, opened
-the PR and spawned you. It is waiting on your verdict. Whether a human also
-reviews depends on the lane you assign from the "Change classification"
-section of the project's guidance: owner-reviewed PRs wait for the
-approver the project's decide list names — the owner (the account `gh` is
-signed in as on this server; the `stewards` skill, "Act as the user,
-signed") or the project steward when the matching entry is
+You are the independent review on a pull request in one of the project's
+repos. It is one of two things, and the mode is decided mechanically below:
+a PR another agent wrote (the author thread, your parent, implemented a
+Linear ticket, tested it, opened the PR and spawned you, and is waiting on
+your verdict) or a teammate's PR (a review steward spawned you from the
+project's review playbook). The work and the review are the same in both;
+only the posting and the push differ.
+
+Whether a human also reviews depends on the lane you assign from the
+"Change classification" section of the project's guidance: owner-reviewed
+PRs wait for the approver the project's decide list names — the owner (the
+account `gh` is signed in as on this server; the `stewards` skill, "Act as
+the user, signed") or the project steward when the matching entry is
 `decide: project` — while no-review PRs merge on your verdict alone. Be
 thorough on substance and quiet on style.
 
@@ -33,36 +38,61 @@ the PR description: verify it.
 
 The project-specific parts are the project's, not this skill's: which
 repos depend on which, each repo's test command, the lane triggers and
-the decide list (`bigDecisions`), and the standing rules. Read the
-workspace `.bb/AGENTS.md`, the repo's own `AGENTS.md` and `README.md`, and
+the decide list (`bigDecisions`), the project's local-stack and
+walkthrough skills, and the standing rules. Read the workspace
+`.bb/AGENTS.md`, the repo's own `AGENTS.md` and `README.md`, and
 `.bb/stewards/project.json` before you classify or run anything. The
 `stewards` skill states the approval-durability and human-approval
 defaults the project's guidance may override.
 
+## Mode: agent-authored or teammate
+
+Decide the mode from the PR author, never from the spawn prompt: compare
+`gh pr view <n> --repo <repo> --json author --jq '.author.login'` with the
+login `gh api user -q .login` prints (the account this server posts as).
+
+- **Agent-authored PR** (the author is that login). You share the
+  identity, so a GitHub review would be a self-review. Your verdict is
+  **one plain PR comment per round**, the marker on line one, **no inline
+  comments, and you never push**. The author thread wakes you with the new
+  head sha for the next round.
+- **Teammate's PR** (the author is someone else). Your verdict is a real
+  **GitHub review** (`gh pr review --approve` / `--request-changes` /
+  `--comment`), the marker on its first line, inline comments allowed.
+  You may push a **rebase of the branch on `main` and nothing else** —
+  never a fix, a refactor or formatting. The review steward wakes you for
+  the next round.
+
+Everything below is shared. In both modes the marker carries
+`approver=` on the owner lane and the decide list names who approves.
+
 ## Ground rules
 
-- **Never approve or request changes through GitHub reviews.** You share
-  the author's GitHub identity, so `gh pr review` would be a self-review.
-  Verdicts go in plain PR comments with the marker described below.
-- **Never push to the PR branch** and never edit files outside your own
-  workspace. Fixing is the author's job; your comment tells them what.
-- **Sign everything you post.** End every PR comment with
+- **Sign everything you post.** End every PR comment or review body with
   `_— from bb thread <value of $BB_THREAD_ID>_` on its own line. The
   owner's approval is recognised as an unsigned review or comment from
-  the owner's account (the `stewards` skill, "An approval is of the pull
-  request, not of a commit"), so an unsigned agent post could pass for it.
-- **One comment per round.** Do not scatter inline comments; the author
-  parses one comment per round, and so does the human.
+  the owner's account (the `stewards` skill, "An approval is of the PR,
+  not a commit"), so an unsigned agent post could pass for it. Inline
+  comments need no signature; the review that carries them has it.
+- **One post per round.** Do not scatter the verdict across posts; the
+  author (or the steward) reads one round at a time, and so does the
+  human.
 - **End your turn after posting.** Do not poll the PR for changes. The
   author pushes fixes and then messages this thread with the new head
   sha; that message starts your next round.
+- **Never merge.** Approval is the end of your job.
+- On an **agent-authored PR** never approve or request changes through
+  GitHub reviews, never push, and never post inline comments.
+- On a **teammate's PR**, keep the author's intent in a rebase conflict;
+  when the resolution needs a judgement call about behaviour, abort the
+  rebase and make it a blocker instead of guessing.
 
 ## Inputs
 
 The spawn prompt names the repository, the PR number, the ticket key, its
 title and acceptance criteria, and the author thread id. If the prompt is
 missing the acceptance criteria, read them from the ticket (`linear_issue`)
-or the PR body and say in your comment that you did. A Dependabot
+or the PR body and say in your review that you did. A Dependabot
 version-update PR, or a worker's replacement for one (the project's
 `deps-prs` playbook), has no ticket: the PR body is the spec, the criteria
 are that every bump it lists is in the lockfiles, no bump it says it
@@ -73,15 +103,34 @@ worker that spawned you.
 
 1. **Load the PR.**
    ```sh
-   gh pr view <n> --repo <repo> --json title,body,headRefName,headRefOid,files,statusCheckRollup
+   gh pr view <n> --repo <repo> --json title,body,author,headRefName,headRefOid,baseRefName,headRepositoryOwner,isDraft,files,statusCheckRollup
    gh pr diff <n> --repo <repo>
    ```
-   Record `headRefOid`; every finding and the marker refer to it.
+   Record `headRefOid`; every finding and the marker refer to it. On a
+   teammate's PR also read the existing reviews, comments and inline
+   replies (`--json reviews,comments`, and
+   `gh api repos/<repo>/pulls/<n>/comments`): do not repeat what an
+   existing `Claude Code Review` or the previous round already said, but
+   do check whether the author acted on it. Read any Linear ticket the
+   title or body names (`linear_issue`).
 2. **Check out the head** in that repo's clone in your workspace so you
    can read surrounding code, not just hunks:
    ```sh
    git fetch origin <headRefName> && git checkout -q <headRefOid>
    ```
+   On a teammate's PR, rebase it on `main` first and push only the
+   rebase, refusing to clobber a push made meanwhile:
+   ```sh
+   git fetch origin main <headRefName>
+   git checkout -B <headRefName> origin/<headRefName>
+   git rebase origin/main
+   git push --force-with-lease=<headRefName>:<headRefOid> origin <headRefName>
+   ```
+   A fork PR cannot be pushed: rebase locally for testing only. If the
+   rebase does not apply cleanly, or a conflict needs a behaviour
+   decision, `git rebase --abort` and make it a blocker; do not push a
+   half-done rebase. After the push, re-read `headRefOid`; the review
+   names the rebased head. On an agent-authored PR you never push.
 3. **Read the guidance.** The workspace `.bb/AGENTS.md` (how the repos
    depend on each other, what ships how, the lanes), the repo's own
    `AGENTS.md` and `README.md`, and any design docs the project names. The
@@ -129,8 +178,8 @@ worker that spawned you.
    - Contracts: anything another repo depends on, as the project's
      guidance names them (a shared contract file and its copies, a webhook
      doorbell and subscribe body, an API and client registry, a Dockerfile's
-     lists, settings defaults). A change to one side without the other is a
-     blocker.
+     lists, settings defaults). A change to one side without the other is
+     a blocker.
    - Security: tokens and secrets in logs, responses or a public repo,
      input validation, anything reachable without the expected identity.
    - Tests: do new tests exercise the behaviour the ticket describes, or
@@ -141,14 +190,17 @@ worker that spawned you.
    the changed repo's test command yourself (the project's guidance names
    it), plus `typecheck` and any other check the repo defines. A red
    result you can reproduce is a blocker, with the output quoted. Say in
-   the comment which suites CI skipped and that you ran them. Do not
+   the review which suites CI skipped and that you ran them. Do not
    list suites you did not run because the diff does not touch what
-   they cover.
-7. **Post the comment** (format below) and stop.
+   they cover. When the diff has UI, follow the project's walkthrough
+   skill and list what you walked under Tested; a clean review is terse,
+   not unchecked.
+7. **Post the review** (format below) and stop.
 
 ## Later rounds
 
-The author's message says what it changed and gives the new head sha.
+The author (on an agent-authored PR) or the review steward (on a
+teammate's PR) messages this thread with what changed and the new head sha.
 
 1. Fetch and check out that sha. Diff it against the sha you last reviewed:
    `git diff <last-sha> <new-sha>`.
@@ -167,21 +219,42 @@ The author's message says what it changed and gives the new head sha.
    what was reviewed; if the author asks for one on a rebase alone, say
    the earlier verdict stands and post a marker that repeats it on the
    new head.
-5. Re-run the tests for what changed.
-6. Post the comment and stop.
+5. Re-run the tests for what changed. A fresh rebase on `main` is still
+   only a rebase.
+6. Post the review and stop.
 
 If the PR head has moved past the sha you were told, review the actual
 head and say so.
 
-## The comment
+## Posting the review
 
-Post exactly one comment per round with `gh pr comment <n> --repo <repo>
---body-file <file>`. The first line is the marker; the author's thread
-parses it, so keep its shape exact:
+The first line is the marker in both modes; the author's thread and the
+plugin parse it, so keep its shape exact:
 
 ```
 <!-- bb-review round=<N> sha=<full head sha> verdict=<verdict> lane=<lane> approver=<owner|project> -->
 ```
+
+- **Agent-authored PR:** post exactly one comment per round with
+  `gh pr comment <n> --repo <repo> --body-file <file>`. No inline comments.
+- **Teammate's PR:** post one real review, the marker on its first line:
+  ```sh
+  gh pr review <n> --repo <repo> --approve|--request-changes|--comment --body-file <file>
+  ```
+  The action follows the verdict and the lane: `changes-requested` →
+  `--request-changes`; `approved` on `lane=no-review` → `--approve`;
+  `approved` on `lane=owner-reviewed` → `--comment`, never `--approve`, so
+  the owner's account does not appear to have signed off before the owner
+  looked, and the plugin files the owner's Approve item. Attach inline
+  comments where a finding points at a changed line: post
+  the review through the API (`gh api repos/<repo>/pulls/<n>/reviews
+  --method POST --input <json>`) with `commit_id` set to the head you
+  reviewed and `comments` as `[{ path, line, side: "RIGHT", body }]`;
+  build the JSON with `jq -n --rawfile` rather than by hand. A line not
+  in the diff is rejected with 422 and takes the whole review with it, so
+  drop that comment from `comments` and keep it in the body. If the POST
+  fails, retry once with `comments: []`, then fall back to `gh pr review`
+  and say in your final line that the inline comments were lost.
 
 `verdict` is `approved` or `changes-requested`. `approved` means: no
 blockers remain, the change does what the ticket asks, and the tests you
@@ -206,6 +279,12 @@ credential; changing what the requester asked for. Otherwise set
 set it explicitly on every owner-reviewed round. On a `no-review` marker it
 is ignored, and escalation only goes up: no marker can move a `user` match
 down to the project steward or to no-review.
+
+In both modes your verdict is the reviewer's, not the owner's approval:
+the owner's approval is an unsigned review or comment from the owner's
+account, and your post is signed. On the owner lane a teammate's review is
+`--comment`, so it does not read as the owner's sign-off and the owner still
+approves after you.
 
 On `owner-reviewed`, put the decision in the owner-review line in the
 round that first assigns the lane and again in the round whose verdict is
@@ -240,12 +319,13 @@ or
 ### Resolved since round <N-1>
 - Blocker 1 from round 1: resolved by <short sha> / unresolved because ...
 
-### Checked
+### Tested
 - Ran: <the repo's test command> (pass; not in the CI matrix) ...
+- Walked: <the project's walkthrough skill, when the diff has UI: one line per step and result>.
 - Verified against ticket: <criteria not met, if any>
 ```
 
-The Checked section is an exceptions list, not a transcript. Name the
+The Tested section is an exceptions list, not a transcript. Name the
 command you ran and its result. An acceptance criterion gets a line only
 when it is not met, or when verifying it needed something not in the diff
 and not in the repo: a run against a live service or server, a read of
@@ -255,12 +335,11 @@ round.** Writing "spawn carries the flag, with a test asserting it: met"
 is exactly the recital this forbids. The round-1 shape is one "Ran:"
 line, zero or more unmet criteria, and any off-diff verification, and
 nothing else. Leave out rollout notes when there is no migration, no new
-dependency and no contract change, and leave out walkthrough sections
-when there is no UI. In a later round, the Resolved section is the only
-place that talks about round 1's items: its Checked is one "Ran:" line,
-and nothing about criteria that did not change. A round whose diff is
-docs or wording only says so in one sentence and does not re-list
-anything.
+dependency and no contract change, and leave out a Walked line when there
+is no UI. In a later round, the Resolved section is the only place that
+talks about round 1's items: its Tested is one "Ran:" line, and nothing
+about criteria that did not change. A round whose diff is docs or wording
+only says so in one sentence and does not re-list anything.
 
 A blocker is something that would be wrong to merge: a bug, a missing
 piece of the ticket, a failing or missing test for the behaviour, a
@@ -292,6 +371,6 @@ Say when you are unsure about something that matters to the verdict.
 ## Stopping
 
 After posting, end the turn with a one-line summary: round number,
-verdict, blocker count. The author reads the PR comment, not your reply.
+verdict, blocker count. The author reads the PR review, not your reply.
 If you are asked for a sixth round, review it, but add a line noting the
 loop is long and a human should look.
