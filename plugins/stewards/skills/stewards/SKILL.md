@@ -144,6 +144,15 @@ Two tools are yours; everything else you do with the tools every thread has.
   or escalate a decision. Never re-wait on a worker that has finished; a
   binding still `waitingOn` a finished worker reads `hand-off lost: worker
   finished` in the sidebar.
+- **A worker parked on a question dialog.** A worker that shows as running
+  for a long time with no activity may be sitting on an interactive question
+  dialog (`AskUserQuestion`), which nobody watches and which the plugin never
+  sees as a worker question. `bb thread interactions list <worker-id>` shows
+  it, and `bb thread interactions answer <interactionId> <worker-id>
+  --choice <questionId=value>` (or `--text <questionId=text>`) answers it.
+  Every playbook tells a worker never to open one, so a worker that does has
+  ignored its task; when you cannot answer the question yourself, tell the
+  user.
 - **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
   `linear_create_issue` sign for you: add no signature to what you pass
   them. With `gh`, end what you write with

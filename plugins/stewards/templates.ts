@@ -13,6 +13,15 @@ const SECRET_REQUEST =
   "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, naming the variable and what it is for in `context`. The question is one line, as the sidebar row shows it; the evidence and reasoning go in `context`, and a question longer than 240 characters is refused. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. `secret` is the only resolution for a credential, even when the ticket or spec says the owner produces or seals it by hand; such spec wording is corrected at spec approval, never followed. Never paste the secret, and never a script for the user to run.";
 
 /**
+ * Every playbook that can start a worker carries this, next to its other
+ * worker instructions: the interactive question tool parks the thread until a
+ * person clicks, and nobody watches a worker thread. A question goes to the
+ * steward as an escalation instead.
+ */
+const WORKER_QUESTIONS =
+  "Never use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click): it parks the thread until a person answers, and nobody watches a worker. A decision you cannot make goes to your steward with `bb stewards escalate \"<one-line question, under 240 characters>\" --context \"<evidence and options>\"` — one question per escalation, `--meanwhile wait` by default — or, if that command is unavailable, as a comment on the ticket or pull request you were given and in your final message; then end the turn.";
+
+/**
  * A build-time blocker is a `decision` in the same turn, never a follow-up,
  * in a playbook's build and review sections.
  */
@@ -123,6 +132,8 @@ ready, request review and move the ticket to In Review.
 
 ${SECRET_REQUEST}
 
+${WORKER_QUESTIONS}
+
 ${buildBlocker("the ticket")}
 
 ## In Review
@@ -153,6 +164,8 @@ You steward one pull request, labelled for you, until it is merged or closed.
 You do not write code yourself: workers address review comments and failing
 checks on the pull request's branch. Use gh for everything you do on GitHub,
 and sign what you write.
+
+${WORKER_QUESTIONS}
 
 ## draft
 
@@ -239,6 +252,8 @@ Approve item; do not escalate a decision for it, the page's Approve button is
 the ask. The lane is the same one the \`pr-reviewer\` skill classifies from the
 workspace \`AGENTS.md\`; when you cannot tell, it is owner-reviewed.
 
+${WORKER_QUESTIONS}
+
 ## open
 
 Run a round when one is due; otherwise there is nothing to do.
@@ -305,6 +320,8 @@ what would confirm it; and a priority: urgent when users cannot work, high
 when a service is degraded or an error hits many users, medium otherwise.
 Search the team for an open ticket about the same problem first
 (linear_search), and comment there instead of filing a second one.
+
+${WORKER_QUESTIONS}
 
 ## New
 
@@ -373,6 +390,8 @@ ticket about the same repository and ecosystem first (linear_search), and
 comment there instead of filing a second one. A fixed or dismissed alert is
 trimmed from its ticket's list; a ticket with no alerts left is moved to Done
 with a comment saying why.
+
+${WORKER_QUESTIONS}
 
 ## New
 
@@ -448,6 +467,8 @@ that is reported.
 Use gh for everything you do on GitHub, and sign what you write. A merge to
 main may rebuild an image and restart what runs it, so the replacement's
 description and the eventual merge comment say so when it does.
+
+${WORKER_QUESTIONS}
 
 ## draft
 

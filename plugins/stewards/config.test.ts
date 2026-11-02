@@ -222,6 +222,28 @@ describe("playbooks", () => {
     expect(phaseInstructions(reviews.value, "open")).toMatch(/escalated as a `decision`/u);
   });
 
+  it("tells every default playbook never to use the interactive question tool and to escalate instead (BB-199)", () => {
+    const playbooks: [string, string][] = [
+      ["linear-tickets", LINEAR_TICKETS],
+      ["github-prs", GITHUB_PRS],
+      ["github-reviews", GITHUB_REVIEWS],
+      ["ops-watch", OPS_WATCH],
+      ["deps-alerts", DEPS_ALERTS],
+      ["deps-prs", DEPS_PRS],
+    ];
+    for (const [name, raw] of playbooks) {
+      expect(raw, name).toMatch(/Never use the interactive question tool/u);
+      expect(raw, name).toMatch(/`AskUserQuestion`/u);
+      expect(raw, name).toMatch(/bb stewards escalate/u);
+      expect(raw, name).toMatch(/--context/u);
+      expect(raw, name).toMatch(/--meanwhile wait/u);
+      expect(raw, name).toMatch(/comment on the ticket or pull request you were given/u);
+    }
+    const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!linear.ok) throw new Error(linear.error);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/bb stewards escalate/u);
+  });
+
   it("tells the PR playbooks that an approval survives small follow-ups and when a human must approve", () => {
     const prs = parsePlaybook(GITHUB_PRS, "github-prs");
     if (!prs.ok) throw new Error(prs.error);
