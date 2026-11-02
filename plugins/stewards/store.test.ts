@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -36,7 +36,7 @@ describe("questions to the user", () => {
   it("made by forwarding an escalation, closes with it either way round", () => {
     const { s, binding } = store();
     const ask = () => {
-      const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "me", recommendation: null });
+      const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null });
       return { x, q: s.ask({ projectId: "p1", bindingId: binding.id, escalationId: x.id, question: x.question, context: null }) };
     };
 
@@ -129,7 +129,7 @@ describe("countNeedsUser (BB-104)", () => {
   // status actor does not count by itself (BB-213): the report files a need, so
   // the actor is true only through the open row, and a badge always has an item.
   const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
-    s.openEscalations(b.id).some((x) => x.route === "me") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
+    s.openEscalations(b.id).some((x) => x.route === "user") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
 
   const add = (s: ReturnType<typeof store>["s"], n: number) =>
     s.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
@@ -146,7 +146,7 @@ describe("countNeedsUser (BB-104)", () => {
     // One binding per remaining condition. The escalation that counts is the
     // one routed to the user; escalations routed elsewhere are added below.
     const escalation = add(s, 13);
-    s.escalate({ bindingId: escalation.id, kind: "decision", question: "Q", meanwhile: "m", route: "me", recommendation: null });
+    s.escalate({ bindingId: escalation.id, kind: "decision", question: "Q", meanwhile: "m", route: "user", recommendation: null });
     const need = add(s, 14);
     s.fileNeed({ bindingId: need.id, kind: "configure", url: "", what: "Enable it", how: null });
     const question = add(s, 15);
@@ -154,7 +154,7 @@ describe("countNeedsUser (BB-104)", () => {
     // All four on one binding: still one row.
     const all = add(s, 16);
     s.patch(all.id, { status: userStatus(1_000) });
-    s.escalate({ bindingId: all.id, kind: "decision", question: "Q", meanwhile: "m", route: "me", recommendation: null });
+    s.escalate({ bindingId: all.id, kind: "decision", question: "Q", meanwhile: "m", route: "user", recommendation: null });
     s.fileNeed({ bindingId: all.id, kind: "configure", url: "", what: "Enable it", how: null });
     s.ask({ projectId: "p1", bindingId: all.id, escalationId: null, question: "Which?", context: null });
     // An open escalation routed to someone other than the user does not count.
@@ -274,7 +274,7 @@ describe("lesson citation counts (BB-35 step 2)", () => {
   it("count corrections once each, and keep them on the escalation's citations", () => {
     const { s, binding } = store();
     const l = lesson(s);
-    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Q", meanwhile: "m", route: "me", recommendation: "Do it." });
+    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Q", meanwhile: "m", route: "user", recommendation: "Do it." });
     expect(s.escalation(x.id)).toMatchObject({ citedLessons: [], correctionsCounted: false });
     s.setEscalationCitations(x.id, [l.id, l.id]);
     expect(s.escalation(x.id)).toMatchObject({ citedLessons: [l.id] });
@@ -470,12 +470,88 @@ describe("the actor rename migration (BB-97)", () => {
     // it. BB-164 appended the pull-watch group after BB-184's server settings,
     // and BB-215's stack group follows it (migrations.test.ts pins the whole
     // list, this only checks the group order).
-    const groups = [STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    const groups = [ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
       end -= group.length;
     }
+  });
+});
+
+describe("the escalation route rename migration (BB-209)", () => {
+  // The pre-rename build typed the route as `steward | parent | project | me`
+  // and read it with `String(r.route) as EscalationRoute`; nothing validated
+  // it, so a migrated `user` row is an unrecognised route there, never a
+  // parse error.
+  const preRenameRoutes = ["steward", "parent", "project", "me"] as const;
+  const readAsOldBuild = (route: string): (typeof preRenameRoutes)[number] | "unknown" =>
+    (preRenameRoutes as readonly string[]).includes(route) ? (route as (typeof preRenameRoutes)[number]) : "unknown";
+
+  /** A database as the pre-rename build left it, with the route migration not yet applied. */
+  const legacy = () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS.slice(0, MIGRATIONS.indexOf(ESCALATION_ROUTE_MIGRATIONS[0]!))) db.exec(sql);
+    db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
+             VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
+    return db;
+  };
+  const insert = (db: ReturnType<typeof legacy>, id: string, route: string, question = "Q?") =>
+    db.prepare(`INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at)
+                VALUES (?, 'bnd_1', 'decision', ?, 'Wait.', ?, 'open', 1000)`).run(id, question, route);
+  const routeOf = (db: ReturnType<typeof legacy>, id: string) => (db.prepare("SELECT route FROM escalations WHERE id = ?").get(id) as { route: string }).route;
+
+  it("rewrites `me` to `user`, leaves other routes and columns alone, and is idempotent", () => {
+    const db = legacy();
+    insert(db, "esc_me", "me");
+    insert(db, "esc_project", "project", "Keep?");
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    // A second run matches nothing and changes nothing.
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    expect(routeOf(db, "esc_me")).toBe("user");
+    expect(routeOf(db, "esc_project")).toBe("project");
+    // No other column moved.
+    expect(db.prepare("SELECT * FROM escalations WHERE id = 'esc_me'").get()).toMatchObject({ binding_id: "bnd_1", kind: "decision", question: "Q?", meanwhile: "Wait.", status: "open", created_at: 1000 });
+  });
+
+  it("a pre-rename build reads a migrated row as an unrecognised route, never throwing (rollback)", () => {
+    const db = legacy();
+    insert(db, "esc_me", "me");
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    const route = routeOf(db, "esc_me");
+    expect(route).toBe("user");
+    expect(() => readAsOldBuild(route)).not.toThrow();
+    expect(readAsOldBuild(route)).toBe("unknown");
+  });
+
+  it("stores a route a caller still passes as `me` as `user`, logging one line", () => {
+    const logs: string[] = [];
+    const db = legacy();
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    const s = createStore(db, () => 2000, { log: (m) => logs.push(m) });
+    const x = s.escalate({ bindingId: "bnd_1", kind: "decision", question: "Q?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    expect(x.route).toBe("user");
+    expect(logs.filter((m) => m.includes('route "me" is renamed to "user"'))).toHaveLength(1);
+    // The canonical value stores as `user` and logs nothing.
+    const y = s.escalate({ bindingId: "bnd_1", kind: "decision", question: "Q2?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    expect(y.route).toBe("user");
+    expect(logs).toHaveLength(1);
+  });
+
+  it("reroutes an alias `me` to `user`, logging once", () => {
+    const logs: string[] = [];
+    const db = legacy();
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    const s = createStore(db, () => 2000, { log: (m) => logs.push(m) });
+    const x = s.escalate({ bindingId: "bnd_1", kind: "decision", question: "Q?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
+    expect(s.reroute(x.id, "me", null)).toBe(true);
+    expect(s.escalation(x.id)!.route).toBe("user");
+    expect(logs.filter((m) => m.includes('route "me" is renamed to "user"'))).toHaveLength(1);
+  });
+
+  it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
+    expect(MIGRATIONS.slice(-ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...ESCALATION_ROUTE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(ESCALATION_ROUTE_MIGRATIONS.length + STACK_MIGRATIONS.length), -ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...STACK_MIGRATIONS]);
   });
 });
 
@@ -495,12 +571,13 @@ describe("the rationale migration (BB-35 step 4)", () => {
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
     for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
     return db;
   };
 
   it("is additive and lossless: an existing escalation keeps its values and reads as not asked", () => {
     const s = createStore(legacy(), () => 2000);
-    expect(s.escalation("esc_1")).toMatchObject({ id: "esc_1", question: "Include SSO?", route: "me", status: "open", rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null });
+    expect(s.escalation("esc_1")).toMatchObject({ id: "esc_1", question: "Include SSO?", route: "user", status: "open", rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null });
   });
 
   it("keeps every escalation column, dropping nothing", () => {
@@ -793,6 +870,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
     for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
+    for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }
@@ -819,7 +897,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     expect(s.need("need_secret")).toMatchObject({ kind: "provide-secret", status: "open", data: { variable: "API_TOKEN", setting: "githubToken" } });
 
     const migrated = s.escalation("need_decide")!;
-    expect(migrated).toMatchObject({ resolutionKind: "choice", projectId: "p1", route: "me" });
+    expect(migrated).toMatchObject({ resolutionKind: "choice", projectId: "p1", route: "user" });
     expect(s.escalation("need_secret")).toMatchObject({ resolutionKind: "secret", url: "https://x/thread" });
     // The gate item is still a need and not an escalation.
     expect(s.need("need_approve")).toMatchObject({ kind: "approve-pr", status: "open" });
@@ -842,7 +920,7 @@ describe("answers go straight to the originator (BB-30)", () => {
       kind: "decision",
       question: "Include SSO?",
       meanwhile: "Wait.",
-      route: "me",
+      route: "user",
       recommendation: null,
       origin: { threadId: "thr_worker", bindingId: binding.id, chain: [{ threadId: "thr_mid", bindingId: other.id, rewording: "Still include SSO?" }] },
     });
@@ -859,7 +937,7 @@ describe("answers go straight to the originator (BB-30)", () => {
 
   it("does not queue a delivery when the origin has no thread", () => {
     const { s, binding } = store();
-    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Q", meanwhile: "Wait.", route: "me", recommendation: null, origin: { threadId: null, bindingId: binding.id, chain: [] } });
+    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Q", meanwhile: "Wait.", route: "user", recommendation: null, origin: { threadId: null, bindingId: binding.id, chain: [] } });
     s.resolve(x.id, "Answer.", "project");
     expect(s.binding(binding.id)!.guidance).toMatchObject([{ text: "Answer.", by: "project" }]);
     expect(s.pendingDeliveries()).toEqual([]);

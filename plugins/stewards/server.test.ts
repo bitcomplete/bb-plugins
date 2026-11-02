@@ -526,7 +526,7 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
       kind: "decision",
       question: fields.what,
       meanwhile: "Wait.",
-      route: "me",
+      route: "user",
       recommendation: null,
       projectId: "p1",
       resolutionKind,
@@ -3533,7 +3533,7 @@ describe("the status report actor (BB-97)", () => {
     expect(description).toMatch(/BB-95/u);
   });
 
-  it("counts only an open route-`me` escalation, so the badge, the read dot and the picker agree (BB-208)", async () => {
+  it("counts only an open route-`user` escalation, so the badge, the read dot and the picker agree (BB-208)", async () => {
     const t = await bound();
     const b = t.hooks.store.find("ENG-12")!;
     const marks = () => t.harness.sdk.callsTo("threads.markRead").map(([args]) => (args as { threadId: string }).threadId);
@@ -3553,7 +3553,7 @@ describe("the status report actor (BB-97)", () => {
 
     // Routed to the owner: the row needs them, the picker counts it, and the
     // report leaves the thread unread.
-    const own = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Q?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const own = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Q?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     expect(await needsUser(t)).toBe(true);
     expect(await pickerCount(t)).toBe(1);
     const before = marks().length;
@@ -3644,7 +3644,7 @@ describe("the status report actor (BB-97)", () => {
     // the auto one, so nothing is filed twice.
     await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Enable the event", actor: "user", needs: [{ kind: "configure", url: "https://example.test", what: "Enable it" }] }, t.steward);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.data.autoFiled === true)).toBe(false);
-    expect(t.hooks.store.openEscalations(b.id).some((x) => x.route === "me")).toBe(true);
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.route === "user")).toBe(true);
   });
 
   it("files the same auto-filed need whether the report raises the escalation or a later one finds it open (BB-213)", async () => {
@@ -3830,7 +3830,7 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     // unarchive directly; a real worker with an open escalation would keep
     // needsUser true and not be archived in the first place.
     const b = t.hooks.store.find("ENG-12")!;
-    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
     t.hooks.store.resolve(x.id, "The second one.", "user");
     await t.hooks.sweep();
     await t.flush();
@@ -4194,7 +4194,7 @@ describe("questions to the user", () => {
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided: No SSO for now\./u);
     const list = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
-    expect(list).toMatch(/\(resolved, me\): Include SSO\? → No SSO for now\./u);
+    expect(list).toMatch(/\(resolved, user\): Include SSO\? → No SSO for now\./u);
 
     // A retry is no error, records nothing twice, and does not tell the steward again.
     const told = t.sends.filter((s) => s.threadId === t.steward).length;
@@ -4703,10 +4703,10 @@ describe("questions to the user", () => {
       },
       wokeAt: at,
     });
-    // An open `stuck` escalation is a block; a route-`me` escalation is what
+    // An open `stuck` escalation is a block; a route-`user` escalation is what
     // makes the row need the user (BB-208).
     t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
-    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Decide?", meanwhile: "Waiting", route: "me", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Decide?", meanwhile: "Waiting", route: "user", recommendation: null, projectId: "p1" });
 
     const board = await t.board();
     expect(board.stewards.find((s) => s.key === "ENG-12")).toMatchObject({
@@ -5223,7 +5223,7 @@ describe("the sidebar's needs you block (BB-46)", () => {
     const b = t.hooks.store.find("ENG-12", "p1")!;
 
     // An approval escalation forwarded to the user, covered by the question below.
-    const covered = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const covered = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: covered.id, question: "Which option?", context: null });
     // One actionable need, and one the server cannot act on until it observes the pull request.
     const configure = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
@@ -5266,7 +5266,7 @@ describe("the sidebar's needs you block (BB-46)", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12", "p1")!;
-    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: esc.id, question: "Which approach?", context: null });
     const before = t.harness.inspection.realtimeSignals.length;
     const result = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: question.id, answer: "The safe one." }, { experimental_caller: { kind: "client" } });
@@ -5281,7 +5281,7 @@ describe("the sidebar's needs you block (BB-46)", () => {
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12", "p1")!;
     const before = t.harness.inspection.realtimeSignals.length;
-    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Forwarded?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Forwarded?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED);
     expect(signals).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
   });
@@ -5484,7 +5484,7 @@ describe("needs you items", () => {
     // The user's lane is filed on the page at once, with no project-steward
     // turn (BB-51); the escalation is with the user.
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
-    expect(esc).toMatchObject({ route: "me" });
+    expect(esc).toMatchObject({ route: "user" });
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
     expect(need.data).toMatchObject({ foreign: true });
@@ -5576,7 +5576,7 @@ describe("needs you items", () => {
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
     expect(need.data).toMatchObject({ foreign: true });
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
-    expect(esc).toMatchObject({ route: "me" });
+    expect(esc).toMatchObject({ route: "user" });
   });
 
   it("files approve-pr and the user's approval escalation for an unsigned reviewer marker (BB-110)", async () => {
@@ -5590,7 +5590,7 @@ describe("needs you items", () => {
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
-    expect(esc).toMatchObject({ route: "me" });
+    expect(esc).toMatchObject({ route: "user" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
@@ -5686,7 +5686,7 @@ describe("needs you items", () => {
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(need).toBeDefined();
-    expect(esc).toMatchObject({ route: "me" });
+    expect(esc).toMatchObject({ route: "user" });
     const broken = comment({
       id: "6533066554",
       author: "jane",
@@ -5909,7 +5909,7 @@ describe("needs you items", () => {
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement");
     const b = t.hooks.store.find("ENG-12")!;
-    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
     t.hooks.store.resolve(x.id, "Yes, include SSO.", "user");
     await t.hooks.sweep();
     await t.flush();
@@ -6579,7 +6579,7 @@ describe("needs you items", () => {
 
     const t2 = await withPull([marker]);
     const b2 = t2.binding();
-    expect(t2.hooks.store.openEscalations(b2.id).find((x) => x.kind === "approval")).toMatchObject({ route: "me" });
+    expect(t2.hooks.store.openEscalations(b2.id).find((x) => x.kind === "approval")).toMatchObject({ route: "user" });
     expect(t2.hooks.store.openNeeds(b2.id).some((n) => n.kind === "approve-pr")).toBe(true);
   });
 
@@ -6639,7 +6639,7 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     const t = await adopted();
     const b = t.binding();
     const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
-    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
     const out = await t.cli();
     expect(out.indexOf(question.id)).toBeLessThan(out.indexOf(escalation.id));
@@ -6651,7 +6651,7 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     const t = await adopted();
     const b = t.binding();
     t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
-    t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
     const view = await t.board();
     const expected = [...view.questions, ...view.withUser, ...view.needs].map((x) => x.id);
@@ -6663,7 +6663,7 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     const t = await adopted();
     const b = t.binding();
     const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
-    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
     const parsed = JSON.parse((await t.harness.behavior.runCli(["needs", "--project", "p1", "--json"])).stdout) as { questions: Array<{ id: string }>; withUser: Array<{ id: string }>; needs: Array<{ id: string }> };
     expect(Object.keys(parsed).sort()).toEqual(["needs", "questions", "withUser"]);
@@ -6679,7 +6679,7 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     const t = await adopted();
     const b = t.binding();
     const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
-    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const out = await t.cli();
     expect(out).toContain(`bb stewards done ${question.id}`);
     expect(out).toContain(`bb stewards done ${escalation.id}`);
@@ -6794,7 +6794,7 @@ describe("fixed choices on decide items and questions", () => {
     const t = await adopted();
     await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", url: "https://linear.app/acme/issue/ENG-12", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
     expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/Merge or close\? \[choices: Merge, Close\]/u);
-    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toMatch(/Escalation esc_\S+ decision \(open, me\): Merge or close\? \[choices: Merge, Close\]/u);
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toMatch(/Escalation esc_\S+ decision \(open, user\): Merge or close\? \[choices: Merge, Close\]/u);
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
@@ -6861,7 +6861,7 @@ describe("forwarded spec approvals", () => {
     expect(open[0]!.filedBy).toBe("plugin");
     // No free-text question for it, and the escalation stays open with the user.
     expect(t.hooks.store.openQuestions("p1")).toEqual([]);
-    expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "open", route: "me" });
+    expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "open", route: "user" });
     // The page shows the item, not the raw escalation row.
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { withUser: unknown[]; needs: Array<{ kind: string; escalationId: string | null }> } };
     expect(board.board.withUser).toEqual([]);
@@ -6944,7 +6944,7 @@ describe("forwarded spec approvals", () => {
     const binding = t.hooks.store.find("ENG-12")!;
     // A question forwarded before BB-19, kept for live databases: bound to an
     // approval escalation and answered with words that are not a verdict.
-    const esc = t.hooks.store.escalate({ bindingId: binding.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "me", recommendation: null });
+    const esc = t.hooks.store.escalate({ bindingId: binding.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "user", recommendation: null });
     const q = t.hooks.store.ask({ projectId: "p1", bindingId: binding.id, escalationId: esc.id, question: esc.question, context: null });
     const projectWakes = () => t.sends.filter((s) => s.threadId === project).length;
     const before = projectWakes();
@@ -6988,10 +6988,10 @@ describe("the settings page", () => {
         "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
     });
-    // The `stuck` escalation is with the project steward; the route-`me` one is
+    // The `stuck` escalation is with the project steward; the route-`user` one is
     // what makes the row need the user (BB-208).
     t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
-    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Decide?", meanwhile: "Waiting", route: "me", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Decide?", meanwhile: "Waiting", route: "user", recommendation: null, projectId: "p1" });
 
     const overview = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
     expect(overview.projects[0]!.stewards[0]).toMatchObject({ key: "ENG-12", hold: "a freeze", holdBehind: ["ENG-9"], needsUser: true, stuck: true, deployment: "deployed" });
@@ -9288,7 +9288,7 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
 
     // An escalation routed to the user is: left unread.
     const b = t.hooks.store.find("acme/web#7")!;
-    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const beforeOwn = marks().length;
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other" }, steward);
     expect(marks()).toHaveLength(beforeOwn);
@@ -11223,5 +11223,22 @@ describe("mechanical status and quiet notes (BB-203)", () => {
     const res = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, project);
     expect(res.error, res.text).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.status).toMatchObject({ summary: "Approved acme/web#7.", nextAction: "The worker merges it.", actor: "steward" });
+  });
+});
+
+describe("the approval alias rename (BB-209)", () => {
+  it("parses `approval: me` as `user` and reports exactly one config warning", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/warning: linear-tickets: ready\.approval "me" is renamed to "user"/u);
+    expect(check.stdout.match(/ready\.approval "me" is renamed to "user"/gu)).toHaveLength(1);
+  });
+
+  it("parses `approval: user` clean", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/renamed to "user"/u);
   });
 });

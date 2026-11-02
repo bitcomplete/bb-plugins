@@ -626,7 +626,7 @@ export function idleInActiveStage(b: IdleBinding, observed: Observed): boolean {
   if (b.workers.some((w) => w.status === "running")) return false;
   if ([observed.entity, ...observed.pulls].some((e) => pullOpen(e) && ownPull(e.key, e.url, b.ownPulls))) return false;
   if (Object.values(b.deployments).some((w) => w.state === "merged" || w.state === "deploying")) return false;
-  if (b.escalations.some((x) => x.status === "open" && x.route === "me")) return false;
+  if (b.escalations.some((x) => x.status === "open" && x.route === "user")) return false;
   if (b.needs.length > 0) return false;
   return true;
 }

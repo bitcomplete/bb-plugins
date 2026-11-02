@@ -1153,6 +1153,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // channel. Keeping it a callback keeps store.ts free of bb, so
     // steward-side mutations publish too.
     const store = createStore(db, now, {
+      log: (message) => bb.log.info(message),
       onProjectChange: (projectId, columns) => {
         // One debug line per published signal, with the project and the
         // coalesced columns, so the next slowdown has numbers (BB-95).
@@ -1623,6 +1624,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // unknown or non-pr playbook, a bad glob, or two held roles on one
         // repo (BB-164).
         problems.push(...pullWatchProblems(roles, repos, file.github.exclude, watchPlaybooks));
+      }
+      // BB-209: a playbook that still writes the pre-rename `approval: me`
+      // alias parses as `user`; surface one warning per playbook, however many
+      // of the load paths reached it.
+      const warnedPlaybooks = new Set<string>();
+      for (const p of [...Object.values(playbooks), depsAlerts, depsPrs, ...watchPlaybooks.values()]) {
+        if (p === undefined || p === null || warnedPlaybooks.has(p.name)) continue;
+        warnedPlaybooks.add(p.name);
+        for (const w of p.warnings) warnings.push(`${p.name}: ${w}`);
       }
       return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
@@ -2376,7 +2386,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * Whether anything on a binding needs the user: an escalation routed to the
-     * user (route `me`) is open, a question about it is unanswered, or a needs
+     * user (route `user`) is open, a question about it is unanswered, or a needs
      * item is on the Stewards page. An escalation routed to the project
      * steward, the binding's own steward or its parent does not: the owner has
      * nothing to press for it (BB-208). A report whose `actor` is `user` does
@@ -2388,7 +2398,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function needsUser(b: Binding): boolean {
       return (
-        store.openEscalations(b.id).some((x) => x.route === "me") ||
+        store.openEscalations(b.id).some((x) => x.route === "user") ||
         store.openNeeds(b.id).length > 0 ||
         store.openQuestions(b.projectId).some((q) => q.bindingId === b.id)
       );
@@ -2410,7 +2420,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * count and the effort page's "Needs you" section agree. It is deduped by
      * (binding, kind, url) like every need, so a re-report updates the wording
      * rather than adding a row. A later report with another actor, or one that
-     * files its own item or leaves an open question or route-`me` escalation,
+     * files its own item or leaves an open question or route-`user` escalation,
      * closes it. A report whose own `approve-pr`/`merge` was refused does not
      * file one either: the refusal says the user is not the actor yet. Returns
      * the item it filed or refreshed, null otherwise.
@@ -2428,7 +2438,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         hadRefusal ||
         other.length > 0 ||
         store.openQuestions(b.projectId).some((q) => q.bindingId === b.id) ||
-        store.openEscalations(b.id).some((x) => x.route === "me");
+        store.openEscalations(b.id).some((x) => x.route === "user");
       if (actor !== "user" || userItem) {
         if (auto !== null) store.closeNeed(auto.id, actor === "user" ? "A later report filed its own item for the user." : "A later report named a different actor.", "plugin");
         return null;
@@ -2954,7 +2964,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // so that one does not keep `actor` on the user (BB-203).
       const userWaiting =
         store.openNeeds(b.id).length > 0 ||
-        store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "me" && !(event.kind === "approved" && x.kind === "approval"));
+        store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user" && !(event.kind === "approved" && x.kind === "approval"));
       const status = mechanicalStatus(b.status, event, userWaiting, now());
       if (status === null) return b;
       const moved = advanced(b.status, status);
@@ -3242,7 +3252,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ownPulls = await ownPullKeys(b, workers, observed);
       // BB-203: an open need or `me` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
-      const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "me");
+      const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
       changes.push(...fresh);
       changes.push(...deploymentChanges);
@@ -3296,12 +3306,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // event.
       if (prev !== null) countCommentCorrections(b, observed);
       // Criterion 4: a spec comment the user wrote from their own thread is
-      // the user's own words. With approval: me it carries its own approval,
+      // the user's own words. With approval: user it carries its own approval,
       // pinned to the spec it just changed, whether or not an earlier
       // approval has gone stale.
-      if (approval === "me" && (ready.approval === null || ready.approval.specHash !== currentSpec) && fresh.some((c) => c.byUser === true)) {
+      if (approval === "user" && (ready.approval === null || ready.approval.specHash !== currentSpec) && fresh.some((c) => c.byUser === true)) {
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user" }, voidedAt: null, declinedSpecHash: null };
-        changes.push({ text: "The user's spec comment approves the spec (approval: me)", actionable: true });
+        changes.push({ text: "The user's spec comment approves the spec (approval: user)", actionable: true });
       }
       // Only an entry into build from spec: review → build is the worker's
       // normal loop, and an unreported checklist is not an unmet one.
@@ -4713,7 +4723,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }),
       );
       const coveredWithUser = new Set(store.openQuestionEscalationIds(projectId));
-      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.kind !== "approval" && x.resolutionKind === null && !coveredWithUser.has(x.id)).map((escalation) => ({ escalation, from: b })));
+      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "user" && !x.isQuestion && x.kind !== "approval" && x.resolutionKind === null && !coveredWithUser.has(x.id)).map((escalation) => ({ escalation, from: b })));
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
@@ -4744,7 +4754,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
         ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
         answered: store.answeredSince(projectId, since),
-        withUser: openWith((x) => x.route === "me" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
+        withUser: openWith((x) => x.route === "user" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
         noWakeSource: open.filter((b) => b.noWakeSource),
@@ -5248,7 +5258,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const rows = store.openUserEscalations(config.projectId);
       const byKey = new Map<string, Escalation[]>();
       for (const x of rows) {
-        // Only a question has the page's box; a raw route-`me` escalation
+        // Only a question has the page's box; a raw route-`user` escalation
         // (an approval request) never asks.
         if (!x.isQuestion) continue;
         // A question with no binding (the project steward's own) has no
@@ -5331,11 +5341,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return parent !== null && parent.endedAt === null && parent.threadId !== null ? "parent" : "project";
       }
       if (from === "steward" || from === "parent") return "project";
-      return "me";
+      return "user";
     }
 
     async function deliver(b: Binding, x: Escalation): Promise<void> {
-      if (x.route === "me") return;
+      if (x.route === "user") return;
       // A worker's escalation is for the binding's own steward.
       if (x.route === "steward") {
         store.note(b.id, `Escalation ${x.id} from a worker (${x.kind}): ${x.question}`);
@@ -5354,7 +5364,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * Keep the gate's approval request in step with the gate. While the
      * checklist is met, the ticket is substantial and the current spec has
      * no approval, one `approval` escalation is open with the approver: the
-     * project steward, or the user with `approval: me`. It is the plugin's,
+     * project steward, or the user with `approval: user`. It is the plugin's,
      * so the approver hears whatever the steward wrote, and it closes itself
      * once the gate passes or no longer needs an approval. A request the
      * approver declined (guidance + resolve) is not made again until the
@@ -5366,9 +5376,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function syncApprovalRequest(b: Binding, playbook: Playbook): Promise<Escalation | null> {
       const mode = playbook.ready?.approval ?? null;
       if (mode === null || typeof mode === "object" || b.lastSnapshot === null) return null;
-      // `approval: me` is the user's, and is filed as an `approve-spec` need by
+      // `approval: user` is the user's, and is filed as an `approve-spec` need by
       // syncNeeds; the escalation below is only for the project steward.
-      if (mode === "me") return null;
+      if (mode === "user") return null;
       const open = store.openEscalations(b.id).filter((x) => x.kind === "approval" && x.resolutionKind !== "approve-decline");
       const current = specHashFor(b, b.lastSnapshot.entity);
       const gate = gateState(playbook, b.ready, current);
@@ -5633,9 +5643,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * File or refresh the user's `approve-spec` need for a binding. The plugin
-     * files it when the gate waits and the approver is the user (`approval: me`),
+     * files it when the gate waits and the approver is the user (`approval: user`),
      * and when the project steward forwards an `approval` escalation to the user:
-     * a forwarded approval is the user's to decide exactly as `approval: me` is.
+     * a forwarded approval is the user's to decide exactly as `approval: user` is.
      * Deduped by (binding, kind, url), so the escalation that asked for it is
      * linked in `data.escalationId` rather than a second item filed.
      */
@@ -5660,7 +5670,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * "on the Stewards page" or "from a thread".
      */
     function recordSpecVerdict(b: Binding, action: "approve" | "decline", entity: EntitySnapshot, text: string | null, where: string): { closure: string; forwarded: Escalation[] } {
-      const forwarded = store.openEscalations(b.id).filter((x) => x.kind === "approval" && x.route === "me" && x.resolutionKind !== "approve-decline");
+      const forwarded = store.openEscalations(b.id).filter((x) => x.kind === "approval" && x.route === "user" && x.resolutionKind !== "approve-decline");
       const hash = specHashFor(b, entity);
       const said = text === null ? "" : `: "${text}"`;
       if (action === "approve") {
@@ -5734,11 +5744,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const current = specHashFor(b, observed.entity);
       const gate = gateState(playbook, b.ready, current);
       // A forwarded approval escalation is with the user, so the page's
-      // Approve/Decline answers it; `approval: me` is the same wait, filed by
+      // Approve/Decline answers it; `approval: user` is the same wait, filed by
       // the plugin. Either way the need is the same item, linked to the
       // escalation when one is open.
-      const forwarded = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.route === "me" && x.resolutionKind !== "approve-decline") ?? null;
-      const wantsSpec = (mode === "me" || forwarded !== null) && approvalWanted(gate) && b.endedAt === null && b.ending === null && b.ready.declinedSpecHash !== current;
+      const forwarded = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.route === "user" && x.resolutionKind !== "approve-decline") ?? null;
+      const wantsSpec = (mode === "user" || forwarded !== null) && approvalWanted(gate) && b.endedAt === null && b.ending === null && b.ready.declinedSpecHash !== current;
       if (wantsSpec) {
         fileApproveSpecNeed(b, observed.entity, forwarded?.id ?? null);
       } else {
@@ -5828,7 +5838,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * the escalation, so it is told too, to resolve it or leave it open.
      */
     async function toldWhileWithUser(b: Binding, fresh: Change[]): Promise<void> {
-      const withUser = store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval" && !x.isQuestion);
+      const withUser = store.openEscalations(b.id).filter((x) => x.route === "user" && x.kind !== "approval" && !x.isQuestion);
       const news = fresh.filter((c) => c.actionable && c.own !== true);
       if (withUser.length === 0 || news.length === 0 || (await settings.get()).paused) return;
       await wakeProject(b.projectId, `${b.entityKey} changed while the user has its escalation`, {
@@ -6736,7 +6746,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const open = all.filter((b) => b.endedAt === null);
         const { questions, withUser, needs } = needsYou(projectId);
         const stuck = open.flatMap((b) => [
-          ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
+          ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = all.filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS).sort((a, b) => b.endedAt! - a.endedAt!).slice(0, 30);
@@ -7948,7 +7958,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             worker: z.string().trim().max(200).optional().describe("For resolution \"secret\": the worker thread that will request it."),
           })
           .optional()
-          .describe("Project steward only: originate an escalation you are putting to the user (route me), so it is kept until answered. `resolution` says how the page asks; `choice` needs `choices`, `secret` needs the variable and destination."),
+          .describe("Project steward only: originate an escalation you are putting to the user (route user), so it is kept until answered. `resolution` says how the page asks; `choice` needs `choices`, `secret` needs the variable and destination."),
         forward: z.string().trim().min(1).max(100).optional().describe("An escalation that reached you and that you should not decide: pass it up. From the project steward it goes to the user — an approval becomes an Approve/Decline item on the Stewards page, so do not ask in prose; anything else asks them in your reply. With a forward to the user, `resolution` says how the page asks."),
         resolution: z.enum(RESOLUTION_KINDS).optional().describe("With forward: how the page asks the user (choice, text, approve-decline, secret, done); required when forwarding to the user."),
         url: z.string().trim().max(500).optional().describe("With forward: the link the page shows, when there is one."),
@@ -8210,7 +8220,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (!byProject && !byUser) {
                 return toolError(
                   new Error(
-                    mode === "me"
+                    mode === "user"
                       ? "This spec is approved by the user: quote their words from a message in this thread, or from their unsigned approving comment on the entity."
                       : "This spec is approved by the project steward (or by the user, quoting their words from this thread). Escalate a decision instead.",
                   ),
@@ -8304,22 +8314,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const recommendation = input.recommendation ?? forwarding.recommendation;
             const resolutionKind = input.resolution ?? (forwarding.choices.length > 0 ? "choice" : "text");
             // A forwarded approval is the user's to decide exactly as
-            // `approval: me` is: file the page's `approve-spec` need and keep
+            // `approval: user` is: file the page's `approve-spec` need and keep
             // the escalation open, linked to it, instead of a free-text
             // question. A forwarded decision stays a question. Computed here,
             // before the await below, so the escalation cannot be resolved in
             // between and leave the need or question open, and before the
             // credential refusal so an approval is not mistaken for a
             // credential ask just because its question names one.
-            const prToUser = route === "me" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
-            const approvalToUser = route === "me" && forwarding.kind === "approval" && !prToUser;
+            const prToUser = route === "user" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
+            const approvalToUser = route === "user" && forwarding.kind === "approval" && !prToUser;
             // BB-176: a credential always reaches the user through bb's secure
             // form. A forward that names a credential variable is never a
             // `done`/`text` item, whatever the ticket or spec says. The error
             // names the resolution and its fields and never repeats the
             // question or context, so no secret is echoed. Refused before any
             // state changes, so a refused forward is not half-applied.
-            if (route === "me" && !approvalToUser && !prToUser && (resolutionKind === "done" || resolutionKind === "text") && namesCredential(forwarding)) {
+            if (route === "user" && !approvalToUser && !prToUser && (resolutionKind === "done" || resolutionKind === "text") && namesCredential(forwarding)) {
               return toolError(
                 new Error(
                   'A credential must be forwarded with resolution: "secret", naming `variable` and `purpose` and either `writeEnv`/`worker` or `setting`, so bb\'s secure form takes the value. `done` and `text` are refused for it; a decision that only mentions a credential variable can be forwarded with `choices` instead.',
@@ -8331,7 +8341,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // originator can be answered directly (BB-30).
             store.addHop(forwarding.id, { threadId, bindingId: target.id, rewording: recommendation });
             store.reroute(forwarding.id, route, recommendation);
-            if (route === "me" && !approvalToUser && !prToUser && input.resolution === undefined) {
+            if (route === "user" && !approvalToUser && !prToUser && input.resolution === undefined) {
               return toolError(new Error("Forwarding to the user needs a resolution: choice (with choices), text, approve-decline, secret or done. It is what the page's ask looks like; the plugin assigns the route, but the human boundary is yours to describe."));
             }
             if (resolutionKind === "choice" && forwarding.choices.length < 2) {
@@ -8341,7 +8351,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return toolError(new Error("A secret question needs the variable name (variable), or a stewards secret setting (setting)."));
             }
             const q =
-              approvalToUser || prToUser || route !== "me"
+              approvalToUser || prToUser || route !== "user"
                 ? null
                 : store.ask({
                     projectId: target.projectId,
@@ -8387,7 +8397,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
             // BB-213: a forward that reaches the user files the real item, so
             // the auto-filed `nextAction` item closes rather than sit beside it.
-            if (route === "me") reconcileAutoNeed(target, target.status?.actor ?? "steward");
+            if (route === "user") reconcileAutoNeed(target, target.status?.actor ?? "steward");
             await deliver(target, store.escalation(forwarding.id)!);
             if (approvalToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-spec item: they press Approve or Decline on the Stewards page, so do not ask them in prose`);
             else if (prToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-pr item: they approve on GitHub from the Stewards page`);
@@ -8529,7 +8539,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * The board's "waiting on you" lists for one project, in one place so the
-     * board and the sidebar cannot disagree: open questions, the route-`me`
+     * board and the sidebar cannot disagree: open questions, the route-`user`
      * escalations no question or item covers, and open needs. `actionableOnly`
      * drops needs the server cannot act on now, which the sidebar's badge and
      * block do not show; the board keeps them and says why.
@@ -8541,7 +8551,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A question or a need covers the escalation it was made for: the page's
       // row is the question or the item, never the raw escalation.
       const covered = new Set([...questions.map((q) => q.escalationId), ...allNeeds.map((n) => n.escalationId), ...store.openQuestionEscalationIds(projectId)].filter((id): id is string => id !== null));
-      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => withUserView(x, b)));
+      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "user" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => withUserView(x, b)));
       return { questions, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds };
     }
 
@@ -9506,7 +9516,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 // question's creation is when it reached them.
                 const all = store.escalationsForProject(projectId);
                 const covered = new Set(all.map((x) => x.forwardedFrom).filter((id): id is string => id !== null));
-                const reaching = all.filter((x) => x.route === "me" && (x.isQuestion || !covered.has(x.id)));
+                const reaching = all.filter((x) => x.route === "user" && (x.isQuestion || !covered.has(x.id)));
                 const weeks = escalationWeeks(reaching.map((x) => x.createdAt), now());
                 if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ weeks, uncited: uncited.map((u) => ({ id: u.unit.id, file: u.unit.file, heading: u.unit.heading, text: u.unit.text, lastCitedAt: u.lastCitedAt })) }) };
                 const lines = ["Escalations reaching the user, per week (oldest first):", ...weeks.map((w) => `  ${iso(w.start).slice(0, 10)}  ${w.count}`)];
@@ -9583,7 +9593,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           needs: cliCommand({
             summary: "Things waiting on the user: open questions, escalations with the user, then needs",
-            description: "The same items as the Stewards page's \"Waiting on you\" section and the sidebar, in the same order: open questions, route-`me` escalations no question or need covers, then needs. Each line ends with the `bb stewards done` command that answers it. `--all` keeps its old job: every need, open or closed, as a diagnostic.",
+            description: "The same items as the Stewards page's \"Waiting on you\" section and the sidebar, in the same order: open questions, route-`user` escalations no question or need covers, then needs. Each line ends with the `bb stewards done` command that answers it. `--all` keeps its old job: every need, open or closed, as a diagnostic.",
             options: { all: { type: "boolean", description: "Include closed items" }, project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const projectId = projectOf(input.options.project, ctx);

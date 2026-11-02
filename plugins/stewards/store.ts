@@ -508,7 +508,17 @@ export const PULL_WATCH_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN adopted_b
 // open its store. `migrations.test.ts` pins the recorded prefix.
 export const STACK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN hold_stack TEXT NOT NULL DEFAULT '[]'`, `ALTER TABLE bindings ADD COLUMN landed_in TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS];
+// BB-209: the escalation route `me` (the server's owner) is renamed `user`,
+// matching BB-97's actor rename. A stored row keeps its meaning: this rewrites
+// `escalations.route` from `me` to `user` in place, touching no other column.
+// It is idempotent (a second run matches nothing). The route is a plain TEXT
+// column the pre-rename build read with `String(r.route) as EscalationRoute`,
+// so a migrated `user` row is an unrecognised route there, never a parse error.
+// The historical migration statements above still insert `me`; this runs after
+// them and normalises what they wrote.
+export const ESCALATION_ROUTE_MIGRATIONS = [`UPDATE escalations SET route = 'user' WHERE route = 'me'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -892,7 +902,7 @@ export type NewBinding = Pick<Binding, "projectId" | "source" | "entityId" | "en
 
 // ---- escalations, actions, workers --------------------------------------------------------
 
-export type EscalationRoute = "steward" | "parent" | "project" | "me";
+export type EscalationRoute = "steward" | "parent" | "project" | "user";
 
 /** How the page asks the user: what the human boundary looks like. */
 export const RESOLUTION_KINDS = ["choice", "text", "approve-decline", "secret", "done"] as const;
@@ -1127,6 +1137,8 @@ export const newId = (prefix: string) => `${prefix}_${randomBytes(9).toString("b
  */
 export interface StoreOptions {
   onProjectChange?: (projectId: string, columns: string[]) => void;
+  /** One line when a pre-rename route alias (`me`) is normalised to `user` (BB-209). */
+  log?: (message: string) => void;
 }
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
@@ -1141,7 +1153,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   /**
    * The picker's needs count (BB-104): one statement per project, so the
    * sidebar does not parse every binding and run three more queries each. It
-   * mirrors `needsUser`: an open escalation routed to the user (route `me`),
+   * mirrors `needsUser`: an open escalation routed to the user (route `user`),
    * need or question. The open predicates are the ones `openEscalations`,
    * `openNeeds` and `openQuestions` use, so the count and the yellow rows
    * cannot disagree. An escalation routed to the project steward, the binding's
@@ -1153,7 +1165,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const countNeedsUserStmt = db.prepare<[string], { n: number }>(
     `SELECT COUNT(*) AS n FROM bindings b
      WHERE b.project_id = ? AND b.ended_at IS NULL AND (
-       EXISTS (SELECT 1 FROM escalations e WHERE e.binding_id = b.id AND e.status = 'open' AND e.route = 'me')
+       EXISTS (SELECT 1 FROM escalations e WHERE e.binding_id = b.id AND e.status = 'open' AND e.route = 'user')
        OR EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = b.id AND n.status = 'open')
        OR EXISTS (SELECT 1 FROM escalations q WHERE q.binding_id = b.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret', 'done')))
      )`,
@@ -1179,24 +1191,24 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const lastResolvedOfKind = db.prepare<[string, string], { resolved_at: number }>("SELECT resolved_at FROM escalations WHERE binding_id = ? AND kind = ? AND status = 'resolved' ORDER BY resolved_at DESC LIMIT 1");
 
   // Questions are escalations too: the project steward's `ask` is an escalation
-  // it originates with route `me`. `is_question` keeps the page's questions
-  // list its own among all the route-`me` escalations.
+  // it originates with route `user`. `is_question` keeps the page's questions
+  // list its own among all the route-`user` escalations.
   const insertQuestion = db.prepare(
-    "INSERT INTO escalations (id, project_id, binding_id, forwarded_from, question, context, choices, meanwhile, route, status, created_at, resolution_kind, url, data, is_question, kind, origin) VALUES (@id, @project_id, @binding_id, @forwarded_from, @question, @context, @choices, 'wait', 'me', 'open', @created_at, @resolution_kind, @url, @data, 1, 'decision', @origin)",
+    "INSERT INTO escalations (id, project_id, binding_id, forwarded_from, question, context, choices, meanwhile, route, status, created_at, resolution_kind, url, data, is_question, kind, origin) VALUES (@id, @project_id, @binding_id, @forwarded_from, @question, @context, @choices, 'wait', 'user', 'open', @created_at, @resolution_kind, @url, @data, 1, 'decision', @origin)",
   );
   const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ? AND is_question = 1");
   const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY created_at");
   const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'resolved' AND resolved_at >= ? AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY resolved_at");
-  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'me' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) AND (is_question = 1 OR NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = escalations.id AND q.is_question = 1)) ORDER BY created_at");
-  // A route-`me` escalation a question or a need already covers is not listed
+  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'user' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) AND (is_question = 1 OR NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = escalations.id AND q.is_question = 1)) ORDER BY created_at");
+  // A route-`user` escalation a question or a need already covers is not listed
   // again as a need: the page shows the question or the item, never the raw row.
   const openEscalationNeeds = db.prepare<[string], Record<string, unknown>>(
-    "SELECT * FROM escalations e WHERE e.binding_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
+    "SELECT * FROM escalations e WHERE e.binding_id = ? AND e.route = 'user' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
       "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open') " +
       "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
   );
   const openEscalationNeedsForProject = db.prepare<[string], Record<string, unknown>>(
-    "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
+    "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND e.route = 'user' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
       "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open') " +
       "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
   );
@@ -1328,7 +1340,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const markEscalationRationaleAskedStmt = db.prepare("UPDATE escalations SET rationale_asked = 1 WHERE id = ?");
   const markEscalationRationaleGivenStmt = db.prepare("UPDATE escalations SET rationale_given = 1, rationale_asked = 1 WHERE id = ?");
   const setEscalationClusterStmt = db.prepare("UPDATE escalations SET cluster_key = ? WHERE id = ?");
-  const openUserEscalationsStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND route = 'me' AND status = 'open' ORDER BY created_at");
+  const openUserEscalationsStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND route = 'user' AND status = 'open' ORDER BY created_at");
   const escalationsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND cluster_key = ? ORDER BY created_at");
   const escalationsWithRationaleStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND rationale_wanted = ? AND rationale_asked = 0 ORDER BY created_at");
   // BB-35 step 5: validation escalations are `needs` of kind `decide` whose
@@ -1771,7 +1783,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       question: string;
       context?: string | null;
       meanwhile: string;
-      route: EscalationRoute;
+      route: EscalationRoute | "me";
       recommendation: string | null;
       choices?: string[];
       projectId?: string | null;
@@ -1784,13 +1796,18 @@ export function createStore(db: Database.Database, now: () => number, options: S
     }): Escalation {
       const id = newId("esc");
       const origin: EscalationOrigin = fields.origin ?? { threadId: null, bindingId: fields.bindingId, chain: [] };
+      // BB-209: `me` is the old name for `user`. Accept it for one release so a
+      // caller whose prompt predates the rename is not wedged; the stored value
+      // is always `user`.
+      const route: EscalationRoute = fields.route === "me" ? "user" : fields.route;
+      if (fields.route === "me") options.log?.(`stewards: escalation route "me" is renamed to "user"; recording this escalation as user (binding ${fields.bindingId}).`);
       insertEscalation.run({
         id,
         binding_id: fields.bindingId,
         kind: fields.kind,
         question: fields.question,
         meanwhile: fields.meanwhile,
-        route: fields.route,
+        route,
         recommendation: fields.recommendation,
         choices: JSON.stringify(fields.choices ?? []),
         created_at: now(),
@@ -1805,8 +1822,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
         context: fields.context === undefined || fields.context === null || fields.context === "" ? null : fields.context,
         head_sha: fields.headSha ?? null,
       });
-      // A route-`me` escalation is a "needs you" item the moment it is filed.
-      if (fields.route === "me") projectChanged(fields.projectId ?? projectIdForBinding(fields.bindingId));
+      // A route-`user` escalation is a "needs you" item the moment it is filed.
+      if (route === "user") projectChanged(fields.projectId ?? projectIdForBinding(fields.bindingId));
       return toEscalation(getEscalation.get(id)!);
     },
     escalation(id: string): Escalation | null {
@@ -1849,13 +1866,17 @@ export function createStore(db: Database.Database, now: () => number, options: S
     undeliver(ids: string[], at: number): void {
       for (const id of ids) clearDelivered.run(id, at);
     },
-    reroute(id: string, route: EscalationRoute, recommendation: string | null): boolean {
+    reroute(id: string, route: EscalationRoute | "me", recommendation: string | null): boolean {
+      // BB-209: `me` is the old name for `user`, accepted for one release and
+      // normalised here; the stored value is always `user`.
+      const next: EscalationRoute = route === "me" ? "user" : route;
+      if (route === "me") options.log?.(`stewards: escalation route "me" is renamed to "user"; recording this reroute as user (escalation ${id}).`);
       const before = getEscalation.get(id);
-      const changed = rerouteEscalation.run(route, recommendation, id).changes > 0;
-      // A route-`me` escalation is a "needs you" item: forwarding one to the
+      const changed = rerouteEscalation.run(next, recommendation, id).changes > 0;
+      // A route-`user` escalation is a "needs you" item: forwarding one to the
       // user adds it, and moving one off the user removes it. A reroute to the
       // route it already had changes nothing on the board.
-      if (changed && before !== undefined && String(before.route) !== route && (String(before.route) === "me" || route === "me")) projectChanged(projectIdForBinding(String(before.binding_id)));
+      if (changed && before !== undefined && String(before.route) !== next && (String(before.route) === "user" || next === "user")) projectChanged(projectIdForBinding(String(before.binding_id)));
       return changed;
     },
     /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
@@ -1922,7 +1943,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     answeredSince(projectId: string, since: number): Question[] {
       return answeredSince.all(projectId, since).map(toQuestion);
     },
-    /** The raw route-`me` escalations an open question covers, whatever its resolution. */
+    /** The raw route-`user` escalations an open question covers, whatever its resolution. */
     openQuestionEscalationIds(projectId: string): string[] {
       return openQuestionCovered.all(projectId).map((r) => r.forwarded_from);
     },

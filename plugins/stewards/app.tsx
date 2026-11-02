@@ -656,7 +656,7 @@ function StewardsSection() {
 }
 
 function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
-  const mine = s.escalations.filter((x) => x.route === "me");
+  const mine = s.escalations.filter((x) => x.route === "user");
   const status = overviewEffortStatus(s);
   const state = effortState(status);
   const phrase = effortPhrase(status, now);
@@ -689,8 +689,8 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
       {s.waitingOn !== null ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
       {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
-        <p key={i} className={x.route === "me" ? "text-destructive" : "text-muted-foreground"}>
-          {x.kind} escalation with {x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: {x.question}
+        <p key={i} className={x.route === "user" ? "text-destructive" : "text-muted-foreground"}>
+          {x.kind} escalation with {x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: {x.question}
         </p>
       ))}
       <p className="text-xs text-muted-foreground">
