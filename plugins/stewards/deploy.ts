@@ -318,6 +318,10 @@ export function applyDeploymentRead(
   const latest = read.filter((d) => d.environment.toLowerCase() === target.environment.toLowerCase()).sort((a, b) => b.id - a.id)[0];
   if (latest === undefined) return { deployments, changed: [], deployment: null };
   const failed = latest.state === "failure" || latest.state === "error";
+  // BB-204: a deployment that has not reached a final status has not applied
+  // the image yet. It records its facts so a repeat read is not news, but it
+  // moves no watch; the caller writes a quiet note.
+  const final = failed || latest.state === "success";
   const next = { ...deployments };
   const changed: string[] = [];
   for (const [id, watch] of Object.entries(next)) {
@@ -330,15 +334,13 @@ export function applyDeploymentRead(
     if (watch.deploymentId !== null && latest.id < watch.deploymentId) continue;
     next[id] = {
       ...watch,
-      state: failed ? "failed" : "deploying",
+      ...(final ? { state: failed ? "failed" : "deploying", deadlineAt: failed ? null : now + target.timeout, note: failed ? `Deployment ${latest.id} reported ${latest.state}` : watch.note } : {}),
       deploymentId: latest.id,
       deploymentState: latest.state,
       ref: latest.ref === "" ? null : latest.ref,
       sha: latest.sha === "" ? null : latest.sha,
       url: latest.url,
       at: now,
-      deadlineAt: failed ? null : now + target.timeout,
-      note: failed ? `Deployment ${latest.id} reported ${latest.state}` : watch.note,
     };
     changed.push(watch.key);
   }

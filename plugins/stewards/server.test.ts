@@ -9137,6 +9137,40 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
   });
 
+  // BB-204: the sweep read path has the same rules as the doorbell. An
+  // in_progress deployment discovered on the sweep is a quiet note.
+  it("records an in_progress deployment discovered on the sweep as a quiet note (BB-204)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentId: 7, deploymentState: "in_progress" });
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+    expect(t.hooks.store.find("ENG-12")!.pending.some((n) => n.quiet === true && /in_progress/.test(n.text))).toBe(true);
+  });
+
+  // BB-204: a later no-rule deployment found on the sweep does not wake the
+  // steward a second time.
+  it("does not wake again when the sweep reads another no-rule deployment (BB-204)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/other }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ id: 8 })]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 8 });
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
   it("reports a watched repo with no carries rule as a configuration problem (BB-204)", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/other }\n      strategy: { kind: ref-contains-merge }');
