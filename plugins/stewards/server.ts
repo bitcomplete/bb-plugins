@@ -5717,6 +5717,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The approval sync a steward's report runs, on a fresh read (BB-210). The
+     * stored snapshot a turn starts from predates a signed `bb-review` marker
+     * the steward posted during the turn, so syncing it would miss the marker
+     * (or close the `approve-pr` item the reconcile already filed) until the
+     * next doorbell or the half-hourly sweep. Re-read the binding's entity and
+     * linked pull requests first, so the marker is seen at once; a read that
+     * fails falls back to the stored snapshot. The steward is not woken: only
+     * the page's item is filed, refreshed or closed.
+     */
+    async function syncNeedsFresh(b: Binding, playbook: Playbook): Promise<void> {
+      // `freshObserved` re-reads the entity and a ticket's linked pull requests,
+      // falling back to the stored snapshot when the read fails (BB-54).
+      const fresh = await freshObserved(b);
+      const observed = fresh?.observed ?? b.lastSnapshot;
+      if (observed !== null) await syncNeeds(b, observed, playbook, anyWorkerInFlight(store.workers(b.id)));
+    }
+
+    /**
      * The bound entity changed while one of its escalations is with the user:
      * they may have answered on the entity (rewritten the description,
      * commented, moved it) rather than in the project steward's thread. The
@@ -7685,7 +7703,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // instead of filing the item.
           if (mergeFiled) await stopWorkers(b);
           const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
-          if (playbook !== null && b.lastSnapshot !== null) await syncNeeds(b, b.lastSnapshot, playbook, anyWorkerInFlight(store.workers(b.id)));
+          if (playbook !== null && b.lastSnapshot !== null) await syncNeedsFresh(b, playbook);
           // BB-154: the mark and the requeue-only run, over the report's final
           // set of sources (an escalation this turn raised, a need it filed, a
           // gate item syncNeeds filed, a worker it started).

@@ -2995,6 +2995,86 @@ describe("pull requests", () => {
     expect(t.spawns[1]).toMatchObject({ parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
   });
 
+  it("BB-210: a reviewer marker posted during the steward's turn files approve-pr without waking it", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const head = "aaaaaaa1";
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the owner.", actor: "user" }, steward);
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeDefined();
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("BB-210: a changes-requested marker files nothing and does not wake the steward", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=changes-requested lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the worker.", actor: "other" }, steward);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("BB-210: a non-marker comment files nothing", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const plain = comment({ id: "c9", author: "sam", body: "Looks good to me.", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [plain] }, { checks: { state: "success", failing: [] } }));
+    await t.tool("steward_report", { phase: "Review", summary: "A comment landed.", nextAction: "Wait.", actor: "other" }, steward);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("BB-210: the later reconcile does not duplicate the approve-pr item", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the owner.", actor: "user" }, steward);
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "approve-pr")).toHaveLength(1);
+    // The doorbell reconcile that follows syncs the same marker again.
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "approve-pr")).toHaveLength(1);
+  });
+
+  it("BB-210: a quiet own-review marker files approve-pr without waking the steward", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [marker] }, { headAuthor: "jane", checks: { state: "success", failing: [] }, reviews: [{ author: "jane", state: "commented", submittedAt: "2026-10-14T16:00:00Z", commit: "aaaaaaa1" }] }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeDefined();
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+    expect(t.hooks.store.binding(b.id)!.pending.some((n) => n.quiet === true && n.text.includes("Review:"))).toBe(true);
+  });
+
   it("leaves out repos the project file excludes, and says so in check", async () => {
     const t = await setup();
     t.repos.push({ dir: "docs", url: "git@github.com:acme/docs.git" });
