@@ -502,12 +502,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 ## The sidebar thread list and its toggle
 
 BB-44 registers a replacement for bb's own sidebar thread list through the
-exclusive `experimental_threadList` slot: one project dropdown, two-line
+exclusive `experimental_threadList` slot — one project dropdown, two-line
 effort rows with the four glyphs, and the **Blocked**, **In flight**,
-**Threads**, **Monitors** and **Recently ended** sections. BB-45 makes it
-switchable from where you are. While it is on, the plugin also supplies the
-sidebar navigation, drawing bb's items except the host's **New thread** row,
-which the list's own compose button replaces (BB-184).
+**Threads**, **Monitors** and **Recently ended** sections — that BB-45 makes
+switchable from where you are and that, while it is on, pairs with a
+rail-placement navigation provider rendering bb's own rail without its New
+thread button (BB-184, BB-198).
 
 **The row and the glyphs (BB-76).** An effort row is two lines: the glyph, the
 entity key in bold and the title on line one; the kind (`ticket`, `pull
