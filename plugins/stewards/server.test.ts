@@ -10336,6 +10336,55 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(json.approval).toBeNull();
   });
 
+  it("resolves --project from a thread in another project, skipping that thread's own binding (BB-214)", async () => {
+    const t = await withPull([reviewMarker("no-review")]);
+    // The invoking thread's own binding lives in p2 and watches another PR.
+    const own = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(own.id, { threadId: "thr_p2" });
+    const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"], { threadId: "thr_p2", projectId: "p2" })).stdout) as { binding: string; gateMet: boolean };
+    expect(json.binding).toBe("ENG-12");
+    expect(json.gateMet).toBe(true);
+  });
+
+  it("still refuses with No binding watches when the named project has no binding for the PR (BB-214)", async () => {
+    const t = await withPull([reviewMarker("no-review")]);
+    // p2 watches acme/web#9; p1 does not. `--project p1` must not fall back to
+    // the invoking p2 thread's own binding.
+    const other = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(other.id, { threadId: "thr_p2", lastSnapshot: { entity: issue({ id: "uuid-20", key: "ENG-20", title: "Other" }), pulls: [pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", unit: "acme/web" })] } });
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", unit: "acme/web" }));
+    const out = await t.harness.behavior.runCli(["gate", "acme/web#9", "--project", "p1"], { threadId: "thr_p2", projectId: "p2" });
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr).toMatch(/No binding watches acme\/web#9/u);
+  });
+
+  it("keeps the invoking thread's own binding winning when --project is left out (BB-214)", async () => {
+    const t = await withPull([reviewMarker("no-review")]);
+    // A second p1 binding whose snapshot links acme/web#9.
+    const second = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: "Second", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(second.id, { lastSnapshot: { entity: issue({ id: "uuid-13", key: "ENG-13", title: "Second" }), pulls: [pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", unit: "acme/web" })] } });
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", unit: "acme/web" }));
+    // No --project: the thread's own binding (ENG-12) wins over the snapshot match.
+    const own = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#9", "--json"], { threadId: t.steward, projectId: "p1" })).stdout) as { binding: string };
+    expect(own.binding).toBe("ENG-12");
+    // With --project the own binding is skipped and the linked binding is found.
+    const named = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#9", "--project", "p1", "--json"], { threadId: t.steward, projectId: "p1" })).stdout) as { binding: string };
+    expect(named.binding).toBe("ENG-13");
+  });
+
+  it("merges through --project from a thread in another project (BB-214)", async () => {
+    const t = await withPull([reviewMarker("no-review")]);
+    const own = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(own.id, { threadId: "thr_p2" });
+    const b = t.binding();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"], { threadId: "thr_p2", projectId: "p2" });
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
+    // The p1 binding's Merge item closed: the named project's binding was acted on, not the p2 thread's own.
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
   it("names the matched decide-list entry and who decides", async () => {
     const t = await withPull([reviewMarker("owner-reviewed")], { files: ["bb-gate/docs/hooks.md"] });
     const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { decision: { entry: string | null; decide: string; why: string | null; listing: string }; gateMet: boolean };
