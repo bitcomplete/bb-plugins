@@ -2410,11 +2410,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * count and the effort page's "Needs you" section agree. It is deduped by
      * (binding, kind, url) like every need, so a re-report updates the wording
      * rather than adding a row. A later report with another actor, or one that
-     * files its own item, raises an escalation or leaves an open question or
-     * route-`me` escalation, closes it. Returns the item it filed or refreshed,
-     * null otherwise.
+     * files its own item or leaves an open question or route-`me` escalation,
+     * closes it. A report whose own `approve-pr`/`merge` was refused does not
+     * file one either: the refusal says the user is not the actor yet. Returns
+     * the item it filed or refreshed, null otherwise.
      */
-    function reconcileAutoNeed(b: Binding, actor: string, filedOwn: boolean): Need | null {
+    function reconcileAutoNeed(b: Binding, actor: string, hadRefusal = false): Need | null {
       const open = store.openNeeds(b.id);
       const url = b.url ?? "";
       const autos = open.filter(isAutoFiledNeed);
@@ -2424,7 +2425,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const stale of autos) if (stale.id !== auto?.id) store.closeNeed(stale.id, "Superseded by a newer report.", "plugin");
       const other = open.filter((n) => n.id !== auto?.id);
       const userItem =
-        filedOwn ||
+        hadRefusal ||
         other.length > 0 ||
         store.openQuestions(b.projectId).some((q) => q.bindingId === b.id) ||
         store.openEscalations(b.id).some((x) => x.route === "me");
@@ -2574,6 +2575,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // unset makes the next start retry, as the old show-on-every-wake path
       // did. Only a clean pass records it.
       if (!failed) await bb.storage.kv.set(UNHIDE_ONCE_KEY, String(now()));
+    }
+
+    /**
+     * The one-time BB-213 backfill. Dropping the actor clause from `needsUser`
+     * means an open binding whose stored report says the user acts next loses
+     * its badge until its steward reports again, which the default requeue can
+     * put two days out. On the first start after the change, file the auto item
+     * for every such binding that has nothing else for the user, so the rows
+     * this ticket is about keep something to press. The marker lives in the
+     * plugin's kv store, so a later start does nothing; a failure leaves it
+     * unset so the next start retries.
+     */
+    const AUTO_NEEDS_ONCE_KEY = "migrations/auto-file-user-needs";
+    async function backfillAutoNeedsOnce(): Promise<void> {
+      if ((await bb.storage.kv.get<string>(AUTO_NEEDS_ONCE_KEY)) != null) return;
+      let failed = false;
+      for (const b of store.all()) {
+        if (b.endedAt !== null || b.status?.actor !== "user") continue;
+        try {
+          reconcileAutoNeed(b, "user");
+        } catch (error) {
+          failed = true;
+          bb.log.warn(`stewards: BB-213 backfill for ${b.entityKey}: ${errorMessage(error)}`);
+        }
+      }
+      if (!failed) await bb.storage.kv.set(AUTO_NEEDS_ONCE_KEY, String(now()));
     }
 
     /** Show a thread hidden in the sidebar; false when the update failed, so the caller can retry. */
@@ -7770,9 +7797,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // them gets one `decide` item from its `nextAction`, so the badge and
           // the effort page's "Needs you" section agree. A re-report updates
           // the same item; a later report with another actor, or one that files
-          // its own item (including an escalation, which `raised` names), closes
-          // it.
-          const autoFiled = reconcileAutoNeed(b, actor, raised !== null);
+          // its own item, closes it. A report whose own item was refused does
+          // not get one: the refusal says the user is not the actor yet.
+          const autoFiled = reconcileAutoNeed(b, actor, refused.length > 0);
           const autoNote =
             autoFiled === null
               ? ""
@@ -8857,6 +8884,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-93: nothing hides threads any more; the first start after the
         // upgrade shows the ones the old hide path left hidden.
         await unhideOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time unhide: ${errorMessage(e)}`));
+        // BB-213: the first start after dropping the actor clause gives every
+        // open actor-`user` binding the item its badge will now stand on.
+        await backfillAutoNeedsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time auto-need backfill: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
         const sweeper = setInterval(() => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`)), timing.sweepMs);
         // The first sweep tells linear and github what to watch after a restart.
@@ -9984,12 +10014,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

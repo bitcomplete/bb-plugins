@@ -3647,6 +3647,40 @@ describe("the status report actor (BB-97)", () => {
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.route === "me")).toBe(true);
   });
 
+  it("files the same auto-filed need whether the report raises the escalation or a later one finds it open (BB-213)", async () => {
+    const t = await bound();
+    const b = t.hooks.store.find("ENG-12")!;
+    // A new escalation routes to the project steward (parent/project), never
+    // `me`, so the actor-`user` report files the auto item either way.
+    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Decide the question", actor: "user", escalate: { kind: "decision", question: "Which?", meanwhile: "Wait." } }, t.steward);
+    const first = t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true);
+    expect(first).toHaveLength(1);
+    expect(await needsUser(t)).toBe(true);
+    // The next report leaves the escalation open and files nothing new: the
+    // same item is updated, not closed and not duplicated.
+    await t.tool("steward_report", { phase: "In Review", summary: "Waiting still.", nextAction: "Decide the question", actor: "user" }, t.steward);
+    const second = t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true);
+    expect(second).toHaveLength(1);
+    expect(second[0]!.id).toBe(first[0]!.id);
+    expect(await needsUser(t)).toBe(true);
+  });
+
+  it("backfills an auto-filed need for an open actor-`user` binding on the first start, once (BB-213)", async () => {
+    const t = await bound();
+    const b = t.hooks.store.find("ENG-12")!;
+    // A row stored before the change: actor `user`, no item.
+    t.hooks.store.patch(b.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "Approve the pull request", actor: "user", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
+    expect(await needsUser(t)).toBe(false);
+    await t.hooks.backfillAutoNeedsOnce();
+    const needs = t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true);
+    expect(needs).toHaveLength(1);
+    expect(needs[0]!.what).toBe("Approve the pull request");
+    expect(await needsUser(t)).toBe(true);
+    // A second start does nothing: no duplicate.
+    await t.hooks.backfillAutoNeedsOnce();
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true)).toHaveLength(1);
+  });
+
   it("the sidebar badge and the SQL picker count agree on the auto-filed need (BB-213)", async () => {
     const t = await bound();
     const b = t.hooks.store.find("ENG-12")!;
@@ -5693,11 +5727,10 @@ describe("needs you items", () => {
     expect(report.text).toMatch(/approve-pr for https:\/\/github\.com\/acme\/web\/pull\/7 not filed: no reviewer round yet\./u);
     expect(report.text).toMatch(/build-tickets review loop first/u);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
-    // Nothing was filed for the user by the report, so the actor-`user` report
-    // auto-files one `decide` item from its nextAction (BB-213); the refused
-    // approve-pr is not it.
-    expect(t.hooks.store.openNeeds(b.id)).toMatchObject([{ kind: "decide", what: "Wait", data: { autoFiled: true } }]);
-    expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/decide, ENG-12/u);
+    // The report's own item was refused, so it does not auto-file one either:
+    // the refusal says the user is not the actor yet (BB-213).
+    expect(t.hooks.store.openNeeds(b.id)).toEqual([]);
+    expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toBe("Nothing is waiting on the user.");
   });
 
   it("refuses a merge the gate cannot hold, naming the missing step (BB-21)", async () => {
@@ -5903,7 +5936,10 @@ describe("needs you items", () => {
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.question === "Provide API_TOKEN." && !x.isQuestion && x.status === "open")).toBe(true);
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; id: string }>; withUser: Array<{ id: string }> } };
     expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ kind: "provide-secret" });
-    expect(board.board.needs.filter((n) => n.id !== need.id)).toEqual([]);
+    // The actor-`user` report also auto-filed its `nextAction` (BB-213), since
+    // the escalation it raised routed to the project steward, not the user.
+    const open = t.hooks.store.openNeeds(b.id);
+    expect(open.filter((n) => n.id !== need.id).every((n) => n.data.autoFiled === true)).toBe(true);
     expect(board.board.withUser).toEqual([]);
   });
 
