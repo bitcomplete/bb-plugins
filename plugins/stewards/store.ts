@@ -212,6 +212,12 @@ export const BASE_MIGRATIONS = [
      need_id TEXT NOT NULL,
      created_at INTEGER NOT NULL
    )`,
+  // Stack scheduling (BB-215): the open bindings whose pull request this hold
+  // waits for (a stack-wait; `hold_behind` waits for a merge or an end), and
+  // the base pull request a stacked pull request landed in, so the deployment
+  // carries-check follows that merge on the default branch.
+  `ALTER TABLE bindings ADD COLUMN hold_stack TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE bindings ADD COLUMN landed_in TEXT`,
 ];
 
 // ---- the one escalation chain (BB-30) -----------------------------------------------
@@ -627,6 +633,10 @@ export type Binding = {
   touches: string[];
   /** Entity keys of the bindings this hold waits behind: the hold lifts itself when every one has merged its pull requests or ended. */
   holdBehind: string[];
+  /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
+  holdStack: string[];
+  /** The base pull request a stacked pull request landed in (owner/repo#N, BB-215): the deployment carries-check follows its merge on the default branch, since a squash rewrote the stacked merge. Null when the work did not stack. */
+  landedIn: string | null;
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
   scheduleAsked: string[];
   /** The gate has passed and nothing holds or schedules it: it is starting, whatever Linear still says, so others schedule against it. */
@@ -724,6 +734,8 @@ function rowToBinding(r: BindingRow): Binding {
     hold: str("hold"),
     touches: json(z.array(z.string()), str("touches"), []),
     holdBehind: json(z.array(z.string()), str("hold_behind"), []),
+    holdStack: json(z.array(z.string()), str("hold_stack"), []),
+    landedIn: str("landed_in"),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
@@ -787,6 +799,8 @@ const COLUMNS = {
   hold: "hold",
   touches: "touches",
   holdBehind: "hold_behind",
+  holdStack: "hold_stack",
+  landedIn: "landed_in",
   scheduleAsked: "schedule_asked",
   clearedToStart: "cleared_to_start",
   modelSteward: "model_steward",
@@ -847,6 +861,7 @@ const VISIBLE_COLUMNS = [
   "phase",
   "hold",
   "hold_behind",
+  "hold_stack",
   "status",
   "pending",
   "requeue_at",

@@ -78,6 +78,32 @@ not this skill's.
 
 Review your own diff before committing; there is no user to ask.
 
+## Stacked tickets
+
+When the task says your ticket is stacked on another ticket's pull request —
+the project steward's schedule answer "Start now, branch from `<branch>` with
+that branch as PR base" — your work goes on top of that pull request, not on
+the default branch:
+
+- Branch from the base pull request's head branch and open your pull request
+  with that branch as its base. Do not branch from the default branch.
+- Keep your own lane gate. The reviewer's verdict and, on an owner-reviewed
+  change, the owner's approval are for your pull request; the base pull
+  request's approval is not yours and never counts for it.
+- When your own review approves and your checks are green, merge your pull
+  request into the base branch — not into the default branch — with
+  `bb stewards merge <owner/repo#N>` on your own gate. The base pull request
+  then lands on the default branch as one landing.
+- If the base pull request closes without merging, retarget yours to the
+  default branch (`gh pr edit <n> --base <default>`, rebasing or merging the
+  default branch as needed) and carry on as an ordinary pull request.
+- When your stacked pull request merges into the base branch, say in your
+  final message that it landed in the base pull request
+  (`owner/repo#<base>`). A squash rewrote your merge, so it is not an ancestor
+  of the default branch; the steward reports it with
+  `steward_report { landedIn: "owner/repo#<base>" }` so the deployment
+  carries-check follows the base pull request's merge on the default branch.
+
 ## Test
 
 Run what CI runs, and what it does not. The project's `.bb/AGENTS.md` names

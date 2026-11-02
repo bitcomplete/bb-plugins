@@ -108,23 +108,29 @@ export const targetAppliesToMerge = (target: DeploymentTarget, prRepo: string, f
  * target is watched, as before, so the merge still lands on the
  * steward-decided path rather than getting no watch (BB-132 follow-up).
  */
-export function recordMerged(deployments: Deployments, observed: Observed, targets: readonly DeploymentTarget[], now: number): Deployments {
+export function recordMerged(deployments: Deployments, observed: Observed, targets: readonly DeploymentTarget[], now: number, overrideFor?: (p: EntitySnapshot) => { mergeSha: string | null; prRepo: string; files: string[] } | null): Deployments {
   const pulls = mergedPulls(observed);
   if (pulls.length === 0 || targets.length === 0) return deployments;
   const multiple = targets.length > 1;
   const next = { ...deployments };
   let changed = false;
   for (const p of pulls) {
-    const merge = p.pull?.mergeCommit ?? null;
-    const files = p.pull?.files ?? [];
+    // A stacked pull request that landed in a base pull request (BB-215) is
+    // carried by the base's merge on the default branch, not by the stacked
+    // merge a squash rewrote: the override supplies that merge's commit and
+    // the base's repo and files, so the carries rule matches what is on main.
+    const over = overrideFor?.(p) ?? null;
+    const merge = over === null ? p.pull?.mergeCommit ?? null : over.mergeSha;
+    const files = over === null ? p.pull?.files ?? [] : over.files;
+    const prRepo = over === null ? p.unit : over.prRepo;
     // An existing watch's own recorded repo and files decide applicability
     // when it has them: a snapshot whose files read came back empty must not
     // drop an in-flight watch. The fresh snapshot is the fallback.
     const contextFor = (target: DeploymentTarget): { prRepo: string; files: readonly string[] } => {
       const id = watchId(p.key, target, multiple);
       const existing = next[id] ?? (id === p.key ? undefined : next[p.key]);
-      if (existing !== undefined && existing.prRepo !== "" && matchesTarget(target, existing.repo, existing.environment)) return { prRepo: existing.prRepo, files: existing.files };
-      return { prRepo: p.unit, files };
+      if (over === null && existing !== undefined && existing.prRepo !== "" && matchesTarget(target, existing.repo, existing.environment)) return { prRepo: existing.prRepo, files: existing.files };
+      return { prRepo, files };
     };
     const applicable = targets.filter((t) => {
       const c = contextFor(t);
@@ -154,7 +160,7 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
         // old note is kept: a settled watch's failure text must not vanish.
         if (merge !== null && existing.mergeSha !== merge) {
           const resolved = `Merge commit re-resolved to ${merge.slice(0, 7)}`;
-          next[id] = { ...existing, mergeSha: merge, note: existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})` };
+          next[id] = { ...existing, mergeSha: merge, ...(over === null ? {} : { prRepo, files }), note: existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})` };
           changed = true;
         }
         continue;
@@ -165,8 +171,8 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
         mergeSha: merge,
         target: multiple || target.name !== undefined ? targetKeyOf(target) : "",
         mergedAt: now,
-        prRepo: p.unit,
-        files: p.pull?.files ?? [],
+        prRepo,
+        files: files,
         repo: target.repo,
         environment: target.environment,
         deploymentId: null,

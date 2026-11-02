@@ -116,13 +116,15 @@ Specify the ticket against the ready checklist. Work out what you can —
 acceptance criteria, affected repos, a plan — from the code and the project's
 docs, and post it as spec comments. Ask only what you cannot work out, as a
 decision escalation, one question at a time. Report the checklist on every
-turn, and the paths the work changes (steward_report touches, repo directory
-first) as soon as the spec names them. When it is all met and the ticket is
+turn, and the files the work changes (steward_report touches, repo directory
+first; a directory is accepted and counts as every file under it) as soon as
+the spec names them. When it is all met and the ticket is
 substantial, the plugin asks the project steward to approve the spec: wait
 for it, and do not escalate for it. When the gate passes but the wake says
-scheduling is with the project steward (the paths overlap work in flight),
-wait for that too: it holds you behind that work, and the hold lifts itself
-when the work lands, or it tells you to start. Otherwise, or once approved
+scheduling is with the project steward (the files overlap work in flight),
+wait for that too: it holds you behind that work, or stacks you on a pull
+request still being built, and the hold lifts itself when the work lands or
+that pull request opens, or it tells you to start. Otherwise, or once approved
 and scheduled, move the ticket to In Progress. A new spec needs approval
 again, and is asked for the same way.
 

@@ -23,6 +23,8 @@ export type WakeSourceInput = {
   hold: string | null;
   /** Entity keys the hold waits behind; a hold with entries lifts itself when they land. */
   holdBehind: readonly string[];
+  /** Entity keys whose open pull request the hold waits for (a stack-wait, BB-215); it lifts when one opens. */
+  holdStack: readonly string[];
   /** Per-pull-request deployment watches; `merged` and `deploying` are the live ones. */
   deployments: Deployments;
   /** The binding's running workers. */
@@ -43,7 +45,7 @@ export type WakeSourceInput = {
  */
 export function hasLiveWakeSource(s: WakeSourceInput): boolean {
   return (
-    (s.hold !== null && s.holdBehind.length > 0) ||
+    (s.hold !== null && (s.holdBehind.length > 0 || s.holdStack.length > 0)) ||
     Object.values(s.deployments).some((d) => d.state === "merged" || d.state === "deploying") ||
     s.runningWorkers > 0 ||
     s.openEscalations > 0 ||
