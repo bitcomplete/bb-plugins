@@ -200,8 +200,26 @@ describe("the no-deployment timeout", () => {
     expect(timeoutsDue(deployments, NOW + target.timeout - 1)).toEqual([]);
     expect(timeoutsDue(deployments, NOW + target.timeout)).toEqual(["acme/web#7"]);
     const failed = timeOut(deployments, ["acme/web#7"], NOW + target.timeout);
-    expect(failed["acme/web#7"]).toMatchObject({ state: "failed", deadlineAt: null });
+    expect(failed["acme/web#7"]).toMatchObject({ state: "failed", deadlineAt: null, note: "No matching deployment within the playbook's timeout" });
     expect(timeoutsDue(failed, NOW + target.timeout + 1000)).toEqual([]);
+  });
+
+  // BB-194: a not-yet verdict leaves a note, and the timeout must not let it
+  // mask the timeout message. The timeout comes first, the stale reason after.
+  it("puts the timeout message in front of the note a not-yet watch carried", () => {
+    const notYet = reportDeployment(
+      applyDeployment(recordMerged({}, observed(), [target], NOW), target, deployment(), NOW).deployments,
+      { state: "not-yet", note: "image-tag: bb-server.yaml run 2858 pinned BB_PLUGINS_REF=3c9f4ef, which does not contain merge b6957dd (behind)" },
+      NOW + 1000,
+      target.timeout,
+    ).deployments;
+    expect(notYet["acme/web#7"]).toMatchObject({ state: "merged", note: "image-tag: bb-server.yaml run 2858 pinned BB_PLUGINS_REF=3c9f4ef, which does not contain merge b6957dd (behind)" });
+    const failed = timeOut(notYet, ["acme/web#7"], NOW + 1000 + target.timeout);
+    expect(failed["acme/web#7"]).toMatchObject({
+      state: "failed",
+      deadlineAt: null,
+      note: "No matching deployment within the playbook's timeout; last: image-tag: bb-server.yaml run 2858 pinned BB_PLUGINS_REF=3c9f4ef, which does not contain merge b6957dd (behind)",
+    });
   });
 
   it("keeps a deadline while deploying, so a deployment with no final status still times out", () => {

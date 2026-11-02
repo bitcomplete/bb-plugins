@@ -128,6 +128,43 @@ describe("a steward's wake", () => {
     expect(wake).toContain("the condition is your own to re-examine");
   });
 
+  // BB-194: a failed watch is settled and will not wake the steward, so the
+  // paragraph names every failed key and the exact not-yet report that
+  // re-arms it. A merged watch is not named.
+  it("names each failed deployment watch and the not-yet report that re-arms it", () => {
+    const { s, bind } = world();
+    const binding = bind("ENG-12");
+    const watch = (key: string, state: "failed" | "merged") => ({
+      key,
+      state,
+      mergeSha: null,
+      target: "",
+      mergedAt: T,
+      prRepo: "acme/web",
+      files: [],
+      repo: "acme/bb-gate",
+      environment: "production",
+      deploymentId: null,
+      deploymentState: null,
+      ref: null,
+      sha: null,
+      url: null,
+      at: T,
+      deadlineAt: state === "failed" ? null : T + 3_600_000,
+      note: state === "failed" ? "No matching deployment within the playbook's timeout; last: image-tag: behind" : null,
+      workflowRuns: [],
+    });
+    s.patch(binding.id, {
+      deployments: { "acme/web#7": watch("acme/web#7", "failed"), "acme/web#8": watch("acme/web#8", "failed"), "acme/web#9": watch("acme/web#9", "merged") },
+      noWakeSource: true,
+    });
+    const wake = formatWake(wakeInput({ binding: s.binding(binding.id)! }));
+    expect(wake).toContain("The failed deployment watches for acme/web#7, acme/web#8 are settled and will not wake you on their own");
+    expect(wake).toContain('re-arm acme/web#7 with `steward_report { deployment: { state: "not-yet", key: "acme/web#7" } }` and acme/web#8 with `steward_report { deployment: { state: "not-yet", key: "acme/web#8" } }`');
+    expect(wake).toContain("puts each back to merged with a fresh deadline so the next deployment doorbell wakes you");
+    expect(wake).not.toContain('key: "acme/web#9"');
+  });
+
   it("lists an open escalation and approval request as on the Stewards page, not to be asked again", () => {
     const { s, bind } = world();
     const binding = bind("ENG-12");

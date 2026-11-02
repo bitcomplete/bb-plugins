@@ -440,17 +440,38 @@ const holdLine = (binding: Binding, then: string): string =>
     : `- **HOLD: ${binding.hold}**${binding.holdBehind.length === 0 ? "" : ` (behind ${binding.holdBehind.join(", ")}: it lifts itself, and you are woken, once ${binding.holdBehind.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"})`} — ${then}`;
 
 /**
+ * The sentence a no-wake-source paragraph carries when a `failed` watch is
+ * holding the binding (BB-194): a settled watch will not wake the steward on
+ * its own, and the playbook's `not-yet` report is the way back. One sentence,
+ * naming every failed key and the exact call that re-arms it.
+ */
+function failedWatchSentence(watches: readonly DeploymentWatch[]): string {
+  const keys = watches.map((w) => w.key);
+  const calls = keys.map((k) => `${k} with \`steward_report { deployment: { state: "not-yet", key: "${k}" } }\``).join(keys.length > 2 ? ", " : " and ");
+  const subject = watches.length === 1 ? `The failed deployment watch for ${keys[0]}` : `The failed deployment watches for ${keys.join(", ")}`;
+  const verb = watches.length === 1 ? "is" : "are";
+  const own = watches.length === 1 ? "its own" : "their own";
+  const pronoun = watches.length === 1 ? "it" : "each";
+  return `${subject} ${verb} settled and will not wake you on ${own}; re-arm ${calls}, which puts ${pronoun} back to merged with a fresh deadline so the next deployment doorbell wakes you.`;
+}
+
+/**
  * The paragraph a wake carries when the binding is marked waiting with no wake
  * source (BB-154): what the plugin does not track, and what the steward can do
  * about it. One paragraph, as the ticket asks.
  */
 function noWakeSourceLines(binding: Binding): string[] {
   const wait = binding.status?.waitingOn ?? null;
-  return [
+  const lines = [
     "**Waiting with no wake source.** Nothing the plugin tracks will deliver this wait" +
       (wait === null ? "" : ` (${JSON.stringify(wait)})`) +
       ": no hold behind anything, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. Name what will — a binding to hold behind, a pull request, a deployment target, a worker — or, if nothing can, the condition is your own to re-examine.",
   ];
+  const failed = Object.values(binding.deployments)
+    .filter((w) => w.state === "failed")
+    .sort((a, b) => a.key.localeCompare(b.key));
+  if (failed.length > 0) lines.push(failedWatchSentence(failed));
+  return lines;
 }
 
 /** Section 3's scheduling lines for a ticket or pull request binding: what it touches, and what is in flight on the same paths. */
