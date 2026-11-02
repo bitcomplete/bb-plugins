@@ -5936,10 +5936,12 @@ describe("needs you items", () => {
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.question === "Provide API_TOKEN." && !x.isQuestion && x.status === "open")).toBe(true);
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; id: string }>; withUser: Array<{ id: string }> } };
     expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ kind: "provide-secret" });
-    // The actor-`user` report also auto-filed its `nextAction` (BB-213), since
-    // the escalation it raised routed to the project steward, not the user.
-    const open = t.hooks.store.openNeeds(b.id);
-    expect(open.filter((n) => n.id !== need.id).every((n) => n.data.autoFiled === true)).toBe(true);
+    // The actor-`user` report auto-filed its `nextAction` first, but forwarding
+    // the escalation to the user files the real item, so the auto one closes
+    // and only the provide-secret item is left (BB-213).
+    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(1);
+    expect(t.hooks.store.openNeeds(b.id)[0]).toMatchObject({ id: need.id, kind: "provide-secret" });
+    expect(board.board.needs.filter((n) => n.id !== need.id)).toEqual([]);
     expect(board.board.withUser).toEqual([]);
   });
 

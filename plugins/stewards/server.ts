@@ -8385,6 +8385,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // (BB-135).
               await fileForwardedApprovePrNeed(approvalsCtx, target, forwarding);
             }
+            // BB-213: a forward that reaches the user files the real item, so
+            // the auto-filed `nextAction` item closes rather than sit beside it.
+            if (route === "me") reconcileAutoNeed(target, target.status?.actor ?? "steward");
             await deliver(target, store.escalation(forwarding.id)!);
             if (approvalToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-spec item: they press Approve or Decline on the Stewards page, so do not ask them in prose`);
             else if (prToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-pr item: they approve on GitHub from the Stewards page`);
