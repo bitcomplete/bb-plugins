@@ -3307,9 +3307,13 @@ describe("the status report actor (BB-97)", () => {
     return { ...t, project, steward };
   }
   const status = (t: Awaited<ReturnType<typeof bound>>) => t.hooks.store.find("ENG-12")!.status;
-  const needsUser = async (t: Awaited<ReturnType<typeof bound>>) => {
+  const needsUser = async (t: Awaited<ReturnType<typeof bound>>, key = "ENG-12") => {
     const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; needsUser: boolean }> };
-    return sidebar.bindings.find((b) => b.key === "ENG-12")!.needsUser;
+    return sidebar.bindings.find((b) => b.key === key)!.needsUser;
+  };
+  const pickerCount = async (t: Awaited<ReturnType<typeof bound>>) => {
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { projects: Array<{ projectId: string; needsCount: number }> };
+    return sidebar.projects.find((p) => p.projectId === "p1")!.needsCount;
   };
 
   it("records `user` as the server's owner, so the row needs you; `steward` and `other` do not", async () => {
@@ -3346,6 +3350,54 @@ describe("the status report actor (BB-97)", () => {
     expect(description).toMatch(/`steward` is you/u);
     expect(description).toMatch(/next deployment wake/u);
     expect(description).toMatch(/BB-95/u);
+  });
+
+  it("counts only an open route-`me` escalation, so the badge, the read dot and the picker agree (BB-208)", async () => {
+    const t = await bound();
+    const b = t.hooks.store.find("ENG-12")!;
+    const marks = () => t.harness.sdk.callsTo("threads.markRead").map(([args]) => (args as { threadId: string }).threadId);
+
+    // Routed to the project steward, the binding's own steward or its parent:
+    // the owner has nothing to press, so the row does not need them, the report
+    // marks the thread read, and the picker counts nothing.
+    for (const route of ["project", "steward", "parent"] as const) {
+      const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Q?", meanwhile: "Wait.", route, recommendation: null, projectId: "p1" });
+      expect(await needsUser(t)).toBe(false);
+      expect(await pickerCount(t)).toBe(0);
+      const before = marks().length;
+      await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "steward" }, t.steward);
+      expect(marks().length).toBeGreaterThan(before);
+      t.hooks.store.resolve(x.id, "Done.", "steward");
+    }
+
+    // Routed to the owner: the row needs them, the picker counts it, and the
+    // report leaves the thread unread.
+    const own = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Q?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    expect(await needsUser(t)).toBe(true);
+    expect(await pickerCount(t)).toBe(1);
+    const before = marks().length;
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "steward" }, t.steward);
+    expect(marks()).toHaveLength(before);
+    t.hooks.store.resolve(own.id, "Done.", "steward");
+  });
+
+  it("still counts an open need, an open question and an actor `user` report (BB-208)", async () => {
+    const t = await bound();
+    const create = (n: number, key: string) => t.hooks.store.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: key, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+
+    const need = create(20, "ENG-20");
+    t.hooks.store.fileNeed({ bindingId: need.id, kind: "configure", url: "", what: "Enable it", how: null });
+    expect(await needsUser(t, "ENG-20")).toBe(true);
+
+    const question = create(21, "ENG-21");
+    t.hooks.store.ask({ projectId: "p1", bindingId: question.id, escalationId: null, question: "Which?", context: null });
+    expect(await needsUser(t, "ENG-21")).toBe(true);
+
+    const user = create(22, "ENG-22");
+    t.hooks.store.patch(user.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "On the user", actor: "user", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
+    expect(await needsUser(t, "ENG-22")).toBe(true);
+
+    expect(await pickerCount(t)).toBe(3);
   });
 });
 
@@ -4358,8 +4410,10 @@ describe("questions to the user", () => {
       },
       wokeAt: at,
     });
-    // An open `stuck` escalation is a block, and needs the user to clear it.
+    // An open `stuck` escalation is a block; a route-`me` escalation is what
+    // makes the row need the user (BB-208).
     t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Decide?", meanwhile: "Waiting", route: "me", recommendation: null, projectId: "p1" });
 
     const board = await t.board();
     expect(board.stewards.find((s) => s.key === "ENG-12")).toMatchObject({
@@ -6631,7 +6685,10 @@ describe("the settings page", () => {
         "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
     });
+    // The `stuck` escalation is with the project steward; the route-`me` one is
+    // what makes the row need the user (BB-208).
     t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Decide?", meanwhile: "Waiting", route: "me", recommendation: null, projectId: "p1" });
 
     const overview = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
     expect(overview.projects[0]!.stewards[0]).toMatchObject({ key: "ENG-12", hold: "a freeze", holdBehind: ["ENG-9"], needsUser: true, stuck: true, deployment: "deployed" });
@@ -8920,9 +8977,18 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "You decide", actor: "user" }, steward);
     expect(marks()).toHaveLength(before);
 
-    // An escalation is open: left unread.
+    // An escalation to the project steward is not the user's: the report marks
+    // the thread read (BB-208).
+    const afterUser = marks().length;
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
-    expect(marks()).toHaveLength(before);
+    expect(marks().length).toBeGreaterThan(afterUser);
+
+    // An escalation routed to the user is: left unread.
+    const b = t.hooks.store.find("acme/web#7")!;
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const beforeOwn = marks().length;
+    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other" }, steward);
+    expect(marks()).toHaveLength(beforeOwn);
   });
 });
 

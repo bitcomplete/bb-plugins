@@ -1120,9 +1120,11 @@ export function createStore(db: Database.Database, now: () => number, options: S
   /**
    * The picker's needs count (BB-104): one statement per project, so the
    * sidebar does not parse every binding and run three more queries each. It
-   * mirrors `needsUser`: the actor is `user`, or an open escalation, need or
-   * question. The open predicates are the ones `openEscalations`, `openNeeds`
-   * and `openQuestions` use, so the count and the yellow rows cannot disagree.
+   * mirrors `needsUser`: the actor is `user`, or an open escalation routed to
+   * the user (route `me`), need or question. The open predicates are the ones
+   * `openEscalations`, `openNeeds` and `openQuestions` use, so the count and
+   * the yellow rows cannot disagree. An escalation routed to the project
+   * steward, the binding's own steward or its parent does not count (BB-208).
    * It reads `$.actor` from the JSON column and so assumes a schema-valid
    * `status` record or NULL; writes go through the store's typed `StatusRecord`,
    * so it agrees with the zod parse behind `needsUser`.
@@ -1131,7 +1133,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     `SELECT COUNT(*) AS n FROM bindings b
      WHERE b.project_id = ? AND b.ended_at IS NULL AND (
        (CASE WHEN json_valid(b.status) THEN json_extract(b.status, '$.actor') END) = 'user'
-       OR EXISTS (SELECT 1 FROM escalations e WHERE e.binding_id = b.id AND e.status = 'open')
+       OR EXISTS (SELECT 1 FROM escalations e WHERE e.binding_id = b.id AND e.status = 'open' AND e.route = 'me')
        OR EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = b.id AND n.status = 'open')
        OR EXISTS (SELECT 1 FROM escalations q WHERE q.binding_id = b.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret', 'done')))
      )`,

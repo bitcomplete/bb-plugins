@@ -2361,14 +2361,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * Whether anything on a binding needs the user: the steward said the user
-     * acts next, an escalation is open, a question about it is unanswered, or a
-     * needs item is on the Stewards page. Such a steward's row stays visible
-     * and unread; a "nothing to do yet" turn is neither.
+     * acts next, an escalation routed to the user (route `me`) is open, a
+     * question about it is unanswered, or a needs item is on the Stewards page.
+     * An escalation routed to the project steward, the binding's own steward or
+     * its parent does not: the owner has nothing to press for it (BB-208). Such
+     * a steward's row stays visible and unread; a "nothing to do yet" turn is
+     * neither.
      */
     function needsUser(b: Binding): boolean {
       return (
         b.status?.actor === "user" ||
-        store.openEscalations(b.id).length > 0 ||
+        store.openEscalations(b.id).some((x) => x.route === "me") ||
         store.openNeeds(b.id).length > 0 ||
         store.openQuestions(b.projectId).some((q) => q.bindingId === b.id)
       );

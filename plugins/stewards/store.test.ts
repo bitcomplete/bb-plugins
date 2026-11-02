@@ -124,9 +124,10 @@ describe("needs you items", () => {
 
 describe("countNeedsUser (BB-104)", () => {
   // The same predicate `needsUser` in server.ts evaluates from the store's own
-  // reads, so the SQL count and the yellow rows cannot drift.
+  // reads, so the SQL count and the yellow rows cannot drift. Only a route-`me`
+  // escalation counts (BB-208); project, steward and parent ones do not.
   const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
-    b.status?.actor === "user" || s.openEscalations(b.id).length > 0 || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
+    b.status?.actor === "user" || s.openEscalations(b.id).some((x) => x.route === "me") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
 
   const add = (s: ReturnType<typeof store>["s"], n: number) =>
     s.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
@@ -137,9 +138,10 @@ describe("countNeedsUser (BB-104)", () => {
     const { s, binding } = store();
     // The base binding: actor `user`.
     s.patch(binding.id, { status: userStatus(1_000) });
-    // One binding per remaining condition.
+    // One binding per remaining condition. The escalation that counts is the
+    // one routed to the user; escalations routed elsewhere are added below.
     const escalation = add(s, 13);
-    s.escalate({ bindingId: escalation.id, kind: "decision", question: "Q", meanwhile: "m", route: "project", recommendation: null });
+    s.escalate({ bindingId: escalation.id, kind: "decision", question: "Q", meanwhile: "m", route: "me", recommendation: null });
     const need = add(s, 14);
     s.fileNeed({ bindingId: need.id, kind: "configure", url: "", what: "Enable it", how: null });
     const question = add(s, 15);
@@ -147,9 +149,14 @@ describe("countNeedsUser (BB-104)", () => {
     // All four on one binding: still one row.
     const all = add(s, 16);
     s.patch(all.id, { status: userStatus(1_000) });
-    s.escalate({ bindingId: all.id, kind: "decision", question: "Q", meanwhile: "m", route: "project", recommendation: null });
+    s.escalate({ bindingId: all.id, kind: "decision", question: "Q", meanwhile: "m", route: "me", recommendation: null });
     s.fileNeed({ bindingId: all.id, kind: "configure", url: "", what: "Enable it", how: null });
     s.ask({ projectId: "p1", bindingId: all.id, escalationId: null, question: "Which?", context: null });
+    // An open escalation routed to someone other than the user does not count.
+    for (const [i, route] of (["project", "steward", "parent"] as const).entries()) {
+      const elsewhere = add(s, 20 + i);
+      s.escalate({ bindingId: elsewhere.id, kind: "decision", question: "Q", meanwhile: "m", route, recommendation: null });
+    }
     // An ended binding, and one whose escalation and need are resolved: neither counts.
     const ended = add(s, 17);
     s.patch(ended.id, { endedAt: 2_000 });
