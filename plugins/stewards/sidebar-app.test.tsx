@@ -2437,6 +2437,14 @@ describe("the switch-project command (BB-188)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-197: the digit pill is the plugin's own `<kbd>`, not the SDK's
+  // `experimental_ShortcutHint` stub. The stub renders a bare `<kbd>` with no
+  // class or `aria-hidden`, so the class list and the attribute are asserted
+  // too: the stub cannot satisfy them, and the test fails if the pill is
+  // swapped back for the host component.
+  const shortcutPillClass =
+    "pointer-events-none inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-sm bg-state-hover px-1.5 py-1 font-sans text-xs font-normal leading-none tabular-nums text-subtle-foreground opacity-60";
+
   it("shows the digit on the first nine rows and none on a compact viewport", async () => {
     const many = Array.from({ length: 10 }, (_, i) => ({ id: `p${i + 1}`, name: `Project ${i + 1}`, isPersonal: false, href: `/projects/p${i + 1}`, settingsHref: `/projects/p${i + 1}/settings` }));
     const wide = await renderSidebar({
@@ -2447,7 +2455,10 @@ describe("the switch-project command (BB-188)", () => {
     const rows = wide.getAllByRole("option");
     expect(rows).toHaveLength(10);
     for (let i = 0; i < 9; i += 1) {
-      expect(rows[i]!.querySelector("kbd")?.textContent).toBe(String(i + 1));
+      const pill = rows[i]!.querySelector("kbd");
+      expect(pill?.textContent).toBe(String(i + 1));
+      expect(pill?.getAttribute("aria-hidden")).toBe("true");
+      expect(pill?.className).toBe(shortcutPillClass);
     }
     expect(rows[9]!.querySelector("kbd")).toBeNull();
     wide.lifecycle.unmount();
