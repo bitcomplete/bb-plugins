@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { GhProcess, GhResult, GhRunner } from "./gh.js";
-import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, ONBOARDING_DISMISSED_KEY, SEEDED_NOTE, SLACK_ID } from "./server.js";
+import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, SEEDED_NOTE, SLACK_ID } from "./server.js";
 
 // A gh whose `auth login` the test drives: print lines, then exit.
 function fakeGh(runs: Record<string, GhResult> = {}) {
@@ -128,7 +128,6 @@ declare function statusType(): Promise<{
   figma: { available: boolean; message: string | null; machine: string | null; claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null };
   machines: { names: string[] };
   steps: { ai: string; github: string; devbox: string; linear: string; slack: string; figma: string; machine: string };
-  onboarding: { dismissed: boolean; requiredComplete: boolean };
   complete: boolean;
 }>;
 
@@ -501,38 +500,4 @@ describe("machine environment seeding", () => {
   });
 });
 
-describe("onboarding dismissal", () => {
-  it("round-trips the dismiss flag through the server's own state", async () => {
-    const { status, harness, factory } = await setup();
-    expect((await status()).onboarding).toEqual({ dismissed: false, requiredComplete: false });
 
-    expect(await harness.callRpc("dismissOnboarding", { dismissed: true })).toEqual({ ok: true });
-    expect((await status()).onboarding.dismissed).toBe(true);
-
-    // A reload keeps the kv, so the flag survives a server restart. Read the
-    // stored key directly: the reloaded harness has no SDK stubs, and the flag
-    // is the plugin's own state.
-    const next = await harness.lifecycle.reload(factory);
-    expect(await next.bb.storage.kv.get(ONBOARDING_DISMISSED_KEY)).toBe(true);
-
-    // Clearing it is a write too, so the round trip is observable in both directions.
-    expect(await next.harness.callRpc("dismissOnboarding", { dismissed: false })).toEqual({ ok: true });
-    expect(await next.bb.storage.kv.get(ONBOARDING_DISMISSED_KEY)).toBe(false);
-    await next.harness.lifecycle.dispose();
-  });
-
-  it("counts required steps as complete even while an optional step is a to-do", async () => {
-    const { status } = await setup({
-      builtInGit: { status: "logged in", statusMessage: "ok" },
-      pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
-      devbox: { connected: true, project: "dylan" },
-      hosts: [{ name: "box" }],
-      figmaHost: { claude: true, configured: true, authenticated: false, pending: false, url: null, message: null },
-      runs: signedIn,
-    });
-    const s = await status();
-    expect(s.steps.figma).toBe("todo");
-    expect(s.complete).toBe(false);
-    expect(s.onboarding.requiredComplete).toBe(true);
-  });
-});
