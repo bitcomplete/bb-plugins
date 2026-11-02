@@ -20,7 +20,7 @@ const SECRET_REQUEST =
  * worker thread.
  */
 const WORKER_QUESTIONS =
-  "Never let a worker use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click): it parks the worker until a person clicks, and nobody watches a worker thread. A worker's task must say that a decision the worker cannot make goes to you with `bb stewards escalate \"<one-line question, under 240 characters>\" --context \"<evidence and options>\"` — one question per escalation, `--meanwhile wait` by default — or, if that command is unavailable, as a comment on the ticket or pull request it was given and in its final message, then end the turn.";
+  "Never let a worker use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click): it parks the worker until a person clicks, and nobody watches a worker thread. A worker's task must say never to use it, and that a decision the worker cannot make goes to you with `bb stewards escalate \"<one-line question, under 240 characters>\" --context \"<evidence and options>\"` — one question per escalation, `--meanwhile wait` by default — or, if that command is unavailable, as a comment on the ticket or pull request it was given and in its final message, then end the turn.";
 
 /**
  * The ops playbooks start no workers, so theirs is the steward's own rule: it
