@@ -19,10 +19,12 @@ import { access, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "no
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { projectFilePathProblem, slugify } from "./names.js";
-import { git, gitIn, gitInOrThrow, gitLine, firstProblemLine, run, splitNul } from "./git.js";
+import { GitError, git, gitIn, gitInOrThrow, gitLine, firstProblemLine, run, splitNul } from "./git.js";
 import { REPOS_FILE, parseReposFile, resolvePublishMode, serializeReposFile, type PublishMode, type PublishPolicy, type ReposFile } from "./repos.js";
 import { parseCreatedUrl } from "./gh-parse.js";
-import type { UnpushedSummary } from "./contract.js";
+import { cacheDefaultBranch, ensureCache } from "./cache.js";
+import { CACHE_FRESH_MS } from "./shared.js";
+import type { ProbeRemoteResult, UnpushedSummary } from "./contract.js";
 import {
   PROJECT_SOURCE_DIR,
   projectDefinitionPrefix,
@@ -126,6 +128,83 @@ export async function detectProjectLayout(dir: string, signal?: AbortSignal): Pr
   }
   if (await exists(path.join(dir, PROJECT_SOURCE_DIR, REPOS_FILE))) return "primary";
   return "standalone";
+}
+
+export interface ProbeRemoteArgs {
+  /** The host data directory the per-machine object cache lives under. */
+  dataDir: string;
+  /** A git URL, or an absolute path to a local checkout. */
+  url: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Which shape the thing at `url` has, without checking it out.
+ *
+ * This is the New project form's replacement for its old mode radio. The
+ * answer is read from the default branch's committed tree — `repos.json` at
+ * the root is a standalone `.bb` repo, `.bb/repos.json` is a primary repo,
+ * neither is a plain repo — through the per-machine bare cache, which is the
+ * same clone a real checkout borrows from, so the fetch is not wasted.
+ *
+ * A local path that is already a checkout is `checkout`: the caller adopts it
+ * as the project source rather than cloning beside it. A remote the machine
+ * cannot read (a private https URL with no credential helper is the common
+ * one) throws with a message that names the cause, so the form can say so
+ * plainly instead of guessing "plain".
+ */
+export async function probeRemote(args: ProbeRemoteArgs): Promise<ProbeRemoteResult> {
+  const { url, dataDir, signal } = args;
+  const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
+
+  if (path.isAbsolute(url) && (await isGitRepo(url))) {
+    const layout = await detectProjectLayout(url, signal);
+    const ref = await resolveDefaultBranchRef(url, signal);
+    const defaultBranch = ref?.replace(/^refs\/(heads|remotes\/origin)\//u, "") ?? null;
+    const what = layout === "primary" ? "a primary repo carrying .bb/" : "an existing checkout";
+    return { outcome: "checkout", defaultBranch, message: `${url} is ${what}; it is used as the project source.` };
+  }
+
+  const entry = await ensureCache({
+    dataDir,
+    url,
+    mirrors: [],
+    fetchTtlMs: CACHE_FRESH_MS,
+    ...(signal === undefined ? {} : { signal }),
+  }).catch((error: unknown) => {
+    throw new Error(probeRemoteError(url, error));
+  });
+
+  const defaultBranch = await cacheDefaultBranch(entry.path, signal);
+  if (defaultBranch === null) {
+    return { outcome: "plain", defaultBranch: null, message: `No branch was found on ${url}.` };
+  }
+  const ref = `refs/heads/${defaultBranch}`;
+  const primary = await gitIn(entry.path, ["cat-file", "-e", `${ref}:${PROJECT_SOURCE_DIR}/${REPOS_FILE}`], options);
+  if (primary.code === 0) {
+    return { outcome: "primary", defaultBranch, message: `Primary repo: .bb/repos.json on ${defaultBranch}.` };
+  }
+  const standalone = await gitIn(entry.path, ["cat-file", "-e", `${ref}:${REPOS_FILE}`], options);
+  if (standalone.code === 0) {
+    return { outcome: "standalone", defaultBranch, message: `Standalone .bb repo: repos.json on ${defaultBranch}.` };
+  }
+  return { outcome: "plain", defaultBranch, message: `Plain repo: no .bb definition on ${defaultBranch}.` };
+}
+
+/**
+ * A probe failure a person can act on.
+ *
+ * A private https remote with no credential helper is the common one, and
+ * git's own message — "could not read Username" — does not say what to do
+ * about it, so the cause is named explicitly.
+ */
+export function probeRemoteError(url: string, error: unknown): string {
+  const detail =
+    error instanceof GitError ? firstProblemLine(error.result) : error instanceof Error ? error.message : String(error);
+  if (/could not read Username|terminal prompts disabled|authentication failed|permission denied|no such device or address/iu.test(detail)) {
+    return `${url} looks private and this machine has no credential helper for it. Add one, or use an SSH URL. (${detail})`.slice(0, 600);
+  }
+  return `Could not read ${url}: ${detail}`.slice(0, 600);
 }
 
 /**

@@ -1770,63 +1770,120 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       return host.call("suggestProjectSourcePath", { name }, { hostId, timeoutMs: READ_TIMEOUT_MS });
     },
 
+    async probeRemote({ hostId, url }) {
+      return host.call("probeRemote", { url }, { hostId, timeoutMs: CREATE_TIMEOUT_MS });
+    },
+
     async createProject({ name, hostId, path, source }) {
       const warnings: string[] = [];
       let layout: ProjectLayout | null = null;
       let prUrl: string | null = null;
       const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings, layout, prUrl });
 
+      // Resolve the source into one concrete mode and the directory the project
+      // will point at. `auto` probes the remote here, host-side, so a Create
+      // pressed before the form's own probe finished still lands in the right
+      // mode. A local path that is already a checkout is adopted as the source
+      // (never cloned beside), which the probe reports as `checkout`.
+      let mode: "fresh" | "clone" | "primary" | "plain" | "checkout";
+      let projectPath = path;
+      let url: string | null = null;
+      let repos: RepoSeed[] = [];
+      let openPullRequest = false;
+      if (source.kind === "fresh") {
+        mode = "fresh";
+        repos = source.repos;
+      } else if (source.kind === "clone") {
+        mode = "clone";
+        url = source.url;
+      } else if (source.kind === "primary") {
+        mode = "primary";
+        url = source.url;
+        repos = source.repos;
+        openPullRequest = source.openPullRequest ?? true;
+      } else if (source.kind === "plain") {
+        mode = "plain";
+        url = source.url;
+        repos = source.repos;
+        openPullRequest = source.openPullRequest ?? false;
+      } else {
+        url = source.url;
+        repos = source.repos;
+        openPullRequest = source.openPullRequest ?? false;
+        try {
+          const probed = await host.call(
+            "probeRemote",
+            { url: source.url },
+            { hostId, timeoutMs: CREATE_TIMEOUT_MS },
+          );
+          if (probed.outcome === "standalone") {
+            mode = "clone";
+          } else if (probed.outcome === "checkout") {
+            mode = "checkout";
+            projectPath = source.url;
+          } else {
+            // A primary repo already carries `.bb/`; a plain one gets a local
+            // seed. Both go through the same clone-or-adopt, seed-if-absent
+            // path, so the probe only had to tell them apart for the form.
+            mode = "plain";
+          }
+        } catch (error) {
+          return fail(errorMessage(error));
+        }
+      }
+
       // Refuse to stack a second project on a directory one already owns. Core
       // may or may not reject it, and either way the panel would then show two
       // projects editing one repos.json.
       const existing = await bb.sdk.projects.list({ includePersonal: true });
       const taken = existing.find((project) =>
-        project.sources.some((entry) => entry.type === "local_path" && entry.hostId === hostId && entry.path === path),
+        project.sources.some((entry) => entry.type === "local_path" && entry.hostId === hostId && entry.path === projectPath),
       );
-      if (taken !== undefined) return fail(`${path} is already the source of the project "${taken.name}".`);
+      if (taken !== undefined) return fail(`${projectPath} is already the source of the project "${taken.name}".`);
 
       // The git work first: a failure here leaves no project behind.
       try {
-        if (source.kind === "fresh") {
-          const resolved = resolveSeed(source.repos);
+        if (mode === "fresh") {
+          const resolved = resolveSeed(repos);
           if (!resolved.ok) return fail(resolved.error);
           const prepared = await host.call(
             "prepareProjectSource",
-            { path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true, seed: source.repos },
+            { path: projectPath, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true, seed: repos },
             { hostId, timeoutMs: READ_TIMEOUT_MS },
           );
           warnings.push(...prepared.warnings);
           layout = prepared.layout ?? "standalone";
-          if (!prepared.bootstrapped && source.repos.length > 0) {
+          if (!prepared.bootstrapped && repos.length > 0) {
             // Adopting a directory that is already a `.bb` repo: the seed was
             // not written, so merge the entries in the ordinary way.
-            const location: SourceLocation = { hostId, path };
-            for (const entry of source.repos) {
+            const location: SourceLocation = { hostId, path: projectPath };
+            for (const entry of repos) {
               const outcome = await addRepoToProject(location, entry);
               if (!outcome.ok) warnings.push(outcome.error);
             }
           }
-        } else if (source.kind === "clone") {
+        } else if (mode === "clone") {
           const cloned = await host.call(
             "cloneProjectSource",
-            { url: source.url, path },
+            { url: url as string, path: projectPath },
             { hostId, timeoutMs: CREATE_TIMEOUT_MS },
           );
           if (!cloned.ok) return fail(cloned.message ?? "Could not clone the .bb repo.");
           layout = "standalone";
         } else {
-          // A primary repo: clone it if it is not here, seed `.bb/` when it
-          // does not carry one, and publish the seed for review.
-          const resolved = resolveSeed(source.repos);
+          // primary, plain or an adopted checkout: clone it when it is a
+          // remote, use the checkout when it is one, and seed `.bb/` when the
+          // repo carries none. The probe picked the mode; this only does it.
+          const resolved = resolveSeed(repos);
           if (!resolved.ok) return fail(resolved.error);
           const prepared = await host.call(
             "preparePrimaryProjectSource",
             {
-              url: source.url,
-              path,
+              url: url as string,
+              path: projectPath,
               seed: serializeReposFile({ version: 1, repos: resolved.repos }),
               branch: `bb/seed-bb-${Date.now().toString(36)}`,
-              openPullRequest: source.openPullRequest ?? true,
+              openPullRequest,
             },
             { hostId, timeoutMs: CREATE_TIMEOUT_MS },
           );
@@ -1842,13 +1899,13 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       try {
         const project = await bb.sdk.projects.create({
           name,
-          source: { type: "local_path", hostId, path },
+          source: { type: "local_path", hostId, path: projectPath },
         });
         changed();
         return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20), layout, prUrl };
       } catch (error) {
         return fail(
-          `${path} is ready but the project could not be created: ${errorMessage(error)}. Try again, or create it with \`bb project create --root ${path}\`.`,
+          `${projectPath} is ready but the project could not be created: ${errorMessage(error)}. Try again, or create it with \`bb project create --root ${projectPath}\`.`,
         );
       }
     },

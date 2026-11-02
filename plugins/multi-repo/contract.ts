@@ -233,6 +233,26 @@ export const discoveredCheckoutSchema = z
 
 export type DiscoveredCheckout = z.infer<typeof discoveredCheckoutSchema>;
 
+/**
+ * What a git remote (or a local path) turns out to be, for the New project
+ * form's status line. `checkout` is a path that already exists on the machine
+ * and is adopted as the project source rather than cloned beside it.
+ */
+export const probeRemoteOutcomeSchema = z.enum(["standalone", "primary", "plain", "checkout"]);
+export type ProbeRemoteOutcome = z.infer<typeof probeRemoteOutcomeSchema>;
+
+export const probeRemoteResultSchema = z
+  .object({
+    outcome: probeRemoteOutcomeSchema,
+    /** The remote's default branch, or null when the probe could not read one. */
+    defaultBranch: z.string().max(300).nullable(),
+    /** One line for the status line under the URL field. */
+    message: z.string().max(600),
+  })
+  .strict();
+
+export type ProbeRemoteResult = z.infer<typeof probeRemoteResultSchema>;
+
 /* ------------------------------------------------------------------ host */
 
 export const hostContract = defineRpcContract({
@@ -362,6 +382,21 @@ export const hostContract = defineRpcContract({
   suggestProjectSourcePath: {
     input: z.object({ name: z.string().min(1).max(300) }).strict(),
     output: z.object({ path: absolutePath, exists: z.boolean() }).strict(),
+  },
+
+  /**
+   * Which shape a remote (or a local path) has, without checking it out.
+   *
+   * The New project form calls this on blur/Enter to replace the old mode
+   * radio: the answer comes from the default branch's committed tree, read
+   * out of the per-machine bare cache — the same clone a real checkout borrows
+   * from, so the fetch is not wasted. A local path that is already a checkout
+   * is reported as `checkout`; the caller adopts it rather than cloning beside
+   * it. A private remote the machine cannot read is thrown, not guessed at.
+   */
+  probeRemote: {
+    input: z.object({ url: z.string().min(1).max(2000) }).strict(),
+    output: probeRemoteResultSchema,
   },
 
   /**
@@ -891,7 +926,18 @@ export const rpcContract = defineRpcContract({
   },
 
   /**
-   * Create a project whose source is a `.bb` checkout, in one step.
+   * Probe a remote for the New project form, on the chosen machine.
+   *
+   * The host RPC takes only the URL; `hostId` is how the server routes the
+   * call to the machine whose cache is being read.
+   */
+  probeRemote: {
+    input: z.object({ hostId: z.string().min(1).max(100), url: z.string().min(1).max(2000) }).strict(),
+    output: probeRemoteResultSchema,
+  },
+
+  /**
+   * Create a project whose source is a git remote, in one step.
    *
    * Either initializes a fresh checkout seeded with `repos`, or clones an
    * existing `.bb` repo. The git work runs first so a failure there leaves no
@@ -914,6 +960,33 @@ export const rpcContract = defineRpcContract({
               /** The other repos to seed `.bb/repos.json` with. */
               repos: z.array(repoSeedSchema).max(64),
               /** Publish a seed branch and open a pull request. */
+              openPullRequest: z.boolean().optional(),
+            })
+            .strict(),
+          /**
+           * A repo with no `.bb/` definition: clone it and make it the whole
+           * project. Seeding `.bb/` is local by default; the checkbox asks for
+           * a seed pull request too.
+           */
+          z
+            .object({
+              kind: z.literal("plain"),
+              url: z.string().min(1).max(2000),
+              repos: z.array(repoSeedSchema).max(64),
+              openPullRequest: z.boolean().optional(),
+            })
+            .strict(),
+          /**
+           * Let the host decide on submit: it probes the remote and lands in
+           * the standalone, primary, plain or local-checkout path. This is
+           * what Create uses when the form's own probe has not finished, so
+           * Create is never blocked on it.
+           */
+          z
+            .object({
+              kind: z.literal("auto"),
+              url: z.string().min(1).max(2000),
+              repos: z.array(repoSeedSchema).max(64),
               openPullRequest: z.boolean().optional(),
             })
             .strict(),

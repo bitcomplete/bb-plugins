@@ -7,15 +7,21 @@
  * it repos. This form folds those into one: it picks the `.bb` location,
  * initializes or clones it, and creates the project pointing at it.
  *
- * The location is a suggestion the user can overwrite, not a decision. It is
- * recomputed from the name and machine until the user edits it, and then left
- * alone — an edited path that silently reverts when the name changes is the
- * kind of form nobody trusts twice.
+ * The URL comes first and everything else is derived from it. The name is the
+ * URL's last component, the location follows the name, and a probe of the
+ * remote's default branch decides the mode the old radio buttons used to ask
+ * for: a root `repos.json` is a standalone `.bb` repo, `.bb/repos.json` is a
+ * primary repo, neither is a plain repo. Every derived field stays editable —
+ * it is recomputed until the user edits it, and then left alone — because an
+ * edited field that silently reverts is the kind of form nobody trusts twice.
+ *
+ * The probe runs on blur or Enter, never per keystroke, and Create does not
+ * wait for it: the host re-probes on submit when the answer has not arrived.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { FormEvent, KeyboardEvent } from "react";
 import { experimental_Icon as Icon, useRpc } from "@get-bb/plugin-sdk/app";
-import type { DiscoveredCheckout, RepoSeed, rpcContract } from "./contract.js";
+import type { DiscoveredCheckout, ProbeRemoteResult, RepoSeed, rpcContract } from "./contract.js";
 import { AddRepoRow } from "./add-repo-row.js";
 import { dirFromUrl } from "./names.js";
 
@@ -31,19 +37,29 @@ interface NewProjectFormProps {
   onCreated: (projectId: string, warnings: readonly string[]) => void;
 }
 
-type Mode = "fresh" | "clone" | "primary";
+/** URL-first is the default; "from scratch" is the secondary link. */
+type FormMode = "url" | "fresh";
+
+type Probe =
+  | { status: "idle" }
+  | { status: "probing" }
+  | { status: "done"; result: ProbeRemoteResult }
+  | { status: "error"; message: string };
 
 export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   const rpc = useRpc<typeof rpcContract>();
+  const suggestionsListId = useId();
   const [hosts, setHosts] = useState<HostOption[] | null>(null);
+  const [formMode, setFormMode] = useState<FormMode>("url");
+  const [url, setUrl] = useState("");
   const [name, setName] = useState("");
+  const [nameEdited, setNameEdited] = useState(false);
   const [hostId, setHostId] = useState<string | null>(null);
   const [path, setPath] = useState("");
   const [pathEdited, setPathEdited] = useState(false);
   const [pathExists, setPathExists] = useState(false);
-  const [mode, setMode] = useState<Mode>("fresh");
-  const [cloneUrl, setCloneUrl] = useState("");
-  const [primaryUrl, setPrimaryUrl] = useState("");
+  const [probe, setProbe] = useState<Probe>({ status: "idle" });
+  const [seedPr, setSeedPr] = useState(false);
   const [repos, setRepos] = useState<RepoSeed[]>([]);
   const [suggestions, setSuggestions] = useState<DiscoveredCheckout[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -73,6 +89,12 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     };
   }, [rpc]);
 
+  // The name follows the URL's last component until the user edits it.
+  useEffect(() => {
+    if (formMode !== "url" || nameEdited) return;
+    setName(dirFromUrl(url) ?? "");
+  }, [url, nameEdited, formMode]);
+
   // The suggested location follows the name and machine until it is edited.
   // Debounced because it is a host round trip per keystroke otherwise, and
   // sequenced so a slow early answer cannot overwrite a fast later one.
@@ -95,10 +117,11 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     return () => window.clearTimeout(timer);
   }, [rpc, hostId, name, pathEdited]);
 
-  // Local checkouts on the chosen machine, for the add row's completions.
-  // Keyed on the path so the sibling scan looks beside where `.bb` will go.
+  // Local checkouts on the chosen machine, for the URL field's completions
+  // (and, in "from scratch" mode, for the add row). Keyed on the path so the
+  // sibling scan looks beside where `.bb` will go.
   useEffect(() => {
-    if (hostId === null || path.length === 0 || mode === "clone") return;
+    if (hostId === null || path.length === 0) return;
     let cancelled = false;
     void rpc
       .call("suggestRepos", { hostId, path })
@@ -111,7 +134,36 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     return () => {
       cancelled = true;
     };
-  }, [rpc, hostId, path, mode]);
+  }, [rpc, hostId, path]);
+
+  // A local path that is already a checkout is adopted as the project source,
+  // so show where it is. This freezes the location until the URL changes.
+  useEffect(() => {
+    if (formMode !== "url" || probe.status !== "done" || probe.result.outcome !== "checkout" || pathEdited) return;
+    setPath(url.trim());
+    setPathExists(true);
+    setPathEdited(true);
+  }, [formMode, probe, url, pathEdited]);
+
+  const probeSeq = useRef(0);
+  const runProbe = useCallback(() => {
+    const value = url.trim();
+    if (formMode !== "url" || hostId === null || value.length === 0) return;
+    const seq = ++probeSeq.current;
+    setProbe({ status: "probing" });
+    void rpc
+      .call("probeRemote", { hostId, url: value })
+      .then((result) => {
+        if (seq === probeSeq.current) setProbe({ status: "done", result });
+      })
+      .catch((caught: unknown) => {
+        if (seq !== probeSeq.current) return;
+        setProbe({
+          status: "error",
+          message: caught instanceof Error ? caught.message : "Could not read that remote.",
+        });
+      });
+  }, [rpc, hostId, url, formMode]);
 
   const existing = useMemo(
     () => repos.map((repo) => ({ dir: repo.dir ?? dirFromUrl(repo.url) ?? repo.url, url: repo.url })),
@@ -123,24 +175,38 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     return null;
   }, []);
 
+  const urlOutcome = probe.status === "done" ? probe.result.outcome : null;
+
   const ready =
     !submitting &&
     hostId !== null &&
     name.trim().length > 0 &&
     path.trim().length > 0 &&
-    (mode === "fresh" || (mode === "clone" && cloneUrl.trim().length > 0) || (mode === "primary" && primaryUrl.trim().length > 0));
+    (formMode === "fresh" || url.trim().length > 0);
+
+  /**
+   * What the host is asked to build. A finished probe picks the exact mode; an
+   * unfinished or failed one falls back to `auto`, which re-probes on submit,
+   * so Create is never blocked on the probe.
+   */
+  const source = useMemo(() => {
+    if (formMode === "fresh") return { kind: "fresh" as const, repos };
+    const value = url.trim();
+    if (urlOutcome === "standalone") return { kind: "clone" as const, url: value };
+    if (urlOutcome === "primary") {
+      return { kind: "primary" as const, url: value, repos: [] as RepoSeed[], openPullRequest: false };
+    }
+    if (urlOutcome === "plain") {
+      return { kind: "plain" as const, url: value, repos: [] as RepoSeed[], openPullRequest: seedPr };
+    }
+    return { kind: "auto" as const, url: value, repos: [] as RepoSeed[], openPullRequest: seedPr };
+  }, [formMode, url, urlOutcome, seedPr, repos]);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!ready || hostId === null) return;
     setSubmitting(true);
     setError(null);
-    const source =
-      mode === "fresh"
-        ? { kind: "fresh" as const, repos }
-        : mode === "clone"
-          ? { kind: "clone" as const, url: cloneUrl.trim() }
-          : { kind: "primary" as const, url: primaryUrl.trim(), repos, openPullRequest: true };
     void rpc
       .call("createProject", {
         name: name.trim(),
@@ -162,7 +228,20 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
       .finally(() => setSubmitting(false));
   };
 
+  // Enter in the URL field probes instead of submitting the form.
+  const onUrlKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    runProbe();
+  };
+
   const selectedHost = hosts?.find((entry) => entry.id === hostId) ?? null;
+  const showSeedCheckbox =
+    formMode === "url" && (urlOutcome === null || urlOutcome === "plain" || urlOutcome === "checkout");
+  // In URL mode the remote is the whole repo set: a standalone `.bb` carries
+  // its own, a primary carries `.bb/`, and a plain repo is a single-repo
+  // project. Extra repos are added from the panel once the project exists.
+  const showRepos = formMode === "fresh";
 
   return (
     <form onSubmit={submit} className="space-y-4 rounded-md border p-4">
@@ -178,6 +257,43 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
         </button>
       </div>
 
+      {formMode === "url" && (
+        <label className="block space-y-1 text-sm">
+          <span className="text-muted-foreground text-xs">Git remote or local path</span>
+          <input
+            type="text"
+            list={suggestionsListId}
+            className="bg-background w-full rounded-md border px-2 py-1 font-mono text-xs"
+            placeholder="git@github.com:you/repo.git, https://…, or /path/to/checkout"
+            value={url}
+            autoFocus
+            spellCheck={false}
+            autoComplete="off"
+            disabled={submitting}
+            onKeyDown={onUrlKeyDown}
+            onBlur={runProbe}
+            onChange={(event) => {
+              setUrl(event.target.value);
+              // A new URL re-derives the location unless the user froze it.
+              setPathEdited(false);
+              setProbe({ status: "idle" });
+            }}
+          />
+          <datalist id={suggestionsListId}>
+            {suggestions.map((checkout) => (
+              <option key={checkout.path} value={checkout.url}>
+                {checkout.path}
+              </option>
+            ))}
+          </datalist>
+          {probe.status === "probing" && (
+            <span className="text-muted-foreground block text-xs">Reading the remote…</span>
+          )}
+          {probe.status === "error" && <span className="text-destructive block text-xs">{probe.message}</span>}
+          {probe.status === "done" && <span className="text-muted-foreground block text-xs">{probe.result.message}</span>}
+        </label>
+      )}
+
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="space-y-1 text-sm">
           <span className="text-muted-foreground text-xs">Name</span>
@@ -185,9 +301,11 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
             type="text"
             className="bg-background w-full rounded-md border px-2 py-1 text-sm"
             value={name}
-            autoFocus
             disabled={submitting}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => {
+              setName(event.target.value);
+              setNameEdited(true);
+            }}
           />
         </label>
         <label className="space-y-1 text-sm">
@@ -201,7 +319,10 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
               className="bg-background w-full rounded-md border px-2 py-1 text-sm"
               value={hostId ?? ""}
               disabled={submitting}
-              onChange={(event) => setHostId(event.target.value)}
+              onChange={(event) => {
+                setHostId(event.target.value);
+                setProbe({ status: "idle" });
+              }}
             >
               {hosts.map((entry) => (
                 <option key={entry.id} value={entry.id} disabled={!entry.connected}>
@@ -233,80 +354,42 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
             setPathExists(false);
           }}
         />
-        {pathExists && mode === "fresh" && (
+        {pathExists && formMode === "fresh" && (
           <span className="text-muted-foreground block text-xs">
             Something is already there. An existing <code className="font-mono">.bb</code> repo is adopted as it is;
             anything else fails.
           </span>
         )}
-        {pathExists && mode === "clone" && (
+        {pathExists && formMode === "url" && urlOutcome === "standalone" && (
           <span className="text-destructive block text-xs">Something is already there, and a clone needs an empty directory.</span>
         )}
-        {pathExists && mode === "primary" && (
-          <span className="text-muted-foreground block text-xs">
-            An existing checkout of the primary repo is fetched and used as it is.
-          </span>
+        {pathExists && formMode === "url" && urlOutcome === "checkout" && (
+          <span className="text-muted-foreground block text-xs">This checkout is used as the project source; nothing is cloned.</span>
         )}
+        {pathExists &&
+          formMode === "url" &&
+          urlOutcome !== "standalone" &&
+          urlOutcome !== "checkout" &&
+          urlOutcome !== null && (
+            <span className="text-muted-foreground block text-xs">
+              An existing checkout of the repo is fetched and used as it is; `.bb/` is seeded into it when it carries none.
+            </span>
+          )}
       </label>
 
-      <fieldset className="space-y-2">
-        <legend className="text-muted-foreground text-xs">Start from</legend>
-        <div className="flex flex-wrap gap-4 text-sm">
-          <label className="flex items-center gap-1.5">
-            <input type="radio" name="mode" checked={mode === "fresh"} disabled={submitting} onChange={() => setMode("fresh")} />
-            A new repo set
-          </label>
-          <label className="flex items-center gap-1.5">
-            <input type="radio" name="mode" checked={mode === "clone"} disabled={submitting} onChange={() => setMode("clone")} />
-            An existing <code className="font-mono">.bb</code> repo
-          </label>
-          <label className="flex items-center gap-1.5">
-            <input type="radio" name="mode" checked={mode === "primary"} disabled={submitting} onChange={() => setMode("primary")} />
-            This repo carries <code className="font-mono">.bb</code>
-          </label>
-        </div>
-      </fieldset>
-
-      {mode === "clone" && (
-        <label className="block space-y-1 text-sm">
-          <span className="text-muted-foreground text-xs">Clone URL of the .bb repo</span>
+      {showSeedCheckbox && (
+        <label className="flex items-center gap-1.5 text-sm">
           <input
-            type="text"
-            className="bg-background w-full rounded-md border px-2 py-1 font-mono text-xs"
-            placeholder="git@github.com:you/project.bb.git"
-            value={cloneUrl}
-            spellCheck={false}
-            autoComplete="off"
+            type="checkbox"
+            checked={seedPr}
             disabled={submitting}
-            onChange={(event) => setCloneUrl(event.target.value)}
+            onChange={(event) => setSeedPr(event.target.checked)}
           />
-          <span className="text-muted-foreground block text-xs">
-            Its repos.json, AGENTS.md and skills come with it. Nothing is written back to it here.
-          </span>
+          Seed <code className="font-mono">.bb/</code> and open a pull request
         </label>
       )}
 
-      {mode === "primary" && (
-        <label className="block space-y-1 text-sm">
-          <span className="text-muted-foreground text-xs">URL of the primary repo</span>
-          <input
-            type="text"
-            className="bg-background w-full rounded-md border px-2 py-1 font-mono text-xs"
-            placeholder="git@github.com:you/your-product.git"
-            value={primaryUrl}
-            spellCheck={false}
-            autoComplete="off"
-            disabled={submitting}
-            onChange={(event) => setPrimaryUrl(event.target.value)}
-          />
-          <span className="text-muted-foreground block text-xs">
-            The repo whose default branch carries <code className="font-mono">.bb/</code>. If it does not yet, the
-            plugin commits a seed and opens a pull request.
-          </span>
-        </label>
-      )}
-
-      {mode !== "clone" && (
+      {showRepos && (
         <section className="space-y-2">
           <h3 className="text-sm font-medium">Repos</h3>
           {repos.length === 0 ? (
@@ -352,13 +435,21 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
         </div>
       )}
 
-      <div className="flex items-center justify-end gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground text-xs underline"
+          disabled={submitting}
+          onClick={() => setFormMode((current) => (current === "url" ? "fresh" : "url"))}
+        >
+          {formMode === "url" ? "A new repo set from scratch" : "Use a git remote instead"}
+        </button>
         <button
           type="submit"
           className="bg-primary text-primary-foreground rounded-md px-2.5 py-1 text-xs disabled:opacity-50"
           disabled={!ready}
         >
-          {submitting ? (mode === "clone" ? "Cloning…" : "Creating…") : "Create project"}
+          {submitting ? (source.kind === "clone" ? "Cloning…" : "Creating…") : "Create project"}
         </button>
       </div>
       <p className="text-muted-foreground text-xs">
