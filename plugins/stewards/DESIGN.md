@@ -1641,9 +1641,14 @@ project picker popover in the live view (BB-181, matching the host's
 (needs-you rows first, then blocked), **In flight** (running before quiet),
 **Threads** (one-off threads, collapsed), **Monitors** (the `ops`, Dependabot
 and Sentry bindings, collapsed), **Recently ended** (collapsed), and the
-project steward demoted to one small row at the bottom. Every effort and thread
-row carries bb's own thread actions context menu, so archive, pin, rename,
-split and delete still work. Held and waiting stewards are ordinary rows
+project steward demoted to one small row at the bottom. Rows in the **Threads**
+section and their children carry bb's own thread actions context menu, so
+archive, pin, rename, split and delete still work on the user's own threads. An
+effort row, and the worker and reviewer rows nested under it, carries no thread
+actions (BB-202): the plugin owns those threads, so a hand-archive is undone by
+the next wake (`sendTo`), delete takes the descendants with the parent, rename
+is overwritten by the plugin's retitle, and pin and split do not apply. Held and
+waiting stewards are ordinary rows
 here: the plugin does not hide a thread between wakes (BB-93), so a steward
 waiting on someone else shows in **Blocked** or **In flight** rather than
 dropping out of the host's live feed.
@@ -1745,24 +1750,29 @@ page and overview polls, which have no named rows, never start one. Otherwise
 the sidebar's rows flashed over the Stewards page and thread pages on a phone
 for the length of the crossfade.
 
-**bb's row chrome and hover actions (BB-182).** Every row takes bb's own
-single-row height (`--bb-sidebar-row-height`, 2.5rem on coarse pointers via
+**bb's row chrome and hover actions (BB-182, BB-202).** Every row takes bb's
+own single-row height (`--bb-sidebar-row-height`, 2.5rem on coarse pointers via
 `--bb-sidebar-row-height-coarse`): a one-line thread row is exactly that tall,
 and the two-line effort row uses it as a minimum with `py-1`. Hover is bb's
 `hover:bg-sidebar-accent hover:text-sidebar-accent-foreground` and the selected
 row is `bg-state-active bb-sidebar-selected-row`, with the row text on
-`text-sidebar-foreground`. A row backed by a live thread also carries bb's two
-hover actions — the live thread's **Archive** action and its thread-actions
-menu, revealed by bb's `bb-sidebar-hover-actions-row` /
+`text-sidebar-foreground`. A **Threads** row backed by a live thread carries
+bb's two hover actions — the live thread's **Archive** action and its
+thread-actions menu, revealed by bb's `bb-sidebar-hover-actions-row` /
 `bb-sidebar-hover-actions` host classes and kept open while the menu is open —
 and the title reserves their width with `bb-sidebar-hover-actions-inset`
 (`--bb-sidebar-hover-actions-inset: calc(var(--spacing) * 15)` for the two
-actions) so it truncates instead of running under them. The wrapper is hidden
-where the pointer cannot hover, so touch keeps the context menu. A Recently
-ended row whose thread is gone has no hover actions, as before. The base left
-inset is bb's 8px (`pl-2`), nested worker and reviewer rows keep the 14px
-per-level indent, and the effort row's second line and its inline needs block
-are derived from the same title offset so they stay under the title.
+actions) so it truncates instead of running under them. An effort row and the
+worker and reviewer rows nested under it carry none (BB-202): the plugin owns
+those threads, so archive is undone by the next wake, delete takes the
+descendants, rename is overwritten by the plugin's retitle, and pin and split do
+not apply; those rows drop the inset reservation so the title gets the width
+back. The wrapper is hidden where the pointer cannot hover, so touch keeps the
+context menu. A Recently ended row whose thread is gone has no hover actions,
+as before. The base left inset is bb's 8px (`pl-2`), nested worker and reviewer
+rows keep the 14px per-level indent, and the effort row's second line and its
+inline needs block are derived from the same title offset so they stay under
+the title.
 
 **Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
