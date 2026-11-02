@@ -8679,21 +8679,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The binding that watches a pull request: the invoking thread's own when
      * there is one, a binding whose own entity is the pull request, or any open
      * binding in the project whose last snapshot links it. Null when none does.
+     * An explicit `project` (a `--project` lookup) resolves in that project
+     * alone and does not use the invoking thread's own binding, so a pull
+     * request in another project resolves from any thread.
      */
-    function bindingForPullRef(ref: { repo: string; number: number }, ctx: { threadId?: string; projectId?: string }): Binding | null {
+    function bindingForPullRef(ref: { repo: string; number: number }, ctx: { threadId?: string; projectId?: string }, project?: string): Binding | null {
+      const projectId = project ?? ctx.projectId;
       const key = `${ref.repo}#${ref.number}`;
       // A binding whose own entity is the pull request (a review or pr
       // binding) wins, so a worker asking about another binding's pull request
       // does not read its own binding's approvals.
-      const direct = store.find(key, ctx.projectId);
+      const direct = store.find(key, projectId);
       if (direct !== null && direct.endedAt === null) return direct;
-      if (ctx.threadId !== undefined) {
+      if (project === undefined && ctx.threadId !== undefined) {
         const worker = store.worker(ctx.threadId);
         const own = store.byThread(ctx.threadId) ?? (worker === null ? null : store.binding(worker.bindingId));
         if (own !== null && own.endedAt === null) return own;
       }
       const matches = (b: Binding) => b.lastSnapshot !== null && observedPulls(b, b.lastSnapshot).some((p) => (p.url ?? p.key) === key || p.key === key);
-      const candidates = ctx.projectId === undefined ? store.open() : store.open(ctx.projectId);
+      const candidates = projectId === undefined ? store.open() : store.open(projectId);
       return candidates.find(matches) ?? null;
     }
 
@@ -9121,7 +9125,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const ref = parsePullRef(input.positionals.ref);
               if (ref === null) throw new PluginCliError(`${JSON.stringify(input.positionals.ref)} is not a pull request (owner/repo#N).`, { code: "bad_ref" });
-              const b = bindingForPullRef(ref, ctx);
+              const b = bindingForPullRef(ref, ctx, input.options.project === undefined ? undefined : projectOf(input.options.project, ctx));
               if (b === null) throw new PluginCliError(`No binding watches ${ref.repo}#${ref.number}; pass --project or run from the thread that owns it.`, { code: "binding_not_found" });
               const pull = await readPullRef(ref);
               if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
@@ -9138,7 +9142,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const ref = parsePullRef(input.positionals.ref);
               if (ref === null) throw new PluginCliError(`${JSON.stringify(input.positionals.ref)} is not a pull request (owner/repo#N).`, { code: "bad_ref" });
-              const b = bindingForPullRef(ref, ctx);
+              const b = bindingForPullRef(ref, ctx, input.options.project === undefined ? undefined : projectOf(input.options.project, ctx));
               if (b === null) throw new PluginCliError(`No binding watches ${ref.repo}#${ref.number}; pass --project or run from the thread that owns it.`, { code: "binding_not_found" });
               const pull = await readPullRef(ref);
               if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
