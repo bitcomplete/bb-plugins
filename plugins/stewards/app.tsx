@@ -17,12 +17,10 @@ import {
   ThreadTitle,
   definePluginApp,
   experimental_Icon as Icon,
-  experimental_SidebarNavigationIcon as SidebarNavigationIcon,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
   experimental_ThreadActionsMenu as ThreadActionsMenu,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
   experimental_usePluginId,
-  experimental_useSidebarNavigation,
   experimental_useSidebarThreads,
   experimental_useThreadActions,
   useBbNavigate,
@@ -31,8 +29,7 @@ import {
   useSdk,
   useSidebarThreadDraft,
   useSidebarThreadRowStatus,
-  type ExperimentalBadge,
-  type ExperimentalSidebarNavigationItem,
+  type ExperimentalSidebarNavigationProps,
   type PluginSidebarThread,
   type PluginThreadActionTarget,
   type PluginThreadActionsTriggerProps,
@@ -2726,111 +2723,27 @@ function StewardsSidebar({ activeProjectId, activeThreadId, isCompactViewport, o
   );
 }
 
-// ---- The stewards navigation provider (BB-184) -------------------------------------------------
+// ---- The stewards navigation provider (BB-184, BB-198) -----------------------------------------
 
 /**
- * The stewards navigation provider (BB-184): while the stewards list is on,
- * draw bb's own navigation items in the user's saved order, except New thread.
- * The stewards list has its own compose button beside the project picker, so
- * the host row would be a second one; the `thread.new` shortcut, the home
- * screen and that button keep New thread reachable. Items the user hid stay
- * reachable under **More**. Drag-to-split, per-item menus and shortcut pills
- * belong to the host's Customize editor and Settings, so they are not drawn
- * here, and the deprecated `experimental_Original` is not rendered.
+ * The stewards navigation provider (BB-184, BB-198): a `rail`-placement
+ * provider that renders bb's own bundled Rail unchanged through the
+ * deprecated `experimental_Original`, so the user gets bb's navigation, not
+ * a list of items this plugin draws.
+ *
+ * The provider exists for one reason: with no `headerComponent`, the host
+ * draws no navigation header, and the Rail's New thread button — its only
+ * in-sidebar part — is gone. The stewards list has its own compose button
+ * beside the project picker, and the `thread.new` shortcut and the home page
+ * keep New thread reachable.
+ *
+ * `experimental_Original` is deprecated and scheduled for removal. When a
+ * `BB_REF` bump drops it, draw the icon column from
+ * `experimental_useSidebarNavigation` instead (the SDK's `goHome` action for
+ * Home, hidden items under More); see DESIGN.md, "The navigation provider".
  */
-const NEW_THREAD_ITEM_ID = "__bb__/new-thread";
-
-/**
- * The badge tone as the host's neutral/warning/critical colors. SDK 0.6.80
- * exports the `ExperimentalBadge` shape but no `experimental_Badge`
- * component, so the pill is drawn here; the row's accessible name carries
- * `badge.label`.
- */
-function NavigationBadge({ badge }: { badge: ExperimentalBadge }) {
-  const tone = badge.tone ?? "neutral";
-  const colors = tone === "critical" ? "bg-destructive/15 text-destructive" : tone === "warning" ? "bg-attention/15 text-attention" : "bg-state-hover text-muted-foreground";
-  const text = badge.count !== undefined ? (badge.count > 99 ? "99+" : String(badge.count)) : (badge.text ?? "•");
-  return <span aria-hidden="true" className={`ml-auto shrink-0 rounded-full px-1.5 py-0.5 text-[10px] leading-none ${colors}`}>{text}</span>;
-}
-
-/** One navigation row, shared by the list and the **More** menu. */
-function SidebarNavigationRow({ item, activeItemId, onActivate }: { item: ExperimentalSidebarNavigationItem; activeItemId: string | null; onActivate: (id: string) => void }) {
-  const active = item.id === activeItemId;
-  // The badge is decorative; its label carries its meaning to assistive tech.
-  const name = item.badge === null ? item.label : `${item.label} ${item.badge.label}`;
-  return (
-    <button
-      type="button"
-      data-navigation-item={item.id}
-      aria-current={active ? "page" : undefined}
-      aria-label={name}
-      aria-busy={item.isLoading || undefined}
-      disabled={item.isDisabled}
-      className={`flex w-full items-center gap-2 rounded-md px-2 text-left text-sm ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${active ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS} disabled:pointer-events-none disabled:opacity-50`}
-      onClick={() => onActivate(item.id)}
-    >
-      <SidebarNavigationIcon icon={item.icon} className="size-4 shrink-0" />
-      <span className="min-w-0 flex-1 truncate">{item.label}</span>
-      {item.badge === null ? null : <NavigationBadge badge={item.badge} />}
-    </button>
-  );
-}
-
-function StewardsNavigation() {
-  const { items, activeItemId, actions } = experimental_useSidebarNavigation();
-  const [moreOpen, setMoreOpen] = useState(false);
-  const scope = usePortalScopeProps();
-  const visible = items.filter((item) => item.isVisible && item.id !== NEW_THREAD_ITEM_ID);
-  const hidden = items.filter((item) => !item.isVisible && item.id !== NEW_THREAD_ITEM_ID);
-  const activate = (id: string) => actions.activate(id, { target: "current" });
-  return (
-    <div className="flex flex-col p-1">
-      <div className="flex flex-col gap-0.5">
-        {visible.map((item) => (
-          <SidebarNavigationRow key={item.id} item={item} activeItemId={activeItemId} onActivate={activate} />
-        ))}
-      </div>
-      {hidden.length > 0 ? (
-        <PopoverPrimitive.Root open={moreOpen} onOpenChange={setMoreOpen}>
-          <PopoverPrimitive.Trigger asChild>
-            <button
-              type="button"
-              aria-haspopup="menu"
-              className={`flex w-full items-center gap-2 rounded-md px-2 text-left text-sm ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${ROW_INTERACTIVE_CLASS}`}
-            >
-              <Icon name="MoreHorizontal" className="size-4 shrink-0" aria-hidden />
-              <span className="min-w-0 flex-1 truncate">More</span>
-            </button>
-          </PopoverPrimitive.Trigger>
-          <PopoverPrimitive.Portal>
-            <PopoverPrimitive.Content
-              {...scope}
-              align="start"
-              side="bottom"
-              sideOffset={4}
-              collisionPadding={8}
-              className="z-50 w-[var(--radix-popover-trigger-width)] min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
-            >
-              <div className="flex flex-col">
-                {hidden.map((item) => (
-                  <SidebarNavigationRow
-                    key={item.id}
-                    item={item}
-                    activeItemId={activeItemId}
-                    onActivate={(id) => {
-                      activate(id);
-                      setMoreOpen(false);
-                    }}
-                  />
-                ))}
-              </div>
-            </PopoverPrimitive.Content>
-          </PopoverPrimitive.Portal>
-        </PopoverPrimitive.Root>
-      ) : null}
-      <div role="separator" className="mx-2 my-1 border-t border-border" />
-    </div>
-  );
+function StewardsNavigation({ experimental_Original: Original }: ExperimentalSidebarNavigationProps) {
+  return <Original />;
 }
 
 // ---- The sidebar-footer toggle -----------------------------------------------------------------
@@ -3019,13 +2932,14 @@ export default definePluginApp((app) => {
     description: "Threads grouped by project and in-flight effort, with stages, workers and reviewers.",
     component: StewardsSidebar,
   });
-  // BB-184: while the stewards list is on, bb's navigation is drawn by this
-  // plugin too, so the host's New thread row can be dropped (the list has its
-  // own compose button). The footer toggle keeps the two preferences in step.
+  // BB-184, BB-198: while the stewards list is on, this rail-placement
+  // provider renders bb's own Rail through `experimental_Original`, with no
+  // header, so the rail's New thread button is dropped (the list has its own
+  // compose button). The footer toggle keeps the two preferences in step.
   app.slots.experimental_sidebarNavigation({
     id: "navigation",
     title: "Stewards",
-    placement: "list",
+    placement: "rail",
     component: StewardsNavigation,
   });
   // The footer disclosure that writes the provider preference, so the list

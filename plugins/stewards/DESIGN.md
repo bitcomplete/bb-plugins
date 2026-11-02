@@ -1874,30 +1874,34 @@ server-synced, so a flip is per server: every window of one bb server shows
 the same list. Each developer has their own server behind bb-gate, so it is
 per developer in practice.
 
-**The navigation provider (BB-184).** The host picks the sidebar's navigation
-from `sidebar.navigationProvider`, and an unset (`__automatic__`) value
-resolves to the first installed provider other than the bundled
+**The navigation provider (BB-184, BB-198).** The host picks the sidebar's
+navigation from `sidebar.navigationProvider`, and an unset (`__automatic__`)
+value resolves to the first installed provider other than the bundled
 `navigation/rail` — the stewards plugin's. To keep that from switching
 everyone the moment the image rolls, the load-time pin sets `navigation/rail`
 when the preference is unset or automatic, exactly as it pins the thread list;
-an explicit value is left alone. `app.tsx` registers a `list`-placement
+an explicit value is left alone. `app.tsx` registers a `rail`-placement
 `experimental_sidebarNavigation` provider (`id: "navigation"`, no
-`headerComponent`) that reads `experimental_useSidebarNavigation` and draws the
-host's items in the user's saved order, except New thread: the stewards list
-has its own compose button beside the project picker, so the host row would be
-a second one, and the `thread.new` shortcut, the home screen and that button
-keep New thread reachable. Hidden items stay reachable under **More**; a
-disabled item renders disabled, the active one carries `aria-current="page"`,
-and a badge's `label` joins the row's accessible name. Drag-to-split, per-item
-menus and shortcut pills stay with the host's Customize editor and Settings,
-and the deprecated `experimental_Original` is not rendered. Because the
-toggle writes both preferences, turning the list off restores the navigation
-the user had: on saves it in the plugin's store (a per-server
-`server_settings` row, through `stewardsSetNavigationRestore`); off restores
-the saved value, or `navigation/rail` when none is saved. The switch still
-reads as on from the thread-list key alone, so a list turned on from
-Settings → Appearance keeps bb's navigation until the user also picks
-"Stewards" there — a known gap.
+`headerComponent`) whose component renders the slot's deprecated
+`experimental_Original`, so the column is bb's own bundled Rail exactly: Home,
+Plugins, Skills, Automations, the plugin panels and More, with Settings drawn
+by the host at the bottom for rail placement. Because no `headerComponent` is
+registered, the host draws no navigation header (bb 0.48.1's
+`SidebarNavigationHeader` returns null and `SidebarTopReserveRow` gets no
+`headerSlot`), so the Rail's New thread button — its only in-sidebar part — is
+gone; the stewards list has its own compose button beside the project picker,
+and the `thread.new` shortcut and the home page keep New thread reachable.
+`experimental_Original` is deprecated and scheduled for removal. When a
+`BB_REF` bump drops it, draw the icon column from
+`experimental_useSidebarNavigation` instead (the SDK's `goHome` action for
+Home, hidden items under More); the provider and this section change in the
+same pull request. Because the toggle writes both preferences, turning the
+list off restores the navigation the user had: on saves it in the plugin's
+store (a per-server `server_settings` row, through
+`stewardsSetNavigationRestore`); off restores the saved value, or
+`navigation/rail` when none is saved. The switch still reads as on from the
+thread-list key alone, so a list turned on from Settings → Appearance keeps
+bb's navigation until the user also picks "Stewards" there — a known gap.
 
 
 
