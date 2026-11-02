@@ -241,7 +241,12 @@ plugin parse it, so keep its shape exact:
   ```sh
   gh pr review <n> --repo <repo> --approve|--request-changes|--comment --body-file <file>
   ```
-  Attach inline comments where a finding points at a changed line: post
+  The action follows the verdict and the lane: `changes-requested` →
+  `--request-changes`; `approved` on `lane=no-review` → `--approve`;
+  `approved` on `lane=owner-reviewed` → `--comment`, never `--approve`, so
+  the owner's account does not appear to have signed off before the owner
+  looked, and the plugin files the owner's Approve item. Attach inline
+  comments where a finding points at a changed line: post
   the review through the API (`gh api repos/<repo>/pulls/<n>/reviews
   --method POST --input <json>`) with `commit_id` set to the head you
   reviewed and `comments` as `[{ path, line, side: "RIGHT", body }]`;
@@ -277,9 +282,9 @@ down to the project steward or to no-review.
 
 In both modes your verdict is the reviewer's, not the owner's approval:
 the owner's approval is an unsigned review or comment from the owner's
-account, and your post is signed, so on the owner lane the owner still
-approves after you. A teammate's `gh pr review --approve` is a signed
-review, so it does not close the owner gate either.
+account, and your post is signed. On the owner lane a teammate's review is
+`--comment`, so it does not read as the owner's sign-off and the owner still
+approves after you.
 
 On `owner-reviewed`, put the decision in the owner-review line in the
 round that first assigns the lane and again in the round whose verdict is

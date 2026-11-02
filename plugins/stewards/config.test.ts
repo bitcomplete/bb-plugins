@@ -272,6 +272,7 @@ describe("playbooks", () => {
     // The review body opens with the round marker, and the marker's shape is stated.
     expect(reviews.value.general).toMatch(/review body opens with the round's marker\s+on its first line/u);
     expect(reviews.value.general).toMatch(/<!-- bb-review round=<N>/u);
+    expect(reviews.value.general).toMatch(/approver=<owner\|project>/u);
   });
 
   it("maps states to phases and stages, ignoring case, and splits sections", () => {

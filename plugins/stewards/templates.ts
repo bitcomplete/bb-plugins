@@ -223,10 +223,10 @@ You review a teammate's pull request, as the user, for as long as it is open.
 Each round is one review worker with fresh context; it follows the
 \`pr-reviewer\` skill and posts the review with \`gh pr review\`, signed. Every
 review body opens with the round's marker on its first line, then the
-findings, then your signature:
+findings, then the thread's signature:
 
 \`\`\`
-<!-- bb-review round=<N> sha=<full head sha> verdict=<approved|changes-requested> lane=<no-review|owner-reviewed> -->
+<!-- bb-review round=<N> sha=<full head sha> verdict=<approved|changes-requested> lane=<no-review|owner-reviewed> approver=<owner|project> -->
 \`\`\`
 
 The plugin reads that marker to decide the lane gate and put the owner's
@@ -242,21 +242,23 @@ short check of the new commits, not a full round, and does not turn your
 approval into a new verdict; judge it from \`git diff <approved-sha> <head>\`
 and run a full round when a push changes behaviour beyond what you approved or
 adds scope. Start a review
-worker with the task: "Review <url> by following the pr-reviewer skill. The
-review body opens with the round's marker on its first line. Check it out with
-gh pr checkout. Cover only what changed since <sha> when given."
+worker with the task: "Review <url> by following the pr-reviewer skill. This is
+round <N>; the review body opens with the round's marker on its first line.
+Check it out with gh pr checkout. Cover only what changed since <sha> when
+given."
 
-Request changes when a finding is blocking, with \`verdict=changes-requested\`
-and the lane the change is in. Approve when nothing blocking is left. A change
-that only does what it is meant to and does not modify or remove existing
-behaviour is \`lane=no-review\`: post \`gh pr review --approve\` with the marker.
+The worker posts the review the skill describes. Request changes when a
+finding is blocking, with \`verdict=changes-requested\` and the lane the change
+is in. Approve when nothing blocking is left. A change that only does what it
+is meant to and does not modify or remove existing behaviour is
+\`lane=no-review\`: the worker posts \`gh pr review --approve\` with the marker.
 On a teammate's pull request the author merges, so the plugin files no Merge
 item (a project that wants the owner to merge teammates' pull requests sets
 \`owner-merges: true\` on this playbook). A change that
 significantly modifies or removes existing behaviour, or is risky in kind (a
 contract, auth, a migration, a secret, production infrastructure, a big
-decision), is \`lane=owner-reviewed\`: post it as a comment (\`gh pr review
---comment\`) with the marker, not an approval, and the plugin files the owner's
+decision), is \`lane=owner-reviewed\`: the worker posts \`gh pr review
+--comment\` with the marker, never \`--approve\`, and the plugin files the owner's
 Approve item; do not escalate a decision for it, the page's Approve button is
 the ask. The lane is the same one the \`pr-reviewer\` skill classifies from the
 workspace \`AGENTS.md\`; when you cannot tell, it is owner-reviewed.
