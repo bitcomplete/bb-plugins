@@ -150,9 +150,9 @@ Two tools are yours; everything else you do with the tools every thread has.
   sees as a worker question. `bb thread interactions list <worker-id>` shows
   it, and `bb thread interactions answer <interactionId> <worker-id>
   --choice <questionId=value>` (or `--text <questionId=text>`) answers it.
-  Every playbook tells a worker never to open one, so a worker that does has
-  ignored its task; when you cannot answer the question yourself, tell the
-  user.
+  The worker playbooks tell a worker never to open one, so a worker that
+  does has ignored its task; when you cannot answer the question yourself,
+  tell the user.
 - **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
   `linear_create_issue` sign for you: add no signature to what you pass
   them. With `gh`, end what you write with

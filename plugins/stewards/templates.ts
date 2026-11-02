@@ -14,12 +14,21 @@ const SECRET_REQUEST =
 
 /**
  * Every playbook that can start a worker carries this, next to its other
- * worker instructions: the interactive question tool parks the thread until a
- * person clicks, and nobody watches a worker thread. A question goes to the
- * steward as an escalation instead.
+ * worker instructions. It is the steward's text, so it is addressed to the
+ * steward and tells it what the worker's task must say: the interactive
+ * question tool parks the worker until a person clicks, and nobody watches a
+ * worker thread.
  */
 const WORKER_QUESTIONS =
-  "Never use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click): it parks the thread until a person answers, and nobody watches a worker. A decision you cannot make goes to your steward with `bb stewards escalate \"<one-line question, under 240 characters>\" --context \"<evidence and options>\"` — one question per escalation, `--meanwhile wait` by default — or, if that command is unavailable, as a comment on the ticket or pull request you were given and in your final message; then end the turn.";
+  "Never let a worker use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click): it parks the worker until a person clicks, and nobody watches a worker thread. A worker's task must say that a decision the worker cannot make goes to you with `bb stewards escalate \"<one-line question, under 240 characters>\" --context \"<evidence and options>\"` — one question per escalation, `--meanwhile wait` by default — or, if that command is unavailable, as a comment on the ticket or pull request it was given and in its final message, then end the turn.";
+
+/**
+ * The ops playbooks start no workers, so theirs is the steward's own rule: it
+ * must not park itself on the interactive question tool either, and it
+ * escalates with `steward_report` rather than `bb stewards escalate`.
+ */
+const OPS_QUESTIONS =
+  "Never use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click) yourself: it parks the thread until a person clicks, and nobody watches an ops steward. Raise a decision you cannot make with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, one question per escalation.";
 
 /**
  * A build-time blocker is a `decision` in the same turn, never a follow-up,
@@ -321,7 +330,7 @@ when a service is degraded or an error hits many users, medium otherwise.
 Search the team for an open ticket about the same problem first
 (linear_search), and comment there instead of filing a second one.
 
-${WORKER_QUESTIONS}
+${OPS_QUESTIONS}
 
 ## New
 
@@ -391,7 +400,7 @@ comment there instead of filing a second one. A fixed or dismissed alert is
 trimmed from its ticket's list; a ticket with no alerts left is moved to Done
 with a comment saying why.
 
-${WORKER_QUESTIONS}
+${OPS_QUESTIONS}
 
 ## New
 

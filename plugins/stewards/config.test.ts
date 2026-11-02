@@ -223,21 +223,28 @@ describe("playbooks", () => {
   });
 
   it("tells every default playbook never to use the interactive question tool and to escalate instead (BB-199)", () => {
-    const playbooks: [string, string][] = [
+    const workers: [string, string][] = [
       ["linear-tickets", LINEAR_TICKETS],
       ["github-prs", GITHUB_PRS],
       ["github-reviews", GITHUB_REVIEWS],
-      ["ops-watch", OPS_WATCH],
-      ["deps-alerts", DEPS_ALERTS],
       ["deps-prs", DEPS_PRS],
     ];
-    for (const [name, raw] of playbooks) {
-      expect(raw, name).toMatch(/Never use the interactive question tool/u);
+    for (const [name, raw] of workers) {
+      expect(raw, name).toMatch(/interactive question tool/u);
       expect(raw, name).toMatch(/`AskUserQuestion`/u);
+      expect(raw, name).toMatch(/A worker's task must say/u);
       expect(raw, name).toMatch(/bb stewards escalate/u);
       expect(raw, name).toMatch(/--context/u);
       expect(raw, name).toMatch(/--meanwhile wait/u);
-      expect(raw, name).toMatch(/comment on the ticket or pull request you were given/u);
+    }
+    const ops: [string, string][] = [
+      ["ops-watch", OPS_WATCH],
+      ["deps-alerts", DEPS_ALERTS],
+    ];
+    for (const [name, raw] of ops) {
+      expect(raw, name).toMatch(/interactive question tool/u);
+      expect(raw, name).toMatch(/`AskUserQuestion`/u);
+      expect(raw, name).toMatch(/steward_report \{ escalate/u);
     }
     const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!linear.ok) throw new Error(linear.error);
