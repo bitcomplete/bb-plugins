@@ -689,25 +689,57 @@ describe("a worker's pending model check", () => {
   });
 });
 
-describe("the lost-hand-off phrase the store rings on (BB-152)", () => {
-  const status = (waitingOn: string | null) => ({ phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const, waitingOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1_000 });
+describe("the status ring (BB-152, BB-205)", () => {
+  const status = (over: { waitingOn?: string | null; summary?: string; nextAction?: string } = {}) => ({
+    phase: "In Progress",
+    summary: over.summary ?? "Waiting.",
+    nextAction: over.nextAction ?? "Wait",
+    actor: "other" as const,
+    waitingOn: over.waitingOn ?? null,
+    requeueAfterMs: null,
+    conditions: [],
+    resources: { workers: [], pullRequests: [], children: [] },
+    at: 1_000,
+  });
 
-  it("rings when a status write makes waitingOn name a finished worker", () => {
+  function ring() {
     const db = new Database(":memory:");
     for (const sql of MIGRATIONS) db.exec(sql);
     const columns: string[] = [];
     const s = createStore(db, () => 1_000, { onProjectChange: (_projectId, cols) => columns.push(...cols) });
     const b = s.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "Fix login", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "In Progress", stage: "build" });
+    return { s, b, columns };
+  }
+
+  it("rings on a status write that changes only summary, nextAction or waitingOn (BB-205)", () => {
+    const { s, b, columns } = ring();
+    s.patch(b.id, { status: status() });
+    for (const [field, value] of [["summary", "Building."], ["nextAction", "Watch CI"], ["waitingOn", "the reviewer"]] as const) {
+      columns.length = 0;
+      s.patch(b.id, { status: status({ [field]: value }) });
+      expect(columns, field).toContain("status");
+    }
+  });
+
+  it("rings when a status write makes waitingOn name a finished worker (BB-152)", () => {
+    const { s, b, columns } = ring();
     s.addWorker("thr_w1", b.id, "ENG-12: Implement");
     s.setWorker("thr_w1", "finished", "Merged acme/web#7.");
-    // A report waiting on the reviewer is not a lost hand-off, so after it the
-    // channel is quiet until the phrase actually changes.
-    s.patch(b.id, { status: status("the reviewer") });
+    // A report waiting on the reviewer rings, and then the channel is quiet
+    // until the next status write.
+    s.patch(b.id, { status: status({ waitingOn: "the reviewer" }) });
     columns.length = 0;
-    // Naming the finished worker changes the phrase to the lost hand-off, so
-    // the status write rings the refetch.
-    s.patch(b.id, { status: status("worker thr_w1 (merge)") });
+    // Naming the finished worker is the lost hand-off, so the write rings too.
+    s.patch(b.id, { status: status({ waitingOn: "worker thr_w1 (merge)" }) });
     expect(columns).toContain("status");
+  });
+
+  it("stays silent when a status write sets the value it already had", () => {
+    const { s, b, columns } = ring();
+    s.patch(b.id, { status: status() });
+    columns.length = 0;
+    s.patch(b.id, { status: status() });
+    expect(columns).toEqual([]);
   });
 });
 

@@ -1276,3 +1276,185 @@ describe("the Stewards page's Provide navigation (BB-177)", () => {
     slot.lifecycle.unmount();
   });
 });
+
+// BB-205: the board page shows how old its data is, retries a failed fetch on
+// a backoff, and refetches when the page wakes.
+describe("the Stewards page's data age and refresh (BB-205)", () => {
+  const boardPayload = () => ({
+    projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+    board: {
+      projectId: "p1",
+      name: "Acme",
+      enabled: true,
+      paused: false,
+      projectStewardThreadId: null,
+      stages: [],
+      digest: null,
+      questions: [],
+      withUser: [],
+      needs: [],
+      lessons: [],
+      lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+      stewards: [],
+      stuck: [],
+      ended: [],
+    },
+  });
+
+  const renderBoardRpc = async (handler: () => unknown): Promise<RenderedSlot> => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    return renderSlot(panel, { subPath: "" }, { rpc: { stewardsBoard: handler } } as never);
+  };
+
+  it("shows the data's age when it is stale", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    let calls = 0;
+    vi.useFakeTimers();
+    try {
+      const slot = renderSlot(panel, { subPath: "" }, {
+        rpc: {
+          stewardsBoard: () => {
+            calls += 1;
+            return calls === 1 ? boardPayload() : new Promise(() => {});
+          },
+        },
+      } as never);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(1);
+      expect(slot.queryByText(/Updated/u)).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(slot.getByText(/Updated 2m ago · refreshing/u)).toBeTruthy();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the failure banner, retries on a backoff and clears when a fetch succeeds", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    let calls = 0;
+    vi.useFakeTimers();
+    try {
+      const slot = renderSlot(panel, { subPath: "" }, {
+        rpc: {
+          stewardsBoard: () => {
+            calls += 1;
+            if (calls === 1 || calls >= 4) return boardPayload();
+            throw new Error("offline");
+          },
+        },
+      } as never);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(1);
+      expect(slot.queryByText(/Refresh failed/u)).toBeNull();
+      // A realtime signal refetches after the debounce; this one fails.
+      await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(calls).toBe(2);
+      expect(slot.getByText(/Refresh failed, retrying/u)).toBeTruthy();
+      // The first retry is 1 s after the failure, and it fails too.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(calls).toBe(3);
+      expect(slot.getByText(/Refresh failed, retrying/u)).toBeTruthy();
+      // The second retry is 2 s later, and it succeeds, clearing the banner.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(calls).toBe(4);
+      expect(slot.queryByText(/Refresh failed/u)).toBeNull();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the real age after a resume, without waiting for the minute tick", async () => {
+    await loadApp();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-02T12:00:00Z"));
+    try {
+      let calls = 0;
+      const slot = await renderBoardRpc(() => {
+        calls += 1;
+        if (calls === 1) return boardPayload();
+        throw new Error("offline");
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(1);
+      expect(slot.queryByText(/Updated/u)).toBeNull();
+      // The page was suspended for 24 minutes: the clock moves but no timer
+      // fires, so only a wake handler can refresh the age.
+      vi.setSystemTime(new Date("2026-11-02T12:24:00Z"));
+      act(() => {
+        window.dispatchEvent(new Event("pageshow"));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(slot.getByText(/updated 24m ago/u)).toBeTruthy();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refetches on pageshow, focus and online, not just the poll", async () => {
+    let calls = 0;
+    const slot = await renderBoardRpc(() => {
+      calls += 1;
+      return boardPayload();
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    act(() => {
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    await waitFor(() => expect(calls).toBe(2));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(calls).toBe(3));
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await waitFor(() => expect(calls).toBe(4));
+    slot.lifecycle.unmount();
+  });
+
+  it("advances a Reported ago label once a minute with no data change", async () => {
+    await loadApp();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-02T12:00:00Z"));
+    try {
+      const slot = await renderBoardWith({
+        subPath: "p1/ENG-1",
+        stewards: [boardSteward({ key: "ENG-1", title: "Fix login", statusAt: Date.parse("2026-11-02T11:59:00Z") })],
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(slot.getByText(/Reported 1m ago/u)).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(slot.getByText(/Reported 2m ago/u)).toBeTruthy();
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -9,7 +9,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { effortPhrase } from "./sidebar.js";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
@@ -834,12 +833,14 @@ export type BindingPatch = Partial<Pick<Binding, keyof typeof COLUMNS>>;
 
 /**
  * The binding columns the sidebar, the board and the overview show (BB-90).
- * `patch` rings the realtime channel only when one of these actually changed
- * before and after, and `status` / `pending` only when the row's derived phrase
- * (`sidebar.ts` rules) changed too (BB-95); a write to `lastJudgmentAt`,
- * `lastSnapshot`, `wokeAt`, `awaitingReport`, `missedReports`, `archiveWhenIdle`,
- * `advancedAt`, a model-check flag or the like changes nothing a page renders
- * and stays silent, as does setting a field to the value it already had.
+ * `patch` rings the realtime channel when one of these actually changed before
+ * and after (BB-205 dropped the BB-95 phrase gate on `status`/`pending`: a
+ * report that changes only its summary, next action or `waitingOn` is still a
+ * visible change, and writes are already coalesced per steward turn and
+ * debounced on the client); a write to `lastJudgmentAt`, `lastSnapshot`,
+ * `wokeAt`, `awaitingReport`, `missedReports`, `archiveWhenIdle`, `advancedAt`,
+ * a model-check flag or the like changes nothing a page renders and stays
+ * silent, as does setting a field to the value it already had.
  */
 const VISIBLE_COLUMNS = [
   "stage",
@@ -1441,51 +1442,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
     return b === undefined ? null : String(b.project_id);
   }
 
-  /**
-   * Whether the row would show "needs you" (BB-76). Mirrors server.ts's
-   * `needsUser`, since a `status`/`pending` write can only ring when it changes
-   * the row's derived phrase, and "needs you" is the first rule.
-   */
-  function needsUserFor(b: Binding): boolean {
-    return (
-      b.status?.actor === "user" ||
-      openEscalations.all(b.id).length > 0 ||
-      needsFor.all(b.id, 0).length > 0 ||
-      openQuestions.all(b.projectId).some((q) => q.binding_id === b.id)
-    );
-  }
-
-  /**
-   * The phrase the sidebar row shows for a binding, from the rules in
-   * `sidebar.ts` (BB-76). A `status` or `pending` write rings the refetch
-   * channel only when this changes, so a rewrite that reads the same stays
-   * silent (BB-95). `now` is the clock for a `next look` phrase.
-   */
-  function bindingPhrase(b: Binding, now: number): string {
-    const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
-    return effortPhrase(
-      {
-        busy: false,
-        runningWorkers: 0,
-        needsUser: needsUserFor(b),
-        hold: b.hold,
-        holdBehind: b.holdBehind,
-        stuck: openEscalations.all(b.id).some((x) => x.kind === "stuck"),
-        statusActor: b.status?.actor ?? null,
-        statusNextAction: b.status?.nextAction ?? null,
-        deployment: newestDeployment === null ? null : newestDeployment.state,
-        pending: b.pending,
-        requeueAt: b.requeueAt,
-        waitingOn: b.status?.waitingOn ?? null,
-        noWakeSource: b.noWakeSource,
-        // The lost-hand-off phrase (BB-152) reads the worker statuses, so the
-        // ring must too; the query is one indexed row set per status write.
-        workers: workersFor.all(b.id).map(toWorker),
-      },
-      now,
-    );
-  }
-
   // A project-visible change is coalesced: within one synchronous store
   // operation (a nested write publishes once), and across a whole steward turn
   // when one is wrapped in `coalescingTurn`, so a turn that reports status,
@@ -1655,19 +1611,13 @@ export function createStore(db: Database.Database, now: () => number, options: S
     // and a same-value write change nothing visible and stay silent. Ending or
     // reopening a binding is covered here too: endedAt is one of these fields,
     // so its needs and with-user escalations leave or return with the signal.
-    // `status` and `pending` change on almost every turn, so they ring only
-    // when the row's derived phrase (`sidebar.ts` rules) actually changed
-    // (BB-95).
+    // `status` and `pending` ring like any other visible column (BB-205): a
+    // report that changes only the summary, next action or `waitingOn` is
+    // visible, and the turn-level coalescing plus the client's debounce keep
+    // the refetch bounded.
     if (before !== undefined) {
       const changed = VISIBLE_COLUMNS.filter((c) => before[c] !== after[c]);
-      if (changed.length > 0) {
-        const phraseGated = changed.every((c) => c === "status" || c === "pending");
-        if (!phraseGated) projectChanged(b.projectId, changed);
-        else {
-          const at = now();
-          if (bindingPhrase(rowToBinding(before), at) !== bindingPhrase(b, at)) projectChanged(b.projectId, changed);
-        }
-      }
+      if (changed.length > 0) projectChanged(b.projectId, changed);
     }
     return b;
   }
