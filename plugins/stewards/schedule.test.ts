@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { issue, pull } from "./fixtures.js";
-import { allPullsMerged, atWork, conflictsOf, normalizeTouches, touchesOverlap } from "./schedule.js";
+import { allPullsMerged, atWork, conflictsOf, normalizeTouches, openPull, touchesOverlap } from "./schedule.js";
 import { MIGRATIONS, createStore, type Binding } from "./store.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
@@ -28,6 +28,11 @@ describe("touches", () => {
     expect(touchesOverlap(["web/src/login/form.ts"], ["web"])).toEqual(["web/src/login/form.ts"]);
     expect(touchesOverlap(["web/src"], ["web/srcs", "api/src"])).toEqual([]);
     expect(touchesOverlap(["bb-plugins/plugins/stewards", "bb-gate"], ["bb-gate/docker", "bb-plugins/plugins/linear"])).toEqual(["bb-gate/docker"]);
+  });
+
+  it("do not overlap two different files in one directory (BB-215)", () => {
+    expect(touchesOverlap(["plugins/stewards/schedule.ts"], ["plugins/stewards/wake.ts"])).toEqual([]);
+    expect(touchesOverlap(["plugins/stewards/schedule.ts"], ["plugins/stewards"])).toEqual(["plugins/stewards/schedule.ts"]);
   });
 
   it("overlap across the repo-prefixed and native repo-relative forms (BB-107)", () => {
@@ -81,5 +86,19 @@ describe("conflicts", () => {
     const pr = { ...ticket, kind: "pr" as const };
     expect(allPullsMerged(pr, { entity: pull({}, { merged: true }), pulls: [] })).toBe(true);
     expect(allPullsMerged(pr, { entity: pull(), pulls: [] })).toBe(false);
+  });
+
+  it("find the open pull request a stack-wait waits for, with its head branch (BB-215)", () => {
+    const { bind } = world();
+    const ticket = bind("ENG-1");
+    const open = pull({ key: "acme/web#7" }, { head: "feature-login", merged: false });
+    expect(openPull(ticket, { entity: issue(), pulls: [open] })).toEqual({ key: "acme/web#7", head: "feature-login" });
+    // Merged or closed is not open; neither is a ticket with no pull request yet.
+    expect(openPull(ticket, { entity: issue(), pulls: [pull({ key: "acme/web#8" }, { merged: true })] })).toBeNull();
+    expect(openPull(ticket, { entity: issue(), pulls: [pull({ key: "acme/web#9", state: "closed" })] })).toBeNull();
+    expect(openPull(ticket, { entity: issue(), pulls: [] })).toBeNull();
+    // A pr binding's own open entity is its pull request.
+    const pr = { ...bind("acme/web#7"), kind: "pr" as const };
+    expect(openPull(pr, { entity: pull({ key: "acme/web#7" }, { head: "feature-login" }), pulls: [] })).toEqual({ key: "acme/web#7", head: "feature-login" });
   });
 });

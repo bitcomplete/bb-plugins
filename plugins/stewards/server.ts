@@ -104,7 +104,7 @@ import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, 
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
-import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
+import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
@@ -594,6 +594,8 @@ export const rpcContract = defineRpcContract({
               hold: z.string().nullable(),
               /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
               holdBehind: z.array(z.string()),
+              /** Entity keys this stack-wait waits for a pull request to open (BB-215). */
+              holdStack: z.array(z.string()),
               /** Something waits on the user, so the shared BB-78 row is yellow. */
               needsUser: z.boolean(),
               /** An open `stuck` escalation: the row is blocked (BB-78). */
@@ -714,6 +716,8 @@ export const rpcContract = defineRpcContract({
               hold: z.string().nullable(),
               /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
               holdBehind: z.array(z.string()),
+              /** Entity keys this stack-wait waits for a pull request to open (BB-215). */
+              holdStack: z.array(z.string()),
               /** Something waits on the user: the row is yellow and the card shows its items (BB-78). */
               needsUser: z.boolean(),
               /** An open `stuck` escalation: the row is blocked (BB-78). */
@@ -795,6 +799,8 @@ export const rpcContract = defineRpcContract({
           hold: z.string().nullable(),
           /** Entity keys this hold waits behind, for `held behind <keys>`. */
           holdBehind: z.array(z.string()),
+          /** Entity keys this stack-wait waits for a pull request to open (BB-215). */
+          holdStack: z.array(z.string()),
           waitingOn: z.string().nullable(),
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
@@ -2013,6 +2019,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const sources: WakeSourceInput = {
         hold: b.hold,
         holdBehind: b.holdBehind,
+        holdStack: b.holdStack,
         deployments: b.deployments,
         runningWorkers: store.workers(b.id).filter((w) => w.status === "running").length,
         openEscalations: store.openEscalations(b.id).length,
@@ -2987,7 +2994,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let deployments = b.deployments;
       if (deployTargets.length > 0) {
         const beforeDeploy = deployments;
-        deployments = recordMerged(deployments, observed, deployTargets, now());
+        // BB-215: a stacked pull request whose ticket reported the base pull
+        // request it landed in is carried by the base's merge on the default
+        // branch, because a squash rewrote the stacked merge. Read the base
+        // fresh so the watch re-points as soon as the base merges.
+        let landedOverride: { mergeSha: string | null; prRepo: string; files: string[] } | null = null;
+        if (b.landedIn !== null) {
+          const base = await snapshot("github", b.landedIn).catch(() => null);
+          if (base !== null && base.pull !== null && base.pull.merged) landedOverride = { mergeSha: base.pull.mergeCommit ?? null, prRepo: base.unit, files: base.pull.files ?? [] };
+        }
+        deployments = recordMerged(deployments, observed, deployTargets, now(), () => landedOverride);
         if (deployments !== beforeDeploy) {
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
           // A reconcile can also only drop a not-applicable watch (BB-132
@@ -3262,6 +3278,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           for (const t of targets) await releaseBehind(t, howFinished(t));
           b = store.binding(b.id) ?? b;
         }
+      }
+      // BB-215: a stack-wait lifts the moment the work it waits for opens a
+      // pull request, not when it merges. Both directions are checked here:
+      // this binding's own open pull request releases its waiters, and this
+      // binding's own stack-wait releases if its targets already have one
+      // (level-triggered, so a hold placed after the pull request opened lifts
+      // on the next look rather than at an edge that has already passed).
+      if (openPull(b, observed) !== null) await releaseStack(b, observed);
+      if (b.holdStack.length > 0) {
+        const projectId = b.projectId;
+        const targets = b.holdStack.map((k) => store.find(k, projectId)).filter((t): t is Binding => t !== null);
+        for (const t of targets) if (t.lastSnapshot !== null) await releaseStack(t, t.lastSnapshot);
+        b = store.binding(b.id) ?? b;
       }
       const scheduling = await syncScheduleRequest(b, playbook);
       // BB-55: the start-now backstop is queued by the report that passed the
@@ -5318,13 +5347,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       cleared(false);
       store.patch(b.id, { scheduleAsked: keys });
-      const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}; ${pullFacts(c.with, c.observed, c.complete)}) on ${c.on.join(", ")}`).join("; ");
+      const overlap = conflicts
+        .map((c) => {
+          const open = c.observed === null ? null : openPull(c.with, c.observed);
+          const stack = open === null ? "" : `; its pull request ${open.key}${open.head === null || open.head === "" ? "" : ` is open on ${open.head}`}`;
+          return `${c.with.entityKey} (${c.with.phase ?? "?"}; ${pullFacts(c.with, c.observed, c.complete)}) on the overlapping files ${c.on.join(", ")}${stack}`;
+        })
+        .join("; ");
       const x = store.escalate({
         bindingId: b.id,
         kind: "schedule",
         question:
-          `Schedule ${b.entityKey}${b.title === null ? "" : ` (${b.title})`}? Its ready gate has passed, and it touches what is already being changed by ${overlap}. ` +
-          `Hold it behind that work with steward_update { binding: "${b.entityKey}", hold: "<why>", behind: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, and it starts by itself once ${keys.length === 1 ? "that ticket's pull requests merge or it ends" : "their pull requests merge or they end"}; or let it start now with steward_update { binding: "${b.entityKey}", guidance: "Start now: <why>", resolve: "<this escalation>" }.`,
+          `Schedule ${b.entityKey}${b.title === null ? "" : ` (${b.title})`}? Its ready gate has passed, and it overlaps at file level with what is already being changed by ${overlap}. ` +
+          `Hold it behind that work with steward_update { binding: "${b.entityKey}", hold: "<why>", behind: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, and it starts by itself once ${keys.length === 1 ? "that ticket's pull requests merge or it ends" : "their pull requests merge or they end"}; ` +
+          `stack it with steward_update { binding: "${b.entityKey}", hold: "<why>", stack: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, and it starts by itself, branched from that pull request, as soon as it opens; ` +
+          `when an earlier pull request is already open, let it start stacked with steward_update { binding: "${b.entityKey}", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" }; ` +
+          `or let it start now with steward_update { binding: "${b.entityKey}", guidance: "Start now: <why>", resolve: "<this escalation>" }.`,
         meanwhile: "Waiting: no implementation workers start until it is scheduled.",
         route: "project",
         recommendation: null,
@@ -5401,6 +5439,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     const shortSha = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
+
+    /**
+     * The work a stack-wait waits for now has an open pull request (BB-215):
+     * lift the wait and wake the waiting steward with the pull request's key
+     * and head branch, so it branches from that branch and opens its own pull
+     * request with that branch as the base. A `behind` hold lifts when its
+     * target merges or ends; this one lifts the moment the pull request opens,
+     * which is what lets a stacked ticket start before the base lands.
+     */
+    async function releaseStack(target: Binding, observed: Observed): Promise<void> {
+      const open = openPull(target, observed);
+      if (open === null) return;
+      const key = lc(target.entityKey);
+      const waiting = store.open(target.projectId).filter((h) => h.id !== target.id && h.holdStack.some((k) => lc(k) === key));
+      if (waiting.length === 0) return;
+      const branch = open.head === null || open.head === "" ? "(its head branch)" : open.head;
+      for (const h of waiting) {
+        const rest = h.holdStack.filter((k) => lc(k) !== key);
+        if (rest.length > 0) {
+          store.patch(h.id, { holdStack: rest });
+          store.note(h.id, `${target.entityKey}'s pull request ${open.key} is open on ${branch}; your stack-wait stays until ${rest.join(", ")} ${rest.length === 1 ? "also has one" : "also have one"}.`, true);
+          continue;
+        }
+        store.patch(h.id, { hold: null, holdStack: [] });
+        store.note(h.id, `Stack-wait lifted: ${target.entityKey}'s pull request ${open.key} is open on ${branch}. Start now, branch from ${branch} with that branch as PR base.`);
+        scheduleReconcile(h.id);
+      }
+      bb.log.info(`stewards: ${target.entityKey}'s pull request ${open.key} is open; released the stack-wait on ${waiting.map((h) => h.entityKey).join(", ")}`);
+    }
 
     /**
      * The approval helpers bound to this server's store, GitHub writer and
@@ -6479,6 +6546,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
+              holdStack: b.holdStack,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
@@ -6578,6 +6646,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
+              holdStack: b.holdStack,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               // The newest deployment watch, whatever its state; `merged` reads as deploying.
@@ -6672,6 +6741,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               threadId: b.threadId,
               hold: b.hold,
               holdBehind: b.holdBehind,
+              holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
               needsUser: needsUser(b),
@@ -7265,7 +7335,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .array(z.string().trim().min(1).max(200))
           .max(40)
           .optional()
-          .describe('The repo-relative paths this work changes, repo directory first ("bb-plugins/plugins/stewards", "bb-gate/docker/bb-server"); the whole set, replacing what was reported before. The project steward schedules tickets that touch the same paths one after another. Report it once the spec names the affected repos; refine it as pull requests open.'),
+          .describe('The repo-relative files this work changes, repo directory first ("bb-plugins/plugins/stewards/wake.ts", "bb-gate/docker/bb-server/Dockerfile"); the whole set, replacing what was reported before. A directory is accepted and counts as every file under it. The project steward schedules tickets whose files overlap one after another, and stacks a ticket on a pull request still being built. Report it once the spec names the affected repos; refine it as pull requests open.'),
         cites: z
           .array(z.string().trim().min(1).max(100))
           .max(20)
@@ -7282,6 +7352,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(500)
           .optional()
           .describe('Pull-request stewards: the open pull request that replaces this one (owner/repo#N or its URL), opened on its own branch when this one could not merge as is. The binding moves to it: the gate, the Merge item and every later wake are about the replacement, and this pull request is closed by whoever opened the replacement. Report it once, as soon as the replacement is open.'),
+        landedIn: z
+          .string()
+          .trim()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe('Ticket stewards: the base pull request (owner/repo#N or its URL) a stacked pull request landed in, when its own merge went into that pull request\'s branch rather than the default branch. The deployment carries-check then follows the base pull request\'s merge on the default branch, because a squash rewrote the stacked merge. Report it once the stacked pull request has merged into the base branch.'),
         needs: z
           .array(
             z.object({
@@ -7382,6 +7459,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             replacedNote = ` ${moved.binding.entityKey} replaces ${b.entityKey}: the gate, the Merge item and your wakes now follow it.`;
             b = moved.binding;
           }
+          // A stacked pull request that landed in a base pull request names it
+          // so the deployment carries-check follows that merge (BB-215).
+          const landedIn = input.landedIn === undefined ? undefined : parsePullRef(input.landedIn);
+          if (input.landedIn !== undefined && landedIn === null) return toolError(new Error(`landedIn must name a pull request as owner/repo#N or its URL; ${JSON.stringify(input.landedIn)} does not.`));
           // The gate as it stood before this report, so the reply can tell a
           // report that just passed it from one that finds it already passed.
           const priorReady = b.ready;
@@ -7514,6 +7595,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
             ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
+            ...(landedIn === undefined || landedIn === null ? {} : { landedIn: `${landedIn.repo}#${landedIn.number}` }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
@@ -7732,6 +7814,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(10)
           .optional()
           .describe("With hold: the open bindings (entity keys) this hold waits behind. The hold lifts itself, and the steward is woken, once every one has merged its pull requests or ended. Use it to schedule a ticket after the work it overlaps."),
+        stack: z
+          .array(z.string().trim().min(1).max(100))
+          .max(10)
+          .optional()
+          .describe("With hold: the open bindings (entity keys) whose open pull request this stack-wait waits for. It lifts itself, and the steward is woken with that pull request's head branch, as soon as every one has opened a pull request; use it to start a ticket stacked on work still being built."),
         stewardModel: modelSpecSchema.optional().describe("The steward thread's model, provider/model/level."),
         workerModel: modelSpecSchema.optional().describe("The model for workers it starts from now."),
         reviewerModel: modelSpecSchema.optional().describe("The model for reviewers its workers start from now."),
@@ -7890,7 +7977,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const target = bindingRef === undefined ? (projectOf !== null ? null : ownBinding(threadId)) : store.find(bindingRef);
           if (bindingRef !== undefined && target === null) return toolError(new Error(`No binding for ${bindingRef}.`));
           if (target === null) {
-            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.reviewerModel, input.approve, input.quote];
+            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stack, input.stewardModel, input.workerModel, input.reviewerModel, input.approve, input.quote];
             if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
             if (closing === null && input.ask === undefined && input.lesson === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, record a lesson, or close one."));
             const written = questionWrites(closing, null);
@@ -8000,10 +8087,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const info = await threadInfo(target.threadId);
               if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
             }
-            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.reviewerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
+            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stack, input.stewardModel, input.workerModel, input.reviewerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
             if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, ask, or record a lesson."));
           }
           const behind: Binding[] = [];
+          const stack: Binding[] = [];
+          if (input.behind !== undefined && input.stack !== undefined) return toolError(new Error("behind and stack are different holds: name the work to wait to merge behind, or the work whose open pull request to stack on, not both."));
           if (input.behind !== undefined) {
             if (input.hold === undefined || input.hold === "") return toolError(new Error("behind goes with a hold: say why it is held, and name the bindings it waits behind."));
             const missing: string[] = [];
@@ -8013,9 +8102,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               else if (!behind.some((x) => x.id === other.id)) behind.push(other);
             }
             if (missing.length > 0) return toolError(new Error(`Not an open binding in this project to wait behind: ${missing.join(", ")}.`));
-            // No cycles: a hold behind something that, through its own holds, waits behind this binding would never lift.
+          }
+          if (input.stack !== undefined) {
+            if (input.hold === undefined || input.hold === "") return toolError(new Error("stack goes with a hold: say why it is held, and name the bindings whose pull request it waits for."));
+            const missing: string[] = [];
+            for (const k of input.stack) {
+              const other = store.find(k, target.projectId);
+              if (other === null || other.endedAt !== null || other.id === target.id) missing.push(k);
+              else if (!stack.some((x) => x.id === other.id)) stack.push(other);
+            }
+            if (missing.length > 0) return toolError(new Error(`Not an open binding in this project to stack on: ${missing.join(", ")}.`));
+          }
+          if (behind.length > 0 || stack.length > 0) {
+            // No cycles: a hold that, through its own holds, waits behind this
+            // binding would never lift. A stack-wait deadlocks the same way:
+            // neither pull request opens if each waits for the other's.
             const waitsOn = (from: Binding, seen = new Set<string>()): string | null => {
-              for (const k of from.holdBehind) {
+              for (const k of [...from.holdBehind, ...from.holdStack]) {
                 const next = store.find(k, from.projectId);
                 if (next === null || next.endedAt !== null || seen.has(next.id)) continue;
                 if (next.id === target.id) return from.entityKey;
@@ -8025,7 +8128,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               }
               return null;
             };
-            for (const other of behind) {
+            for (const other of [...behind, ...stack]) {
               const via = other.id === target.id ? null : waitsOn(other);
               if (via !== null) return toolError(new Error(`${target.entityKey} cannot wait behind ${other.entityKey}: ${via} already waits behind ${target.entityKey}, so neither hold would ever lift.`));
             }
@@ -8210,17 +8313,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           if (input.priority !== undefined || input.hold !== undefined) {
             const behindKeys = behind.map((x) => x.entityKey);
+            const stackKeys = stack.map((x) => x.entityKey);
             store.patch(target.id, {
               ...(input.priority === undefined ? {} : { priority: input.priority }),
-              ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold, holdBehind: behindKeys }),
+              ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold, holdBehind: behindKeys, holdStack: stackKeys }),
             });
             const behindNote = behindKeys.length === 0 ? "" : ` (behind ${behindKeys.join(", ")}: lifts itself once ${behindKeys.length === 1 ? "its pull requests merge or it ends" : "their pull requests merge or they end"})`;
-            const what = [input.priority === undefined ? null : `priority ${input.priority}`, input.hold === undefined ? null : input.hold === "" ? "hold lifted" : `on hold: ${input.hold}${behindNote}`].filter((s) => s !== null).join("; ");
+            const stackNote = stackKeys.length === 0 ? "" : ` (stacked on ${stackKeys.join(", ")}: lifts itself once ${stackKeys.length === 1 ? "its pull request opens" : "their pull requests open"})`;
+            const what = [input.priority === undefined ? null : `priority ${input.priority}`, input.hold === undefined ? null : input.hold === "" ? "hold lifted" : `on hold: ${input.hold}${behindNote}${stackNote}`].filter((s) => s !== null).join("; ");
             done.push(what);
             notes.push(`Set by your ${isProjectSteward(threadId, target) ? "project" : "parent"} steward: ${what}`);
             // A hold answers an open scheduling request. A hold lifted by hand closes it too; the next look asks again if it must.
             if (input.hold !== undefined) {
-              for (const x of store.openEscalations(target.id).filter((e) => e.kind === "schedule")) store.resolve(x.id, input.hold === "" ? "Hold lifted." : behindKeys.length === 0 ? `Held: ${input.hold}` : `Held behind ${behindKeys.join(", ")}.`);
+              for (const x of store.openEscalations(target.id).filter((e) => e.kind === "schedule")) store.resolve(x.id, input.hold === "" ? "Hold lifted." : stackKeys.length > 0 ? `Stacked on ${stackKeys.join(", ")}.` : behindKeys.length === 0 ? `Held: ${input.hold}` : `Held behind ${behindKeys.join(", ")}.`);
             }
           }
           if (input.stewardModel !== undefined && target.threadId !== null) {
@@ -8326,7 +8431,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   ? `cannot read the target: ${sentry.error}`
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -9305,7 +9410,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
               if (b.kind !== "ops") {
                 const conflicts = conflictsOf(b, store.open(b.projectId));
-                lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
+                lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; file-level overlap: ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
               }
               for (const line of deploymentLines(b.deployments)) lines.push(`Deployment ${line}`);
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);

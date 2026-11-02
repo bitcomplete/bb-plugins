@@ -4,6 +4,7 @@ import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, hasLiveWakeSource, type W
 const noSources: WakeSourceInput = {
   hold: null,
   holdBehind: [],
+  holdStack: [],
   deployments: {},
   runningWorkers: 0,
   openEscalations: 0,
@@ -20,6 +21,10 @@ describe("a binding's live wake sources (BB-154)", () => {
 
   it("is true for an open holdBehind", () => {
     expect(hasLiveWakeSource(watch({ hold: "behind ENG-9", holdBehind: ["ENG-9"] }))).toBe(true);
+  });
+
+  it("is true for an open stack-wait (BB-215)", () => {
+    expect(hasLiveWakeSource(watch({ hold: "stacked on ENG-9", holdStack: ["ENG-9"] }))).toBe(true);
   });
 
   it("does not count a manual hold with no holdBehind", () => {

@@ -1726,10 +1726,10 @@ describe("scheduling overlapping work", () => {
     expect(toProject()).toHaveLength(1);
     const wake = toProject()[0]!.text;
     expect(wake).toMatch(/^# Project steward: scheduling requested for ENG-13/u);
-    expect(wake).toMatch(/from ENG-13 \(schedule\): Schedule ENG-13 \(Add SSO\)\? Its ready gate has passed, and it touches what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on web\/src\/login\. Hold it behind that work with steward_update \{ binding: "ENG-13", hold: "<why>", behind: \["ENG-12"\] \}/u);
+    expect(wake).toMatch(/from ENG-13 \(schedule\): Schedule ENG-13 \(Add SSO\)\? Its ready gate has passed, and it overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry\. Hold it behind that work with steward_update \{ binding: "ENG-13", hold: "<why>", behind: \["ENG-12"\] \}/u);
     expect(wake).toMatch(/A schedule escalation is the plugin's/u);
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): .*\[touches web\/src\/login\]/u);
-    expect(wake).toMatch(/- ENG-13 \(ticket, Todo\): .*\[touches web\/src; overlaps ENG-12 on web\/src\/login; 1 escalation\(s\): schedule→project\]/u);
+    expect(wake).toMatch(/- ENG-13 \(ticket, Todo\): .*\[touches web\/src; file-level overlap: ENG-12 on web\/src\/login \(its pull request acme\/web#7 is open on retry\); 1 escalation\(s\): schedule→project\]/u);
     const id = /(esc_[\w-]+) from ENG-13 \(schedule\)/u.exec(wake)![1]!;
 
     // Asked once, however often the steward reports; its own wake carries the overlap and the wait.
@@ -1740,10 +1740,10 @@ describe("scheduling overlapping work", () => {
     const own = toSecond().at(-1)!.text;
     expect(own).toMatch(/## 3\. Guidance, priority, holds and scheduling/u);
     expect(own).toMatch(/- Touches: web\/src \(steward_report \{ touches \} replaces it\)/u);
-    expect(own).toMatch(/- In flight on the same paths: ENG-12 \(In Progress\) on web\/src\/login\./u);
+    expect(own).toMatch(/- File-level overlap with work in flight: ENG-12 \(In Progress\) on web\/src\/login\./u);
     expect(own).toMatch(new RegExp(`\\*\\*Scheduling is with the project steward \\(${id}\\)\\.\\*\\* Start no workers`, "u"));
     expect(own).toMatch(/- Gate: PASSED — but scheduling is with the project steward/u);
-    expect((await t.harness.behavior.runCli(["show", "ENG-13"])).stdout).toContain("Touches: web/src; overlaps ENG-12 on web/src/login");
+    expect((await t.harness.behavior.runCli(["show", "ENG-13"])).stdout).toContain("Touches: web/src; file-level overlap: ENG-12 on web/src/login");
 
     // The project steward holds it behind ENG-12, by key in any case: the request is answered.
     const held = await t.tool("steward_update", { binding: "ENG-13", hold: "Overlaps ENG-12's login work", behind: ["eng-12"] }, project);
@@ -1766,7 +1766,7 @@ describe("scheduling overlapping work", () => {
     expect(toSecond().at(-1)!.text).toMatch(/- Hold: none/u);
     // Merged but with no "no more pull requests" report: still at work, so the
     // overlap is shown and the project steward is woken, not a silent lift (BB-54).
-    expect(toSecond().at(-1)!.text).toMatch(/In flight on the same paths: ENG-12/u);
+    expect(toSecond().at(-1)!.text).toMatch(/File-level overlap with work in flight: ENG-12/u);
     expect(toProject().at(-1)!.text).toMatch(/^# Project steward: ENG-12 merged its pull requests\n\n- Lifted the hold on ENG-13: ENG-12, which it waited behind, merged its pull requests\./u);
     // Landed work is no longer a conflict, so nothing asks again.
     await t.tool("steward_report", ready, second);
@@ -1790,7 +1790,7 @@ describe("scheduling overlapping work", () => {
     await t.tool("steward_report", { ...building, touches: ["web/src/audit"] }, third);
     await t.tool("steward_report", ready, second);
     expect(toProject()).toHaveLength(2);
-    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13 \(Add SSO\)\? .* already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on web\/src\/login; ENG-14 \(In Progress; 0 open, 0 merged, no more pull requests: not reported\) on web\/src\/audit\. Hold it behind that work with steward_update \{ binding: "ENG-13", hold: "<why>", behind: \["ENG-12", "ENG-14"\] \}, and it starts by itself once their pull requests merge or they end/u);
+    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13 \(Add SSO\)\? .* overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry; ENG-14 \(In Progress; 0 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/audit\. Hold it behind that work with steward_update \{ binding: "ENG-13", hold: "<why>", behind: \["ENG-12", "ENG-14"\] \}, and it starts by itself once their pull requests merge or they end/u);
 
     // Held behind both; ENG-14 is canceled, ENG-12 ends: the hold lifts when the last one goes.
     await t.tool("steward_update", { binding: "ENG-13", hold: "After the login and audit work", behind: ["ENG-12", "ENG-14"] }, project);
@@ -1878,7 +1878,7 @@ describe("scheduling overlapping work", () => {
     expect(reported.text).toMatch(/Scheduling is with the project steward \(esc_[\w-]+\): ENG-13 touches what ENG-12 is already changing/u);
     expect(t.hooks.store.find("ENG-13")!.clearedToStart).toBe(false);
     expect(toProject()).toHaveLength(1);
-    expect(toProject()[0]!.text).toMatch(/already being changed by ENG-12 \(Todo; 0 open, 0 merged, no more pull requests: not reported\) on web\/src\/login/u);
+    expect(toProject()[0]!.text).toMatch(/already being changed by ENG-12 \(Todo; 0 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login/u);
     // Held, it stops counting as in flight; told to start, it counts again.
     const id = /(esc_[\w-]+) from ENG-13 \(schedule\)/u.exec(toProject()[0]!.text)![1]!;
     await t.tool("steward_update", { binding: "ENG-13", guidance: "Start now: different files.", resolve: id }, project!);
@@ -2039,7 +2039,7 @@ describe("scheduling overlapping work", () => {
     t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
     const reported = await t.tool("steward_report", ready, second);
     expect(reported.text).toMatch(/Scheduling is with the project steward/u);
-    expect(toProject()[0]!.text).toMatch(/already being changed by ENG-12 \(In Progress; 0 open, 1 merged, no more pull requests: not reported\) on web\/src\/login/u);
+    expect(toProject()[0]!.text).toMatch(/already being changed by ENG-12 \(In Progress; 0 open, 1 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login/u);
   });
 
   // BB-54 item 5: reporting more pull requests after "none coming" clears the
@@ -2057,6 +2057,72 @@ describe("scheduling overlapping work", () => {
     expect(t.hooks.store.find("ENG-13")!.noMorePulls).toBeNull();
     expect(toProject()).toHaveLength(2);
     expect(toProject()[1]!.text).toMatch(/Schedule ENG-13/u);
+  });
+
+  // BB-215: two tickets on different files in one directory are not held; a
+  // stack-wait is a different hold from behind and lifts when the earlier
+  // pull request opens, not when it merges.
+  async function stackable() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", url: "https://linear.app/acme/issue/ENG-13" }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const [project, first, second] = t.spawns.map((x) => x.id) as [string, string, string];
+    const toProject = () => t.sends.filter((s) => s.threadId === project);
+    const toSecond = () => t.sends.filter((s) => s.threadId === second);
+    await t.tool("steward_report", { ...building, touches: ["web/src/login.ts"] }, first);
+    await t.tool("steward_report", { ...ready, touches: ["web/src/login.ts"] }, second);
+    const esc = /(esc_[\w-]+) from ENG-13 \(schedule\)/u.exec(toProject()[0]!.text)![1]!;
+    return { t, project, first, second, toProject, toSecond, esc };
+  }
+
+  it("does not hold two tickets on different files in one directory (BB-215)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", url: "https://linear.app/acme/issue/ENG-13" }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const [project, first, second] = t.spawns.map((x) => x.id) as [string, string, string];
+    const toProject = () => t.sends.filter((s) => s.threadId === project);
+    await t.tool("steward_report", { ...building, touches: ["web/src/login.ts"] }, first);
+    const reported = await t.tool("steward_report", { ...ready, touches: ["web/src/signup.ts"] }, second);
+    expect(reported.text).toMatch(/Ready gate: passed and nothing schedules you/u);
+    expect(toProject()).toHaveLength(0);
+  });
+
+  it("holds a ticket stacked on an earlier one and releases it with the branch when that pull request opens (BB-215)", async () => {
+    const { t, project, second, toProject, toSecond, esc } = await stackable();
+    const held = await t.tool("steward_update", { binding: "ENG-13", hold: "Stacked on ENG-12's login work", stack: ["ENG-12"] }, project);
+    expect(held).toMatchObject({ error: false, text: expect.stringMatching(/on hold: Stacked on ENG-12's login work \(stacked on ENG-12: lifts itself once its pull request opens\)/u) });
+    await t.flush();
+    expect(t.hooks.store.find("ENG-13")).toMatchObject({ hold: "Stacked on ENG-12's login work", holdStack: ["ENG-12"], holdBehind: [] });
+    expect(t.hooks.store.escalation(esc)!.resolution).toBe("Stacked on ENG-12.");
+    expect(toSecond().at(-1)!.text).toMatch(/\*\*HOLD: Stacked on ENG-12's login work\*\* \(stacked on ENG-12: it lifts itself, and you are woken with that pull request's head branch, as soon as that binding has opened a pull request\)/u);
+
+    // ENG-12's pull request opens: the stack-wait lifts, naming the branch.
+    const wakes = toSecond().length;
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { head: "eng-12-login", merged: false }));
+    await t.ring("linear", "uuid-12");
+    const b13 = t.hooks.store.find("ENG-13")!;
+    expect(b13.hold).toBeNull();
+    expect(b13.holdStack).toEqual([]);
+    expect(toSecond().length).toBe(wakes + 1);
+    expect(toSecond().at(-1)!.text).toMatch(/Stack-wait lifted: ENG-12's pull request acme\/web#7 is open on eng-12-login\. Start now, branch from eng-12-login with that branch as PR base\./u);
+    // Its own files still overlap ENG-12, but the request was already asked and
+    // answered, so the lift does not ask the project steward again.
+    expect(toProject().filter((s) => /scheduling requested/u.test(s.text))).toHaveLength(1);
+  });
+
+  it("does not lift a behind hold when its target only opens a pull request (BB-215)", async () => {
+    const { t, project } = await stackable();
+    await t.tool("steward_update", { binding: "ENG-13", hold: "After ENG-12 merges", behind: ["ENG-12"] }, project);
+    await t.flush();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { head: "eng-12-login", merged: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-13")).toMatchObject({ hold: "After ENG-12 merges", holdBehind: ["ENG-12"], holdStack: [] });
   });
 });
 
@@ -9146,6 +9212,29 @@ describe("deployment watching (BB-53)", () => {
     const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
     expect(wake).toMatch(/deployed/);
     expect(wake).toMatch(/evaluated by the plugin/);
+  });
+
+  // BB-215: a stacked pull request's own merge is not on the default branch
+  // after a squash, so the ticket reports the base pull request it landed in
+  // and the carries check follows that merge instead.
+  it("follows a stacked pull request's base pull request for the carries check (BB-215)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1" }));
+    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // Before the report the watch carries the stacked merge.
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ mergeSha: "stacked1" });
+    await t.tool("steward_report", { phase: "In Review", summary: "Stacked PR merged into the base.", nextAction: "Await the base deployment.", actor: "other", landedIn: "acme/web#9" }, steward);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.landedIn).toBe("acme/web#9");
+    // The watch now carries the base pull request's merge on main.
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ mergeSha: "aaaaaaa1" });
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", note: expect.stringMatching(/contains merge aaaaaaa/u) });
   });
 
   // BB-204: a deployment that has not reached a final status cannot settle a

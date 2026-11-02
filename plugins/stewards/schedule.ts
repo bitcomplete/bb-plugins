@@ -133,3 +133,24 @@ export function allPullsMerged(b: Binding, observed: Observed): boolean {
   const pulls = b.kind === "ticket" ? observed.pulls : observed.entity.pull === null ? [] : [observed.entity];
   return pulls.length > 0 && pulls.every((p) => p.pull?.merged === true);
 }
+
+/** A binding's open pull request: its key (`owner/repo#N`) and head branch. */
+export type OpenPull = { key: string; head: string | null };
+
+/**
+ * The open pull request a stack-wait waits for (BB-215): a ticket's linked pull
+ * request or a `pr` binding's own entity, still open (a draft counts). Null
+ * when there is none, so the stack-wait stays until one opens. A squash or
+ * rebase is irrelevant here: the wait is for the pull request to exist, not
+ * for it to land.
+ */
+export function openPull(b: Binding, observed: Observed): OpenPull | null {
+  const pulls = b.kind === "ticket" ? observed.pulls : observed.entity.pull === null ? [] : [observed.entity];
+  for (const p of pulls) {
+    if (p.pull === null || p.pull.merged === true) continue;
+    const state = p.state.toLowerCase();
+    if (state === "closed" || state === "merged") continue;
+    return { key: p.key, head: p.pull.head };
+  }
+  return null;
+}

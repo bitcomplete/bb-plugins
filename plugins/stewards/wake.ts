@@ -15,7 +15,7 @@ import { dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
 import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { prGate, type ProjectApprovalRecord } from "./gate.js";
-import { conflictsOf, type Conflict } from "./schedule.js";
+import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
@@ -434,10 +434,19 @@ function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "esc
 }
 
 /** The hold line of a wake: the reason, and what it waits behind when it was placed to schedule. */
-const holdLine = (binding: Binding, then: string): string =>
-  binding.hold === null
-    ? "- Hold: none"
-    : `- **HOLD: ${binding.hold}**${binding.holdBehind.length === 0 ? "" : ` (behind ${binding.holdBehind.join(", ")}: it lifts itself, and you are woken, once ${binding.holdBehind.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"})`} — ${then}`;
+const holdLine = (binding: Binding, then: string): string => {
+  if (binding.hold === null) return "- Hold: none";
+  const behind =
+    binding.holdBehind.length === 0
+      ? null
+      : `behind ${binding.holdBehind.join(", ")}: it lifts itself, and you are woken, once ${binding.holdBehind.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"}`;
+  const stack =
+    binding.holdStack.length === 0
+      ? null
+      : `stacked on ${binding.holdStack.join(", ")}: it lifts itself, and you are woken with that pull request's head branch, as soon as ${binding.holdStack.length === 1 ? "that binding has opened a pull request" : "each of them has opened a pull request"}`;
+  const why = [behind, stack].filter((x): x is string => x !== null).join("; ");
+  return `- **HOLD: ${binding.hold}**${why === "" ? "" : ` (${why})`} — ${then}`;
+};
 
 /**
  * The sentence a no-wake-source paragraph carries when a `failed` watch is
@@ -479,12 +488,12 @@ function schedulingLines(binding: Binding, conflicts: Conflict[], escalations: E
   if (binding.kind !== "ticket" && binding.kind !== "pr") return [];
   const lines = [
     binding.touches.length === 0
-      ? "- Touches: not reported. Report the repo-relative paths the work changes, repo directory first, with steward_report { touches: [\"<repo>/<path>\", …] } as soon as the spec names them, and refine it as pull requests open: the project steward schedules tickets that touch the same paths one after another."
+      ? "- Touches: not reported. Report the repo-relative files the work changes, repo directory first, with steward_report { touches: [\"<repo>/<path>\", …] } as soon as the spec names them; a directory is accepted and counts as every file under it. Refine it as pull requests open: the project steward schedules tickets whose files overlap one after another, and stacks them when a file overlaps a pull request still being built."
       : `- Touches: ${binding.touches.join(", ")} (steward_report { touches } replaces it)`,
   ];
-  if (conflicts.length > 0) lines.push(`- In flight on the same paths: ${conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ")}.`);
+  if (conflicts.length > 0) lines.push(`- File-level overlap with work in flight: ${conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ")}.`);
   const scheduling = escalations.find((x) => x.status === "open" && x.kind === "schedule");
-  if (scheduling !== undefined) lines.push(`- **Scheduling is with the project steward (${scheduling.id}).** Start no workers and do not move the ticket into a build state until it decides: it holds you behind that work (the hold lifts itself when the work lands) or tells you to start. Do not escalate for it.`);
+  if (scheduling !== undefined) lines.push(`- **Scheduling is with the project steward (${scheduling.id}).** Start no workers and do not move the ticket into a build state until it decides: it holds you behind that work (the hold lifts itself when the work lands), stacks you on a pull request still being built (the hold lifts itself, with the branch, when it opens), or tells you to start. Do not escalate for it.`);
   else if (conflicts.length > 0 && binding.hold === null) lines.push("- Once your ready gate passes, the plugin asks the project steward to schedule you against that work; do not escalate for it.");
   return lines;
 }
@@ -1156,7 +1165,7 @@ export function formatProjectWake(input: {
     }
     if (input.routed.some((r) => r.escalation.kind === "schedule")) {
       out.push(
-        "A schedule escalation is the plugin's: the ticket's ready gate has passed, and it touches paths another binding is already building or reviewing, so starting it now means two branches changing the same files and a rebase for whichever merges second. Decide the order from the project's guidance and priorities. Usually the ticket waits: steward_update { binding, hold: \"<why>\", behind: [<the keys named>] } holds it behind that work and resolves the request; the hold lifts itself, and the steward is woken, once every binding named has merged its pull requests or ended. When the overlap is harmless or the new ticket matters more (then consider holding the other one instead), let it start: steward_update { binding, guidance: \"Start now: <why>\", resolve }. A hold is also how you sequence any two tickets, asked or not.",
+        "A schedule escalation is the plugin's: the ticket's ready gate has passed, and its files overlap another binding's that is already being built or reviewed, so starting it now means two branches changing the same files and a rebase for whichever merges second. The overlap is file-level: two tickets on different files in one directory are not in conflict, and a directory in touches counts as every file under it. Decide the order from the project's guidance and priorities. Usually the ticket waits: steward_update { binding, hold: \"<why>\", behind: [<the keys named>] } holds it behind that work and resolves the request; the hold lifts itself, and the steward is woken, once every binding named has merged its pull requests or ended. When the earlier ticket's pull request is open, or will be before it merges, stack it instead: steward_update { binding, hold: \"<why>\", stack: [<the keys named>] } lifts as soon as that pull request opens, and the waiting steward is woken with its head branch to branch from. When the earlier pull request is already open, let it start stacked: steward_update { binding, guidance: \"Start now, branch from <its head branch> with that branch as PR base\", resolve }. When the overlap is harmless or the new ticket matters more (then consider holding the other one instead), let it start: steward_update { binding, guidance: \"Start now: <why>\", resolve }. A hold is also how you sequence any two tickets, asked or not.",
         "",
       );
     }
@@ -1218,7 +1227,7 @@ export function formatProjectWake(input: {
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
     const conflicts = conflictsOf(b, allOpen);
-    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
+    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   const bindings = out.splice(0);
@@ -1405,7 +1414,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
 
   const stuck = [
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
-    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`),
+    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
 
@@ -1428,7 +1437,7 @@ export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Line
 - steward_update sets guidance, priority, holds and models on any binding, approves a substantial ticket's spec, and resolves or forwards escalations.
 - Before you ask the user something in a reply, record it with steward_update { ask: { question, context } } (with binding when it concerns one); close it with steward_update { resolve: "<question id>", answer } when they answer. Every wake lists the questions still open, so list them from there, not from memory.
 - You are woken by escalations, at the end of each nightly pass to write the morning digest, and by the user. When the user says something like "hold everything touching billing", turn it into steward_update calls on the bindings it concerns, and say what you changed.
-- You schedule the work so that two tickets do not change the same files at once. Every binding reports what it touches; when a ready ticket overlaps work in flight, the plugin asks you with a schedule escalation. Hold it behind that work (steward_update { binding, hold, behind: [keys] }: the hold lifts itself when the work lands) or let it start (guidance + resolve). Use the same hold to sequence any two tickets whose overlap you can see in the bindings list.
+- You schedule the work so that two tickets do not change the same files at once. Every binding reports what it touches; when a ready ticket overlaps work in flight at file level, the plugin asks you with a schedule escalation. Hold it behind that work (steward_update { binding, hold, behind: [keys] }: the hold lifts itself when the work lands), stack it on a pull request still being built (steward_update { binding, hold, stack: [keys] }: the hold lifts itself, with the branch, when that pull request opens), or let it start (guidance + resolve). Use the same holds to sequence any two tickets whose overlap you can see in the bindings list.
 - Budget is advisory: keep the total work sensible through priority and holds.
 
 Wait for the user or a wake; there is nothing to do right now.`;
