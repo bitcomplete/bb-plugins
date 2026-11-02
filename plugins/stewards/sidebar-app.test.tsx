@@ -256,9 +256,8 @@ describe("the stewards sidebar list (BB-44)", () => {
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     // Line one: the shortened key and the title, the key stripped from the title.
     expect(slot.getByText("ENG-1")).toBeTruthy();
-    // BB-182: the effort row carries no row-level title (with the hover actions
-    // inside it, a native tooltip would cover the Archive button); the full
-    // title stays on the link text.
+    // The effort row carries no row-level title; the full title stays on the
+    // link text.
     expect(slot.getByText("Fix login").closest("a")!.getAttribute("title")).toBe("ENG-1: Fix login");
     // Line two: kind, phase, phrase; no stage text anywhere.
     expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · wait for the review");
@@ -405,24 +404,71 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("wraps every row in bb's thread actions context menu", async () => {
+  it("wraps the Threads section's rows in bb's thread actions context menu, but not an effort row", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: "A one-off thread" })],
+      },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
-      threadActions: () =>
-        [{ key: "archive", pluginId: "thread-list", group: "4_lifecycle", action: { label: "Archive", icon: "Archive", run: () => {} } }] as never,
+      threadActions: () => archiveEntry() as never,
     });
     await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
-    const menu = slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_steward"]');
+    // BB-202: an effort row carries neither the menu wrapper nor the hover actions.
+    const effortRow = slot.getByText("Fix login").closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    expect(effortRow.querySelector("[data-sidebar-row-actions]")).toBeNull();
+    expect(effortRow.querySelector("[data-thread-actions-trigger]")).toBeNull();
+    expect(slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_steward"]')).toBeNull();
+    // A row in the Threads section keeps the wrapper and opens its menu.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    await waitFor(() => expect(slot.getByText("A one-off thread")).toBeTruthy());
+    const menu = slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_oneoff"]');
     expect(menu).not.toBeNull();
     fireEvent.contextMenu(menu!);
     await waitFor(() => expect(slot.getByRole("menuitem", { name: "Archive" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 
-  // BB-182: stewards rows take bb's own row height, hover/selected tokens and
-  // hover actions, and the effort row's second line lines up with its title.
-  it("gives live-thread rows bb's height, hover tokens and hover actions, and lines up the effort's second line", async () => {
+  // BB-202: a worker and a reviewer nested under an effort are plugin-owned
+  // threads too, so they carry no hover actions and no context menu.
+  it("gives worker and reviewer rows under an effort no hover actions or context menu", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_worker", displayTitle: "Implement retry", status: "active" }),
+          thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }] })],
+          }),
+      } as never,
+      threadActions: () => archiveEntry() as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: /Expand ENG-1: Fix login/u }));
+    await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: /Expand Implement retry/u }));
+    await waitFor(() => expect(slot.getByText("Review the PR")).toBeTruthy());
+    for (const title of ["Implement retry", "Review the PR"]) {
+      const row = slot.getByText(title).closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+      expect(row.querySelector("[data-sidebar-row-actions]")).toBeNull();
+      expect(row.querySelector("[data-thread-actions-trigger]")).toBeNull();
+      expect(row.querySelector(".bb-sidebar-hover-actions-inset")).toBeNull();
+    }
+    expect(slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_worker"]')).toBeNull();
+    expect(slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_reviewer"]')).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  // BB-182: stewards rows take bb's own row height and hover/selected tokens,
+  // and the effort row's second line lines up with its title. BB-202: only the
+  // Threads section's rows carry the hover actions.
+  it("gives rows bb's height and hover tokens, the Threads rows the hover actions, and lines up the effort's second line", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -439,24 +485,29 @@ describe("the stewards sidebar list (BB-44)", () => {
     expect(effort.className).toContain("hover:bg-sidebar-accent");
     expect(effort.className).toContain("text-sidebar-foreground");
     expect(effort.style.paddingLeft).toBe("8px");
+    // BB-202: the effort row carries no hover actions and no inset reservation.
+    expect(effort.querySelector(".bb-sidebar-hover-actions")).toBeNull();
+    expect(effort.querySelector("[data-thread-actions-trigger]")).toBeNull();
+    expect(effort.querySelector(".bb-sidebar-hover-actions-inset")).toBeNull();
     // The line two padding is the title's offset: the base 8px plus the two
     // 16px chevron/status slots and their 4px gaps put the title 40px into the
     // row's content box, and line two carries exactly that.
     const lineTwo = effort.querySelector("[data-sidebar-line-two]") as HTMLElement;
     expect(lineTwo.style.paddingLeft).toBe("40px");
     expect(parseInt(effort.style.paddingLeft, 10) + parseInt(lineTwo.style.paddingLeft, 10)).toBe(48);
-    // The Archive button and the thread-actions trigger are the only two hover
-    // actions, in bb's reveal wrapper.
-    const actions = effort.querySelector(".bb-sidebar-hover-actions")!;
-    expect(actions.getAttribute("data-sidebar-row-actions")).toBe("");
-    expect(actions.querySelector('[data-thread-action="bb--core/archive"]')!.getAttribute("aria-label")).toBe("Archive");
-    expect(actions.querySelector("[data-thread-actions-trigger]")!.getAttribute("aria-label")).toBe("Thread actions");
-    // A one-line thread row takes bb's fixed height, not the old py-0.5.
+    // A one-line Threads row takes bb's fixed height, not the old py-0.5, keeps
+    // the Archive button and the thread-actions trigger in bb's reveal wrapper,
+    // and reserves their width on the title.
     fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
     const oneOffAnchor = (await waitFor(() => slot.getByText("A one-off thread"))).closest("a")!;
     const oneOff = oneOffAnchor.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
     expect(oneOff.className).toContain("h-[var(--bb-sidebar-row-height)]");
     expect(oneOff.className).not.toContain("py-0.5");
+    expect(oneOff.querySelector(".bb-sidebar-hover-actions-inset")).not.toBeNull();
+    const actions = oneOff.querySelector(".bb-sidebar-hover-actions")!;
+    expect(actions.getAttribute("data-sidebar-row-actions")).toBe("");
+    expect(actions.querySelector('[data-thread-action="bb--core/archive"]')!.getAttribute("aria-label")).toBe("Archive");
+    expect(actions.querySelector("[data-thread-actions-trigger]")!.getAttribute("aria-label")).toBe("Thread actions");
     slot.lifecycle.unmount();
   });
 
@@ -482,13 +533,18 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("keeps the hover-action buttons from navigating the row", async () => {
+  it("keeps a Threads row's hover-action buttons from navigating the row", async () => {
     const archive = vi.fn();
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: "A one-off thread" })],
+      },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
       threadActions: () => archiveEntry(archive) as never,
     });
+    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
     const button = await waitFor(() => slot.getByRole("button", { name: "Archive" }));
     fireEvent.click(button);
     expect(archive).toHaveBeenCalledTimes(1);
@@ -496,7 +552,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("keeps the project-steward and ended stamps out from under the hover actions", async () => {
+  it("keeps the project-steward stamp out from under the hover actions and the ended stamp in a plain title span", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -516,17 +572,20 @@ describe("the stewards sidebar list (BB-44)", () => {
       } as never,
       threadActions: () => archiveEntry() as never,
     });
-    // The project-steward label lives inside the title's inset content span, so
-    // the hover actions take the right edge without covering it.
+    // The project-steward row keeps its actions; its label lives inside the
+    // title's inset content span, so the hover actions take the right edge
+    // without covering it.
     const ps = await waitFor(() => slot.getByText("project steward"));
     expect(ps.closest(".bb-sidebar-hover-actions-inset")).not.toBeNull();
-    // The same for a Recently ended row whose steward thread is still live.
+    // BB-202: a Recently ended effort row keeps its stamp but has no inset and
+    // no hover actions.
     fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
     const ended = await waitFor(() => slot.getByText("Old work"));
     const row = ended.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
-    const inset = row.querySelector(".bb-sidebar-hover-actions-inset")!;
-    expect(inset.querySelector("a")).not.toBeNull();
-    expect(inset.textContent).toMatch(/ago/u);
+    expect(row.querySelector(".bb-sidebar-hover-actions-inset")).toBeNull();
+    expect(row.querySelector(".bb-sidebar-hover-actions")).toBeNull();
+    const titleSpan = ended.closest("a")!.parentElement!;
+    expect(titleSpan.textContent).toMatch(/ago/u);
     slot.lifecycle.unmount();
   });
 

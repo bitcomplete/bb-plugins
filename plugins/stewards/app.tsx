@@ -1600,6 +1600,15 @@ type SidebarThreadRowProps = {
   openThreads: ReadonlySet<string>;
   /** A signature of the descendants' read state, so a memoised row re-renders when any of them is read (BB-95). */
   unreadKey: string;
+  /**
+   * Whether the row carries bb's two hover actions — the live thread's Archive
+   * action and its thread-actions context menu (BB-182). Worker and reviewer
+   * rows under an effort turn this off (BB-202): the plugin owns those threads,
+   * so a hand-archive is undone by the next wake, delete takes the descendants,
+   * rename is overwritten by the plugin's retitle, and pin/split do not apply.
+   * The Threads section and its children keep them.
+   */
+  threadActions?: boolean;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
 };
@@ -1621,6 +1630,7 @@ function sameThreadRowProps(a: SidebarThreadRowProps, b: SidebarThreadRowProps):
     a.titleAttr === b.titleAttr &&
     a.glyph === b.glyph &&
     a.activeThreadId === b.activeThreadId &&
+    a.threadActions === b.threadActions &&
     a.entered === b.entered &&
     a.unreadKey === b.unreadKey &&
     a.openThreads.has(a.thread.id) === b.openThreads.has(b.thread.id)
@@ -1744,6 +1754,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
   glyph,
   activeThreadId,
   openThreads,
+  threadActions = true,
   entered = false,
 }: SidebarThreadRowProps) {
   useRenderProbe(`thread:${thread.id}`);
@@ -1768,69 +1779,70 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
   // slot back to it (BB-195). The draft is a pencil beside the steward glyph.
   const useStewardGlyph = glyph !== undefined;
   const count = countThreads(children);
+  const rowContent = (
+    <div
+      className={`bb-sidebar-hover-actions-row relative flex items-center gap-1 rounded-md pr-1 ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${selected ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS}`}
+      style={{ paddingLeft: `${rowPaddingLeft(depth)}px` }}
+      title={titleAttr}
+    >
+      {count > 0 ? (
+        <button
+          type="button"
+          aria-label={`${open ? "Collapse" : "Expand"} ${thread.displayTitle}`}
+          aria-expanded={open}
+          className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
+          onClick={() => setUserOpen(!open)}
+        >
+          <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+        </button>
+      ) : (
+        <span className="flex size-4 shrink-0 items-center justify-center" />
+      )}
+      {/* A fixed-width slot keeps the title column put whatever the glyph
+          (none, dot, spinner) or its width. The spinner at size="compact"
+          is the widest, so size-4 is the slot. */}
+      <span data-sidebar-status-slot="" className="relative flex size-4 shrink-0 items-center justify-center">
+        {useStewardGlyph ? (
+          <>
+            <StewardGlyph kind={glyph!} />
+            {draft.hasUnsubmittedDraft ? (
+              <span data-steward-draft="" className="pointer-events-none absolute -bottom-0.5 -right-0.5 flex items-center justify-center">
+                <Icon name="Edit" className="size-2.5 text-muted-foreground" aria-label="Unsubmitted draft" />
+              </span>
+            ) : null}
+          </>
+        ) : (
+          <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
+        )}
+      </span>
+      <span className={`${threadActions ? "bb-sidebar-hover-actions-inset " : ""}flex min-w-0 flex-1 items-center gap-1`} style={threadActions ? HOVER_ACTIONS_INSET_STYLE : undefined}>
+        <a
+          href={thread.href}
+          aria-current={selected ? "page" : undefined}
+          className="min-w-0 flex-1 truncate text-sm"
+          title={thread.displayTitle}
+          onClick={(e) => {
+            e.preventDefault();
+            navigate.toThread(thread.id);
+            onNavigate();
+          }}
+        >
+          <ThreadTitle threadId={thread.id} />
+        </a>
+        {meta}
+      </span>
+      {threadActions ? <SidebarRowHoverActions target={actionTarget(thread)} /> : null}
+    </div>
+  );
   return (
     <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
-      <ThreadActionsContextMenu thread={actionTarget(thread)}>
-        <div
-          className={`bb-sidebar-hover-actions-row relative flex items-center gap-1 rounded-md pr-1 ${ROW_HEIGHT_CLASS} ${ROW_TEXT_CLASS} ${selected ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS}`}
-          style={{ paddingLeft: `${rowPaddingLeft(depth)}px` }}
-          title={titleAttr}
-        >
-          {count > 0 ? (
-            <button
-              type="button"
-              aria-label={`${open ? "Collapse" : "Expand"} ${thread.displayTitle}`}
-              aria-expanded={open}
-              className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-              onClick={() => setUserOpen(!open)}
-            >
-              <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
-            </button>
-          ) : (
-            <span className="flex size-4 shrink-0 items-center justify-center" />
-          )}
-          {/* A fixed-width slot keeps the title column put whatever the glyph
-              (none, dot, spinner) or its width. The spinner at size="compact"
-              is the widest, so size-4 is the slot. */}
-          <span data-sidebar-status-slot="" className="relative flex size-4 shrink-0 items-center justify-center">
-            {useStewardGlyph ? (
-              <>
-                <StewardGlyph kind={glyph!} />
-                {draft.hasUnsubmittedDraft ? (
-                  <span data-steward-draft="" className="pointer-events-none absolute -bottom-0.5 -right-0.5 flex items-center justify-center">
-                    <Icon name="Edit" className="size-2.5 text-muted-foreground" aria-label="Unsubmitted draft" />
-                  </span>
-                ) : null}
-              </>
-            ) : (
-              <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
-            )}
-          </span>
-          <span className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-center gap-1" style={HOVER_ACTIONS_INSET_STYLE}>
-            <a
-              href={thread.href}
-              aria-current={selected ? "page" : undefined}
-              className="min-w-0 flex-1 truncate text-sm"
-              title={thread.displayTitle}
-              onClick={(e) => {
-                e.preventDefault();
-                navigate.toThread(thread.id);
-                onNavigate();
-              }}
-            >
-              <ThreadTitle threadId={thread.id} />
-            </a>
-            {meta}
-          </span>
-          <SidebarRowHoverActions target={actionTarget(thread)} />
-        </div>
-      </ThreadActionsContextMenu>
+      {threadActions ? <ThreadActionsContextMenu thread={actionTarget(thread)}>{rowContent}</ThreadActionsContextMenu> : rowContent}
       {open && children.length > 0 ? (
         <ul className="flex flex-col">
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} entered={entered} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} threadActions={threadActions} entered={entered} />
             );
           })}
         </ul>
@@ -1987,8 +1999,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   if (key === null) return null;
   const displayKey = shortBindingKey(key);
   // A Recently ended binding's steward thread is usually archived and so absent
-  // from the live view; its title comes from the RPC and the row renders without
-  // the thread actions context menu (BB-88).
+  // from the live view; its title comes from the RPC (BB-88).
   const title = effortTitle(root?.displayTitle ?? effort.title, key);
   const count = countThreads(effort.children);
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
@@ -2024,7 +2035,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
         <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
           <StewardGlyph kind={glyph ?? effort.state} />
         </span>
-        <span className="bb-sidebar-hover-actions-inset flex min-w-0 flex-1 items-center gap-1" style={HOVER_ACTIONS_INSET_STYLE}>
+        <span className="flex min-w-0 flex-1 items-center gap-1">
           <a
             href={href}
             aria-current={selected ? "page" : undefined}
@@ -2041,7 +2052,6 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
           </a>
           {trailing}
         </span>
-        {root === undefined ? null : <SidebarRowHoverActions target={actionTarget(root)} />}
       </div>
       <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: `${rowTitleLeft(0) - rowPaddingLeft(0)}px` }} data-sidebar-line-two="">
         {kindLabel(effort.kind)}
@@ -2053,7 +2063,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   );
   return (
     <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
-      {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
+      {body}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: `${rowTitleLeft(0)}px` }}>
           {mine.map((item) => (
@@ -2067,7 +2077,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
             {effort.children.map((c) => {
               const child = byId.get(c.threadId);
               return child === undefined ? null : (
-                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} entered={entered} />
+                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} threadActions={false} entered={entered} />
               );
             })}
           </ul>
