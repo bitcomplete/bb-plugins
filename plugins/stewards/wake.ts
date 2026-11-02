@@ -415,14 +415,14 @@ function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "esc
   // start the worker in that same turn.
   if (gate.substantial === null && !gate.passed) lines.push("  If none apply, report `substantial: false`: with every checklist item met, the gate passes immediately on that report, so move the ticket to In Progress and start the worker in the same turn.");
   const approval = playbook.ready!.approval;
-  const how = approval === "me" ? "the user" : approval === "project" ? "the project steward" : `the ticket reaching ${approval["linear-state"]}`;
+  const how = approval === "user" ? "the user" : approval === "project" ? "the project steward" : `the ticket reaching ${approval["linear-state"]}`;
   const request = input.escalations.find((x) => x.status === "open" && x.kind === "approval");
   const asked =
     request === undefined
-      ? approval === "me" || approval === "project"
+      ? approval === "user" || approval === "project"
         ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
         : ""
-      : request.route === "me"
+      : request.route === "user"
         ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`
         : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
@@ -590,7 +590,7 @@ export function formatWake(input: WakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0 || input.routedToMe.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "user" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve, cites: [lesson ids or guidance unit ids] }, or pass it up with steward_update { binding, forward, recommendation, cites: [lesson ids or guidance unit ids] }.");
@@ -813,7 +813,7 @@ export function formatOpsWake(input: OpsWakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : "the project steward"}): ${x.question}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "user" ? "the user" : "the project steward"}): ${x.question}`);
   }
 
   const snapshot = out.splice(0);
@@ -916,7 +916,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : "the project steward"}): ${x.question}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "user" ? "the user" : "the project steward"}): ${x.question}`);
   }
 
   const snapshot = out.splice(0);
@@ -1036,7 +1036,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : "the project steward"}): ${x.question}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "user" ? "the user" : "the project steward"}): ${x.question}`);
   }
 
   const snapshot = out.splice(0);

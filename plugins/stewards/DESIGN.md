@@ -489,7 +489,7 @@ current within a refetch (`reconcile.ts` `mechanicalStatus`, applied by
 
 The write keeps the steward's phase, `waitingOn`, conditions and resources,
 and goes through `patch`, so the realtime channel rings. `actor` follows the
-standing rule — `user` only while a need or a `me` escalation is open — and
+standing rule — `user` only while a need or a `user` escalation is open — and
 the approval event does not count the approval escalation it answers, so an
 approval reads as the steward's worker merging, not as the user's. A binding
 with no status record gets none: a mechanical write never invents the
@@ -499,7 +499,7 @@ Which events still wake the steward is unchanged except where a running
 worker already owns the next step. A new pull request comment, a checks
 result, a link or follow, and a project-steward decision the worker was
 told about by `tell` are quiet notes while a worker is in flight on that
-pull request and nothing the user must act on is open. An open need or `me`
+pull request and nothing the user must act on is open. An open need or `user`
 escalation keeps them loud, so the steward can reconcile the item it is
 holding for the user. A human (non-reviewer, non-worker) comment, a
 `changes-requested` or blocker marker with no worker in flight, a worker's
@@ -652,7 +652,7 @@ ready:
     - schema or data migration
     - public API or contract change
     - estimate >= 3
-  approval: project       # or me, or { linear-state: Approved }
+  approval: project       # or user, or { linear-state: Approved }
 ```
 
 - **Specifying is done in comments.** In a `spec` stage the steward checks the
@@ -662,13 +662,13 @@ ready:
   description.
 - **Approval.** A substantial ticket waits. By default the project steward
   approves it, judging the spec against the project's guidance, through
-  `steward_update`. With `approval: me` you approve in the steward's thread,
+  `steward_update`. With `approval: user` you approve in the steward's thread,
   and the steward records it quoting your words. With a Linear signal, the
   steward waits for it.
 - **The plugin asks for it.** Whenever the checklist is met, the ticket is
   substantial (or not yet judged) and the current spec has no approval, the
   plugin files an `approval` escalation with the approver — the project
-  steward, or you with `approval: me` — after the steward's report or on
+  steward, or you with `approval: user` — after the steward's report or on
   the next look, and closes it when the gate passes or stops needing it.
   The gate does not depend on the steward remembering to escalate: on
   HUB-196 a steward posted a new spec and said only in its status that it
@@ -760,7 +760,7 @@ chain of hops each with its rewording, the route the plugin assigned, the
 status, and `meanwhile`), a free-text payload the model reads, and the
 human-boundary fields (`resolution`, `choices`, `url`, and a secret's
 variable, purpose and destination) the project steward supplies when the
-route becomes `me`. `route` is assigned, never chosen: a worker's
+route becomes `user`. `route` is assigned, never chosen: a worker's
 `bb stewards escalate` goes to its steward, `steward_report { escalate }`
 from a steward goes to the project steward, and only the project steward
 reaches the user. Each layer decides from the guidance if it can; it
@@ -849,7 +849,7 @@ approval code is always yours, whatever the list says; a signed comment
 never satisfies either. `prGate` accepts the project-steward approval for
 a `project` entry, and the user's unsigned GitHub approval is unchanged.
 - **Questions and asks are escalations.** Whatever the project steward
-asks you is an `escalations` row with `route: me` and a `resolution`
+asks you is an `escalations` row with `route: user` and a `resolution`
 (`choice`, `text`, `approve-decline`, `secret`, `done`), not a sentence in
 its reply and not a separate table. A row is made when the project
 steward asks you itself with `steward_update { ask: { question,
@@ -1301,7 +1301,7 @@ repeated across Linear comments, the project steward's digest and the stewards'
 replies. A **needs** record makes it structured: one row per thing the user
 must do, with a link, one line of what, steps, and a close rule. Under
 BB-30 the steward-filed asks (`decide`, `configure`, `provide-secret`) are
-the one `escalations` record with `route: me` and a `resolution`; the
+the one `escalations` record with `route: user` and a `resolution`; the
 plugin-filed gate items (`approve-spec`, `approve-pr`, `merge`) stay as
 needs. Both appear on the effort's detail view under **Needs you**, attached
 to its binding by its entity key (or, with no open binding, in the project
@@ -1309,14 +1309,14 @@ view's **Waiting on you**), in the digest, and by `bb stewards needs` and
 `bb stewards show`. The detail's needs-you item keeps the page's full controls
 — the free-text answer box, the rationale box, the fixed-choice buttons and
 **Other…**, the secret form and the `approve-spec` note — where the sidebar's
-inline block carries only the one-click actions. A `route: me`
+inline block carries only the one-click actions. A `route: user`
 escalation is rendered from its `resolution` alone: `choice` (one button
 per label), `text` (the answer box), `approve-decline`, `secret` (the
 requester thread and bb's secure form) or `done`.
 
 | kind | filed by | link | done when | one-click action |
 | -- | -- | -- | -- | -- |
-| `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
+| `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `user`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
 | `approve-pr` | plugin, when a `user`-marked owner-reviewed pull request is forwarded to the user, or the project steward's approval is not the gate's | the pull request | owner approval seen in the snapshot | **Approve**: on a teammate's pull request posts an unsigned APPROVED review; on the owner's own (an agent PR) posts the unsigned comment "Approved <sha> from the Stewards page". **Decline** posts a CHANGES_REQUESTED review on a teammate's pull request (a comment when there is no note) and does not ask the same round again |
 | `merge` | plugin, when the lane gate is met, no worker is running and the pull request is the owner's own or a dependency bot's (a teammate's pull request files none unless its playbook sets `owner-merges: true`), or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
@@ -1390,7 +1390,7 @@ The rules that hold:
   `approval` escalation to the user, the plugin files an `approve-spec` need
   on the binding and keeps the escalation open, linked to it
   (`data.escalationId`), instead of a free-text question: the binding is
-  waiting on the user's approval exactly as `approval: me` would be. The
+  waiting on the user's approval exactly as `approval: user` would be. The
   page's Approve and Decline, and `bb stewards done` for Approve, record the
   gate verdict and resolve the open `approval` escalations in the same step,
   so the project steward is not left holding the request. A forwarded
@@ -1890,7 +1890,7 @@ reason for the next judgment turn, and its one visible effect, the "worker
 finished" phrase, is published by `setWorker` when the worker's status
 changes. The callback also fires from the needs-you mutation points — a
 question filed (`ask`) or answered (`answer`, `answerQuestionOnly`,
-`answerEscalation`), an escalation filed route-`me` (`escalate`) or forwarded
+`answerEscalation`), an escalation filed route-`user` (`escalate`) or forwarded
 to the user or resolved (`reroute`, `resolve`, `approve`, `decline`), and a
 need filed, updated or closed (`fileNeed`, `closeNeed`, `closeNeeds`,
 `closeNeedByKey`). A synchronous coalescing guard makes one question filed or

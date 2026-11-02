@@ -247,16 +247,16 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   what the project file lists under `bigDecisions` is forwarded to you, by
   the project steward asking in its own thread, where thread-briefs shows it
   as waiting on you. Substantial specs are approved by the project steward
-  unless a playbook says `approval: me`. The plugin asks for that approval
+  unless a playbook says `approval: user`. The plugin asks for that approval
   itself: whenever a ready gate's checklist is met, the ticket is
   substantial and the current spec has no approval, it files an `approval`
   escalation with the project steward, or an `approve-spec` item on the
-  Stewards page when the approver is the user (`approval: me`), whatever
+  Stewards page when the approver is the user (`approval: user`), whatever
   the steward's report says, and closes it once approved or no longer
   needed. When the project steward forwards an `approval` escalation to
   you, the plugin files the same `approve-spec` item and keeps the
   escalation open, linked to it, so a forwarded approval is answered with
-  Approve/Decline exactly as `approval: me` is; a forwarded `decision`
+  Approve/Decline exactly as `approval: user` is; a forwarded `decision`
   stays a question. An approval is recorded from the approver's
   words wherever they are: the project steward's guidance that resolves the
   request, the user's answer on the Stewards page, their message in the
@@ -264,7 +264,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   page answer that is neither an approval nor a clear refusal goes back to
   the project steward to interpret, rather than being remembered as a
   decline. A spec comment the user writes from their own thread counts
-  toward the spec and, with `approval: me`, is its own approval. A request
+  toward the spec and, with `approval: user`, is its own approval. A request
   the approver declines is not made again until the spec changes, and while
   one is open the steward is told not to ask the user again: the request is
   on the Stewards page, and a report that asks anyway shows as a playbook
@@ -282,7 +282,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 - **"Needs you" items** are the structured things only the user can do. The
   plugin files the gate items (`approve-spec`, `approve-pr`, `merge`) from
   the snapshot; a steward's `decide`, `configure` and `provide-secret` asks
-  are the one `escalations` record with `route: me` and a `resolution`
+  are the one `escalations` record with `route: user` and a `resolution`
   (`choice`, `text`, `approve-decline`, `secret`, `done`), forwarded by the
   project steward (BB-30). Both appear on the Stewards page under **Blocked**,
   attached to their binding's card, with a link and a button each, in the
@@ -461,7 +461,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   project and effort its path names through [board-route.ts](board-route.ts),
   and the sidebar thread list follows it, so the list is not remounted when the
   page opens.
-- **Questions and asks to you** are escalations with `route: me`, kept in
+- **Questions and asks to you** are escalations with `route: user`, kept in
   the store from the moment the project steward asks
   (`steward_update { ask }`, or forwarding an escalation) until it records
   your answer (`steward_update { resolve: "<id>", answer }`) or you close it
@@ -810,7 +810,7 @@ and reports each repo whose alerts the `gh` login cannot read.
 Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
 `source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
 stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
-`substantial`, `approval: project` (default), `me` or `{ linear-state: … }`),
+`substantial`, `approval: project` (default), `user` or `{ linear-state: … }`),
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker`,
 `reviewer` as `provider/model/level`; `claude` means `claude-code`; the model may hold
 slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last

@@ -886,15 +886,20 @@ const phaseSchema = z
   })
   .strict();
 
+/** Who approves a substantial ticket: the project steward (default), the user, or a Linear state. */
+export const approvalModeSchema = z.union([z.literal("project"), z.literal("user"), z.object({ "linear-state": z.string().trim().min(1).max(100) }).strict()]);
+export type ApprovalMode = z.infer<typeof approvalModeSchema>;
+
 const readySchema = z
   .object({
     checklist: z.array(z.string().trim().min(1).max(300)).min(1).max(30),
     substantial: z.array(z.string().trim().min(1).max(300)).max(30).default([]),
-    /** Who approves a substantial ticket: the project steward (default), the user, or a Linear state. */
-    approval: z.union([z.literal("project"), z.literal("me"), z.object({ "linear-state": z.string().trim().min(1).max(100) }).strict()]).default("project"),
+    // BB-209: `user` is the canonical value; the pre-rename `me` alias is still
+    // accepted and parsePlaybook normalises it to `user` with a warning.
+    approval: z.union([approvalModeSchema, z.literal("me")]).default("project"),
   })
   .strict();
-export type ReadyConfig = z.infer<typeof readySchema>;
+export type ReadyConfig = Omit<z.infer<typeof readySchema>, "approval"> & { approval: ApprovalMode };
 
 /** The default cap on follow-through: a deploy and its verification, with room to spare. */
 export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
@@ -1071,6 +1076,8 @@ export type Playbook = {
   ownerMerges: boolean;
   /** Where a merge is confirmed live, or empty when the playbook names no deployment target. */
   deployments: DeploymentTarget[];
+  /** Alias warnings the front matter raised, surfaced by `bb stewards check` (BB-209). */
+  warnings: string[];
   /** The text before the first `## ` heading: instructions for every phase. */
   general: string;
   /** Each `## Phase` section's text, keyed by heading as written. */
@@ -1124,6 +1131,13 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   }
 
   const { general, sections } = splitSections(m[2] ?? "");
+  // BB-209: `approval: me` is the pre-rename alias for `user`. Normalise it in
+  // the parsed playbook and record one warning, so every comparison sees
+  // `user` while `bb stewards check` tells the project to write it.
+  const warnings: string[] = [];
+  const rawReady = fm.ready ?? null;
+  if (rawReady !== null && rawReady.approval === "me") warnings.push('ready.approval "me" is renamed to "user"; write "user"');
+  const ready: ReadyConfig | null = rawReady === null ? null : { ...rawReady, approval: rawReady.approval === "me" ? "user" : rawReady.approval };
   return {
     ok: true,
     value: {
@@ -1132,7 +1146,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       source: fm.source,
       phases,
       terminal: fm.terminal,
-      ready: fm.ready ?? null,
+      ready,
       promote: fm.promote ?? null,
       may: fm.may,
       models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null, reviewer: fm.models.reviewer ?? null },
@@ -1142,6 +1156,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       skipAuthors: fm["skip-authors"],
       ownerMerges: fm["owner-merges"],
       deployments: fm.deployment === undefined ? [] : Array.isArray(fm.deployment) ? fm.deployment : [fm.deployment],
+      warnings,
       general,
       sections,
       version: createHash("sha256").update(text).digest("hex").slice(0, 12),

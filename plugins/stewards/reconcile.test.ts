@@ -854,7 +854,7 @@ describe("idle in an active stage (BB-83)", () => {
     expect(idleInActiveStage(binding({ deployments: { "acme/web#7": { state: "deploying" } as never } }), merged)).toBe(false);
     expect(idleInActiveStage(binding({ hold: "a freeze" }), merged)).toBe(false);
     expect(idleInActiveStage(binding({ ending: "terminal" }), merged)).toBe(false);
-    expect(idleInActiveStage(binding({ escalations: [{ status: "open", route: "me" }] }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ escalations: [{ status: "open", route: "user" }] }), merged)).toBe(false);
     expect(idleInActiveStage(binding({ needs: [{ kind: "approve-pr" }] }), merged)).toBe(false);
     // The spec stage is not active, and a deployment that is already deployed
     // is nothing to wait on.

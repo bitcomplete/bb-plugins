@@ -222,11 +222,11 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       ctx.store.closeNeedByKey(b.id, "approve-pr", url, "Declined on the Stewards page; waiting for a new review round.");
       if (approvalEsc !== null) ctx.store.resolve(approvalEsc.id, "Declined on the Stewards page.");
     } else if (approvalEsc === null) {
-      const x = ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "me", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
+      const x = ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "user", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
       fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing);
     } else {
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route !== "me") ctx.store.reroute(approvalEsc.id, "me", approvalEsc.recommendation);
+      if (approvalEsc.route !== "user") ctx.store.reroute(approvalEsc.id, "user", approvalEsc.recommendation);
       fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing);
     }
   } else if (g.needsProjectApproval) {
@@ -240,7 +240,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       }
     } else {
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route === "me") {
+      if (approvalEsc.route === "user") {
         // A change from the user's lane to the project steward's: ask it.
         ctx.store.reroute(approvalEsc.id, "project", null);
         approvalRaised = true;
@@ -251,7 +251,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       // Checks went pending or failing: never resolve the request as
       // approved. Keep it and the page item open, re-pointed at the head.
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route === "me") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing);
+      if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing);
       ctx.store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
     } else if (g.ownerApproved || g.projectApproved) {
       // The resolution names what approved, so a closed item can always

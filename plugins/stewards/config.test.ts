@@ -311,6 +311,25 @@ describe("playbooks", () => {
     expect(p.version).toMatch(/^[0-9a-f]{12}$/u);
   });
 
+  it("normalises the pre-rename approval alias `me` to `user` with a warning (BB-209)", () => {
+    const user = parsePlaybook(LINEAR_TICKETS.replace("approval: project", "approval: user"), "linear-tickets");
+    if (!user.ok) throw new Error(user.error);
+    expect(user.value.ready?.approval).toBe("user");
+    expect(user.value.warnings).toEqual([]);
+
+    const alias = parsePlaybook(LINEAR_TICKETS.replace("approval: project", "approval: me"), "linear-tickets");
+    if (!alias.ok) throw new Error(alias.error);
+    expect(alias.value.ready?.approval).toBe("user");
+    expect(alias.value.warnings).toHaveLength(1);
+    expect(alias.value.warnings[0]).toMatch(/"me" is renamed to "user"/u);
+
+    // The default is unchanged and warns about nothing.
+    const plain = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!plain.ok) throw new Error(plain.error);
+    expect(plain.value.ready?.approval).toBe("project");
+    expect(plain.value.warnings).toEqual([]);
+  });
+
   it("takes a deployment target's optional workflows list, defaulting to none (BB-61)", () => {
     const withDeployment = (extra: string) =>
       LINEAR_TICKETS.replace(
