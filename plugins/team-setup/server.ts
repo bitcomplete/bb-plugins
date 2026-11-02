@@ -129,6 +129,11 @@ export const rpcContract = defineRpcContract({
         user: z.string().nullable(),
       }),
       machines: z.object({ names: z.array(z.string()) }),
+      // How many projects exist on this server, for the "Create a project from
+      // a git URL" entry: with none it is the primary call to action. Read
+      // from core rather than the multi-repo plugin because a project is a
+      // core concept; the entry deep-links into multi-repo's New project form.
+      projects: z.object({ count: z.number().int().min(0) }),
       figma: figmaStatusSchema,
       steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, slack: stepStateSchema, figma: stepStateSchema, machine: stepStateSchema }),
       complete: z.boolean(),
@@ -457,6 +462,17 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
         ]);
         const machineNames = hosts.map((h) => h.name);
 
+        // A failed list is not worth failing the whole checklist for: the
+        // entry then reads as "no projects", which is the safe first-run
+        // default rather than a hidden call to action.
+        let projectCount = 0;
+        try {
+          const all = await bb.sdk.projects.list();
+          projectCount = all.length;
+        } catch (error) {
+          bb.log.warn(`could not list projects: ${errorMessage(error)}`);
+        }
+
         const ai = { ...poolState, routing: { claude: false, codex: false }, accounts: [] as z.infer<typeof accountRowSchema>[] };
         if (poolState.available) {
           try {
@@ -567,6 +583,7 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           linear,
           slack,
           machines: { names: machineNames },
+          projects: { count: projectCount },
           figma,
           steps,
           complete: Object.values(steps).every((s) => s !== "todo"),

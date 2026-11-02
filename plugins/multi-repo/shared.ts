@@ -36,6 +36,26 @@ export const REPOS_PANEL_ID = "repos";
 export const REPOS_PANEL_PATH = "repos";
 
 /**
+ * The sub-path that opens the New project form.
+ *
+ * A deep link (`/plugins/multi-repo/repos/new`) is how team-setup surfaces
+ * "Create a project from a git URL" without mounting this plugin's component
+ * across the package boundary. The same literal is in team-setup's
+ * `create-project-entry.tsx`; a plugin bundle cannot import it from here.
+ */
+export const NEW_PROJECT_SUBPATH = "new";
+
+/**
+ * Whether a nav-panel sub-path should open the New project form.
+ *
+ * The panel's own New project button flips the same state; this is only the
+ * deep-link half, kept a pure function so it is testable without a DOM.
+ */
+export function opensNewProjectForm(subPath: string): boolean {
+  return subPath === NEW_PROJECT_SUBPATH;
+}
+
+/**
  * How often the composer banner re-reads its own thread's diff.
  *
  * Slower than the panel on purpose. The panel is open because someone is

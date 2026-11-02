@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { browserDeps, createUpdateStore, type UpdateStore } from "./server-update";
+import { CreateProjectEntry } from "./create-project-entry.js";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 
@@ -253,9 +254,17 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
     return <p className="text-sm text-muted-foreground">{error ?? "Checking…"}</p>;
   }
 
-  const { ai, github, devbox, linear, slack, machines, steps, figma: figmaStatus } = status;
+  const { ai, github, devbox, linear, slack, machines, steps, figma: figmaStatus, projects } = status;
+  const createProject = <CreateProjectEntry projectCount={projects.count} />;
 
-  if (compact && !complete) return <Remaining steps={steps} />;
+  if (compact && !complete) {
+    return (
+      <div className="flex flex-col gap-2">
+        {createProject}
+        <Remaining steps={steps} />
+      </div>
+    );
+  }
 
   if (compact) {
     const aiLabel = ai.accounts
@@ -263,16 +272,19 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
       .map((a) => a.label)
       .join(", ");
     return (
-      <p className="text-sm text-muted-foreground">
-        All set: {aiLabel !== "" ? `${aiLabel}; ` : ""}
-        {github.login !== null ? `GitHub as ${github.login}; ` : steps.github === "done" ? "GitHub; " : ""}
-        {devbox.project !== null ? `devbox project ${devbox.project}; ` : steps.devbox === "done" ? "devbox; " : ""}
-        {linear.user !== null ? `Linear as ${linear.user}; ` : steps.linear === "done" ? "Linear; " : ""}
-        {slack.user !== null ? `Slack as ${slack.user}; ` : steps.slack === "done" ? "Slack; " : ""}
-        {steps.figma === "done" ? "Figma; " : ""}
-        {machines.names.length === 1 ? "1 machine" : `${machines.names.length} machines`}.{" "}
-        <SettingsLink pluginId="team-setup">Details</SettingsLink>
-      </p>
+      <div className="flex flex-col gap-2">
+        {createProject}
+        <p className="text-sm text-muted-foreground">
+          All set: {aiLabel !== "" ? `${aiLabel}; ` : ""}
+          {github.login !== null ? `GitHub as ${github.login}; ` : steps.github === "done" ? "GitHub; " : ""}
+          {devbox.project !== null ? `devbox project ${devbox.project}; ` : steps.devbox === "done" ? "devbox; " : ""}
+          {linear.user !== null ? `Linear as ${linear.user}; ` : steps.linear === "done" ? "Linear; " : ""}
+          {slack.user !== null ? `Slack as ${slack.user}; ` : steps.slack === "done" ? "Slack; " : ""}
+          {steps.figma === "done" ? "Figma; " : ""}
+          {machines.names.length === 1 ? "1 machine" : `${machines.names.length} machines`}.{" "}
+          <SettingsLink pluginId="team-setup">Details</SettingsLink>
+        </p>
+      </div>
     );
   }
 
@@ -282,6 +294,24 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
   return (
     <div className="flex flex-col gap-4 text-sm">
       <ol className="flex flex-col gap-4">
+        <Step
+          state={projects.count > 0 ? "done" : "todo"}
+          title="A project"
+          about={
+            <p>
+              A project points bb at the git repo — or set of repos — your threads work in. The multi-repo New
+              project form clones a git URL on a machine and creates the project in one step.
+            </p>
+          }
+          action={createProject}
+        >
+          {projects.count > 0 ? (
+            <p>{projects.count === 1 ? "One project" : `${projects.count} projects`} on this server.</p>
+          ) : (
+            <p>Nothing to work in yet. Create the first project from a git URL.</p>
+          )}
+        </Step>
+
         <Step
           state={steps.ai}
           title="Claude or Codex"
