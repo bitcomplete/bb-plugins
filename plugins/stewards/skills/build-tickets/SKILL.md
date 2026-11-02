@@ -341,6 +341,27 @@ look for another way: fix the gate, or if the thread's permission system
 refuses the command (or a direct `gh pr merge`), take the hand-off path
 below. Carry on here once it is in.
 
+**4c. Dispatch the `bb-server` build — a `bb-plugins` merge only.** A
+`bb-plugins` merge must dispatch the `bb-server` build exactly once so it
+starts within a minute; the ten-minute tick is the backstop. `bb stewards
+merge` dispatches it when the project's `mergeDispatch` names the repo, and
+its "Merged:" comment says so — when you see that line the dispatch has
+happened and you do not run the command. Otherwise (nothing configured yet,
+or you merged with a direct `gh pr merge` in the hand-off path below) run it
+yourself, exactly once, right after the merge succeeds:
+
+```sh
+gh workflow run bb-server.yaml --repo bitcomplete/bb-gate --ref main -f only_if_moved=true
+```
+
+Use `-f only_if_moved=true`, never a plain dispatch: a plain dispatch always
+builds, even when the pin is already current, while this form builds only
+when the pin moved. Say in the "Merged:" comment (or in your own signed
+comment when the merge path posted none) that the build was dispatched. If
+the dispatch fails, say that and carry on: the tick is the backstop. Never
+retry the dispatch in a loop, and never fail or undo the merge for it. Only a
+`bb-plugins` merge dispatches; `bb-gate` and `devbox` merges do not.
+
 ### When the merge is refused
 
 A permission system that refuses `bb stewards merge` (or `gh pr merge`)

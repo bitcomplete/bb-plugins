@@ -108,6 +108,20 @@ describe("the project file", () => {
     expect(parseProjectFile(JSON.stringify({ version: 1, standingRule: ["typo"] }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, standingRules: [""] }))).toMatchObject({ ok: false });
   });
+  it("parses mergeDispatch, defaulting to none, and refuses a bad entry (BB-216)", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.mergeDispatch).toEqual([]);
+    const configured = parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "bitcomplete/bb-plugins", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] }));
+    if (!configured.ok) throw new Error(configured.error);
+    expect(configured.value.mergeDispatch).toEqual([{ repo: "bitcomplete/bb-plugins", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }]);
+    // workflowRepo, ref and inputs are optional; inputs defaults to empty.
+    const minimal = parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "acme/web", workflow: "build.yaml" }] }));
+    if (!minimal.ok) throw new Error(minimal.error);
+    expect(minimal.value.mergeDispatch).toEqual([{ repo: "acme/web", workflow: "build.yaml", inputs: {} }]);
+    expect(parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "not a repo", workflow: "x.yaml" }] }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "acme/web", workflow: "x.yaml", bogus: true }] }))).toMatchObject({ ok: false });
+  });
 });
 
 describe("ops in the project file", () => {

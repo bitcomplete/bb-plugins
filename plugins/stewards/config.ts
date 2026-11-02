@@ -217,6 +217,29 @@ export const lessonRulesSchema = z
   .default({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30, validations: { perWeek: 1 } });
 export type LessonRules = z.infer<typeof lessonRulesSchema>;
 
+/**
+ * One workflow dispatch a merge triggers (BB-216): when a pull request in
+ * `repo` merges, the plugin dispatches `workflow` in `workflowRepo` on `ref`
+ * with `inputs`, through the same GitHub writer the merge uses. `workflowRepo`
+ * defaults to the merged repo and `ref` to the workflow repo's default branch.
+ * With nothing configured, a merge dispatches nothing.
+ */
+export const mergeDispatchSchema = z
+  .object({
+    /** The merged pull request's repo, as GitHub spells it, e.g. bitcomplete/bb-plugins. */
+    repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-plugins"),
+    /** The workflow file or id to dispatch, e.g. bb-server.yaml. */
+    workflow: z.string().trim().min(1).max(300),
+    /** The repo the workflow lives in; the merged repo when omitted. */
+    workflowRepo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-gate").optional(),
+    /** The ref to dispatch on; the workflow repo's default branch when omitted. */
+    ref: z.string().trim().min(1).max(300).optional(),
+    /** The workflow_dispatch inputs, as strings (a boolean input is "true"/"false"). */
+    inputs: z.record(z.string(), z.string()).default({}),
+  })
+  .strict();
+export type MergeDispatch = z.infer<typeof mergeDispatchSchema>;
+
 export const projectFileSchema = z
   .object({
     version: z.literal(1),
@@ -294,6 +317,12 @@ export const projectFileSchema = z
     deps: depsSchema,
     /** The mechanical lesson lifecycle's thresholds and caps (BB-35 step 3). */
     lessons: lessonRulesSchema,
+    /**
+     * Workflows a merge dispatches (BB-216): each entry names a merged repo
+     * and the workflow to run after its pull requests merge. Empty, a merge
+     * dispatches nothing and behaves exactly as before.
+     */
+    mergeDispatch: z.array(mergeDispatchSchema).max(20).default([]),
   })
   .strict()
   .superRefine((file, ctx) => {
