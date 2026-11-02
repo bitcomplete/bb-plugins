@@ -2956,7 +2956,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * Write the status the plugin observed itself, without a steward turn
      * (BB-203): the page and sidebar are current before the next wake, and the
      * write goes through `patch` so the realtime channel rings. `actor` follows
-     * the standing rule (`user` only while a need or a `me` escalation is open),
+     * the standing rule (`user` only while a need or a `user` escalation is open),
      * and the record keeps the steward's phase, wait, conditions and resources.
      */
     function patchMechanicalStatus(b: Binding, event: MechanicalEvent): Binding {
@@ -3250,7 +3250,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // diff only quiets them while one is, and the idle rule (BB-83) needs the
       // set for a binding whose worker has finished its turn.
       const ownPulls = await ownPullKeys(b, workers, observed);
-      // BB-203: an open need or `me` escalation keeps the worker's own pull
+      // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });

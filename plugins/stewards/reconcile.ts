@@ -122,7 +122,7 @@ export function markerLaneChange(before: readonly SnapshotComment[], after: read
  * A spec comment is a signed comment that starts by saying so. The steward's
  * own count, and so do the user's: a thread the user runs themselves is
  * treated as the user's own words (an amendment carries its own approval
- * when the approver is `me`). `isUserThread` says whether a signing thread is
+ * when the approver is `user`). `isUserThread` says whether a signing thread is
  * the user's rather than a steward, worker or the project steward; without it
  * only the steward's own comments count.
  */
@@ -306,7 +306,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
   if (addedSpecs.length > 0) {
     const byUser = addedSpecs.some((c) => c.signedBy !== null && (ctx.userThread?.(c.signedBy) ?? false));
     // A spec comment the user wrote is news on its own: it carries its own
-    // approval when the approver is `me`, and when it is the project steward
+    // approval when the approver is `user`, and when it is the project steward
     // the steward should know the user authored it, not wait on them.
     changes.push({ text: `${p}Spec comment${addedSpecs.length === 1 ? "" : "s"} added${byUser ? " by the user" : ""}`, actionable: ctx.approved || byUser, ...(byUser ? { byUser } : {}) });
   }
@@ -335,7 +335,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
 
 /**
  * Whether a worker in flight owns this pull request's activity and nothing the
- * user must act on is open (BB-203). An open need or `me` escalation keeps the
+ * user must act on is open (BB-203). An open need or `user` escalation keeps the
  * activity loud, so the steward can reconcile the item it is holding for the
  * user. BB-52's in-flight rule is unchanged for everything else.
  */
@@ -396,7 +396,7 @@ export type ObservedDiffContext = {
   /** The stage an entity state maps to in this binding's playbook, for the build/review move (rule 1). */
   stageOf?: (state: string) => string | null;
   userThread?: (threadId: string) => boolean;
-  /** An open need or `me` escalation: the user is being asked, so own-PR work is not quiet (BB-203). */
+  /** An open need or `user` escalation: the user is being asked, so own-PR work is not quiet (BB-203). */
   userWaiting?: boolean;
 };
 
@@ -649,7 +649,7 @@ export const checksPhrase = (state: string, failing: readonly string[]): string 
  * built from the last report the steward made so the phase, wait, conditions
  * and resources survive. Checks fold into the phrase and leave the summary;
  * the others name the new state. `actor` follows the standing rule: `user`
- * only while a need or a `me` escalation is open. Null when there is no report
+ * only while a need or a `user` escalation is open. Null when there is no report
  * to build on: a mechanical write never invents the steward's first report.
  */
 export function mechanicalStatus(prev: StatusRecord | null, event: MechanicalEvent, userWaiting: boolean, at: number): StatusRecord | null {
