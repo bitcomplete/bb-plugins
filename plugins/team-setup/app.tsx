@@ -443,9 +443,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
           {github.status === "logged in" ? (
             <p>
               Signed in{github.login !== null ? ` as ${github.login}` : ""}. Every machine gets this login as GH_TOKEN and a git credential helper.
-              {github.orgMember === false ? (
-                <span className="text-destructive"> {github.login} is not a member of {github.org}, so its repos will not be reachable. Sign out and sign in with your work account.</span>
-              ) : null}
             </p>
           ) : github.status === "overridden" ? (
             <p>Using a GH_TOKEN you set by hand in Environment variables. Sign in here to stop managing the token yourself, then delete the variable.</p>
