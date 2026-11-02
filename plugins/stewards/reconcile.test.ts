@@ -570,11 +570,14 @@ describe("the pull request gate (build-tickets)", () => {
     expect(productReason(null, false)).toBeNull();
   });
 
-  it("reads the product inputs from a binding: a ticket's approved spec is the ack, a review binding has none (BB-207)", () => {
+  it("reads the product inputs from a binding: only a review binding's substantial is the diff judgment (BB-207)", () => {
     const binding = (kind: "ticket" | "review", ready: Record<string, unknown> = {}) => ({ kind, ready: readyStateSchema.parse(ready) });
     expect(productGateOptions(binding("review", { substantial: true }))).toEqual({ substantial: true, ticketApprovedSpec: false });
-    expect(productGateOptions(binding("ticket", { substantial: true, approval: { at: 1, specHash: "h", by: "user" } }))).toEqual({ substantial: true, ticketApprovedSpec: true });
-    expect(productGateOptions(binding("ticket", { substantial: true }))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    // A ticket binding's `substantial` is the spec gate's judgment, not the
+    // reviewer's diff judgment, so this PR leaves it inert whatever it says.
+    // PR 2 adds the ticket PR's diff report; the approved spec is its ack.
+    expect(productGateOptions(binding("ticket", { substantial: true }))).toEqual({ substantial: null, ticketApprovedSpec: false });
+    expect(productGateOptions(binding("ticket", { substantial: true, approval: { at: 1, specHash: "h", by: "user" } }))).toEqual({ substantial: null, ticketApprovedSpec: false });
   });
 
   it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {

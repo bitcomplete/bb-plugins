@@ -132,16 +132,18 @@ export function productReason(substantial: boolean | null, ticketApprovedSpec: b
 }
 
 /**
- * The product inputs `prGate` reads from a binding (BB-207). A ticket
- * binding's referenced ticket is itself, so its approved spec is the ready
- * gate's approval; a review binding has no approved spec of its own, and the
- * reviewer reports the referenced ticket's separately.
+ * The product inputs `prGate` reads from a binding (BB-207). Only a review
+ * binding's `substantial` is the reviewer's diff judgment; a ticket binding's
+ * is the spec gate's, a different thing, so this PR leaves a ticket binding
+ * inert and PR 2 adds the ticket PR's diff-judged report in its own field.
+ * Whether a referenced ticket has an approved spec is the reviewer's report
+ * and also arrives with PR 2; until then a review binding has none.
  */
 export function productGateOptions(b: Pick<Binding, "kind" | "ready">): { substantial: boolean | null; ticketApprovedSpec: boolean } {
   // `ready` is always present on a stored binding; the guard keeps a partial
   // caller (a unit test's stub) from throwing, and unjudged stays null.
   const ready: ReadyState | null | undefined = b.ready;
-  return { substantial: ready?.substantial ?? null, ticketApprovedSpec: b.kind === "ticket" && ready?.approval != null };
+  return { substantial: b.kind === "review" ? ready?.substantial ?? null : null, ticketApprovedSpec: false };
 }
 
 /**
