@@ -17,7 +17,6 @@ import {
   ThreadTitle,
   definePluginApp,
   experimental_Icon as Icon,
-  experimental_ShortcutHint as ShortcutHint,
   experimental_SidebarNavigationIcon as SidebarNavigationIcon,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
   experimental_ThreadActionsMenu as ThreadActionsMenu,
@@ -2264,9 +2263,12 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompac
                     <span className="min-w-0 flex-1 truncate">{count > 0 ? `${t.name} (${count})` : t.name}</span>
                     {isActive ? <Icon name="Check" className="size-4 shrink-0" aria-hidden /> : null}
                     {!isCompactViewport && index < 9 ? (
-                      <span aria-hidden="true" className="shrink-0">
-                        <ShortcutHint shortcut={{ ariaKeyshortcuts: String(index + 1), label: String(index + 1) }} />
-                      </span>
+                      <kbd
+                        aria-hidden="true"
+                        className="pointer-events-none inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-sm bg-state-hover px-1.5 py-1 font-sans text-xs font-normal leading-none tabular-nums text-subtle-foreground opacity-60"
+                      >
+                        {index + 1}
+                      </kbd>
                     ) : null}
                   </button>
                 );
