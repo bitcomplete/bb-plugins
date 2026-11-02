@@ -345,13 +345,25 @@ export const timeoutsDue = (deployments: Deployments, now: number): string[] =>
     .filter(([, w]) => (w.state === "merged" || w.state === "deploying") && w.deadlineAt !== null && now >= w.deadlineAt)
     .map(([id]) => id);
 
+/** The note a timed-out watch carries; the timeout reason, then the earlier one. */
+export const TIMEOUT_NOTE = "No matching deployment within the playbook's timeout";
+
+/**
+ * The note a timeout writes. The timeout is always visible (BB-194): the
+ * earlier reason a watch carried — a not-yet verdict, say — follows it as
+ * `; last: <reason>`, so `bb stewards show` and the wake read the timeout
+ * first and the stale reason after, not one in place of the other.
+ */
+export const timeoutNote = (previous: string | null | undefined): string =>
+  previous === null || previous === undefined || previous === "" ? TIMEOUT_NOTE : `${TIMEOUT_NOTE}; last: ${previous}`;
+
 /** Mark timed-out watches failed, so the steward is woken once and the state does not flap. */
 export function timeOut(deployments: Deployments, ids: readonly string[], now: number): Deployments {
   const next = { ...deployments };
   const wanted = new Set(ids);
   for (const [id, watch] of Object.entries(next)) {
     if (!wanted.has(id)) continue;
-    next[id] = { ...watch, state: "failed", at: now, deadlineAt: null, note: watch.note ?? "No matching deployment within the playbook's timeout" };
+    next[id] = { ...watch, state: "failed", at: now, deadlineAt: null, note: timeoutNote(watch.note) };
   }
   return next;
 }
