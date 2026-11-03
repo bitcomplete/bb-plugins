@@ -109,6 +109,25 @@ describe("a steward's wake", () => {
     expect(wake).toMatch(/report `substantial: false`.*the gate passes immediately on that report.*start the worker in the same turn/u);
   });
 
+  // BB-207: a review playbook has no ready gate, but its `substantial` list is
+  // the reviewer's criteria; the wake carries the list and the verdict, and
+  // says to report it on the binding.
+  it("shows the github-reviews substantial criteria and the reported verdict on a review binding", () => {
+    const { s } = world();
+    const review = s.create({ projectId: "p1", source: "github", entityId: "acme/web#8", entityKey: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Review", kind: "review", playbook: "github-reviews", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
+    const parsed = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+    if (!parsed.ok) throw new Error(parsed.error);
+    const playbook = parsed.value;
+    const input = (binding = review) => wakeInput({ binding, playbook, gate: gateState(playbook, binding.ready, ""), observed: { entity: pull(), pulls: [] } });
+    const unjudged = formatWake(input());
+    expect(unjudged).toContain("- Substantial: not judged yet");
+    expect(unjudged).toContain("a new outbound integration or dependency");
+    expect(unjudged).toContain("the reviewer computes it from the diff, never the pull request body");
+    // Once the reviewer reports the verdict on the binding, the wake carries it.
+    s.patch(review.id, { ready: { ...review.ready, substantial: true, why: "a new outbound integration" } });
+    expect(formatWake(input(s.binding(review.id)!))).toContain("- Substantial: yes — a new outbound integration");
+  });
+
   // BB-154: a binding marked waiting with no wake source carries one paragraph
   // naming what the plugin does not track and what the steward can do.
   it("carries the no-wake-source paragraph only while marked", () => {

@@ -219,6 +219,12 @@ models:
   worker: claude/claude-opus-5-5/high
 requeue-default: 7d
 skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]
+substantial:
+  - "a new outbound integration or dependency"
+  - "a migration or new table"
+  - "a new user-facing surface a person would notice: a page, dialog, background task or job; a new route behind an existing role gate does not count on its own"
+  - "an owner-reviewed trigger from the project's change classification"
+  - "hand-written non-test lines above a threshold (400 by default), excluding generated code, lockfiles and testdata or test paths"
 ---
 
 You review a teammate's pull request, as the user, for as long as it is open.
@@ -228,13 +234,21 @@ review body opens with the round's marker on its first line, then the
 findings, then the thread's signature:
 
 \`\`\`
-<!-- bb-review round=<N> sha=<full head sha> verdict=<approved|changes-requested> lane=<no-review|owner-reviewed> approver=<owner|project> -->
+<!-- bb-review round=<N> sha=<full head sha> verdict=<approved|changes-requested> lane=<no-review|owner-reviewed> approver=<owner|project> substantial=<yes|no> spec=<yes|no> -->
 \`\`\`
 
 The plugin reads that marker to decide the lane gate and put the owner's
 Approve item on the Stewards page, so a round without it is
 invisible to the gate. Round 1 is the first review of the pull request; count
-up from there.
+up from there. \`substantial\` is the worker's judgment of the diff against the
+\`substantial\` list above (never the pull request body), and \`spec\` is whether
+a ticket the pull request references has an approved spec. A substantial pull
+request with no approved spec is the owner's, with reason \`product\`: its review
+body opens with a **Product** section before the findings, and the owner's
+unsigned approval of that section is the ack. The worker also reports the
+verdict on the binding with \`steward_report { ready: { substantial, why } }\`,
+so \`bb stewards show\` and the wake carry it. A pull request judged not
+substantial gets no Product section and no product ask.
 
 A round is due when the pull request is new to you, when the author pushes
 after your last review, or when your review is re-requested. A small follow-up

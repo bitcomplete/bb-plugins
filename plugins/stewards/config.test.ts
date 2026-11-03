@@ -289,6 +289,21 @@ describe("playbooks", () => {
     expect(reviews.value.general).toMatch(/approver=<owner\|project>/u);
   });
 
+  it("parses the github-reviews substantial criteria, defaulting to empty, and rejects a blank or over-long entry (BB-207)", () => {
+    const reviews = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+    if (!reviews.ok) throw new Error(reviews.error);
+    expect(reviews.value.substantial).toHaveLength(5);
+    expect(reviews.value.substantial[0]).toMatch(/new outbound integration/u);
+    expect(reviews.value.substantial[2]).toMatch(/user-facing surface/u);
+    // A playbook with no list behaves exactly as before: nothing substantial.
+    const plain = parsePlaybook(GITHUB_PRS, "github-prs");
+    if (!plain.ok) throw new Error(plain.error);
+    expect(plain.value.substantial).toEqual([]);
+    // A blank or over-long criterion is refused, like `ready.substantial`.
+    expect(parsePlaybook(GITHUB_REVIEWS.replace("substantial:\n", 'substantial:\n  - ""\n'), "github-reviews")).toMatchObject({ ok: false });
+    expect(parsePlaybook(GITHUB_REVIEWS.replace("substantial:\n", `substantial:\n  - "${"x".repeat(301)}"\n`), "github-reviews")).toMatchObject({ ok: false });
+  });
+
   it("maps states to phases and stages, ignoring case, and splits sections", () => {
     const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!parsed.ok) throw new Error(parsed.error);

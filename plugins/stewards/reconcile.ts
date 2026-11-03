@@ -53,9 +53,12 @@ export function runningWorkerReason(workers: readonly Pick<Worker, "threadId" | 
  * (the gate then treats the pull request as the owner's). `approver` is the
  * optional `approver=owner|project` attribute; it is undefined when the marker
  * did not name one, and the gate then reads it as `owner` (fail closed,
- * BB-192).
+ * BB-192). `substantial` is the reviewer's diff judgment (BB-207), null when
+ * the marker did not name one; `ticketApprovedSpec` is whether a ticket the
+ * pull request references has an approved spec, the ack that spares the owner
+ * the product ask, false when the marker did not say so (fail closed).
  */
-export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null; approver?: string };
+export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null; approver?: string; substantial: boolean | null; ticketApprovedSpec: boolean };
 
 const REVIEW_MARKER = /^<!--\s*bb-review\b([^>]*?)-->/u;
 
@@ -83,12 +86,17 @@ export function reviewMarker(body: string): ReviewMarker | null {
     else bare.push(token);
   }
   const round = Number(keyed.get("round") ?? "");
+  // BB-207: `substantial=yes|no` is the reviewer's diff judgment, absent is
+  // unjudged; `spec=yes` says a referenced ticket has an approved spec.
+  const substantial = keyed.get("substantial");
   return {
     round: Number.isInteger(round) && round > 0 ? round : 0,
     sha: keyed.get("sha") ?? "",
     verdict: keyed.get("verdict") ?? bare[0] ?? UNREADABLE_VERDICT,
     lane: keyed.get("lane") ?? null,
     approver: keyed.get("approver"),
+    substantial: substantial === "yes" ? true : substantial === "no" ? false : null,
+    ticketApprovedSpec: keyed.get("spec") === "yes",
   };
 }
 
@@ -132,18 +140,28 @@ export function productReason(substantial: boolean | null, ticketApprovedSpec: b
 }
 
 /**
- * The product inputs `prGate` reads from a binding (BB-207). Only a review
- * binding's `substantial` is the reviewer's diff judgment; a ticket binding's
- * is the spec gate's, a different thing, so this PR leaves a ticket binding
- * inert and PR 2 adds the ticket PR's diff-judged report in its own field.
- * Whether a referenced ticket has an approved spec is the reviewer's report
- * and also arrives with PR 2; until then a review binding has none.
+ * The product inputs `prGate` reads from a binding (BB-207). A review or PR
+ * binding's `substantial` is the reviewer's diff judgment: the `bb-review`
+ * marker carries it (`substantial=yes|no`), and a review steward may also
+ * report it with `steward_report { ready: { substantial, why } }`, which wins
+ * when set. The marker's `spec=yes|no` says whether a ticket the pull request
+ * references has an approved spec, the ack that spares the owner the ask.
+ *
+ * A ticket binding's own `ready.substantial` is the spec gate's judgment, a
+ * different thing from the diff's, so the diff judgment is read only from the
+ * marker on its pull request; its own `ready.approval` is the ack. Unjudged
+ * (null) leaves every lane exactly as before, which is what keeps the change
+ * inert until a reviewer reports a verdict.
  */
-export function productGateOptions(b: Pick<Binding, "kind" | "ready">): { substantial: boolean | null; ticketApprovedSpec: boolean } {
+export function productGateOptions(b: Pick<Binding, "kind" | "ready">, pull?: EntitySnapshot | null): { substantial: boolean | null; ticketApprovedSpec: boolean } {
   // `ready` is always present on a stored binding; the guard keeps a partial
   // caller (a unit test's stub) from throwing, and unjudged stays null.
   const ready: ReadyState | null | undefined = b.ready;
-  return { substantial: b.kind === "review" ? ready?.substantial ?? null : null, ticketApprovedSpec: false };
+  const marker = pull === undefined || pull === null ? null : latestReviewMarker(pull.comments);
+  if (b.kind === "ticket") {
+    return { substantial: marker?.substantial ?? null, ticketApprovedSpec: ready?.approval != null };
+  }
+  return { substantial: ready?.substantial ?? marker?.substantial ?? null, ticketApprovedSpec: marker?.ticketApprovedSpec ?? false };
 }
 
 /**

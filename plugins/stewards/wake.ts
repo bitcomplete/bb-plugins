@@ -13,7 +13,7 @@ import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } fro
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
-import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { newHumanComments, productGateOptions, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { prGate, type ProjectApprovalRecord } from "./gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
@@ -322,7 +322,7 @@ function commentLines(comments: SnapshotComment[]): string[] {
   return lines;
 }
 
-function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovals?: readonly ProjectApprovalRecord[]): string[] {
+function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovals?: readonly ProjectApprovalRecord[], product?: { substantial: boolean | null; ticketApprovedSpec: boolean }): string[] {
   const lines = [`### ${heading}`, ""];
   lines.push(`- ${e.key}: ${e.title ?? "(untitled)"}${e.url === null ? "" : ` — ${e.url}`}`);
   lines.push(`- State: ${e.state}${e.stateType === null ? "" : ` (${e.stateType})`}`);
@@ -334,7 +334,7 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
-    const gate = prGate(e, { projectApprovals });
+    const gate = prGate(e, { projectApprovals, ...(product ?? {}) });
     const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
     if (gate.gateMet) {
       const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
@@ -400,7 +400,17 @@ export function workflowRunLine(repo: string, run: WorkflowRun, watches: readonl
 
 function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "escalations">): string[] {
   const { gate, binding, playbook } = input;
-  if (gate.none) return ["No ready gate in this playbook."];
+  if (gate.none) {
+    // BB-207: a review playbook has no ready gate, but its `substantial` list
+    // is the reviewer's criteria; the wake carries the list and the verdict.
+    if (playbook.substantial.length === 0) return ["No ready gate in this playbook."];
+    const verdict = binding.ready.substantial === null ? "not judged yet" : binding.ready.substantial ? "yes" : "no";
+    return [
+      `- Substantial: ${verdict}${binding.ready.why ? ` — ${binding.ready.why}` : ""}`,
+      `  Substantial when any of: ${playbook.substantial.join("; ")}`,
+      '  Report it with `steward_report { ready: { substantial: true|false, why: "<one line>" } }`; the reviewer computes it from the diff, never the pull request body.',
+    ];
+  }
   const lines: string[] = [];
   playbook.ready!.checklist.forEach((item, i) => {
     const c = reportedItem(binding.ready, item);
@@ -571,8 +581,8 @@ export function formatWake(input: WakeInput): string {
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
-  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovals));
-  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovals));
+  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovals, productGateOptions(binding, e)));
+  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovals, productGateOptions(binding, pull)));
   if (input.workers.length > 0) {
     out.push("", "### Workers", "");
     for (const w of input.workers) {

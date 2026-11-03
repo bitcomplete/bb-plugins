@@ -1,6 +1,6 @@
 ---
 name: pr-reviewer
-description: Review a pull request in one of the project's repos as an independent reviewer thread - an agent's PR or a teammate's - read the diff against the ticket, run the tests the CI does not, classify the PR into a lane, and post one structured review per round with a machine-readable verdict marker, re-reviewing when the author pushes fixes. The posting mode is decided mechanically from the PR author. Use when a thread was spawned with "follow the pr-reviewer skill" or asked to review a PR.
+description: Review a pull request in one of the project's repos as an independent reviewer thread - an agent's PR or a teammate's - read the diff against the ticket, judge it substantial against the review playbook's criteria, run the tests the CI does not, classify the PR into a lane, and post one structured review per round with a machine-readable verdict marker, re-reviewing when the author pushes fixes. A substantial PR with no approved spec is owner-reviewed with reason product and its review opens with a Product section. The posting mode is decided mechanically from the PR author. Use when a thread was spawned with "follow the pr-reviewer skill" or asked to review a PR.
 ---
 
 # PR reviewer
@@ -113,7 +113,23 @@ worker that spawned you.
    existing `Claude Code Review` or the previous round already said, but
    do check whether the author acted on it. Read any Linear ticket the
    title or body names (`linear_issue`).
-2. **Check out the head** in that repo's clone in your workspace so you
+2. **Judge substantial, and the referenced ticket's spec.** Do this before
+   the rebase push, the tests or the lane classification, and from the diff
+   (`gh pr diff`), never from the pull request body. A pull request is
+   substantial when any criterion on the review playbook's `substantial`
+   list applies: a new outbound integration or dependency; a migration or
+   new table; a new user-facing surface a person would notice (a page,
+   dialog, background task or job; a new route behind an existing role gate
+   does not count on its own); an owner-reviewed trigger from the project's
+   guidance; hand-written non-test lines above the project's threshold.
+   Read the list from the playbook, not from memory. Then look for a ticket
+   the title or body references, read it (`linear_issue`) and find its
+   binding with `bb stewards show <KEY>`: it has an approved spec when its
+   `Ready:` line names an approval. A pull request whose referenced ticket
+   has an approved spec cites it and is not re-asked, however large the
+   diff. Carry both in the marker (`substantial=yes|no`, `spec=yes|no`);
+   substantial with no approved spec is the owner's, with reason `product`.
+3. **Check out the head** in that repo's clone in your workspace so you
    can read surrounding code, not just hunks:
    ```sh
    git fetch origin <headRefName> && git checkout -q <headRefOid>
@@ -131,11 +147,11 @@ worker that spawned you.
    decision, `git rebase --abort` and make it a blocker; do not push a
    half-done rebase. After the push, re-read `headRefOid`; the review
    names the rebased head. On an agent-authored PR you never push.
-3. **Read the guidance.** The workspace `.bb/AGENTS.md` (how the repos
+4. **Read the guidance.** The workspace `.bb/AGENTS.md` (how the repos
    depend on each other, what ships how, the lanes), the repo's own
    `AGENTS.md` and `README.md`, and any design docs the project names. The
    `stewards` skill carries the generic approval and human-approval rules.
-4. **Classify the change** against the owner-reviewed triggers in the
+5. **Classify the change** against the owner-reviewed triggers in the
    project's guidance, "Change classification", and against the project's
    decide list. Decide from the diff, not from the PR's Classification
    line; name the trigger. The test is whether the change modifies or
@@ -166,7 +182,7 @@ worker that spawned you.
    request, read it before assigning a lane. Classify each PR from its own
    diff with the sibling in view. A split that hides a trigger — neither
    half's diff shows it — is a blocker.
-5. **Read the ticket's intent against the diff.** The questions, in order:
+6. **Read the ticket's intent against the diff.** The questions, in order:
    - Does the change do what the ticket asks, all of it, and nothing the
      ticket did not ask for?
    - Correctness: error handling, races between awaits, retries and
@@ -190,7 +206,7 @@ worker that spawned you.
      input validation, anything reachable without the expected identity.
    - Tests: do new tests exercise the behaviour the ticket describes, or
      only the happy path? Would they fail if the change were reverted?
-6. **Run what the diff touches.** CI does not cover everything: the
+7. **Run what the diff touches.** CI does not cover everything: the
    project's `.bb/AGENTS.md` and the repo's CI config name which suites it
    skips, so a green check can mean the changed suite was never run. Run
    the changed repo's test command yourself (the project's guidance names
@@ -201,7 +217,7 @@ worker that spawned you.
    they cover. When the diff has UI, follow the project's walkthrough
    skill and list what you walked under Tested; a clean review is terse,
    not unchecked.
-7. **Post the review** (format below) and stop.
+8. **Post the review** (format below) and stop.
 
 ## Later rounds
 
@@ -238,7 +254,7 @@ The first line is the marker in both modes; the author's thread and the
 plugin parse it, so keep its shape exact:
 
 ```
-<!-- bb-review round=<N> sha=<full head sha> verdict=<verdict> lane=<lane> approver=<owner|project> -->
+<!-- bb-review round=<N> sha=<full head sha> verdict=<verdict> lane=<lane> approver=<owner|project> substantial=<yes|no> spec=<yes|no> -->
 ```
 
 - **Agent-authored PR:** post exactly one comment per round with
@@ -309,6 +325,15 @@ set it explicitly on every owner-reviewed round. On a `no-review` marker it
 is ignored, and escalation only goes up: no marker can move a `user` match
 down to the project steward or to no-review.
 
+`substantial` and `spec` are required on every marker: `substantial` is your
+step 2 judgment of the diff, and `spec` is whether a ticket the pull request
+references has an approved spec. A `no-review` marker with
+`substantial=yes spec=no` is raised to the owner lane with reason `product`:
+the owner's unsigned approval of the Product section is the gate, and a
+project-steward `bb-approval` never meets it. A self-asserted ack in the
+pull request body ("user-requested follow-up") never counts; the ack is
+something the owner did.
+
 In both modes your verdict is the reviewer's, not the owner's approval:
 the owner's approval is an unsigned review or comment from the owner's
 account, and your post is signed. On the owner lane a teammate's review is
@@ -333,7 +358,8 @@ pull request and every push since was a rebase, a merge of the base
 branch, a fix you suggested or a small fix of the author's own, do not ask
 the owner again. Say in the owner-review line that the owner's approval of
 <date> stands (the approval is of the pull request), and do not mention the
-owner. Ask again only when a push added scope, changed behaviour beyond
+owner. The product ack is of the pull request too, not of a commit. Ask
+again only when a push added scope, changed behaviour beyond
 what was approved, or brought in an owner-reviewed trigger the approved
 change did not have; owner-reviewed files byte-identical after a rebase or
 squash are the example that needs no fresh ask. This is the same rule as
@@ -344,6 +370,8 @@ Then the body, in this order, omitting empty sections:
 ```
 ## Review round <N> (<model name>, at <short sha>)
 
+**Owner review required:** yes — product: the change is substantial and references no ticket with an approved spec. @<owner login>, this one needs your approval.
+or
 **Owner review required:** yes — <trigger>; decide list entry "<entry text>" is decide: project, so the project steward approves.
 or
 **Owner review required:** yes — <trigger>. @<owner login>, this one needs your approval.
@@ -351,6 +379,13 @@ or
 **Owner review required:** yes — <trigger>; the owner's approval of <date> stands (the approval is of the pull request).
 or
 **Owner review required:** no — none of the owner-reviewed triggers apply.
+
+### Product
+<Only when the change is substantial. What the change adds; whether the
+product already covers the need, naming what you searched — `docs/product.md`
+and the code, for the feature's nouns and its name; and how the scope compares
+with what was asked. A plausible overlap is enough to say so; the owner
+decides. Omit this whole section when the change is not substantial.>
 
 ### Blockers
 1. **<file>:<line>** — what is wrong, why it matters, what would fix it.

@@ -23,3 +23,23 @@ describe("the shipped pr-reviewer skill (BB-211)", () => {
     expect(skill).toMatch(/Skip quietly when no review you posted is still in\s+state `CHANGES_REQUESTED`/u);
   });
 });
+
+describe("the shipped pr-reviewer skill's product ack (BB-207)", () => {
+  it("judges substantial from the diff before the rebase and the lane, and opens a Product section before Blockers", () => {
+    // The marker carries the diff judgment and the referenced ticket's spec.
+    expect(skill).toContain("substantial=yes|no");
+    expect(skill).toContain("spec=yes|no");
+    // Compute substantial first, from the diff, never the body.
+    expect(skill).toMatch(/Judge substantial, and the referenced ticket's spec\.[\s\S]*?before\s+the rebase push, the tests or the lane classification, and from the diff/u);
+    expect(skill).toContain("never from the pull request body");
+    // The Product section comes before Blockers, and names what was searched.
+    expect(skill).toMatch(/### Product[\s\S]*?### Blockers/u);
+    expect(skill).toContain("docs/product.md");
+    expect(skill).toMatch(/naming what you searched/u);
+    expect(skill).toMatch(/Omit this whole section when the change is not substantial/u);
+    // A body assertion never stands in for the owner's ack.
+    expect(skill).toMatch(/self-asserted ack in the[\s\S]*?never counts/u);
+    // A standing owner approval carries across a rebase, product included.
+    expect(skill).toMatch(/product ack is of the pull request too/u);
+  });
+});
