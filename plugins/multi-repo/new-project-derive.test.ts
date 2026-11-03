@@ -8,7 +8,7 @@
  * they can be checked without a browser.
  */
 import { describe, expect, it } from "vitest";
-import { createReady, deriveName, fieldsRevealed, locationFrozen, sourceFromProbe } from "./new-project-derive.js";
+import { createReady, deriveName, fieldsRevealed, locationFrozen, probeNeeded, sourceFromProbe } from "./new-project-derive.js";
 
 describe("deriving the name from the URL", () => {
   it("uses the URL's last component until the name is edited", () => {
@@ -43,11 +43,19 @@ describe("freezing the location", () => {
 });
 
 describe("the probe gate", () => {
-  it("reveals Name, Machine and Location only after the probe answers", () => {
-    expect(fieldsRevealed("idle")).toBe(false);
-    expect(fieldsRevealed("probing")).toBe(false);
-    expect(fieldsRevealed("error")).toBe(false);
-    expect(fieldsRevealed("done")).toBe(true);
+  it("reveals Name, Machine and Location only after the URL's own probe answers", () => {
+    expect(fieldsRevealed(false, "idle")).toBe(false);
+    expect(fieldsRevealed(false, "probing")).toBe(false);
+    expect(fieldsRevealed(false, "error")).toBe(false);
+    expect(fieldsRevealed(false, "done")).toBe(true);
+  });
+
+  it("keeps them visible through a machine-change re-probe once revealed", () => {
+    // The URL's own probe has answered, so a re-probe and its error do not
+    // unmount the Machine select the user is trying to use.
+    expect(fieldsRevealed(true, "probing")).toBe(true);
+    expect(fieldsRevealed(true, "error")).toBe(true);
+    expect(fieldsRevealed(true, "idle")).toBe(true);
   });
 
   it("keeps Create disabled until a probe has answered, whatever the fields hold", () => {
@@ -60,6 +68,18 @@ describe("the probe gate", () => {
     expect(createReady({ ...filled, hostId: null })).toBe(false);
     expect(createReady({ ...filled, name: "  " })).toBe(false);
     expect(createReady({ ...filled, path: "  " })).toBe(false);
+  });
+
+  it("skips a blur or Enter the last answer already covers", () => {
+    const last = { url: "https://example.com/acme.git", hostId: "host-a" };
+    expect(probeNeeded(last, "https://example.com/acme.git", "host-a")).toBe(false);
+    // A new URL, or a new machine, probes again.
+    expect(probeNeeded(last, "https://example.com/other.git", "host-a")).toBe(true);
+    expect(probeNeeded(last, "https://example.com/acme.git", "host-b")).toBe(true);
+    // Nothing to probe with, and nothing to probe for.
+    expect(probeNeeded(null, "https://example.com/acme.git", "host-a")).toBe(true);
+    expect(probeNeeded(null, "", "host-a")).toBe(false);
+    expect(probeNeeded(null, "https://example.com/acme.git", null)).toBe(false);
   });
 });
 

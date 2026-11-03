@@ -126,14 +126,12 @@ describe("createProject's source kinds", () => {
     warnings: [],
   };
 
-  function setupServer(probeOutcome: "standalone" | "primary" | "plain" | "checkout") {
+  function setupServer() {
     const hostCalls: Array<{ method: string; input: unknown }> = [];
     const { bb, harness } = createFakePluginHost({
       experimental_callHostRpc: (call: { method: string; input: unknown }) => {
         hostCalls.push({ method: call.method, input: call.input });
         switch (call.method) {
-          case "probeRemote":
-            return { outcome: probeOutcome, defaultBranch: "main", message: `${probeOutcome} on main` };
           case "cloneProjectSource":
             return { ok: true, message: null };
           case "prepareProjectSource":
@@ -150,16 +148,16 @@ describe("createProject's source kinds", () => {
   }
 
   it("clones a remote and points the project at the clone, without seeding", async () => {
-    const { bb, harness, hostCalls } = setupServer("plain");
+    const { bb, harness, hostCalls } = setupServer();
     await plugin(bb);
     const result = (await harness.callRpc("createProject", {
       name: "acme",
       hostId: HOST_ID,
       path: PROJECT_PATH,
       source: { kind: "clone", url: "https://example.com/acme.git" },
-    })) as { ok: boolean; layout: string | null };
-    expect(result).toMatchObject({ ok: true, layout: "standalone" });
-    expect(hostCalls.map((call) => call.method)).toEqual(["cloneProjectSource", "prepareProjectSource"]);
+    })) as { ok: boolean };
+    expect(result.ok).toBe(true);
+    expect(hostCalls.map((call) => call.method)).toEqual(["cloneProjectSource"]);
     expect(hostCalls.find((call) => call.method === "cloneProjectSource")?.input).toMatchObject({
       url: "https://example.com/acme.git",
       path: PROJECT_PATH,
@@ -169,7 +167,7 @@ describe("createProject's source kinds", () => {
   });
 
   it("adopts a local checkout as the project source instead of cloning beside it", async () => {
-    const { bb, harness, hostCalls } = setupServer("checkout");
+    const { bb, harness, hostCalls } = setupServer();
     await plugin(bb);
     const checkout = "/home/me/code/acme";
     const result = (await harness.callRpc("createProject", {
@@ -185,24 +183,6 @@ describe("createProject's source kinds", () => {
       bootstrap: false,
     });
     expect(hostCalls.some((call) => call.method === "cloneProjectSource")).toBe(false);
-  });
-
-  it("probes host-side for the legacy auto kind and still does not seed", async () => {
-    const { bb, harness, hostCalls } = setupServer("standalone");
-    await plugin(bb);
-    const result = (await harness.callRpc("createProject", {
-      name: "acme",
-      hostId: HOST_ID,
-      path: PROJECT_PATH,
-      source: { kind: "auto", url: "https://example.com/acme.bb.git", repos: [], openPullRequest: false },
-    })) as { ok: boolean; layout: string | null };
-    expect(result).toMatchObject({ ok: true, layout: "standalone" });
-    expect(hostCalls.map((call) => call.method)).toEqual([
-      "probeRemote",
-      "cloneProjectSource",
-      "prepareProjectSource",
-    ]);
-    expect(hostCalls.some((call) => call.method === "preparePrimaryProjectSource")).toBe(false);
   });
 
   it("still refuses a path another project owns", async () => {
@@ -231,11 +211,10 @@ describe("createProject's source kinds", () => {
     expect(result.error).toMatch(/already the source of the project "other"/u);
   });
 
-  it("accepts clone, checkout and the legacy auto kinds, and rejects the removed primary and plain", () => {
+  it("accepts clone and checkout, and rejects the removed auto, primary and plain", () => {
     for (const source of [
       { kind: "clone", url: "https://example.com/a.git" },
       { kind: "checkout", url: "/home/me/code/a" },
-      { kind: "auto", url: "https://example.com/a.git", repos: [], openPullRequest: true },
     ]) {
       const parsed = rpcContract.createProject.input.safeParse({
         name: "a",
@@ -246,6 +225,7 @@ describe("createProject's source kinds", () => {
       expect(parsed.success).toBe(true);
     }
     for (const source of [
+      { kind: "auto", url: "https://example.com/a.git", repos: [], openPullRequest: true },
       { kind: "primary", url: "https://example.com/a.git", repos: [] },
       { kind: "plain", url: "https://example.com/a.git", repos: [], openPullRequest: false },
     ]) {
@@ -257,5 +237,102 @@ describe("createProject's source kinds", () => {
       });
       expect(parsed.success).toBe(false);
     }
+  });
+});
+
+describe("suggesting the project location", () => {
+  const HOST_ID = "host-a";
+
+  it("passes only this host's local_path sources to the host", async () => {
+    const hostCalls: Array<{ method: string; input: unknown }> = [];
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string; input: unknown }) => {
+        hostCalls.push({ method: call.method, input: call.input });
+        if (call.method === "suggestProjectSourcePath") return { path: "/home/me/code/acme", exists: false };
+        throw new Error(`unexpected host method ${call.method}`);
+      },
+    });
+    harness.sdk.stub("projects.list", () => [
+      {
+        id: "p1",
+        name: "one",
+        sources: [{ type: "local_path", hostId: HOST_ID, path: "/home/me/code/one" }],
+      },
+      {
+        id: "p2",
+        name: "two",
+        sources: [
+          { type: "local_path", hostId: "host-b", path: "/home/other/two" },
+          { type: "local_path", hostId: HOST_ID, path: "/home/me/code/two" },
+        ],
+      },
+    ]);
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("suggestProjectSource", { hostId: HOST_ID, name: "acme" })) as {
+      path: string;
+      exists: boolean;
+    };
+    expect(result).toEqual({ path: "/home/me/code/acme", exists: false });
+    expect(hostCalls.find((call) => call.method === "suggestProjectSourcePath")?.input).toEqual({
+      name: "acme",
+      existingPaths: ["/home/me/code/one", "/home/me/code/two"],
+    });
+  });
+});
+
+describe("seeding a plain project source on the first write", () => {
+  const HOST_ID = "host-a";
+  const SOURCE_PATH = "/home/me/bb/acme";
+
+  it("seeds .bb/ through preparePrimaryProjectSource before saving a repo set", async () => {
+    const hostCalls: Array<{ method: string; input: unknown }> = [];
+    let seeded = false;
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string; input: unknown }) => {
+        hostCalls.push({ method: call.method, input: call.input });
+        switch (call.method) {
+          case "prepareProjectSource":
+            return {
+              bootstrapped: false,
+              reposJson: seeded ? '{"version":1,"repos":[]}\n' : null,
+              remote: "https://example.com/acme.git",
+              defaultBranch: "main",
+              unpushed: null,
+              layout: seeded ? ("primary" as const) : ("standalone" as const),
+              warnings: [],
+            };
+          case "preparePrimaryProjectSource":
+            seeded = true;
+            return { ok: true, layout: "primary" as const, seeded: true, prUrl: null, warnings: [], message: "seeded" };
+          case "writeProjectSourceRepos":
+            return { ok: true, committed: true, head: "abc", mode: "push" as const, prUrl: null, message: null };
+          default:
+            throw new Error(`unexpected host method ${call.method}`);
+        }
+      },
+    });
+    harness.sdk.stub("projects.get", () => ({
+      id: "proj_1",
+      name: "acme",
+      sources: [{ type: "local_path", hostId: HOST_ID, path: SOURCE_PATH, isDefault: true }],
+    }));
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("saveRepoSet", {
+      projectId: "proj_1",
+      reposJson: '{"version":1,"repos":[{"dir":"other","url":"https://example.com/other.git"}]}',
+    })) as { ok: boolean };
+    expect(result.ok).toBe(true);
+    // The seed is local only, and in a detached worktree on the default
+    // branch, so the checkout's own branch is never touched.
+    expect(hostCalls.find((call) => call.method === "preparePrimaryProjectSource")?.input).toMatchObject({
+      url: "https://example.com/acme.git",
+      path: SOURCE_PATH,
+      openPullRequest: false,
+    });
+    expect(hostCalls.find((call) => call.method === "writeProjectSourceRepos")?.input).toMatchObject({
+      layout: "primary",
+    });
   });
 });

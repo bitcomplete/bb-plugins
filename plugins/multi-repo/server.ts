@@ -605,6 +605,38 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       : { text: prepared.reposJson, file: null, error: parsed.error, layout: prepared.layout ?? "standalone", remote: prepared.remote, unpushed: prepared.unpushed };
   }
 
+  /**
+   * Seed `.bb/` into a project source created from a plain repo.
+   *
+   * A project created from a plain repo (BB-222) has no definition until its
+   * first write. Seed `.bb/` on the default branch, in a detached worktree and
+   * with no pull request, so the write that follows lands in `.bb/` rather
+   * than at the repo root and the checkout's own branch is never touched.
+   * Returns the layout the source now has; a source that already carries a
+   * definition, or a fresh directory that `bootstrap` just initialized, is
+   * left alone.
+   */
+  async function ensureProjectDefinition(location: SourceLocation, signal?: AbortSignal): Promise<ProjectLayout> {
+    const current = await readRepoSet(location, { bootstrap: true }, signal);
+    if (current.layout !== "standalone" || current.text !== null || current.remote === null || current.file === null) {
+      return current.layout;
+    }
+    const seeded = await host.call(
+      "preparePrimaryProjectSource",
+      {
+        url: current.remote,
+        path: location.path,
+        seed: serializeReposFile(current.file),
+        branch: `bb/seed-bb-${Date.now().toString(36)}`,
+        openPullRequest: false,
+      },
+      { hostId: location.hostId, timeoutMs: CREATE_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
+    );
+    if (!seeded.ok) throw new Error(seeded.message);
+    const next = await readRepoSet(location, { bootstrap: false }, signal);
+    return next.layout;
+  }
+
   async function writeRepoSet(
     location: SourceLocation,
     file: ReposFile,
@@ -660,7 +692,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     seed: RepoSeed,
     signal?: AbortSignal,
   ): Promise<EditOutcome> {
-    const current = await readRepoSet(location, { bootstrap: true }, signal);
+    await ensureProjectDefinition(location, signal);
+    const current = await readRepoSet(location, { bootstrap: false }, signal);
     if (current.file === null) {
       return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
     }
@@ -1679,23 +1712,20 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       const parsed = parseReposFile(reposJson);
       if (!parsed.ok) return { ok: false, error: parsed.error, mode: null, prUrl: null, message: null };
       try {
-        // Bootstrap first. On a project whose `.bb` does not exist yet — a
+        // Seed `.bb/` first when the source is a plain repo (or bootstrap a
+        // fresh directory): on a project whose `.bb` does not exist yet — a
         // brand new one, on a machine whose workspace directory is still
         // empty — writing straight through would fail on the missing
         // directory, which made this panel unable to be the thing that sets a
         // project up. Committing a repo set is a deliberate enough act to
         // stand up the repo that holds it.
-        const prepared = await host.call(
-          "prepareProjectSource",
-          { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true },
-          { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS },
-        );
+        const layout = await ensureProjectDefinition(location);
         const published = await writeRepoSet(
           location,
           parsed.value,
           `Update the repo set`,
           undefined,
-          prepared.layout ?? "standalone",
+          layout,
         );
         return { ok: true, error: null, ...published };
       } catch (error) {
@@ -1788,45 +1818,12 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
 
     async createProject({ name, hostId, path, source }) {
       const warnings: string[] = [];
-      let layout: ProjectLayout | null = null;
-      const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings, layout });
+      const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings });
 
-      // Resolve the source into the directory the project will point at. A
-      // local checkout is adopted in place; a remote is cloned into the chosen
-      // path. The legacy `auto` kind probes here, host-side, for a caller that
-      // has not probed itself. No mode seeds `.bb/`, commits, pushes or opens
-      // a pull request: the Repos panel does that on its first write.
-      let mode: "fresh" | "clone" | "checkout";
-      let projectPath = path;
-      let url: string | null = null;
-      let repos: RepoSeed[] = [];
-      if (source.kind === "fresh") {
-        mode = "fresh";
-        repos = source.repos;
-      } else if (source.kind === "clone") {
-        mode = "clone";
-        url = source.url;
-      } else if (source.kind === "checkout") {
-        mode = "checkout";
-        projectPath = source.url;
-      } else {
-        url = source.url;
-        try {
-          const probed = await host.call(
-            "probeRemote",
-            { url: source.url },
-            { hostId, timeoutMs: CREATE_TIMEOUT_MS },
-          );
-          if (probed.outcome === "checkout") {
-            mode = "checkout";
-            projectPath = source.url;
-          } else {
-            mode = "clone";
-          }
-        } catch (error) {
-          return fail(errorMessage(error));
-        }
-      }
+      // A local checkout is adopted in place; a remote is cloned into the
+      // chosen path. No mode seeds `.bb/`, commits, pushes or opens a pull
+      // request: the Repos panel's first write does that.
+      const projectPath = source.kind === "checkout" ? source.url : path;
 
       // Refuse to stack a second project on a directory one already owns. Core
       // may or may not reject it, and either way the panel would then show two
@@ -1839,49 +1836,41 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
 
       // The git work first: a failure here leaves no project behind.
       try {
-        if (mode === "fresh") {
-          const resolved = resolveSeed(repos);
+        if (source.kind === "fresh") {
+          const resolved = resolveSeed(source.repos);
           if (!resolved.ok) return fail(resolved.error);
           const prepared = await host.call(
             "prepareProjectSource",
-            { path: projectPath, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true, seed: repos },
+            { path: projectPath, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true, seed: source.repos },
             { hostId, timeoutMs: READ_TIMEOUT_MS },
           );
           warnings.push(...prepared.warnings);
-          layout = prepared.layout ?? "standalone";
-          if (!prepared.bootstrapped && repos.length > 0) {
+          if (!prepared.bootstrapped && source.repos.length > 0) {
             // Adopting a directory that is already a `.bb` repo: the seed was
             // not written, so merge the entries in the ordinary way.
             const location: SourceLocation = { hostId, path: projectPath };
-            for (const entry of repos) {
+            for (const entry of source.repos) {
               const outcome = await addRepoToProject(location, entry);
               if (!outcome.ok) warnings.push(outcome.error);
             }
           }
-        } else if (mode === "clone") {
+        } else if (source.kind === "clone") {
           const cloned = await host.call(
             "cloneProjectSource",
-            { url: url as string, path: projectPath },
+            { url: source.url, path: projectPath },
             { hostId, timeoutMs: CREATE_TIMEOUT_MS },
           );
           if (!cloned.ok) return fail(cloned.message ?? "Could not clone the repo.");
-          const prepared = await host.call(
-            "prepareProjectSource",
-            { path: projectPath, fetchTtlMs: CACHE_FRESH_MS, bootstrap: false },
-            { hostId, timeoutMs: READ_TIMEOUT_MS },
-          );
-          warnings.push(...prepared.warnings);
-          layout = prepared.layout ?? "standalone";
         } else {
-          // checkout: adopt the existing checkout in place. No clone, no seed
-          // commit, no push, no pull request.
+          // checkout: adopt the existing checkout in place. Fetch it so the
+          // thread-start read is current, but do not clone, commit, push or
+          // open anything.
           const prepared = await host.call(
             "prepareProjectSource",
             { path: projectPath, fetchTtlMs: CACHE_FRESH_MS, bootstrap: false },
             { hostId, timeoutMs: READ_TIMEOUT_MS },
           );
           warnings.push(...prepared.warnings);
-          layout = prepared.layout ?? "standalone";
         }
       } catch (error) {
         return fail(errorMessage(error));
@@ -1893,7 +1882,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           source: { type: "local_path", hostId, path: projectPath },
         });
         changed();
-        return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20), layout };
+        return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20) };
       } catch (error) {
         return fail(
           `${projectPath} is ready but the project could not be created: ${errorMessage(error)}. Try again, or create it with \`bb project create --root ${projectPath}\`.`,

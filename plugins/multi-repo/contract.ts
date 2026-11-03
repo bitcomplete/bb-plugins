@@ -964,18 +964,6 @@ export const rpcContract = defineRpcContract({
           z.object({ kind: z.literal("clone"), url: z.string().min(1).max(2000) }).strict(),
           /** A local checkout: point the project at it; nothing is cloned. */
           z.object({ kind: z.literal("checkout"), url: z.string().min(1).max(2000) }).strict(),
-          /**
-           * Legacy host-side probe, for a caller that has not probed itself.
-           * The New project form probes first and never sends this.
-           */
-          z
-            .object({
-              kind: z.literal("auto"),
-              url: z.string().min(1).max(2000),
-              repos: z.array(repoSeedSchema).max(64),
-              openPullRequest: z.boolean().optional(),
-            })
-            .strict(),
         ]),
       })
       .strict(),
@@ -985,8 +973,6 @@ export const rpcContract = defineRpcContract({
         projectId: z.string().max(100).nullable(),
         error: z.string().max(2000).nullable(),
         warnings: z.array(z.string().max(600)).max(20),
-        /** The layout the source ended up with, when the project was created. */
-        layout: projectLayoutSchema.nullable(),
       })
       .strict(),
   },

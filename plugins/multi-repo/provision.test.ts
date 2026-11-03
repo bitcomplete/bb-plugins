@@ -18,7 +18,6 @@ import {
   bootstrapProjectSource,
   cloneProjectSource,
   defaultProjectSourcePath,
-  detectProjectLayout,
   existingProjectSourceParent,
   mergeGuidance,
   projectSourceUnpushed,
@@ -425,32 +424,12 @@ describe("the project source", () => {
     expect(await gitLine(dir, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/u);
   });
 
-  it("seeds .bb/ into an existing code repo without touching its files", async () => {
+  it("leaves an existing repo alone", async () => {
     const dir = await makeRemote("already-a-repo");
     await writeFile(path.join(dir, "AGENTS.md"), "mine\n", "utf8");
-    await gitIn(dir, ["add", "-A"]);
-    await gitIn(dir, ["commit", "--quiet", "-m", "own guidance"]);
     const result = await bootstrapProjectSource(dir, EMPTY_REPOS);
-    expect(result.bootstrapped).toBe(true);
-    // The repo's own files are untouched; the definition is added under .bb/.
+    expect(result.bootstrapped).toBe(false);
     expect(await readFile(path.join(dir, "AGENTS.md"), "utf8")).toBe("mine\n");
-    expect(await exists(path.join(dir, ".bb", "repos.json"))).toBe(true);
-    expect(await detectProjectLayout(dir)).toBe("primary");
-  });
-
-  it("leaves a repo that already carries a definition alone", async () => {
-    const standalone = await makeRemote("standalone");
-    await writeFile(path.join(standalone, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
-    await gitIn(standalone, ["add", "-A"]);
-    await gitIn(standalone, ["commit", "--quiet", "-m", "standalone definition"]);
-    expect((await bootstrapProjectSource(standalone, EMPTY_REPOS)).bootstrapped).toBe(false);
-
-    const primary = await makeRemote("primary");
-    await mkdir(path.join(primary, ".bb"), { recursive: true });
-    await writeFile(path.join(primary, ".bb", "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
-    await gitIn(primary, ["add", "-A"]);
-    await gitIn(primary, ["commit", "--quiet", "-m", "primary definition"]);
-    expect((await bootstrapProjectSource(primary, EMPTY_REPOS)).bootstrapped).toBe(false);
   });
 
   it("commits an updated repo set", async () => {

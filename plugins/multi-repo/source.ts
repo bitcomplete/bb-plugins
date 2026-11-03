@@ -311,16 +311,18 @@ export interface BootstrapResult {
 }
 
 /**
- * Stand up a project definition in place.
+ * Initialize an empty project source in place.
  *
- * A directory that is not a git repo is initialized as a standalone `.bb`
- * repo: `git init`, the seed at the root, one commit. A directory that is
- * already a git repo is a code repo, and its definition belongs in `.bb/`:
- * when it carries neither `.bb/repos.json` nor a root `repos.json`, `.bb/` is
- * seeded and committed on the current branch. That is what makes a project
- * created from a plain repo (BB-222) get its `.bb/` on the first write after
- * creation — the Repos panel's first add, or the first thread — rather than at
- * create time. Nothing here overwrites a file that already exists.
+ * Only ever runs when the directory has no `.git`. A project pointed at a
+ * cloned `.bb` repo takes none of this path, and nothing here overwrites a
+ * file that already exists — a directory holding an `AGENTS.md` and no repo
+ * keeps its `AGENTS.md`.
+ *
+ * A git repo with no definition is **not** seeded here: this runs on the
+ * thread-start read path, and committing `.bb/` onto whatever branch the
+ * checkout has is not a read's job. The explicit write paths (the Repos
+ * panel's add and the raw editor) seed it through
+ * {@link preparePrimaryProjectSource} instead.
  */
 export async function bootstrapProjectSource(
   dir: string,
@@ -328,18 +330,7 @@ export async function bootstrapProjectSource(
   signal?: AbortSignal,
 ): Promise<BootstrapResult> {
   const warnings: string[] = [];
-  if (await isGitRepo(dir)) {
-    const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
-    const ref = await resolveDefaultBranchRef(dir, signal);
-    if (ref !== null) {
-      const primary = await gitIn(dir, ["cat-file", "-e", `${ref}:${PROJECT_SOURCE_DIR}/${REPOS_FILE}`], options);
-      if (primary.code === 0) return { bootstrapped: false, warnings };
-      const standalone = await gitIn(dir, ["cat-file", "-e", `${ref}:${REPOS_FILE}`], options);
-      if (standalone.code === 0) return { bootstrapped: false, warnings };
-    }
-    if (await exists(path.join(dir, PROJECT_SOURCE_DIR, REPOS_FILE))) return { bootstrapped: false, warnings };
-    return seedPrimaryDefinition(dir, seed, signal);
-  }
+  if (await isGitRepo(dir)) return { bootstrapped: false, warnings };
 
   const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
   await mkdir(dir, { recursive: true });
@@ -393,7 +384,7 @@ export async function seedPrimaryDefinition(
   if (!(await exists(keepPath))) await writeFile(keepPath, "", "utf8");
 
   await gitIn(dir, ["add", "--", PROJECT_SOURCE_DIR], options);
-  const commit = await commitAll(dir, "Initialize .bb in the primary repo", signal, [PROJECT_SOURCE_DIR]);
+  const commit = await commitAll(dir, "Initialize .bb in the primary repo", signal);
   if (!commit.committed && commit.message !== null) warnings.push(commit.message);
   return { bootstrapped: true, warnings };
 }
@@ -450,8 +441,7 @@ export function existingProjectSourceParent(existingPaths: readonly string[], fa
       .map((target) => path.dirname(target)),
   );
   if (parents.size !== 1) return fallback;
-  const [only] = [...parents];
-  return only === fallback ? fallback : only;
+  return [...parents][0];
 }
 
 /**
@@ -485,13 +475,9 @@ export async function commitAll(
   dir: string,
   message: string,
   signal?: AbortSignal,
-  paths: readonly string[] = [],
 ): Promise<{ committed: boolean; head: string | null; message: string | null }> {
   const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
-  // With paths, only those paths count as "staged": a caller seeding `.bb/`
-  // into a checkout must not sweep up someone's unrelated staged work.
-  const pathArgs = paths.length > 0 ? ["--", ...paths] : [];
-  const staged = await gitIn(dir, ["diff", "--cached", "--quiet", ...pathArgs], options);
+  const staged = await gitIn(dir, ["diff", "--cached", "--quiet"], options);
   // Exit 1 means there is something staged; 0 means there is not.
   if (staged.code === 0) {
     return { committed: false, head: await gitLine(dir, ["rev-parse", "HEAD"], options), message: null };
@@ -501,7 +487,7 @@ export async function commitAll(
     identity.trim().length > 0
       ? []
       : ["-c", "user.name=bb multi-repo", "-c", "user.email=multi-repo@plugins.bb.invalid"];
-  const result = await gitIn(dir, [...withIdentity, "commit", "--quiet", "-m", message, ...pathArgs], options);
+  const result = await gitIn(dir, [...withIdentity, "commit", "--quiet", "-m", message], options);
   if (result.code !== 0) {
     return { committed: false, head: null, message: firstProblemLine(result) };
   }

@@ -27,7 +27,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import type { FormEvent, KeyboardEvent } from "react";
 import { useRpc } from "@get-bb/plugin-sdk/app";
 import type { DiscoveredCheckout, ProbeRemoteResult, rpcContract } from "./contract.js";
-import { createReady, deriveName, fieldsRevealed, locationFrozen, sourceFromProbe } from "./new-project-derive.js";
+import { createReady, deriveName, fieldsRevealed, locationFrozen, probeNeeded, sourceFromProbe } from "./new-project-derive.js";
 
 interface HostOption {
   id: string;
@@ -60,6 +60,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   const [pathAdopted, setPathAdopted] = useState(false);
   const [pathExists, setPathExists] = useState(false);
   const [probe, setProbe] = useState<Probe>({ status: "idle" });
+  const [revealed, setRevealed] = useState(false);
   const [suggestions, setSuggestions] = useState<DiscoveredCheckout[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -144,6 +145,10 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   }, [probe, url, pathEdited, pathAdopted]);
 
   const probeSeq = useRef(0);
+  // The URL and machine the last probe answered for. A blur or Enter that
+  // matches this is a no-op, so clicking a revealed field does not start a
+  // probe that unmounts it under the cursor.
+  const lastProbe = useRef<{ url: string; hostId: string } | null>(null);
   const runProbe = useCallback(
     (probeHostId: string | null = hostId) => {
       const value = url.trim();
@@ -153,7 +158,10 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
       void rpc
         .call("probeRemote", { hostId: probeHostId, url: value })
         .then((result) => {
-          if (seq === probeSeq.current) setProbe({ status: "done", result });
+          if (seq !== probeSeq.current) return;
+          lastProbe.current = { url: value, hostId: probeHostId };
+          setProbe({ status: "done", result });
+          setRevealed(true);
         })
         .catch((caught: unknown) => {
           if (seq !== probeSeq.current) return;
@@ -166,6 +174,11 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     [rpc, url, hostId],
   );
 
+  const runProbeIfNeeded = useCallback(() => {
+    if (!probeNeeded(lastProbe.current, url.trim(), hostId)) return;
+    runProbe();
+  }, [runProbe, url, hostId]);
+
   // Invalidate any in-flight probe, so a result for the old URL or machine
   // cannot land as the answer for the new one.
   const resetProbe = useCallback(() => {
@@ -173,7 +186,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     setProbe({ status: "idle" });
   }, []);
 
-  const revealed = fieldsRevealed(probe.status);
+  const revealedFields = fieldsRevealed(revealed, probe.status);
   const urlOutcome = probe.status === "done" ? probe.result.outcome : null;
 
   const source = useMemo(
@@ -216,7 +229,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   const onUrlKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Enter") return;
     event.preventDefault();
-    runProbe();
+    runProbeIfNeeded();
   };
 
   const selectedHost = hosts?.find((entry) => entry.id === hostId) ?? null;
@@ -238,12 +251,16 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
           autoComplete="off"
           disabled={submitting}
           onKeyDown={onUrlKeyDown}
-          onBlur={() => runProbe()}
+          onBlur={runProbeIfNeeded}
           onChange={(event) => {
             setUrl(event.target.value);
             // A new URL re-derives the location, but only the freeze a
-            // previous checkout adoption put on it — never a hand edit.
+            // previous checkout adoption put on it — never a hand edit. It
+            // also hides the revealed fields and forgets the last answer, so
+            // the next blur probes the new URL.
             setPathAdopted(false);
+            setRevealed(false);
+            lastProbe.current = null;
             resetProbe();
           }}
         />
@@ -261,7 +278,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
         {probe.status === "done" && <span className="text-muted-foreground block text-xs">{probe.result.message}</span>}
       </label>
 
-      {revealed && (
+      {revealedFields && (
         <>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="space-y-1 text-sm">
