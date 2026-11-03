@@ -579,6 +579,10 @@ describe("the pull request gate (build-tickets)", () => {
     expect(productGateOptions(binding("review", { substantial: true }))).toEqual({ substantial: true, ticketApprovedSpec: false });
     // The marker alone reports the diff judgment when the steward has not.
     expect(productGateOptions(binding("review"), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    // The marker is the newest word: a stale report of false cannot lower it,
+    // and a report cannot raise a marker that says no.
+    expect(productGateOptions(binding("review", { substantial: false }), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    expect(productGateOptions(binding("review", { substantial: true }), marked("substantial=no"))).toEqual({ substantial: false, ticketApprovedSpec: false });
     // A ticket binding's own `substantial` is the spec gate's judgment, not
     // the diff's, so it stays inert; the marker on its pull request is the
     // diff report, and the ticket's own approved spec is the ack.

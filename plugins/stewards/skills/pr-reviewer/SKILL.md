@@ -115,19 +115,21 @@ worker that spawned you.
    title or body names (`linear_issue`).
 2. **Judge substantial, and the referenced ticket's spec.** Do this before
    the rebase push, the tests or the lane classification, and from the diff
-   (`gh pr diff`), never from the pull request body. A pull request is
-   substantial when any criterion on the review playbook's `substantial`
-   list applies: a new outbound integration or dependency; a migration or
-   new table; a new user-facing surface a person would notice (a page,
-   dialog, background task or job; a new route behind an existing role gate
-   does not count on its own); an owner-reviewed trigger from the project's
-   guidance; hand-written non-test lines above the project's threshold.
-   Read the list from the playbook, not from memory. Then look for a ticket
-   the title or body references, read it (`linear_issue`) and find its
-   binding with `bb stewards show <KEY>`: it has an approved spec when its
-   `Ready:` line names an approval. A pull request whose referenced ticket
-   has an approved spec cites it and is not re-asked, however large the
-   diff. Carry both in the marker (`substantial=yes|no`, `spec=yes|no`);
+   (`gh pr diff`), never from the pull request body. Read the review
+   playbook's `substantial` list: a pull request is substantial when any
+   criterion on it applies — a new outbound integration or dependency; a
+   migration or new table; a new user-facing surface a person would notice
+   (a page, dialog, background task or job; a new route behind an existing
+   role gate does not count on its own); an owner-reviewed trigger from the
+   project's guidance; hand-written non-test lines above the project's
+   threshold. Read the list from the playbook, not from memory. **A playbook
+   with no `substantial` list has not opted in: nothing is substantial, so
+   mark `substantial=no spec=no` and skip the Product section.** Then look
+   for a ticket the title or body references, read it (`linear_issue`) and
+   find its binding with `bb stewards show <KEY>`: it has an approved spec
+   when its `Ready:` line names an approval. A pull request whose referenced
+   ticket has an approved spec cites it and is not re-asked, however large
+   the diff. Carry both in the marker (`substantial=yes|no`, `spec=yes|no`);
    substantial with no approved spec is the owner's, with reason `product`.
 3. **Check out the head** in that repo's clone in your workspace so you
    can read surrounding code, not just hunks:
@@ -326,7 +328,8 @@ is ignored, and escalation only goes up: no marker can move a `user` match
 down to the project steward or to no-review.
 
 `substantial` and `spec` are required on every marker: `substantial` is your
-step 2 judgment of the diff, and `spec` is whether a ticket the pull request
+step 2 judgment of the diff (and `no` when the playbook has no `substantial`
+list), and `spec` is whether a ticket the pull request
 references has an approved spec. A `no-review` marker with
 `substantial=yes spec=no` is raised to the owner lane with reason `product`:
 the owner's unsigned approval of the Product section is the gate, and a

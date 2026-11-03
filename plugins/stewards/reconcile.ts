@@ -142,10 +142,11 @@ export function productReason(substantial: boolean | null, ticketApprovedSpec: b
 /**
  * The product inputs `prGate` reads from a binding (BB-207). A review or PR
  * binding's `substantial` is the reviewer's diff judgment: the `bb-review`
- * marker carries it (`substantial=yes|no`), and a review steward may also
- * report it with `steward_report { ready: { substantial, why } }`, which wins
- * when set. The marker's `spec=yes|no` says whether a ticket the pull request
- * references has an approved spec, the ack that spares the owner the ask.
+ * marker carries it (`substantial=yes|no`) and is the newest word, so it wins;
+ * a review steward's report (`steward_report { ready: { substantial, why } }`)
+ * is the fallback when the marker did not name one. The marker's `spec=yes|no`
+ * says whether a ticket the pull request references has an approved spec, the
+ * ack that spares the owner the ask.
  *
  * A ticket binding's own `ready.substantial` is the spec gate's judgment, a
  * different thing from the diff's, so the diff judgment is read only from the
@@ -161,7 +162,7 @@ export function productGateOptions(b: Pick<Binding, "kind" | "ready">, pull?: En
   if (b.kind === "ticket") {
     return { substantial: marker?.substantial ?? null, ticketApprovedSpec: ready?.approval != null };
   }
-  return { substantial: ready?.substantial ?? marker?.substantial ?? null, ticketApprovedSpec: marker?.ticketApprovedSpec ?? false };
+  return { substantial: marker?.substantial ?? ready?.substantial ?? null, ticketApprovedSpec: marker?.ticketApprovedSpec ?? false };
 }
 
 /**

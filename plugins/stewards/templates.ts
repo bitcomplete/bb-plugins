@@ -245,8 +245,8 @@ up from there. \`substantial\` is the worker's judgment of the diff against the
 a ticket the pull request references has an approved spec. A substantial pull
 request with no approved spec is the owner's, with reason \`product\`: its review
 body opens with a **Product** section before the findings, and the owner's
-unsigned approval of that section is the ack. The worker also reports the
-verdict on the binding with \`steward_report { ready: { substantial, why } }\`,
+unsigned approval of that section is the ack. The steward reports what the
+marker says on the binding with \`steward_report { ready: { substantial, why } }\`,
 so \`bb stewards show\` and the wake carry it. A pull request judged not
 substantial gets no Product section and no product ask.
 

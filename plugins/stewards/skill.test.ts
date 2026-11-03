@@ -37,6 +37,9 @@ describe("the shipped pr-reviewer skill's product ack (BB-207)", () => {
     expect(skill).toContain("docs/product.md");
     expect(skill).toMatch(/naming what you searched/u);
     expect(skill).toMatch(/Omit this whole section when the change is not substantial/u);
+    // A playbook with no list has not opted in, so nothing is substantial.
+    expect(skill).toMatch(/playbook\s+with no `substantial` list has not opted in/u);
+    expect(skill).toMatch(/mark `substantial=no spec=no`/u);
     // A body assertion never stands in for the owner's ack.
     expect(skill).toMatch(/self-asserted ack in the[\s\S]*?never counts/u);
     // A standing owner approval carries across a rebase, product included.
