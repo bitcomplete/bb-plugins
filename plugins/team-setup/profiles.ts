@@ -102,12 +102,15 @@ async function dirSize(dir: string, skip: ReadonlySet<string> = new Set()): Prom
   return total;
 }
 
-// listProfiles reports the active profile and every profile with its booted
-// state and size. `default` is the volume root, and its size leaves
-// profiles/ out so it does not include the other profiles.
-export async function listProfiles(layout: ProfilesLayout): Promise<{ active: string; profiles: ProfileRow[] }> {
-  const active = await readActiveProfile(layout);
-  const names = new Set<string>([DEFAULT_PROFILE, active]);
+// listProfiles reports the running profile and every profile with its
+// booted state and size. `running` is the profile the server actually booted
+// on (the entrypoint resolved it at start), which can differ from
+// active-profile for a moment after a failed switch; reporting it as active
+// keeps the UI from offering Delete on the live data dir. `default` is the
+// volume root, and its size leaves profiles/ out so it does not include the
+// other profiles.
+export async function listProfiles(layout: ProfilesLayout, running: string): Promise<{ active: string; profiles: ProfileRow[] }> {
+  const names = new Set<string>([DEFAULT_PROFILE, running]);
   try {
     for (const entry of await readdir(layout.profilesDir, { withFileTypes: true })) {
       if (entry.name === DEFAULT_PROFILE || !validProfileName(entry.name)) continue;
@@ -128,8 +131,8 @@ export async function listProfiles(layout: ProfilesLayout): Promise<{ active: st
     }),
   );
   // Active first, then by name, so the list is stable across a switch.
-  profiles.sort((a, b) => (a.name === active ? -1 : b.name === active ? 1 : a.name.localeCompare(b.name)));
-  return { active, profiles };
+  profiles.sort((a, b) => (a.name === running ? -1 : b.name === running ? 1 : a.name.localeCompare(b.name)));
+  return { active: running, profiles };
 }
 
 export async function createProfile(layout: ProfilesLayout, name: string): Promise<ProfileRow> {
@@ -147,9 +150,14 @@ export async function createProfile(layout: ProfilesLayout, name: string): Promi
   return { name, booted: false, bytes: 0 };
 }
 
-export async function deleteProfile(layout: ProfilesLayout, name: string): Promise<{ ok: true }> {
+// deleteProfile refuses default, the running profile and the one
+// active-profile names. The last two differ only for a moment after a failed
+// switch, and both must be protected: one is the live data dir, the other is
+// what the next boot will use.
+export async function deleteProfile(layout: ProfilesLayout, name: string, running: string): Promise<{ ok: true }> {
   assertName(name);
   if (name === DEFAULT_PROFILE) throw new Error(`the "${DEFAULT_PROFILE}" profile cannot be deleted`);
+  if (name === running) throw new Error(`"${name}" is the active profile`);
   if (name === (await readActiveProfile(layout))) throw new Error(`"${name}" is the active profile`);
   const dir = profileDir(layout, name);
   let info;

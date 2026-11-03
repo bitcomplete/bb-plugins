@@ -613,4 +613,18 @@ describe("data profiles", () => {
     expect(await harness.callRpc("profiles.activate", { name: "demo" })).toEqual({ booted: true });
     expect(await harness.callRpc("profiles.activate", { name: "default" })).toEqual({ booted: false });
   });
+
+  it("protects the running profile after a failed switch rewrote active-profile", async () => {
+    const l = await layout();
+    await mkdir(join(l.profilesDir, "demo"));
+    await writeFile(l.activeProfileFile, "demo\n");
+    // The server booted on demo, so that is the running profile.
+    const { harness } = await setup({ env: envFor(l) });
+    // A switch to default whose restart failed left the file pointing at
+    // default while the server still runs demo.
+    await writeFile(l.activeProfileFile, "default\n");
+    const list = (await harness.callRpc("profiles.list", null)) as { active: string };
+    expect(list.active).toBe("demo");
+    await expect(harness.callRpc("profiles.delete", { name: "demo" })).rejects.toThrow(/active/u);
+  });
 });

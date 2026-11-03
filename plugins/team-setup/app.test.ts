@@ -33,6 +33,12 @@ describe("registration", () => {
     const { homepageSections, settingsSections } = capture();
     expect(homepageSections.map((section) => section.id)).toEqual(["checklist"]);
     expect(settingsSections.map((section) => section.id)).toEqual(["server-update", "checklist", "advanced"]);
+    // The Advanced section draws its own heading and description in the
+    // disclosure, and renders nothing off-gate; the host must not draw a
+    // heading for it.
+    const advanced = settingsSections.find((section) => section.id === "advanced");
+    expect(advanced?.title).toBeUndefined();
+    expect(advanced?.description).toBeUndefined();
   });
 
   // BB-174's Get started nav panel and redirect overlay were removed in

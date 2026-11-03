@@ -843,7 +843,11 @@ function ProfilesPanel({ rpc, list, setList }: { rpc: ProfilesRpc; list: Profile
     setBusy(true);
     setActionError(null);
     try {
-      await switchProfile({ ...browserDeps(), activate: (value) => rpc.call("profiles.activate", { name: value }) }, target.name);
+      await switchProfile(
+        { ...browserDeps(), activate: (value) => rpc.call("profiles.activate", { name: value }) },
+        target.name,
+        list.active,
+      );
     } catch (error) {
       setActionError(message(error));
       setBusy(false);
@@ -1064,8 +1068,6 @@ export default definePluginApp((app) => {
   });
   app.slots.settingsSection({
     id: "advanced",
-    title: "Advanced",
-    description: "Switch this server between data sets; for testing onboarding.",
     component: AdvancedSection,
   });
 });

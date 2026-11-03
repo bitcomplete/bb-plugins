@@ -30,7 +30,7 @@ import {
 } from "./gh.js";
 import { figmaHostContract, type FigmaHostState } from "./figma-contract.js";
 import { profilesRpcContract } from "./profiles-contract.js";
-import { activateProfile, createProfile, deleteProfile, listProfiles, profilesLayout } from "./profiles.js";
+import { activateProfile, createProfile, deleteProfile, listProfiles, profilesLayout, readActiveProfile } from "./profiles.js";
 
 export const ACCOUNT_POOL_ID = "account-pool";
 export const DEVBOX_ID = "devbox-provider";
@@ -691,10 +691,14 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
     // layout, has no such method and the Advanced section renders nothing.
     const profiles = profilesLayout(deps.env);
     if (profiles !== null) {
+      // The profile the entrypoint resolved at start. active-profile can be
+      // rewritten by a switch whose restart then fails, so the running one is
+      // what list reports as active and delete refuses.
+      const running = await readActiveProfile(profiles);
       bb.rpc.register(profilesRpcContract, {
-        "profiles.list": () => listProfiles(profiles),
+        "profiles.list": () => listProfiles(profiles, running),
         "profiles.create": ({ name }) => createProfile(profiles, name),
-        "profiles.delete": ({ name }) => deleteProfile(profiles, name),
+        "profiles.delete": ({ name }) => deleteProfile(profiles, name, running),
         "profiles.activate": ({ name }) => activateProfile(profiles, name),
       });
     }

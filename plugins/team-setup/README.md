@@ -117,12 +117,16 @@ both are set:
 |---|---|
 | `profiles.list` | `{ active, profiles: [{ name, booted, bytes }] }`; `booted` is "has a `bb.db`", sizes are computed on request and `profiles/` is left out of `default`'s. |
 | `profiles.create { name }` | Validates the name, refuses an existing one, creates the empty directory. |
-| `profiles.delete { name }` | Refuses `default` and the active profile; removes the directory, never following a symlink. |
+| `profiles.delete { name }` | Refuses `default`, the active profile and the profile the server is actually running; removes the directory, never following a symlink. |
 | `profiles.activate { name }` | Refuses an unknown name, writes `active-profile`, returns `{ booted }`. |
 
 A profile name is a lowercase DNS label of 1 to 32 characters, checked before
 it becomes a path, and the resolved path is refused if it escapes
-`profiles/`.
+`profiles/`. The server records the profile it booted on; `list` reports that
+as active and `delete` refuses it as well as `active-profile`, so a switch
+whose restart failed cannot leave the live data dir deletable. `switchProfile`
+also puts `active-profile` back when the restart is refused or unreachable,
+so a later unrelated restart does not land the developer on the new data set.
 
 Switching calls `profiles.activate` and then `POST`s the router's
 `/_bb-gate/restart`, with `?first_visit=1` for a profile that has never

@@ -62,6 +62,7 @@ describe("profile switch", () => {
         },
       },
       "demo",
+      "default",
     );
     await h.flush();
     expect(activated).toEqual(["demo"]);
@@ -78,7 +79,7 @@ describe("profile switch", () => {
       { status: 200, body: { restarted: true } },
       { status: 200, body: { pending: false, ready: false } },
     ]);
-    const running = switchProfile({ ...h.deps, activate: async () => ({ booted: true }) }, "default");
+    const running = switchProfile({ ...h.deps, activate: async () => ({ booted: true }) }, "default", "demo");
     await h.flush();
     expect(h.calls[0]).toEqual({ method: "POST", url: RESTART_PATH });
     await h.advance(RESTART_POLL_MS);
@@ -86,10 +87,48 @@ describe("profile switch", () => {
     expect(h.reloaded()).toBe(1);
   });
 
-  it("reports a refused restart and does not follow", async () => {
+  it("puts the previous profile back when the restart is refused", async () => {
     const h = harness([{ status: 403 }]);
-    await expect(switchProfile({ ...h.deps, activate: async () => ({ booted: false }) }, "demo")).rejects.toThrow(/403/u);
+    const activated: string[] = [];
+    await expect(
+      switchProfile(
+        {
+          ...h.deps,
+          activate: async (name) => {
+            activated.push(name);
+            return { booted: false };
+          },
+        },
+        "demo",
+        "default",
+      ),
+    ).rejects.toThrow(/403/u);
+    // The target, then the previous profile restored before the throw.
+    expect(activated).toEqual(["demo", "default"]);
     expect(h.calls).toHaveLength(1);
+    expect(h.reloaded()).toBe(0);
+  });
+
+  it("puts the previous profile back when the restart is unreachable", async () => {
+    const h = harness([]);
+    h.deps.fetch = async () => {
+      throw new Error("network down");
+    };
+    const activated: string[] = [];
+    await expect(
+      switchProfile(
+        {
+          ...h.deps,
+          activate: async (name) => {
+            activated.push(name);
+            return { booted: true };
+          },
+        },
+        "demo",
+        "default",
+      ),
+    ).rejects.toThrow(/network down/u);
+    expect(activated).toEqual(["demo", "default"]);
     expect(h.reloaded()).toBe(0);
   });
 });
