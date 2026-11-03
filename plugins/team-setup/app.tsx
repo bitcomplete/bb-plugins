@@ -65,7 +65,7 @@ function useVisiblePolling(refetch: () => void, active: boolean, intervalMs: num
 function StepMark({ state }: { state: StepState }) {
   const name = state === "done" ? "CircleCheck" : "Circle";
   const tone = state === "done" ? "text-success" : state === "todo" ? "text-muted-foreground" : "text-muted-foreground/60";
-  return <Icon name={name} className={`mt-0.5 size-4 shrink-0 ${tone}`} aria-label={state} />;
+  return <Icon name={name} className={`size-4 shrink-0 ${tone}`} aria-label={state} />;
 }
 
 const STEP_TITLES: Record<keyof Status["steps"], string> = {
@@ -98,25 +98,37 @@ function Step({
   children,
   action,
   about,
+  panel,
 }: {
   state: StepState;
   title: string;
   children: React.ReactNode;
   action?: React.ReactNode;
   about?: React.ReactNode;
+  panel?: React.ReactNode;
 }) {
   return (
     <li className="flex items-start gap-3">
-      <StepMark state={state} />
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
-        <div className="flex items-center justify-between gap-4">
-          <p className="font-medium">{title}</p>
-          {action}
+      <span className="flex h-8 shrink-0 items-center">
+        <StepMark state={state} />
+      </span>
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        {/* Two columns, both top aligned: title and paragraph on the left, a
+            fixed-width action column on the right that every row keeps so
+            the right edge lines up. Narrow windows stack the action under
+            the whole left column rather than wrapping it under the title. */}
+        <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-start sm:gap-4">
+          <div className="flex min-w-0 flex-1 flex-col gap-1">
+            <p className="flex h-8 items-center font-medium">{title}</p>
+            <div className="flex flex-col gap-2 text-muted-foreground">
+              {about}
+              {children}
+            </div>
+          </div>
+          <div className="w-56 shrink-0">{action}</div>
         </div>
-        <div className="flex flex-col gap-2 text-muted-foreground">
-          {about}
-          {children}
-        </div>
+        {/* In-progress panels (device code, paste box) span the row width. */}
+        {panel ? <div className="flex flex-col gap-2 text-muted-foreground">{panel}</div> : null}
       </div>
     </li>
   );
@@ -310,7 +322,7 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
           }
           action={
             ai.available && claude === null && codex === null ? (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <Button size="sm" variant={steps.ai === "done" ? "outline" : "default"} disabled={busy !== null} onClick={() => void run("claude", async () => {
                   const s = await rpc.call("claudeSignIn");
                   setPasted("");
@@ -319,7 +331,7 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
                 })}>
                   Sign in to Claude
                 </Button>
-                <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void run("codex", async () => {
+                <Button size="sm" variant="link" className="h-auto px-0" disabled={busy !== null} onClick={() => void run("codex", async () => {
                   setCodexError(null);
                   const s = await rpc.call("codexSignIn");
                   setCodex(s);
@@ -328,6 +340,67 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
                 </Button>
               </div>
             ) : null
+          }
+          panel={
+            <>
+              {claude !== null ? (
+                <form
+                  className="flex flex-col gap-2 rounded-lg border border-border p-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (pasted.trim() === "") return;
+                    void run("claude-complete", async () => {
+                      await rpc.call("claudeComplete", { sessionId: claude.sessionId, pasted: pasted.trim() });
+                      setClaude(null);
+                      setPasted("");
+                      refetch();
+                    });
+                  }}
+                >
+                  <p className="text-foreground">Sign in at claude.ai, then paste the code from its final page here.</p>
+                  <div className="flex items-center gap-2">
+                    <Button type="button" size="sm" variant="outline" onClick={() => open(claude.url)}>
+                      Open claude.ai again
+                    </Button>
+                    <input
+                      className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
+                      aria-label="Claude authorization code"
+                      placeholder="Paste code#state here"
+                      value={pasted}
+                      onChange={(e) => setPasted(e.target.value)}
+                    />
+                    <Button size="sm" type="submit" disabled={busy !== null || pasted.trim() === ""}>
+                      Finish
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" onClick={() => setClaude(null)}>
+                      Cancel
+                    </Button>
+                  </div>
+                </form>
+              ) : null}
+              {codex !== null ? (
+                <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+                  <p className="text-foreground">Open the verification page, sign in to ChatGPT, and enter this code.</p>
+                  <CodeBlock code={codex.code} />
+                  <div className="flex items-center gap-2">
+                    <Button size="sm" onClick={() => open(codex.url)}>
+                      Open verification page
+                    </Button>
+                    <span>Waiting for you to approve…</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void run("codex-cancel", async () => {
+                        await rpc.call("codexCancel", { sessionId: codex.sessionId });
+                        setCodex(null);
+                      })}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+            </>
           }
         >
           {!ai.available ? (
@@ -346,63 +419,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
           ) : (
             <p>Agents run on your own Claude or ChatGPT subscription through the Account Pool. One is enough; add both to fall back.</p>
           )}
-          {claude !== null ? (
-            <form
-              className="flex flex-col gap-2 rounded-lg border border-border p-3"
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (pasted.trim() === "") return;
-                void run("claude-complete", async () => {
-                  await rpc.call("claudeComplete", { sessionId: claude.sessionId, pasted: pasted.trim() });
-                  setClaude(null);
-                  setPasted("");
-                  refetch();
-                });
-              }}
-            >
-              <p className="text-foreground">Sign in at claude.ai, then paste the code from its final page here.</p>
-              <div className="flex items-center gap-2">
-                <Button type="button" size="sm" variant="outline" onClick={() => open(claude.url)}>
-                  Open claude.ai again
-                </Button>
-                <input
-                  className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
-                  aria-label="Claude authorization code"
-                  placeholder="Paste code#state here"
-                  value={pasted}
-                  onChange={(e) => setPasted(e.target.value)}
-                />
-                <Button size="sm" type="submit" disabled={busy !== null || pasted.trim() === ""}>
-                  Finish
-                </Button>
-                <Button type="button" size="sm" variant="ghost" onClick={() => setClaude(null)}>
-                  Cancel
-                </Button>
-              </div>
-            </form>
-          ) : null}
-          {codex !== null ? (
-            <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
-              <p className="text-foreground">Open the verification page, sign in to ChatGPT, and enter this code.</p>
-              <CodeBlock code={codex.code} />
-              <div className="flex items-center gap-2">
-                <Button size="sm" onClick={() => open(codex.url)}>
-                  Open verification page
-                </Button>
-                <span>Waiting for you to approve…</span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => void run("codex-cancel", async () => {
-                    await rpc.call("codexCancel", { sessionId: codex.sessionId });
-                    setCodex(null);
-                  })}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          ) : null}
           {codexError !== null ? <p className="text-destructive">{codexError}</p> : null}
         </Step>
 
@@ -434,6 +450,26 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
               )
             ) : null
           }
+          panel={
+            github.pending !== null ? (
+              <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+                <p className="text-foreground">Enter this code on GitHub.</p>
+                <CodeBlock code={github.pending.code} />
+                <div className="flex items-center gap-2">
+                  <Button size="sm" onClick={() => open(github.pending!.url)}>
+                    Open github.com/login/device
+                  </Button>
+                  <span>Waiting for you to approve…</span>
+                  <Button size="sm" variant="ghost" onClick={() => void run("github-cancel", async () => {
+                    await rpc.call("githubCancel");
+                    refetch();
+                  })}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : null
+          }
         >
           {github.status === "logged in" ? (
             <p>
@@ -446,24 +482,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
           ) : (
             <p>Machines clone and push as you. The sign-in happens on this server, once: GitHub shows you a code, you approve it, and bb forwards the login to every machine.</p>
           )}
-          {github.pending !== null ? (
-            <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
-              <p className="text-foreground">Enter this code on GitHub.</p>
-              <CodeBlock code={github.pending.code} />
-              <div className="flex items-center gap-2">
-                <Button size="sm" onClick={() => open(github.pending!.url)}>
-                  Open github.com/login/device
-                </Button>
-                <span>Waiting for you to approve…</span>
-                <Button size="sm" variant="ghost" onClick={() => void run("github-cancel", async () => {
-                  await rpc.call("githubCancel");
-                  refetch();
-                })}>
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          ) : null}
           {github.lastError !== null && github.pending === null ? <p className="text-destructive">{github.lastError}</p> : null}
         </Step>
 
@@ -617,6 +635,62 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
               </Button>
             ) : null
           }
+          panel={
+            figmaStatus.pending || figma !== null ? (
+              <form
+                className="flex flex-col gap-2 rounded-lg border border-border p-3"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (figmaPasted.trim() === "") return;
+                  void run("figma-complete", async () => {
+                    const result = await rpc.call("figmaComplete", { url: figmaPasted.trim() });
+                    if (!result.ok) {
+                      setFigmaError(result.message ?? "The sign-in did not complete.");
+                      return;
+                    }
+                    setFigma(null);
+                    setFigmaPasted("");
+                    setFigmaError(null);
+                    refetch();
+                  });
+                }}
+              >
+                <p className="text-foreground">
+                  Open the URL, approve the sign-in, then paste the <code>http://localhost:…/callback</code> address from the page it
+                  lands on. The page itself will not load; only the address is needed.
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button type="button" size="sm" variant="outline" disabled={figmaUrl === null} onClick={() => figmaUrl !== null && open(figmaUrl)}>
+                    Open Figma again
+                  </Button>
+                  <input
+                    className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
+                    aria-label="Figma callback URL"
+                    placeholder="Paste the http://localhost:.../callback address"
+                    value={figmaPasted}
+                    onChange={(e) => setFigmaPasted(e.target.value)}
+                  />
+                  <Button size="sm" type="submit" disabled={busy !== null || figmaPasted.trim() === ""}>
+                    Finish
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void run("figma-cancel", async () => {
+                      await rpc.call("figmaCancel");
+                      setFigma(null);
+                      setFigmaPasted("");
+                      setFigmaError(null);
+                      refetch();
+                    })}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </form>
+            ) : null
+          }
         >
           {!figmaStatus.available ? (
             <p>{figmaStatus.message ?? "Figma is unavailable."}</p>
@@ -630,60 +704,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
             <p>Give Claude Code design context from a Figma link. Figma's remote MCP server signs in with your browser; skip this if you do not use Figma.</p>
           )}
           {figmaStatus.available && figmaStatus.message !== null ? <p className="text-muted-foreground">{figmaStatus.message}</p> : null}
-          {figmaStatus.pending || figma !== null ? (
-            <form
-              className="flex flex-col gap-2 rounded-lg border border-border p-3"
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (figmaPasted.trim() === "") return;
-                void run("figma-complete", async () => {
-                  const result = await rpc.call("figmaComplete", { url: figmaPasted.trim() });
-                  if (!result.ok) {
-                    setFigmaError(result.message ?? "The sign-in did not complete.");
-                    return;
-                  }
-                  setFigma(null);
-                  setFigmaPasted("");
-                  setFigmaError(null);
-                  refetch();
-                });
-              }}
-            >
-              <p className="text-foreground">
-                Open the URL, approve the sign-in, then paste the <code>http://localhost:…/callback</code> address from the page it
-                lands on. The page itself will not load; only the address is needed.
-              </p>
-              <div className="flex items-center gap-2">
-                <Button type="button" size="sm" variant="outline" disabled={figmaUrl === null} onClick={() => figmaUrl !== null && open(figmaUrl)}>
-                  Open Figma again
-                </Button>
-                <input
-                  className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
-                  aria-label="Figma callback URL"
-                  placeholder="Paste the http://localhost:.../callback address"
-                  value={figmaPasted}
-                  onChange={(e) => setFigmaPasted(e.target.value)}
-                />
-                <Button size="sm" type="submit" disabled={busy !== null || figmaPasted.trim() === ""}>
-                  Finish
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => void run("figma-cancel", async () => {
-                    await rpc.call("figmaCancel");
-                    setFigma(null);
-                    setFigmaPasted("");
-                    setFigmaError(null);
-                    refetch();
-                  })}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </form>
-          ) : null}
           {figmaError !== null ? <p className="text-destructive">{figmaError}</p> : null}
         </Step>
       </ol>
