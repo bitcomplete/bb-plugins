@@ -24,15 +24,13 @@ export const NEW_PROJECT_HREF = `/plugins/${MULTI_REPO_ID}/${MULTI_REPO_REPOS_PA
 /**
  * A deep link into multi-repo's New project form.
  *
- * `projectCount` is the number of projects on the server. With none, this is
- * the primary call to action — the first thing a brand-new developer should
- * press. Once one exists it steps back to a secondary link, so it stays
- * available without competing with the setup checklist.
+ * It is shown only while the server has no projects, so it is the primary
+ * call to action: the first thing a brand-new developer should press. Once a
+ * project exists the checklist step hides it.
  */
-export function CreateProjectEntry({ projectCount }: { projectCount: number }) {
-  const primary = projectCount === 0;
+export function CreateProjectEntry() {
   return (
-    <Button asChild variant={primary ? "default" : "link"} size="sm">
+    <Button asChild size="sm">
       <a href={NEW_PROJECT_HREF}>Create a project from a git URL</a>
     </Button>
   );
