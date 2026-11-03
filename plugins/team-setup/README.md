@@ -7,8 +7,9 @@ steps remain, a warning icon, what is left and a link to the settings page;
 once none do, what is set up. Each row says what the step is for and what
 happens once it is done.
 
-bb's own **Replay setup guide** in Settings is bb core's first-run wizard; it
-needs a primary host and is not useful behind bb-gate.
+bb's own **Setup guide** row in Settings → Threads & editing (its **Show
+setup guide** button) is bb core's first-run wizard; it needs a primary host
+and is not useful behind bb-gate.
 
 | Step | Owned by | Done when | What the button does |
 |---|---|---|---|
