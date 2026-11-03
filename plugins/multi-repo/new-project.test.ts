@@ -335,4 +335,93 @@ describe("seeding a plain project source on the first write", () => {
       layout: "primary",
     });
   });
+
+  it("refuses the write when the seed does not land on the default branch", async () => {
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string; input: unknown }) => {
+        switch (call.method) {
+          case "prepareProjectSource":
+            return {
+              bootstrapped: false,
+              reposJson: null,
+              remote: "https://example.com/acme.git",
+              defaultBranch: "main",
+              unpushed: null,
+              layout: "standalone" as const,
+              warnings: [],
+            };
+          case "preparePrimaryProjectSource":
+            return {
+              ok: true,
+              layout: "primary" as const,
+              seeded: true,
+              prUrl: null,
+              warnings: ["main has diverged from origin; the seed is only on the local branch bb/seed-bb-x."],
+              message: "seeded",
+            };
+          default:
+            throw new Error(`unexpected host method ${call.method}`);
+        }
+      },
+    });
+    harness.sdk.stub("projects.get", () => ({
+      id: "proj_1",
+      name: "acme",
+      sources: [{ type: "local_path", hostId: HOST_ID, path: SOURCE_PATH, isDefault: true }],
+    }));
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("saveRepoSet", {
+      projectId: "proj_1",
+      reposJson: '{"version":1,"repos":[{"dir":"other","url":"https://example.com/other.git"}]}',
+    })) as { ok: boolean; error: string | null };
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/diverged from origin/u);
+  });
+
+  it("seeds a plain repo with no origin from its own path", async () => {
+    const hostCalls: Array<{ method: string; input: unknown }> = [];
+    let seeded = false;
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string; input: unknown }) => {
+        hostCalls.push({ method: call.method, input: call.input });
+        switch (call.method) {
+          case "prepareProjectSource":
+            return {
+              bootstrapped: false,
+              reposJson: seeded ? '{"version":1,"repos":[]}\n' : null,
+              remote: null,
+              defaultBranch: "main",
+              unpushed: null,
+              layout: seeded ? ("primary" as const) : ("standalone" as const),
+              warnings: [],
+            };
+          case "preparePrimaryProjectSource":
+            seeded = true;
+            return { ok: true, layout: "primary" as const, seeded: true, prUrl: null, warnings: [], message: "seeded" };
+          case "writeProjectSourceRepos":
+            return { ok: true, committed: true, head: "abc", mode: "push" as const, prUrl: null, message: null };
+          default:
+            throw new Error(`unexpected host method ${call.method}`);
+        }
+      },
+    });
+    harness.sdk.stub("projects.get", () => ({
+      id: "proj_1",
+      name: "acme",
+      sources: [{ type: "local_path", hostId: HOST_ID, path: SOURCE_PATH, isDefault: true }],
+    }));
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("saveRepoSet", {
+      projectId: "proj_1",
+      reposJson: '{"version":1,"repos":[{"dir":"other","url":"https://example.com/other.git"}]}',
+    })) as { ok: boolean };
+    expect(result.ok).toBe(true);
+    expect(hostCalls.find((call) => call.method === "preparePrimaryProjectSource")?.input).toMatchObject({
+      url: SOURCE_PATH,
+      path: SOURCE_PATH,
+      openPullRequest: false,
+    });
+  });
 });

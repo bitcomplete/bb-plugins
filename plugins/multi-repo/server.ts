@@ -611,20 +611,27 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
    * A project created from a plain repo (BB-222) has no definition until its
    * first write. Seed `.bb/` on the default branch, in a detached worktree and
    * with no pull request, so the write that follows lands in `.bb/` rather
-   * than at the repo root and the checkout's own branch is never touched.
-   * Returns the layout the source now has; a source that already carries a
-   * definition, or a fresh directory that `bootstrap` just initialized, is
-   * left alone.
+   * than at the repo root and the checkout's own branch is never touched. A
+   * source that already carries a definition, or a fresh directory that
+   * `bootstrap` just initialized, is left alone. When the seed does not land
+   * on the default branch — it has diverged from origin, say — the write is
+   * refused with the seed's own warning rather than committed at the repo
+   * root.
    */
-  async function ensureProjectDefinition(location: SourceLocation, signal?: AbortSignal): Promise<ProjectLayout> {
+  async function ensureProjectDefinition(
+    location: SourceLocation,
+    signal?: AbortSignal,
+  ): Promise<{ layout: ProjectLayout; warnings: string[] }> {
     const current = await readRepoSet(location, { bootstrap: true }, signal);
-    if (current.layout !== "standalone" || current.text !== null || current.remote === null || current.file === null) {
-      return current.layout;
+    if (current.layout !== "standalone" || current.text !== null || current.file === null) {
+      return { layout: current.layout, warnings: [] };
     }
+    // A plain git repo, with or without a remote: seed `.bb/` on its default
+    // branch. A repo with no origin is seeded locally, from its own path.
     const seeded = await host.call(
       "preparePrimaryProjectSource",
       {
-        url: current.remote,
+        url: current.remote ?? location.path,
         path: location.path,
         seed: serializeReposFile(current.file),
         branch: `bb/seed-bb-${Date.now().toString(36)}`,
@@ -634,7 +641,14 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     );
     if (!seeded.ok) throw new Error(seeded.message);
     const next = await readRepoSet(location, { bootstrap: false }, signal);
-    return next.layout;
+    if (next.layout !== "primary") {
+      throw new Error(
+        seeded.warnings.length > 0
+          ? seeded.warnings.join("; ")
+          : `${location.path} carries no .bb/ on its default branch after seeding; the write was refused rather than putting repos.json at the repo root.`,
+      );
+    }
+    return { layout: next.layout, warnings: seeded.warnings };
   }
 
   async function writeRepoSet(
@@ -683,6 +697,12 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     return "Pushed the change to origin.";
   }
 
+  /** The write's note with any seed warnings beside it, so a diverged default branch is not silent. */
+  function noteWithWarnings(message: string | null, warnings: readonly string[]): string | null {
+    const lines = [message, ...warnings].filter((line): line is string => line !== null && line.length > 0);
+    return lines.length === 0 ? null : lines.join("; ");
+  }
+
   type EditOutcome =
     | { ok: true; dir: string; mode: PublishMode; prUrl: string | null; message: string | null }
     | { ok: false; code: string; error: string };
@@ -692,7 +712,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     seed: RepoSeed,
     signal?: AbortSignal,
   ): Promise<EditOutcome> {
-    await ensureProjectDefinition(location, signal);
+    const definition = await ensureProjectDefinition(location, signal);
     const current = await readRepoSet(location, { bootstrap: false }, signal);
     if (current.file === null) {
       return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
@@ -711,8 +731,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = addRepo(current.file, entry);
     if (!edited.ok) return { ok: false, code: "invalid_repo_set", error: edited.error };
-    const published = await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout);
-    return { ok: true, dir: entry.dir, ...published };
+    const published = await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, definition.layout);
+    return { ok: true, dir: entry.dir, ...published, message: noteWithWarnings(published.message, definition.warnings) };
   }
 
   async function removeRepoFromProject(
@@ -1719,15 +1739,15 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         // directory, which made this panel unable to be the thing that sets a
         // project up. Committing a repo set is a deliberate enough act to
         // stand up the repo that holds it.
-        const layout = await ensureProjectDefinition(location);
+        const definition = await ensureProjectDefinition(location);
         const published = await writeRepoSet(
           location,
           parsed.value,
           `Update the repo set`,
           undefined,
-          layout,
+          definition.layout,
         );
-        return { ok: true, error: null, ...published };
+        return { ok: true, error: null, ...published, message: noteWithWarnings(published.message, definition.warnings) };
       } catch (error) {
         return { ok: false, error: errorMessage(error), mode: null, prUrl: null, message: null };
       }
