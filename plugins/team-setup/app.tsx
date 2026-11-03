@@ -7,10 +7,17 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import type { profilesRpcContract } from "./profiles-contract.js";
+import { validProfileName, type ProfileRow } from "./profiles-name.js";
+import { switchProfile } from "./profile-switch.js";
 import { browserDeps, createUpdateStore, type UpdateStore } from "./server-update";
 import { CreateProjectEntry } from "./create-project-entry.js";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
+import { Disclosure } from "@/components/ui/disclosure";
 import { Icon } from "@/components/ui/icon";
+import { Input } from "@/components/ui/input";
 
 type Status = Awaited<ReturnType<ReturnType<typeof useRpc<typeof rpcContract>>["call"]>> extends infer R
   ? Extract<R, { steps: unknown }>
@@ -778,6 +785,258 @@ function ServerUpdateSection() {
   );
 }
 
+// ---- Data profiles (Advanced) ---------------------------------------------
+
+interface ProfilesList {
+  active: string;
+  profiles: ProfileRow[];
+}
+
+type ProfilesRpc = ReturnType<typeof useRpc<typeof profilesRpcContract>>;
+
+function sortProfiles(profiles: ProfileRow[], active: string): ProfileRow[] {
+  return [...profiles].sort((a, b) => (a.name === active ? -1 : b.name === active ? 1 : a.name.localeCompare(b.name)));
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function ProfilesPanel({ rpc, list, setList }: { rpc: ProfilesRpc; list: ProfilesList; setList: (list: ProfilesList) => void }) {
+  const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [switchTarget, setSwitchTarget] = useState<ProfileRow | null>(null);
+  const [deleting, setDeleting] = useState<ProfileRow | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const trimmed = name.trim();
+  const nameValid = validProfileName(trimmed);
+  const nameTaken = list.profiles.some((profile) => profile.name === trimmed);
+  const canCreate = nameValid && !nameTaken && !creating;
+
+  const create = async () => {
+    if (!canCreate) return;
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const row = await rpc.call("profiles.create", { name: trimmed });
+      setList({ active: list.active, profiles: sortProfiles([...list.profiles, row], list.active) });
+      setName("");
+    } catch (error) {
+      setCreateError(message(error));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const confirmSwitch = async (target: ProfileRow) => {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await switchProfile({ ...browserDeps(), activate: (value) => rpc.call("profiles.activate", { name: value }) }, target.name);
+    } catch (error) {
+      setActionError(message(error));
+      setBusy(false);
+      setSwitchTarget(null);
+    }
+  };
+
+  const confirmDelete = async (target: ProfileRow) => {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await rpc.call("profiles.delete", { name: target.name });
+      setList({ active: list.active, profiles: list.profiles.filter((profile) => profile.name !== target.name) });
+      setDeleting(null);
+    } catch (error) {
+      setActionError(message(error));
+      setDeleting(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
+        {list.profiles.map((profile) => (
+          <li key={profile.name} className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+            <span className="flex items-center gap-2">
+              <span className="font-medium">{profile.name}</span>
+              {profile.name === list.active ? <Badge>Active</Badge> : !profile.booted ? <Badge>Never started</Badge> : null}
+            </span>
+            <span className="flex items-center gap-3 text-muted-foreground">
+              <span className="text-xs">{formatBytes(profile.bytes)}</span>
+              <span className="flex gap-2">
+                {profile.name !== list.active ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => {
+                      setActionError(null);
+                      setSwitchTarget(profile);
+                    }}
+                  >
+                    Switch
+                  </Button>
+                ) : null}
+                {profile.name !== list.active && profile.name !== "default" ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    onClick={() => {
+                      setActionError(null);
+                      setDeleting(profile);
+                    }}
+                  >
+                    Delete
+                  </Button>
+                ) : null}
+              </span>
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      <form
+        className="flex flex-col gap-1"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void create();
+        }}
+      >
+        <div className="flex items-center gap-2">
+          <Input
+            aria-label="New profile name"
+            placeholder="new profile name (lowercase letters, digits, hyphens)"
+            value={name}
+            onChange={(event) => {
+              setName(event.target.value);
+              setCreateError(null);
+            }}
+          />
+          <Button size="sm" type="submit" disabled={!canCreate}>
+            Create
+          </Button>
+        </div>
+        {trimmed !== "" && !nameValid ? (
+          <p className="text-xs text-destructive">Use a lowercase DNS label: letters, digits and hyphens, 1–32 characters.</p>
+        ) : nameTaken ? (
+          <p className="text-xs text-destructive">“{trimmed}” already exists.</p>
+        ) : null}
+        {createError !== null ? <p className="text-xs text-destructive">{createError}</p> : null}
+      </form>
+
+      {actionError !== null ? <p className="text-xs text-destructive">{actionError}</p> : null}
+
+      <Dialog
+        open={switchTarget !== null}
+        title={switchTarget !== null ? `Switch to ${switchTarget.name}?` : ""}
+        onClose={() => {
+          if (!busy) setSwitchTarget(null);
+        }}
+        footer={
+          <>
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => setSwitchTarget(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" disabled={busy} onClick={() => switchTarget !== null && void confirmSwitch(switchTarget)}>
+              {busy ? "Restarting…" : "Switch"}
+            </Button>
+          </>
+        }
+      >
+        {switchTarget !== null ? (
+          <>
+            <p>The server restarts in under a minute and any running turn is interrupted.</p>
+            <p>Machines and connections stay with the profile that made them.</p>
+            {!switchTarget.booted ? <p>This profile has never started, so it opens on Team setup.</p> : null}
+          </>
+        ) : null}
+      </Dialog>
+
+      <Dialog
+        open={deleting !== null}
+        title={deleting !== null ? `Delete ${deleting.name}?` : ""}
+        onClose={() => {
+          if (!busy) setDeleting(null);
+        }}
+        footer={
+          <>
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => setDeleting(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" variant="destructive" disabled={busy} onClick={() => deleting !== null && void confirmDelete(deleting)}>
+              {busy ? "Deleting…" : "Delete"}
+            </Button>
+          </>
+        }
+      >
+        {deleting !== null ? (
+          <p>
+            {deleting.name} is {formatBytes(deleting.bytes)}. Deleting it cannot be undone.
+          </p>
+        ) : null}
+      </Dialog>
+    </div>
+  );
+}
+
+/** The settings section: switch this server between data sets. It renders
+ * nothing on a server whose entrypoint does not export the profile layout
+ * (not behind bb-gate, or an older image), which it learns from the first
+ * profiles.list. */
+function AdvancedSection() {
+  const rpc = useRpc<typeof profilesRpcContract>();
+  const [open, setOpen] = useState(false);
+  const [list, setList] = useState<ProfilesList | null>(null);
+  const [absent, setAbsent] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    rpc.call("profiles.list").then(
+      (result) => {
+        if (!cancelled) setList(result);
+      },
+      () => {
+        // No profile layout: not behind bb-gate, or an older image.
+        if (!cancelled) setAbsent(true);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc]);
+
+  if (absent) return null;
+  return (
+    <Disclosure
+      title="Advanced"
+      description="Switch this server between data sets. For testing onboarding; most people never need it."
+      open={open}
+      onOpenChange={setOpen}
+    >
+      {list === null ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <ProfilesPanel rpc={rpc} list={list} setList={setList} />
+      )}
+    </Disclosure>
+  );
+}
+
 const CHANGED_CHANNEL = "changed";
 
 export default definePluginApp((app) => {
@@ -802,5 +1061,11 @@ export default definePluginApp((app) => {
     title: "Checklist",
     description: "Everything a new server needs before agents can work here.",
     component: () => <Checklist mode="settings" />,
+  });
+  app.slots.settingsSection({
+    id: "advanced",
+    title: "Advanced",
+    description: "Switch this server between data sets; for testing onboarding.",
+    component: AdvancedSection,
   });
 });

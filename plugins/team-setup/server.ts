@@ -29,6 +29,8 @@ import {
   type GhRunner,
 } from "./gh.js";
 import { figmaHostContract, type FigmaHostState } from "./figma-contract.js";
+import { profilesRpcContract } from "./profiles-contract.js";
+import { activateProfile, createProfile, deleteProfile, listProfiles, profilesLayout } from "./profiles.js";
 
 export const ACCOUNT_POOL_ID = "account-pool";
 export const DEVBOX_ID = "devbox-provider";
@@ -681,6 +683,21 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
         return { url };
       },
     });
+
+    // ---- data profiles ----------------------------------------------------
+
+    // Registered only when the bb-gate entrypoint set both paths. A server
+    // that is not behind bb-gate, or is on an image older than the profile
+    // layout, has no such method and the Advanced section renders nothing.
+    const profiles = profilesLayout(deps.env);
+    if (profiles !== null) {
+      bb.rpc.register(profilesRpcContract, {
+        "profiles.list": () => listProfiles(profiles),
+        "profiles.create": ({ name }) => createProfile(profiles, name),
+        "profiles.delete": ({ name }) => deleteProfile(profiles, name),
+        "profiles.activate": ({ name }) => activateProfile(profiles, name),
+      });
+    }
   };
 }
 

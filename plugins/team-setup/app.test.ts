@@ -32,7 +32,7 @@ describe("registration", () => {
   it("registers the checklist homepage section and the settings sections", () => {
     const { homepageSections, settingsSections } = capture();
     expect(homepageSections.map((section) => section.id)).toEqual(["checklist"]);
-    expect(settingsSections.map((section) => section.id)).toEqual(["server-update", "checklist"]);
+    expect(settingsSections.map((section) => section.id)).toEqual(["server-update", "checklist", "advanced"]);
   });
 
   // BB-174's Get started nav panel and redirect overlay were removed in
