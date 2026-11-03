@@ -255,12 +255,11 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
   }
 
   const { ai, github, devbox, linear, slack, machines, steps, figma: figmaStatus, projects } = status;
-  const createProject = <CreateProjectEntry projectCount={projects.count} />;
+  const createProject = <CreateProjectEntry />;
 
   if (compact && !complete) {
     return (
       <div className="flex flex-col gap-2">
-        {createProject}
         <Remaining steps={steps} />
       </div>
     );
@@ -273,7 +272,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
       .join(", ");
     return (
       <div className="flex flex-col gap-2">
-        {createProject}
         <p className="text-sm text-muted-foreground">
           All set: {aiLabel !== "" ? `${aiLabel}; ` : ""}
           {github.login !== null ? `GitHub as ${github.login}; ` : steps.github === "done" ? "GitHub; " : ""}
@@ -294,24 +292,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
   return (
     <div className="flex flex-col gap-4 text-sm">
       <ol className="flex flex-col gap-4">
-        <Step
-          state={projects.count > 0 ? "done" : "todo"}
-          title="A project"
-          about={
-            <p>
-              A project points bb at the git repo — or set of repos — your threads work in. The multi-repo New
-              project form clones a git URL on a machine and creates the project in one step.
-            </p>
-          }
-          action={createProject}
-        >
-          {projects.count > 0 ? (
-            <p>{projects.count === 1 ? "One project" : `${projects.count} projects`} on this server.</p>
-          ) : (
-            <p>Nothing to work in yet. Create the first project from a git URL.</p>
-          )}
-        </Step>
-
         <Step
           state={steps.ai}
           title="Claude or Codex"
@@ -501,6 +481,24 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
             <p>Connected{devbox.project !== null ? ` to project ${devbox.project}` : ""}.</p>
           ) : (
             <p>Connect your devbox project so bb can create machines in it. You approve it on devbox, which sends you back here.</p>
+          )}
+        </Step>
+
+        <Step
+          state={projects.count > 0 ? "done" : "todo"}
+          title="A project"
+          about={
+            <p>
+              A project points bb at the git repo — or set of repos — your threads work in. The multi-repo New
+              project form clones a git URL on a machine and creates the project in one step.
+            </p>
+          }
+          action={projects.count === 0 ? createProject : undefined}
+        >
+          {projects.count > 0 ? (
+            <p>{projects.count === 1 ? "One project" : `${projects.count} projects`} on this server.</p>
+          ) : (
+            <p>Nothing to work in yet. Create the first project from a git URL.</p>
           )}
         </Step>
 
