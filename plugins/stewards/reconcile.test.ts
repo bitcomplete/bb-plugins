@@ -186,7 +186,7 @@ describe("a worker in flight between its turns (BB-11)", () => {
 
   it("keeps the reviewer's marker comments for the worker, and wakes on a lane change", () => {
     const marker = (round: number, lane: string) => comment({ id: `m${round}`, author: "jane", body: `<!-- bb-review round=${round} sha=abc${round} verdict=approved lane=${lane} -->\n\nLGTM.`, createdAt: `2026-10-02T0${round}:00:00Z` });
-    expect(reviewMarker(marker(1, "no-review").body)).toEqual({ round: 1, sha: "abc1", verdict: "approved", lane: "no-review" });
+    expect(reviewMarker(marker(1, "no-review").body)).toEqual({ round: 1, sha: "abc1", verdict: "approved", lane: "no-review", substantial: null, ticketApprovedSpec: false });
     expect(reviewMarker("just a comment")).toBeNull();
     // A marker is a marker only on the first line.
     expect(reviewMarker("Hello\n<!-- bb-review round=1 sha=abc verdict=approved lane=no-review -->")).toBeNull();
@@ -465,17 +465,17 @@ describe("the pull request gate (build-tickets)", () => {
     // no `verdict=`, no `lane=`. Skipping it would make round 1's `approved` the latest word
     // and file an approve-pr item for the owner on a head the reviewer had just rejected.
     const bad = comment({ id: "m-bad", author: "trotterdylan", body: "<!-- bb-review round=2 sha=ccccccc3 changes-requested -->\n\n## Review round 2", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
-    expect(reviewMarker(bad.body)).toEqual({ round: 2, sha: "ccccccc3", verdict: "changes-requested", lane: null });
+    expect(reviewMarker(bad.body)).toEqual({ round: 2, sha: "ccccccc3", verdict: "changes-requested", lane: null, substantial: null, ticketApprovedSpec: false });
     const gate = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), bad] }, green));
     expect(gate).toMatchObject({ gateMet: false, needsOwnerApproval: false, lane: null, missing: "reviewer verdict: changes-requested" });
     // A marker with nothing readable at all still closes the gate, in the owner's lane.
     const empty = comment({ id: "m-empty", author: "trotterdylan", body: "<!-- bb-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:40:00Z" });
-    expect(reviewMarker(empty.body)).toEqual({ round: 0, sha: "", verdict: UNREADABLE_VERDICT, lane: null });
+    expect(reviewMarker(empty.body)).toEqual({ round: 0, sha: "", verdict: UNREADABLE_VERDICT, lane: null, substantial: null, ticketApprovedSpec: false });
     expect(prGate(pull({ comments: [marker(head, "approved", "no-review"), empty] }, green))).toMatchObject({ gateMet: false, needsOwnerApproval: false, missing: `reviewer verdict: ${UNREADABLE_VERDICT}` });
     // A marker that names no lane is not a lane change.
     expect(markerLaneChange([marker(head, "approved", "owner-reviewed")], [marker(head, "approved", "owner-reviewed"), bad])).toBeNull();
     // Keys in another order, or a verdict that is not approved, still read.
-    expect(reviewMarker("<!-- bb-review lane=no-review verdict=approved sha=abc round=3 -->")).toEqual({ round: 3, sha: "abc", verdict: "approved", lane: "no-review" });
+    expect(reviewMarker("<!-- bb-review lane=no-review verdict=approved sha=abc round=3 -->")).toEqual({ round: 3, sha: "abc", verdict: "approved", lane: "no-review", substantial: null, ticketApprovedSpec: false });
     expect(reviewMarker("<!-- bb-reviewer round=1 -->")).toBeNull();
   });
 
@@ -570,14 +570,26 @@ describe("the pull request gate (build-tickets)", () => {
     expect(productReason(null, false)).toBeNull();
   });
 
-  it("reads the product inputs from a binding: only a review binding's substantial is the diff judgment (BB-207)", () => {
+  it("reads the product inputs from a binding: a ticket's own substantial is the spec gate, the marker is the diff judgment (BB-207)", () => {
     const binding = (kind: "ticket" | "review", ready: Record<string, unknown> = {}) => ({ kind, ready: readyStateSchema.parse(ready) });
+    const marked = (attrs: string) => pull({ comments: [comment({ id: "m", author: "jane", body: `<!-- bb-review round=1 sha=abc verdict=approved lane=no-review ${attrs} -->`, createdAt: "2026-10-02T00:00:00Z" })] });
+    // A review binding's `ready.substantial` is the reviewer's diff judgment;
+    // the marker's `spec=yes` is a referenced ticket's approved spec, the ack.
+    expect(productGateOptions(binding("review", { substantial: true }), marked("spec=yes"))).toEqual({ substantial: true, ticketApprovedSpec: true });
     expect(productGateOptions(binding("review", { substantial: true }))).toEqual({ substantial: true, ticketApprovedSpec: false });
-    // A ticket binding's `substantial` is the spec gate's judgment, not the
-    // reviewer's diff judgment, so this PR leaves it inert whatever it says.
-    // PR 2 adds the ticket PR's diff report; the approved spec is its ack.
+    // The marker alone reports the diff judgment when the steward has not.
+    expect(productGateOptions(binding("review"), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    // The marker is the newest word: a stale report of false cannot lower it,
+    // and a report cannot raise a marker that says no.
+    expect(productGateOptions(binding("review", { substantial: false }), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    expect(productGateOptions(binding("review", { substantial: true }), marked("substantial=no"))).toEqual({ substantial: false, ticketApprovedSpec: false });
+    // A ticket binding's own `substantial` is the spec gate's judgment, not
+    // the diff's, so it stays inert; the marker on its pull request is the
+    // diff report, and the ticket's own approved spec is the ack.
     expect(productGateOptions(binding("ticket", { substantial: true }))).toEqual({ substantial: null, ticketApprovedSpec: false });
-    expect(productGateOptions(binding("ticket", { substantial: true, approval: { at: 1, specHash: "h", by: "user" } }))).toEqual({ substantial: null, ticketApprovedSpec: false });
+    expect(productGateOptions(binding("ticket", { substantial: true, approval: { at: 1, specHash: "h", by: "user" } }))).toEqual({ substantial: null, ticketApprovedSpec: true });
+    expect(productGateOptions(binding("ticket", { substantial: false }), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    expect(productGateOptions(binding("ticket", { substantial: false, approval: { at: 1, specHash: "h", by: "user" } }), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: true });
   });
 
   it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {

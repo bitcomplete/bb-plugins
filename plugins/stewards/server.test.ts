@@ -758,6 +758,24 @@ describe("a Linear ticket steward", () => {
     expect(wake).toContain(`Your thread id is ${steward}.`);
   });
 
+  it("keeps the reported checklist when a later report judges substantial without one (BB-207)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const base = { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" as const };
+    await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward);
+    expect(t.hooks.store.find("ENG-12")!.ready.checklist).toHaveLength(4);
+    // A report that only judges substantial (as a review binding's does) keeps
+    // the checklist the ticket already reported rather than wiping it.
+    const report = await t.tool("steward_report", { ...base, ready: { substantial: false, why: "no criterion applies" } }, steward);
+    expect(report.error, report.text).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.ready.checklist).toHaveLength(4);
+    expect(b.ready.substantial).toBe(false);
+    expect(b.ready.why).toBe("no criterion applies");
+  });
+
   // BB-55: the stall after a report passes the ready gate. The reply must send
   // the steward to work in the same turn, and the mechanical tier wakes it
   // again at once if it still ends without a worker, unless a hold or an
@@ -5626,6 +5644,28 @@ describe("needs you items", () => {
     expect(t.githubComments.filter((c) => c.body.startsWith("<!-- bb-approval"))).toHaveLength(0);
   });
 
+  it("stores a review steward's substantial report on the binding, shown by `bb stewards show` and in the wake (BB-207)", async () => {
+    const t = await setup();
+    const signed = comment({ id: "rev", author: "jane", did: "reviewed", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->\n\nFindings.\n\n_— from bb thread thr_review_`, signedBy: "thr_review", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [signed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    // A review playbook has no checklist; substantial and why alone are enough.
+    const report = await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Wait", actor: "other", ready: { substantial: true, why: "a new outbound integration" } }, b.threadId!);
+    expect(report.error, report.text).toBe(false);
+    const stored = t.hooks.store.find("acme/web#7")!;
+    expect(stored.ready).toMatchObject({ substantial: true, why: "a new outbound integration" });
+    const shown = await t.harness.behavior.runCli(["show", "acme/web#7", "--project", "p1"]);
+    expect(shown.stdout).toContain("substantial true");
+    // A later wake carries the criteria and the reported verdict.
+    t.entities.set("acme/web#7", pull({ comments: [signed, comment({ id: "c2", author: "sam", body: "Any update?", createdAt: "2026-10-14T17:00:00Z" })] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const wake = t.sends.filter((s) => s.threadId === b.threadId).at(-1)!.text;
+    expect(wake).toContain("a new outbound integration or dependency");
+    expect(wake).toContain("Substantial: yes — a new outbound integration");
+  });
+
   it("leaves a ticket binding's spec substantial inert: the project steward still approves (BB-207)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
@@ -5637,6 +5677,25 @@ describe("needs you items", () => {
     await t.ring("linear", "uuid-12");
     const update = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
     expect(update.error, update.text).toBe(false);
+    expect(t.githubComments.some((c) => c.body.startsWith("<!-- bb-approval"))).toBe(true);
+  });
+
+  it("makes a ticket's pull request the owner's when the marker judges it substantial and the ticket has no approved spec (BB-207)", async () => {
+    const substantial = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review substantial=yes -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    const t = await withPull([substantial]);
+    const b = t.binding();
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    // The ticket passed the gate without a spec approval and the reviewer
+    // judged the diff substantial, so the owner decides it: a project-steward
+    // approval is refused.
+    const refused = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(refused.error, refused.text).toBe(true);
+    expect(refused.text).toMatch(/substantial and references no ticket with an approved spec/u);
+    // The ticket's own approved spec is the ack, so the project steward may approve.
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, approval: { at: 1, specHash: "h", by: "user" } } });
+    const ok = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(ok.error, ok.text).toBe(false);
     expect(t.githubComments.some((c) => c.body.startsWith("<!-- bb-approval"))).toBe(true);
   });
 

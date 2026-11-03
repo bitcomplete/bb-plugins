@@ -727,6 +727,15 @@ gets a review steward.
   a project that wants branch protection to mean a person looked removes
   `approve` from the review playbook's `may` list and has the steward
   escalate instead.
+- **A substantial pull request needs a product ack (BB-207).** The reviewer
+  judges the diff against the review playbook's `substantial` criteria, never
+  the pull request body, and checks for a ticket the pull request references
+  with an approved spec. A substantial pull request with no approved spec is
+  the owner's, with reason `product`: the review opens with a **Product**
+  section and the owner's unsigned approval of it is the gate, a
+  project-steward `bb-approval` notwithstanding. A referenced ticket with an
+  approved spec is the ack, and a pull request judged not substantial is
+  unchanged.
 - **Authors to skip**, such as dependency bots, are a playbook field.
 - **Cost.** Review stewards default to a small model. The work is in the
   workers, one per round.

@@ -811,6 +811,9 @@ Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
 `source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
 stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
 `substantial`, `approval: project` (default), `user` or `{ linear-state: … }`),
+`substantial` (reviews only, BB-207: the criteria a reviewer judges the diff
+against; a substantial pull request with no approved spec on a referenced
+ticket is the owner's, with reason `product`),
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker`,
 `reviewer` as `provider/model/level`; `claude` means `claude-code`; the model may hold
 slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last

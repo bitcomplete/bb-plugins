@@ -1031,6 +1031,14 @@ export const frontMatterSchema = z
     phases: z.record(z.string().trim().min(1).max(100), phaseSchema.nullable().transform((p) => p ?? {})).optional(),
     terminal: z.array(z.string().trim().min(1).max(100)).default([]),
     ready: readySchema.optional(),
+    /**
+     * Reviews (BB-207): the criteria that make a pull request substantial, the
+     * way `ready.substantial` lists them for a ticket. The reviewer judges the
+     * diff against them and reports the verdict on the binding; a substantial
+     * pull request with no approved spec on a referenced ticket is the owner's.
+     * A review playbook with no list behaves exactly as before.
+     */
+    substantial: z.array(z.string().trim().min(1).max(300)).max(30).default([]),
     promote: z.string().trim().max(1000).optional(),
     /** What the steward may do on the entity. Policy the wake states, not a wall. */
     may: z.array(z.string().trim().min(1).max(60)).default([]),
@@ -1064,6 +1072,8 @@ export type Playbook = {
   phases: Record<string, { stage?: Stage; stuck?: number }>;
   terminal: string[];
   ready: ReadyConfig | null;
+  /** The review playbook's substantial criteria (BB-207); empty on every other kind. */
+  substantial: string[];
   promote: string | null;
   may: string[];
   models: { steward: ModelSpec | null; worker: ModelSpec | null; reviewer: ModelSpec | null };
@@ -1147,6 +1157,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       phases,
       terminal: fm.terminal,
       ready,
+      substantial: fm.substantial,
       promote: fm.promote ?? null,
       may: fm.may,
       models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null, reviewer: fm.models.reviewer ?? null },

@@ -4718,7 +4718,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A reviewer's owner call makes the approval the owner's, whatever
             // the decide list matched, so the wake says so and the project
             // steward forwards rather than approves (BB-192).
-            escalated: prGate(pull, { projectApprovals: projectApprovalsFor(r.from), ...productGateOptions(r.from) }).escalated,
+            escalated: prGate(pull, { projectApprovals: projectApprovalsFor(r.from), ...productGateOptions(r.from, pull) }).escalated,
           };
         }),
       );
@@ -6467,7 +6467,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The verdict is `prGate` with the project's approvals, exactly as the
       // page's Merge item and the wake compute it; the decide-list entry above
       // is what the plugin asks the owner or project steward for (BB-133).
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
       return {
         ref: `${ref.repo}#${ref.number}`,
         binding: b.entityKey,
@@ -6598,7 +6598,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The same `prGate` with the project's approvals the page's Merge item
       // and the wake use, so the page, `bb stewards gate` and `bb stewards
       // merge` cannot disagree.
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
       if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
       const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
       if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
@@ -7511,12 +7511,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   note: z.string().trim().max(300).optional(),
                 }),
               )
-              .max(30),
+              .max(30)
+              .optional(),
             substantial: z.boolean().optional(),
             why: z.string().trim().max(600).optional(),
           })
           .optional()
-          .describe("The ready gate as you judge it now: every checklist item from the wake, by its number, met or not, and whether the ticket is substantial."),
+          .describe("The ready gate as you judge it now: every checklist item from the wake, by its number, met or not, and whether the ticket is substantial. On a review binding there is no checklist; report `substantial` and `why` alone, the reviewer's judgment of the diff."),
         voidApproval: z.boolean().optional().describe("The spec changed materially since approval: void it and ask again."),
         touches: z
           .array(z.string().trim().min(1).max(200))
@@ -7675,7 +7676,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const items = playbook?.ready?.checklist ?? null;
             const checklist = new Map<string, ReadyState["checklist"][number]>();
             const unknown: string[] = [];
-            for (const c of input.ready.checklist) {
+            for (const c of input.ready.checklist ?? []) {
               const item = items === null ? String(c.item) : resolveChecklistItem(items, c.item);
               if (item === null) unknown.push(JSON.stringify(c.item));
               else checklist.set(item, { item, met: c.met, note: c.note ?? null });
@@ -7686,7 +7687,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
             ready = {
               ...ready,
-              checklist: [...checklist.values()],
+              ...(input.ready.checklist === undefined ? {} : { checklist: [...checklist.values()] }),
               substantial: input.ready.substantial ?? ready.substantial,
               why: input.ready.why ?? ready.why,
             };
@@ -7813,7 +7814,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
               const decision = pull === undefined ? "user" : decideForPull(await pullChangedFiles(pull), config?.file.bigDecisions ?? []);
-              const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
+              const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
                 refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
@@ -8225,7 +8226,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // steward does not decide it, whatever entry the decide list
               // matched, and never posts a `bb-approval` on it (BB-192). The
               // product reason (BB-207) binds it the same way.
-              const approvalGate = pull === null ? null : prGate(pull, { projectApprovals: projectApprovalsFor(target), ...productGateOptions(target) });
+              const approvalGate = pull === null ? null : prGate(pull, { projectApprovals: projectApprovalsFor(target), ...productGateOptions(target, pull) });
               if (approvalGate !== null && approvalGate.escalated) {
                 return toolError(new Error(approvalGate.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL));
               }
@@ -8558,7 +8559,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (n.kind === "approve-pr" || n.kind === "merge") {
         const observed = b.lastSnapshot;
         const target = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === n.url || e.key === n.url) ?? null;
-        const gate = target === null ? null : prGate(target, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b) });
+        const gate = target === null ? null : prGate(target, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, target) });
         if (n.kind === "approve-pr") {
           actionable = gate?.needsOwnerApproval ?? false;
           why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
