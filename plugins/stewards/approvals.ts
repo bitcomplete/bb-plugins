@@ -8,9 +8,9 @@
 // The functions take an `ApprovalsContext` rather than the server's whole
 // closure, so nothing here reads the plugin's config or snapshots on its own.
 import { type BigDecision, explainDecision, formatDecisionListing } from "./decisions.js";
-import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, reviewWorkerThread, type PrGate } from "./gate.js";
+import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
-import { workerInFlight, type MechanicalEvent } from "./reconcile.js";
+import { productGateOptions, productReason, workerInFlight, type MechanicalEvent } from "./reconcile.js";
 import { signatureLine, type EntitySnapshot, type Source } from "./source-contract.js";
 import type { Binding, Need, Observed, Store } from "./store.js";
 
@@ -92,7 +92,8 @@ export async function deliverProjectApproval(ctx: ApprovalsContext, b: Binding, 
  * decide list matched (BB-192).
  */
 export async function recordProjectDecision(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, threadId: string, fields: { headSha: string; entry: string | null; verdict: "approved" | "declined"; reasoning: string }): Promise<{ commentId: string }> {
-  if (prGate(pull).escalated) throw new Error(ESCALATED_APPROVAL_REFUSAL);
+  const g = prGate(pull, productGateOptions(b));
+  if (g.escalated) throw new Error(g.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL);
   const commentId = await postApprovalMarker(ctx, pull, threadId, fields);
   ctx.store.recordProjectApproval({ bindingId: b.id, headSha: fields.headSha, entry: fields.entry, byThread: threadId, commentId, verdict: fields.verdict });
   return { commentId };
@@ -114,11 +115,14 @@ export function isForeignPull(pull: EntitySnapshot): boolean {
  * teammate's pull request the owner can approve with a real GitHub review, so
  * the item says that rather than the agent-PR comment convention (BB-118).
  */
-export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null, listing: string | null = null): void {
+export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null, listing: string | null = null, reason: "product" | null = null): void {
   const foreign = isForeignPull(pull);
-  const how = foreign
+  const base = foreign
     ? `Submit an APPROVED review as you from the Stewards page; that is what counts as your approval.`
     : `Post the unsigned comment "Approved ${ctx.shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`;
+  // The product reason (BB-207) points the owner at the Product section of the
+  // review, which is what the approval acks.
+  const how = reason === "product" ? `${base}\n\nThis pull request is substantial and references no ticket with an approved spec: read the **Product** section of the review before you approve.` : base;
   // A later refresh (checks went red) may not have the files at hand; keep
   // the listing an earlier wake stored for the same head rather than
   // dropping it or showing the previous head's listing (BB-135).
@@ -146,7 +150,10 @@ export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Bindi
   const pull = b.lastSnapshot === null ? undefined : ctx.observedPulls(b, b.lastSnapshot).find((p) => (p.url ?? p.key) === forwarding.url);
   const key = forwarding.question.replace(/^Approve\s+/u, "");
   const listing = pull === undefined ? null : formatDecisionListing(explainDecision(await ctx.pullChangedFiles(pull), await ctx.loadDecisions(b.projectId)));
-  const how = `Post the unsigned comment "Approved ${ctx.shortSha(forwarding.headSha)} from the Stewards page" as you; that is what counts as your approval.`;
+  const base = `Post the unsigned comment "Approved ${ctx.shortSha(forwarding.headSha)} from the Stewards page" as you; that is what counts as your approval.`;
+  // The same product text the plugin-filed item carries (BB-207).
+  const product = productGateOptions(b);
+  const how = productReason(product.substantial, product.ticketApprovedSpec) === "product" ? `${base}\n\nThis pull request is substantial and references no ticket with an approved spec: read the **Product** section of the review before you approve.` : base;
   ctx.store.fileNeed({
     bindingId: b.id,
     kind: "approve-pr",
@@ -191,7 +198,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
   // the change touches is the project steward's, and everything else is
   // the user's, filed on the page at once (BB-51). The files are read only
   // when the lane actually waits on an approval.
-  const preliminary = prGate(pull, { projectApprovals: ctx.store.projectApprovals(b.id) });
+  const preliminary = prGate(pull, { projectApprovals: ctx.store.projectApprovals(b.id), ...productGateOptions(b) });
   let g = preliminary;
   // The decide-list listing is fetched once, with the changed files, and
   // passed to whichever surface asks for the approval (BB-135).
@@ -200,7 +207,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
     const files = await ctx.pullChangedFiles(pull);
     const explanation = explainDecision(files, decisions);
     listing = formatDecisionListing(explanation);
-    g = prGate(pull, { decision: explanation.mark, projectApprovals: ctx.store.projectApprovals(b.id) });
+    g = prGate(pull, { decision: explanation.mark, projectApprovals: ctx.store.projectApprovals(b.id), ...productGateOptions(b) });
   }
   const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
   const approvalEsc = ctx.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
@@ -223,11 +230,11 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       if (approvalEsc !== null) ctx.store.resolve(approvalEsc.id, "Declined on the Stewards page.");
     } else if (approvalEsc === null) {
       const x = ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "user", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
-      fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing);
+      fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing, g.reason);
     } else {
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
       if (approvalEsc.route !== "user") ctx.store.reroute(approvalEsc.id, "user", approvalEsc.recommendation);
-      fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing);
+      fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
     }
   } else if (g.needsProjectApproval) {
     // The project steward's lane: one escalation, no page item.
@@ -251,7 +258,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       // Checks went pending or failing: never resolve the request as
       // approved. Keep it and the page item open, re-pointed at the head.
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing);
+      if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
       ctx.store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
     } else if (g.ownerApproved || g.projectApproved) {
       // The resolution names what approved, so a closed item can always
@@ -292,7 +299,7 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
   const ref = parsePullRef(need.url);
   if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
   const pull = await freshPull(ctx, b, need.url);
-  const gate = pull === null ? null : prGate(pull);
+  const gate = pull === null ? null : prGate(pull, productGateOptions(b));
   if (pull === null || gate === null || !gate.needsOwnerApproval) return { ok: false, message: `Not now: ${gate?.missing ?? "the pull request has not been observed yet"}.` };
   const foreign = isForeignPull(pull);
   const after = (closure: string): void => {

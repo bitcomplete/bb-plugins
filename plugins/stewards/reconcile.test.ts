@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, ownerApproval, prGate, projectApprovalMarker, reviewWorkerThread, type ProjectApprovalRecord } from "./gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
@@ -533,6 +533,51 @@ describe("the pull request gate (build-tickets)", () => {
     // The parser reads the attribute, and leaves it undefined when absent.
     expect(reviewMarker("<!-- bb-review round=1 sha=abc verdict=approved lane=owner-reviewed approver=owner -->")?.approver).toBe("owner");
     expect(reviewMarker("<!-- bb-review round=1 sha=abc verdict=approved lane=owner-reviewed -->")?.approver).toBeUndefined();
+  });
+
+  it("makes a substantial pull request with no approved spec the owner's, with reason product (BB-207)", () => {
+    const ap = approval(head, "A cross-repo contract");
+    // The product reason raises even a `no-review` marker to the owner lane,
+    // and a recorded project-steward approval does not meet it.
+    const product = pull({ comments: [marker(head, "approved", "no-review"), ap] }, green);
+    expect(prGate(product, { substantial: true, decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({
+      reason: "product",
+      escalated: true,
+      decision: "user",
+      projectApproved: false,
+      needsOwnerApproval: true,
+      needsProjectApproval: false,
+      gateMet: false,
+      missing: "owner approval needed (product)",
+    });
+    // The owner's unsigned approval meets it.
+    const ownerApproved = pull({ comments: [marker(head, "approved", "no-review"), owner("LGTM")] }, green);
+    expect(prGate(ownerApproved, { substantial: true, decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ reason: "product", escalated: true, gateMet: true });
+    // A referenced ticket with an approved spec is the ack, so no product
+    // reason and the lane is exactly as the reviewer left it.
+    expect(prGate(product, { substantial: true, ticketApprovedSpec: true, decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ reason: null, escalated: false, decision: "project", gateMet: true });
+    // Substantial false and unjudged (omitted or null) leave every lane as
+    // today: a `no-review` marker is met with no owner ask, and an
+    // owner-reviewed one waits on the owner with the old wording.
+    for (const substantial of [false, null, undefined] as const) {
+      expect(prGate(pull({ comments: [marker(head, "approved", "no-review")] }, green), { substantial })).toMatchObject({ reason: null, escalated: false, lane: "no-review", gateMet: true, needsOwnerApproval: false });
+      expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green), { substantial })).toMatchObject({ reason: null, escalated: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    }
+    // The pure rule the gate reads.
+    expect(productReason(true, false)).toBe("product");
+    expect(productReason(true, true)).toBeNull();
+    expect(productReason(false, false)).toBeNull();
+    expect(productReason(null, false)).toBeNull();
+  });
+
+  it("reads the product inputs from a binding: only a review binding's substantial is the diff judgment (BB-207)", () => {
+    const binding = (kind: "ticket" | "review", ready: Record<string, unknown> = {}) => ({ kind, ready: readyStateSchema.parse(ready) });
+    expect(productGateOptions(binding("review", { substantial: true }))).toEqual({ substantial: true, ticketApprovedSpec: false });
+    // A ticket binding's `substantial` is the spec gate's judgment, not the
+    // reviewer's diff judgment, so this PR leaves it inert whatever it says.
+    // PR 2 adds the ticket PR's diff report; the approved spec is its ack.
+    expect(productGateOptions(binding("ticket", { substantial: true }))).toEqual({ substantial: null, ticketApprovedSpec: false });
+    expect(productGateOptions(binding("ticket", { substantial: true, approval: { at: 1, specHash: "h", by: "user" } }))).toEqual({ substantial: null, ticketApprovedSpec: false });
   });
 
   it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {
