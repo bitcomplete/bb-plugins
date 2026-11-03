@@ -378,9 +378,15 @@ export const hostContract = defineRpcContract({
    * Where a new project's `.bb` checkout would go by default on this machine,
    * and whether something is already there. The panel shows it as an editable
    * suggestion; it decides nothing.
+   *
+   * `existingPaths` are the project checkouts already on this machine, which
+   * decide the parent directory: `~/bb` unless every one of them lives under
+   * one other parent, which is then used.
    */
   suggestProjectSourcePath: {
-    input: z.object({ name: z.string().min(1).max(300) }).strict(),
+    input: z
+      .object({ name: z.string().min(1).max(300), existingPaths: z.array(absolutePath).max(500) })
+      .strict(),
     output: z.object({ path: absolutePath, exists: z.boolean() }).strict(),
   },
 
@@ -937,12 +943,14 @@ export const rpcContract = defineRpcContract({
   },
 
   /**
-   * Create a project whose source is a git remote, in one step.
+   * Create a project whose source is a git remote or a local checkout.
    *
-   * Either initializes a fresh checkout seeded with `repos`, or clones an
-   * existing `.bb` repo. The git work runs first so a failure there leaves no
-   * dangling project; a failure after it leaves an initialized directory,
-   * which the next attempt adopts rather than re-creates.
+   * Either initializes a fresh checkout seeded with `repos`, clones a remote,
+   * or adopts a local checkout in place. Nothing is committed, pushed or
+   * opened: the Repos panel seeds `.bb/` and publishes it by the project's
+   * policy when a repo is added. The git work runs first so a failure there
+   * leaves no dangling project; a failure after it leaves an initialized
+   * directory, which the next attempt adopts rather than re-creates.
    */
   createProject: {
     input: z
@@ -952,35 +960,13 @@ export const rpcContract = defineRpcContract({
         path: absolutePath,
         source: z.discriminatedUnion("kind", [
           z.object({ kind: z.literal("fresh"), repos: z.array(repoSeedSchema).max(64) }).strict(),
+          /** A remote: clone it into `path` and point the project at it. */
           z.object({ kind: z.literal("clone"), url: z.string().min(1).max(2000) }).strict(),
-          z
-            .object({
-              kind: z.literal("primary"),
-              url: z.string().min(1).max(2000),
-              /** The other repos to seed `.bb/repos.json` with. */
-              repos: z.array(repoSeedSchema).max(64),
-              /** Publish a seed branch and open a pull request. */
-              openPullRequest: z.boolean().optional(),
-            })
-            .strict(),
+          /** A local checkout: point the project at it; nothing is cloned. */
+          z.object({ kind: z.literal("checkout"), url: z.string().min(1).max(2000) }).strict(),
           /**
-           * A repo with no `.bb/` definition: clone it and make it the whole
-           * project. Seeding `.bb/` is local by default; the checkbox asks for
-           * a seed pull request too.
-           */
-          z
-            .object({
-              kind: z.literal("plain"),
-              url: z.string().min(1).max(2000),
-              repos: z.array(repoSeedSchema).max(64),
-              openPullRequest: z.boolean().optional(),
-            })
-            .strict(),
-          /**
-           * Let the host decide on submit: it probes the remote and lands in
-           * the standalone, primary, plain or local-checkout path. This is
-           * what Create uses when the form's own probe has not finished, so
-           * Create is never blocked on it.
+           * Legacy host-side probe, for a caller that has not probed itself.
+           * The New project form probes first and never sends this.
            */
           z
             .object({
@@ -1001,8 +987,6 @@ export const rpcContract = defineRpcContract({
         warnings: z.array(z.string().max(600)).max(20),
         /** The layout the source ended up with, when the project was created. */
         layout: projectLayoutSchema.nullable(),
-        /** The seed/adopt pull request, when one was opened. */
-        prUrl: z.string().max(600).nullable(),
       })
       .strict(),
   },

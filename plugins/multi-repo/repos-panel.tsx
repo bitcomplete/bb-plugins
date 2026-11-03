@@ -541,25 +541,24 @@ export function ReposPanel({ subPath = "" }: { subPath?: string }) {
   return (
     <div className="h-full overflow-auto p-4 md:p-5">
       <div className="mx-auto w-full max-w-3xl space-y-4">
-        <div className="flex items-center gap-2">
-          <label htmlFor="multi-repo-project" className="text-muted-foreground text-sm">
-            Project
-          </label>
-          <select
-            id="multi-repo-project"
-            className="bg-background min-w-0 flex-1 rounded-md border px-2 py-1 text-sm"
-            value={projectId ?? ""}
-            disabled={creating}
-            onChange={(event) => choose(event.target.value)}
-          >
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.name}
-                {project.hasSource ? "" : " (no checkout)"}
-              </option>
-            ))}
-          </select>
-          {!creating && (
+        {!creating && (
+          <div className="flex items-center gap-2">
+            <label htmlFor="multi-repo-project" className="text-muted-foreground text-sm">
+              Project
+            </label>
+            <select
+              id="multi-repo-project"
+              className="bg-background min-w-0 flex-1 rounded-md border px-2 py-1 text-sm"
+              value={projectId ?? ""}
+              onChange={(event) => choose(event.target.value)}
+            >
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                  {project.hasSource ? "" : " (no checkout)"}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               className="hover:bg-muted shrink-0 rounded-md border px-2.5 py-1 text-xs"
@@ -570,8 +569,8 @@ export function ReposPanel({ subPath = "" }: { subPath?: string }) {
             >
               New project
             </button>
-          )}
-        </div>
+          </div>
+        )}
 
         {creating && form}
 
