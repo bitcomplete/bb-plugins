@@ -342,65 +342,67 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
             ) : null
           }
           panel={
-            <>
-              {claude !== null ? (
-                <form
-                  className="flex flex-col gap-2 rounded-lg border border-border p-3"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (pasted.trim() === "") return;
-                    void run("claude-complete", async () => {
-                      await rpc.call("claudeComplete", { sessionId: claude.sessionId, pasted: pasted.trim() });
-                      setClaude(null);
-                      setPasted("");
-                      refetch();
-                    });
-                  }}
-                >
-                  <p className="text-foreground">Sign in at claude.ai, then paste the code from its final page here.</p>
-                  <div className="flex items-center gap-2">
-                    <Button type="button" size="sm" variant="outline" onClick={() => open(claude.url)}>
-                      Open claude.ai again
-                    </Button>
-                    <input
-                      className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
-                      aria-label="Claude authorization code"
-                      placeholder="Paste code#state here"
-                      value={pasted}
-                      onChange={(e) => setPasted(e.target.value)}
-                    />
-                    <Button size="sm" type="submit" disabled={busy !== null || pasted.trim() === ""}>
-                      Finish
-                    </Button>
-                    <Button type="button" size="sm" variant="ghost" onClick={() => setClaude(null)}>
-                      Cancel
-                    </Button>
+            claude !== null || codex !== null ? (
+              <>
+                {claude !== null ? (
+                  <form
+                    className="flex flex-col gap-2 rounded-lg border border-border p-3"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (pasted.trim() === "") return;
+                      void run("claude-complete", async () => {
+                        await rpc.call("claudeComplete", { sessionId: claude.sessionId, pasted: pasted.trim() });
+                        setClaude(null);
+                        setPasted("");
+                        refetch();
+                      });
+                    }}
+                  >
+                    <p className="text-foreground">Sign in at claude.ai, then paste the code from its final page here.</p>
+                    <div className="flex items-center gap-2">
+                      <Button type="button" size="sm" variant="outline" onClick={() => open(claude.url)}>
+                        Open claude.ai again
+                      </Button>
+                      <input
+                        className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
+                        aria-label="Claude authorization code"
+                        placeholder="Paste code#state here"
+                        value={pasted}
+                        onChange={(e) => setPasted(e.target.value)}
+                      />
+                      <Button size="sm" type="submit" disabled={busy !== null || pasted.trim() === ""}>
+                        Finish
+                      </Button>
+                      <Button type="button" size="sm" variant="ghost" onClick={() => setClaude(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </form>
+                ) : null}
+                {codex !== null ? (
+                  <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+                    <p className="text-foreground">Open the verification page, sign in to ChatGPT, and enter this code.</p>
+                    <CodeBlock code={codex.code} />
+                    <div className="flex items-center gap-2">
+                      <Button size="sm" onClick={() => open(codex.url)}>
+                        Open verification page
+                      </Button>
+                      <span>Waiting for you to approve…</span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => void run("codex-cancel", async () => {
+                          await rpc.call("codexCancel", { sessionId: codex.sessionId });
+                          setCodex(null);
+                        })}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
                   </div>
-                </form>
-              ) : null}
-              {codex !== null ? (
-                <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
-                  <p className="text-foreground">Open the verification page, sign in to ChatGPT, and enter this code.</p>
-                  <CodeBlock code={codex.code} />
-                  <div className="flex items-center gap-2">
-                    <Button size="sm" onClick={() => open(codex.url)}>
-                      Open verification page
-                    </Button>
-                    <span>Waiting for you to approve…</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => void run("codex-cancel", async () => {
-                        await rpc.call("codexCancel", { sessionId: codex.sessionId });
-                        setCodex(null);
-                      })}
-                    >
-                      Cancel
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
-            </>
+                ) : null}
+              </>
+            ) : null
           }
         >
           {!ai.available ? (
