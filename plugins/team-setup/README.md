@@ -7,6 +7,10 @@ steps remain, a warning icon, what is left and a link to the settings page;
 once none do, what is set up. Each row says what the step is for and what
 happens once it is done.
 
+bb's own **Setup guide** row in Settings → Threads & editing (its **Show
+setup guide** button) is bb core's first-run wizard; it needs a primary host
+and is not useful behind bb-gate.
+
 | Step | Owned by | Done when | What the button does |
 |---|---|---|---|
 | Claude or Codex | Account Pool | An enabled account exists and routing for its provider is on | Starts Account Pool's sign-in: claude.ai with a code to paste back, or ChatGPT's device code, polled from here. |
