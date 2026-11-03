@@ -317,6 +317,12 @@ export interface BootstrapResult {
  * cloned `.bb` repo takes none of this path, and nothing here overwrites a
  * file that already exists — a directory holding an `AGENTS.md` and no repo
  * keeps its `AGENTS.md`.
+ *
+ * A git repo with no definition is **not** seeded here: this runs on the
+ * thread-start read path, and committing `.bb/` onto whatever branch the
+ * checkout has is not a read's job. The explicit write paths (the Repos
+ * panel's add and the raw editor) seed it through
+ * {@link preparePrimaryProjectSource} instead.
  */
 export async function bootstrapProjectSource(
   dir: string,
@@ -421,15 +427,40 @@ export async function cloneProjectSource(
 }
 
 /**
- * Where a new project's `.bb` checkout goes unless someone says otherwise:
- * `~/bb/<slug>`. Under the home directory because that is the one place on a
- * machine that is reliably writable and survives a plugin uninstall, and
- * under one `bb` folder so several projects' definitions sit together — and
- * beside any checkouts the user keeps there, which the mirror discovery scans
- * as siblings of the project source.
+ * The parent a new project's `.bb` checkout should sit under.
+ *
+ * `~/bb` unless every existing project checkout on the machine lives under one
+ * other parent directory, which is then used. Mixed parents, or no projects,
+ * mean `~/bb`; a set that is already all under `~/bb` also means `~/bb`.
  */
-export async function defaultProjectSourcePath(name: string): Promise<{ path: string; exists: boolean }> {
-  const target = path.join(homedir(), "bb", slugify(name));
+export function existingProjectSourceParent(existingPaths: readonly string[], fallback: string): string {
+  const parents = new Set(
+    existingPaths
+      .map((target) => target.replace(/[\\/]+$/u, ""))
+      .filter((target) => target.length > 0)
+      .map((target) => path.dirname(target)),
+  );
+  if (parents.size !== 1) return fallback;
+  return [...parents][0];
+}
+
+/**
+ * Where a new project's `.bb` checkout goes unless someone says otherwise.
+ *
+ * Under the home directory because that is the one place on a machine that is
+ * reliably writable and survives a plugin uninstall, and under one `bb`
+ * folder so several projects' definitions sit together — and beside any
+ * checkouts the user keeps there, which the mirror discovery scans as siblings
+ * of the project source. When every existing project on the machine lives
+ * under one other parent, that parent is used instead, so a machine that keeps
+ * its projects elsewhere gets the next one there too.
+ */
+export async function defaultProjectSourcePath(
+  name: string,
+  existingPaths: readonly string[] = [],
+): Promise<{ path: string; exists: boolean }> {
+  const parent = existingProjectSourceParent(existingPaths, path.join(homedir(), "bb"));
+  const target = path.join(parent, slugify(name));
   return { path: target, exists: await exists(target) };
 }
 

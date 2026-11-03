@@ -127,7 +127,7 @@ export function createMultiRepoHostEntry() {
       },
 
       async suggestProjectSourcePath(input) {
-        return defaultProjectSourcePath(input.name);
+        return defaultProjectSourcePath(input.name, input.existingPaths);
       },
 
       async probeRemote(input, context) {
