@@ -98,6 +98,53 @@ the page when the server is back. A bb that is not behind bb-gate gets a
 on bb's own host, so the request carries the tailnet assertion the gateway
 adds, and the plugin's server side knows nothing about it.
 
+## Data profiles
+
+A bb-gate server's one data volume can hold several data sets, switchable
+from the "Advanced" disclosure at the foot of this plugin's settings page.
+It is for testing or filming onboarding: create a `demo` profile, switch to
+it for an empty server, and switch back to `default` for the real one. Most
+people never need it.
+
+The bb-gate entrypoint owns the layout. The volume root is the `default`
+profile and every other profile is a directory under `profiles/<name>/`; a
+one-line `active-profile` file at the root names the active one. The
+entrypoint exports `BB_GATE_PROFILES_DIR` and `BB_GATE_ACTIVE_PROFILE_FILE`
+into this plugin's server process. The plugin registers four RPCs only when
+both are set:
+
+| RPC | What it does |
+|---|---|
+| `profiles.list` | `{ active, profiles: [{ name, booted, bytes }] }`; `booted` is "has a `bb.db`", sizes are computed on request and `profiles/` is left out of `default`'s. |
+| `profiles.create { name }` | Validates the name, refuses an existing one, creates the empty directory. |
+| `profiles.delete { name }` | Refuses `default`, the active profile and the profile the server is actually running; removes the directory, never following a symlink. |
+| `profiles.activate { name }` | Refuses an unknown name, writes `active-profile`, returns `{ booted }`. |
+
+A profile name is a lowercase DNS label of 1 to 32 characters, checked before
+it becomes a path, and the resolved path is refused if it escapes
+`profiles/`. The server records the profile it booted on; `list` reports that
+as active and `delete` refuses it as well as `active-profile`, so a switch
+whose restart failed cannot leave the live data dir deletable. `switchProfile`
+also puts `active-profile` back when the restart is refused or unreachable,
+so a later unrelated restart does not land the developer on the new data set.
+
+Switching calls `profiles.activate` and then `POST`s the router's
+`/_bb-gate/restart`, with `?first_visit=1` for a profile that has never
+booted so the first browser visit lands on Team setup, then follows the
+restart through `/_bb-gate/update` exactly as the Server update section does.
+The router rolls only the caller's own Deployment.
+
+What does not follow a profile: machines are enrolled per profile, so a
+devbox stays attached to the profile that made it and gets 401 from any
+other until switched back; Linear, Slack, hooks leases and every steward
+thread live in the profile's database, so a fresh profile has no subscribers
+until it connects. Disk is one shared 20Gi volume with no cap on the number
+of profiles.
+
+A server not behind bb-gate, or on an image older than this layout, has no
+`BB_GATE_PROFILES_DIR`, so the RPCs are absent and the Advanced section
+renders nothing.
+
 ## Development
 
 ```sh

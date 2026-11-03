@@ -12,6 +12,9 @@
 // per open thread and the home page section all read it.
 
 export const UPDATE_PATH = "/_bb-gate/update";
+// The data-profile switch rolls the server through the router's restart
+// endpoint, which acts on the caller's own Deployment.
+export const RESTART_PATH = "/_bb-gate/restart";
 export const POLL_MS = 60_000;
 export const RESTART_POLL_MS = 500;
 // A restart the Deployment has not reported within this long is not one the
@@ -59,6 +62,38 @@ function parseStatus(v: unknown): GateStatus | null {
   return { pending, ready };
 }
 
+// gateStatus asks the router for the caller's own server. A 404 or a
+// non-JSON body means this bb is not behind bb-gate (or is on an older
+// router), so the caller hides its gate-driven UI.
+export const gateStatus = async (fetchFn: UpdateStoreDeps["fetch"], path = UPDATE_PATH): Promise<GateStatus | "unavailable"> => {
+  const r = await fetchFn(path, { headers: { Accept: "application/json" } });
+  if (r.status === 404) return "unavailable";
+  if (!r.ok) throw new Error(`bb-gate answered ${r.status}`);
+  const s = parseStatus(await r.json().catch(() => null));
+  if (s === null) return "unavailable";
+  return s;
+};
+
+// followRestart polls until the Deployment reports the old pod gone, then
+// reloads onto the router's starting page, which reloads itself until the
+// new pod answers. It is shared by the update apply and the profile switch.
+export async function followRestart(
+  deps: UpdateStoreDeps,
+  get: () => Promise<GateStatus | "unavailable">,
+): Promise<void> {
+  const started = deps.now();
+  while (deps.now() - started < RESTART_TIMEOUT_MS) {
+    await new Promise<void>((resolve) => deps.setTimeout(resolve, RESTART_POLL_MS));
+    try {
+      const s = await get();
+      if (s === "unavailable" || !s.ready) break;
+    } catch {
+      // The router itself is briefly away, or the gateway is; keep waiting.
+    }
+  }
+  deps.reload();
+}
+
 export function createUpdateStore(deps: UpdateStoreDeps): UpdateStore {
   let state: UpdateState = { status: "unknown" };
   const listeners = new Set<() => void>();
@@ -70,14 +105,7 @@ export function createUpdateStore(deps: UpdateStoreDeps): UpdateStore {
     for (const l of listeners) l();
   };
 
-  const get = async (): Promise<GateStatus | "unavailable"> => {
-    const r = await deps.fetch(UPDATE_PATH, { headers: { Accept: "application/json" } });
-    if (r.status === 404) return "unavailable";
-    if (!r.ok) throw new Error(`bb-gate answered ${r.status}`);
-    const s = parseStatus(await r.json().catch(() => null));
-    if (s === null) return "unavailable";
-    return s;
-  };
+  const get = (): Promise<GateStatus | "unavailable"> => gateStatus(deps.fetch);
 
   const refresh = async () => {
     if (state.status === "restarting") return;
@@ -118,17 +146,7 @@ export function createUpdateStore(deps: UpdateStoreDeps): UpdateStore {
   // from landing on the old pod in its last moments and loading the full
   // app only to lose it again.
   const follow = async () => {
-    const started = deps.now();
-    while (deps.now() - started < RESTART_TIMEOUT_MS) {
-      await new Promise<void>((resolve) => deps.setTimeout(resolve, RESTART_POLL_MS));
-      try {
-        const s = await get();
-        if (s === "unavailable" || !s.ready) break;
-      } catch {
-        // The router itself is briefly away, or the gateway is; keep waiting.
-      }
-    }
-    deps.reload();
+    await followRestart(deps, get);
   };
 
   const apply = async () => {

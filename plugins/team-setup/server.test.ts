@@ -1,4 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { GhProcess, GhResult, GhRunner } from "./gh.js";
 import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, SEEDED_NOTE, SLACK_ID } from "./server.js";
@@ -520,3 +523,108 @@ describe("machine environment seeding", () => {
 });
 
 
+
+describe("data profiles", () => {
+  async function layout() {
+    const root = await mkdtemp(join(tmpdir(), "team-setup-profiles-"));
+    const profilesDir = join(root, "profiles");
+    await mkdir(profilesDir, { recursive: true });
+    return { root, profilesDir, activeProfileFile: join(root, "active-profile") };
+  }
+  const envFor = (l: Awaited<ReturnType<typeof layout>>) => ({
+    BB_GATE_PROFILES_DIR: l.profilesDir,
+    BB_GATE_ACTIVE_PROFILE_FILE: l.activeProfileFile,
+  });
+
+  it("registers the profiles RPCs only when both env vars are set", async () => {
+    const off = await setup();
+    expect(off.harness.registrations.rpcMethods).not.toContain("profiles.list");
+    await expect(off.harness.callRpc("profiles.list", null)).rejects.toThrow(/no rpc method/u);
+
+    const l = await layout();
+    const on = await setup({ env: envFor(l) });
+    expect(on.harness.registrations.rpcMethods).toEqual(
+      expect.arrayContaining(["profiles.list", "profiles.create", "profiles.delete", "profiles.activate"]),
+    );
+  });
+
+  it("lists default and every profile with booted and size", async () => {
+    const l = await layout();
+    await mkdir(join(l.profilesDir, "demo"));
+    await writeFile(join(l.profilesDir, "demo", "bb.db"), "x");
+    await writeFile(join(l.profilesDir, "demo", "big"), "x".repeat(4096));
+    const { harness } = await setup({ env: envFor(l) });
+    const list = (await harness.callRpc("profiles.list", null)) as {
+      active: string;
+      profiles: Array<{ name: string; booted: boolean; bytes: number }>;
+    };
+    expect(list.active).toBe("default");
+    expect(list.profiles.map((p) => p.name)).toEqual(["default", "demo"]);
+    const demo = list.profiles.find((p) => p.name === "demo");
+    const def = list.profiles.find((p) => p.name === "default");
+    expect(demo?.booted).toBe(true);
+    expect(demo?.bytes).toBeGreaterThanOrEqual(4096);
+    // profiles/ is left out of default's size, so the other profile's bytes
+    // do not count towards it.
+    expect(def?.bytes).toBeLessThan(demo?.bytes ?? 0);
+  });
+
+  it("creates a profile and refuses a bad or existing name", async () => {
+    const l = await layout();
+    const { harness } = await setup({ env: envFor(l) });
+    expect(await harness.callRpc("profiles.create", { name: "demo" })).toEqual({ name: "demo", booted: false, bytes: 0 });
+    await expect(harness.callRpc("profiles.create", { name: "demo" })).rejects.toThrow(/already exists/u);
+    for (const name of ["..", "a/b", "x".repeat(33), "Demo", "-demo", "default"]) {
+      await expect(harness.callRpc("profiles.create", { name })).rejects.toThrow();
+    }
+    // Nothing escaped the profiles directory.
+    expect((await readdir(l.root)).sort()).toEqual(["profiles"]);
+  });
+
+  it("delete refuses default and the active profile, and does not follow a symlink", async () => {
+    const l = await layout();
+    const { harness } = await setup({ env: envFor(l) });
+    await harness.callRpc("profiles.create", { name: "demo" });
+    await expect(harness.callRpc("profiles.delete", { name: "default" })).rejects.toThrow(/cannot be deleted/u);
+    await harness.callRpc("profiles.activate", { name: "demo" });
+    await expect(harness.callRpc("profiles.delete", { name: "demo" })).rejects.toThrow(/active/u);
+
+    // A symlinked profile dir is removed as a link; its target is untouched.
+    const outside = await mkdtemp(join(tmpdir(), "team-setup-outside-"));
+    await writeFile(join(outside, "keep"), "keep");
+    await symlink(outside, join(l.profilesDir, "link"), "dir");
+    expect(await harness.callRpc("profiles.delete", { name: "link" })).toEqual({ ok: true });
+    expect(await readdir(outside)).toEqual(["keep"]);
+
+    await harness.callRpc("profiles.activate", { name: "default" });
+    expect(await harness.callRpc("profiles.delete", { name: "demo" })).toEqual({ ok: true });
+    await expect(readdir(join(l.profilesDir, "demo"))).rejects.toThrow();
+  });
+
+  it("activate refuses an unknown name, writes the file, and reports booted", async () => {
+    const l = await layout();
+    const { harness } = await setup({ env: envFor(l) });
+    await expect(harness.callRpc("profiles.activate", { name: "nope" })).rejects.toThrow(/no profile/u);
+    await expect(harness.callRpc("profiles.activate", { name: ".." })).rejects.toThrow(/DNS label/u);
+    await harness.callRpc("profiles.create", { name: "demo" });
+    expect(await harness.callRpc("profiles.activate", { name: "demo" })).toEqual({ booted: false });
+    expect((await readFile(l.activeProfileFile, "utf8")).trim()).toBe("demo");
+    await writeFile(join(l.profilesDir, "demo", "bb.db"), "x");
+    expect(await harness.callRpc("profiles.activate", { name: "demo" })).toEqual({ booted: true });
+    expect(await harness.callRpc("profiles.activate", { name: "default" })).toEqual({ booted: false });
+  });
+
+  it("protects the running profile after a failed switch rewrote active-profile", async () => {
+    const l = await layout();
+    await mkdir(join(l.profilesDir, "demo"));
+    await writeFile(l.activeProfileFile, "demo\n");
+    // The server booted on demo, so that is the running profile.
+    const { harness } = await setup({ env: envFor(l) });
+    // A switch to default whose restart failed left the file pointing at
+    // default while the server still runs demo.
+    await writeFile(l.activeProfileFile, "default\n");
+    const list = (await harness.callRpc("profiles.list", null)) as { active: string };
+    expect(list.active).toBe("demo");
+    await expect(harness.callRpc("profiles.delete", { name: "demo" })).rejects.toThrow(/active/u);
+  });
+});
