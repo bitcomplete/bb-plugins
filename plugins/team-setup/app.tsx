@@ -485,6 +485,27 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
         </Step>
 
         <Step
+          state={steps.machine}
+          title="A machine"
+          about={<p>Agents run on machines, not on this server. Once one exists, you can start a thread on it.</p>}
+        >
+          {machines.names.length > 0 ? (
+            <p>
+              {machines.names.join(", ")}. <SettingsLink pluginId="devbox-provider">Add another</SettingsLink>
+            </p>
+          ) : (
+            <p>
+              Agents run on machines, not on this server.{" "}
+              {devbox.connected ? (
+                <SettingsLink pluginId="devbox-provider">Create one in Devbox machines</SettingsLink>
+              ) : (
+                "Connect devbox first, then create one from Devbox machines."
+              )}
+            </p>
+          )}
+        </Step>
+
+        <Step
           state={projects.count > 0 ? "done" : "todo"}
           title="A project"
           about={
@@ -657,27 +678,6 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
             </form>
           ) : null}
           {figmaError !== null ? <p className="text-destructive">{figmaError}</p> : null}
-        </Step>
-
-        <Step
-          state={steps.machine}
-          title="A machine"
-          about={<p>Agents run on machines, not on this server. Once one exists, you can start a thread on it.</p>}
-        >
-          {machines.names.length > 0 ? (
-            <p>
-              {machines.names.join(", ")}. <SettingsLink pluginId="devbox-provider">Add another</SettingsLink>
-            </p>
-          ) : (
-            <p>
-              Agents run on machines, not on this server.{" "}
-              {devbox.connected ? (
-                <SettingsLink pluginId="devbox-provider">Create one in Devbox machines</SettingsLink>
-              ) : (
-                "Connect devbox first, then create one from Devbox machines."
-              )}
-            </p>
-          )}
         </Step>
       </ol>
       {error !== null ? <p className="text-destructive">{error}</p> : null}
