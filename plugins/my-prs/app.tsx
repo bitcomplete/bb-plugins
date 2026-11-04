@@ -27,10 +27,18 @@ const COUNT = "min-w-[18px] rounded-full px-1.5 text-center text-[11px] tabular-
 const POINTER_CURSORS = "[&_button:not(:disabled)]:cursor-pointer [&_summary]:cursor-pointer [&_a[href]]:cursor-pointer [&_input[type=checkbox]:not(:disabled)]:cursor-pointer";
 type SectionKind = "turn" | "dismissed" | "other" | "held";
 const FILTER_KEY = "my-prs:status-filter";
-const scrollPositions = new Map<PrStatus | null, number>();
+const ORGANIZATION_KEY = "my-prs:organization";
+const ALL_ORGANIZATIONS = "";
+const scrollPositions = new Map<string, number>();
 
 function restoredFilter(): PrStatus | null {
   try { return PR_STATUSES.find((status) => status.key === sessionStorage.getItem(FILTER_KEY))?.key ?? null; }
+  catch { return null; }
+}
+
+/** `null` means no choice was saved, which is different from the saved choice "All organizations". */
+function restoredOrganization(): string | null {
+  try { return sessionStorage.getItem(ORGANIZATION_KEY); }
   catch { return null; }
 }
 
@@ -71,12 +79,13 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
   const why = statusDescription(row);
   const since = row.turn && !row.dismissed ? row.turn.since : Date.parse(row.updatedAt);
   const info = holdLabel ?? `${why}${since === null ? "" : ` · ${age(since, now)} ago`}`;
+  const threadActive = threadId !== null && threadWorking(row);
   const threadLabel = row.threadStatus === "idle" ? "Idle" : row.threadStatus === "error" ? "Failed"
-    : threadWorking(row) ? "Working" : "Open thread";
-  const threadTone = kind !== "turn" || threadLabel === "Idle" ? GRAY : row.threadStatus === "error"
+    : threadActive ? "Active thread" : "Open thread";
+  const threadTone = threadActive ? BLUE : kind !== "turn" || threadLabel === "Idle" ? GRAY : row.threadStatus === "error"
     ? "bg-rose-500/10 text-[light-dark(var(--color-rose-800),var(--color-rose-200))]" : BLUE;
-  return <li className={cn("group min-w-0 rounded-md hover:bg-foreground/[0.03]", selected && "bg-sky-500/[0.07]")}>
-    <div className="flex flex-wrap items-start gap-x-2 gap-y-0 py-1 pl-2 pr-1.5 text-[12.5px] leading-5 @min-[480px]:flex-nowrap">
+  return <li className={cn("group min-w-0 rounded-md border-l-2 border-transparent hover:bg-foreground/[0.03]", threadActive && "border-sky-500 bg-sky-500/[0.05]", selected && "bg-sky-500/[0.07]")}>
+    <div className="flex flex-wrap items-start gap-x-2 gap-y-0 px-1.5 py-1 text-[12.5px] leading-5 @min-[480px]:flex-nowrap">
       <input type="checkbox" checked={selected} disabled={pending}
         aria-label={`Select ${row.repo}#${row.number}`} onChange={() => undefined} onClick={(event) => onPick(event.shiftKey)}
         className={cn(CHECKBOX, "mt-[3px] opacity-50 group-hover:opacity-100 group-focus-within:opacity-100")} />
@@ -94,7 +103,9 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
             {row.draft && (row.turn || row.holdUntil) ? <span className={cn(CHIP, GRAY)}>Draft</span> : null}
             {threadId !== null ? <button type="button" onClick={() => navigate.toThread(threadId)}
               aria-label={`Open thread for ${row.repo}#${row.number}`}
-              title={`Open its thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, threadTone, "hover:underline", RING)}>{threadLabel}<span aria-hidden>↗</span></button> :
+              aria-description={threadActive ? "Active thread: its agent is working on this PR" : undefined}
+              title={threadActive ? "Open its active thread · working on this PR" : `Open its thread · ${row.threadStatus ?? "unknown status"}`}
+              className={cn(CHIP, threadTone, threadActive && "font-medium", "hover:underline", RING)}>{threadActive ? <Spin /> : null}{threadLabel}<span aria-hidden>↗</span></button> :
               row.dispatch.kind === "starting" ? <span className={cn(CHIP, kind === "turn" ? BLUE : GRAY)}><Spin />Starting…</span> :
                 row.dispatch.kind === "none" ? <button type="button" disabled={pending}
                   aria-label={`Start thread for ${row.repo}#${row.number}`} title="Start a thread for this PR" onClick={onAddress}
@@ -150,7 +161,13 @@ export function MyPrsPage() {
   const [polling, setPolling] = useState(false);
   const [filter, setFilter] = useState(restoredFilter);
   const [dismissedOpen, setDismissedOpen] = useState(false);
-  const rows = view?.rows ?? [];
+  const [orgChoice, setOrgChoice] = useState(restoredOrganization);
+  const allRows = view?.rows ?? [];
+  const organizations = groupByOrganization(allRows);
+  const orgGroup = organizations.find((group) => group.label === orgChoice) ?? (orgChoice === ALL_ORGANIZATIONS ? undefined : organizations[0]);
+  const orgLabel = orgGroup?.label ?? ALL_ORGANIZATIONS;
+  const rows = orgGroup?.items ?? allRows;
+  const scrollScope = `${orgLabel}:${filter ?? ""}`;
   const filtered = filter === null ? rows : rows.filter((row) => prStatus(row) === filter);
   const activeStatus = PR_STATUSES.find((status) => status.key === filter);
   const yours = rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil);
@@ -165,8 +182,8 @@ export function MyPrsPage() {
   const closing = pending && closeItems !== null;
 
   useLayoutEffect(() => {
-    if (ready && scrollRef.current) scrollRef.current.scrollTop = scrollPositions.get(filter) ?? 0;
-  }, [filter, ready]);
+    if (ready && scrollRef.current) scrollRef.current.scrollTop = scrollPositions.get(scrollScope) ?? 0;
+  }, [scrollScope, ready]);
 
   const filterBy = (status: PrStatus | null) => {
     setFilter(status);
@@ -175,11 +192,19 @@ export function MyPrsPage() {
     catch { /* Filtering still works when browser storage is unavailable. */ }
   };
 
+  const chooseOrganization = (label: string) => {
+    setOrgChoice(label);
+    setSelected(new Map());
+    anchor.current = null;
+    try { sessionStorage.setItem(ORGANIZATION_KEY, label); }
+    catch { /* Filtering still works when browser storage is unavailable. */ }
+  };
+
   useEffect(() => {
     if (!view) return;
-    const available = new Map(view.rows.map((row) => [row.id, row.activity]));
+    const available = new Map(rows.map((row) => [row.id, row.activity]));
     setSelected((current) => new Map([...current].filter(([id, activity]) => available.get(id) === activity)));
-  }, [view]);
+  }, [view, orgLabel]);
 
   const act = async (operation: () => Promise<unknown>) => {
     if (pending) return;
@@ -276,6 +301,14 @@ export function MyPrsPage() {
   return <div ref={rootRef} className={cn("flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground", POINTER_CURSORS)}>
     <header className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/70 px-3 py-1">
       <h1 className="text-[13px] font-semibold">My PRs</h1>
+      <label className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
+        Organization
+        <select aria-label="Organization" value={orgLabel} disabled={organizations.length === 0} onChange={(event) => chooseOrganization(event.target.value)}
+          className={cn("h-6 min-w-0 max-w-44 rounded-md border border-border bg-transparent px-1 text-[12px] text-foreground disabled:opacity-45", RING)}>
+          <option value={ALL_ORGANIZATIONS}>All organizations</option>
+          {organizations.map((group) => <option key={group.label} value={group.label}>{group.label}</option>)}
+        </select>
+      </label>
       <button type="button" disabled={polling} onClick={() => { void poll(); }} aria-label="Refresh GitHub feedback"
         title={lastRead ? `Last read ${new Date(lastRead).toLocaleString()} · check GitHub now` : "Check GitHub now"}
         className={cn("ml-auto inline-flex min-w-0 items-center gap-1 rounded text-[11.5px] text-muted-foreground hover:text-foreground disabled:hover:text-inherit", RING)}>
@@ -283,7 +316,7 @@ export function MyPrsPage() {
         <span className="truncate">{polling ? "Reading GitHub…" : lastRead ? `Last read ${age(Date.parse(lastRead), now)} ago` : "Not read yet"}</span>
       </button>
     </header>
-    <div ref={scrollRef} onScroll={(event) => scrollPositions.set(filter, event.currentTarget.scrollTop)}
+    <div ref={scrollRef} onScroll={(event) => scrollPositions.set(scrollScope, event.currentTarget.scrollTop)}
       className="@container min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <main className={cn(COLUMN, "px-2 pb-10 pt-3 @min-[720px]:px-4")}>
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
