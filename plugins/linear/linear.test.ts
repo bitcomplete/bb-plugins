@@ -336,6 +336,7 @@ describe("what stewards reads", () => {
       updatedAt: "2026-10-02T00:00:00.000Z",
       completedAt: null,
       canceledAt: null,
+      dueDate: null,
       comments: [
         { id: "c-1", author: "someone", did: "commented", body: "Repro?", createdAt: "2026-10-01T01:00:00Z", url: null, signedBy: null },
         { id: "c-2", author: "jane", did: "commented", body: "On it.\n\n_— from bb thread thr_abc_", createdAt: "2026-10-01T02:00:00Z", url: "https://linear.app/c/2", signedBy: "thr_abc" },

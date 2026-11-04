@@ -558,6 +558,9 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     alertNumber: 4,
     severity: "high",
     package: "lodash",
+    ticketDueDate: null,
+    ticketLabels: [],
+    alertCreatedAt: null,
     ecosystem: "npm",
     manifestPath: "package-lock.json",
     ghsaId: null,
@@ -591,6 +594,7 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
       autoAdopt: [],
       timeZone: "UTC",
       escalations: [],
+      decisions: [],
       changes: [],
     });
 
@@ -608,6 +612,43 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     expect(depsWake(depsFinding())).toMatch(/Assignee: Jane/u);
     expect(depsWake(depsFinding({ class: "recurring", ticket: "ENG-50", ticketState: "Todo" }))).toMatch(/Recurring on ENG-50 \(open\)/u);
     expect(depsWake(depsFinding({ class: "returned", ticket: "ENG-50", ticketState: "Done", closedAt: "2026-10-01T00:00:00Z", window: "outside" }))).toMatch(/Returned: ENG-50 closed 2026-10-01T00:00:00Z, outside two weeks/u);
+  });
+
+  it("shows the ticket's own due date over the SLA deadline, and says when they disagree (SC-111)", () => {
+    const sla = Date.parse("2026-11-07T12:00:00Z");
+    const matching = depsWake(depsFinding({ class: "recurring", ticket: "SC-111", ticketState: "Backlog", severity: "medium", priority: "medium", dueAt: sla, ticketDueDate: "2026-11-07" }));
+    expect(matching).toMatch(/\*\*medium\*\* priority medium, due 2026-11-07 \(the ticket's due date\)/u);
+    const drifted = depsWake(depsFinding({ class: "recurring", ticket: "SC-111", ticketState: "Backlog", severity: "medium", priority: "medium", dueAt: sla, ticketDueDate: "2026-11-04", ticketLabels: ["security"], alertCreatedAt: "2026-10-29T00:19:43Z" }));
+    expect(drifted).toMatch(/due 2026-11-04 \(the ticket's due date; the SLA alone would say 2026-11-07, but the ticket's date is the one that counts\)/u);
+    expect(drifted).toMatch(/Ticket labels: security/u);
+    expect(drifted).toMatch(/opened 2026-10-29T00:19:43Z \(the SLA clock\); first seen by this watch/u);
+    const unread = depsWake(depsFinding({ class: "recurring", ticket: "SC-111", ticketState: "Backlog", dueAt: sla, ticketDueDate: null }));
+    expect(unread).toMatch(/SLA due 2026-11-07 \(the ticket's own due date could not be read\)/u);
+    expect(depsWake(depsFinding({ dueAt: sla }))).toMatch(/priority high, due 2026-11-07\n/u);
+  });
+
+  it("lists the adoption decisions waiting on the owner and what each answer means, and says not to ask again", () => {
+    const at = Date.parse("2026-10-14T15:00:00Z");
+    const text = formatDepsWake({
+      reason: "requeue",
+      binding: binding("dependabot/acme/web"),
+      playbook: parsedPlaybook(DEPS_ALERTS, "deps-alerts"),
+      look: { at, target: "dependabot/acme/web", error: null, viewer: "jane", alerts: [depsFinding({ class: "recurring", ticket: "SC-111", ticketState: "Backlog" })] },
+      team: "ENG",
+      label: "bb-managed",
+      owner: "Jane",
+      autoAdopt: ["critical", "high"],
+      timeZone: "UTC",
+      escalations: [],
+      decisions: [{ projectId: "p1", ticketKey: "SC-111", entityId: "dependabot/acme/web", fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedAt: at - 86_400_000, raisedBy: "thr_filed", needId: "need_1", status: "pending", resolution: null, resolvedAt: null, reminded: ["half"] }],
+      changes: [],
+    });
+    expect(text).toMatch(/### Adoption decisions waiting on the owner\n\n- SC-111 \(acme\/web#23, acme\/web#24\), raised 2026-10-13T15:00:00Z, item need_1, reminded: half/u);
+    expect(text).toMatch(/Do not ask again\. Adopt: the ticket is labelled and moved to Todo/u);
+    expect(text).toMatch(/Adoption of any other ticket is the owner's decision, and the plugin asks it/u);
+    expect(text).toMatch(/Dismiss as not used: dismiss each of the ticket's alerts on GitHub \(`gh api -X PATCH/u);
+    expect(text).toMatch(/Keep tracking: keep the ticket open and unadopted and move its due date/u);
+    expect(depsWake(depsFinding())).not.toMatch(/### Adoption decisions/u);
   });
 
   it("says unassigned and the dedup note when the login or the search is unavailable", () => {

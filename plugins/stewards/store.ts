@@ -518,7 +518,45 @@ export const STACK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN hold_stack TEX
 // them and normalises what they wrote.
 export const ESCALATION_ROUTE_MIGRATIONS = [`UPDATE escalations SET route = 'user' WHERE route = 'me'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS];
+// An adoption decision on a dependency ticket filed for a severity
+// deps.autoAdopt does not name: pending until the owner answers, the ticket is
+// labelled, or it closes. Keyed by ticket, not by binding or thread, so it
+// outlives both; `need_id` is the decide item currently showing it.
+export const DEPS_DECISION_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS deps_decisions (
+     project_id TEXT NOT NULL,
+     ticket_key TEXT NOT NULL,
+     entity_id TEXT NOT NULL,
+     fingerprints TEXT NOT NULL DEFAULT '[]',
+     severity TEXT,
+     raised_at INTEGER NOT NULL,
+     raised_by TEXT,
+     need_id TEXT,
+     status TEXT NOT NULL DEFAULT 'pending',
+     resolution TEXT,
+     resolved_at INTEGER,
+     reminded TEXT NOT NULL DEFAULT '[]',
+     PRIMARY KEY (project_id, ticket_key)
+   )`,
+  `CREATE INDEX IF NOT EXISTS deps_decisions_target ON deps_decisions (project_id, entity_id, status)`,
+  // An ops target's action log: what the plugin and its stewards did about
+  // the target (filed, commented, raised a decision, reminded, resolved),
+  // keyed by target so it survives the binding being recreated and the
+  // filing thread being deleted.
+  `CREATE TABLE IF NOT EXISTS ops_log (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     entity_id TEXT NOT NULL,
+     binding_id TEXT,
+     thread_id TEXT,
+     ticket_key TEXT,
+     at INTEGER NOT NULL,
+     text TEXT NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS ops_log_target ON ops_log (project_id, entity_id, at)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1121,6 +1159,31 @@ export type Fingerprint = FingerprintRow & { projectId: string; bindingId: strin
 /** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
 export type TicketAction = "filed" | "commented" | "reopened";
 
+/**
+ * The owner's pending decision on a dependency ticket nobody has adopted:
+ * raised when the ticket is filed for a severity `deps.autoAdopt` does not
+ * name, resolved by the owner's answer, the ticket being labelled, or the
+ * ticket closing. Keyed by ticket, so it survives the filing thread and the
+ * binding; `reminded` lists the reminder stages already sent.
+ */
+export type DepsDecision = {
+  projectId: string;
+  ticketKey: string;
+  entityId: string;
+  fingerprints: string[];
+  severity: string | null;
+  raisedAt: number;
+  raisedBy: string | null;
+  needId: string | null;
+  status: "pending" | "resolved";
+  resolution: string | null;
+  resolvedAt: number | null;
+  reminded: string[];
+};
+
+/** One line of an ops target's action log. */
+export type OpsLogEntry = { id: string; projectId: string; entityId: string; bindingId: string | null; threadId: string | null; ticketKey: string | null; at: number; text: string };
+
 export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; pendingNotes: string[] };
 
 /** Guidance repeated within this window is a retry, not new guidance. */
@@ -1245,6 +1308,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const setTicket = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
   const setCommented = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
   const setAdopted = db.prepare("UPDATE ops_fingerprints SET ticket_key = ? WHERE project_id = ? AND fingerprint = ?");
+
+  // Prepared on first use: the migration tests open stores on partial schemas
+  // from before the deps-decision group, and these tables are the newest.
+  const lazy = <P extends unknown[], R>(sql: string): (() => Database.Statement<P, R>) => {
+    let prepared: Database.Statement<P, R> | null = null;
+    return () => (prepared ??= db.prepare<P, R>(sql));
+  };
+  const getDepsDecision = lazy<[string, string], Record<string, unknown>>("SELECT * FROM deps_decisions WHERE project_id = ? AND ticket_key = ?");
+  const depsDecisionsForTarget = lazy<[string, string], Record<string, unknown>>("SELECT * FROM deps_decisions WHERE project_id = ? AND entity_id = ? ORDER BY raised_at");
+  const depsDecisionsForProject = lazy<[string], Record<string, unknown>>("SELECT * FROM deps_decisions WHERE project_id = ? AND status = 'pending' ORDER BY raised_at");
+  const insertDepsDecision = lazy<[Record<string, unknown>], unknown>(
+    "INSERT INTO deps_decisions (project_id, ticket_key, entity_id, fingerprints, severity, raised_at, raised_by, need_id) VALUES (@project_id, @ticket_key, @entity_id, @fingerprints, @severity, @raised_at, @raised_by, @need_id)",
+  );
+  const insertOpsLog = lazy<[Record<string, unknown>], unknown>("INSERT INTO ops_log (id, project_id, entity_id, binding_id, thread_id, ticket_key, at, text) VALUES (@id, @project_id, @entity_id, @binding_id, @thread_id, @ticket_key, @at, @text)");
+  const opsLogForTarget = lazy<[string, string, number], Record<string, unknown>>("SELECT * FROM ops_log WHERE project_id = ? AND entity_id = ? ORDER BY at DESC, rowid DESC LIMIT ?");
 
   const getProject = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE project_id = ?");
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
@@ -1428,6 +1506,30 @@ export function createStore(db: Database.Database, now: () => number, options: S
     lastCommentedAt: r.last_commented_at === null ? null : Number(r.last_commented_at),
     severity: r.severity === null || r.severity === undefined ? null : String(r.severity),
     ecosystem: r.ecosystem === null || r.ecosystem === undefined ? null : String(r.ecosystem),
+  });
+  const toDepsDecision = (r: Record<string, unknown>): DepsDecision => ({
+    projectId: String(r.project_id),
+    ticketKey: String(r.ticket_key),
+    entityId: String(r.entity_id),
+    fingerprints: json(z.array(z.string()), r.fingerprints === null ? null : String(r.fingerprints), []),
+    severity: r.severity === null ? null : String(r.severity),
+    raisedAt: Number(r.raised_at),
+    raisedBy: r.raised_by === null ? null : String(r.raised_by),
+    needId: r.need_id === null ? null : String(r.need_id),
+    status: r.status === "resolved" ? "resolved" : "pending",
+    resolution: r.resolution === null ? null : String(r.resolution),
+    resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
+    reminded: json(z.array(z.string()), r.reminded === null ? null : String(r.reminded), []),
+  });
+  const toOpsLogEntry = (r: Record<string, unknown>): OpsLogEntry => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    entityId: String(r.entity_id),
+    bindingId: r.binding_id === null ? null : String(r.binding_id),
+    threadId: r.thread_id === null ? null : String(r.thread_id),
+    ticketKey: r.ticket_key === null ? null : String(r.ticket_key),
+    at: Number(r.at),
+    text: String(r.text),
   });
   const toProject = (r: Record<string, unknown>): ProjectStewardRow => ({
     projectId: String(r.project_id),
@@ -2133,6 +2235,54 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return changed.changes > 0;
     },
 
+    // adoption decisions on dependency tickets, keyed by ticket
+    depsDecision(projectId: string, ticketKey: string): DepsDecision | null {
+      const r = getDepsDecision().get(projectId, ticketKey.toUpperCase());
+      return r === undefined ? null : toDepsDecision(r);
+    },
+    /** Every decision ever raised for a target, pending and resolved, oldest first. */
+    depsDecisions(projectId: string, entityId: string): DepsDecision[] {
+      return depsDecisionsForTarget().all(projectId, entityId).map(toDepsDecision);
+    },
+    /** The project's pending decisions, oldest first. */
+    pendingDepsDecisions(projectId: string): DepsDecision[] {
+      return depsDecisionsForProject().all(projectId).map(toDepsDecision);
+    },
+    /** Record a pending decision on a ticket; a ticket that already has one keeps it. Returns the row, new or existing. */
+    raiseDepsDecision(fields: { projectId: string; ticketKey: string; entityId: string; fingerprints: string[]; severity: string | null; raisedBy: string | null; needId: string | null }): { decision: DepsDecision; raised: boolean } {
+      const key = fields.ticketKey.toUpperCase();
+      const existing = getDepsDecision().get(fields.projectId, key);
+      if (existing !== undefined) return { decision: toDepsDecision(existing), raised: false };
+      insertDepsDecision().run({ project_id: fields.projectId, ticket_key: key, entity_id: fields.entityId, fingerprints: JSON.stringify(fields.fingerprints), severity: fields.severity, raised_at: now(), raised_by: fields.raisedBy, need_id: fields.needId });
+      return { decision: toDepsDecision(getDepsDecision().get(fields.projectId, key)!), raised: true };
+    },
+    patchDepsDecision(projectId: string, ticketKey: string, fields: Partial<Pick<DepsDecision, "needId" | "reminded" | "fingerprints" | "entityId" | "severity">>): DepsDecision | null {
+      const key = ticketKey.toUpperCase();
+      if (getDepsDecision().get(projectId, key) === undefined) return null;
+      if (fields.needId !== undefined) db.prepare("UPDATE deps_decisions SET need_id = ? WHERE project_id = ? AND ticket_key = ?").run(fields.needId, projectId, key);
+      if (fields.reminded !== undefined) db.prepare("UPDATE deps_decisions SET reminded = ? WHERE project_id = ? AND ticket_key = ?").run(JSON.stringify(fields.reminded), projectId, key);
+      if (fields.fingerprints !== undefined) db.prepare("UPDATE deps_decisions SET fingerprints = ? WHERE project_id = ? AND ticket_key = ?").run(JSON.stringify(fields.fingerprints), projectId, key);
+      if (fields.entityId !== undefined) db.prepare("UPDATE deps_decisions SET entity_id = ? WHERE project_id = ? AND ticket_key = ?").run(fields.entityId, projectId, key);
+      if (fields.severity !== undefined) db.prepare("UPDATE deps_decisions SET severity = ? WHERE project_id = ? AND ticket_key = ?").run(fields.severity, projectId, key);
+      return toDepsDecision(getDepsDecision().get(projectId, key)!);
+    },
+    /** Resolve a pending decision with how it was settled; false when it was not pending. */
+    resolveDepsDecision(projectId: string, ticketKey: string, resolution: string): boolean {
+      const changed = db.prepare("UPDATE deps_decisions SET status = 'resolved', resolution = ?, resolved_at = ? WHERE project_id = ? AND ticket_key = ? AND status = 'pending'").run(resolution, now(), projectId, ticketKey.toUpperCase());
+      return changed.changes > 0;
+    },
+
+    // the ops action log, keyed by target
+    logOps(fields: { projectId: string; entityId: string; bindingId?: string | null; threadId?: string | null; ticketKey?: string | null; text: string }): OpsLogEntry {
+      const id = newId("log");
+      insertOpsLog().run({ id, project_id: fields.projectId, entity_id: fields.entityId, binding_id: fields.bindingId ?? null, thread_id: fields.threadId ?? null, ticket_key: fields.ticketKey === undefined || fields.ticketKey === null ? null : fields.ticketKey.toUpperCase(), at: now(), text: fields.text });
+      return toOpsLogEntry(opsLogForTarget().get(fields.projectId, fields.entityId, 1)!);
+    },
+    /** A target's action log, newest first. */
+    opsLog(projectId: string, entityId: string, limit = 50): OpsLogEntry[] {
+      return opsLogForTarget().all(projectId, entityId, limit).map(toOpsLogEntry);
+    },
+
     // lessons: the project steward's general judgements, made permanent in `.bb`
     /**
      * Record a lesson, pending until its text is found at `.bb` HEAD or the
@@ -2394,7 +2544,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         db.prepare(`DELETE FROM secret_requesters WHERE thread_id IN (SELECT thread_id FROM workers WHERE binding_id IN (${byBinding}))`).run(projectId);
         for (const table of ["escalations", "workers", "needs", "project_approvals"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
         db.prepare(`DELETE FROM pending_deliveries WHERE origin_binding_id IN (${byBinding})`).run(projectId);
-        for (const table of ["ops_fingerprints", "lessons", "guidance_citations", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
+        for (const table of ["ops_fingerprints", "deps_decisions", "ops_log", "lessons", "guidance_citations", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
         options.onProjectChange?.(projectId, ["purged"]);
         return ids;
       })();

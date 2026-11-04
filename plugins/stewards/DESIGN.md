@@ -1447,6 +1447,37 @@ binding do it.
   once rather than waiting for the adopt pass. The alert's fingerprint is
   `owner/repo#<alert number>` (the alert's own numbering), recorded in the
   ops fingerprint map so a recurrence is a comment, never a second ticket.
+- **The SLA clock is the alert's own `created_at`**, not when this server
+  first saw it, so a watch binding recreated days later does not hand a
+  ticket a fresh deadline beside the one Linear already carries (SC-111
+  drifted three days that way and every digest repeated the wrong date).
+  Once a ticket exists, **its Linear `dueDate` is the truth**: the look
+  reads it with the ticket's state and labels, the wake shows it on the
+  alert and says when the SLA alone would disagree, and the batch plan only
+  ever tightens it, never computes a looser one beside it.
+- **Adoption of a ticket for a severity `deps.autoAdopt` does not name is
+  the owner's decision, and the plugin keeps it.** The steward used to
+  raise one `decision` escalation from the filing thread; when that thread
+  was deleted the question went with it, and nothing re-raised it. Now the
+  moment a report lists such a ticket as filed (and at every look, as the
+  backfill for a ticket inherited, found by dedup, or filed by a thread that
+  never reported), the plugin records a `deps_decisions` row keyed by ticket
+  and files a `decide` need on whichever binding watches the repository,
+  with choices **Adopt**, **Dismiss as not used** and **Keep tracking** (the
+  recommended one first: dismiss when no alert has a fixed version). It
+  shows in `bb stewards needs`, on the Stewards page and in the digest's
+  "Needs you" until the owner answers, the ticket is labelled, or it
+  closes; a recreated binding re-files the item on itself. The answer
+  reaches the dependency steward under "What changed" and the wake says
+  what each choice means. As the due date nears the plugin reminds
+  mechanically — at half the time to the due date, the day before, and once
+  past it — by rewording the item, noting the project steward's next wake
+  (so the digest names the deadline rather than promising to raise it
+  later) and logging it.
+- **Every ops target keeps an action log** (`ops_log`, keyed by target):
+  what each steward filed, commented on or reopened, with its thread id,
+  and each decision raised, reminded or settled. `bb stewards show` prints
+  it, so "did anyone ask?" is answered without the filing thread.
 - **critical and high get their own ticket; medium and low coalesce** into
   one open ticket per repo per ecosystem. A new alert joins that ticket
   when its due date is inside the new alert's deadline, and otherwise

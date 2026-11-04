@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -470,7 +470,7 @@ describe("the actor rename migration (BB-97)", () => {
     // it. BB-164 appended the pull-watch group after BB-184's server settings,
     // and BB-215's stack group follows it (migrations.test.ts pins the whole
     // list, this only checks the group order).
-    const groups = [ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    const groups = [DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -506,8 +506,10 @@ describe("the escalation route rename migration (BB-209)", () => {
     insert(db, "esc_me", "me");
     insert(db, "esc_project", "project", "Keep?");
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     // A second run matches nothing and changes nothing.
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     expect(routeOf(db, "esc_me")).toBe("user");
     expect(routeOf(db, "esc_project")).toBe("project");
     // No other column moved.
@@ -518,6 +520,7 @@ describe("the escalation route rename migration (BB-209)", () => {
     const db = legacy();
     insert(db, "esc_me", "me");
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     const route = routeOf(db, "esc_me");
     expect(route).toBe("user");
     expect(() => readAsOldBuild(route)).not.toThrow();
@@ -528,6 +531,7 @@ describe("the escalation route rename migration (BB-209)", () => {
     const logs: string[] = [];
     const db = legacy();
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000, { log: (m) => logs.push(m) });
     const x = s.escalate({ bindingId: "bnd_1", kind: "decision", question: "Q?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
     expect(x.route).toBe("user");
@@ -542,6 +546,7 @@ describe("the escalation route rename migration (BB-209)", () => {
     const logs: string[] = [];
     const db = legacy();
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000, { log: (m) => logs.push(m) });
     const x = s.escalate({ bindingId: "bnd_1", kind: "decision", question: "Q?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
     expect(s.reroute(x.id, "me", null)).toBe(true);
@@ -550,8 +555,11 @@ describe("the escalation route rename migration (BB-209)", () => {
   });
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
-    expect(MIGRATIONS.slice(-ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...ESCALATION_ROUTE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(ESCALATION_ROUTE_MIGRATIONS.length + STACK_MIGRATIONS.length), -ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...STACK_MIGRATIONS]);
+    // The deps-decision group (adoption decisions and the ops log) was appended after this one.
+    const tail = MIGRATIONS.slice(0, -DEPS_DECISION_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-DEPS_DECISION_MIGRATIONS.length)).toEqual([...DEPS_DECISION_MIGRATIONS]);
+    expect(tail.slice(-ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...ESCALATION_ROUTE_MIGRATIONS]);
+    expect(tail.slice(-(ESCALATION_ROUTE_MIGRATIONS.length + STACK_MIGRATIONS.length), -ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...STACK_MIGRATIONS]);
   });
 });
 
@@ -572,6 +580,7 @@ describe("the rationale migration (BB-35 step 4)", () => {
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
     for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -871,6 +880,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     for (const sql of LESSON_PR_MIGRATIONS) db.exec(sql);
     for (const sql of PULL_WATCH_MIGRATIONS) db.exec(sql);
     for (const sql of ESCALATION_ROUTE_MIGRATIONS) db.exec(sql);
+    for (const sql of DEPS_DECISION_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }
@@ -955,5 +965,44 @@ describe("the server settings", () => {
     s.setServerSetting("sidebar.navigationRestore", "navigation/rail");
     expect(s.serverSetting("sidebar.navigationRestore")).toBe("navigation/rail");
     expect(s.serverSetting("another-key")).toBeNull();
+  });
+});
+
+describe("adoption decisions and the ops log (keyed by ticket and target, not by binding)", () => {
+  it("raises a decision once per ticket, keeps it across bindings, and resolves it once", () => {
+    const { s, advance } = store();
+    const first = s.raiseDepsDecision({ projectId: "p1", ticketKey: "sc-111", entityId: "dependabot/acme/web", fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedBy: "thr_filed", needId: "need_1" });
+    expect(first.raised).toBe(true);
+    expect(first.decision).toMatchObject({ ticketKey: "SC-111", entityId: "dependabot/acme/web", fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedBy: "thr_filed", needId: "need_1", status: "pending", resolution: null, reminded: [] });
+    // Raised again from a recreated binding: the same row, not a second question.
+    advance(86_400_000);
+    const again = s.raiseDepsDecision({ projectId: "p1", ticketKey: "SC-111", entityId: "dependabot/acme/web", fingerprints: ["acme/web#23"], severity: "medium", raisedBy: "thr_new", needId: null });
+    expect(again.raised).toBe(false);
+    expect(again.decision.raisedAt).toBe(first.decision.raisedAt);
+    expect(s.depsDecision("p1", "SC-111")).toMatchObject({ raisedBy: "thr_filed", needId: "need_1" });
+    expect(s.patchDepsDecision("p1", "SC-111", { needId: "need_2", reminded: ["half"] })).toMatchObject({ needId: "need_2", reminded: ["half"] });
+    expect(s.pendingDepsDecisions("p1").map((d) => d.ticketKey)).toEqual(["SC-111"]);
+    expect(s.depsDecisions("p1", "dependabot/acme/web").map((d) => d.ticketKey)).toEqual(["SC-111"]);
+    expect(s.depsDecisions("p1", "dependabot/acme/other")).toEqual([]);
+    expect(s.resolveDepsDecision("p1", "sc-111", "Chose: Adopt")).toBe(true);
+    expect(s.resolveDepsDecision("p1", "SC-111", "again")).toBe(false);
+    expect(s.depsDecision("p1", "SC-111")).toMatchObject({ status: "resolved", resolution: "Chose: Adopt", resolvedAt: 1_000 + 86_400_000 });
+    expect(s.pendingDepsDecisions("p1")).toEqual([]);
+    expect(s.patchDepsDecision("p1", "SC-999", { needId: "x" })).toBeNull();
+  });
+
+  it("keeps a target's action log newest first, with the thread that acted", () => {
+    const { s, advance } = store();
+    s.logOps({ projectId: "p1", entityId: "dependabot/acme/web", bindingId: "bnd_old", threadId: "thr_filed", ticketKey: "sc-111", text: "Filed SC-111 for acme/web#23" });
+    advance(1_000);
+    s.logOps({ projectId: "p1", entityId: "dependabot/acme/web", bindingId: "bnd_new", threadId: null, text: "Reminder (half): SC-111 is halfway to its due date" });
+    s.logOps({ projectId: "p1", entityId: "dependabot/acme/other", text: "Filed SC-200" });
+    const log = s.opsLog("p1", "dependabot/acme/web");
+    expect(log.map((e) => [e.text, e.threadId, e.ticketKey, e.at])).toEqual([
+      ["Reminder (half): SC-111 is halfway to its due date", null, null, 2_000],
+      ["Filed SC-111 for acme/web#23", "thr_filed", "SC-111", 1_000],
+    ]);
+    expect(s.opsLog("p1", "dependabot/acme/web", 1)).toHaveLength(1);
+    expect(s.opsLog("p1", "dependabot/acme/other").map((e) => e.text)).toEqual(["Filed SC-200"]);
   });
 });

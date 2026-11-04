@@ -222,6 +222,12 @@ export const entitySnapshotSchema = z.object({
    */
   completedAt: z.string().nullable().optional(),
   canceledAt: z.string().nullable().optional(),
+  /**
+   * Linear: the issue's due date as YYYY-MM-DD, or null. Optional for the
+   * same reason; stewards' dependency watch reads it as the truth about when
+   * a ticket is due, over the deadline it computed itself. Null on GitHub.
+   */
+  dueDate: z.string().nullable().optional(),
   /** The newest comments (and, on a pull request, reviews and review comments), oldest first. */
   comments: z.array(snapshotCommentSchema),
   parent: z.object({ id: z.string(), key: z.string() }).nullable(),

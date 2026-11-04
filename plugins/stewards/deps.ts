@@ -35,15 +35,34 @@ export const isBatchable = (severity: DependabotSeverity): boolean => severity =
 export const alertFingerprint = (alert: Pick<DependabotAlert, "repo" | "number">): string => `${alert.repo}#${alert.number}`;
 
 /**
- * When an alert is due: `asap` is due the moment it is first seen, otherwise
- * first seen plus the severity's SLA. The clock is `firstSeenAt`, not the
- * alert's GitHub `created_at`: a server that missed a doorbell must not
- * inherit a deadline already spent, and an alert re-seen after a restart
- * keeps the deadline it first got from the fingerprint map.
+ * When an alert is due: `asap` is due the moment the clock starts, otherwise
+ * the clock plus the severity's SLA. The clock is the alert's own GitHub
+ * `created_at` (`alertClockAt`), not when this server first saw it: a watch
+ * binding recreated days later must not hand the ticket a fresh deadline
+ * beside the one Linear already carries (SC-111 drifted three days that way).
+ * A server that first sees an old alert inherits a deadline already spent,
+ * which is the truth of the matter.
  */
-export function deadlineAt(severity: DependabotSeverity, sla: Record<DependabotSeverity, number | "asap">, firstSeenAt: number): number {
+export function deadlineAt(severity: DependabotSeverity, sla: Record<DependabotSeverity, number | "asap">, clockAt: number): number {
   const value = sla[severity];
-  return value === "asap" ? firstSeenAt : firstSeenAt + value;
+  return value === "asap" ? clockAt : clockAt + value;
+}
+
+/**
+ * When an alert's SLA clock started: its GitHub `created_at` when it parses,
+ * else when this server first saw it (the fingerprint map's `first_seen_at`).
+ */
+export function alertClockAt(alert: Pick<DependabotAlert, "createdAt">, firstSeenAt: number): number {
+  if (alert.createdAt === null) return firstSeenAt;
+  const parsed = Date.parse(alert.createdAt);
+  return Number.isNaN(parsed) ? firstSeenAt : parsed;
+}
+
+/** A Linear due date (YYYY-MM-DD) as an instant on that calendar day: noon UTC, which is that date in every time zone between UTC-12 and UTC+11. */
+export function dueDateToMs(date: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(date)) return null;
+  const ms = Date.parse(`${date}T12:00:00Z`);
+  return Number.isNaN(ms) ? null : ms;
 }
 
 /** An open ticket a batched alert may join: one per repo per ecosystem. */
@@ -123,8 +142,12 @@ export const depsFindingSchema = z.object({
   summary: z.string(),
   state: z.string(),
   url: z.string().nullable(),
-  /** The SLA deadline, from the severity and when the alert was first seen. */
+  /** The SLA deadline, from the severity and the alert's own created_at (`alertClockAt`). */
   dueAt: z.number(),
+  /** The ticket's due date as Linear has it (YYYY-MM-DD), the source of truth once a ticket exists; null when none or unreadable. */
+  ticketDueDate: z.string().nullable().default(null),
+  /** The ticket's labels as Linear has them, so the wake can say whether it is adopted. */
+  ticketLabels: z.array(z.string()).default([]),
   /** The Linear priority the severity maps to. */
   priority: z.string(),
   class: z.enum(["new", "recurring", "returned"]),
@@ -139,6 +162,8 @@ export const depsFindingSchema = z.object({
   /** Set on a new finding when the dedup search could not run or was partial. */
   dedupUnavailable: z.boolean().default(false),
   firstSeenAt: z.number(),
+  /** The alert's own created_at as GitHub reports it, the SLA clock; null when it did not parse. */
+  alertCreatedAt: z.string().nullable().default(null),
   lastCommentedAt: z.number().nullable(),
   /** For a medium or low alert, what to do with the open ticket for its repo and ecosystem. */
   batch: z.union([
@@ -159,6 +184,78 @@ export const depsLookSchema = z.object({
   alerts: z.array(depsFindingSchema),
 });
 export type DepsLook = z.infer<typeof depsLookSchema>;
+
+// ---- adoption decisions ------------------------------------------------------------
+//
+// A ticket filed for a severity `deps.autoAdopt` does not name is nobody's
+// until the owner says so. The plugin keeps that question as durable state
+// keyed by ticket (store.ts `deps_decisions`), shown as a `decide` need on
+// whichever binding watches the repository now, so it survives the filing
+// thread being deleted and the binding being recreated (SC-111 sat six days
+// in Backlog because the one escalation that was meant to ask got lost).
+
+/** The owner's choices on an unadopted ticket, the recommended one first. */
+export const ADOPTION_CHOICES = { adopt: "Adopt", dismiss: "Dismiss as not used", keep: "Keep tracking" } as const;
+
+/**
+ * The choices offered on an adoption decision. With a fix available, adopting
+ * (a worker makes the upgrade) leads; with no patched version for any alert,
+ * "Recommend adopting" does not fit and dismissing the alerts as unused leads,
+ * since adopting could only produce a decision anyway.
+ */
+export function adoptionChoices(hasFix: boolean): string[] {
+  return hasFix ? [ADOPTION_CHOICES.adopt, ADOPTION_CHOICES.keep, ADOPTION_CHOICES.dismiss] : [ADOPTION_CHOICES.dismiss, ADOPTION_CHOICES.keep, ADOPTION_CHOICES.adopt];
+}
+
+/** The one line a decision item asks. */
+export function adoptionQuestion(ticketKey: string, repo: string, alerts: ReadonlyArray<Pick<DependabotAlert, "severity" | "package" | "ecosystem" | "fixedVersion">>, dueDate: string | null): string {
+  const severities = [...new Set(alerts.map((a) => a.severity))].sort((a, b) => DEPENDABOT_SEVERITIES.indexOf(a) - DEPENDABOT_SEVERITIES.indexOf(b));
+  const packages = [...new Set(alerts.map((a) => a.package))];
+  const ecosystems = [...new Set(alerts.map((a) => a.ecosystem))];
+  const fixes = alerts.filter((a) => a.fixedVersion !== null).length;
+  const fix = fixes === 0 ? "no fixed version" : fixes === alerts.length ? "fix available" : `fix for ${fixes} of ${alerts.length}`;
+  return `Adopt ${ticketKey}? ${severities.join("/")} Dependabot alert${alerts.length === 1 ? "" : `s (${alerts.length})`} on ${repo}: ${packages.join(", ")} (${ecosystems.join(", ")}), ${fix}${dueDate === null ? "" : `, due ${dueDate}`}.`;
+}
+
+/** What each choice means, for the item's `how` and the steward's wake. */
+export const ADOPTION_HOW =
+  `${ADOPTION_CHOICES.adopt}: the ticket is labelled and moved to Todo, and a ticket steward builds the upgrade. ` +
+  `${ADOPTION_CHOICES.dismiss}: the alerts are dismissed on GitHub as "vulnerable code is not actually used" and the ticket is closed with the reason. ` +
+  `${ADOPTION_CHOICES.keep}: the ticket stays open and unadopted; say the new due date in the note, or it moves out by one SLA window.`;
+
+/** The reminder stages an unanswered decision goes through, in order. */
+export const REMINDER_STAGES = ["half", "eve", "overdue"] as const;
+export type ReminderStage = (typeof REMINDER_STAGES)[number];
+
+/**
+ * The next reminder an unanswered decision is due, or null: `half` once half
+ * the time from raising to the due date has passed, `eve` from the day before
+ * the due date, `overdue` once the due date (in the project's time zone) has
+ * gone by. A stage already sent is skipped; a later stage supersedes an
+ * earlier one not yet sent, so a decision raised the day before its due date
+ * gets one reminder, not three.
+ */
+export function reminderDue(raisedAt: number, dueAt: number, reminded: readonly string[], now: number, timeZone: string): ReminderStage | null {
+  const today = dueDate(now, timeZone);
+  const due = dueDate(dueAt, timeZone);
+  let stage: ReminderStage | null = null;
+  if (today > due) stage = "overdue";
+  else if (dueDate(now + 86_400_000, timeZone) >= due) stage = "eve";
+  else if (now >= raisedAt + (dueAt - raisedAt) / 2) stage = "half";
+  if (stage === null) return null;
+  // Everything up to and including the stage due now counts as sent once it is.
+  const sent = new Set(reminded);
+  return sent.has(stage) || REMINDER_STAGES.slice(REMINDER_STAGES.indexOf(stage) + 1).some((s) => sent.has(s)) ? null : stage;
+}
+
+/** How a reminder reads: the days to or past the due date, in the project's time zone. */
+export function reminderText(stage: ReminderStage, ticketKey: string, due: string, now: number, timeZone: string): string {
+  const today = dueDate(now, timeZone);
+  const days = Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${due}T00:00:00Z`)) / 86_400_000);
+  if (stage === "overdue") return `${ticketKey} is ${days === 1 ? "a day" : `${days} days`} past its due date (${due}) and still unadopted.`;
+  if (stage === "eve") return `${ticketKey} is due ${days === 0 ? "today" : "tomorrow"} (${due}) and still unadopted.`;
+  return `${ticketKey} is halfway to its due date (${due}) and still unadopted.`;
+}
 
 /** The repo a fingerprint names: "owner/repo#4" → "owner/repo". */
 export const repoOfFingerprint = (fingerprint: string): string | null => {

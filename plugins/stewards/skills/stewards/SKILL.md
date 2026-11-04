@@ -316,6 +316,14 @@ fingerprint before filing.
   ticket, did: "filed" | "commented" | "reopened" }] }`, by the fingerprint the
   wake gives. That is what makes the next look a comment instead of a
   duplicate.
+- **Dependabot tickets (`deps-alerts`) raise no adoption escalation.** For
+  a severity `deps.autoAdopt` does not name, the plugin files the owner's
+  adoption decision itself the moment your report lists the ticket as
+  filed, keeps it by ticket until answered, and reminds the owner as the
+  due date nears. The answer arrives under "What changed" as "The user
+  chose …"; the wake says what Adopt, Dismiss as not used and Keep
+  tracking each mean. Once a ticket exists, its Linear due date is the one
+  the wake shows; the SLA deadline stands in only until then.
 - **All healthy:** the wake says so every requeue; report it with
   `actor: other` and end the turn.
 - **No Sentry token** (the wake says so): raise the escalation it describes

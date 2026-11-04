@@ -447,7 +447,7 @@ export function searchLimit(limit: number | undefined): number {
 // tools' output should not change because stewards needs more.
 
 const SNAPSHOT_FIELDS =
-  "id identifier title description url priority priorityLabel estimate createdAt updatedAt completedAt canceledAt " +
+  "id identifier title description url priority priorityLabel estimate createdAt updatedAt completedAt canceledAt dueDate " +
   "state { name type } team { id key } assignee { name displayName email } creator { name displayName email } " +
   "labels { nodes { name } } parent { id identifier } " +
   "children { nodes { id identifier title state { name type } labels { nodes { name } } } } " +
@@ -482,6 +482,7 @@ const snapshotIssueSchema = z.object({
   updatedAt: z.string().nullish(),
   completedAt: z.string().nullish(),
   canceledAt: z.string().nullish(),
+  dueDate: z.string().nullish(),
   state: z.object({ name: z.string(), type: z.string().nullish() }).nullish(),
   team: z.object({ id: z.string(), key: z.string() }),
   assignee: person,
@@ -554,6 +555,7 @@ export function snapshotOfIssue(issue: SnapshotIssue, viewer: string | null): En
     updatedAt: issue.updatedAt ?? null,
     completedAt: issue.completedAt ?? null,
     canceledAt: issue.canceledAt ?? null,
+    dueDate: issue.dueDate ?? null,
     comments: comments.map((c) => ({
       id: c.id,
       author: personName(c.user) ?? "someone",

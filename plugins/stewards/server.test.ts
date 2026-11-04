@@ -7754,7 +7754,9 @@ describe("dependency stewards", () => {
     expect(first).toMatch(/You have just been made the dependency steward/u);
     expect(first).toContain("#### acme/web#4");
     expect(first).toMatch(/### New: no ticket yet/u);
-    expect(first).toMatch(/\*\*high\*\* priority high, due 2026-10-15/u);
+    // The SLA clock is the alert's own created_at (2026-10-01T00:00Z), not when this server first saw it: a day later, in the project's time zone.
+    expect(first).toMatch(/\*\*high\*\* priority high, due 2026-10-01/u);
+    expect(first).toMatch(/opened 2026-10-01T00:00:00Z \(the SLA clock\); first seen by this watch 2026-10-14T15:00:00Z/u);
     expect(first).toMatch(/`lodash` \(npm\) — package-lock.json — GHSA-xxxx-yyyy-zzzz/u);
     expect(first).toMatch(/Fixed in 4\.17\.21/u);
     expect(first).toMatch(/This severity gets its own ticket\./u);
@@ -7824,11 +7826,12 @@ describe("dependency stewards", () => {
   it("suppresses the escalation only for the severities deps.autoAdopt names", async () => {
     const adopted = await watching();
     expect(adopted.wakes()[0]).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
-    expect(adopted.wakes()[0]).toMatch(/a severity it does not name\s+raises one decision escalation/u);
+    expect(adopted.wakes()[0]).toMatch(/Adoption of any other ticket is the owner's decision, and the plugin asks it/u);
 
     const escalate = await watching([alert({ number: 4, severity: "high" })], { deps: { autoAdopt: [] } });
     expect(escalate.wakes()[0]).not.toMatch(/deps\.autoAdopt:/u);
-    expect(escalate.wakes()[0]).toMatch(/a severity it does not name\s+raises one decision escalation/u);
+    expect(escalate.wakes()[0]).toMatch(/Adoption of any other ticket is the owner's decision, and the plugin asks it/u);
+    expect(escalate.wakes()[0]).toMatch(/Do not raise a decision escalation for it yourself/u);
   });
 
   it("wakes on a fixed alert so its ticket is trimmed, and rings on a dependabot_alert doorbell", async () => {
@@ -7851,6 +7854,148 @@ describe("dependency stewards", () => {
     expect(wakes().at(-1)).toContain("#### acme/web#7");
     expect(wakes().at(-1)).toMatch(/\*\*critical\*\* priority urgent/u);
     expect(wakes().at(-1)).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+  });
+
+  it("replays SC-111: the adoption decision is durable plugin state, the SLA clock is the alert's, and reminders land in needs and the digest", async () => {
+    // Two medium alerts with no fix, opened 2026-10-10; medium SLA 7d → due 2026-10-16 (America/New_York).
+    const echo = (number: number, ghsaId: string) => alert({ id: `acme/web#${number}`, number, severity: "medium", package: "github.com/labstack/echo/v4", ecosystem: "go", manifestPath: "go.mod", ghsaId, fixedVersion: null, createdAt: "2026-10-10T00:19:43Z", url: `https://github.com/acme/web/security/dependabot/${number}` });
+    const { t, steward, wakes } = await watching([echo(23, "GHSA-99jh"), echo(24, "GHSA-246p")]);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/\*\*medium\*\* priority medium, due 2026-10-16/u);
+    expect(first).toMatch(/opened 2026-10-10T00:19:43Z \(the SLA clock\)/u);
+    expect(first).toMatch(/Adoption of any other ticket is the owner's decision, and the plugin asks it/u);
+
+    // The steward files ENG-50 for both and reports it. Medium is not in autoAdopt, so the plugin raises the decision at once.
+    const filedThread = steward()!.id;
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", url: "https://linear.app/acme/issue/ENG-50", title: "echo alerts", state: "Backlog", stateType: "backlog", labels: [], dueDate: "2026-10-16", description: "Fingerprint: `acme/web#23`\nFingerprint: `acme/web#24`" }));
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed ENG-50.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#23", ticket: "ENG-50", did: "filed" }, { fingerprint: "acme/web#24", ticket: "ENG-50", did: "filed" }] }, filedThread)).error).toBe(false);
+    const needs = (await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout;
+    expect(needs).toMatch(/decide, dependabot\/acme\/web: Adopt ENG-50\? medium Dependabot alerts \(2\) on acme\/web: github.com\/labstack\/echo\/v4 \(go\), no fixed version, due 2026-10-16\. \[choices: Dismiss as not used, Keep tracking, Adopt\] \(https:\/\/linear.app\/acme\/issue\/ENG-50\)/u);
+    const decision = t.hooks.store.depsDecision("p1", "ENG-50")!;
+    expect(decision).toMatchObject({ status: "pending", entityId: DEPS_TARGET, fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedBy: filedThread, reminded: [] });
+    const firstNeed = t.hooks.store.need(decision.needId!)!;
+    expect(firstNeed).toMatchObject({ kind: "decide", filedBy: "plugin", url: "https://linear.app/acme/issue/ENG-50", data: expect.objectContaining({ adoption: true, ticket: "ENG-50" }) });
+    // Reporting again does not raise a second decision.
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Nothing new.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#23", ticket: "ENG-50", did: "commented" }] }, filedThread)).error).toBe(false);
+    expect(t.hooks.store.pendingDepsDecisions("p1")).toHaveLength(1);
+
+    // The watch is recreated (the repo leaves and re-enters the watched set; the filing thread is gone).
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb", "acme/web"] } });
+    await t.hooks.sweep();
+    await t.flush();
+    expect((await t.list()).find((b) => b.key === DEPS_TARGET)).toMatchObject({ ended: true });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb"] } });
+    t.advance(3_600_000);
+    await t.hooks.sweep();
+    await t.flush();
+    const current = t.hooks.store.open("p1").find((b) => b.entityKey === DEPS_TARGET)!;
+    expect(current).toBeDefined();
+    const watchers = t.spawns.filter((x) => String(x.title).startsWith("Deps watch"));
+    const currentThread = current.threadId!;
+    const latest = () => [...watchers.map((x) => [x.id, String(x.prompt)] as const), ...t.sends.map((x) => [x.threadId, x.text] as const)].filter(([id]) => id === currentThread).map(([, text]) => text).at(-1)!;
+    // The recreated watch keeps the alert's deadline and shows the ticket's own date; the decision is still pending, now on this binding.
+    expect(latest()).toMatch(/Recurring on ENG-50 \(open\)/u);
+    expect(latest()).toMatch(/\*\*medium\*\* priority medium, due 2026-10-16 \(the ticket's due date\)/u);
+    expect(latest()).toMatch(/opened 2026-10-10T00:19:43Z \(the SLA clock\)/u);
+    expect(latest()).toMatch(/### Adoption decisions waiting on the owner\n\n- ENG-50 \(acme\/web#23, acme\/web#24\)/u);
+    const moved = t.hooks.store.depsDecision("p1", "ENG-50")!;
+    expect(moved.status).toBe("pending");
+    expect(moved.raisedAt).toBe(decision.raisedAt);
+    const open = t.hooks.store.openNeedsForProject("p1").filter((n) => n.data.adoption === true);
+    expect(open.map((n) => n.bindingId)).toEqual([current.id]);
+    expect(moved.needId).toBe(open[0]!.id);
+    // This harness revives the ended binding rather than making a new one, so the
+    // item is the same row, still open; a binding with a new id gets a fresh item
+    // and the old one is closed as moved (raiseAdoption).
+    expect(t.hooks.store.need(firstNeed.id)).toMatchObject({ status: "open", bindingId: current.id });
+    expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/Adopt ENG-50\?/u);
+
+    // Someone moves the ticket's due date: the next wake says the ticket's date counts and names the drift.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", url: "https://linear.app/acme/issue/ENG-50", title: "echo alerts", state: "Backlog", stateType: "backlog", labels: [], dueDate: "2026-10-22", description: "Fingerprint: `acme/web#23`\nFingerprint: `acme/web#24`" }));
+    t.advance(86_400_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(latest()).toMatch(/due 2026-10-22 \(the ticket's due date; the SLA alone would say 2026-10-16, but the ticket's date is the one that counts\)/u);
+    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.what).toMatch(/due 2026-10-22\.$/u);
+
+    // Reminders: halfway (raised 10-14, due 10-22 → 10-18), the day before, and once overdue; each lands as a project note and in the log.
+    const notes = () => t.hooks.store.project("p1").pendingNotes.join("\n");
+    expect(t.hooks.store.depsDecision("p1", "ENG-50")!.reminded).toEqual([]);
+    t.advance(3 * 86_400_000); // 10-18T16:00Z
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.depsDecision("p1", "ENG-50")!.reminded).toEqual(["half"]);
+    expect(notes()).toMatch(/ENG-50 is halfway to its due date \(2026-10-22\) and still unadopted\. The decision is need_\S+ \(dependabot\/acme\/web\); it is the owner's to answer/u);
+    t.advance(3 * 86_400_000); // 10-21
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.depsDecision("p1", "ENG-50")!.reminded).toEqual(["half", "eve"]);
+    expect(notes()).toMatch(/ENG-50 is due tomorrow \(2026-10-22\) and still unadopted/u);
+    t.advance(2 * 86_400_000); // 10-23
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.depsDecision("p1", "ENG-50")!.reminded).toEqual(["half", "eve", "overdue"]);
+    expect(notes()).toMatch(/ENG-50 is a day past its due date \(2026-10-22\) and still unadopted/u);
+
+    // The digest lists it under "Needs you" because the item is open, whatever any earlier digest planned.
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const projectThread = t.hooks.store.project("p1").threadId!;
+    const digest = t.sends.filter((x) => x.threadId === projectThread).at(-1)!.text;
+    expect(digest).toMatch(/## Needs you[\s\S]*decide, dependabot\/acme\/web\): Adopt ENG-50\? medium Dependabot alerts \(2\)[^\n]*\[choices: Dismiss as not used, Keep tracking, Adopt\]/u);
+    expect(digest).toMatch(/ENG-50 is a day past its due date/u);
+
+    // The owner answers from a thread; the steward is woken with the choice and the decision settles on the next look.
+    const needId = t.hooks.store.depsDecision("p1", "ENG-50")!.needId!;
+    expect(await t.harness.behavior.runCli(["done", needId, "--choice", "Adopt", "--project", "p1"])).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Adopt/u) });
+    await t.flush();
+    expect(latest()).toMatch(/The user chose Adopt for Adopt ENG-50\?/u);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.depsDecision("p1", "ENG-50")).toMatchObject({ status: "resolved", resolution: "Chose: Adopt" });
+    expect(t.hooks.store.openNeedsForProject("p1").filter((n) => n.data.adoption === true)).toEqual([]);
+    expect(await t.harness.behavior.runCli(["needs", "--project", "p1"])).toMatchObject({ stdout: "Nothing is waiting on the user." });
+
+    // The target's record answers "did anyone ask?" without the filing thread.
+    const show = (await t.harness.behavior.runCli(["show", DEPS_TARGET, "--project", "p1"])).stdout;
+    expect(show).toMatch(/Decision ENG-50 \(resolved, raised 2026-10-14T15:00:00Z by thr_\S+, item need_\S+, reminded half, eve, overdue\): acme\/web#23, acme\/web#24 → Chose: Adopt/u);
+    expect(show).toMatch(new RegExp(`Action 2026-10-14T15:00:00Z \\(${filedThread}\\): Filed ENG-50 for acme/web#23`, "u"));
+    expect(show).toMatch(/Action [^\n]*: Raised the adoption decision on ENG-50 \(need_\S+\): Adopt ENG-50\?/u);
+    expect(show).toMatch(/Action [^\n]*: Reminder \(overdue\): ENG-50 is a day past its due date/u);
+    expect(show).toMatch(/Action [^\n]*: Adoption decision on ENG-50 settled: Chose: Adopt/u);
+  });
+
+  it("settles the decision when the ticket is labelled or closed, and raises none for an autoAdopt severity or a labelled ticket", async () => {
+    const { t, steward } = await watching([alert({ number: 4, severity: "medium", ghsaId: "GHSA-med" }), alert({ number: 5, severity: "high", ghsaId: "GHSA-high", package: "minimist" })]);
+    const ops = steward()!.id;
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", url: "https://linear.app/acme/issue/ENG-50", state: "Backlog", stateType: "backlog", labels: [], dueDate: "2026-10-16" }));
+    t.entities.set("ENG-51", issue({ id: "ENG-51", key: "ENG-51", url: "https://linear.app/acme/issue/ENG-51", state: "Todo", stateType: "unstarted", labels: ["bb-managed"], dueDate: "2026-10-15" }));
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed ENG-50 and ENG-51.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "ENG-50", did: "filed" }, { fingerprint: "acme/web#5", ticket: "ENG-51", did: "filed" }] }, ops)).error).toBe(false);
+    // Only the medium ticket gets a decision: high is in autoAdopt and ENG-51 is labelled.
+    expect(t.hooks.store.pendingDepsDecisions("p1").map((d) => d.ticketKey)).toEqual(["ENG-50"]);
+    expect(t.hooks.store.depsDecision("p1", "ENG-51")).toBeNull();
+
+    // The owner labels ENG-50 in Linear instead of pressing a button: the next look settles it.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", url: "https://linear.app/acme/issue/ENG-50", state: "Todo", stateType: "unstarted", labels: ["bb-managed"], dueDate: "2026-10-16" }));
+    t.advance(60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.depsDecision("p1", "ENG-50")).toMatchObject({ status: "resolved", resolution: "ENG-50 was adopted (labelled bb-managed)." });
+    expect(t.hooks.store.openNeedsForProject("p1").filter((n) => n.data.adoption === true)).toEqual([]);
+
+    // A ticket filed by a thread that never reported (found by the dedup search, open and unlabelled) gets its decision from the look, and closing it settles it.
+    t.entities.set("ENG-60", issue({ id: "ENG-60", key: "ENG-60", url: "https://linear.app/acme/issue/ENG-60", state: "Backlog", stateType: "backlog", labels: [], dueDate: "2026-11-01", description: "Fingerprint: `acme/web#6`" }));
+    t.dependabotAlerts.set("acme/web", [alert({ number: 4, severity: "medium", ghsaId: "GHSA-med" }), alert({ number: 5, severity: "high", ghsaId: "GHSA-high", package: "minimist" }), alert({ number: 6, severity: "low", ghsaId: "GHSA-low", package: "tar" })]);
+    t.advance(60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.fingerprint("p1", "acme/web#6")).toMatchObject({ ticketKey: "ENG-60" });
+    expect(t.hooks.store.depsDecision("p1", "ENG-60")).toMatchObject({ status: "pending", fingerprints: ["acme/web#6"], severity: "low" });
+    t.entities.set("ENG-60", issue({ id: "ENG-60", key: "ENG-60", url: "https://linear.app/acme/issue/ENG-60", state: "Canceled", stateType: "canceled", labels: [], dueDate: "2026-11-01", description: "Fingerprint: `acme/web#6`" }));
+    t.advance(60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.depsDecision("p1", "ENG-60")).toMatchObject({ status: "resolved", resolution: "ENG-60 was closed (Canceled)." });
   });
 
   it("adopts a dependabot[bot] pull request under deps-prs", async () => {

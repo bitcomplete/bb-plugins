@@ -402,8 +402,14 @@ Severity decides the Linear priority and the due date: the wake gives each
 alert's priority and deadline. critical and high get a ticket of their own
 at once; medium and low coalesce into one open ticket per repository per
 ecosystem. A severity deps.autoAdopt names is adopted when filed (labelled
-and moved to Todo) and raises no escalation; a severity it does not name
-raises one decision escalation. The wake's batch plan says, for each new
+and moved to Todo) and raises no escalation; for a severity it does not
+name, the plugin raises the adoption decision with the owner itself, as a
+decide item kept by ticket, the moment your report lists the ticket as
+filed. Do not raise that decision yourself. The wake says what to do when
+the owner's answer arrives. Once a ticket exists, its Linear due date is the
+one that counts, and the wake shows it; the SLA deadline the plugin computed
+from the alert's own created_at stands in only until the ticket has one.
+The wake's batch plan says, for each new
 medium or low alert, whether to file a new ticket, join an open one, or
 tighten an open ticket's due date; follow it. When you file or comment, list
 every alert the ticket covers, with its package, ecosystem, manifest path,
@@ -423,12 +429,13 @@ ${OPS_QUESTIONS}
 ## New
 
 File one ticket per problem, in the team the wake names, with the priority
-and due date the wake gives. Then raise one decision escalation to the
-project steward for every ticket filed this turn: "Filed BB-N (high): <one
-line>. Recommend adopting." A severity deps.autoAdopt names is labelled and
-moved to Todo when filed, as the wake says; such a ticket needs no
-escalation. For a medium or low alert whose plan is to join or tighten, do
-that instead of filing.
+and due date the wake gives, and list it as filed in your report: that is
+what raises the owner's adoption decision. A severity deps.autoAdopt names
+is labelled and moved to Todo when filed, as the wake says, and needs no
+decision. When no alert on the ticket has a fixed version, say in the ticket
+whether the vulnerable code is reachable from this repository, since
+"dismiss as not used" is the owner's likely answer. For a medium or low
+alert whose plan is to join or tighten, do that instead of filing.
 
 ## Recurring
 
