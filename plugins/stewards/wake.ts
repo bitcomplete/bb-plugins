@@ -11,13 +11,13 @@ import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js"
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
-import { dueDate } from "./deps.js";
+import { ADOPTION_CHOICES, adoptionHow, dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
 import { newHumanComments, productGateOptions, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { prGate, type ProjectApprovalRecord } from "./gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
-import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
+import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -854,6 +854,8 @@ export type DepsWakeInput = {
   /** The project's time zone, which due dates are given in. */
   timeZone: string;
   escalations: Escalation[];
+  /** The adoption decisions pending with the owner on this repository's tickets. */
+  decisions: DepsDecision[];
   changes: string[];
 };
 
@@ -874,9 +876,13 @@ function depsAlertLines(a: DepsFinding, timeZone: string): string[] {
   if (a.ticket !== null) lines.push(`- ticket ${a.ticket}${a.ticketState === null ? "" : ` (${a.ticketState})`}${a.lastCommentedAt === null ? "" : `, your last word on it ${iso(a.lastCommentedAt)}`}`);
   lines.push(`- Assignee: ${assigneeLine(a.assignee)}`);
   if (a.dedupUnavailable) lines.push(`- ${DEDUP_UNAVAILABLE}`);
+  // The plugin owns the deadline: the alert's own created_at plus the SLA,
+  // which is the same date a recreated binding computes (SC-111). It never
+  // reads Linear's due date (the source contract does not carry it).
   lines.push(`- **${a.severity}** priority ${a.priority}, due ${dueDate(a.dueAt, timeZone)}`);
+  if (a.ticket !== null && a.ticketLabels.length > 0) lines.push(`- Ticket labels: ${a.ticketLabels.join(", ")}`);
   lines.push(`- \`${a.package}\` (${a.ecosystem})${a.manifestPath === null ? "" : ` — ${a.manifestPath}`}${a.ghsaId === null ? "" : ` — ${a.ghsaId}`}`);
-  lines.push(`- ${a.fixedVersion === null ? "No fixed version yet" : `Fixed in ${a.fixedVersion}`}; first seen ${iso(a.firstSeenAt)}${a.url === null ? "" : ` — ${a.url}`}`);
+  lines.push(`- ${a.fixedVersion === null ? "No fixed version yet" : `Fixed in ${a.fixedVersion}`}; ${a.alertCreatedAt === null ? "" : `opened ${a.alertCreatedAt} (the SLA clock); `}first seen by this watch ${iso(a.firstSeenAt)}${a.url === null ? "" : ` — ${a.url}`}`);
   if (a.batch.kind === "join") lines.push(`- Batch: join the open ticket ${a.batch.ticketKey} (its due date is already inside this alert's).`);
   else if (a.batch.kind === "tighten") lines.push(`- Batch: tighten the open ticket ${a.batch.ticketKey}'s due date to no later than ${dueDate(a.batch.dueAt, timeZone)} (the earlier of its current due date and this deadline).`);
   else if (a.severity === "medium" || a.severity === "low") lines.push("- Batch: no open ticket for this repo and ecosystem; file a new one.");
@@ -907,6 +913,15 @@ export function formatDepsWake(input: DepsWakeInput): string {
   if (input.autoAdopt.length > 0) {
     out.push(`deps.autoAdopt: a ticket you file for a ${input.autoAdopt.join(" or ")} alert is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`);
   }
+  const allowDismiss = playbook.may.includes("dismiss-alert");
+  out.push(
+    `Adoption of any other ticket is the owner's decision, and the plugin asks it: once your report lists the ticket as filed, a decide item appears on the Stewards page and in \`bb stewards needs\`, kept by ticket until the owner answers, the ticket is labelled \`${input.label}\`, or it closes. Do not raise a decision escalation for it yourself, and do not ask the owner in prose. ` +
+      `The answer arrives under "What changed" as "The user chose <choice> for …". ${ADOPTION_CHOICES.adopt}: add the label \`${input.label}\` and move the ticket to Todo. ` +
+      (allowDismiss
+        ? `${ADOPTION_CHOICES.dismiss}: only when the owner answered with it on that ticket's decide item — never on a steward's own initiative — re-read each of that decision's alerts on GitHub first and skip any already fixed or dismissed, then dismiss the rest as "not used" and move the ticket to Done with a comment saying why. The item and this wake list the exact alert numbers. `
+        : "") +
+      `${ADOPTION_CHOICES.keep}: keep the ticket open and unadopted and move its due date to the one the note gives, or by one SLA window from today when it gives none, with a comment on the ticket saying so.`,
+  );
 
   out.push("", "## 2. Guidance, priority and holds", "");
   if (binding.guidance.length === 0) out.push("No standing guidance.");
@@ -927,6 +942,24 @@ export function formatDepsWake(input: DepsWakeInput): string {
   if (open.length > 0) {
     out.push("", "### Open escalations", "");
     for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "user" ? "the user" : "the project steward"}): ${x.question}`);
+  }
+  if (input.decisions.length > 0) {
+    out.push("", "### Adoption decisions waiting on the owner", "");
+    for (const d of input.decisions) {
+      out.push(`- ${d.ticketKey} (${d.fingerprints.join(", ")}), raised ${iso(d.raisedAt)}${d.needId === null ? "" : `, item ${d.needId}`}${d.snoozedUntil === null ? "" : `, snoozed until ${iso(d.snoozedUntil)}`}${d.reminded.length === 0 ? "" : `, reminded: ${d.reminded.join(", ")}`}`);
+      if (allowDismiss) {
+        // Only the owner's answer dismisses; the exact alert numbers are the
+        // ones in this decision's fingerprints, in its repo, and each is
+        // re-read first so an already fixed or dismissed alert is skipped.
+        const repo = d.entityId.replace(/^dependabot\//u, "");
+        for (const fingerprint of d.fingerprints) {
+          const number = fingerprint.slice(fingerprint.lastIndexOf("#") + 1);
+          if (!/^\d+$/u.test(number)) continue;
+          out.push(`  - On ${ADOPTION_CHOICES.dismiss} from the owner's answer: re-read \`/repos/${repo}/dependabot/alerts/${number}\` first and skip it if it is already fixed or dismissed; otherwise \`gh api -X PATCH /repos/${repo}/dependabot/alerts/${number} -f state=dismissed -f dismissed_reason=not_used -f dismissed_comment=<why>\`.`);
+        }
+      }
+    }
+    out.push("", `These are on the Stewards page; the plugin reminds the owner once a deadline has passed. Do not ask again, and never dismiss or snooze on a steward's own initiative. ${adoptionHow(allowDismiss)}`);
   }
 
   const snapshot = out.splice(0);

@@ -70,7 +70,7 @@ import {
   type RolesFile,
 } from "./config.js";
 import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
+import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
@@ -99,7 +99,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -3504,7 +3504,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const key of [...new Set(keys)].slice(0, 20)) {
         const e = await snapshot("linear", key).catch(() => null);
         const resolved = e !== null && (e.stateType === "completed" || e.stateType === "canceled");
-        out.set(key, e === null ? null : { state: e.state, stateType: e.stateType, closedAt: e.completedAt ?? e.canceledAt ?? (resolved ? (e.updatedAt ?? null) : null) });
+        out.set(key, e === null ? null : { state: e.state, stateType: e.stateType, closedAt: e.completedAt ?? e.canceledAt ?? (resolved ? (e.updatedAt ?? null) : null), labels: e.labels, url: e.url });
       }
       return out;
     }
@@ -3587,7 +3587,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * resolved one. A ticket whose state cannot be read counts as open, as
      * in `classify`.
      */
-    function openBatchedTickets(rows: readonly Fingerprint[], sla: ProjectFile["deps"]["sla"], tickets: ReadonlyMap<string, TicketState>): DepsTicket[] {
+    function openBatchedTickets(rows: readonly Fingerprint[], sla: ProjectFile["deps"]["sla"], tickets: ReadonlyMap<string, TicketState>, clockAt: (fingerprint: string, firstSeenAt: number) => number): DepsTicket[] {
       const byTicket = new Map<string, DepsTicket>();
       for (const r of rows) {
         if (r.ticketKey === null || r.severity === null || r.ecosystem === null) continue;
@@ -3596,7 +3596,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (state !== null && (state.stateType === "completed" || state.stateType === "canceled")) continue;
         const repo = repoOfFingerprint(r.fingerprint);
         if (repo === null) continue;
-        const dueAt = deadlineAt(r.severity as DependabotSeverity, sla, r.firstSeenAt);
+        // The plugin owns the deadline: it is the alert's own created_at plus
+        // the SLA, never Linear's due date (which the source contract does not
+        // carry). The plan may tighten the ticket's deadline, never loosen it.
+        const dueAt = deadlineAt(r.severity as DependabotSeverity, sla, clockAt(r.fingerprint, r.firstSeenAt));
         const ticket = byTicket.get(r.ticketKey);
         if (ticket === undefined) byTicket.set(r.ticketKey, { ticketKey: r.ticketKey, repo, ecosystem: r.ecosystem, dueAt });
         else ticket.dueAt = Math.min(ticket.dueAt, dueAt);
@@ -3631,14 +3634,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const sightings: Sighting[] = alerts.map((a) => ({ fingerprint: alertFingerprint(a), workload: a.package, pods: [], container: null, signature: a.severity, summary: `${a.severity} ${a.package}`, restarts: 0, events: [], logs: null, previous: false }));
         const tickets = await ticketStates([...allRows].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         const findings = classify(sightings, rows, tickets, at, config.linearLogin).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
-        const open = openBatchedTickets(allRows, config.file.deps.sla, tickets);
         const byFingerprint = new Map(alerts.map((a) => [alertFingerprint(a), a]));
+        // The SLA clock is the alert's own created_at, so a binding recreated
+        // later does not hand a ticket a fresh deadline (SC-111); a row whose
+        // alert is no longer listed keeps the first-seen clock it had.
+        const clockAt = (fingerprint: string, firstSeenAt: number): number => {
+          const a = byFingerprint.get(fingerprint);
+          return a === undefined ? firstSeenAt : alertClockAt(a, firstSeenAt);
+        };
+        const open = openBatchedTickets(allRows, config.file.deps.sla, tickets, clockAt);
         const depsFindings: DepsFinding[] = [];
         for (const f of findings) {
           const a = byFingerprint.get(f.fingerprint);
           if (a === undefined) continue;
           const firstSeenAt = rows.get(f.fingerprint)?.firstSeenAt ?? at;
-          const dueAt = deadlineAt(a.severity, config.file.deps.sla, firstSeenAt);
+          const dueAt = deadlineAt(a.severity, config.file.deps.sla, alertClockAt(a, firstSeenAt));
+          const ticketState = f.ticket === null ? null : (tickets.get(f.ticket) ?? null);
           depsFindings.push({
             fingerprint: f.fingerprint,
             alertNumber: a.number,
@@ -3652,6 +3663,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             state: a.state,
             url: a.url,
             dueAt,
+            ticketLabels: ticketState?.labels ?? [],
             priority: priorityFor(a.severity),
             class: f.class,
             ticket: f.ticket,
@@ -3661,13 +3673,189 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             assignee: f.assignee,
             dedupUnavailable: f.dedupUnavailable,
             firstSeenAt,
+            alertCreatedAt: a.createdAt !== null && !Number.isNaN(Date.parse(a.createdAt)) ? a.createdAt : null,
             lastCommentedAt: f.lastCommentedAt,
             batch: batchAlert(a, dueAt, open),
           });
         }
-        return { at, target: opsTargetKey(target), error: null, viewer: out.viewer, alerts: depsFindings };
+        const look: DepsLook = { at, target: opsTargetKey(target), error: null, viewer: out.viewer, alerts: depsFindings };
+        reconcileDepsDecisions(b, config, look, allRows, tickets, byFingerprint, clockAt);
+        return look;
       } catch (error) {
         return { at, target: opsTargetKey(target), error: errorMessage(error), viewer: null, alerts: [] };
+      }
+    }
+
+    // ---- adoption decisions ---------------------------------------------------------------------
+    //
+    // A ticket filed for a severity deps.autoAdopt does not name is nobody's
+    // until the owner says so. The steward used to raise that as one decision
+    // escalation from the filing thread, and when that thread was deleted the
+    // question went with it (SC-111 sat six days in Backlog). Now the plugin
+    // records the decision as durable state keyed by ticket, shows it as a
+    // `decide` need on whichever binding watches the repository, reminds the
+    // owner once the deadline (or a snooze) has passed, and resolves it when
+    // the owner answers, the ticket is labelled, or the ticket closes.
+
+    /** Whether a ticket's severity is one deps.autoAdopt names: such a ticket is adopted when filed and needs no decision. */
+    const autoAdopted = (severity: string | null, config: ProjectConfig): boolean => severity !== null && (config.file.deps.autoAdopt as string[]).includes(severity);
+
+    /** Whether the deps-alerts playbook's `may` list lets a steward dismiss an alert on GitHub. */
+    const dismissAllowed = (config: ProjectConfig): boolean => config.depsAlerts?.may.includes("dismiss-alert") === true;
+
+    /** The most severe of a ticket's alerts, for the decision's record. */
+    function ticketSeverity(severities: ReadonlyArray<string | null>): string | null {
+      const order = ["critical", "high", "medium", "low"];
+      const known = severities.filter((x): x is string => x !== null).sort((a, b) => order.indexOf(a) - order.indexOf(b));
+      return known[0] ?? null;
+    }
+
+    /** The earliest deadline among a ticket's alert rows: the SLA clock from each alert's own created_at. */
+    function decisionDeadline(rows: ReadonlyArray<Fingerprint>, config: ProjectConfig, clockAt: (fingerprint: string, firstSeenAt: number) => number): number {
+      return Math.min(...rows.map((r) => deadlineAt((r.severity ?? "medium") as DependabotSeverity, config.file.deps.sla, clockAt(r.fingerprint, r.firstSeenAt))));
+    }
+
+    /** The days past a deadline, in the project's time zone, or null when it has not passed. */
+    function overdueDays(dueAt: number, config: ProjectConfig): number | null {
+      const at = now();
+      if (!overdue(dueAt, at, config.file.nightly.timezone)) return null;
+      const today = Date.parse(`${dueDate(at, config.file.nightly.timezone)}T00:00:00Z`);
+      const due = Date.parse(`${dueDate(dueAt, config.file.nightly.timezone)}T00:00:00Z`);
+      return Math.max(1, Math.round((today - due) / 86_400_000));
+    }
+
+    /** The decide item an adoption decision shows as, filed on the binding that watches the repository now; an open one is reworded. */
+    function fileAdoptionNeed(b: Binding, config: ProjectConfig, ticketKey: string, fingerprints: string[], alerts: ReadonlyArray<Pick<DependabotAlert, "severity" | "package" | "ecosystem" | "fixedVersion">>, ticket: TicketState, repo: string, dueAt: number, overdueBy: number | null): Need {
+      const hasFix = alerts.length > 0 && alerts.some((a) => a.fixedVersion !== null);
+      const allowDismiss = dismissAllowed(config);
+      const due = dueDate(dueAt, config.file.nightly.timezone);
+      return store.fileNeed({
+        bindingId: b.id,
+        kind: "decide",
+        url: ticket?.url ?? ticketKey,
+        what: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
+        how: adoptionHow(allowDismiss),
+        data: { adoption: true, ticket: ticketKey, fingerprints, choices: adoptionChoices(hasFix, allowDismiss), dueDate: due },
+        filedBy: "plugin",
+      });
+    }
+
+    /**
+     * Raise the adoption decision on a ticket, idempotently: the decision row
+     * if it is new, and the decide item on this binding (reworded when it is
+     * already open). Called from the steward's report the moment it files, and
+     * from every look as the backfill for a ticket inherited by a recreated
+     * binding, found by the dedup search, or filed by a thread that never
+     * reported.
+     */
+    function raiseAdoption(b: Binding, config: ProjectConfig, ticketKey: string, rows: ReadonlyArray<Fingerprint>, alerts: ReadonlyArray<Pick<DependabotAlert, "severity" | "package" | "ecosystem" | "fixedVersion">>, ticket: TicketState, dueAt: number, overdueBy: number | null = null): Need | null {
+      const repo = parseOpsTargetKey(b.entityId);
+      if (repo === null || repo.kind !== "dependabot") return null;
+      const fingerprints = rows.map((r) => r.fingerprint);
+      const { decision, raised } = store.raiseDepsDecision({ projectId: b.projectId, ticketKey, entityId: b.entityId, fingerprints, severity: ticketSeverity(rows.map((r) => r.severity)), raisedBy: b.threadId, needId: null });
+      if (decision.status !== "pending") return null;
+      // The item from an earlier binding (recreated, rebound) is closed, not
+      // left open and invisible on an ended binding: the one filed here is
+      // the live question.
+      if (decision.needId !== null) {
+        const earlier = store.need(decision.needId);
+        if (earlier !== null && earlier.status === "open" && earlier.bindingId !== b.id) store.closeNeed(earlier.id, `Moved to ${b.id}, which watches the repository now.`, "plugin");
+      }
+      const need = fileAdoptionNeed(b, config, ticketKey, fingerprints, alerts, ticket, repo.repo, dueAt, overdueBy);
+      if (decision.needId !== need.id || decision.fingerprints.length !== fingerprints.length || decision.entityId !== b.entityId) store.patchDepsDecision(b.projectId, ticketKey, { needId: need.id, fingerprints, entityId: b.entityId });
+      if (raised) bb.log.info(`stewards: raised the adoption decision on ${ticketKey} for ${b.entityKey}`);
+      return need;
+    }
+
+    /** Settle a pending decision with how it was settled and close its item. */
+    function settleAdoption(b: Binding, decision: DepsDecision, resolution: string): void {
+      if (!store.resolveDepsDecision(b.projectId, decision.ticketKey, resolution)) return;
+      if (decision.needId !== null) {
+        const need = store.need(decision.needId);
+        if (need !== null && need.status === "open") store.closeNeed(need.id, resolution, "plugin");
+      }
+    }
+
+    /**
+     * Every look: raise the decision for each unadopted ticket in the map that
+     * has none, re-file the item on this binding when it was on an earlier
+     * one, settle a decision the owner has answered, the ticket has been
+     * labelled for, or whose ticket closed, re-raise a snoozed decision when
+     * its date arrives, and send the one overdue reminder. The reminder
+     * rewords the item and adds a note to the project steward's next wake (so
+     * the digest's "needs you" names the deadline); it is recorded once. Only
+     * tickets the look could read are judged: an unreadable ticket keeps
+     * whatever state the decision had.
+     */
+    function reconcileDepsDecisions(b: Binding, config: ProjectConfig, look: DepsLook, rows: ReadonlyArray<Fingerprint>, tickets: ReadonlyMap<string, TicketState>, alerts: ReadonlyMap<string, DependabotAlert>, clockAt: (fingerprint: string, firstSeenAt: number) => number): void {
+      const byTicket = new Map<string, Fingerprint[]>();
+      for (const r of rows) {
+        if (r.ticketKey === null) continue;
+        const list = byTicket.get(r.ticketKey) ?? [];
+        list.push(r);
+        byTicket.set(r.ticketKey, list);
+      }
+      const label = lc(config.file.label);
+      for (const [ticketKey, ticketRows] of byTicket) {
+        const ticket = tickets.get(ticketKey) ?? null;
+        const decision = store.depsDecision(b.projectId, ticketKey);
+        const ticketAlerts = ticketRows.map((r) => alerts.get(r.fingerprint)).filter((a): a is DependabotAlert => a !== undefined);
+        // A ticket whose state could not be read is left as it is: neither
+        // raised (it may be adopted) nor settled (it may still be open).
+        if (ticket === null) continue;
+        const closed = ticket.stateType === "completed" || ticket.stateType === "canceled";
+        const labelled = (ticket.labels ?? []).some((l) => lc(l) === label);
+        if (decision !== null && decision.status === "pending") {
+          const need = decision.needId === null ? null : store.need(decision.needId);
+          if (closed) {
+            settleAdoption(b, decision, `${ticketKey} was closed (${ticket.state}).`);
+            continue;
+          }
+          if (labelled) {
+            settleAdoption(b, decision, `${ticketKey} was adopted (labelled ${config.file.label}).`);
+            continue;
+          }
+          // The owner answered on the Stewards page or with `bb stewards done`.
+          // Only that answer snoozes a decision; the plugin never snoozes or
+          // dismisses on a steward's word.
+          if (need !== null && need.status === "done") {
+            const resolution = need.resolution ?? "Answered.";
+            if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.keep}`)) {
+              if (decision.snoozedUntil === null) {
+                const until = snoozeUntil(resolution, decision.severity as DependabotSeverity | null, config.file.deps.sla, now());
+                store.patchDepsDecision(b.projectId, ticketKey, { snoozedUntil: until, reminded: [] });
+                store.note(b.id, `${ticketKey} is snoozed until ${dueDate(until, config.file.nightly.timezone)}; the plugin asks again then.`, true);
+              }
+            } else {
+              settleAdoption(b, decision, resolution);
+              continue;
+            }
+          }
+          const current = store.depsDecision(b.projectId, ticketKey)!;
+          // A snoozed decision is quiet until its date arrives; then the item
+          // is re-filed and the reminder clock runs from the snooze date.
+          const snoozeEnded = current.snoozedUntil !== null && current.snoozedUntil <= now();
+          if (current.snoozedUntil !== null && !snoozeEnded) continue;
+          const dueAt = current.snoozedUntil ?? decisionDeadline(ticketRows, config, clockAt);
+          if (snoozeEnded) store.patchDepsDecision(b.projectId, ticketKey, { snoozedUntil: null, reminded: [] });
+          const days = overdueDays(dueAt, config);
+          raiseAdoption(b, config, ticketKey, ticketRows, ticketAlerts, ticket, dueAt, days);
+          const after = store.depsDecision(b.projectId, ticketKey)!;
+          if (days === null || after.reminded.includes("overdue")) continue;
+          const text = reminderText(ticketKey, dueDate(dueAt, config.file.nightly.timezone), now(), config.file.nightly.timezone);
+          store.patchDepsDecision(b.projectId, ticketKey, { reminded: [...after.reminded, "overdue"] });
+          const latest = store.depsDecision(b.projectId, ticketKey);
+          store.noteProject(b.projectId, `${text} The decision is ${latest?.needId ?? "on the Stewards page"} (${b.entityKey}); it is the owner's to answer, so it belongs under "needs you" in the digest, not in a plan to raise it later.`);
+          store.note(b.id, text, true);
+          continue;
+        }
+        if (decision !== null) continue;
+        // No decision yet: an open, unlabelled ticket for a severity
+        // deps.autoAdopt does not name needs one, whoever filed it and whenever.
+        if (closed || labelled) continue;
+        if (ticketRows.every((r) => autoAdopted(r.severity, config))) continue;
+        const dueAt = decisionDeadline(ticketRows, config, clockAt);
+        raiseAdoption(b, config, ticketKey, ticketRows, ticketAlerts, ticket, dueAt, overdueDays(dueAt, config));
       }
     }
 
@@ -3813,6 +4001,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         autoAdopt: config.file.deps.autoAdopt,
         timeZone: config.file.nightly.timezone,
         escalations: store.openEscalations(b.id),
+        decisions: store.depsDecisions(b.projectId, b.entityId).filter((d) => d.status === "pending"),
         changes: [...new Set(changes.map((c) => c.text))],
       });
       const delivery = await deliverWake(b, config, playbook, text);
@@ -4231,7 +4420,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const team = roleOpsTeam(config.role, config.file);
       const escalations = store.openEscalations(b.id);
       if (target?.kind === "dependabot" && b.depsLook !== null) {
-        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, changes });
+        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, decisions: store.depsDecisions(b.projectId, b.entityId).filter((d) => d.status === "pending"), changes });
       }
       if (target?.kind === "sentry-project" && b.sentryLook !== null) {
         return formatSentryWake({ reason: "disabled", binding: b, playbook, look: b.sentryLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
@@ -7713,7 +7902,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ),
             );
           }
-          for (const t of opsTickets) store.recordTicket(b.projectId, t.fingerprint, t.ticket, t.did);
+          for (const t of opsTickets) store.recordTicket(b.projectId, t.fingerprint, t.ticket, t.did, threadId);
+          if (opsTickets.length > 0) {
+            // A dependency ticket filed for a severity deps.autoAdopt does not
+            // name gets its adoption decision now, not at the next look, so
+            // `bb stewards needs` shows it the moment the ticket exists.
+            if (config !== null && parseOpsTargetKey(b.entityId)?.kind === "dependabot") {
+              const filed = new Map<string, Fingerprint[]>();
+              for (const t of opsTickets.filter((x) => x.did === "filed" || x.did === "reopened")) {
+                const row = store.fingerprint(b.projectId, t.fingerprint);
+                if (row === null || row.ticketKey === null) continue;
+                filed.set(row.ticketKey, [...(filed.get(row.ticketKey) ?? []), row]);
+              }
+              for (const [ticketKey, rows] of filed) {
+                if (rows.every((r) => autoAdopted(r.severity, config))) continue;
+                const alerts = (b.depsLook?.alerts ?? []).filter((a) => rows.some((r) => r.fingerprint === a.fingerprint));
+                const ticket = await ticketStates([ticketKey]).then((m) => m.get(ticketKey) ?? null).catch(() => null);
+                if (ticket !== null && (ticket.stateType === "completed" || ticket.stateType === "canceled" || (ticket.labels ?? []).some((l) => lc(l) === lc(config.file.label)))) continue;
+                // The deadline is the earliest the look computed for the
+                // ticket's alerts (alert created_at + SLA), the same date the
+                // wake showed the steward when it filed.
+                const dueAt = alerts.length > 0 ? Math.min(...alerts.map((a) => a.dueAt)) : deadlineAt((rows[0]!.severity ?? "medium") as DependabotSeverity, config.file.deps.sla, now());
+                raiseAdoption(b, config, ticketKey, rows, alerts, ticket, dueAt);
+              }
+            }
+          }
           // BB-53: a deployment verdict the steward reached from the playbook's
           // rule. `deployed` settles the watch; `not-yet` puts it back to
           // awaiting; `failed` marks it failed. Once every watch is deployed
@@ -9629,7 +9842,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
               for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
               for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
-              for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
+              for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.filedByThread === null || f.filedByThread === undefined ? "" : `, filed by ${f.filedByThread}`}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
+              if (b.kind === "ops") {
+                for (const d of store.depsDecisions(b.projectId, b.entityId)) lines.push(`Decision ${d.ticketKey} (${d.status}, raised ${iso(d.raisedAt)}${d.raisedBy === null ? "" : ` by ${d.raisedBy}`}${d.needId === null ? "" : `, item ${d.needId}`}${d.snoozedUntil === null ? "" : `, snoozed until ${iso(d.snoozedUntil)}`}${d.reminded.length === 0 ? "" : `, reminded ${d.reminded.join(", ")}`}): ${d.fingerprints.join(", ")}${d.resolution === null ? "" : ` → ${d.resolution}`}`);
+              }
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),

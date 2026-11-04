@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_BATCH, DEFAULT_SLA, alertFingerprint, alertLine, batchAlert, deadlineAt, depsFindingSchema, dueDate, isBatchable, priorityFor, sightingOf } from "./deps.js";
+import { ADOPTION_CHOICES, DEFAULT_BATCH, DEFAULT_SLA, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, alertLine, batchAlert, dateInText, deadlineAt, depsFindingSchema, dueDate, isBatchable, overdue, priorityFor, reminderText, sightingOf, snoozeUntil } from "./deps.js";
 import type { DependabotAlert } from "./source-contract.js";
 
 const alert = (over: Partial<DependabotAlert> = {}): DependabotAlert => ({
@@ -135,5 +135,66 @@ describe("the defaults", () => {
   it("are the ticket's", () => {
     expect(DEFAULT_SLA).toEqual({ critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 });
     expect(DEFAULT_BATCH).toEqual({ medium: 7 * 86_400_000, low: 30 * 86_400_000 });
+  });
+});
+
+describe("the SLA clock is the alert's own created_at", () => {
+  it("starts at created_at when it parses, else at first seen", () => {
+    expect(alertClockAt(alert({ createdAt: "2026-10-29T00:19:43Z" }), now)).toBe(Date.parse("2026-10-29T00:19:43Z"));
+    expect(alertClockAt(alert({ createdAt: null }), now)).toBe(now);
+    expect(alertClockAt(alert({ createdAt: "not a date" }), now)).toBe(now);
+  });
+
+  it("gives a binding recreated later the same deadline, not a fresh one (SC-111)", () => {
+    const created = Date.parse("2026-10-29T00:19:43Z");
+    const filedBy = deadlineAt("medium", DEFAULT_SLA, alertClockAt(alert({ createdAt: "2026-10-29T00:19:43Z" }), created));
+    const recreatedAt = Date.parse("2026-10-31T15:48:52Z");
+    const seenAgain = deadlineAt("medium", DEFAULT_SLA, alertClockAt(alert({ createdAt: "2026-10-29T00:19:43Z" }), recreatedAt));
+    expect(seenAgain).toBe(filedBy);
+    expect(dueDate(seenAgain, "UTC")).toBe("2026-11-05");
+    expect(dueDate(seenAgain, "America/New_York")).toBe("2026-11-04");
+  });
+
+  it("snoozes Keep tracking to the note's date, or one SLA window from now when it gives none", () => {
+    const at = Date.parse("2026-10-29T00:00:00Z");
+    expect(dateInText("Chose: Keep tracking — 2026-11-20")).toBe(Date.parse("2026-11-20T12:00:00Z"));
+    expect(dateInText("nothing here")).toBeNull();
+    expect(snoozeUntil("Chose: Keep tracking — 2026-11-20", "medium", DEFAULT_SLA, at)).toBe(Date.parse("2026-11-20T12:00:00Z"));
+    expect(snoozeUntil("Chose: Keep tracking", "medium", DEFAULT_SLA, at)).toBe(at + 7 * 86_400_000);
+  });
+});
+
+describe("the adoption decision", () => {
+  it("leads with Adopt when a fix exists and with Dismiss when none does", () => {
+    expect(adoptionChoices(true, true)).toEqual([ADOPTION_CHOICES.adopt, ADOPTION_CHOICES.keep, ADOPTION_CHOICES.dismiss]);
+    expect(adoptionChoices(false, true)).toEqual([ADOPTION_CHOICES.dismiss, ADOPTION_CHOICES.keep, ADOPTION_CHOICES.adopt]);
+  });
+
+  it("offers no Dismiss when the playbook's may list does not allow it", () => {
+    expect(adoptionChoices(true, false)).toEqual([ADOPTION_CHOICES.adopt, ADOPTION_CHOICES.keep]);
+    expect(adoptionChoices(false, false)).toEqual([ADOPTION_CHOICES.keep, ADOPTION_CHOICES.adopt]);
+    expect(adoptionHow(false)).not.toMatch(/Dismiss/u);
+    expect(adoptionHow(true)).toMatch(/Dismiss as not used/u);
+  });
+
+  it("asks one line naming the ticket, the alerts, the fix and the due date, and says when it is overdue", () => {
+    const echo = { severity: "medium" as const, package: "github.com/labstack/echo/v4", ecosystem: "go", fixedVersion: null };
+    expect(adoptionQuestion("SC-111", "bitcomplete/santaclaw", [echo, echo], "2026-11-04")).toBe("Adopt SC-111? medium Dependabot alerts (2) on bitcomplete/santaclaw: github.com/labstack/echo/v4 (go), no fixed version, due 2026-11-04.");
+    expect(adoptionQuestion("ENG-50", "acme/web", [alert()], null)).toBe("Adopt ENG-50? high Dependabot alert on acme/web: lodash (npm), fix available.");
+    expect(adoptionQuestion("ENG-50", "acme/web", [alert({ severity: "low" }), alert({ severity: "medium", package: "axios", fixedVersion: null })], "2026-11-01")).toMatch(/^Adopt ENG-50\? medium\/low Dependabot alerts \(2\) on acme\/web: lodash, axios \(npm\), fix for 1 of 2, due 2026-11-01\.$/u);
+    expect(adoptionQuestion("ENG-50", "acme/web", [alert()], "2026-11-04", 2)).toMatch(/due 2026-11-04\. Overdue by 2 days\.$/u);
+    expect(adoptionQuestion("ENG-50", "acme/web", [alert()], "2026-11-04", 1)).toMatch(/Overdue by 1 day\.$/u);
+  });
+
+  it("words the one overdue reminder with the days past the due date", () => {
+    expect(overdue(Date.parse("2026-11-04T12:00:00Z"), Date.parse("2026-11-04T12:00:00Z"), "UTC")).toBe(false);
+    expect(overdue(Date.parse("2026-11-04T12:00:00Z"), Date.parse("2026-11-05T12:00:00Z"), "UTC")).toBe(true);
+    expect(reminderText("SC-111", "2026-11-04", Date.parse("2026-11-05T12:00:00Z"), "UTC")).toBe("SC-111 is a day past its due date (2026-11-04) and still unadopted.");
+    expect(reminderText("SC-111", "2026-11-04", Date.parse("2026-11-10T12:00:00Z"), "UTC")).toBe("SC-111 is 6 days past its due date (2026-11-04) and still unadopted.");
+  });
+
+  it("parses an older look without the ticket's labels or created_at", () => {
+    const parsed = depsFindingSchema.parse({ fingerprint: "acme/web#4", alertNumber: 4, severity: "high", package: "lodash", ecosystem: "npm", manifestPath: null, ghsaId: null, fixedVersion: null, summary: "x", state: "open", url: null, dueAt: now, priority: "high", class: "new", ticket: null, ticketState: null, closedAt: null, window: null, assignee: "Jane", firstSeenAt: now, lastCommentedAt: null, batch: { kind: "new" } });
+    expect(parsed).toMatchObject({ ticketLabels: [], alertCreatedAt: null });
   });
 });

@@ -314,10 +314,10 @@ export type OpsLook = z.infer<typeof opsLookSchema>;
 export type RawLook = Omit<OpsLook, "at" | "target" | "error" | "findings"> & { sightings: Sighting[] };
 
 /** A fingerprint map row, as classification needs it. */
-export type FingerprintRow = { fingerprint: string; ticketKey: string | null; firstSeenAt: number; lastCommentedAt: number | null };
+export type FingerprintRow = { fingerprint: string; ticketKey: string | null; firstSeenAt: number; lastCommentedAt: number | null; filedByThread?: string | null };
 
-/** A ticket's state as the linear plugin reports it; null when it could not be read. */
-export type TicketState = { state: string; stateType: string | null; closedAt?: string | null } | null;
+/** A ticket's state as the linear plugin reports it; null when it could not be read. `labels` and `url` are read for the dependency watch. */
+export type TicketState = { state: string; stateType: string | null; closedAt?: string | null; labels?: string[]; url?: string | null } | null;
 
 /** How long a resolved ticket is still "within two weeks" for a returned problem. */
 export const CLOSED_WINDOW_MS = 14 * 86_400_000;
