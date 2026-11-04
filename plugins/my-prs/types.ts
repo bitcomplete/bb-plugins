@@ -18,6 +18,11 @@ export type PullRequest = z.infer<typeof pullRequestSchema>;
 
 export const selectionSchema = pullRequestSchema.pick({ id: true, activity: true });
 export type Selection = z.infer<typeof selectionSchema>;
+export const closeResultSchema = z.discriminatedUnion("kind", [
+  z.object({ id: z.string(), kind: z.literal("closed") }),
+  z.object({ id: z.string(), kind: z.literal("failed"), message: z.string() }),
+]);
+export type CloseResult = z.infer<typeof closeResultSchema>;
 export const dispatchSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("none") }),
   z.object({ kind: z.literal("starting") }),

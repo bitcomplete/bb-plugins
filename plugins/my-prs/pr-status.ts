@@ -22,6 +22,10 @@ export function prStatus(row: Row): PrStatus {
   return "waiting";
 }
 
+export function threadWorking(row: Row): boolean {
+  return ["starting", "pending", "active", "running", "stopping"].includes(row.threadStatus ?? "");
+}
+
 export function statusDescription(row: Row): string {
   if (row.turn && !row.dismissed) return row.turn.why;
   if (row.draft) return "Draft";

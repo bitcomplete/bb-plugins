@@ -35,6 +35,12 @@ approval notes need a reply. Drafts count. Workstreams is not required.
   For an interrupted or ambiguous start, check the existing threads first.
   Clearing retains the thread in BB.
 
+Closing PRs is a page-only action. The user selects 1–20 PRs, chooses **Close
+selected**, and confirms in the dialog, which needs pull request write access. No
+command or agent tool closes a PR, and Address threads must not close PRs. After
+a close fails, the PR might still have closed on GitHub, so run `poll` before you
+report its state. Closing does not stop a linked thread.
+
 Never dispatch automatically or use `clear` while its linked thread is working.
 Never treat a cached row as current after a failed poll. The plugin stores GitHub tokens as secrets;
 read them only through the plugin's configured transport, never print them.

@@ -18,7 +18,8 @@ bb my-prs poll --json
 Open **My PRs** in the sidebar. The first successful refresh shows your open
 PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
-The token needs read access to the repositories you want to follow.
+The token needs read access to the repositories you want to follow. To close PRs
+from the page, the `gh` login or token also needs pull request write access.
 
 The page uses Workstreams' PR layout: an amber **Your turn** section followed by
 an always-visible **Other open PRs** section, each with its own count and empty
@@ -74,7 +75,7 @@ A batch spanning different mapped projects requires a choice. The thread finds c
 runs checks, pushes changes, and replies to outstanding review comments, including
 bot comments. It also resolves merge conflicts and fixes failing CI. For approved
 PRs without outstanding work, it verifies readiness and reports the result.
-The prompt forbids merging, approving, closing PRs, and automatic thread resolution. The plugin itself only reads GitHub.
+The prompt forbids merging, approving, closing PRs, and automatic thread resolution.
 
 **Hold…** moves a PR to a faded **On hold** section at the bottom for 1 hour,
 until tomorrow at 9 AM in your browser’s timezone, or for 1 week. Held PRs stay
@@ -90,6 +91,33 @@ Select previously threaded PRs to include them in a new batch. Their links updat
 to the new thread after it starts. Simultaneous start requests cannot dispatch
 the same PR twice. If a start fails without returning a thread, check your
 threads before using **Clear attempt** to retry.
+
+## Close PRs
+
+To close PRs, select 1 to 20 and choose **Close selected**. The dialog lists each
+PR's repository, number, and title, and it starts on **Cancel**. Closing has no
+keyboard shortcut or CLI command, and the prompt for threads that My PRs starts
+still forbids closing PRs. My PRs only closes each PR. It never merges, deletes a
+branch, or adds a comment.
+
+After you confirm, My PRs reads each PR from GitHub and closes it, one PR at a
+time. It closes a PR only if it remains your open PR in an allowed repository and
+its head and human feedback match the selected row. This check does not cover
+changes to CI, the title, or draft status. GitHub's close mutation has no
+expected-head condition, so My PRs cannot detect a push between its read and the
+close.
+
+The dialog stays open and reports each result. PRs that GitHub confirms as closed
+leave the list immediately. A PR that GitHub no longer reports as your open PR in
+an allowed repository also leaves the list, and it reports a failure because My
+PRs did not close it. Other PRs stay listed and selected, and My PRs never retries
+automatically. A failed request might still have closed a PR, so choose **Refresh
+GitHub** before you retry. If the refresh finds a new head or new human feedback,
+select that PR again.
+
+Closing a PR does not stop its linked thread, and the dialog tells you when a
+selected PR has a working thread. A PR with an Address start in progress cannot
+close until that start finishes.
 
 ## Feedback rules
 

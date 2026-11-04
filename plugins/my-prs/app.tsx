@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { definePluginApp, UrlLink, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { AddressProjectDialog } from "./address-project-dialog.js";
+import { ClosePrsDialog } from "./close-prs-dialog.js";
 import { PrOverview } from "./pr-overview.js";
-import { PR_STATUSES, prStatus, statusDescription, type PrStatus } from "./pr-status.js";
+import { PR_STATUSES, prStatus, statusDescription, threadWorking, type PrStatus } from "./pr-status.js";
 import type { ExperimentalBadge } from "@get-bb/plugin-sdk/app";
 import { groupByOrganization } from "./areas.js";
 import { cn } from "./lib/utils.js";
@@ -71,7 +72,7 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
   const since = row.turn && !row.dismissed ? row.turn.since : Date.parse(row.updatedAt);
   const info = holdLabel ?? `${why}${since === null ? "" : ` · ${age(since, now)} ago`}`;
   const threadLabel = row.threadStatus === "idle" ? "Idle" : row.threadStatus === "error" ? "Failed"
-    : ["starting", "pending", "active", "running", "stopping"].includes(row.threadStatus ?? "") ? "Working" : "Open thread";
+    : threadWorking(row) ? "Working" : "Open thread";
   const threadTone = kind !== "turn" || threadLabel === "Idle" ? GRAY : row.threadStatus === "error"
     ? "bg-rose-500/10 text-[light-dark(var(--color-rose-800),var(--color-rose-200))]" : BLUE;
   return <li className={cn("group min-w-0 rounded-md hover:bg-foreground/[0.03]", selected && "bg-sky-500/[0.07]")}>
@@ -145,6 +146,7 @@ export function MyPrsPage() {
   const [selected, setSelected] = useState<Map<string, string>>(new Map());
   const [pending, setPending] = useState(false);
   const [addressItems, setAddressItems] = useState<Row[] | null>(null);
+  const [closeItems, setCloseItems] = useState<Row[] | null>(null);
   const [polling, setPolling] = useState(false);
   const [filter, setFilter] = useState(restoredFilter);
   const [dismissedOpen, setDismissedOpen] = useState(false);
@@ -160,6 +162,7 @@ export function MyPrsPage() {
   const chosen = rows.filter((row) => selected.get(row.id) === row.activity);
   const now = Date.now();
   const ready = view !== null;
+  const closing = pending && closeItems !== null;
 
   useLayoutEffect(() => {
     if (ready && scrollRef.current) scrollRef.current.scrollTop = scrollPositions.get(filter) ?? 0;
@@ -194,6 +197,15 @@ export function MyPrsPage() {
     } catch (cause) { refresh(); throw cause; }
     finally { setPending(false); }
   };
+  const closePrs = async (items: Row[]) => {
+    setPending(true); setError(null);
+    try {
+      const { results } = await rpc.call("close_prs", { items: items.map(({ id, activity }) => ({ id, activity })) });
+      const closed = new Set(results.flatMap((result) => result.kind === "closed" ? [result.id] : []));
+      setSelected((current) => new Map([...current].filter(([id]) => !closed.has(id))));
+      return results;
+    } finally { refresh(); setPending(false); }
+  };
   const pickScope = (items: readonly Row[], select: boolean) => setSelected((current) => {
     const next = new Map(current);
     for (const row of items) { if (select) next.set(row.id, row.activity); else next.delete(row.id); }
@@ -213,17 +225,17 @@ export function MyPrsPage() {
     catch (cause) { report(cause); }
     finally { setPolling(false); }
   };
-  const shortcuts = useRef({ run: () => {}, clear: () => {}, count: 0, enabled: false });
+  const shortcuts = useRef({ run: () => {}, clear: () => {}, count: 0, enabled: false, locked: false });
   shortcuts.current = { run: () => { void address(chosen); }, clear: () => setSelected(new Map()), count: chosen.length,
-    enabled: !pending && chosen.length <= 20 };
+    enabled: !pending && chosen.length <= 20, locked: closeItems !== null };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const root = rootRef.current;
       const active = document.activeElement;
       if (!root || (active && active !== document.body && !root.contains(active))) return;
-      if (event.metaKey || event.ctrlKey || event.altKey || (event.target instanceof HTMLElement &&
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || (event.target instanceof HTMLElement &&
         (event.target.isContentEditable || event.target.closest("input:not([type=checkbox]):not([type=radio]), textarea, select, [contenteditable]")))) return;
-      if (shortcuts.current.count === 0) return;
+      if (shortcuts.current.count === 0 || shortcuts.current.locked) return;
       if (event.key === "Escape") { event.preventDefault(); shortcuts.current.clear(); }
       else if (event.key === "b" && !event.repeat && shortcuts.current.enabled) { event.preventDefault(); shortcuts.current.run(); }
     };
@@ -327,18 +339,25 @@ export function MyPrsPage() {
     {chosen.length > 0 ? <div aria-label="Selection" className="shrink-0 border-t border-border bg-background">
       <div className={cn(COLUMN, "flex flex-wrap items-center gap-1.5 px-4 py-1.5 text-[12px]")}>
         <b className="mr-1 font-semibold">{chosen.length} selected</b>
-        <button type="button" disabled={pending || chosen.length > 20} aria-busy={pending || undefined}
+        <button type="button" disabled={pending || chosen.length > 20} aria-busy={(pending && !closing) || undefined}
           aria-label={`Start thread for ${chosen.length} selected`} title="Send the selected PRs to one thread" onClick={() => { void address(chosen); }}
           className={cn(BUTTON, "border-foreground bg-foreground font-medium text-background")}>
-          {pending ? <><Spin />Starting…</> : <>Start thread<Kbd inverted>b</Kbd></>}
+          {pending && !closing ? <><Spin />Starting…</> : <>Start thread<Kbd inverted>b</Kbd></>}
+        </button>
+        <button type="button" disabled={pending || chosen.length > 20} aria-busy={closing || undefined}
+          title="Close the selected PRs on GitHub after you confirm" onClick={() => setCloseItems(chosen)}
+          className={cn(BUTTON, "border-border hover:bg-foreground/[0.06]")}>
+          {closing ? <><Spin />Closing…</> : "Close selected"}
         </button>
         <span className="flex-1" />
-        <span className="text-[11px] text-muted-foreground">{chosen.length > 20 ? "Select up to 20 PRs" : "One thread"}</span>
+        {chosen.length > 20 ? <span className="text-[11px] text-muted-foreground">Select up to 20 PRs</span> : null}
         <button type="button" onClick={() => setSelected(new Map())} className={GHOST}>Clear<Kbd>esc</Kbd></button>
       </div>
     </div> : null}
     {addressItems === null ? null : <AddressProjectDialog items={addressItems} onClose={() => setAddressItems(null)}
       onStart={(projectId) => startAddress(addressItems, projectId)} />}
+    {closeItems === null ? null : <ClosePrsDialog items={closeItems} onDismiss={() => setCloseItems(null)}
+      onConfirm={() => closePrs(closeItems)} onRefreshGithub={() => { void poll(); }} />}
   </div>;
 }
 

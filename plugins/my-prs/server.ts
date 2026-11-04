@@ -4,8 +4,8 @@ import { z } from "zod";
 import { importLegacy } from "./import-legacy.js";
 import { parseOrganizationProjects, projectChoiceSchema, suggestedProject } from "./projects.js";
 import { createGithubClient, githubTransport, GithubRateLimitError, type Transport } from "./github.js";
-import { pollSchema, pullRequestSchema, savedStateSchema, selectionSchema, viewSchema,
-  type PullRequest, type Row, type SavedState, type Selection } from "./types.js";
+import { closeResultSchema, pollSchema, pullRequestSchema, savedStateSchema, selectionSchema, viewSchema,
+  type CloseResult, type PullRequest, type Row, type SavedState, type Selection } from "./types.js";
 
 export const rpcContract = defineRpcContract({
   prs_get: { input: z.null(), output: viewSchema },
@@ -16,6 +16,7 @@ export const rpcContract = defineRpcContract({
     output: projectChoiceSchema.extend({ projects: z.array(z.object({ id: z.string(), name: z.string() })) }) },
   address: { input: z.object({ items: z.array(selectionSchema).min(1).max(20), projectId: z.string().min(1).optional() }), output: z.object({ threadId: z.string() }) },
   clear_dispatch: { input: z.object({ id: z.string() }), output: z.object({ ok: z.literal(true) }) },
+  close_prs: { input: z.object({ items: z.array(selectionSchema).min(1).max(20) }), output: z.object({ results: z.array(closeResultSchema) }) },
 });
 
 export function addressPrompt(prs: PullRequest[]): string {
@@ -107,10 +108,14 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       });
     }
     let polling: Promise<z.infer<typeof pollSchema>> | null = null;
+    // Rows removed while a poll runs, so its older read cannot restore them. Later polls can list them again.
+    let removedDuringPoll: Set<string> | null = null;
     async function poll(signal = lifecycle.signal) {
       if (polling) return polling;
       polling = (async () => {
         const startedRevision = revision;
+        const removed = new Set<string>();
+        removedDuringPoll = removed;
         const previous = await readPoll();
         let result: z.infer<typeof pollSchema>;
         try {
@@ -121,7 +126,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
           db.transaction(() => {
             db.prepare("DELETE FROM prs").run();
             const insert = db.prepare("INSERT INTO prs (id, body) VALUES (?, ?)");
-            for (const pr of snapshot.prs) insert.run(pr.id, JSON.stringify(pr));
+            for (const pr of snapshot.prs) if (!removed.has(pr.id)) insert.run(pr.id, JSON.stringify(pr));
           })();
           const at = new Date().toISOString();
           result = { at, login: snapshot.login, error: null, lastSuccess: at, retryAt: null };
@@ -135,7 +140,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         await bb.storage.kv.set("poll", result);
         bb.realtime.publish("prs-changed", {});
         return result;
-      })().finally(() => { polling = null; });
+      })().finally(() => { polling = null; removedDuringPoll = null; });
       return polling;
     }
 
@@ -169,6 +174,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       return pr;
     }
     const addressing = new Set<string>();
+    const closing = new Set<string>();
     async function address(items: Selection[], override?: string) {
       if (new Set(items.map((item) => item.id)).size !== items.length) throw new Error("Select each PR once.");
       const configuration = current;
@@ -206,6 +212,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         throw new Error(`Could not verify the current feedback: ${cause instanceof Error ? cause.message : String(cause)}`);
       }
       if (current !== configuration) throw new Error("Settings changed. Try again.");
+      items.forEach(checked);
       db.transaction(() => {
         for (const [index, item] of items.entries()) {
           const pr = refreshed[index];
@@ -216,6 +223,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       bb.realtime.publish("prs-changed", {});
       const selected = items.map((item) => {
         const pr = checked(item), state = readState(pr.id);
+        if (closing.has(pr.id)) throw new Error("This PR is closing. Refresh after the close finishes.");
         if (addressing.has(pr.id) || state.dispatch.kind === "starting" || state.dispatch.kind === "uncertain" ||
           JSON.stringify(state.dispatch) !== dispatches.get(pr.id)) throw new Error("This PR already has a dispatch in progress. Open its thread, or clear the previous attempt first.");
         return pr;
@@ -241,6 +249,51 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       } finally { for (const pr of selected) addressing.delete(pr.id); }
     }
 
+    function removeRow(id: string) {
+      removedDuringPoll?.add(id);
+      db.prepare("DELETE FROM prs WHERE id = ?").run(id);
+      bb.realtime.publish("prs-changed", {});
+    }
+
+    async function closePr(item: Selection, client: ReturnType<typeof githubClient>, allowed: string[], startedRevision: number): Promise<CloseResult> {
+      try {
+        const cached = checked(item);
+        const live = await client.fetchPullRequest(item.id, allowed, lifecycle.signal);
+        if (revision !== startedRevision) throw new Error("GitHub settings changed. Refresh and try again.");
+        if (!live) {
+          removeRow(item.id);
+          throw new Error("GitHub no longer reports this as your open PR in an allowed repository, so My PRs removed it from the list.");
+        }
+        if (live.activity !== item.activity || live.head !== cached.head) throw new Error("This PR changed on GitHub. Refresh and select it again.");
+      } catch (cause) { return { id: item.id, kind: "failed", message: cause instanceof Error ? cause.message : String(cause) }; }
+      try { await client.closePullRequest(item.id, lifecycle.signal); }
+      catch (cause) {
+        const error = cause instanceof Error ? cause.message : String(cause);
+        bb.log.warn(JSON.stringify({ message: "Closing a PR failed", id: item.id, error }));
+        return { id: item.id, kind: "failed", message: `GitHub did not confirm this close. Refresh GitHub before you retry. Details: ${error}` };
+      }
+      removeRow(item.id);
+      return { id: item.id, kind: "closed" };
+    }
+
+    async function closePrs(items: Selection[]) {
+      if (new Set(items.map((item) => item.id)).size !== items.length) throw new Error("Select each PR once.");
+      const busy = new Set(items.map((item) => item.id).filter((id) => closing.has(id) || addressing.has(id) || readState(id).dispatch.kind === "starting"));
+      const reserved = items.map((item) => item.id).filter((id) => !busy.has(id));
+      for (const id of reserved) closing.add(id);
+      try {
+        const startedRevision = revision;
+        const client = githubClient();
+        const allowed = current.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean);
+        // GitHub's close mutation has no expected-head check, so each close must directly follow its own verification.
+        const results: CloseResult[] = [];
+        for (const item of items) results.push(busy.has(item.id)
+          ? { id: item.id, kind: "failed", message: "This PR has a close or thread start in progress. Refresh after it finishes." }
+          : await closePr(item, client, allowed, startedRevision));
+        return { results };
+      } finally { for (const id of reserved) closing.delete(id); }
+    }
+
     const handlers = {
       prs_get: view, poll_now: () => poll(),
       dismiss: async ({ id, activity, dismissed }: Selection & { dismissed: boolean }) => {
@@ -264,6 +317,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
           ? { projects, projectId: null, reason: "choose" as const } : { projects, ...choice };
       },
       address: ({ items, projectId }: { items: Selection[]; projectId?: string }) => address(items, projectId),
+      close_prs: ({ items }: { items: Selection[] }) => closePrs(items),
       clear_dispatch: async ({ id }: { id: string }) => {
         const state = readState(id);
         if (addressing.has(id) || state.dispatch.kind === "starting") throw new Error("The thread is still starting.");

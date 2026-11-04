@@ -16,12 +16,20 @@ up to 20 into one thread. Selections persist across state filters. Approved,
 conflicting, draft, held, dismissed, and previously threaded PRs are selectable.
 The thread addresses outstanding comments, resolves conflicts, and fixes CI.
 It verifies readiness when no changes are needed. Its instructions forbid
-merging. The plugin starts no work automatically and only reads GitHub itself.
+merging and closing PRs. The plugin starts no work automatically.
 Started PRs keep their thread links after the feedback clears.
+
+## Close PRs
+
+Select up to 20 PRs and choose **Close selected**. A confirmation lists each PR,
+and My PRs closes only PRs whose head and human feedback still match your
+selection on GitHub. It reports a result for each PR. Closing never merges,
+deletes a branch, or stops a linked thread.
 
 ## Requirements
 
 Use the BB server's authenticated GitHub CLI or configure a secret GitHub token.
+Closing PRs requires pull request write access.
 Choose a BB project for PR threads. Projects with a repo set provision a
 fresh Multi-repo workspace on their default machine; other projects use their
 default checkout. Optional provider and model settings override that project's

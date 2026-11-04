@@ -1,3 +1,6 @@
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGithubClient, githubTransport, GithubRateLimitError, type Transport } from "./github.js";
 import { comment, fixture, page, transportFor } from "./fixtures.js";
@@ -43,7 +46,7 @@ describe("GitHub reads", () => {
 });
 
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 it("reads a normal PR's feedback in two calls, including the final head check", async () => {
   const base = transportFor(() => [fixture()]);
@@ -142,4 +145,46 @@ it("accepts the last successful response and honors secondary-limit retry-after"
     expect(cause).toBeInstanceOf(GithubRateLimitError);
     if (cause instanceof GithubRateLimitError) expect(Date.parse(cause.retryAt)).toBeGreaterThanOrEqual(before + 120_000);
   }
+});
+
+describe("closing a PR", () => {
+  const closeMutation = "mutation($id:ID!) { closePullRequest(input:{pullRequestId:$id}) { pullRequest { id state } } }";
+  const closedResponse = { data: { closePullRequest: { pullRequest: { id: "PR_1", state: "CLOSED" } } } };
+
+  it("binds the id as a variable and asks GitHub only to close the PR", async () => {
+    const transport = vi.fn<Transport>(async () => closedResponse.data);
+    await createGithubClient(transport).closePullRequest("PR_1");
+    expect(transport.mock.calls).toEqual([[closeMutation, { id: "PR_1" }, undefined]]);
+  });
+
+  it.each([
+    ["another PR", { closePullRequest: { pullRequest: { id: "PR_2", state: "CLOSED" } } }],
+    ["an open PR", { closePullRequest: { pullRequest: { id: "PR_1", state: "OPEN" } } }],
+    ["a merged PR", { closePullRequest: { pullRequest: { id: "PR_1", state: "MERGED" } } }],
+    ["no PR", { closePullRequest: { pullRequest: null } }],
+    ["no payload", { closePullRequest: null }],
+  ])("refuses to report a close when GitHub returns %s", async (_name, response) => {
+    await expect(createGithubClient(async () => response).closePullRequest("PR_1")).rejects.toThrow("did not report this PR as closed");
+  });
+
+  it("closes through a configured token", async () => {
+    const fetcher = vi.fn(async (_url: string, _init: RequestInit) => new Response(JSON.stringify(closedResponse)));
+    vi.stubGlobal("fetch", fetcher);
+    await createGithubClient(githubTransport("test-token")).closePullRequest("PR_1");
+    const [url, init] = fetcher.mock.calls[0] ?? [];
+    expect(url).toBe("https://api.github.com/graphql");
+    expect(init).toMatchObject({ method: "POST", headers: { authorization: "Bearer test-token" } });
+    expect(JSON.parse(String(init?.body))).toEqual({ query: closeMutation, variables: { id: "PR_1" } });
+  });
+
+  it("closes through the authenticated gh CLI", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "my-prs-gh-"));
+    try {
+      await writeFile(join(dir, "gh"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${dir}/args"\nprintf 'HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n%s' '${JSON.stringify(closedResponse)}'\n`);
+      await chmod(join(dir, "gh"), 0o755);
+      vi.stubEnv("PATH", `${dir}:${process.env.PATH ?? ""}`);
+      await createGithubClient(githubTransport()).closePullRequest("PR_1");
+      expect((await readFile(join(dir, "args"), "utf8")).trim().split("\n")).toEqual(["api", "graphql", "--include", "-f", `query=${closeMutation}`, "-f", "id=PR_1"]);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
 });

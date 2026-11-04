@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
-import { rpcContract } from "./server.js";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { loadPluginApp, renderSlot, type RenderSlotOptions } from "@get-bb/plugin-sdk/testing/app";
+import { createPlugin, rpcContract } from "./server.js";
 import { feedbackOf } from "./feedback.js";
-import { fixture } from "./fixtures.js";
-import type { View } from "./types.js";
+import { fixture, transportFor } from "./fixtures.js";
+import type { CloseResult, View } from "./types.js";
 import { prsCache } from "./app.js";
 
 it("shares a snapshot between the page and badge and renders cached rows immediately on return", async () => {
@@ -29,9 +30,9 @@ it("shares a snapshot between the page and badge and renders cached rows immedia
   expect(calls).toBe(1);
 });
 
-const cleanups: (() => void)[] = [];
+const cleanups: (() => void | Promise<void>)[] = [];
 beforeEach(() => { vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} })); });
-afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); prsCache.clear(); sessionStorage.clear(); vi.unstubAllGlobals(); });
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); prsCache.clear(); sessionStorage.clear(); vi.unstubAllGlobals(); });
 const targets = () => ({ projects: [{ id: "project-test", name: "Default" }, { id: "project-parsley", name: "Parsley" }], projectId: "project-test", reason: "default" });
 async function confirmAddress() {
   const dialog = within(await screen.findByRole("dialog"));
@@ -63,7 +64,7 @@ it("selects feedback and starts one explicit batch, then navigates to its thread
   expect(JSON.stringify(calls)).toContain(prs[1]?.activity);
 });
 
-async function renderFeedback(rows: View["rows"]) {
+async function renderFeedback(rows: View["rows"], rpc: RenderSlotOptions["rpc"] = {}) {
   const app = await loadPluginApp(() => import("./app.js"));
   const panel = app.navPanels[0];
   if (!panel) throw new Error("Missing feedback page");
@@ -71,6 +72,7 @@ async function renderFeedback(rows: View["rows"]) {
     prs_get: () => ({ rows, project: "project-test", poll: null }),
     address_targets: targets,
     address: () => ({ threadId: "thread-address" }), dismiss: () => ({ ok: true }), clear_dispatch: () => ({ ok: true }),
+    ...rpc,
   } });
   cleanups.push(() => slot.lifecycle.unmount());
   await slot.findByRole("heading", { name: "Your turn" });
@@ -422,4 +424,186 @@ it("shift-selects across sections without including collapsed dismissed PRs", as
   fireEvent.click(slot.getByText("1 dismissed · show"));
   fireEvent.click(slot.getByLabelText("Select example/editor#2"));
   expect(slot.getByText("3 selected")).toBeTruthy();
+});
+
+type Slot = Awaited<ReturnType<typeof renderFeedback>>;
+const closeCalls = (slot: Slot) => slot.inspection.rpcCalls.filter((call) => call.method === "close_prs");
+async function openClose(slot: Slot) {
+  fireEvent.click(slot.getByRole("button", { name: "Close selected" }));
+  return within(await screen.findByRole("dialog"));
+}
+
+it("lists every selected PR before closing, starts on Cancel, and sends nothing when cancelled", async () => {
+  const slot = await renderFeedback([row(1), row(2), row(3)], { close_prs: () => ({ results: [] }) });
+  fireEvent.click(slot.getByLabelText("Select example/editor#1"));
+  fireEvent.click(slot.getByLabelText("Select example/editor#2"));
+  const dialog = await openClose(slot);
+  for (const number of [1, 2]) {
+    expect(dialog.getByText(`example/editor#${number}`)).toBeTruthy();
+    expect(dialog.getByText(`Improve the editor ${number}`)).toBeTruthy();
+  }
+  expect(dialog.queryByText("example/editor#3")).toBeNull();
+  expect(document.activeElement).toBe(dialog.getByRole("button", { name: "Cancel" }));
+  expect(dialog.getByRole("button", { name: "Close 2 PRs" }).className).toContain("bg-destructive");
+  fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  await openClose(slot);
+  fireEvent.keyDown(document.body, { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  // In a browser, the dialog can finish closing before this Escape reaches the page's own handler.
+  const handled = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+  handled.preventDefault();
+  fireEvent(window, handled);
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  expect(closeCalls(slot)).toEqual([]);
+});
+
+it("sends the selection captured when the dialog opened, even after the queue changes", async () => {
+  let rows = [row(1), row(2)];
+  const slot = await renderFeedback(rows, { prs_get: () => ({ rows, project: "project-test", poll: null }), close_prs: () => ({ results: [] }) });
+  fireEvent.click(slot.getByLabelText("Select all listed PRs"));
+  const dialog = await openClose(slot);
+  rows = [{ ...row(1), activity: "newer" }, row(2)];
+  await slot.behavior.emitRealtime("prs-changed", {});
+  await waitFor(() => expect(slot.getByText("1 selected")).toBeTruthy());
+  expect(dialog.getByText("example/editor#1")).toBeTruthy();
+  fireEvent.click(dialog.getByRole("button", { name: "Close 2 PRs" }));
+  await waitFor(() => expect(closeCalls(slot)).toHaveLength(1));
+  expect(closeCalls(slot)[0]?.input).toEqual({ items: [{ id: "PR_1", activity: row(1).activity }, { id: "PR_2", activity: row(2).activity }] });
+});
+
+it("blocks competing actions while closing, then keeps the dialog open to show each result", async () => {
+  let finish = (_results: CloseResult[]) => {};
+  const finished = new Promise<CloseResult[]>((resolve) => { finish = resolve; });
+  const slot = await renderFeedback([row(1), row(2)], {
+    close_prs: async () => ({ results: await finished }),
+    poll_now: () => ({ at: "2026-10-19T12:00:00Z", lastSuccess: "2026-10-19T12:00:00Z", login: "me", error: null, retryAt: null }),
+  });
+  fireEvent.click(slot.getByLabelText("Select all listed PRs"));
+  const dialog = await openClose(slot);
+  const confirm = dialog.getByRole("button", { name: "Close 2 PRs" });
+  act(() => { confirm.click(); confirm.click(); });
+  expect(closeCalls(slot)).toHaveLength(1);
+  expect(confirm).toHaveProperty("disabled", true);
+  expect(confirm.textContent).toBe("Closing…");
+  expect(dialog.getByRole("status").textContent).toBe("Closing 2 pull requests…");
+  expect(dialog.getByRole("button", { name: "Cancel" })).toHaveProperty("disabled", true);
+  expect(dialog.queryByRole("button", { name: "Close" })).toBeNull();
+  expect(slot.queryByText("Starting…")).toBeNull();
+  expect(slot.getByLabelText("Select example/editor#1")).toHaveProperty("disabled", true);
+  fireEvent.keyDown(document.body, { key: "Escape" });
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  // A browser can drop focus to the body when the focused button becomes disabled.
+  const outside = document.createElement("button"); document.body.append(outside); outside.focus(); outside.remove();
+  expect(document.activeElement).toBe(document.body);
+  fireEvent.keyDown(window, { key: "Escape" });
+  fireEvent.keyDown(window, { key: "b" });
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  expect(slot.inspection.rpcCalls.filter((call) => call.method === "address_targets")).toEqual([]);
+  await act(async () => { finish([{ id: "PR_1", kind: "closed" }, { id: "PR_2", kind: "failed", message: "This PR changed on GitHub." }]); await finished; });
+  const done = await dialog.findByRole("button", { name: "Done" });
+  expect(document.activeElement).toBe(done);
+  expect(dialog.getByRole("status").textContent).toBe("GitHub confirmed 1 of 2 closes. Unconfirmed PRs that remain listed stay selected. Refresh GitHub before you retry.");
+  expect(within(dialog.getByText("example/editor#1").closest("li") ?? document.body).getByText("Closed")).toBeTruthy();
+  expect(within(dialog.getByText("example/editor#2").closest("li") ?? document.body).getByText("This PR changed on GitHub.")).toBeTruthy();
+  fireEvent.click(done);
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(slot.getByLabelText("Select example/editor#2")).toHaveProperty("checked", true);
+  expect(slot.getByLabelText("Select example/editor#1")).toHaveProperty("checked", false);
+  expect(closeCalls(slot)).toHaveLength(1);
+});
+
+it("offers no refresh prompt after every selected PR closes", async () => {
+  const slot = await renderFeedback([row(1)], { close_prs: () => ({ results: [{ id: "PR_1", kind: "closed" }] }) });
+  fireEvent.click(slot.getByLabelText("Select example/editor#1"));
+  const dialog = await openClose(slot);
+  fireEvent.click(dialog.getByRole("button", { name: "Close 1 PR" }));
+  await dialog.findByRole("button", { name: "Done" });
+  expect(dialog.getByRole("status").textContent).toBe("Closed 1 pull request.");
+  expect(dialog.queryByRole("button", { name: "Refresh GitHub" })).toBeNull();
+});
+
+it("reports a failed close request without retrying, and refreshes GitHub only when asked", async () => {
+  const slot = await renderFeedback([row(1), row(2)], {
+    close_prs: () => { throw new Error("Connection lost"); },
+    poll_now: () => ({ at: "2026-10-19T12:00:00Z", lastSuccess: "2026-10-19T12:00:00Z", login: "me", error: null, retryAt: null }),
+  });
+  fireEvent.click(slot.getByLabelText("Select all listed PRs"));
+  const dialog = await openClose(slot);
+  fireEvent.click(dialog.getByRole("button", { name: "Close 2 PRs" }));
+  const alert = await dialog.findByRole("alert");
+  expect(alert.textContent).toContain("Connection lost");
+  expect(alert.textContent).toContain("Refresh GitHub before you try again");
+  expect(dialog.queryByRole("button", { name: "Close 2 PRs" })).toBeNull();
+  expect(slot.inspection.rpcCalls.filter((call) => call.method === "poll_now")).toEqual([]);
+  fireEvent.click(dialog.getByRole("button", { name: "Refresh GitHub" }));
+  await waitFor(() => expect(slot.inspection.rpcCalls.filter((call) => call.method === "poll_now")).toHaveLength(1));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  expect(closeCalls(slot)).toHaveLength(1);
+});
+
+it("explains that closing does not stop working threads, and stays quiet otherwise", async () => {
+  const slot = await renderFeedback([
+    { ...row(1), dispatch: { kind: "linked", threadId: "thread-working" }, threadStatus: "active" },
+    { ...row(2), dispatch: { kind: "linked", threadId: "thread-idle" }, threadStatus: "idle" },
+  ]);
+  fireEvent.click(slot.getByLabelText("Select example/editor#2"));
+  let dialog = await openClose(slot);
+  expect(dialog.queryByText(/does not stop/)).toBeNull();
+  fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  fireEvent.click(slot.getByLabelText("Select example/editor#1"));
+  dialog = await openClose(slot);
+  expect(dialog.getByText(/1 selected PR has a working thread.*does not stop its thread/)).toBeTruthy();
+});
+
+it("disables closing above the 20 PR batch limit", async () => {
+  const slot = await renderFeedback(Array.from({ length: 21 }, (_, index) => row(index + 1)));
+  fireEvent.click(slot.getByLabelText("Select all listed PRs"));
+  expect(slot.getByRole("button", { name: "Close selected" })).toHaveProperty("disabled", true);
+  expect(slot.getByText("Select up to 20 PRs")).toBeTruthy();
+});
+
+it("closes through the plugin server: a confirmed PR leaves, and a failed PR stays selected for a retry", async () => {
+  const data = [fixture(1), fixture(2)];
+  const github = transportFor(() => data);
+  const closes: (string | undefined)[] = [];
+  let denied = true;
+  const host = createFakePluginHost({ pluginId: "my-prs", settings: { project: "project-test" } });
+  cleanups.push(() => host.harness.lifecycle.dispose());
+  await createPlugin({ transport: async (query, variables, signal) => {
+    if (query.includes("closePullRequest")) {
+      closes.push(variables.id);
+      if (denied && variables.id === "PR_2") throw new Error("Resource not accessible");
+    }
+    return github(query, variables, signal);
+  } })(host.bb);
+  await host.harness.behavior.callRpc("poll_now", null);
+  const app = await loadPluginApp(() => import("./app.js"));
+  const panel = app.navPanels[0]; if (!panel) throw new Error("Missing My PRs");
+  const server = (method: string) => (input: unknown) => host.harness.behavior.callRpc(method, input);
+  const slot = renderSlot(panel, { subPath: "" }, { rpc: { prs_get: server("prs_get"), poll_now: server("poll_now"), close_prs: server("close_prs") } });
+  cleanups.push(() => slot.lifecycle.unmount());
+  fireEvent.click(await slot.findByLabelText("Select all listed PRs"));
+  const cancelled = await openClose(slot);
+  fireEvent.click(cancelled.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(closes).toEqual([]);
+  const dialog = await openClose(slot);
+  fireEvent.click(dialog.getByRole("button", { name: "Close 2 PRs" }));
+  await dialog.findByText(/Resource not accessible/);
+  expect(closes).toEqual(["PR_1", "PR_2"]);
+  denied = false;
+  fireEvent.click(dialog.getByRole("button", { name: "Refresh GitHub" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(slot.queryByText("Improve the editor 1")).toBeNull());
+  expect(slot.getByLabelText("Select example/editor#2")).toHaveProperty("checked", true);
+  const retry = await openClose(slot);
+  fireEvent.click(retry.getByRole("button", { name: "Close 1 PR" }));
+  await retry.findByRole("button", { name: "Done" });
+  expect(closes).toEqual(["PR_1", "PR_2", "PR_2"]);
+  expect(data.map((pr) => pr.state)).toEqual(["CLOSED", "CLOSED"]);
 });

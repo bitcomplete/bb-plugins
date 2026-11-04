@@ -98,6 +98,7 @@ const metadataFields = `id number title url isDraft headRefOid headRefName updat
 const commentFields = "id body createdAt updatedAt author { login __typename }";
 const threadCommentFields = `${commentFields} pullRequestReview { id }`;
 const pageFields = "pageInfo { hasNextPage endCursor }";
+const closedSchema = z.object({ closePullRequest: z.object({ pullRequest: z.object({ id: z.string(), state: z.string() }) }) });
 
 export function createGithubClient(transport: Transport) {
   async function pages<T extends z.ZodType>(options: {
@@ -176,8 +177,17 @@ export function createGithubClient(transport: Transport) {
       requested: requests.flatMap((request) => request.requestedReviewer?.login ? [request.requestedReviewer.login] : []) });
   }
 
+  async function closePullRequest(id: string, signal?: AbortSignal): Promise<void> {
+    const closed = closedSchema.safeParse(await transport(
+      "mutation($id:ID!) { closePullRequest(input:{pullRequestId:$id}) { pullRequest { id state } } }", { id }, signal));
+    if (!closed.success || closed.data.closePullRequest.pullRequest.id !== id || closed.data.closePullRequest.pullRequest.state !== "CLOSED") {
+      throw new Error("GitHub did not report this PR as closed.");
+    }
+  }
+
   return {
     fetchPullRequest,
+    closePullRequest,
     async fetchMyPrs(allowlist: string[], signal?: AbortSignal, knownIds: readonly string[] = []): Promise<{ login: string; prs: PullRequest[] }> {
       const { viewer } = z.object({ viewer: z.object({ login: z.string() }) }).parse(
         await transport("query { viewer { login } }", {}, signal));
