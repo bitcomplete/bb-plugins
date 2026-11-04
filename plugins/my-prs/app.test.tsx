@@ -6,7 +6,7 @@ import { loadPluginApp, renderSlot, type RenderSlotOptions } from "@get-bb/plugi
 import { createPlugin, rpcContract } from "./server.js";
 import { feedbackOf } from "./feedback.js";
 import { fixture, transportFor } from "./fixtures.js";
-import type { CloseResult, View } from "./types.js";
+import type { CloseResult, Row, View } from "./types.js";
 import { prsCache } from "./app.js";
 
 it("shares a snapshot between the page and badge and renders cached rows immediately on return", async () => {
@@ -81,6 +81,11 @@ async function renderFeedback(rows: View["rows"], rpc: RenderSlotOptions["rpc"] 
 function row(number: number): View["rows"][number] {
   return { ...feedbackOf({ ...fixture(number), requested: [] }), dismissed: false, holdUntil: null, dispatch: { kind: "none" }, threadStatus: null };
 }
+const inRepo = (number: number, repo: string, patch: Partial<Row> = {}): Row => ({ ...row(number), repo, ...patch });
+const organizationSelect = (slot: Slot) => slot.getByLabelText("Organization");
+const chooseOrganization = (slot: Slot, value: string) => fireEvent.change(organizationSelect(slot), { target: { value } });
+const showAllOrganizations = (slot: Slot) => chooseOrganization(slot, "");
+const organizationOptions = (slot: Slot) => within(organizationSelect(slot)).getAllByRole("option").map((option) => option.textContent);
 
 it("filters from the legend and bar without refetching, including dismissed and held PRs", async () => {
   const slot = await renderFeedback([
@@ -133,6 +138,7 @@ it("groups related PRs across repositories and allows selecting previously threa
     { ...row(3), title: "fix(schedule): third" },
     { ...row(4), title: "fix(catalog): already started", dispatch: { kind: "linked", threadId: "thread-existing" }, threadStatus: "running" },
   ]);
+  showAllOrganizations(slot);
   expect(slot.queryByLabelText("Selection")).toBeNull();
   fireEvent.click(slot.getByLabelText("Select parsleyhealth/store#1"));
   fireEvent.click(slot.getByLabelText("Select parsleyhealth/api#2"), { shiftKey: true });
@@ -206,6 +212,7 @@ it("shows both empty sections when no PRs are open", async () => {
   const slot = await renderFeedback([]);
   expect(within(slot.getByRole("region", { name: "Your turn" })).getByText("Nothing waiting on you.")).toBeTruthy();
   expect(within(slot.getByRole("region", { name: "Other open PRs" })).getByText("No other open PRs.")).toBeTruthy();
+  expect(organizationSelect(slot)).toHaveProperty("disabled", true);
 });
 
 it("keeps the linked thread visible when feedback clears and moves a row to Other open PRs", async () => {
@@ -217,7 +224,7 @@ it("keeps the linked thread visible when feedback clears and moves a row to Othe
   } });
   cleanups.push(() => slot.lifecycle.unmount());
   fireEvent.click(await slot.findByLabelText("Select example/editor#1"));
-  expect(await slot.findByRole("button", { name: "Open thread for example/editor#2" })).toHaveProperty("textContent", "Working↗");
+  expect(await slot.findByRole("button", { name: "Open thread for example/editor#2" })).toHaveProperty("textContent", "↻Active thread↗");
   rows = rows.map((item) => ({ ...item, turn: null }));
   await slot.behavior.emitRealtime("prs-changed", {});
   await waitFor(() => expect(slot.getByText("1 selected")).toBeTruthy());
@@ -236,6 +243,204 @@ it("dates waiting feedback from when it arrived and labels the linked thread's c
   fireEvent.click(slot.getByRole("button", { name: "Open thread for example/editor#1" }));
   expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-existing" });
   expect(slot.getByText("Failed")).toBeTruthy();
+});
+
+const linked = (threadStatus: string | null, patch: Partial<Row> = {}): Row =>
+  ({ ...row(1), dispatch: { kind: "linked", threadId: "thread-existing" }, threadStatus, ...patch });
+const openThread = (slot: Slot) => slot.getByRole("button", { name: "Open thread for example/editor#1" });
+const accented = (button: HTMLElement) => button.closest("li")?.className.includes("border-sky-500");
+
+it.each<[string, string, Partial<Row>]>([
+  ["Your turn", "Your turn", {}],
+  ["Other open PRs", "Other open PRs", { turn: null }],
+  ["held", "On hold", { holdUntil: "2099-01-01T12:00:00Z" }],
+  ["dismissed", "Your turn", { dismissed: true }],
+])("shows a working linked thread as active, in blue, and opens it (%s)", async (_name, region, patch) => {
+  const slot = await renderFeedback([linked("running", patch)]);
+  if (patch.dismissed) fireEvent.click(slot.getByText("1 dismissed · show"));
+  const open = within(slot.getByRole("region", { name: region })).getByRole("button", { name: "Open thread for example/editor#1" });
+  expect(open.textContent).toBe("↻Active thread↗");
+  expect(slot.queryByText("Working")).toBeNull();
+  expect(open.getAttribute("aria-description")).toMatch(/^Active thread/);
+  // Regression: held, dismissed and other rows used to gray this chip out.
+  expect(open.className).toContain("bg-sky-500/10");
+  expect(open.className).not.toContain("text-muted-foreground");
+  expect(accented(open)).toBe(true);
+  fireEvent.click(open);
+  expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-existing" });
+});
+
+it.each<[string | null, string]>([["idle", "Idle"], ["error", "Failed"], [null, "Open thread"], ["completed", "Open thread"]])(
+  "does not mark a linked thread with status %s as active, and still opens it", async (threadStatus, label) => {
+    const slot = await renderFeedback([linked(threadStatus)]);
+    const open = openThread(slot);
+    expect(open.textContent).toBe(`${label}↗`);
+    expect(slot.queryByText("Active thread")).toBeNull();
+    expect(open.getAttribute("aria-description")).toBeNull();
+    expect(accented(open)).toBe(false);
+    fireEvent.click(open);
+    expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-existing" });
+  });
+
+it.each<[Row["dispatch"], string]>([[{ kind: "starting" }, "Starting…"], [{ kind: "none" }, "Start thread"]])(
+  "does not call a PR active from its thread status alone when dispatch is %o", async (dispatch, shown) => {
+    const slot = await renderFeedback([{ ...row(1), dispatch, threadStatus: "running" }]);
+    expect(slot.getByText(shown)).toBeTruthy();
+    expect(slot.queryByText("Active thread")).toBeNull();
+    expect(slot.queryByRole("button", { name: /Open thread/ })).toBeNull();
+  });
+
+it("drops the active label and accent when a realtime update turns the thread idle", async () => {
+  let rows: View["rows"] = [linked("active")];
+  const slot = await renderFeedback(rows, { prs_get: () => ({ rows, project: "project-test", poll: null }) });
+  expect(openThread(slot).textContent).toBe("↻Active thread↗");
+  expect(accented(openThread(slot))).toBe(true);
+  rows = [linked("idle")];
+  await slot.behavior.emitRealtime("prs-changed", {});
+  await waitFor(() => expect(openThread(slot).textContent).toBe("Idle↗"));
+  expect(slot.queryByText("Active thread")).toBeNull();
+  expect(accented(openThread(slot))).toBe(false);
+});
+
+const ORGANIZATION_KEY = "my-prs:organization";
+/** acme: Your turn 3 + Other 4. parsley (mixed case): Your turn 1 + Other 2. zeta: held 5. */
+const orgRows = (): Row[] => [
+  inRepo(1, "Parsley/api"), inRepo(2, "parsley/web", { turn: null }),
+  inRepo(3, "acme/core"), inRepo(4, "acme/docs", { turn: null }),
+  inRepo(5, "zeta/app", { holdUntil: "2099-01-01T12:00:00Z" }),
+];
+const shownPrs = (slot: Slot) => slot.queryAllByText(/^Improve the editor \d+$/)
+  .map((title) => Number(title.textContent?.match(/\d+/)?.[0])).sort((a, b) => a - b);
+
+it("shows one organization at a time, first alphabetically, with stable normalized options", async () => {
+  const slot = await renderFeedback(orgRows());
+  const options = ["All organizations", "acme", "parsley", "zeta"];
+  expect(organizationSelect(slot)).toHaveProperty("value", "acme");
+  expect(organizationOptions(slot)).toEqual(options);
+  expect(shownPrs(slot)).toEqual([3, 4]);
+  expect(slot.getByRole("heading", { name: "2 open PRs" })).toBeTruthy();
+  fireEvent.click(slot.getByRole("button", { name: "Filter Waiting on reviewer: 1" }));
+  expect(organizationOptions(slot)).toEqual(options);
+  showAllOrganizations(slot);
+  expect(slot.getByRole("heading", { name: "5 open PRs" })).toBeTruthy();
+  fireEvent.click(slot.getByRole("button", { name: "Show all PRs" }));
+  expect(shownPrs(slot)).toEqual([1, 2, 3, 4, 5]);
+});
+
+it("scopes counts, sections, select-all, and bulk actions to the chosen organization and clears the old selection", async () => {
+  const slot = await renderFeedback(orgRows());
+  fireEvent.click(slot.getByLabelText("Select all listed PRs"));
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  chooseOrganization(slot, "parsley");
+  expect(slot.queryByLabelText("Selection")).toBeNull();
+  expect(shownPrs(slot)).toEqual([1, 2]);
+  const turn = within(slot.getByRole("region", { name: "Your turn" }));
+  expect(turn.getByRole("heading", { name: "Your turn" }).parentElement?.textContent).toBe("Your turn1");
+  expect(turn.getByText("Improve the editor 1")).toBeTruthy();
+  expect(within(slot.getByRole("region", { name: "Other open PRs" })).getByText("Improve the editor 2")).toBeTruthy();
+  expect(slot.queryByRole("region", { name: "On hold" })).toBeNull();
+  chooseOrganization(slot, "zeta");
+  expect(within(slot.getByRole("region", { name: "On hold" })).getByText("Improve the editor 5")).toBeTruthy();
+  expect(slot.getByText("Nothing waiting on you.")).toBeTruthy();
+  chooseOrganization(slot, "acme");
+  expect(slot.getByLabelText("Select acme/core#3")).toHaveProperty("checked", false);
+  fireEvent.click(slot.getByLabelText("Select all listed PRs"));
+  fireEvent.click(slot.getByRole("button", { name: "Start thread for 2 selected" }));
+  await confirmAddress();
+  await waitFor(() => expect(slot.inspection.rpcCalls.find((call) => call.method === "address")).toMatchObject({
+    input: { items: [{ id: "PR_3" }, { id: "PR_4" }] },
+  }));
+});
+
+it("composes the organization with the status filter, and Show all PRs resets only the status", async () => {
+  const slot = await renderFeedback([
+    inRepo(1, "acme/core", { turn: null }), inRepo(2, "acme/docs"), inRepo(3, "parsley/api", { turn: null }), inRepo(4, "parsley/web"),
+  ]);
+  fireEvent.click(slot.getByRole("button", { name: "Filter Waiting on reviewer: 1" }));
+  expect(shownPrs(slot)).toEqual([1]);
+  chooseOrganization(slot, "parsley");
+  expect(slot.getByRole("button", { name: "Filter Waiting on reviewer: 1" })).toHaveProperty("ariaPressed", "true");
+  expect(shownPrs(slot)).toEqual([3]);
+  fireEvent.click(slot.getByRole("button", { name: "Show all PRs" }));
+  expect(organizationSelect(slot)).toHaveProperty("value", "parsley");
+  expect(shownPrs(slot)).toEqual([3, 4]);
+});
+
+it.each<[string, number[]]>([["parsley", [1, 2]], ["", [1, 2, 3, 4, 5]]])(
+  "remembers the organization choice %j across a remount", async (choice, expected) => {
+    const app = await loadPluginApp(() => import("./app.js"));
+    const panel = app.navPanels[0]; if (!panel) throw new Error("Missing My PRs");
+    const rpc = { prs_get: () => ({ rows: orgRows(), project: "project-test", poll: null }) };
+    const first = renderSlot(panel, { subPath: "" }, { rpc });
+    await first.findByRole("heading", { name: "Your turn" });
+    chooseOrganization(first, choice);
+    first.lifecycle.unmount();
+    const returned = renderSlot(panel, { subPath: "" }, { rpc });
+    cleanups.push(() => returned.lifecycle.unmount());
+    expect(organizationSelect(returned)).toHaveProperty("value", choice);
+    expect(shownPrs(returned)).toEqual(expected);
+  });
+
+it.each<[string, string, number[]]>([["parsley", "parsley", [1, 2]], ["retired", "acme", [3, 4]]])(
+  "keeps the saved organization %j while loading, then shows %s without overwriting the saved choice", async (saved, value, expected) => {
+    sessionStorage.setItem(ORGANIZATION_KEY, saved);
+    const app = await loadPluginApp(() => import("./app.js"));
+    const panel = app.navPanels[0]; if (!panel) throw new Error("Missing My PRs");
+    let release = () => {};
+    const loaded = new Promise<void>((resolve) => { release = resolve; });
+    const slot = renderSlot(panel, { subPath: "" }, { rpc: {
+      prs_get: async () => { await loaded; return { rows: orgRows(), project: "project-test", poll: null }; },
+    } });
+    cleanups.push(() => slot.lifecycle.unmount());
+    expect(slot.getByText("Reading the queue…")).toBeTruthy();
+    expect(organizationSelect(slot)).toHaveProperty("disabled", true);
+    expect(sessionStorage.getItem(ORGANIZATION_KEY)).toBe(saved);
+    release();
+    await slot.findByRole("heading", { name: "Your turn" });
+    expect(organizationSelect(slot)).toHaveProperty("disabled", false);
+    expect(organizationSelect(slot)).toHaveProperty("value", value);
+    expect(shownPrs(slot)).toEqual(expected);
+    expect(sessionStorage.getItem(ORGANIZATION_KEY)).toBe(saved);
+  });
+
+it("follows realtime changes: a vanished organization falls back to the first, and returns when it reappears", async () => {
+  let rows = orgRows();
+  const slot = await renderFeedback(rows, { prs_get: () => ({ rows, project: "project-test", poll: null }) });
+  chooseOrganization(slot, "parsley");
+  rows = orgRows().filter((item) => !item.repo.toLowerCase().startsWith("parsley/"));
+  await slot.behavior.emitRealtime("prs-changed", {});
+  await waitFor(() => expect(organizationSelect(slot)).toHaveProperty("value", "acme"));
+  expect(organizationOptions(slot)).toEqual(["All organizations", "acme", "zeta"]);
+  expect(shownPrs(slot)).toEqual([3, 4]);
+  rows = [inRepo(6, "aardvark/app"), ...orgRows()];
+  await slot.behavior.emitRealtime("prs-changed", {});
+  await waitFor(() => expect(organizationSelect(slot)).toHaveProperty("value", "parsley"));
+  expect(organizationOptions(slot)).toEqual(["All organizations", "aardvark", "acme", "parsley", "zeta"]);
+  expect(shownPrs(slot)).toEqual([1, 2]);
+});
+
+it("remembers scroll position per organization and status, and starts a new scope at the top", async () => {
+  const app = await loadPluginApp(() => import("./app.js"));
+  const panel = app.navPanels[0]; if (!panel) throw new Error("Missing My PRs");
+  const rpc = { prs_get: () => ({ rows: orgRows(), project: "project-test", poll: null }) };
+  const scroller = (slot: Slot) => { const element = slot.getByRole("main").parentElement; if (!element) throw new Error("Missing scroll area"); return element; };
+  const scrollTo = (slot: Slot, top: number) => { scroller(slot).scrollTop = top; fireEvent.scroll(scroller(slot)); };
+  const first = renderSlot(panel, { subPath: "" }, { rpc });
+  await first.findByRole("heading", { name: "Your turn" });
+  scrollTo(first, 120);
+  chooseOrganization(first, "parsley");
+  expect(scroller(first).scrollTop).toBe(0);
+  scrollTo(first, 40);
+  chooseOrganization(first, "acme");
+  expect(scroller(first).scrollTop).toBe(120);
+  fireEvent.click(first.getByRole("button", { name: "Filter Waiting on reviewer: 1" }));
+  expect(scroller(first).scrollTop).toBe(0);
+  fireEvent.click(first.getByRole("button", { name: "Show all PRs" }));
+  expect(scroller(first).scrollTop).toBe(120);
+  first.lifecycle.unmount();
+  const returned = renderSlot(panel, { subPath: "" }, { rpc });
+  cleanups.push(() => returned.lifecycle.unmount());
+  expect(scroller(returned).scrollTop).toBe(120);
 });
 
 it("registers a sidebar badge that counts actionable feedback and follows realtime updates", async () => {
@@ -267,6 +472,7 @@ it("selects organizations and areas independently across different organizations
     { ...row(1), title: "fix(catalog): parsley", repo: "parsleyhealth/store" },
     { ...row(2), title: "fix(catalog): bit", repo: "bitcomplete/store" },
   ]);
+  showAllOrganizations(slot);
   const parsley = within(slot.getByRole("region", { name: "parsleyhealth your turn" }));
   expect(parsley.getByText("fix(catalog): parsley")).toBeTruthy();
   expect(parsley.queryByText("fix(catalog): bit")).toBeNull();
