@@ -811,8 +811,7 @@ severity; critical→urgent, high→high, medium→medium, low→low), `batch` (
 window a medium or low alert may wait for company), and `autoAdopt` (the
 severities whose tickets are labelled and moved to Todo when filed; any
 other severity's ticket raises the owner's adoption decision, kept by the
-plugin until answered, with reminders at half the time to the due date, the
-day before, and once overdue).
+plugin until answered, with one overdue reminder).
 `deps-alerts.md` and `deps-prs.md` are optional: a project that has not
 written them runs no dependency watch. `bb stewards init` writes them, and
 `bb stewards check` validates `deps.sla`, `deps.batch` and `deps.autoAdopt`
