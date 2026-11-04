@@ -52,7 +52,7 @@ describe("My PRs behavior", () => {
     await next.harness.behavior.callRpc("poll_now", null);
     expect(viewSchema.parse(await next.harness.behavior.callRpc("prs_get", null)).rows[0]?.dismissed).toBe(false);
   });
-  it("starts one batch thread from selected PRs, retains its links, and blocks duplicates", async () => {
+  it("starts one batch thread from selected PRs and allows explicitly regrouping linked PRs", async () => {
     const env = await setup(); const items = (await env.view()).rows.map(({ id, activity }) => ({ id, activity }));
     expect(await env.rpc("address", { items })).toEqual({ threadId: "thread-address" });
     const calls = env.harness.inspection.sdk.callsTo("threads.spawn");
@@ -61,8 +61,9 @@ describe("My PRs behavior", () => {
     expect(JSON.stringify(calls)).toContain("https://github.com/example/editor/pull/1");
     expect(JSON.stringify(calls)).toContain("Never merge");
     expect((await env.view()).rows.map((row) => row.dispatch)).toEqual([{ kind: "linked", threadId: "thread-address" }, { kind: "linked", threadId: "thread-address" }]);
-    await expect(env.rpc("address", { items })).rejects.toThrow("already has a dispatch");
-    expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    env.harness.inspection.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thread-address", status: "active" }));
+    await env.rpc("address", { items });
+    expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
   });
   it("reads each shared batch thread only once per snapshot", async () => {
     const env = await setup();
@@ -138,13 +139,13 @@ describe("My PRs behavior", () => {
   });
 });
 
-it("persists holds through reload and new feedback, blocks dispatch, then expires automatically", async () => {
+it("persists holds through reload and explicit dispatch, then expires automatically", async () => {
   const env = await setup();
   const selection = await firstSelection(env);
   const until = new Date(Date.now() + 3_600_000).toISOString();
   await env.rpc("hold", { ...selection, until });
-  await expect(env.rpc("address", { items: [selection] })).rejects.toThrow("on hold");
-  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  expect(await env.rpc("address", { items: [selection] })).toEqual({ threadId: "thread-address" });
+  expect((await env.view()).rows.find((row) => row.id === selection.id)?.holdUntil).toBe(until);
   const next = await env.harness.lifecycle.reload(env.factory);
   cleanup.push(() => next.harness.lifecycle.dispose());
   env.data[0]?.comments.push(comment());
@@ -289,4 +290,56 @@ it("keeps the snapshot and suspends GitHub reads until reset, including after re
   try { expect(await reloaded.harness.behavior.callRpc("poll_now", null)).toMatchObject({ error: null, retryAt: null }); }
   finally { clock.mockRestore(); }
   expect(reads.mock.calls.length).toBeGreaterThan(1);
+});
+
+
+it("starts one thread for approved, conflicting, CI-failing, waiting, draft, dismissed, and held PRs", async () => {
+  const env = await setup();
+  const approved = fixture(3); approved.reviews = []; approved.pr.reviewDecision = "APPROVED";
+  const conflict = fixture(4); conflict.reviews = []; conflict.pr.mergeable = "CONFLICTING";
+  const failing = fixture(5); failing.reviews = []; failing.pr.commits.nodes = [{ commit: { committedDate: approved.pr.updatedAt, statusCheckRollup: { state: "FAILURE" } } }];
+  const waiting = fixture(6); waiting.reviews = [];
+  const draft = fixture(7); draft.reviews = []; draft.pr.isDraft = true;
+  env.data.push(approved, conflict, failing, waiting, draft);
+  await env.rpc("poll_now", null);
+  const rows = (await env.view()).rows;
+  const first = rows.find((row) => row.id === "PR_1"), second = rows.find((row) => row.id === "PR_2");
+  if (!first || !second) throw new Error("Missing feedback PRs");
+  await env.rpc("dismiss", { id: first.id, activity: first.activity, dismissed: true });
+  await env.rpc("hold", { id: second.id, activity: second.activity, until: "2099-01-01T00:00:00Z" });
+  expect(await env.rpc("address", { items: rows.map(({ id, activity }) => ({ id, activity })) })).toEqual({ threadId: "thread-address" });
+  const calls = env.harness.inspection.sdk.callsTo("threads.spawn");
+  expect(calls).toHaveLength(1);
+  const spawned = calls[0]?.[0];
+  expect(spawned).toMatchObject({ pluginMetadata: { prs: rows.map((row) => row.url) } });
+  expect(spawned).toHaveProperty("prompt", expect.stringContaining("Review: APPROVED"));
+  expect(spawned).toHaveProperty("prompt", expect.stringContaining("Mergeability: CONFLICTING"));
+  expect(spawned).toHaveProperty("prompt", expect.stringContaining("Checks: FAILURE"));
+  expect(spawned).toHaveProperty("prompt", expect.stringContaining("resolve merge conflicts"));
+  expect(spawned).toHaveProperty("prompt", expect.stringContaining("Do not invent changes"));
+  expect(spawned).not.toHaveProperty("prompt", expect.stringContaining("undefined"));
+  expect((await env.view()).rows.find((row) => row.id === first.id)?.dismissed).toBe(true);
+  expect((await env.view()).rows.find((row) => row.id === second.id)?.holdUntil).toBe("2099-01-01T00:00:00Z");
+});
+
+it("rejects a delayed overlapping start after another request has already linked its thread", async () => {
+  const env = await setup();
+  const item = await firstSelection(env);
+  let release = () => {};
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  let started = () => {};
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let gets = 0;
+  env.harness.inspection.sdk.stub("projects.get", async () => {
+    if (++gets === 2) { started(); await waiting; }
+    return { id: "project-test", sources: [{ hostId: "devbox-host", path: "/project-checkout", isDefault: true }] };
+  });
+  const first = env.rpc("address", { items: [item] });
+  const second = env.rpc("address", { items: [item] });
+  const rejected = expect(second).rejects.toThrow("already has a dispatch");
+  await ready;
+  await first;
+  release();
+  await rejected;
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
 });

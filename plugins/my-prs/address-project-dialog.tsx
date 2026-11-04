@@ -44,8 +44,8 @@ export function AddressProjectDialog({ items, onClose, onStart }: {
     <Dialog open onOpenChange={(open) => { if (!open && !starting) onClose(); }}>
       <DialogContent hideCloseButton={starting} className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{items.length === 1 ? "Address feedback" : `Address ${items.length} pull requests`}</DialogTitle>
-          <DialogDescription>Choose the project for this feedback thread.</DialogDescription>
+          <DialogTitle>{items.length === 1 ? "Start thread for a pull request" : `Start thread for ${items.length} pull requests`}</DialogTitle>
+          <DialogDescription>Choose the project for this PR thread.</DialogDescription>
         </DialogHeader>
         {load.kind === "loading" ? <p role="status" className="text-sm text-muted-foreground">Loading projects…</p> : null}
         {load.kind === "error" ? <p role="alert" className="text-sm text-destructive">{load.message}</p> : null}
@@ -59,10 +59,10 @@ export function AddressProjectDialog({ items, onClose, onStart }: {
               {load.targets.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
             </select>
             <p className="text-xs text-muted-foreground">
-              {load.targets.projects.length === 0 ? "Add a project checkout in BB to address feedback."
+              {load.targets.projects.length === 0 ? "Add a project checkout in BB to start a thread."
                 : load.targets.reason === "mixed" ? "These PRs map to different projects. Choose one for this batch."
                 : load.targets.reason === "organization" ? "Preselected from your organization mappings."
-                : load.targets.reason === "default" ? "Preselected from your default feedback project."
+                : load.targets.reason === "default" ? "Preselected from your default PR project."
                 : "This selection has no available default project."}
             </p>
           </div>
@@ -71,7 +71,7 @@ export function AddressProjectDialog({ items, onClose, onStart }: {
         <DialogFooter>
           <Button variant="outline" disabled={starting} onClick={onClose}>Cancel</Button>
           <Button disabled={starting || load.kind !== "ready" || projectId === ""} onClick={start}>
-            {starting ? "Starting…" : "Address feedback"}
+            {starting ? "Starting…" : "Start thread"}
           </Button>
         </DialogFooter>
       </DialogContent>

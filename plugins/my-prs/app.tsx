@@ -76,9 +76,9 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
     ? "bg-rose-500/10 text-[light-dark(var(--color-rose-800),var(--color-rose-200))]" : BLUE;
   return <li className={cn("group min-w-0 rounded-md hover:bg-foreground/[0.03]", selected && "bg-sky-500/[0.07]")}>
     <div className="flex flex-wrap items-start gap-x-2 gap-y-0 py-1 pl-2 pr-1.5 text-[12.5px] leading-5 @min-[480px]:flex-nowrap">
-      {kind === "turn" && row.dispatch.kind === "none" ? <input type="checkbox" checked={selected} disabled={pending}
+      <input type="checkbox" checked={selected} disabled={pending}
         aria-label={`Select ${row.repo}#${row.number}`} onChange={() => undefined} onClick={(event) => onPick(event.shiftKey)}
-        className={cn(CHECKBOX, "mt-[3px] opacity-50 group-hover:opacity-100 group-focus-within:opacity-100")} /> : <span aria-hidden className="size-3.5 shrink-0" />}
+        className={cn(CHECKBOX, "mt-[3px] opacity-50 group-hover:opacity-100 group-focus-within:opacity-100")} />
       <UrlLink href={row.url} title={`${row.repo} #${row.number}`}
         className={cn("flex w-[calc(100%-22px)] shrink-0 items-center justify-start gap-1 whitespace-nowrap rounded-sm text-muted-foreground hover:underline @min-[480px]:w-[124px] @min-[720px]:w-[156px]", RING)}>
         <span aria-label={status?.label} className={cn("mr-1 h-2.5 w-2 shrink-0 rounded-[2px]", status?.color)} />
@@ -92,12 +92,12 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
           <span className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-1.5">
             {row.draft && (row.turn || row.holdUntil) ? <span className={cn(CHIP, GRAY)}>Draft</span> : null}
             {threadId !== null ? <button type="button" onClick={() => navigate.toThread(threadId)}
-              aria-label={`Open feedback thread for ${row.repo}#${row.number}`}
-              title={`Open its feedback thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, threadTone, "hover:underline", RING)}>{threadLabel}<span aria-hidden>↗</span></button> :
+              aria-label={`Open thread for ${row.repo}#${row.number}`}
+              title={`Open its thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, threadTone, "hover:underline", RING)}>{threadLabel}<span aria-hidden>↗</span></button> :
               row.dispatch.kind === "starting" ? <span className={cn(CHIP, kind === "turn" ? BLUE : GRAY)}><Spin />Starting…</span> :
-                kind === "turn" && row.dispatch.kind === "none" ? <button type="button" disabled={pending}
-                  aria-label={`Address comments on ${row.repo}#${row.number}`} title="Start a thread to address these comments" onClick={onAddress}
-                  className={cn(BUTTON, "h-5 border-border px-1.5 text-[11px] hover:bg-foreground/[0.06]")}>Address</button> : null}
+                row.dispatch.kind === "none" ? <button type="button" disabled={pending}
+                  aria-label={`Start thread for ${row.repo}#${row.number}`} title="Start a thread for this PR" onClick={onAddress}
+                  className={cn(BUTTON, "h-5 border-border px-1.5 text-[11px] hover:bg-foreground/[0.06]")}>Start thread</button> : null}
             {clearable ? <button type="button" disabled={pending} onClick={onClear} className={cn(GHOST, "h-5 px-1 text-[11px]")}>Clear attempt</button> : null}
             {kind === "held" ? <button type="button" disabled={pending} onClick={() => onHold(null)}
               aria-label={`Resume ${row.repo}#${row.number}`} className={cn(GHOST, "h-5 px-1 text-[11px]")}>Resume</button> :
@@ -147,6 +147,7 @@ export function MyPrsPage() {
   const [addressItems, setAddressItems] = useState<Row[] | null>(null);
   const [polling, setPolling] = useState(false);
   const [filter, setFilter] = useState(restoredFilter);
+  const [dismissedOpen, setDismissedOpen] = useState(false);
   const rows = view?.rows ?? [];
   const filtered = filter === null ? rows : rows.filter((row) => prStatus(row) === filter);
   const activeStatus = PR_STATUSES.find((status) => status.key === filter);
@@ -154,9 +155,9 @@ export function MyPrsPage() {
   const dismissed = rows.filter((row) => row.turn && row.dismissed && !row.holdUntil);
   const other = rows.filter((row) => !row.turn && !row.holdUntil);
   const held = rows.filter((row) => row.holdUntil);
-  const organizations = groupByOrganization(yours);
-  const eligible = filter === null || filter === "turn" ? organizations.flatMap((organization) => organization.areas.flatMap((area) => area.items.filter((row) => row.dispatch.kind === "none"))) : [];
-  const chosen = eligible.filter((row) => selected.get(row.id) === row.activity);
+  const listed = filter === null ? [yours, dismissedOpen ? dismissed : [], other, held] : [filtered];
+  const ordered = listed.flatMap((items) => groupByOrganization(items).flatMap((organization) => organization.areas.flatMap((area) => area.items)));
+  const chosen = rows.filter((row) => selected.get(row.id) === row.activity);
   const now = Date.now();
   const ready = view !== null;
 
@@ -166,7 +167,6 @@ export function MyPrsPage() {
 
   const filterBy = (status: PrStatus | null) => {
     setFilter(status);
-    setSelected(new Map());
     anchor.current = null;
     try { if (status === null) sessionStorage.removeItem(FILTER_KEY); else sessionStorage.setItem(FILTER_KEY, status); }
     catch { /* Filtering still works when browser storage is unavailable. */ }
@@ -174,8 +174,8 @@ export function MyPrsPage() {
 
   useEffect(() => {
     if (!view) return;
-    const eligible = new Map(view.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil && row.dispatch.kind === "none").map((row) => [row.id, row.activity]));
-    setSelected((current) => new Map([...current].filter(([id, activity]) => eligible.get(id) === activity)));
+    const available = new Map(view.rows.map((row) => [row.id, row.activity]));
+    setSelected((current) => new Map([...current].filter(([id, activity]) => available.get(id) === activity)));
   }, [view]);
 
   const act = async (operation: () => Promise<unknown>) => {
@@ -200,9 +200,9 @@ export function MyPrsPage() {
     return next;
   });
   const pick = (row: Row, shift: boolean) => {
-    const from = eligible.findIndex((item) => item.id === anchor.current);
-    const to = eligible.findIndex((item) => item.id === row.id);
-    if (shift && from >= 0 && to >= 0) pickScope(eligible.slice(Math.min(from, to), Math.max(from, to) + 1), true);
+    const from = ordered.findIndex((item) => item.id === anchor.current);
+    const to = ordered.findIndex((item) => item.id === row.id);
+    if (shift && from >= 0 && to >= 0) pickScope(ordered.slice(Math.min(from, to), Math.max(from, to) + 1), true);
     else pickScope([row], selected.get(row.id) !== row.activity);
     anchor.current = row.id;
   };
@@ -233,13 +233,15 @@ export function MyPrsPage() {
 
   const renderGroups = (items: Row[], kind: SectionKind) => <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6 pb-1.5 pt-2">
     {groupByOrganization(items).map((organization) => <section key={organization.label} aria-label={`${organization.label} ${kind === "turn" ? "your turn" : kind}`} className="min-w-0">
-      <h3 className="ml-[19px] flex min-w-0 items-center gap-2 pb-1 text-[12px] font-semibold">
+      <h3 className="flex min-w-0 items-center gap-2 pb-1 pl-2 text-[12px] font-semibold">
+        <ScopeCheckbox items={organization.items} selected={selected} label={`Select organization ${organization.label} ${kind}`} disabled={pending} onPick={pickScope} />
         <span className="min-w-0 truncate">{organization.label}</span>
         <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span>
       </h3>
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
         {organization.areas.map((area) => <section key={area.key} aria-label={area.label} className="min-w-0">
-          <h4 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
+          <h4 className="ml-[19px] flex min-w-0 items-center gap-2 pb-0.5 pl-2 pt-1.5 text-[11px] font-medium text-muted-foreground">
+            <ScopeCheckbox items={area.items} selected={selected} label={`Select area ${organization.label}/${area.label} ${kind}`} disabled={pending} onPick={pickScope} />
             <span className="min-w-0 truncate">{area.label}{area.repos.join(", ") === area.label ? null : <span className="font-normal text-muted-foreground/70"> · {area.repos.join(", ")}</span>}</span>
             <span className="font-normal tabular-nums">{area.items.length}</span>
           </h4>
@@ -247,7 +249,7 @@ export function MyPrsPage() {
             {area.items.map((row) => {
               const rowKind = row.holdUntil ? "held" : row.turn ? row.dismissed ? "dismissed" : "turn" : "other";
               return <FeedbackRow key={row.id} row={row} kind={rowKind} now={now} pending={pending}
-                selected={rowKind === "turn" && selected.get(row.id) === row.activity}
+                selected={selected.get(row.id) === row.activity}
                 onPick={(shift) => pick(row, shift)} onAddress={() => { void address([row]); }}
                 onClear={() => { void act(() => rpc.call("clear_dispatch", { id: row.id })); }}
                 onHold={(until) => { void act(() => rpc.call("hold", { id: row.id, activity: row.activity, until })); }}
@@ -275,10 +277,14 @@ export function MyPrsPage() {
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
         {view === null ? <p role="status" className={EMPTY}>Reading the queue…</p> : <>
           <PrOverview rows={rows} now={now} filter={filter} onFilter={filterBy} />
+          <label className="mb-2 flex w-fit cursor-pointer items-center gap-2 px-2 text-[11px] text-muted-foreground">
+            <ScopeCheckbox items={rows} selected={selected} label="Select all listed PRs" disabled={pending} onPick={pickScope} />
+            Select all {rows.length} PRs
+          </label>
           {activeStatus ? <section aria-label="Filtered PRs">
             <div className={SECTION_HEAD}>
               <span aria-hidden className={cn("h-3.5 w-[3px] shrink-0 rounded-full", activeStatus.color)} />
-              {filter === "turn" ? <ScopeCheckbox items={eligible} selected={selected} label="Select all actionable PRs" disabled={pending} onPick={pickScope} /> : null}
+              <ScopeCheckbox items={filtered} selected={selected} label={`Select all ${activeStatus.label} PRs`} disabled={pending} onPick={pickScope} />
               <h2 className="text-[12.5px] font-semibold">{activeStatus.label}</h2>
               <span role="status" className="text-[11px] tabular-nums text-muted-foreground">{filtered.length} of {rows.length} PRs</span>
             </div>
@@ -286,12 +292,12 @@ export function MyPrsPage() {
           </section> : <><section aria-label="Your turn">
             <div className={SECTION_HEAD}>
               <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-amber-500/80" />
-              <ScopeCheckbox items={eligible} selected={selected} label="Select all actionable PRs" disabled={pending} onPick={pickScope} />
+              <ScopeCheckbox items={yours} selected={selected} label="Select all Your turn PRs" disabled={pending} onPick={pickScope} />
               <h2 className="truncate text-[12.5px] font-semibold">Your turn</h2>
               <span className={cn(COUNT, yours.length ? cn("font-semibold", AMBER) : "text-muted-foreground")}>{yours.length}</span>
             </div>
             {yours.length === 0 ? <p className={EMPTY}>Nothing waiting on you.</p> : renderGroups(yours, "turn")}
-            {dismissed.length > 0 ? <details className="pb-1.5">
+            {dismissed.length > 0 ? <details className="pb-1.5" open={dismissedOpen} onToggle={(event) => setDismissedOpen(event.currentTarget.open)}>
               <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>{dismissed.length} dismissed · show</summary>
               {renderGroups(dismissed, "dismissed")}
             </details> : null}
@@ -299,6 +305,7 @@ export function MyPrsPage() {
           <section aria-label="Other open PRs" className="mt-6">
             <div className={SECTION_HEAD}>
               <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-muted-foreground/50" />
+              <ScopeCheckbox items={other} selected={selected} label="Select all Other open PRs" disabled={pending} onPick={pickScope} />
               <h2 className="truncate text-[12.5px] font-semibold">Other open PRs</h2>
               <span className={cn(COUNT, "text-muted-foreground")}>{other.length}</span>
             </div>
@@ -307,6 +314,7 @@ export function MyPrsPage() {
           {held.length > 0 ? <section aria-label="On hold" className="mt-7 opacity-60 hover:opacity-100 focus-within:opacity-100">
             <div className={SECTION_HEAD}>
               <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-muted-foreground/50" />
+              <ScopeCheckbox items={held} selected={selected} label="Select all On hold PRs" disabled={pending} onPick={pickScope} />
               <h2 className="truncate text-[12.5px] font-semibold">On hold</h2>
               <span className={cn(COUNT, "text-muted-foreground")}>{held.length}</span>
             </div>
@@ -320,9 +328,9 @@ export function MyPrsPage() {
       <div className={cn(COLUMN, "flex flex-wrap items-center gap-1.5 px-4 py-1.5 text-[12px]")}>
         <b className="mr-1 font-semibold">{chosen.length} selected</b>
         <button type="button" disabled={pending || chosen.length > 20} aria-busy={pending || undefined}
-          aria-label={`Address ${chosen.length} selected`} title="Start one thread to address the selected PRs" onClick={() => { void address(chosen); }}
+          aria-label={`Start thread for ${chosen.length} selected`} title="Send the selected PRs to one thread" onClick={() => { void address(chosen); }}
           className={cn(BUTTON, "border-foreground bg-foreground font-medium text-background")}>
-          {pending ? <><Spin />Starting…</> : <>Address {chosen.length}<Kbd inverted>b</Kbd></>}
+          {pending ? <><Spin />Starting…</> : <>Start thread<Kbd inverted>b</Kbd></>}
         </button>
         <span className="flex-1" />
         <span className="text-[11px] text-muted-foreground">{chosen.length > 20 ? "Select up to 20 PRs" : "One thread"}</span>

@@ -1,7 +1,7 @@
 # My PRs
 
-My PRs shows human feedback waiting on your authored pull requests. It is a
-standalone sibling of Review Watch, whose Reviews page shows requests for your
+My PRs shows your open pull requests and highlights human feedback waiting on you.
+It is a standalone sibling of Review Watch, whose Reviews page shows requests for your
 review of other people's PRs. My PRs does not require Workstreams.
 
 ## Install and configure
@@ -35,7 +35,7 @@ Snapshots imported before status collection show **Status unknown** until refres
 Click a bar segment or state label to filter instantly. Click it again, or choose
 **Show all PRs**, to reset. Counts always describe the full queue. Filters include
 held and dismissed PRs, and returning to the page restores your filter and scroll
-position. Changing filters clears the batch selection.
+position. Selections persist across filters, so one batch can include several states.
 The reviewer summary flags PRs whose last GitHub update was at least four days ago.
 
 The page and badges share their snapshot and in-flight reads. Returning shows
@@ -58,31 +58,38 @@ navigation badge clears when nothing needs your response. This requires a BB
 server with Plugin SDK 0.6.53 or newer; reinstalling only the desktop app does
 not update a remote server.
 
-Choose one PR's **Address**, or select several rows and choose **Address N**.
-Checkboxes select individual PRs, with one select-all control at the top.
-Organization and area headings are labels and counts. Shift-click selects a range. Press **b** to
-address the selection or **Esc** to clear it. Address opens a project picker, then starts one thread on the chosen project's
-default machine. Projects with a configured repo set get a fresh **Multi-repo
+Choose a PR's **Start thread**, or select up to 20 PRs and choose **Start thread**.
+Every listed PR has a checkbox, including approved, conflicting, waiting, draft,
+held, dismissed, and previously threaded PRs. Organization and area checkboxes
+select their groups. Section checkboxes select their section or filtered state;
+**Select all** includes every listed PR, even outside the current filter.
+Shift-click selects a range in the displayed order. Press **b** to start a thread
+for the selection or **Esc** to clear it. The project picker then starts one
+thread on the chosen project's default machine. Projects with a configured repo set get a fresh **Multi-repo
 workspace**, which provisions their repository checkouts. Other projects use
 their default checkout. Repo-set read failures stop dispatch and display the
 error. Organization mappings preselect the project; the
 configured default is a fallback. Override it for an individual PR or batch.
 A batch spanning different mapped projects requires a choice. The thread finds checkouts, fixes code,
-runs checks, pushes the changes, and replies to review comments. It includes bot comments
-in that work. The prompt forbids merging, approving, closing PRs, and automatic
-thread resolution. The plugin itself only reads GitHub.
+runs checks, pushes changes, and replies to outstanding review comments, including
+bot comments. It also resolves merge conflicts and fixes failing CI. For approved
+PRs without outstanding work, it verifies readiness and reports the result.
+The prompt forbids merging, approving, closing PRs, and automatic thread resolution. The plugin itself only reads GitHub.
 
 **Hold…** moves a PR to a faded **On hold** section at the bottom for 1 hour,
 until tomorrow at 9 AM in your browser’s timezone, or for 1 week. Held PRs stay
-out of Your turn counts and batch selection. Holds survive new feedback and
-restarts, expire automatically, and can be ended early with **Resume**.
+out of Your turn counts but remain selectable for an explicit thread. Holds
+survive new feedback and restarts, expire automatically, and can be ended early
+with **Resume**.
 
 **Dismiss** hides feedback until a new commit or new human feedback changes
 that PR. Open the dismissed list under **Your turn** and choose **Restore** to
 bring it back.
 Started PRs keep a link to their thread, including after the feedback clears.
-When an attempt finishes, **Clear attempt** lets you start another. If a start
-fails without returning a thread, check your threads before clearing it.
+Select previously threaded PRs to include them in a new batch. Their links update
+to the new thread after it starts. Simultaneous start requests cannot dispatch
+the same PR twice. If a start fails without returning a thread, check your
+threads before using **Clear attempt** to retry.
 
 ## Feedback rules
 
@@ -107,8 +114,8 @@ GitHub search, reviews, conversation comments, review requests, review threads,
 and comments inside threads all paginate. The search limit is 1,000 open authored
 PRs. An incomplete or failed read keeps the last successful PR snapshot and displays
 an error. Address reads only the selected PRs and checks their current heads and
-feedback before dispatch. Each PR’s initial feedback connections share one
-request; further pages load only when needed. If GitHub rate limits a request,
+feedback before dispatch. Pending feedback is not required. Each PR's initial
+feedback connections share one request; further pages load only when needed. If GitHub rate limits a request,
 the plugin keeps the PR snapshot and pauses API reads until the reported reset time,
 including across plugin reloads.
 

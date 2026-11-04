@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "My PRs",
-    "description": "Your pull requests waiting on a reply: see human feedback, dismiss it, or start a thread to address it.",
+    "description": "Your open pull requests: see status and feedback, group any PRs, or start a thread to work on them.",
     "branding": {
       "icon": "GitBranch"
     },
