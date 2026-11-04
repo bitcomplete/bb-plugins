@@ -61,9 +61,17 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   `dependabot_alert` doorbell; the github plugin reads the alerts with the
   developer's token and leases each repo as a `dependabot_repo` (a `repo`
   lease does not receive alert doorbells). Severity sets the Linear priority
-  and a due date from `deps.sla`; critical and high get their own ticket,
+  and a due date from `deps.sla`, clocked from the alert's own `created_at`.
+  critical and high get their own ticket,
   medium and low coalesce into one open ticket per repo per ecosystem, and a
-  new alert joins or tightens it. A fixed or dismissed alert trims or closes
+  new alert joins or tightens it. A ticket for a severity `deps.autoAdopt`
+  does not name gets an adoption decision the plugin keeps by ticket (Adopt,
+  Keep tracking, and — when the playbook's `may` allows `dismiss-alert` —
+  Dismiss as not used) in `bb stewards needs` and the digest until the owner
+  answers; Keep tracking snoozes it and the plugin re-files it on that date,
+  and a missed deadline gets one overdue reminder. `bb stewards show` prints
+  the filing thread per fingerprint and each decision. A fixed or dismissed
+  alert trims or closes
   its ticket, and the nightly pass re-lists open alerts as the backstop. A
   `dependabot[bot]` version-update pull request is adopted under `deps-prs`,
   gets the reviewer round, and once its marker is approved on green checks
@@ -801,7 +809,9 @@ unchanged.
 The `deps` object is the dependency watch: `sla` (a duration or `asap` per
 severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
 window a medium or low alert may wait for company), and `autoAdopt` (the
-severities whose tickets are labelled and moved to Todo when filed).
+severities whose tickets are labelled and moved to Todo when filed; any
+other severity's ticket raises the owner's adoption decision, kept by the
+plugin until answered, with one overdue reminder).
 `deps-alerts.md` and `deps-prs.md` are optional: a project that has not
 written them runs no dependency watch. `bb stewards init` writes them, and
 `bb stewards check` validates `deps.sla`, `deps.batch` and `deps.autoAdopt`

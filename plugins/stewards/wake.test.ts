@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
+import type { DepsDecision } from "./store.js";
 import { parsePlaybook } from "./config.js";
 import { explainDecision, formatDecisionListing } from "./decisions.js";
 import { comment, issue, pull } from "./fixtures.js";
@@ -558,6 +559,8 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     alertNumber: 4,
     severity: "high",
     package: "lodash",
+    ticketLabels: [],
+    alertCreatedAt: null,
     ecosystem: "npm",
     manifestPath: "package-lock.json",
     ghsaId: null,
@@ -591,6 +594,7 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
       autoAdopt: [],
       timeZone: "UTC",
       escalations: [],
+      decisions: [],
       changes: [],
     });
 
@@ -608,6 +612,56 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     expect(depsWake(depsFinding())).toMatch(/Assignee: Jane/u);
     expect(depsWake(depsFinding({ class: "recurring", ticket: "ENG-50", ticketState: "Todo" }))).toMatch(/Recurring on ENG-50 \(open\)/u);
     expect(depsWake(depsFinding({ class: "returned", ticket: "ENG-50", ticketState: "Done", closedAt: "2026-10-01T00:00:00Z", window: "outside" }))).toMatch(/Returned: ENG-50 closed 2026-10-01T00:00:00Z, outside two weeks/u);
+  });
+
+  it("shows the computed SLA deadline and the alert's own clock, never the ticket's Linear date (SC-111)", () => {
+    const sla = Date.parse("2026-11-07T12:00:00Z");
+    const recurring = depsWake(depsFinding({ class: "recurring", ticket: "SC-111", ticketState: "Backlog", severity: "medium", priority: "medium", dueAt: sla, ticketLabels: ["security"], alertCreatedAt: "2026-10-29T00:19:43Z" }));
+    expect(recurring).toMatch(/\*\*medium\*\* priority medium, due 2026-11-07/u);
+    expect(recurring).not.toMatch(/the ticket's date is the one that counts/u);
+    expect(recurring).toMatch(/Ticket labels: security/u);
+    expect(recurring).toMatch(/opened 2026-10-29T00:19:43Z \(the SLA clock\); first seen by this watch/u);
+    expect(depsWake(depsFinding({ dueAt: sla }))).toMatch(/priority high, due 2026-11-07\n/u);
+  });
+
+  const decision = (over: Partial<DepsDecision> = {}): DepsDecision => ({ projectId: "p1", ticketKey: "SC-111", entityId: "dependabot/acme/web", fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedAt: Date.parse("2026-10-13T15:00:00Z"), raisedBy: "thr_filed", needId: "need_1", status: "pending", resolution: null, resolvedAt: null, reminded: ["overdue"], snoozedUntil: null, ...over });
+  const decisionsWake = (decisions: DepsDecision[], playbook = DEPS_ALERTS) => {
+    const at = Date.parse("2026-10-14T15:00:00Z");
+    return formatDepsWake({
+      reason: "requeue",
+      binding: binding("dependabot/acme/web"),
+      playbook: parsedPlaybook(playbook, "deps-alerts"),
+      look: { at, target: "dependabot/acme/web", error: null, viewer: "jane", alerts: [depsFinding({ class: "recurring", ticket: "SC-111", ticketState: "Backlog" })] },
+      team: "ENG",
+      label: "bb-managed",
+      owner: "Jane",
+      autoAdopt: ["critical", "high"],
+      timeZone: "UTC",
+      escalations: [],
+      decisions,
+      changes: [],
+    });
+  };
+
+  it("lists the adoption decisions waiting on the owner, with the exact dismiss commands and no steward-initiated dismiss", () => {
+    const text = decisionsWake([decision()]);
+    expect(text).toMatch(/### Adoption decisions waiting on the owner\n\n- SC-111 \(acme\/web#23, acme\/web#24\), raised 2026-10-13T15:00:00Z, item need_1, reminded: overdue/u);
+    expect(text).toMatch(/Adoption of any other ticket is the owner's decision, and the plugin asks it/u);
+    expect(text).toMatch(/Dismiss as not used: only when the owner answered with it on that ticket's decide item/u);
+    expect(text).toMatch(/re-read each of that decision's alerts on GitHub first and skip any already fixed or dismissed/u);
+    expect(text).toMatch(/re-read `\/repos\/acme\/web\/dependabot\/alerts\/23` first and skip it if it is already fixed or dismissed; otherwise `gh api -X PATCH \/repos\/acme\/web\/dependabot\/alerts\/23 -f state=dismissed -f dismissed_reason=not_used/u);
+    expect(text).toMatch(/alerts\/24/u);
+    expect(text).toMatch(/Keep tracking: keep the ticket open and unadopted/u);
+    expect(depsWake(depsFinding())).not.toMatch(/### Adoption decisions/u);
+  });
+
+  it("does not offer or describe Dismiss when the playbook's may list lacks dismiss-alert", () => {
+    const withoutDismiss = DEPS_ALERTS.replace(", dismiss-alert]", "]");
+    expect(withoutDismiss).not.toMatch(/dismiss-alert/u);
+    const text = decisionsWake([decision()], withoutDismiss);
+    expect(text).not.toMatch(/Dismiss as not used/u);
+    expect(text).not.toMatch(/gh api -X PATCH/u);
+    expect(text).toMatch(/Adopt: the ticket is labelled and moved to Todo/u);
   });
 
   it("says unassigned and the dedup note when the login or the search is unavailable", () => {
