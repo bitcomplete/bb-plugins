@@ -544,6 +544,44 @@ export function asksForOpenApproval(status: Binding["status"], open: readonly Es
 }
 
 /**
+ * One item the user must act on for a binding, as the coverage gates name it:
+ * a plugin or steward `need` (`need_…`), a route-`user` escalation (`esc_…`),
+ * or a question (`qst_…`). Two sources can describe the same ask (a plugin
+ * `approve-pr` need and its `approval` escalation); the id is the identity, so
+ * a repeated row is listed once.
+ */
+export type OpenUserItem = { id: string; kind: string; text: string; source: "need" | "escalation" | "question" };
+
+/**
+ * The binding's open user-facing items, in a stable order: route-`user`
+ * escalations and questions first, then the needs that are not one of those.
+ * Used by the escalate and forward coverage gates and by the reverse-order
+ * wake when a gate item is filed (BB-231). Never infers a subject from the
+ * text.
+ */
+export function openUserFacingItems(
+  bindingId: string,
+  needs: readonly Pick<Need, "id" | "kind" | "what">[],
+  escalations: readonly Escalation[],
+  questions: readonly { id: string; question: string; bindingId: string | null }[],
+): OpenUserItem[] {
+  const byId = new Map<string, OpenUserItem>();
+  // Escalations first: an escalation-backed `need` shares the escalation's id,
+  // so the raw route-`user` row must claim its id as an escalation (or a
+  // question), not be relabelled a need by the merge that follows.
+  for (const x of escalations) {
+    if (x.route !== "user") continue;
+    if (!byId.has(x.id)) byId.set(x.id, { id: x.id, kind: x.isQuestion ? "question" : x.kind, text: x.question, source: x.isQuestion ? "question" : "escalation" });
+  }
+  for (const q of questions) {
+    if (q.bindingId !== bindingId) continue;
+    if (!byId.has(q.id)) byId.set(q.id, { id: q.id, kind: "question", text: q.question, source: "question" });
+  }
+  for (const n of needs) if (!byId.has(n.id)) byId.set(n.id, { id: n.id, kind: n.kind, text: n.what, source: "need" });
+  return [...byId.values()];
+}
+
+/**
  * Whether to compact a steward's context: it already holds more than the
  * limit, or the wake about to be sent would push it over (criterion 4).
  * Tokens are estimated from the wake's characters; the provider's reading is

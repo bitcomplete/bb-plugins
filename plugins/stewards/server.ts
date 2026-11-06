@@ -78,7 +78,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate, PRODUCT_APPROVAL_REFUSAL } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
@@ -2382,6 +2382,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       return null;
+    }
+
+    /**
+     * The binding's open user-facing items (BB-231): the plugin's and a
+     * steward's needs, route-`user` escalations, and open questions. The
+     * escalate and forward coverage gates name each of these; the reverse-order
+     * wake asks whether a newly filed gate item covers one. Never a subject
+     * inferred from the text.
+     */
+    function userItemsFor(b: Binding): OpenUserItem[] {
+      // An auto-filed `decide` need is a placeholder made from a report's
+      // `nextAction`, not a real ask, so it is never a coverage candidate
+      // (BB-213, BB-231). A route-`user` escalation an open question already
+      // covers is the question's, so it is listed once, as the question.
+      const needs = store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n));
+      const covered = new Set(store.openQuestionEscalationIds(b.projectId));
+      const escalations = store.openEscalations(b.id).filter((x) => !covered.has(x.id));
+      return openUserFacingItems(b.id, needs, escalations, store.openQuestions(b.projectId));
     }
 
     /**
@@ -5918,6 +5936,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-231: a gate item (approve-spec, approve-pr, merge) filed on a binding
+     * that already has an open route-`user` escalation or question may be the
+     * same ask. Ask the project steward one yes/no: does the new item cover
+     * it? The plugin's item always survives; a yes resolves the escalation as
+     * covered (`steward_update { forward, coveredBy }`). Fired only when the
+     * item is newly filed, so it is not asked again on every look. The item's
+     * own linked escalation (its `data.escalationId`) is never a candidate.
+     */
+    async function noteGateItemCoverage(b: Binding, item: Need): Promise<void> {
+      const linked = typeof item.data.escalationId === "string" ? item.data.escalationId : null;
+      const candidates = userItemsFor(b).filter((x) => (x.source === "escalation" || x.source === "question") && x.id !== linked);
+      if (candidates.length === 0) return;
+      await wakeProject(b.projectId, `a gate item was filed on ${b.entityKey} with an open escalation`, {
+        digestDue: false,
+        notes: [
+          `${item.id} (${item.kind}) was filed on ${b.entityKey}: ${item.what}`,
+          ...candidates.map((c) => `It may cover ${c.id} (${c.source === "question" ? "question" : c.kind}): ${c.text}`),
+          `Does the new item cover ${candidates.length === 1 ? "it" : "them"}? If yes, resolve each as covered — for an escalation, steward_update { binding: "${b.entityKey}", resolve: "<the escalation>", coveredBy: "${item.id}" }; for a question, steward_update { binding: "${b.entityKey}", resolve: "<question id>", answer: "Covered by ${item.id}." }. If not, leave it open; the plugin's item always survives.`,
+        ],
+      });
+    }
+
+    /**
      * File, refresh and close the plugin's "needs you" items from a snapshot:
      * `approve-spec` (the user's approval of the ready gate), and, per observed
      * pull request, `approve-pr` and `merge`. The conditions are recomputed on
@@ -5929,6 +5970,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // present is a mechanical status event. The page and project-steward
       // paths write it at once; this catches an approval observed on GitHub.
       const events: MechanicalEvent[] = [];
+      // BB-231: the gate items open before this look, so a newly filed one can
+      // ask the project steward whether it covers an open escalation.
+      const needsBefore = new Set(store.openNeeds(b.id).map((n) => n.id));
       const mode = playbook.ready?.approval ?? null;
       const current = specHashFor(b, observed.entity);
       const gate = gateState(playbook, b.ready, current);
@@ -5998,6 +6042,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
+      // BB-231: a gate item filed this look may cover an open route-`user`
+      // escalation or question; ask the project steward once, per new item.
+      for (const item of store.openNeeds(b.id)) {
+        if (!needsBefore.has(item.id) && (item.kind === "approve-spec" || item.kind === "approve-pr" || item.kind === "merge")) await noteGateItemCoverage(b, item);
+      }
       return events;
     }
 
@@ -7767,6 +7816,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             context: z.string().trim().max(3000).optional().describe("What the reader needs to decide: the evidence and the reasoning. Not shown in the sidebar row."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
             choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
+            distinctFrom: z
+              .array(z.string().trim().min(1).max(100))
+              .max(20)
+              .optional()
+              .describe("When the binding has open items for the user (a plugin need, a route-user escalation, an open question), each of their ids (need_…, esc_…, qst_…) this escalation is distinct from. Required, and must name every one, when any is open; leave it out when none is. It is a pairwise judgement, never a subject label."),
           })
           .optional()
           .describe("Something the project's guidance does not let you decide. It goes to your parent steward, then the project steward; the answer comes back as guidance and wakes you."),
@@ -7840,6 +7894,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // so the deployment carries-check follows that merge (BB-215).
           const landedIn = input.landedIn === undefined ? undefined : parsePullRef(input.landedIn);
           if (input.landedIn !== undefined && landedIn === null) return toolError(new Error(`landedIn must name a pull request as owner/repo#N or its URL; ${JSON.stringify(input.landedIn)} does not.`));
+          // BB-231: a free-form escalation must say how it differs from every
+          // open user-facing item on the binding, or it can duplicate the
+          // plugin's gate item. The pairwise judgement is forced here; no
+          // subject is ever inferred from the escalation's text.
+          if (input.escalate !== undefined) {
+            const openItems = userItemsFor(b);
+            if (openItems.length > 0) {
+              const named = new Set(input.escalate.distinctFrom ?? []);
+              const unnamed = openItems.filter((item) => !named.has(item.id));
+              if (unnamed.length > 0) {
+                return toolError(
+                  new Error(
+                    `Nothing was recorded: ${b.entityKey} has open items for the user, and a new escalation must say how it differs from each (escalate.distinctFrom). Name ${openItems.length === 1 ? "it" : "them"}:\n` +
+                      openItems.map((item) => `- ${item.id} (${item.kind}): ${item.text}`).join("\n"),
+                  ),
+                );
+              }
+            }
+          }
           // The gate as it stood before this report, so the reply can tell a
           // report that just passed it from one that finds it already passed.
           const priorReady = b.ready;
@@ -8128,14 +8201,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const why = !gate.checklistMet ? `unmet: ${unmet.join(", ")}` : gate.approvalStale ? "the approval is stale" : "approval is needed";
             gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
           }
-          const request = store.openEscalations(b.id).find((x) => x.kind === "approval");
+          const approvalEscalations = store.openEscalations(b.id).filter((x) => x.kind === "approval");
+          const specEscalation = approvalEscalations.find((x) => x.resolutionKind !== "approve-decline");
           const specNeed = store.openNeeds(b.id).find((n) => n.kind === "approve-spec");
-          if (request !== undefined) {
-            gateNote += ` Approval of the spec is requested from the project steward (${request.id}); wait for it, and do not escalate for it.`;
-          } else if (specNeed !== undefined) {
-            gateNote += ` Approval of the spec is requested from the user, on the Stewards page (${specNeed.id}): they press Approve or Decline there.`;
+          const approvePrNeeds = store.openNeeds(b.id).filter((n) => n.kind === "approve-pr");
+          const holder = (route: Escalation["route"]): string => (route === "user" ? "the user" : route === "project" ? "the project steward" : route === "parent" ? "your parent steward" : "you");
+          // BB-231: the gate note is read from the record, so a PR approval is
+          // never called a spec approval. `resolutionKind` says which it is
+          // (`approve-decline` is the pull request's page item); the route says
+          // who holds it; the item id is named whenever the plugin filed one.
+          const approvalNotes: string[] = [];
+          if (specNeed !== undefined) {
+            approvalNotes.push(`Approval of the spec is requested from the user, on the Stewards page (${specNeed.id}): they press Approve or Decline there.`);
+          } else if (specEscalation !== undefined) {
+            approvalNotes.push(`Approval of the spec is requested from ${holder(specEscalation.route)} (${specEscalation.id}); wait for it, and do not escalate for it.`);
           }
-          if (request !== undefined || specNeed !== undefined) {
+          for (const need of approvePrNeeds) {
+            approvalNotes.push(`Approval of ${need.what.replace(/^Approve\s+/u, "").replace(/\s+on GitHub$/u, "")} is requested from the user, on the Stewards page (${need.id}): they approve on GitHub.`);
+          }
+          for (const esc of approvalEscalations.filter((x) => x.resolutionKind === "approve-decline")) {
+            if (approvePrNeeds.some((n) => n.data.escalationId === esc.id)) continue;
+            approvalNotes.push(`Approval of ${esc.question.replace(/^Approve\s+/u, "")} is requested from ${holder(esc.route)} (${esc.id}); wait for it, and do not escalate for it.`);
+          }
+          if (approvalNotes.length > 0) {
+            gateNote += ` ${approvalNotes.join(" ")}`;
             gateNote += " Do not ask the user again; it is listed on the Stewards page.";
             if (asksForOpenApproval(status, store.openEscalations(b.id), store.openNeeds(b.id)) !== null) gateNote += " This report asks for an approval that is already open: a playbook violation, shown by bb stewards show.";
           }
@@ -8149,7 +8238,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // and no wake is due. The wake is scheduled at once (a loud note on
           // the next reconcile), not left to the playbook's requeue.
           b = store.binding(b.id) ?? b;
-          const nothingPending = request === undefined && specNeed === undefined && schedule === undefined && b.hold === null;
+          const nothingPending = specEscalation === undefined && specNeed === undefined && schedule === undefined && b.hold === null;
           const startDue =
             gateJustPassed &&
             b.kind === "ticket" &&
@@ -8214,6 +8303,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .optional()
           .describe("Project steward only: originate an escalation you are putting to the user (route user), so it is kept until answered. `resolution` says how the page asks; `choice` needs `choices`, `secret` needs the variable and destination."),
         forward: z.string().trim().min(1).max(100).optional().describe("An escalation that reached you and that you should not decide: pass it up. From the project steward it goes to the user — an approval becomes an Approve/Decline item on the Stewards page, so do not ask in prose; anything else asks them in your reply. With a forward to the user, `resolution` says how the page asks."),
+        distinctFrom: z
+          .array(z.string().trim().min(1).max(100))
+          .max(20)
+          .optional()
+          .describe("With forward: when the binding has open items for the user (a plugin need, a route-user escalation, an open question), each of their ids (need_…, esc_…, qst_…) this escalation is distinct from. Required, and must name every one, when any is open; leave it out when none is. Use `coveredBy` instead when the escalation is the same ask as an open item."),
+        coveredBy: z
+          .string()
+          .trim()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("With forward or resolve: an open user-facing item on the binding (need_… or esc_… id) that already covers the escalation, so it is resolved as covered by that item instead of forwarded or decided. The ticket steward is woken with the item id. Give this or `distinctFrom`, never both."),
         resolution: z.enum(RESOLUTION_KINDS).optional().describe("With forward: how the page asks the user (choice, text, approve-decline, secret, done); required when forwarding to the user."),
         url: z.string().trim().max(500).optional().describe("With forward: the link the page shows, when there is one."),
         variable: z.string().trim().max(200).optional().describe('With forward and resolution "secret": the variable name.'),
@@ -8412,11 +8513,55 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const holder = forwarding.route === "parent" ? store.binding(target.parentBindingId ?? "")?.threadId : forwarding.route === "project" ? store.project(target.projectId).threadId : forwarding.route === "steward" ? target.threadId : null;
             if (holder !== threadId) return toolError(new Error(`Escalation ${forwarding.id} is not with this thread, so it cannot forward it.`));
           }
+          // BB-231: a forward must say how the escalation differs from every
+          // open user-facing item on the binding (`distinctFrom`), or name the
+          // item that already covers it (`coveredBy`), which resolves it as
+          // covered instead of forwarding. `coveredBy` works with `forward` (an
+          // escalation the project steward holds) or with `resolve` (one
+          // already with the user). The pairwise judgement is forced here; no
+          // subject is inferred from the text. `approve-decline` is the page's
+          // approval shape and is refused on anything but an approval
+          // escalation.
+          if (input.coveredBy !== undefined && input.forward === undefined && (input.resolve === undefined || input.resolve.startsWith("qst_"))) {
+            return toolError(new Error("coveredBy resolves an escalation named by forward or resolve; give one of them (a question is closed with answer instead)."));
+          }
+          if (input.distinctFrom !== undefined && input.forward === undefined) {
+            return toolError(new Error("distinctFrom goes with forward: name the open items the escalation is distinct from, or use coveredBy when one covers it."));
+          }
+          if (input.coveredBy !== undefined && input.distinctFrom !== undefined) {
+            return toolError(new Error("coveredBy and distinctFrom are alternatives: name the item that covers the escalation, or the open items it is distinct from, not both."));
+          }
+          if (input.coveredBy !== undefined) {
+            const covering = userItemsFor(target).find((item) => item.id === input.coveredBy);
+            if (covering === undefined) return toolError(new Error(`coveredBy must name an open item on ${target.entityKey}; ${input.coveredBy} is not one.`));
+          }
+          if (forwarding !== null) {
+            if (input.resolution === "approve-decline" && forwarding.kind !== "approval") {
+              return toolError(new Error(`resolution "approve-decline" is only for an approval escalation; ${forwarding.id} is a ${forwarding.kind} escalation.`));
+            }
+            if (input.coveredBy === undefined) {
+              const openItems = userItemsFor(target);
+              if (openItems.length > 0) {
+                const named = new Set(input.distinctFrom ?? []);
+                const unnamed = openItems.filter((item) => !named.has(item.id));
+                if (unnamed.length > 0) {
+                  return toolError(
+                    new Error(
+                      `Nothing was recorded: ${target.entityKey} has open items for the user, and a forward must say how it differs from each (distinctFrom) or name the item that covers it (coveredBy). Open items:\n` +
+                        openItems.map((item) => `- ${item.id} (${item.kind}): ${item.text}`).join("\n"),
+                    ),
+                  );
+                }
+              }
+            }
+          }
 
           const directs = mayDirect(threadId, target);
           if (!directs && forwarding === null) return toolError(new Error(`This thread does not steer ${target.entityKey}: only its own steward, a steward above it, or the project steward does.`));
           let approval: { entity: EntitySnapshot; byUser: boolean } | null = null;
           let resolving: Escalation | null = null;
+          /** True when a `coveredBy` resolution answers the escalation (BB-231). */
+          let covered = false;
           if (directs) {
             // A steward may put itself on hold (the owner said "halt work on
             // this" in a Linear mention), but only its parent or the project
@@ -8487,6 +8632,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               approval = { entity, byUser };
             }
             if (resolve !== undefined) {
+              // BB-231: `coveredBy` with `resolve` answers an escalation the
+              // user already holds as covered by an open item; the synthesized
+              // guidance names the item and wakes the ticket steward.
+              if (input.coveredBy !== undefined) {
+                const covering = userItemsFor(target).find((item) => item.id === input.coveredBy)!;
+                guidance = `Covered by ${covering.id} (${covering.kind}): ${covering.text}`;
+                covered = true;
+              }
               if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
               resolving = store.escalation(resolve);
               if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
@@ -8495,7 +8648,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // approver the gate names may do it, as with approve: true: the
               // project steward for mode project, and never a steward's own
               // words for mode me (there the user's quote is required).
-              if (approval === null && resolving.kind === "approval" && resolving.resolutionKind !== "approve-decline" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
+              if (!covered && approval === null && resolving.kind === "approval" && resolving.resolutionKind !== "approve-decline" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
                 const config = await loadConfig(target.projectId);
                 const playbook = config === null ? null : playbookFor(config, target.kind);
                 if (playbook?.ready?.approval === "project" && isProjectSteward(threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
@@ -8565,7 +8718,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (citeTarget !== null) store.setEscalationCitations(citeTarget.id, result.cited.map((l) => l.id));
             done.push(...citationLines(result));
           }
-          if (forwarding !== null) {
+          if (forwarding !== null && input.coveredBy !== undefined) {
+            // BB-231: the escalation is the same ask as an open item, so it is
+            // resolved as covered rather than forwarded. The resolve wakes the
+            // originating ticket steward with the covering item's id.
+            const covering = userItemsFor(target).find((item) => item.id === input.coveredBy)!;
+            store.resolve(forwarding.id, `Covered by ${covering.id} (${covering.kind}): ${covering.text}`, threadId);
+            done.push(`resolved ${forwarding.id} as covered by ${covering.id} (${covering.kind}); the ticket steward is woken with it`);
+          } else if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
             const resolutionKind = input.resolution ?? (forwarding.choices.length > 0 ? "choice" : "text");
@@ -8682,7 +8842,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A declined pull-request approval posts its marker before the
             // escalation is resolved, so a GitHub failure leaves the request
             // open to retry rather than recording a decision nobody can see.
-            const isDecline = resolving.kind === "approval" && resolving.resolutionKind === "approve-decline" && resolving.status === "open" && approval === null && classifyApproval(guidance) !== "approve";
+            const isDecline = !covered && resolving.kind === "approval" && resolving.resolutionKind === "approve-decline" && resolving.status === "open" && approval === null && classifyApproval(guidance) !== "approve";
             const declinePull = isDecline && target.lastSnapshot !== null ? observedPulls(target, target.lastSnapshot).find((p) => (p.url ?? p.key) === resolving.url) ?? null : null;
             const declineSha = resolving.headSha ?? declinePull?.pull?.headSha ?? null;
             if (isDecline && declinePull !== null) {
@@ -8705,7 +8865,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 declinedPrMarker: pull === null ? null : markerKey(latestReviewMarker(pull.comments)),
               });
               done.push(`remembered the decline of ${shortSha(resolving.headSha)} so the same head and reviewer marker are not asked again`);
-            } else if (resolving.kind === "approval" && resolving.status === "open" && approval === null && target.lastSnapshot !== null) {
+            } else if (!covered && resolving.kind === "approval" && resolving.status === "open" && approval === null && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
               const objections = objectionLines(guidance ?? "");
               const previous = fresh.declinedSpecObjections;

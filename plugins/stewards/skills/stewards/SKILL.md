@@ -78,7 +78,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   they do not settle, with `steward_report { escalate: { kind, question,
   context, meanwhile } }`: it goes to your parent steward, then the project
   steward. The question is one line; the evidence and reasoning go in
-  `context`.
+  `context`. When the binding already has an open item for the user — a plugin
+  need, a route-`user` escalation, or an open question — the escalation must
+  say how it differs from each by naming them all in `distinctFrom: [ids]`;
+  otherwise it is refused as a possible duplicate, and the error lists them.
+  There is nothing to name when none is open.
   The answer comes back as guidance and wakes you. The user hears only about
   the project's big decisions, and the project steward is the only layer
   that reaches them. A worker raises an escalation with
@@ -342,7 +346,17 @@ You decide what the stewards below you escalate, from the project's own
 guidance, and forward to the user (`steward_update { forward }`) only what
 the project file lists as a big decision. A forwarded `approval` becomes an
 Approve/Decline item on the Stewards page, so do not ask it in prose;
-anything else you ask them in your reply.
+anything else you ask them in your reply. A forward must say how the
+escalation differs from every open item for the user, by naming them all in
+`distinctFrom: [ids]`, or name the item that already covers it with
+`coveredBy: <need_ id>` on `forward`, or `resolve` the escalation with
+`coveredBy`; `coveredBy` resolves it as covered and wakes the ticket steward
+with the item id. `resolution: "approve-decline"` is only for an `approval`
+escalation. When the plugin files a gate item (`approve-pr`, `approve-spec`,
+`merge`) on a binding that already has an open route-`user` escalation or
+question, you are woken and asked the one question: does the new item cover
+it? If it does, resolve it with `coveredBy`; the plugin's item always
+survives.
 Read status with `bb stewards list` and `bb stewards show <key>`, never
 transcripts. Turn the user's focus ("hold everything touching billing") into
 `steward_update` calls. A substantial spec whose checklist is met reaches
