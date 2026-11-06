@@ -6734,16 +6734,19 @@ describe("needs you items", () => {
     const t = await withPull([marker]);
     const b = t.binding();
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     const refused = await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Approve acme/web#7?", meanwhile: "Wait." } }, t.steward);
     expect(refused.error).toBe(true);
     expect(refused.text).toMatch(new RegExp(need.id));
     expect(refused.text).toMatch(/approve-pr/u);
     expect(refused.text).toMatch(/Approve acme\/web#7 on GitHub/u);
+    // The plugin's own approval escalation is the need's, so it is listed once,
+    // as the need.
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(refused.text).not.toContain(esc.id);
     // Nothing was recorded.
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.question === "Approve acme/web#7?")).toBe(false);
-    // Naming every open item lets it through.
-    const allowed = await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Approve acme/web#7?", meanwhile: "Wait.", distinctFrom: [need.id, esc.id] } }, t.steward);
+    // Naming the one open item lets it through.
+    const allowed = await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Approve acme/web#7?", meanwhile: "Wait.", distinctFrom: [need.id] } }, t.steward);
     expect(allowed.error).toBe(false);
   });
 
@@ -6805,6 +6808,45 @@ describe("needs you items", () => {
     expect(wake).toContain(need.id);
     expect(wake).toContain(esc.id);
     expect(wake).toMatch(/Does the new item cover/iu);
+  });
+
+  it("does not ask whether a second pull request's item covers the first's escalation", async () => {
+    const t = await withPull([marker]);
+    // A second owner-lane pull request on the same ticket.
+    const secondMarker = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }, { key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }] }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", comments: [secondMarker] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const wakes = t.sends.filter((s) => s.threadId === t.project);
+    // The plugin's own approval escalation is each need's, so neither is a
+    // coverage candidate and the project steward is not woken about a pair.
+    expect(wakes.filter((w) => /a gate item was filed on ENG-12/u.test(w.text))).toEqual([]);
+    expect(t.hooks.store.openNeeds(t.binding().id).filter((n) => n.kind === "approve-pr")).toHaveLength(2);
+  });
+
+  it("does not re-ask the coverage question when a closed item is refiled for the same escalation", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.advance(1000);
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    t.advance(1000);
+    // The owner approves and checks are green: the merge item is filed, and the
+    // pair is asked once.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const asked = () => t.sends.filter((s) => s.threadId === t.project && /a gate item was filed on ENG-12/u.test(s.text));
+    expect(asked()).toHaveLength(1);
+    // Checks go red: the merge item closes. Green again: it is refiled with a
+    // new id, but the pair was already asked for this escalation.
+    t.advance(1000);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "failure", failing: ["test"] } }));
+    await t.ring("github", "acme/web#7");
+    t.advance(1000);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+    expect(asked()).toHaveLength(1);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
   });
 
   it("resolves an escalation the user holds as covered by an open item", async () => {

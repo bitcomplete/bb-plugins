@@ -2395,10 +2395,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // An auto-filed `decide` need is a placeholder made from a report's
       // `nextAction`, not a real ask, so it is never a coverage candidate
       // (BB-213, BB-231). A route-`user` escalation an open question already
-      // covers is the question's, so it is listed once, as the question.
+      // covers is the question's, and one an open need links through its
+      // `data.escalationId` is that need's, so each ask is listed once.
       const needs = store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n));
+      const linked = new Set(needs.map((n) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null)).filter((x): x is string => x !== null));
       const covered = new Set(store.openQuestionEscalationIds(b.projectId));
-      const escalations = store.openEscalations(b.id).filter((x) => !covered.has(x.id));
+      const escalations = store.openEscalations(b.id).filter((x) => !covered.has(x.id) && !linked.has(x.id));
       return openUserFacingItems(b.id, needs, escalations, store.openQuestions(b.projectId));
     }
 
@@ -5945,8 +5947,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * own linked escalation (its `data.escalationId`) is never a candidate.
      */
     async function noteGateItemCoverage(b: Binding, item: Need): Promise<void> {
-      const linked = typeof item.data.escalationId === "string" ? item.data.escalationId : null;
-      const candidates = userItemsFor(b).filter((x) => (x.source === "escalation" || x.source === "question") && x.id !== linked);
+      // A gate item can be closed and refiled with a new id (a `merge` item
+      // after a push). If a closed item of the same kind and url was filed
+      // after a candidate was created, the pair was already asked, so it is not
+      // asked again even though the new item has a new id.
+      const history = store.needs(b.id, true);
+      const candidates = userItemsFor(b).filter(
+        (x) =>
+          (x.source === "escalation" || x.source === "question") &&
+          !history.some((n) => n.status === "done" && n.kind === item.kind && n.url === item.url && n.createdAt > x.createdAt),
+      );
       if (candidates.length === 0) return;
       await wakeProject(b.projectId, `a gate item was filed on ${b.entityKey} with an open escalation`, {
         digestDue: false,

@@ -550,7 +550,7 @@ export function asksForOpenApproval(status: Binding["status"], open: readonly Es
  * `approve-pr` need and its `approval` escalation); the id is the identity, so
  * a repeated row is listed once.
  */
-export type OpenUserItem = { id: string; kind: string; text: string; source: "need" | "escalation" | "question" };
+export type OpenUserItem = { id: string; kind: string; text: string; source: "need" | "escalation" | "question"; createdAt: number };
 
 /**
  * The binding's open user-facing items, in a stable order: route-`user`
@@ -561,9 +561,9 @@ export type OpenUserItem = { id: string; kind: string; text: string; source: "ne
  */
 export function openUserFacingItems(
   bindingId: string,
-  needs: readonly Pick<Need, "id" | "kind" | "what">[],
+  needs: readonly Pick<Need, "id" | "kind" | "what" | "createdAt">[],
   escalations: readonly Escalation[],
-  questions: readonly { id: string; question: string; bindingId: string | null }[],
+  questions: readonly { id: string; question: string; bindingId: string | null; createdAt: number }[],
 ): OpenUserItem[] {
   const byId = new Map<string, OpenUserItem>();
   // Escalations first: an escalation-backed `need` shares the escalation's id,
@@ -571,13 +571,13 @@ export function openUserFacingItems(
   // question), not be relabelled a need by the merge that follows.
   for (const x of escalations) {
     if (x.route !== "user") continue;
-    if (!byId.has(x.id)) byId.set(x.id, { id: x.id, kind: x.isQuestion ? "question" : x.kind, text: x.question, source: x.isQuestion ? "question" : "escalation" });
+    if (!byId.has(x.id)) byId.set(x.id, { id: x.id, kind: x.isQuestion ? "question" : x.kind, text: x.question, source: x.isQuestion ? "question" : "escalation", createdAt: x.createdAt });
   }
   for (const q of questions) {
     if (q.bindingId !== bindingId) continue;
-    if (!byId.has(q.id)) byId.set(q.id, { id: q.id, kind: "question", text: q.question, source: "question" });
+    if (!byId.has(q.id)) byId.set(q.id, { id: q.id, kind: "question", text: q.question, source: "question", createdAt: q.createdAt });
   }
-  for (const n of needs) if (!byId.has(n.id)) byId.set(n.id, { id: n.id, kind: n.kind, text: n.what, source: "need" });
+  for (const n of needs) if (!byId.has(n.id)) byId.set(n.id, { id: n.id, kind: n.kind, text: n.what, source: "need", createdAt: n.createdAt });
   return [...byId.values()];
 }
 
