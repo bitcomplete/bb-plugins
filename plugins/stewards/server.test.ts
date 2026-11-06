@@ -6113,8 +6113,11 @@ describe("needs you items", () => {
     const through = await t.tool("steward_update", { binding: "ENG-12", forward: prose.id, resolution: "text" }, project);
     expect(through.error).toBe(false);
     // `secret` passes with the variable named, even though `done` and `text`
-    // were refused for it.
-    const asSecret = await t.tool("steward_update", { binding: "ENG-12", forward: inQuestion.id, resolution: "secret", variable: "VOICE_TRANSCRIPTION_API_KEY", purpose: "voice transcription" }, project);
+    // were refused for it. The question the prose forward just made is open
+    // for the user, so this escalation must say it is distinct from it
+    // (BB-231).
+    const proseQuestion = /(qst_[\w-]+)/u.exec(through.text)![1]!;
+    const asSecret = await t.tool("steward_update", { binding: "ENG-12", forward: inQuestion.id, resolution: "secret", variable: "VOICE_TRANSCRIPTION_API_KEY", purpose: "voice transcription", distinctFrom: [proseQuestion] }, project);
     expect(asSecret.error).toBe(false);
   });
 
@@ -6723,6 +6726,159 @@ describe("needs you items", () => {
       expect(text).toContain("that is an escalation now");
     }
     for (const kind of STEWARD_NEED_KINDS) expect(rules).toContain(kind);
+  });
+  // BB-231: a free-form escalation and a forward must not duplicate the
+  // plugin's gate item. The forcing function is pairwise, never a subject
+  // inferred from the escalation's text.
+  it("refuses a free-form escalation that does not say how it differs from the open gate item", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const refused = await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Approve acme/web#7?", meanwhile: "Wait." } }, t.steward);
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(new RegExp(need.id));
+    expect(refused.text).toMatch(/approve-pr/u);
+    expect(refused.text).toMatch(/Approve acme\/web#7 on GitHub/u);
+    // The plugin's own approval escalation is the need's, so it is listed once,
+    // as the need.
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(refused.text).not.toContain(esc.id);
+    // Nothing was recorded.
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.question === "Approve acme/web#7?")).toBe(false);
+    // Naming the one open item lets it through.
+    const allowed = await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Approve acme/web#7?", meanwhile: "Wait.", distinctFrom: [need.id] } }, t.steward);
+    expect(allowed.error).toBe(false);
+  });
+
+  it("refuses a forward without distinctFrom or coveredBy, and coveredBy resolves it and wakes the steward", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    // A free-form escalation reached the project steward before the fix could
+    // refuse it (created directly, as an older build would have).
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Approve acme/web#7?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1", origin: { threadId: t.steward, bindingId: b.id, chain: [] } });
+    const refused = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(new RegExp(need.id));
+    expect(refused.text).toMatch(/distinctFrom/u);
+    expect(refused.text).toMatch(/coveredBy/u);
+    // coveredBy names the open item that covers it: the escalation resolves and
+    // the ticket steward is woken with the item id.
+    const covered = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, coveredBy: need.id }, t.project);
+    expect(covered.error).toBe(false);
+    expect(covered.text).toMatch(/covered by/u);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+    await t.hooks.sweep();
+    await t.flush();
+    const back = t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text;
+    expect(back).toContain(need.id);
+    expect(back).toMatch(/Covered by/u);
+  });
+
+  it("refuses approve-decline on a non-approval escalation", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const project = t.spawns[0]!.id;
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1", origin: { threadId: steward, bindingId: b.id, chain: [] } });
+    const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "approve-decline" }, project);
+    expect(out.error).toBe(true);
+    expect(out.text).toMatch(/only for an approval escalation/u);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
+  });
+
+  it("wakes the project steward to ask whether a newly filed gate item covers an open escalation", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const b = t.hooks.store.find("ENG-12")!;
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    const before = t.sends.filter((s) => s.threadId === project).length;
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { ...base, ready: met }, steward);
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+    const wakes = t.sends.filter((s) => s.threadId === project);
+    expect(wakes.length).toBeGreaterThan(before);
+    const wake = wakes.at(-1)!.text;
+    expect(wake).toMatch(/a gate item was filed on ENG-12/u);
+    expect(wake).toContain(need.id);
+    expect(wake).toContain(esc.id);
+    expect(wake).toMatch(/Does the new item cover/iu);
+  });
+
+  it("does not ask whether a second pull request's item covers the first's escalation", async () => {
+    const t = await withPull([marker]);
+    // A second owner-lane pull request on the same ticket.
+    const secondMarker = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }, { key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }] }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", comments: [secondMarker] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const wakes = t.sends.filter((s) => s.threadId === t.project);
+    // The plugin's own approval escalation is each need's, so neither is a
+    // coverage candidate and the project steward is not woken about a pair.
+    expect(wakes.filter((w) => /a gate item was filed on ENG-12/u.test(w.text))).toEqual([]);
+    expect(t.hooks.store.openNeeds(t.binding().id).filter((n) => n.kind === "approve-pr")).toHaveLength(2);
+  });
+
+  it("does not re-ask the coverage question when a closed item is refiled for the same escalation", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.advance(1000);
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    t.advance(1000);
+    // The owner approves and checks are green: the merge item is filed, and the
+    // pair is asked once.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const asked = () => t.sends.filter((s) => s.threadId === t.project && /a gate item was filed on ENG-12/u.test(s.text));
+    expect(asked()).toHaveLength(1);
+    // Checks go red: the merge item closes. Green again: it is refiled with a
+    // new id, but the pair was already asked for this escalation.
+    t.advance(1000);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "failure", failing: ["test"] } }));
+    await t.ring("github", "acme/web#7");
+    t.advance(1000);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+    expect(asked()).toHaveLength(1);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
+  });
+
+  it("resolves an escalation the user holds as covered by an open item", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const b = t.hooks.store.find("ENG-12")!;
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { ...base, ready: met }, steward);
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1", origin: { threadId: steward, bindingId: b.id, chain: [] } });
+    const covered = await t.tool("steward_update", { binding: "ENG-12", resolve: esc.id, coveredBy: need.id }, project);
+    expect(covered.error).toBe(false);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+    await t.hooks.sweep();
+    await t.flush();
+    const back = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(back).toContain(need.id);
+    expect(back).toMatch(/Covered by/u);
+  });
+
+  it("names a PR approval as a PR approval, its holder and its item in the gate note", async () => {
+    const ownerMarker = comment({ id: "mo", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=owner -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    const t = await withPull([ownerMarker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const out = await t.tool("steward_report", { ...base, summary: "Waiting." }, t.steward);
+    expect(out.error).toBe(false);
+    expect(out.text).toMatch(new RegExp(`Approval of acme/web#7 is requested from the user, on the Stewards page \\(${need.id}\\)`));
+    expect(out.text).not.toMatch(/Approval of the spec is requested/u);
   });
 });
 
@@ -9557,6 +9713,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(stale).toContain("Run `bb stewards spawn-flags` for the exact worker spawn command");
     expect(stale).not.toContain("bb thread spawn --project p1");
   });
+
 });
 
 // BB-39: everything a steward spawns is left alone by thread-briefs, and the
@@ -9616,6 +9773,8 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other" }, steward);
     expect(marks()).toHaveLength(beforeOwn);
   });
+
+
 });
 
 // BB-45: BB-44's dev-server check found that an unset `sidebar.threadListProvider`
