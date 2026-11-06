@@ -69,7 +69,7 @@ function StepMark({ state }: { state: StepState }) {
 }
 
 const STEP_TITLES: Record<keyof Status["steps"], string> = {
-  ai: "Claude or Codex",
+  ai: "AI account",
   github: "GitHub",
   devbox: "devbox",
   linear: "Linear",
@@ -77,6 +77,25 @@ const STEP_TITLES: Record<keyof Status["steps"], string> = {
   figma: "Figma",
   machine: "a machine",
 };
+
+type AccountProvider = "claude" | "codex";
+
+const PROVIDER_NAMES: Record<AccountProvider, string> = { claude: "Claude", codex: "Codex" };
+
+/**
+ * The done-state routing line: each account whose provider routing is on, as
+ * `Provider: label`, in account order. Pure so a test can cover it without a
+ * DOM.
+ */
+export function routedAccountLabels(
+  accounts: ReadonlyArray<{ provider: AccountProvider; label: string }>,
+  routing: Record<AccountProvider, boolean>,
+): string {
+  return accounts
+    .filter((a) => routing[a.provider])
+    .map((a) => `${PROVIDER_NAMES[a.provider]}: ${a.label}`)
+    .join(", ");
+}
 
 /** The home-page line while steps remain: an icon to draw the eye, what is left, and the way to the checklist. */
 function Remaining({ steps }: { steps: Status["steps"] }) {
@@ -195,6 +214,9 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
   const [figma, setFigma] = useState<FigmaFlow | null>(null);
   const [figmaPasted, setFigmaPasted] = useState("");
   const [figmaError, setFigmaError] = useState<string | null>(null);
+  // Done state starts on one quiet "Add another account" action; this reveals
+  // the two sign-in choices inline.
+  const [addingAccount, setAddingAccount] = useState(false);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -313,32 +335,42 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
       <ol className="flex flex-col gap-4">
         <Step
           state={steps.ai}
-          title="Claude or Codex"
+          title="AI account"
           about={
-            <p>
-              Agents run on your own Claude or ChatGPT subscription through Account Pool. Add at least one account and turn its
-              provider routing on; every thread you start can then use it.
-            </p>
+            steps.ai === "done" ? undefined : (
+              <p>
+                Agents run on your own Claude or ChatGPT subscription through Account Pool. Add at least one account and turn its
+                provider routing on; every thread you start can then use it.
+              </p>
+            )
           }
           action={
             ai.available && claude === null && codex === null ? (
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <Button size="sm" variant={steps.ai === "done" ? "outline" : "default"} disabled={busy !== null} onClick={() => void run("claude", async () => {
-                  const s = await rpc.call("claudeSignIn");
-                  setPasted("");
-                  setClaude(s);
-                  open(s.url);
-                })}>
-                  Sign in to Claude
+              steps.ai === "done" && !addingAccount ? (
+                <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => setAddingAccount(true)}>
+                  Add another account
                 </Button>
-                <Button size="sm" variant="link" className="h-auto px-0" disabled={busy !== null} onClick={() => void run("codex", async () => {
-                  setCodexError(null);
-                  const s = await rpc.call("codexSignIn");
-                  setCodex(s);
-                })}>
-                  Sign in to Codex
-                </Button>
-              </div>
+              ) : (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void run("claude", async () => {
+                    setAddingAccount(false);
+                    const s = await rpc.call("claudeSignIn");
+                    setPasted("");
+                    setClaude(s);
+                    open(s.url);
+                  })}>
+                    Sign in to Claude
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void run("codex", async () => {
+                    setAddingAccount(false);
+                    setCodexError(null);
+                    const s = await rpc.call("codexSignIn");
+                    setCodex(s);
+                  })}>
+                    Sign in to Codex
+                  </Button>
+                </div>
+              )
             ) : null
           }
           panel={
@@ -409,7 +441,7 @@ function Checklist({ mode }: { mode: ChecklistMode }) {
             <p>{ai.message ?? "Account Pool is unavailable."} <SettingsLink pluginId="account-pool">Account Pool settings</SettingsLink></p>
           ) : steps.ai === "done" ? (
             <p>
-              Routing through {enabledAccounts.filter((a) => ai.routing[a.provider]).map((a) => a.label).join(", ")}.{" "}
+              Routing through {routedAccountLabels(enabledAccounts, ai.routing)}.{" "}
               <SettingsLink pluginId="account-pool">Manage accounts</SettingsLink>
             </p>
           ) : enabledAccounts.length > 0 ? (
