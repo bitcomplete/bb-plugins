@@ -9,7 +9,7 @@ import type {
   PluginNavPanelRegistration,
   PluginSettingsSectionRegistration,
 } from "@get-bb/plugin-sdk/app";
-import app from "./app.js";
+import app, { routedAccountLabels } from "./app.js";
 
 function capture() {
   const navPanels: PluginNavPanelRegistration[] = [];
@@ -47,5 +47,35 @@ describe("registration", () => {
     const { navPanels, appOverlays } = capture();
     expect(navPanels).toEqual([]);
     expect(appOverlays).toEqual([]);
+  });
+});
+
+describe("routedAccountLabels", () => {
+  it("prefixes each routed account with its provider, in account order", () => {
+    expect(
+      routedAccountLabels(
+        [
+          { provider: "claude", label: "dylan@bitcomplete.io" },
+          { provider: "codex", label: "Elijah" },
+        ],
+        { claude: true, codex: true },
+      ),
+    ).toBe("Claude: dylan@bitcomplete.io, Codex: Elijah");
+  });
+
+  it("leaves out accounts whose provider routing is off", () => {
+    expect(
+      routedAccountLabels(
+        [
+          { provider: "claude", label: "dylan@bitcomplete.io" },
+          { provider: "codex", label: "Elijah" },
+        ],
+        { claude: true, codex: false },
+      ),
+    ).toBe("Claude: dylan@bitcomplete.io");
+  });
+
+  it("is empty when nothing is routed", () => {
+    expect(routedAccountLabels([{ provider: "claude", label: "dylan@bitcomplete.io" }], { claude: false, codex: false })).toBe("");
   });
 });
