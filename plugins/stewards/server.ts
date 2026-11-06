@@ -1603,16 +1603,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       /**
-       * The project steward's cross-server problems (BB-105): no or two
-       * project stewards, a watch nobody runs, a watch two people run. They
-       * are computed here and shown on the project steward's server. With no
-       * project steward at all there is no such server, so every server with a
-       * role shows the "no one is the project steward" line instead.
+       * The project steward's cross-server problems (BB-105): a watch nobody
+       * runs, a watch two people run. They are computed here and shown on the
+       * project steward's server. Two or more project stewards is normal
+       * (BB-230): each server runs only its own login's roles. With no project
+       * steward at all there is no such server, so every server with a role
+       * shows the "no one is the project steward" line instead.
        */
       if (roles !== null) {
         const stewardProblem = projectStewardProblem(roles);
         if (role?.projectSteward === true) {
-          if (stewardProblem !== null) problems.push(stewardProblem);
           problems.push(...watchProblems(file, roles, repos, depsAlerts !== null));
         } else if (stewardProblem !== null && stewardProblem.startsWith("no one")) {
           // No server has the role, so every server that reads roles.json shows
