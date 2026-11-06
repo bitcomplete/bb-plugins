@@ -524,8 +524,8 @@ when asked to "set up stewards".
    is the merge of the roles it holds, and `check`, `list` and the Stewards
    page name those roles, not only the login. `projectSteward` is a built-in
    role with no definition; a role no holder names is a `check` warning, and
-   two holders with overlapping targets, an unknown role name, zero or two
-   `projectSteward` holders, and a holder's roles disagreeing on `context` or
+   two holders with overlapping targets, an unknown role name, no
+   `projectSteward` holder, and a holder's roles disagreeing on `context` or
    `team` are `check` problems (reported only, never changing what runs). A
    login with no entry runs no watches and is not the project steward; its
    home page says so. A version 1 file (one entry per login,

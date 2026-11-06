@@ -10668,12 +10668,14 @@ describe("roles.json (BB-105)", () => {
     expect(t.spawns.map((s) => String(s.title))).toEqual(expect.arrayContaining(["Acme project steward", "Ops watch: bb-gate-production"]));
   });
 
-  it("reports no project steward, and two, where the roles name them", async () => {
+  it("reports no project steward, and no problem for two", async () => {
+    // Two holders is normal (BB-230): each server runs only its own login's
+    // roles, so no project-steward problem is reported for them.
     const two = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     two.files[ROLES_FILE] = roles({ jane: { projectSteward: true }, bob: { projectSteward: true } });
     await two.hooks.sweep();
     await two.flush();
-    expect((await problemsOf(two)).some((p) => p.includes("two people are the project steward: jane, bob"))).toBe(true);
+    expect((await problemsOf(two)).filter((p) => p.includes("project steward"))).toEqual([]);
 
     const none = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     none.files[ROLES_FILE] = roles({ jane: {}, bob: {} });
