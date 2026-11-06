@@ -821,16 +821,17 @@ export function bindingRoles(roles: RolesFile | null, login: string | null, repo
   return out;
 }
 
-/** The project steward count problem, or null when exactly one holder holds it. */
+/**
+ * The project steward count problem, or null when one or more holders hold it.
+ * Two or more holders is normal (BB-230): each server runs only its own login's
+ * roles, so every developer whose server runs stewards can hold the role.
+ */
 export function projectStewardProblem(roles: RolesFile): string | null {
   const stewards = Object.entries(roles.roles).filter(([, role]) => role.projectSteward).map(([login]) => login);
   if (stewards.length === 0) {
     return roles.version === 2
       ? `no one holds ${PROJECT_STEWARD_ROLE}: give one holder the ${PROJECT_STEWARD_ROLE} role in roles.json`
       : "no one is the project steward: set projectSteward: true on one login in roles.json";
-  }
-  if (stewards.length > 1) {
-    return roles.version === 2 ? `two people hold ${PROJECT_STEWARD_ROLE}: ${stewards.join(", ")}` : `two people are the project steward: ${stewards.join(", ")}`;
   }
   return null;
 }

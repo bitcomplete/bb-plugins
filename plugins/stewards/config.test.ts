@@ -546,16 +546,18 @@ describe("roles.json (BB-105)", () => {
     expect(usesKind(legacy.value, "ops", role)).toBe(true);
   });
 
-  it("counts the project stewards and reports an unowned or doubly owned watch", () => {
+  it("reports an unowned or doubly owned watch, and no problem for two project stewards", () => {
     const project = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "web-production" }, { kind: "sentry-project", org: "acme", project: "web" }] } }));
     if (!project.ok) throw new Error(project.error);
     const none = roles({ jane: {}, bob: {} });
     if (!none.ok) throw new Error(none.error);
     expect(projectStewardProblem(none.value)).toMatch(/no one is the project steward/u);
 
+    // Two or more holders is normal (BB-230): each server runs only its own
+    // login's roles, so no problem is reported for them.
     const two = roles({ jane: { projectSteward: true }, bob: { projectSteward: true } });
     if (!two.ok) throw new Error(two.error);
-    expect(projectStewardProblem(two.value)).toMatch(/two people are the project steward: jane, bob/u);
+    expect(projectStewardProblem(two.value)).toBeNull();
 
     const doubled = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["web-production"] } }, bob: { ops: { k8sNamespaces: ["web-production"] } } });
     if (!doubled.ok) throw new Error(doubled.error);
@@ -618,13 +620,13 @@ describe("roles.json version 2 (BB-163)", () => {
     expect(roleK8sTargets(parsed.value.roles["bob"]!)).toEqual([{ kind: "k8s-namespace", name: "web-production" }]);
   });
 
-  it("reports zero or two project stewards", () => {
+  it("reports zero project stewards, and none for two", () => {
     const none = v2({ ops: {} }, { alice: ["ops"] });
     if (!none.ok) throw new Error(none.error);
     expect(projectStewardProblem(none.value)).toMatch(/no one holds projectSteward/u);
     const two = v2({ ops: {} }, { alice: ["ops", "projectSteward"], bob: ["projectSteward"] });
     if (!two.ok) throw new Error(two.error);
-    expect(projectStewardProblem(two.value)).toMatch(/two people hold projectSteward: alice, bob/u);
+    expect(projectStewardProblem(two.value)).toBeNull();
   });
 
   it("reports an unknown role name, and ignores it at runtime", () => {

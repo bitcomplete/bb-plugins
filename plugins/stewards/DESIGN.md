@@ -213,7 +213,7 @@ separately (`holders`: login → role names); `projectSteward` is a built-in
 role with no definition, and a login's effective role is the merge of the
 roles it holds, so every consumer of the old `config.role` is unchanged. A
 version 1 file keeps parsing and maps to one synthesized role per login.
-`check` reports an unknown role, zero or two project stewards, two holders
+`check` reports an unknown role, no project steward, two holders
 whose targets overlap, and a holder's roles disagreeing on `context` or
 `team`; a role no holder names is a warning. These are reported only and
 never change what runs.
@@ -227,7 +227,7 @@ never change what runs.
   author, and a review only where its GitHub login is a requested reviewer
   (BB-115). An unassigned labelled ticket is adopted nowhere.
 - The project steward's server reports cross-server problems: a watch nobody
-  runs, a watch two logins run, and no or two project stewards. A role whose
+  runs, a watch two logins run, and no project steward. A role whose
   machine lacks a credential (no kubectl, no Sentry token) is that server's
   own `bb stewards check` line.
 - A `project.json` that still carries `ops` runs exactly as before on every

@@ -766,7 +766,7 @@ setting: no server can see another's settings, and the file is the only place
 watch".
 
 The project steward's server reports cross-server configuration problems: a
-watch nobody runs, a watch two holders run, and no or two project stewards.
+watch nobody runs, a watch two holders run, and no project steward.
 Version 2 adds an error for an unknown role name, a warning for a role no
 holder names, an error for a holder's roles disagreeing on `context` or
 `team`, and (BB-164) a `check` error for each pull watch on a repo that is not
