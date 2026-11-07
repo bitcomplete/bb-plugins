@@ -92,6 +92,9 @@ export type BindingKind = (typeof KINDS)[number];
 
 export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-tickets", pr: "github-prs", review: "github-reviews", ops: "ops-watch" };
 
+/** The ticket playbook a GitHub-tracked project carries; the default for a project with no Linear teams. */
+export const DEFAULT_GITHUB_TICKET_PLAYBOOK = "github-issues";
+
 /** The playbooks the dependency watch uses: one for alert targets, one for the bot's pull requests. */
 export const DEPS_ALERTS_PLAYBOOK = "deps-alerts";
 export const DEPS_PRS_PLAYBOOK = "deps-prs";
@@ -637,7 +640,13 @@ export const roleUsesOps = (role: Role | null): boolean => roleK8sTargets(role).
 export const usesKind = (project: ProjectFile, kind: BindingKind, role?: Role | null): boolean =>
   kind === "review" ? project.reviews.enabled : kind === "ops" ? (role === undefined ? project.ops.targets.length > 0 : roleUsesOps(role)) : true;
 
-export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string => project.playbooks[kind] ?? DEFAULT_PLAYBOOKS[kind];
+/**
+ * The playbook a project file names for a kind. A ticket with no explicit
+ * playbook follows the source the project tracks: `github-issues` when it has
+ * no Linear teams (a GitHub-tracked project), `linear-tickets` otherwise.
+ */
+export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string =>
+  project.playbooks[kind] ?? (kind === "ticket" && project.linear.teams.length === 0 ? DEFAULT_GITHUB_TICKET_PLAYBOOK : DEFAULT_PLAYBOOKS[kind]);
 
 export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.targets;
 
@@ -1033,7 +1042,7 @@ export const deploymentsFieldSchema = z
   });
 
 export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
-const SOURCE_OF: Record<BindingKind, (typeof PLAYBOOK_SOURCES)[number]> = { ticket: "linear", pr: "github", review: "github", ops: "k8s" };
+const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry"] };
 
 export const frontMatterSchema = z
   .object({
@@ -1126,7 +1135,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   if (!parsed.success) return { ok: false, error: `${file}: ${zodMessage(parsed.error)}` };
   const fm = parsed.data;
   if (fm.name !== expectedName) return { ok: false, error: `${file} names itself ${JSON.stringify(fm.name)}; the file name says ${JSON.stringify(expectedName)}` };
-  const expectedSource = SOURCE_OF[fm.kind];
+  const expectedSources = SOURCES_OF[fm.kind];
   if (fm.kind === "ops") {
     // An ops binding watches a target, not an entity in a source plugin: a
     // Kubernetes namespace reads k8s, a Dependabot alert target reads
@@ -1134,8 +1143,8 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
     // its sections can be about the right thing; any is valid, and the
     // ops-watch playbook serves k8s and Sentry targets alike.
     if (fm.source === "linear") return { ok: false, error: `${file}: an ops playbook watches k8s, sentry or github, not ${fm.source}` };
-  } else if (fm.source !== expectedSource) {
-    return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
+  } else if (!expectedSources.includes(fm.source)) {
+    return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSources.join(" or ")}, not ${fm.source}` };
   }
   if (fm.kind === "ops") {
     // An ops binding watches a target for as long as it is configured: no state to key phases on, and nothing terminal.
@@ -1227,3 +1236,17 @@ export function phaseInstructions(playbook: Playbook, state: string): string | n
 
 /** Every source state the playbook names, for validation against the source (Linear workflow states, or GitHub status labels). */
 export const playbookStates = (playbook: Playbook): string[] => [...Object.keys(playbook.phases), ...playbook.terminal, ...(playbook.ready !== null && typeof playbook.ready.approval === "object" ? [playbook.ready.approval.state] : [])];
+
+/**
+ * The states GitHub produces itself rather than reading from a label: an open
+ * or closed issue (`closed`, `closed (completed)`, `closed (not planned)`),
+ * and a pull request's own states. They cannot be created or validated as
+ * labels, so a GitHub issue playbook's label states are the rest.
+ */
+const derivedGithubState = (state: string): boolean => {
+  const s = state.toLowerCase();
+  return s === "open" || s === "draft" || s === "merged" || s === "closed" || s.startsWith("closed ");
+};
+
+/** The label states a GitHub issue playbook expects: its phases, terminal labels and approval state, less GitHub's derived states. */
+export const githubStateLabels = (playbook: Playbook): string[] => playbookStates(playbook).filter((s) => !derivedGithubState(s));
