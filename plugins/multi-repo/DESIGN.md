@@ -158,7 +158,7 @@ Declares `requires: { projectCheckout: true }`, which guarantees a non-null `con
 
 1. **Bootstrap `.bb`** if `projectCheckout.path` has no `.git`: `git init`, seed `AGENTS.md` and `repos.json`, commit.
 2. **Refresh** the project-source checkout (fetch-if-stale), then parse and validate `repos.json`.
-3. **Seed by discovery** if the repo set is empty — propose repos found on this machine rather than producing an empty workspace.
+3. **An empty repo set stays empty.** The workspace then holds only the project source (the primary clone, or the standalone `.bb`). Nothing is ever proposed into `repos.json` from the checkouts on the machine: on a server that keeps its projects side by side that proposed every other project's primary, and for a plain repo adopted as the project source it committed that list at the repo root.
 4. **Populate the cache** per repo (§5), under a file lock. Concurrent thread creation against one cache entry is normal, not an edge case.
 5. **Materialize the workspace**: claim the root with `context.experimental_claimPath(root)` before writing to it, create it, clone each repo plus `.bb`, rewrite each work repo's `origin` to its real remote, and create the shared thread branch in each work repo. `.bb` stays on its default branch.
 6. **Precompute the layout** table and write it to plugin storage keyed by environment (see §8).
@@ -330,7 +330,7 @@ The `bb` floor is `">=0.0"`, matching every bundled plugin; the only one that de
 
 ## 11. Build order
 
-1. **Provider cold start** — bootstrap `.bb`, discovery seed, cache population, workspace materialization, progress reporting, layout precompute, `contributeInstructions`. Proves the sandbox and commit story end to end, with no UI.
+1. **Provider cold start** — bootstrap `.bb`, cache population, workspace materialization, progress reporting, layout precompute, `contributeInstructions`. Proves the sandbox and commit story end to end, with no UI.
 2. **Tools and skill** — including live `workspace_add_repo`.
 3. **Nav panel** — repo list, per-repo and cache status, `repos.json` editing with loud validation. Plus `bb repos`.
 4. **Diff panel.**

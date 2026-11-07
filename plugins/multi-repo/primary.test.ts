@@ -561,13 +561,17 @@ describe("seeding an empty repo set", () => {
   };
   const THREAD = makeThreadResponse({ id: THREAD_ID, projectId: PROJECT_ID, environmentId: null });
 
-  function hostResponder(layout: "primary" | "standalone", remote: string | null) {
+  function hostResponder(
+    layout: "primary" | "standalone",
+    remote: string | null,
+    options: { reposJson?: string | null } = {},
+  ) {
     return (call: { method: string; input: unknown }): unknown => {
       switch (call.method) {
         case "prepareProjectSource":
           return {
             bootstrapped: false,
-            reposJson: '{"version":1,"repos":[]}',
+            reposJson: options.reposJson === undefined ? '{"version":1,"repos":[]}' : options.reposJson,
             remote,
             defaultBranch: "main",
             unpushed: null,
@@ -612,8 +616,12 @@ describe("seeding an empty repo set", () => {
     };
   }
 
-  async function runCreate(layout: "primary" | "standalone", remote: string | null) {
-    const { bb, harness } = createFakePluginHost({ experimental_callHostRpc: hostResponder(layout, remote) });
+  async function runCreate(
+    layout: "primary" | "standalone",
+    remote: string | null,
+    options: { reposJson?: string | null } = {},
+  ) {
+    const { bb, harness } = createFakePluginHost({ experimental_callHostRpc: hostResponder(layout, remote, options) });
     harness.sdk.stub("projects.list", () => []);
     harness.sdk.stub("projects.get", () => PROJECT);
     harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
@@ -652,19 +660,30 @@ describe("seeding an empty repo set", () => {
     expect(repos.some((repo) => repo.url === SIBLING_URL)).toBe(false);
   });
 
-  it("standalone layout still seeds, and skips the project source's own origin", async () => {
+  it("standalone layout with an empty repos.json seeds nothing and holds only .bb", async () => {
     const { result, harness } = await runCreate("standalone", PRIMARY_URL);
 
     expect(result).toMatchObject({ status: "created", path: ROOT });
-    const write = harness.experimental_hostRpcCalls.find((call) => call.method === "writeProjectSourceRepos");
-    expect(write).toBeDefined();
-    const reposJson = (write?.input as { reposJson: string }).reposJson;
-    // The sibling checkout is the whole proposed set...
-    const parsed = parseReposFile(reposJson);
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) throw new Error(parsed.error);
-    expect(parsed.value.repos).toEqual([{ dir: "sibling", url: SIBLING_URL, inferredDir: true }]);
-    // ...and the project source's own origin is not repeated in the file.
-    expect(reposJson).not.toContain(PRIMARY_URL);
+    // No seed commit: an empty set is the owner's, not an invitation to fill it
+    // from whatever else is checked out on this machine.
+    expect(harness.experimental_hostRpcCalls.some((call) => call.method === "writeProjectSourceRepos")).toBe(false);
+
+    const provision = harness.experimental_hostRpcCalls.find((call) => call.method === "provisionWorkspace");
+    const repos = (provision?.input as { repos: { dir: string; url: string }[] }).repos;
+    expect(repos).toEqual([]);
+  });
+
+  it("a plain repo with no committed repos.json seeds nothing and never writes to it", async () => {
+    // A plain repo adopted as the project source has no definition at all;
+    // `prepareProjectSource` reports `reposJson: null` and `standalone`. A seed
+    // write here lands `repos.json` at the root of someone's real repo.
+    const { result, harness } = await runCreate("standalone", PRIMARY_URL, { reposJson: null });
+
+    expect(result).toMatchObject({ status: "created", path: ROOT });
+    expect(harness.experimental_hostRpcCalls.some((call) => call.method === "writeProjectSourceRepos")).toBe(false);
+
+    const provision = harness.experimental_hostRpcCalls.find((call) => call.method === "provisionWorkspace");
+    const repos = (provision?.input as { repos: { dir: string; url: string }[] }).repos;
+    expect(repos).toEqual([]);
   });
 });

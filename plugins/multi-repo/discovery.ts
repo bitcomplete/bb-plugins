@@ -3,10 +3,10 @@
  *
  * Two jobs, one mechanism. A checkout whose `origin` matches a repo in the set
  * is a **local mirror** the object cache can be seeded from, turning a cold
- * network clone into a hardlinking local one. And for a project whose repo set
- * is still empty, the same list is what gets *proposed* as the repo set, so a
- * new project produces a workspace with something in it rather than an empty
- * directory.
+ * network clone into a hardlinking local one. And the same list is what the
+ * Repos panel offers as suggestions. It is never written into `repos.json`
+ * on its own: a project whose repo set is empty gets a workspace holding only
+ * its project source, not whatever else happens to be checked out next to it.
  *
  * The candidate paths come from bb's own registry rather than from a disk
  * walk: `bb.sdk.projects.list()` returns every project with its `sources[]`,
