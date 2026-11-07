@@ -1077,7 +1077,7 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 The cross-plugin RPC contract in §3, plus `mergeGuidance`: the narrow
 fast-forward of the canonical `.bb` to a thread's published guidance branch
-for a standalone `.bb` repo. Since BB-108 a lesson lands as a pull request on
+for a `.bb` definition. Since BB-108 a lesson lands as a pull request on
 the primary repo and stewards no longer calls `mergeGuidance`; `pushGuidance`
 (`workspace_publish_guidance`) is still the branch push. Only the stewards
 plugin may call `mergeGuidance`.

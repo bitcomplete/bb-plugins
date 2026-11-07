@@ -21,7 +21,7 @@ export const hostContract = defineRpcContract({
         files: z.array(z.object({ path: z.string().max(300), content: z.string().nullable() })).max(64),
         remote: z.string().max(2000).nullable(),
         defaultBranch: z.string().max(300).nullable(),
-        layout: z.enum(["primary", "directory", "standalone"]),
+        layout: z.enum(["primary", "directory"]),
         error: z.string().max(2000).nullable(),
       })
       .strict(),

@@ -94,7 +94,7 @@ export type SurveyBb = {
 export type SurveyInput = {
   projectId: string;
   source: "multi-repo" | "native";
-  layout: "primary" | "directory" | "standalone";
+  layout: "primary" | "directory";
   primary: { dir: string; url: string } | null;
   repos: SurveyRepoInput[];
   linear: SurveyLinear;
@@ -104,7 +104,7 @@ export type SurveyInput = {
 export type SurveyReport = {
   projectId: string;
   source: "multi-repo" | "native";
-  layout: "primary" | "directory" | "standalone";
+  layout: "primary" | "directory";
   primary: { dir: string; url: string } | null;
   repos: SurveyRepo[];
   linear: SurveyLinear;

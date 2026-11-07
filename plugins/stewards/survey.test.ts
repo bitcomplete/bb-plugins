@@ -151,7 +151,7 @@ describe("buildSurvey", () => {
     const report = buildSurvey({
       projectId: "p1",
       source: "native",
-      layout: "standalone",
+      layout: "directory",
       primary: null,
       repos: [repo()],
       linear: { available: false, error: "linear is not connected" },

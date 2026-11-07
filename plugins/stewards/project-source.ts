@@ -5,12 +5,14 @@
 //   * `multi-repo` — the three RPCs, exactly as before: `readProjectFiles`,
 //     `repoSet`, `mergeGuidance`. Every project that has the plugin installed
 //     stays here, so nothing changes for them.
-//   * `native` — a git handler in the plugin's host entry (host.ts,
-//     project-git.ts) that reads `.bb` from `origin/<default>` after a fetch,
-//     never the developer's working tree, and takes the repo set from the
-//     checkout's own `origin`. It is chosen only when the multi-repo RPC
-//     reports the plugin is missing (`isMissingPlugin`), so a single-repo
-//     project on a stock bb install can run stewards.
+//   * `native` — a handler in the plugin's host entry (host.ts,
+//     project-git.ts) that reads `.bb` from a git checkout's
+//     `origin/<default>` after a fetch, never the developer's working tree,
+//     and takes the repo set from the checkout's own `origin`. A plain
+//     project directory has no git, so `.bb/stewards/` is read from disk
+//     instead. It is chosen only when the multi-repo RPC reports the plugin
+//     is missing (`isMissingPlugin`), so a single-repo project on a stock bb
+//     install can run stewards.
 //
 // A source carries the environment choice too: multi-repo spawns a fresh
 // thread on the `multi-repo-workspace` provider when the project has a
@@ -39,7 +41,7 @@ export type ProjectRepoSet = {
   repos: Array<{ dir: string; url: string }>;
   /** The project source's own origin, for a lesson's pull request (BB-108). */
   primary: { dir: string; url: string } | null;
-  layout: "primary" | "directory" | "standalone";
+  layout: "primary" | "directory";
   error: string | null;
 };
 
@@ -52,7 +54,7 @@ export type NativeGitRead = {
   files: ProjectGitFile[];
   remote: string | null;
   defaultBranch: string | null;
-  layout: "primary" | "directory" | "standalone";
+  layout: "primary" | "directory";
   error: string | null;
 };
 

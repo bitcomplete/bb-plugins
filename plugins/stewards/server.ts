@@ -296,7 +296,7 @@ const repoSetOutput = z
     repos: z.array(z.object({ dir: z.string(), url: z.string() }).loose()),
     /** The project source's own origin, for a lesson's pull request (BB-108). */
     primary: z.object({ dir: z.string(), url: z.string() }).loose().nullable().default(null),
-    layout: z.enum(["primary", "directory", "standalone"]).default("standalone"),
+    layout: z.enum(["primary", "directory"]),
     error: z.string().nullable(),
   })
   .loose();

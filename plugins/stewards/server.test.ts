@@ -27,7 +27,7 @@ function world() {
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   /** The primary repo a lesson's pull request opens on (BB-108). */
   let primary: { dir: string; url: string } | null = { dir: "bb", url: "https://github.com/acme/bb.git" };
-  let layout: "primary" | "directory" | "standalone" = "primary";
+  let layout: "primary" | "directory" = "primary";
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
@@ -451,7 +451,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory" | "standalone") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -5248,14 +5248,15 @@ describe("the native project source (BB-107)", () => {
   });
 
   /** A world whose multi-repo plugin is missing: native git serves `.bb`, and every multi-repo RPC is a 404. */
-  const nativeWorld = async (missing = true) => {
+  const nativeWorld = async (missing = true, overrides: { layout?: "primary" | "directory"; remote?: string | null } = {}) => {
     let files: Record<string, string | null> = defaultFiles();
     let hostError: string | null = null;
     const gitCalls: Array<{ path: string; hostId: string | null; files: string[]; fetch: boolean }> = [];
+    const layout = overrides.layout ?? "primary";
     const t = await setup({
       git: async ({ hostId, path, files: paths, fetch }) => {
         gitCalls.push({ path, hostId, files: paths, fetch });
-        return { head: "abc", files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote: "https://github.com/acme/web.git", defaultBranch: "main", layout: "primary" as const, error: hostError };
+        return { head: layout === "directory" ? null : "abc", files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote: overrides.remote === undefined ? "https://github.com/acme/web.git" : overrides.remote, defaultBranch: layout === "directory" ? null : "main", layout, error: hostError };
       },
     });
     files = t.files;
@@ -5280,6 +5281,16 @@ describe("the native project source (BB-107)", () => {
     expect(config!.repos).toEqual(["acme/web"]);
     // It read the project file through the git handler, on the checkout.
     expect(gitCalls.some((c) => c.files.includes(PROJECT_FILE))).toBe(true);
+  });
+
+  it("reads a plain-directory project from disk: layout directory and no repo appended", async () => {
+    const { t } = await nativeWorld(true, { layout: "directory", remote: null });
+    const config = await load(t);
+    expect(config).not.toBeNull();
+    expect(config!.source.kind).toBe("native");
+    // A plain directory has no origin, so there is no repo set to append.
+    expect(config!.repos).toEqual([]);
+    expect(config!.file.linear.teams).toEqual(["ENG"]);
   });
 
   it("keeps the multi-repo source and reports a problem line when the RPC fails for another reason", async () => {
