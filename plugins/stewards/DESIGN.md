@@ -253,23 +253,26 @@ project's canonical `.bb` checkout. multi-repo already locates it (the
 project's `local_path` source, preferring the server's own machine) and reads
 it on the host. It gains one small cross-plugin RPC contract:
 
-- `readProjectFiles({ projectId, paths })` — file contents from the canonical
-  checkout's committed `master`.
+- `readProjectFiles({ projectId, paths })` — file contents from the project's
+  `.bb`: a git repo's canonical checkout at its committed `master`, or a plain
+  project directory's `<dir>/.bb` on disk.
 - `repoSet({ projectId })` — the parsed repo set.
 
 multi-repo still depends on no other plugin; stewards uses it when it is
-installed and falls back to native git when it is not (BB-107). Only committed
-`master` is read, so a playbook edit published from a thread lands as a
-`guidance-<threadId>` branch and takes effect when it is merged. That is the
-review step, and it is deliberate.
+installed and falls back to native git when it is not (BB-107). A git repo's
+committed `master` is read, so a playbook edit published from a thread lands
+as a `guidance-<threadId>` branch and takes effect when it is merged — that is
+the review step, and it is deliberate. A plain project directory has no
+commit: its `.bb` is read from disk, so an edit takes effect on the next read.
 
-When multi-repo is not installed, stewards reads `.bb` through a git handler in
-its own host entry: `origin/<default>` after a fetch, never the developer's
-working tree, with the repo set taken from the checkout's own `origin`. The two
-reads sit behind one `ProjectSource` seam (`project-source.ts`), chosen once
-per project at config load and cached with the config; only an unknown-plugin
-RPC error selects native, and a spawn in native mode uses core's
-`project-default` environment.
+When multi-repo is not installed, stewards reads `.bb` through a handler in
+its own host entry: for a git repo, `origin/<default>` after a fetch, never the
+developer's working tree, with the repo set taken from the checkout's own
+`origin`; for a plain directory, `<dir>/.bb` on disk. The two reads sit behind
+one `ProjectSource` seam (`project-source.ts`), chosen once per project at
+config load and cached with the config; only an unknown-plugin RPC error
+selects native, and a spawn in native mode uses core's `project-default`
+environment.
 
 multi-repo's host-side read fetches and fast-forwards (`--ff-only`) the
 canonical checkout at most once every ten minutes, then reads committed
@@ -2061,8 +2064,10 @@ Three pieces, in order:
    touching playbooks only where the survey found a deviation; `bb stewards
    check`; `workspace_publish_guidance` and a pull request on the primary
    whose body lists every assumption, so review is the second interview. It
-   runs `bb stewards enable` only after that pull request merges, because
-   stewards read committed `origin/main` only. On a partial `.bb` the same
+   runs `bb stewards enable` only after that pull request merges, because a git
+   repo is read at committed `origin/main` only; a plain project directory is
+   read from `.bb` on disk, so its files are live as soon as they are written
+   and there is no pull request to wait for. On a partial `.bb` the same
    flow proposes additions only, matching `init`'s never-overwrite rule, so
    adopting a project is the same as creating one. It is short on day one by
    design: the lessons mechanism grows `.bb` from real decisions.

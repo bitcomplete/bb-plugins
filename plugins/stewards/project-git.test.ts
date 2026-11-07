@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { hostContract } from "./host-contract.js";
 import { readProjectGit } from "./project-git.js";
 
 const roots: string[] = [];
@@ -108,6 +109,11 @@ describe("the native git project source", () => {
     expect(byPath.get("stewards/project.json")).toContain('"marker":"plain"');
     expect(byPath.get("stewards/roles.json")).toBe("{}\n");
     expect(byPath.get("stewards/missing.json")).toBeNull();
+  });
+
+  it("rejects the removed standalone layout at the host contract", () => {
+    const parsed = hostContract.gitProjectFiles.output.safeParse({ head: null, files: [], remote: null, defaultBranch: null, layout: "standalone", error: null });
+    expect(parsed.success).toBe(false);
   });
 
   it("refuses a traversal path rather than running git with it", async () => {

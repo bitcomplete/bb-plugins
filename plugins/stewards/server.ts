@@ -1261,6 +1261,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * makes one read rather than one per caller (BB-104).
      */
     const configReads = new Map<string, Promise<ProjectConfig | null>>();
+    /**
+     * The last configuration-read failure per project. A project whose layout
+     * multi-repo refuses (a leftover root `repos.json`, say) has no last good
+     * config to carry the problem line, so the failure is kept here and shown
+     * for that project alone. A successful read clears it.
+     */
+    const configErrors = new Map<string, string>();
 
     /** The RPC-backed multi-repo source for one project: the three RPCs as they always were. */
     function multiRepoSourceFor(projectId: string): ProjectSource {
@@ -1354,16 +1361,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const promise = readConfig(projectId)
         .then((value) => {
           configs.set(projectId, { at: now(), value });
+          configErrors.delete(projectId);
           return value;
         })
         .catch((error: unknown) => {
           // Unreachable `.bb` is not "no stewards": keep what we had. A
           // non-missing RPC failure stays on the last good source (BB-107) and
           // is shown as a problem line rather than silently swallowed.
-          bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${errorMessage(error)}`);
+          const message = errorMessage(error);
+          bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${message}`);
+          configErrors.set(projectId, message);
           const last = configs.get(projectId)?.value ?? null;
           if (last !== null) {
-            const line = `could not read the configuration: ${errorMessage(error)}`;
+            const line = `could not read the configuration: ${message}`;
             if (!last.problems.includes(line)) last.problems.push(line);
           }
           return last;
@@ -7096,7 +7106,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             repos: config?.repos ?? [],
             excludedRepos: config?.file.github.exclude ?? [],
             playbooks: overviewPlaybooks(config),
-            problems: config?.problems ?? [],
+            // A project with no readable config still reports why, from the
+            // last failed read, so a refused layout shows for it alone.
+            problems: config?.problems ?? (configErrors.has(projectId) ? [`could not read the configuration: ${configErrors.get(projectId)}`] : []),
             nightly: config === null ? null : { at: config.file.nightly.at, timezone: config.file.nightly.timezone },
             lastNight: row.nightlyDate,
             projectStewardThreadId: row.threadId,
@@ -9670,7 +9682,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
-      if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
+      if (config === null) {
+        const error = configErrors.get(projectId);
+        if (error !== undefined) return { ok: false, lines: [`problem: could not read the configuration: ${error}`] };
+        return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb. Run bb stewards init.`] };
+      }
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
       if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
@@ -9985,7 +10001,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           init: cliCommand({
             summary: "Write stewards/project.json and the default playbooks into a .bb checkout",
             description:
-              "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. Then commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself); stewards reads committed HEAD only.",
+              "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. A git repo is read at origin/<default>'s committed tip, so commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself). A plain project directory is read from <dir>/.bb on disk, so the files take effect on the next read and there is nothing to commit or publish.",
             options: {
               teams: { type: "string", description: "Linear team keys, comma-separated; the teams you belong to when left out" },
               dir: { type: "string", description: "The .bb directory to write into" },
@@ -10019,7 +10035,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const result = (await bb.sdk.files.write({ path, content, ...(input.options.force ? {} : { expectedSha256: null }), ...(hostId === undefined ? {} : { hostId }) } as never)) as { outcome: string };
                 lines.push(`${result.outcome === "written" ? "wrote" : "kept existing"} ${rel}`);
               }
-              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), merge the guidance branch, then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
+              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files. In a git repo, commit inside .bb and publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), then merge the guidance branch. In a plain project directory, .bb is read from disk, so there is nothing to commit or publish. Then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
@@ -10695,7 +10711,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       defineCli({
         name: "stewards",
         summary: "Long-lived threads that manage labelled Linear tickets and GitHub pull requests, and watch production",
-        description: "Configuration lives in the project's .bb (stewards/project.json and stewards/playbooks/), read from committed HEAD through multi-repo.",
+        description: "Configuration lives in the project's .bb (stewards/project.json and stewards/playbooks/): a git repo is read at origin/<default>'s committed tip through multi-repo, and a plain project directory is read from <dir>/.bb on disk.",
         commands: measuredCommands(stewardsCommands),
       }),
     );

@@ -395,9 +395,10 @@ export function parseProjectFile(text: string): Parsed<ProjectFile> {
 // ---- roles: per-person watches, keyed by GitHub login ------------------------------
 
 /**
- * The per-person roles file (BB-105). It is read like the project file, from
- * the canonical checkout's committed HEAD, and each server runs only the entry
- * whose key is its own signed-in GitHub login. The watches with no natural
+ * The per-person roles file (BB-105). It is read like the project file — a git
+ * repo at the canonical checkout's committed HEAD, a plain project directory
+ * from `.bb` on disk — and each server runs only the entry whose key is its own
+ * signed-in GitHub login. The watches with no natural
  * owner (namespace, Sentry project, Dependabot repo) are assigned here; the
  * ticket and review stewards are dispatched by the Linear assignee and the
  * GitHub requested reviewer, and need no entry.
