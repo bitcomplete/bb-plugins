@@ -92,25 +92,22 @@ describe("the native git project source", () => {
     expect(listing()).toEqual(before);
   });
 
-  it("reads a standalone .bb checkout at its root, and reports its origin", async () => {
-    const { origin, checkout } = await world();
-    const standalone = path.join(path.dirname(checkout), "standalone");
-    git(path.dirname(checkout), "clone", "--quiet", origin, standalone);
-    git(standalone, "config", "user.email", "test@example.com");
-    git(standalone, "config", "user.name", "Test");
-    // A standalone checkout keeps the definition at the root instead of `.bb/`.
-    await rm(path.join(standalone, ".bb"), { recursive: true, force: true });
-    await mkdir(path.join(standalone, "stewards"), { recursive: true });
-    await writeFile(path.join(standalone, "stewards", "project.json"), '{"version":1,"marker":"standalone"}\n', "utf8");
-    git(standalone, "add", "-A");
-    git(standalone, "commit", "--quiet", "-m", "standalone layout");
-    git(standalone, "push", "--quiet", "origin", "main");
+  it("reads a plain directory's .bb/stewards from disk, with no git", async () => {
+    const plain = path.join(await tempRoot(), "plain-project");
+    await mkdir(path.join(plain, ".bb", "stewards"), { recursive: true });
+    await writeFile(path.join(plain, ".bb", "stewards", "project.json"), '{"version":1,"marker":"plain"}\n', "utf8");
+    await writeFile(path.join(plain, ".bb", "stewards", "roles.json"), "{}\n", "utf8");
 
-    const read = await readProjectGit({ path: standalone, files: ["stewards/project.json"] });
+    const read = await readProjectGit({ path: plain, files: ["stewards/project.json", "stewards/roles.json", "stewards/missing.json"] });
     expect(read.error).toBeNull();
-    expect(read.layout).toBe("standalone");
-    expect(read.files[0]?.content).toContain("standalone");
-    expect(read.remote).toBe(origin);
+    expect(read.layout).toBe("directory");
+    // There is no commit and no origin to read from; the working tree is all.
+    expect(read.head).toBeNull();
+    expect(read.remote).toBeNull();
+    const byPath = new Map(read.files.map((f) => [f.path, f.content]));
+    expect(byPath.get("stewards/project.json")).toContain('"marker":"plain"');
+    expect(byPath.get("stewards/roles.json")).toBe("{}\n");
+    expect(byPath.get("stewards/missing.json")).toBeNull();
   });
 
   it("refuses a traversal path rather than running git with it", async () => {
