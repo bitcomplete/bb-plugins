@@ -161,10 +161,11 @@ name: github-issues
 kind: ticket
 source: github
 phases:
+  open:               { stage: spec }
   status:todo:        { stage: spec }
   status:in-progress: { stage: build, stuck: 2d }
   status:in-review:   { stage: review, stuck: 3d }
-terminal: [closed, closed (completed), closed (not planned)]
+terminal: [closed, closed (completed), closed (not planned), closed (duplicate)]
 ready:
   checklist:
     - Problem and desired outcome are stated
@@ -202,6 +203,27 @@ of \`gh issue comment <owner/repo#N> --body-file -\` with
 scope has changed and the change is settled, and then say in a comment what
 changed and why. Start a spec comment with "**Spec:**" so it counts toward
 the spec an approval is pinned to.
+
+## open
+
+An issue with no status label reads \`open\`. Add \`status:todo\`
+(\`gh issue edit --add-label status:todo\`) so the work has a state to move
+through, then specify it against the ready checklist. Work out what you can —
+acceptance criteria, affected repos, a plan — from the code and the project's
+docs, and post it as spec comments. Ask only what you cannot work out, as a
+decision escalation, one question at a time. Report the checklist on every
+turn, and the files the work changes (steward_report touches, repo directory
+first; a directory is accepted and counts as every file under it) as soon as
+the spec names them. When it is all met and the issue is substantial, the
+plugin asks the project steward to approve the spec: wait for it, and do not
+escalate for it. When the gate passes but the wake says scheduling is with
+the project steward (the files overlap work in flight), wait for that too: it
+holds you behind that work, or stacks you on a pull request still being
+built, and the hold lifts itself when the work lands or that pull request
+opens, or it tells you to start. Otherwise, or once approved and scheduled,
+move the issue to \`status:in-progress\` (remove \`status:todo\`, add
+\`status:in-progress\`). A new spec needs approval again, and is asked for the
+same way.
 
 ## status:todo
 

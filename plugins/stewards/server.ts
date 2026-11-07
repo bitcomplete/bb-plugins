@@ -580,7 +580,7 @@ export const rpcContract = defineRpcContract({
           linearTeams: z.array(z.string()),
           repos: z.array(z.string()),
           excludedRepos: z.array(z.string()),
-          playbooks: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string().nullable() })),
+          playbooks: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string().nullable(), source: z.enum(["linear", "github"]).nullable() })),
           problems: z.array(z.string()),
           nightly: z.object({ at: z.string(), timezone: z.string() }).nullable(),
           lastNight: z.string().nullable(),
@@ -1504,17 +1504,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
       // BB-234: a project may carry both a Linear and a GitHub ticket
-      // playbook. The project file names one (or the default for the source it
-      // tracks); the other source's default is loaded too when its file
-      // exists, and `playbookFor(config, "ticket", source)` picks by source.
-      const ticketPrimary = playbookNameFor(file, "ticket");
-      const ticketExtras = [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK].filter((n) => n !== ticketPrimary);
+      // playbook. An explicitly named ticket playbook is required; with none
+      // named, either default may serve and at least one must exist, so an
+      // existing project with only `linear-tickets` keeps working. The other
+      // source's default is loaded too when its file exists, and
+      // `playbookFor(config, "ticket", source)` picks by source.
+      const explicitTicket = file.playbooks.ticket ?? null;
+      const ticketCandidates = explicitTicket !== null ? [explicitTicket] : [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK];
+      const ticketExtras = explicitTicket !== null ? [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK].filter((n) => n !== explicitTicket) : [];
       // The playbooks a role's declared pull watches name (BB-164). They are
       // read with the rest so one `.bb` read serves every playbook, and parsed
       // into `watchPlaybooks` below.
       const watchNames = new Set<string>();
       for (const r of Object.values(roles?.roles ?? {})) for (const watch of rolePulls(r)) watchNames.add(watch.playbook);
-      const texts = await source.readFiles([...new Set([...names.values(), ticketPrimary, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames])].map(playbookPath));
+      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
       /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
@@ -1545,17 +1548,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (p !== null) playbooks[kind] = p;
       }
       if (kinds.includes("ticket")) {
-        const primary = await loadPlaybook(ticketPrimary, "ticket", true);
-        if (primary !== null) {
-          playbooks.ticket = primary;
-          if (primary.source === "linear" || primary.source === "github") ticketPlaybooks[primary.source] = primary;
+        const loaded: Playbook[] = [];
+        for (const name of ticketCandidates) {
+          const p = await loadPlaybook(name, "ticket", explicitTicket !== null);
+          if (p !== null) loaded.push(p);
         }
         for (const name of ticketExtras) {
-          const extra = await loadPlaybook(name, "ticket", false);
-          // The configured (primary) playbook wins its source; an extra only
-          // fills the other source.
-          if (extra !== null && (extra.source === "linear" || extra.source === "github") && ticketPlaybooks[extra.source] === undefined) ticketPlaybooks[extra.source] = extra;
+          const p = await loadPlaybook(name, "ticket", false);
+          if (p !== null) loaded.push(p);
         }
+        // The configured/default playbook wins its source; an extra only
+        // fills the other source.
+        for (const p of loaded) {
+          if ((p.source === "linear" || p.source === "github") && ticketPlaybooks[p.source] === undefined) ticketPlaybooks[p.source] = p;
+        }
+        // The playbook `config.playbooks.ticket` names for display: the
+        // tracked source's default when it loaded, else whichever did.
+        const preferred = playbookNameFor(file, "ticket");
+        const primary = loaded.find((p) => p.name === preferred) ?? loaded[0] ?? null;
+        if (primary !== null) playbooks.ticket = primary;
+        else if (explicitTicket === null) problems.push(`no ticket playbook: ${ticketCandidates.map((n) => playbookPath(n)).join(" and ")} do not exist`);
       }
 
       /**
@@ -7023,6 +7035,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // Every project, not only the configured ones: a project with no `.bb`
         // stewards content still gets a row and the Set up stewards action.
         const ids = [...new Set([...list.map((p) => p.id), ...projectIds(configsById.keys())])];
+        /** The page's playbook rows: one per source for a ticket playbook, so a project carrying both names GitHub too (BB-234). */
+        const overviewPlaybooks = (config: ProjectConfig | null): Array<{ kind: BindingKind; name: string; version: string | null; source: Source | null }> => {
+          if (config === null) return [];
+          const out: Array<{ kind: BindingKind; name: string; version: string | null; source: Source | null }> = [];
+          for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
+            if (kind !== "ticket") {
+              out.push({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null, source: null });
+              continue;
+            }
+            const loaded = (["linear", "github"] as const).filter((s) => config.ticketPlaybooks[s] !== undefined);
+            if (loaded.length === 0) out.push({ kind, name: playbookNameFor(config.file, kind), version: null, source: null });
+            else for (const source of loaded) out.push({ kind, name: config.ticketPlaybooks[source]!.name, version: config.ticketPlaybooks[source]!.version, source });
+          }
+          return out;
+        };
         const projects = ids.map((projectId) => {
           const config = configsById.get(projectId) ?? null;
           const row = store.project(projectId);
@@ -7042,10 +7069,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             linearTeams: config?.file.linear.teams ?? [],
             repos: config?.repos ?? [],
             excludedRepos: config?.file.github.exclude ?? [],
-            playbooks:
-              config === null
-                ? []
-                : KINDS.filter((k) => usesKind(config.file, k, config.role)).map((kind) => ({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null })),
+            playbooks: overviewPlaybooks(config),
             problems: config?.problems ?? [],
             nightly: config === null ? null : { at: config.file.nightly.at, timezone: config.file.nightly.timezone },
             lastNight: row.nightlyDate,
@@ -8708,7 +8732,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
             if (input.approve === true) {
               const config = await loadConfig(target.projectId);
-              const playbook = config === null ? null : playbookFor(config, target.kind);
+              const playbook = config === null ? null : bindingPlaybook(config, target);
               const mode = playbook?.ready?.approval ?? null;
               if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
               if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode.state} in ${target.source === "github" ? "GitHub" : "Linear"}.`));
@@ -8749,7 +8773,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // words for mode me (there the user's quote is required).
               if (!covered && approval === null && resolving.kind === "approval" && resolving.resolutionKind !== "approve-decline" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
                 const config = await loadConfig(target.projectId);
-                const playbook = config === null ? null : playbookFor(config, target.kind);
+                const playbook = config === null ? null : bindingPlaybook(config, target);
                 if (playbook?.ready?.approval === "project" && isProjectSteward(threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
               }
             }
@@ -9629,6 +9653,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
       lines.push(`roles: ${roleSummary(config)}`);
       for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
+        if (kind === "ticket") {
+          // BB-234: name each source's ticket playbook, so a project that
+          // carries both does not hide the GitHub one behind the Linear one.
+          const parts = (["linear", "github"] as const)
+            .map((source) => [source, config.ticketPlaybooks[source]] as const)
+            .filter(([, p]) => p !== undefined)
+            .map(([source, p]) => `${p!.name}@${p!.version} (${source})`);
+          lines.push(`ticket: ${parts.length === 0 ? `no usable playbook (${playbookNameFor(config.file, "ticket")})` : parts.join(", ")}`);
+          continue;
+        }
         const p = config.playbooks[kind];
         lines.push(`${kind}: ${p === undefined ? `no usable playbook (${playbookNameFor(config.file, kind)})` : `${p.name}@${p.version}`}`);
       }

@@ -531,8 +531,9 @@ function ProjectStatus({ project: p, now, refetch }: { project: Project; now: nu
           </Row>
           <Row label="Playbooks">
             {p.playbooks.map((b) => (
-              <span key={b.kind} className="mr-3 inline-block">
-                {b.kind}: {b.name}
+              <span key={`${b.kind}:${b.source ?? ""}`} className="mr-3 inline-block">
+                {b.kind}
+                {b.source === null ? "" : ` (${b.source})`}: {b.name}
                 {b.version === null ? <span className="text-destructive"> (unusable)</span> : <span className="text-muted-foreground">@{b.version}</span>}
               </span>
             ))}

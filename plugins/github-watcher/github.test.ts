@@ -280,8 +280,10 @@ describe("an issue as a stewards entity (BB-233)", () => {
     expect(parseSnapshot(issue({ labels: { nodes: [{ name: "status:a" }, { name: "status:b" }] } }))!.state).toBe("open");
     expect(parseSnapshot(issue())!.state).toBe("open");
     expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "NOT_PLANNED" }))!.state).toBe("closed (not planned)");
-    // A status label is the state even when the issue is closed.
-    expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "COMPLETED", labels: { nodes: [{ name: "status:done" }] } }))!.state).toBe("status:done");
+    expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "DUPLICATE" }))!.state).toBe("closed (duplicate)");
+    // A closed issue is closed whatever status label it still carries: GitHub
+    // closed it, and the playbook's terminal state must win over a stale label.
+    expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "COMPLETED", labels: { nodes: [{ name: "status:done" }] } }))!.state).toBe("closed (completed)");
   });
 
   it("reads linked pulls from closing references and timeline cross-references, deduped as owner/repo#n", () => {

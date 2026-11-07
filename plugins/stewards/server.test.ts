@@ -3383,7 +3383,7 @@ describe("a GitHub issue ticket steward (BB-234)", () => {
     expect(check.exitCode).toBe(0);
     expect(check.stdout).not.toMatch(/problem:/u);
     expect(check.stdout).not.toMatch(/Linear login/u);
-    expect(check.stdout).toMatch(/ticket: github-issues@/u);
+    expect(check.stdout).toMatch(/github-issues@/u);
     // The GitHub ticket playbook's label states are validated as labels.
     const validate = t.rpcCalls.filter((c) => c.method === "sourceValidate" && c.pluginId === "github-watcher").at(-1);
     expect(validate?.input).toMatchObject({ units: ["acme/web", "acme/bb"], states: ["status:todo", "status:in-progress", "status:in-review"] });
@@ -3426,6 +3426,48 @@ describe("a GitHub issue ticket steward (BB-234)", () => {
     const check = await noTeams.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.stdout).not.toMatch(/problem:/u);
     expect(check.exitCode).toBe(0);
+  });
+
+  it("passes check for a no-teams project that carries only linear-tickets", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    // No github-issues file: linear-tickets is the only ticket playbook, and
+    // an existing project like this must keep passing check (BB-234 review).
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.stdout).toMatch(/ticket: linear-tickets@/u);
+    expect(check.stdout).not.toMatch(/github-issues\.md does not exist/u);
+  });
+
+  it("gates a spec approval on the binding's own source playbook", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    // linear-tickets stays approval: project; github-issues reserves its spec for the user.
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES.replace("approval: project", "approval: user");
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const project = t.hooks.store.project("p1").threadId!;
+    // The project steward must not approve a GitHub spec its own playbook gives to the user.
+    const denied = await t.tool("steward_update", { binding: "acme/web#14", approve: true }, project);
+    expect(denied.error).toBe(true);
+    expect(denied.text).toMatch(/approved by the user/u);
+    // The same project steward still approves a Linear ticket under linear-tickets.
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const ok = await t.tool("steward_update", { binding: "ENG-12", approve: true }, project);
+    expect(ok.error).toBe(false);
+  });
+
+  it("adopts an issue with no status label into the open phase and tells it to add status:todo", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", state: "open", labels: ["bb-managed"] }));
+    await t.ring("github", "acme/web#14");
+    const b = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(b).toMatchObject({ phase: "open", stage: "spec" });
+    const prompt = String(t.spawns.find((s) => String(s.title).startsWith("acme/web#14"))!.prompt);
+    expect(prompt).toMatch(/### open/u);
+    expect(prompt).toMatch(/Add `status:todo`/u);
   });
 });
 

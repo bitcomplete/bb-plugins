@@ -471,12 +471,13 @@ describe("the GitHub issue playbook (BB-234)", () => {
     const parsed = parsePlaybook(GITHUB_ISSUES, "github-issues");
     if (!parsed.ok) throw new Error(parsed.error);
     expect(parsed.value).toMatchObject({ kind: "ticket", source: "github" });
-    expect(Object.keys(parsed.value.phases)).toEqual(["status:todo", "status:in-progress", "status:in-review"]);
-    expect(parsed.value.terminal).toEqual(["closed", "closed (completed)", "closed (not planned)"]);
+    expect(Object.keys(parsed.value.phases)).toEqual(["open", "status:todo", "status:in-progress", "status:in-review"]);
+    expect(parsed.value.terminal).toEqual(["closed", "closed (completed)", "closed (not planned)", "closed (duplicate)"]);
     // No sub-issue handling: create-sub-issue is not in `may`, and there is no promote rule.
     expect(parsed.value.may).not.toContain("create-sub-issue");
     expect(parsed.value.promote).toBeNull();
     expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/gh issue\s+close/u);
+    expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
     expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");
   });
 

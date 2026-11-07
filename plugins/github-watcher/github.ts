@@ -457,7 +457,7 @@ export function parseSnapshot(payload: unknown): EntitySnapshot | null {
     pull: null,
     viewer: read.viewer,
   };
-  if (node.__typename === "Issue") return { ...snapshot, state: statusLabel(target.labels) ?? (node.state.toLowerCase() === "closed" ? target.state : "open"), linkedPulls: linkedPullsOf(node) };
+  if (node.__typename === "Issue") return { ...snapshot, state: node.state.toLowerCase() === "closed" ? target.state : statusLabel(target.labels) ?? "open", linkedPulls: linkedPullsOf(node) };
   const merged = node.merged === true;
   const draft = node.isDraft === true;
   const state = merged ? "merged" : node.state.toLowerCase() !== "open" ? "closed" : draft ? "draft" : "open";
@@ -666,7 +666,7 @@ export function parseSearchIssues(payload: unknown): SearchIssue[] {
     if (repo === undefined || repo === null || n.number === null || n.number === undefined) continue;
     const labels = (n.labels?.nodes ?? []).map((l) => l.name).sort();
     const closed = (n.state ?? "").toLowerCase() === "closed";
-    const state = statusLabel(labels) ?? (closed ? (n.stateReason ? `closed (${lower(n.stateReason)})` : "closed") : "open");
+    const state = closed ? (n.stateReason ? `closed (${lower(n.stateReason)})` : "closed") : statusLabel(labels) ?? "open";
     issues.push({
       id: `${repo}#${n.number}`,
       key: `${repo}#${n.number}`,
