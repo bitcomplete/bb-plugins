@@ -3374,7 +3374,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         else changes.push({ text: n.text, actionable: n.quiet !== true });
       }
 
-      signalNeedActionability(b, observed);
+      signalNeedActionability(b, observed, ready);
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
       // BB-54 item 4: a ticket that links a new pull request re-runs the
       // overlap check, even past its ready gate, and a new pull request clears
@@ -7154,8 +7154,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           claim(b.projectId, b.threadId);
           for (const w of store.workers(b.id)) claim(b.projectId, w.threadId);
         }
-        // The picker's count is the server's own: the open bindings that need
-        // the user, so the pill and the yellow rows cannot disagree (BB-100).
+        // The picker's count is the server's own: every open binding with an
+        // open need, question or route-`user` escalation. It is broader than
+        // `needsUser` since BB-237 (a need the server cannot act on yet is not
+        // a yellow row), so the pill can exceed the yellow rows (BB-100).
         const picker = projects.map((p) => ({
           ...p,
           // One SQL count per project, so the picker never parses every binding
@@ -8986,19 +8988,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Ring the project's refetch channel when replacing `b`'s `lastSnapshot`
-     * with `observed` would change an open need's `actionable` or `why`, as
-     * `needView` computes them (BB-237). The page disables Approve from that
-     * flag, so a snapshot the reconcile just refreshed must reach it without
-     * waiting for the half-minute poll; a snapshot that flips nothing stays
-     * silent. Called before the snapshot is written, with the binding as it
-     * stands; an ended binding's needs are off the board, so it never rings.
+     * Ring the project's refetch channel when the patch about to be written
+     * would change an open need's `actionable` or `why`, as `needView` computes
+     * them (BB-237). The page disables Approve from that flag, so a snapshot or
+     * spec approval the reconcile just refreshed must reach it without waiting
+     * for the half-minute poll; a patch that flips nothing stays silent. Called
+     * before the patch, with the binding as it stands. `observed` is the
+     * snapshot being written, and `ready` the `ReadyState` when the patch also
+     * changes it (it feeds `needView` through `ticketApprovedSpec`); the other
+     * call sites write only the snapshot and ending fields. An ended binding's
+     * needs are off the board, so it never rings.
      */
-    function signalNeedActionability(b: Binding, observed: Observed): void {
+    function signalNeedActionability(b: Binding, observed: Observed, ready?: ReadyState): void {
       if (b.endedAt !== null) return;
       const needs = store.openNeeds(b.id);
       if (needs.length === 0) return;
-      const after: Binding = { ...b, lastSnapshot: observed };
+      const after: Binding = { ...b, lastSnapshot: observed, ...(ready === undefined ? {} : { ready }) };
       const flipped = needs.some((n) => {
         const before = needView(n, b);
         const next = needView(n, after);
@@ -10546,12 +10551,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, signalNeedActionability: (bindingId: string, observed: Observed) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
