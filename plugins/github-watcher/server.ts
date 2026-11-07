@@ -605,7 +605,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
               results.push({ unit, status: "existed", error: null });
               continue;
             }
-            results.push({ unit, status: await createLabel(unit, label, checkSignal()), error: null });
+            // Use the parsed owner/name, not the raw unit: it is the canonical
+            // spelling the lookup already used.
+            results.push({ unit, status: await createLabel(`${repo.owner}/${repo.name}`, label, checkSignal()), error: null });
           } catch (error) {
             results.push({ unit, status: "error", error: errorMessage(error) });
           }

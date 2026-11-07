@@ -9470,13 +9470,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * created is a `failed:` line and a `problem:` line, never a silent
      * skip; a source that does not serve the RPC is reported unavailable.
      */
+    /**
+     * Whether a `sourceEnsureLabel` failure means the source does not serve
+     * the RPC at all: an unloaded/absent plugin (`isMissingPlugin`), or a
+     * loaded plugin whose contract predates it (the SDK's `unknown_method`).
+     * Anything else is a real failure and prints its own message.
+     */
+    function rpcUnavailable(error: unknown): boolean {
+      if (isMissingPlugin(error)) return true;
+      const e = error as { code?: unknown; message?: unknown };
+      if (e?.code === "unknown_method") return true;
+      return typeof e?.message === "string" && /unknown rpc method/iu.test(e.message);
+    }
+
     async function ensureLabels(source: Source, units: string[], label: string, lines: string[]): Promise<void> {
       if (units.length === 0) return;
       let results: z.infer<typeof sourceContract.sourceEnsureLabel.output>["results"];
       try {
         results = (await sourceRpc(source, "sourceEnsureLabel", { units, label }, sourceContract.sourceEnsureLabel.output)).results;
       } catch (error) {
-        const why = isMissingPlugin(error) ? "sourceEnsureLabel is unavailable (the source plugin does not support it)" : errorMessage(error);
+        const why = rpcUnavailable(error) ? "sourceEnsureLabel is unavailable (the source plugin does not support it)" : errorMessage(error);
         lines.push(`problem: ${source}: could not create label ${label}: ${why}`);
         return;
       }
