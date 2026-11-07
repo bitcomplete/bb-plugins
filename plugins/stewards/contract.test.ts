@@ -55,4 +55,38 @@ describe("source-contract.ts", () => {
     expect(pull).toMatchObject({ mergeCommit: "m", files: ["a"] });
     expect(snapshotPullSchema.parse({ draft: false, merged: false, base: null, head: null, headSha: null, headAuthor: null, reviewDecision: null, requestedReviewers: [], reviews: [], checks: null })).toMatchObject({ mergeCommit: null, files: [] });
   });
+
+  it("parses a GitHub issue snapshot whose state is a status label, with linked pulls (BB-232)", () => {
+    const snapshot = {
+      source: "github" as const,
+      kind: "issue" as const,
+      id: "acme/web#42",
+      key: "acme/web#42",
+      url: "https://github.com/acme/web/issues/42",
+      title: "Fix login",
+      // A status label is a label named `status:<phase>`; with exactly one, state is its name and stateType stays null.
+      state: "status:todo",
+      stateType: null,
+      unit: "acme/web",
+      labels: ["bb-managed", "status:todo"],
+      author: "dylan",
+      assignees: ["dylan"],
+      priority: null,
+      estimate: null,
+      description: "Users cannot log in.",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-02T00:00:00Z",
+      comments: [],
+      parent: null,
+      children: [],
+      linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }],
+      pull: null,
+      viewer: "dylan",
+    };
+    const parsed = sourceContract.sourceSnapshot.output.parse({ snapshot });
+    expect(parsed.snapshot).toMatchObject({ source: "github", kind: "issue", state: "status:todo", stateType: null, linkedPulls: [{ key: "acme/web#7" }] });
+    // With no status label the issue is open; closed carries its reason.
+    expect(sourceContract.sourceSnapshot.output.parse({ snapshot: { ...snapshot, state: "open", labels: ["bb-managed"] } }).snapshot).toMatchObject({ state: "open", stateType: null });
+    expect(sourceContract.sourceSnapshot.output.parse({ snapshot: { ...snapshot, state: "closed (not planned)" } }).snapshot).toMatchObject({ state: "closed (not planned)", stateType: null });
+  });
 });

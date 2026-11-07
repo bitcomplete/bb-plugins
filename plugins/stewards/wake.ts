@@ -425,7 +425,7 @@ function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "esc
   // start the worker in that same turn.
   if (gate.substantial === null && !gate.passed) lines.push("  If none apply, report `substantial: false`: with every checklist item met, the gate passes immediately on that report, so move the ticket to In Progress and start the worker in the same turn.");
   const approval = playbook.ready!.approval;
-  const how = approval === "user" ? "the user" : approval === "project" ? "the project steward" : `the ticket reaching ${approval["linear-state"]}`;
+  const how = approval === "user" ? "the user" : approval === "project" ? "the project steward" : `the ticket reaching ${approval.state}`;
   const request = input.escalations.find((x) => x.status === "open" && x.kind === "approval");
   const asked =
     request === undefined

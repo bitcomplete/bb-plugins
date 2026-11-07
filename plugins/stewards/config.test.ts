@@ -345,6 +345,18 @@ describe("playbooks", () => {
     expect(plain.value.warnings).toEqual([]);
   });
 
+  it("accepts a source-neutral approval state and the old linear-state spelling (BB-232)", () => {
+    const neutral = parsePlaybook(LINEAR_TICKETS.replace("approval: project", 'approval: { state: "Approved" }'), "linear-tickets");
+    if (!neutral.ok) throw new Error(neutral.error);
+    expect(neutral.value.ready?.approval).toEqual({ state: "Approved" });
+    expect(playbookStates(neutral.value)).toContain("Approved");
+
+    const legacy = parsePlaybook(LINEAR_TICKETS.replace("approval: project", 'approval: { "linear-state": "Approved" }'), "linear-tickets");
+    if (!legacy.ok) throw new Error(legacy.error);
+    expect(legacy.value.ready?.approval).toEqual({ state: "Approved" });
+    expect(playbookStates(legacy.value)).toContain("Approved");
+  });
+
   it("takes a deployment target's optional workflows list, defaulting to none (BB-61)", () => {
     const withDeployment = (extra: string) =>
       LINEAR_TICKETS.replace(
