@@ -507,14 +507,16 @@ owner never reaches you until the owner confirms it by id.
 
 ## Setting up a project (`bb stewards …`)
 
-Configuration is read from the project's `.bb` at the default branch's
-committed tip only. With the multi-repo plugin installed that is the
-canonical checkout's committed `HEAD`; without it, stewards falls back to a
-native git read of `.bb` from the checkout's `origin/<default>`, and spawns
-workers on bb's own `project-default` environment. `bb stewards check` and
-`bb stewards show` name the source in use. The worker spawn command always
-comes from `bb stewards spawn-flags` (or the wake): never hand-write an
-`--environment-provider`.
+Configuration is read from the project's `.bb`. A git repo is the primary and
+is read at the default branch's committed tip: with the multi-repo plugin
+installed that is the canonical checkout's committed `HEAD`, and without it
+stewards falls back to a native git read of `.bb` from the checkout's
+`origin/<default>`. A plain project directory has no git, so `.bb` is read
+from `<dir>/.bb` on disk and an edit there takes effect on the next read.
+Spawns use bb's own `project-default` environment when multi-repo is not
+installed. `bb stewards check` and `bb stewards show` name the source in use.
+The worker spawn command always comes from `bb stewards spawn-flags` (or the
+wake): never hand-write an `--environment-provider`.
 
 Setting up a project for the first time — the dependency graph, shipping
 paths, decide-list `paths`, project steward login — is the **onboarding

@@ -625,10 +625,11 @@ the choice is per developer.
 
 ## Configuration
 
-In the project's `.bb`, read from the default branch's committed tip through
-multi-repo's `readProjectFiles` and `repoSet`, or — when multi-repo is not
-installed — through native git on the project checkout's `origin/<default>`
-(`project-source.ts`):
+In the project's `.bb`, read through multi-repo's `readProjectFiles` and
+`repoSet` or — when multi-repo is not installed — through stewards' own host
+entry (`project-source.ts`): a git repo is read at the default branch's
+committed tip (`origin/<default>`), and a plain project directory is read from
+`<dir>/.bb` on disk, where an edit takes effect on the next read:
 
 ```
 stewards/

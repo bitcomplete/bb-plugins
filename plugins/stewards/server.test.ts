@@ -5309,6 +5309,46 @@ describe("the native project source (BB-107)", () => {
     expect(after!.problems.some((p) => p.includes("the .bb is unreachable"))).toBe(true);
   });
 
+  it("isolates a project whose layout multi-repo refuses, and keeps the others (BB-238)", async () => {
+    const t = await setup();
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Beta" }]);
+    const original = t.sdk.plugins.callRpc;
+    const refusal = "/p2 has a repos.json at its root, which is a leftover standalone definition. This project is a git repo now: move it to .bb/repos.json.";
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "multi-repo" && args.method === "readProjectFiles" && (args.input as { projectId?: string } | undefined)?.projectId === "p2") {
+        return { projectSourcePath: "/p2/.bb", head: null, files: [], error: refusal };
+      }
+      return original(args);
+    });
+    t.hooks.forgetConfigs();
+
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; configured: boolean; problems: string[] }> };
+    const p1 = overview.projects.find((p) => p.projectId === "p1")!;
+    const p2 = overview.projects.find((p) => p.projectId === "p2")!;
+    expect(p1.configured).toBe(true);
+    expect(p1.problems).toEqual([]);
+    expect(p2.configured).toBe(false);
+    expect(p2.problems).toEqual([`could not read the configuration: ${refusal}`]);
+    // The refused project is isolated: p1 still loads, and p2 says why it cannot.
+    expect(await t.hooks.loadConfig("p1", true)).not.toBeNull();
+    expect((await t.harness.behavior.runCli(["check", "--project", "p2"])).stdout).toContain(`problem: could not read the configuration: ${refusal}`);
+  });
+
+  it("rejects the removed standalone layout from multi-repo's repoSet parser (BB-238)", async () => {
+    const t = await setup();
+    await t.flush();
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.method === "repoSet") return args.outputSchema.parse({ repos: t.repos, primary: t.primary, layout: "standalone", error: null });
+      return original(args);
+    });
+    t.hooks.forgetConfigs();
+    const config = await t.hooks.loadConfig("p1", true);
+    expect(config).not.toBeNull();
+    expect(config!.problems.some((p) => p.includes("could not read the repo set"))).toBe(true);
+  });
+
   it("spawns on project-default and carries no multi-repo flag in native mode", async () => {
     const { t } = await nativeWorld();
     t.entities.set("uuid-12", issue());
