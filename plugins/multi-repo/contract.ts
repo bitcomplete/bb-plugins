@@ -16,8 +16,15 @@ import { PROJECT_FILE_PATH_MAX, projectFilePathProblem } from "./names.js";
 const absolutePath = z.string().min(1).max(4096);
 
 /** Which of the two project-source shapes a checkout has. */
-export const projectLayoutSchema = z.enum(["standalone", "primary"]);
+export const projectLayoutSchema = z.enum(["primary", "directory"]);
 export type ProjectLayoutValue = z.infer<typeof projectLayoutSchema>;
+
+/**
+ * How a `.bb` write reached the project. Mirrored from `repos.ts` for the same
+ * frontend-bundle reason as the publish policy below; `none` is a plain
+ * directory, edited in place with nothing published.
+ */
+const writeModeSchema = z.enum(["push", "pull-request", "none"]);
 
 /**
  * The `publish` policy, mirrored from `repos.ts` to keep this module safe for
@@ -236,9 +243,10 @@ export type DiscoveredCheckout = z.infer<typeof discoveredCheckoutSchema>;
 /**
  * What a git remote (or a local path) turns out to be, for the New project
  * form's status line. `checkout` is a path that already exists on the machine
- * and is adopted as the project source rather than cloned beside it.
+ * and is adopted as the project source rather than cloned beside it; `plain`
+ * is a git repo with no `.bb/` yet, which becomes an unseeded primary.
  */
-export const probeRemoteOutcomeSchema = z.enum(["standalone", "primary", "plain", "checkout"]);
+export const probeRemoteOutcomeSchema = z.enum(["primary", "plain", "checkout"]);
 export type ProbeRemoteOutcome = z.infer<typeof probeRemoteOutcomeSchema>;
 
 export const probeRemoteResultSchema = z
@@ -296,7 +304,7 @@ export const hostContract = defineRpcContract({
          * The provider computes this; `readRepoSet` and `create()` carry it.
          */
         unpushed: unpushedSummarySchema.nullable(),
-        /** `standalone` (definition at the root) or `primary` (`.bb/`). */
+        /** `primary` (a git repo, `.bb/` on its default branch) or `directory`. */
         layout: projectLayoutSchema,
         warnings: z.array(z.string().max(600)).max(20),
       })
@@ -336,7 +344,7 @@ export const hostContract = defineRpcContract({
         path: absolutePath,
         reposJson: z.string().max(200_000),
         message: z.string().min(1).max(300),
-        /** Which layout's definition path to write; defaults to `standalone`. */
+        /** Which layout's definition path to write; defaults to `primary`. */
         layout: projectLayoutSchema.optional(),
         /**
          * The `publish` policy parsed from the file being written. Kept a
@@ -352,8 +360,8 @@ export const hostContract = defineRpcContract({
         ok: z.boolean(),
         committed: z.boolean(),
         head: z.string().max(64).nullable(),
-        /** `push` or `pull-request`; the mode the policy resolved to. */
-        mode: z.enum(["push", "pull-request"]),
+        /** `push`, `pull-request`, or `none` for a plain directory. */
+        mode: writeModeSchema,
         /** The pull request opened or found, for `pull-request`. */
         prUrl: z.string().max(600).nullable(),
         /** Why the publish failed, or a note; null on a clean success. */
@@ -429,7 +437,7 @@ export const hostContract = defineRpcContract({
         projectSourcePath: absolutePath,
         /** Which shape the project source has; decides how `.bb/` is materialized. */
         layout: projectLayoutSchema.optional(),
-        /** The primary work repo's directory; `.bb/` is copied out of it. */
+        /** The primary work repo's directory; `.bb/` is linked out of it. */
         primaryDir: z.string().min(1).max(100).nullable().optional(),
         repos: z.array(repoRequestSchema).max(64),
         branchName: z.string().min(1).max(300),
@@ -618,33 +626,8 @@ export const hostContract = defineRpcContract({
   },
 
   /**
-   * Copy a standalone `.bb` tree into a primary repo as `.bb/` on a branch, or
-   * report that it already carries one. Idempotent; never touches the default
-   * branch.
+   * Clone/ensure a primary repo and seed `.bb/` on it when it does not carry one.
    */
-  adoptProjectSource: {
-    input: z
-      .object({
-        standalonePath: absolutePath,
-        primaryUrl: z.string().min(1).max(2000),
-        primaryPath: absolutePath,
-        branch: z.string().min(1).max(300),
-        openPullRequest: z.boolean(),
-      })
-      .strict(),
-    output: z
-      .object({
-        status: z.enum(["already", "pull-request", "failed"]),
-        message: z.string().max(2000),
-        prUrl: z.string().max(600).nullable(),
-        warnings: z.array(z.string().max(600)).max(20),
-        primaryPath: absolutePath,
-        defaultBranch: z.string().max(300).nullable(),
-      })
-      .strict(),
-  },
-
-  /** Clone/ensure a primary repo and seed `.bb/` on it when it does not carry one. */
   preparePrimaryProjectSource: {
     input: z
       .object({
@@ -698,7 +681,7 @@ export const repoSetViewSchema = z
     /** Null when this project has no `.bb` checkout on a reachable machine. */
     projectSourcePath: absolutePath.nullable(),
     hostId: z.string().max(100).nullable(),
-    /** `standalone` (definition at the root) or `primary` (`.bb/`). */
+    /** `primary` (`.bb/` on a git repo's default branch) or `directory`. */
     layout: projectLayoutSchema,
     /** The primary repo derived from the source's `origin`, or null. */
     primary: z.object({ dir: z.string().max(100), url: z.string().max(2000) }).strict().nullable(),
@@ -729,13 +712,6 @@ export const workspaceViewSchema = z
     branchName: z.string().max(300),
     hostId: z.string().max(100),
     projectSourcePath: absolutePath,
-    /**
-     * True when this workspace was provisioned from a standalone `.bb` and the
-     * project source has since been adopted into a primary repo. Guidance
-     * published from it still goes to the old canonical checkout, so it has to
-     * be re-applied to the primary by hand.
-     */
-    predatesAdopt: z.boolean(),
     repos: z.array(workspaceRepoSchema).max(64),
     /**
      * The other threads attached to this same checkout — forks, which keep
@@ -754,7 +730,7 @@ export const editResultSchema = z
     ok: z.boolean(),
     error: z.string().max(2000).nullable(),
     /** How the write reached `origin`; null when it did not get that far. */
-    mode: z.enum(["push", "pull-request"]).nullable(),
+    mode: writeModeSchema.nullable(),
     /** The pull request opened or found, for `pull-request`. */
     prUrl: z.string().max(600).nullable(),
     /** A note (for example, no remote), or why the publish failed. */
@@ -854,8 +830,8 @@ export const rpcContract = defineRpcContract({
       .object({
         ok: z.boolean(),
         error: z.string().max(2000).nullable(),
-        /** How the write reached `origin`; null when it did not get that far. */
-        mode: z.enum(["push", "pull-request"]).nullable(),
+        /** How the write reached `origin`; `none` for a plain directory; null on failure. */
+        mode: writeModeSchema.nullable(),
         prUrl: z.string().max(600).nullable(),
         /** A note (for example, no remote), or why the publish failed. */
         message: z.string().max(600).nullable(),
@@ -978,40 +954,8 @@ export const rpcContract = defineRpcContract({
   },
 
   /**
-   * Adopt a standalone `.bb` into a primary repo, per machine.
-   *
-   * The first run copies the tree to `.bb/` on a branch and opens a pull
-   * request; a later run, once `.bb/` is on the default branch, re-points the
-   * project source at the primary checkout. Case A of BB-106: the project id,
-   * every binding and every thread stay as they are.
+   * The thread's workspace manifest, or null when the thread has none.
    */
-  adoptProjectSource: {
-    input: z
-      .object({
-        projectId: z.string().min(1).max(100),
-        /** URL or local path of the primary repo. */
-        primary: z.string().min(1).max(2000),
-        /** Where the primary clone lives or should be cloned to. */
-        path: absolutePath,
-        /** Publish a branch and open a pull request. */
-        openPullRequest: z.boolean().optional(),
-      })
-      .strict(),
-    output: z
-      .object({
-        status: z.enum(["already", "pull-request", "failed"]),
-        message: z.string().max(2000),
-        prUrl: z.string().max(600).nullable(),
-        warnings: z.array(z.string().max(600)).max(20),
-        primaryPath: absolutePath,
-        defaultBranch: z.string().max(300).nullable(),
-        /** True when the project source now points at the primary checkout. */
-        repointed: z.boolean(),
-      })
-      .strict(),
-  },
-
-  /** The thread's workspace manifest, or null when the thread has none. */
   workspace: {
     input: z.object({ threadId: z.string().min(1).max(100) }).strict(),
     output: z.object({ workspace: workspaceViewSchema.nullable() }).strict(),

@@ -79,7 +79,7 @@ function hostResponder(call: HostRpcCall): unknown {
         remote: null,
         defaultBranch: "main",
         unpushed: null,
-        layout: "standalone",
+        layout: "directory",
         warnings: [],
       };
     case "discoverCheckouts":

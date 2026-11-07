@@ -209,61 +209,46 @@ export async function materializeRepo(args: MaterializeArgs): Promise<WorkspaceR
 }
 
 /**
- * Clone the project source into the workspace as `.bb`.
+ * Link `<workspace>/.bb` straight to a plain project directory's `.bb/`.
  *
- * Cloned from the canonical checkout on this machine rather than from its
- * remote: it is a local path, so the objects hardlink, and a project source
- * with no remote at all still works. `origin` is left pointing at the
- * canonical checkout so the agent can pull guidance updates; the write-back in
- * the other direction is {@link pushGuidance}, which runs host-side.
- *
- * `.bb` stays on its default branch. Two threads could not both check out
- * `main` as worktrees of one repo, but independent clones can — which is the
- * secondary reason this design clones.
+ * A plain directory has no git repo and no primary clone, so there is nothing
+ * to clone and no commit to read: the thread reads and edits the project's own
+ * `.bb/` through the link. Relative, so the workspace resolves wherever it is
+ * mounted.
  */
-export async function materializeProjectSource(args: {
+export async function materializePlainDefinition(args: {
   root: string;
   projectSourcePath: string;
   signal?: AbortSignal;
 }): Promise<WorkspaceRepo> {
   const dest = path.join(args.root, PROJECT_SOURCE_DIR);
-  const options = {
-    timeoutMs: CLONE_TIMEOUT_MS,
-    ...(args.signal === undefined ? {} : { signal: args.signal }),
-  };
-  if (await exists(path.join(dest, ".git"))) {
-    const branch = (await gitLine(dest, ["rev-parse", "--abbrev-ref", "HEAD"], options)) ?? "main";
-    return {
-      dir: PROJECT_SOURCE_DIR,
-      path: dest,
-      branch,
-      baseBranch: branch,
-      remote: args.projectSourcePath,
-      status: "ready",
-    };
-  }
+  const target = path.join(args.projectSourcePath, PROJECT_SOURCE_DIR);
+  const remote = args.projectSourcePath;
+  const ready = (): WorkspaceRepo => ({
+    dir: PROJECT_SOURCE_DIR,
+    path: dest,
+    branch: "default",
+    baseBranch: "default",
+    remote,
+    status: "ready",
+  });
+  // Idempotent per path key: a re-entered `create()` leaves a link that still
+  // resolves alone. A dangling link is replaced below.
+  if (await exists(path.join(dest, "repos.json"))) return ready();
   await rm(dest, { recursive: true, force: true });
-  const cloned = await git(["clone", "--quiet", args.projectSourcePath, dest], options);
-  if (cloned.code !== 0) {
+  const linked = await linkDirectory(dest, target);
+  if (!linked) {
     return {
       dir: PROJECT_SOURCE_DIR,
       path: dest,
       branch: "",
       baseBranch: "",
-      remote: args.projectSourcePath,
+      remote,
       status: "failed",
-      message: firstProblemLine(cloned).slice(0, 600),
+      message: `${target} is not a usable .bb/ directory, so ${PROJECT_SOURCE_DIR}/ could not be linked.`,
     };
   }
-  const branch = (await gitLine(dest, ["rev-parse", "--abbrev-ref", "HEAD"], options)) ?? "main";
-  return {
-    dir: PROJECT_SOURCE_DIR,
-    path: dest,
-    branch,
-    baseBranch: branch,
-    remote: args.projectSourcePath,
-    status: "ready",
-  };
+  return ready();
 }
 
 export interface ProvisionArgs {
@@ -274,7 +259,7 @@ export interface ProvisionArgs {
   layout?: ProjectLayout;
   /**
    * The directory of the primary work clone inside the workspace. Present only
-   * for the `primary` layout, and the repo `.bb/` is copied out of.
+   * for the `primary` layout, and the repo `.bb/` is linked out of.
    */
   primaryDir?: string | null;
   repos: readonly RepoRequest[];
@@ -445,7 +430,7 @@ export async function provisionWorkspace(
     definitionBase = materialized.base;
     definitionLinked = materialized.linked;
   } else {
-    source = await materializeProjectSource({
+    source = await materializePlainDefinition({
       root,
       projectSourcePath: args.projectSourcePath,
       ...(args.signal === undefined ? {} : { signal: args.signal }),

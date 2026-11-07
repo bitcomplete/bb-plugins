@@ -81,9 +81,13 @@ There are two layouts, detected from the default branch's committed tree:
   reads `<workspacePath>/.bb/AGENTS.md` and `.bb/skills` from the workspace
   root only; a copy from the default branch's committed tip is the fallback
   when the link cannot be made.
-- **standalone** — the checkout is a `.bb` git repo with the definition at its
-  root. This is the original layout, still read and written as before so a
-  machine that has not adopted keeps working.
+- **directory** — the project directory is not a git repo. `.bb/` is an
+  ordinary subdirectory of it, created with `repos.json`, `AGENTS.md` and
+  `skills/` when missing, with no `git init`. `<workspace>/.bb` is a symlink
+  straight to it; there is no commit, no `definitionBase` and no publish.
+- A git repo carrying a root `repos.json` and no `.bb/repos.json` is a leftover
+  standalone definition. It is refused with a message to move it to
+  `.bb/repos.json`; nothing is guessed at.
 
 Reads (`readProjectFiles`, `repoSet`) resolve the default branch's committed
 tip — `origin/<default>`, or the local default branch when the plugin's own
@@ -94,16 +98,10 @@ Ways in:
 - **Primary, from an existing repo** — point the project at a clone of P. If it
   does not carry `.bb/`, the plugin seeds it on the default branch and publishes
   a `guidance-<seed>` branch with a pull request.
-- **Shared** — the standalone `.bb` repo has a remote. Clone it, create the
-  project pointing at it.
+- **Shared** — a primary repo has a remote. Clone it, create the project
+  pointing at it.
 - **Local, from scratch** — create the project pointing at a fresh directory;
-  the plugin initializes a standalone `.bb` there.
-
-`bb repos adopt <primary>` (and the panel) copies a standalone tree into
-`.bb/` on a branch of the primary and opens a pull request; once it merges, a
-later run re-points `project_sources.path` in place. That is BB-106 Case A: the
-SDK's `bb.sdk.projects.sources.update` re-points the source row for the same
-project id, so no store re-key and no steward respawn is needed.
+  the plugin creates a plain-directory `.bb/` there, with no git.
 
 ## 3. Why a plain-directory workspace root
 

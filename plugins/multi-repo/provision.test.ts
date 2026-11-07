@@ -6,7 +6,7 @@
  * those can be checked by parsing strings. These build actual repos on disk
  * and assert the properties the design depends on.
  */
-import { access, mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
+import { access, lstat, mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -409,22 +409,23 @@ describe("removing a workspace", () => {
 });
 
 describe("the project source", () => {
-  it("initializes an empty directory with a repo set and seeded guidance", async () => {
+  it("creates a plain directory's .bb/ skeleton with no git", async () => {
     const dir = path.join(scratch, "fresh");
     await mkdir(dir, { recursive: true });
     const result = await bootstrapProjectSource(dir, EMPTY_REPOS);
     expect(result.bootstrapped).toBe(true);
-    expect(await exists(path.join(dir, ".git"))).toBe(true);
-    const agents = await readFile(path.join(dir, "AGENTS.md"), "utf8");
+    // A plain directory is just a directory: no hidden repo anywhere.
+    expect(await exists(path.join(dir, ".git"))).toBe(false);
+    expect(await exists(path.join(dir, ".bb", ".git"))).toBe(false);
+    const agents = await readFile(path.join(dir, ".bb", "AGENTS.md"), "utf8");
     // Agents will not use `.bb` unless the seed explains what it is for.
     // Matched loosely because the seed is hard-wrapped prose.
     expect(agents).toMatch(/shared by every\s+thread in this project/u);
     expect(agents).toMatch(/durable cross-repo\s+knowledge/u);
-    expect(parseReposFile((await readReposJson(dir))!).ok).toBe(true);
-    expect(await gitLine(dir, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/u);
+    expect(parseReposFile((await readReposJson(dir, "directory"))!).ok).toBe(true);
   });
 
-  it("leaves an existing repo alone", async () => {
+  it("leaves an existing git repo alone", async () => {
     const dir = await makeRemote("already-a-repo");
     await writeFile(path.join(dir, "AGENTS.md"), "mine\n", "utf8");
     const result = await bootstrapProjectSource(dir, EMPTY_REPOS);
@@ -432,18 +433,34 @@ describe("the project source", () => {
     expect(await readFile(path.join(dir, "AGENTS.md"), "utf8")).toBe("mine\n");
   });
 
-  it("commits an updated repo set", async () => {
+  it("creates only the .bb files that are missing, never overwriting", async () => {
+    const dir = path.join(scratch, "partial");
+    await mkdir(path.join(dir, ".bb"), { recursive: true });
+    await writeFile(path.join(dir, ".bb", "AGENTS.md"), "mine\n", "utf8");
+    const result = await bootstrapProjectSource(dir, EMPTY_REPOS);
+    expect(result.bootstrapped).toBe(true);
+    expect(await readFile(path.join(dir, ".bb", "AGENTS.md"), "utf8")).toBe("mine\n");
+    expect(await exists(path.join(dir, ".bb", "repos.json"))).toBe(true);
+    expect(await exists(path.join(dir, ".bb", "skills", ".gitkeep"))).toBe(true);
+    expect(await exists(path.join(dir, ".git"))).toBe(false);
+  });
+
+  it("writes a plain directory's repo set in place, with no commit", async () => {
     const dir = path.join(scratch, "fresh");
     await mkdir(dir, { recursive: true });
     await bootstrapProjectSource(dir, EMPTY_REPOS);
-    const before = await gitLine(dir, ["rev-parse", "HEAD"]);
     const written = await writeReposJson(
       dir,
       `{"version":1,"repos":[{"dir":"a","url":"https://example.com/a"}]}\n`,
       "Add a",
+      undefined,
+      "directory",
     );
-    expect(written.committed).toBe(true);
-    expect(await gitLine(dir, ["rev-parse", "HEAD"])).not.toBe(before);
+    expect(written.ok).toBe(true);
+    expect(written.committed).toBe(false);
+    expect(written.mode).toBe("none");
+    expect(await readFile(path.join(dir, ".bb", "repos.json"), "utf8")).toContain('"a"');
+    expect(await exists(path.join(dir, ".git"))).toBe(false);
   });
 
   it("reports the commits a project checkout's default branch has not pushed", async () => {
@@ -467,97 +484,98 @@ describe("the project source", () => {
     expect(unpushed?.subjects).toEqual(["Rewrite guidance", "Add a repo"]);
   });
 
-  it("publishes workspace .bb commits back to the canonical checkout as a branch", async () => {
-    const canonical = path.join(scratch, "canonical");
-    await mkdir(canonical, { recursive: true });
-    await bootstrapProjectSource(canonical, EMPTY_REPOS);
-    const workspaceBb = path.join(scratch, "workspace-bb");
-    await git(["clone", "--quiet", canonical, workspaceBb]);
-    await gitIn(workspaceBb, ["config", "user.email", "test@example.invalid"]);
-    await gitIn(workspaceBb, ["config", "user.name", "Test"]);
-    await writeFile(path.join(workspaceBb, "AGENTS.md"), "learned something\n", "utf8");
-    await gitIn(workspaceBb, ["add", "-A"]);
-    await gitIn(workspaceBb, ["commit", "--quiet", "-m", "record knowledge"]);
-
-    const result = await pushGuidance(canonical, workspaceBb, "thr_abc123");
-    expect(result.ok).toBe(true);
-    expect(result.ref).toBe("refs/heads/guidance-thr_abc123");
-    // It lands on a branch, not on the checked-out one: that is what sidesteps
-    // receive.denyCurrentBranch and leaves something reviewable.
-    const branchHead = await gitLine(canonical, ["rev-parse", "guidance-thr_abc123"]);
-    expect(branchHead).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
-    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).not.toBe("learned something\n");
+  it("links a plain project's .bb straight to the project directory, with no clone", async () => {
+    const projectSource = path.join(scratch, "plain-source");
+    await mkdir(projectSource, { recursive: true });
+    await bootstrapProjectSource(projectSource, EMPTY_REPOS);
+    const result = await provisionWorkspace({
+      dataDir,
+      pathKey: "thread-plain",
+      projectSourcePath: projectSource,
+      layout: "directory",
+      repos: [],
+      branchName: "dylan/work",
+      fetchTtlMs: 0,
+      mirrors: [],
+    });
+    const source = result.repos.find((repo) => repo.dir === ".bb")!;
+    expect(source.status).toBe("ready");
+    expect((await lstat(path.join(result.root, ".bb"))).isSymbolicLink()).toBe(true);
+    expect(await exists(path.join(result.root, ".bb", ".git"))).toBe(false);
+    expect(await readFile(path.join(result.root, ".bb", "AGENTS.md"), "utf8")).toContain("Cross-repo guidance");
   });
 });
 
 describe("merging a published lesson branch", () => {
-  /** A canonical `.bb` and a clone of it, both with an identity to commit with. */
+  /** A primary canonical repo with `.bb/` and no origin, and a clone of it. */
   async function pair() {
     const canonical = path.join(scratch, "lesson-canonical");
     await mkdir(canonical, { recursive: true });
-    await bootstrapProjectSource(canonical, EMPTY_REPOS);
+    await git(["init", "--quiet", "--initial-branch=main", canonical]);
     await gitIn(canonical, ["config", "user.email", "test@example.invalid"]);
     await gitIn(canonical, ["config", "user.name", "Test"]);
-    // `AGENTS.md` defaults to a pull request in a standalone repo. These tests
-    // exercise the self-merge mechanics, so pin the policy to `push`; the
-    // pull-request half is covered in `publish.test.ts`.
-    await writeFile(path.join(canonical, "repos.json"), '{"version":1,"repos":[],"publish":"push"}\n', "utf8");
-    await gitIn(canonical, ["add", "--", "repos.json"]);
-    await gitIn(canonical, ["commit", "--quiet", "-m", "push policy"]);
-    const workspaceBb = path.join(scratch, "lesson-workspace");
-    await git(["clone", "--quiet", canonical, workspaceBb]);
-    await gitIn(workspaceBb, ["config", "user.email", "test@example.invalid"]);
-    await gitIn(workspaceBb, ["config", "user.name", "Test"]);
-    return { canonical, workspaceBb };
+    await mkdir(path.join(canonical, ".bb", "skills"), { recursive: true });
+    // Pin the policy to `push` so these tests exercise the self-merge
+    // mechanics; the pull-request half is covered in `publish.test.ts`.
+    await writeFile(path.join(canonical, ".bb", "repos.json"), '{"version":1,"repos":[],"publish":"push"}\n', "utf8");
+    await writeFile(path.join(canonical, ".bb", "AGENTS.md"), "# guidance\n", "utf8");
+    await gitIn(canonical, ["add", "-A"]);
+    await gitIn(canonical, ["commit", "--quiet", "-m", "add .bb"]);
+    const workspace = path.join(scratch, "lesson-workspace");
+    await git(["clone", "--quiet", canonical, workspace]);
+    await gitIn(workspace, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspace, ["config", "user.name", "Test"]);
+    return { canonical, workspaceBb: path.join(workspace, ".bb") };
   }
 
-  /** Append `text` to `file` in the workspace and commit it. */
+  /** Append `text` to `file` under `.bb/` in the workspace and commit it. */
   async function append(workspaceBb: string, file: string, text: string): Promise<void> {
     const current = await readFile(path.join(workspaceBb, file), "utf8");
     await writeFile(path.join(workspaceBb, file), `${current}\n${text}\n`, "utf8");
-    await gitIn(workspaceBb, ["add", "--", file]);
-    await gitIn(workspaceBb, ["commit", "--quiet", "-m", "record a lesson"]);
+    await gitIn(path.dirname(workspaceBb), ["add", "--", `.bb/${file}`]);
+    await gitIn(path.dirname(workspaceBb), ["commit", "--quiet", "-m", "record a lesson"]);
   }
 
   const lesson = "A new column read with SELECT * breaks the previous image.";
+  const FILE = ".bb/AGENTS.md";
 
   it("fast-forwards the canonical checkout to the lesson's own file, and returns the sha", async () => {
     const { canonical, workspaceBb } = await pair();
     await append(workspaceBb, "AGENTS.md", lesson);
     await pushGuidance(canonical, workspaceBb, "thr_lesson");
 
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", FILE, lesson);
     expect(result).toMatchObject({ ok: true, branch: "refs/heads/guidance-thr_lesson" });
-    expect(result.sha).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
     expect(await gitLine(canonical, ["rev-parse", "HEAD"])).toBe(result.sha);
-    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).toContain(lesson);
+    expect(await readFile(path.join(canonical, ".bb", "AGENTS.md"), "utf8")).toContain(lesson);
   });
 
   it("refuses a dirty canonical checkout and leaves the branch", async () => {
     const { canonical, workspaceBb } = await pair();
     await append(workspaceBb, "AGENTS.md", lesson);
     await pushGuidance(canonical, workspaceBb, "thr_lesson");
-    await writeFile(path.join(canonical, "AGENTS.md"), "half-written by hand\n", "utf8");
+    const branchBefore = await gitLine(canonical, ["rev-parse", "guidance-thr_lesson"]);
+    await writeFile(path.join(canonical, ".bb", "AGENTS.md"), "half-written by hand\n", "utf8");
 
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", FILE, lesson);
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/uncommitted changes/u);
     // The branch is exactly where it was published: nothing was merged.
-    expect(await gitLine(canonical, ["rev-parse", "guidance-thr_lesson"])).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
-    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).toBe("half-written by hand\n");
+    expect(await gitLine(canonical, ["rev-parse", "guidance-thr_lesson"])).toBe(branchBefore);
+    expect(await readFile(path.join(canonical, ".bb", "AGENTS.md"), "utf8")).toBe("half-written by hand\n");
   });
 
   it("refuses a non-fast-forward", async () => {
     const { canonical, workspaceBb } = await pair();
-    // The canonical branch moves on after the workspace branched: the
-    // workspace's commit is no longer a descendant.
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+    // The canonical branch moves on after the guidance branch was cut: the
+    // guidance commit is no longer a descendant of HEAD.
     await writeFile(path.join(canonical, "canonical-only.md"), "moved on\n", "utf8");
     await gitIn(canonical, ["add", "--", "canonical-only.md"]);
     await gitIn(canonical, ["commit", "--quiet", "-m", "canonical moves on"]);
-    await append(workspaceBb, "AGENTS.md", lesson);
-    await pushGuidance(canonical, workspaceBb, "thr_lesson");
 
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", FILE, lesson);
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/not a fast-forward/u);
   });
@@ -568,9 +586,9 @@ describe("merging a published lesson branch", () => {
     await append(workspaceBb, "repos.json", "// unrelated\n");
     await pushGuidance(canonical, workspaceBb, "thr_lesson");
 
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", FILE, lesson);
     expect(result.ok).toBe(false);
-    expect(result.message).toMatch(/changes files other than AGENTS\.md: repos\.json/u);
+    expect(result.message).toMatch(/changes files other than \.bb\/AGENTS\.md: \.bb\/repos\.json/u);
   });
 
   it("refuses a file that does not carry the lesson text", async () => {
@@ -578,14 +596,14 @@ describe("merging a published lesson branch", () => {
     await append(workspaceBb, "AGENTS.md", "Something else entirely.");
     await pushGuidance(canonical, workspaceBb, "thr_lesson");
 
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", FILE, lesson);
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/does not carry the lesson text/u);
   });
 
   it("refuses when nothing has been published", async () => {
     const { canonical } = await pair();
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", FILE, lesson);
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/No guidance branch refs\/heads\/guidance-thr_lesson has been published/u);
   });
@@ -876,73 +894,77 @@ describe("the cache is keyed by repo, not by project", () => {
 });
 
 describe("standing up a brand new project", () => {
-  it("bootstraps a project source whose directory does not exist yet", async () => {
+  it("bootstraps a plain project source whose directory does not exist yet", async () => {
     // The panel's Commit and `bb repos add --project` both land here on a new
     // project: a fresh machine's workspace directory is empty, so the repo
-    // set has to be able to create the repo that holds it.
+    // set has to be able to create the definition that holds it.
     const dir = path.join(scratch, "never-created", "acme");
     expect(await exists(dir)).toBe(false);
 
     const result = await bootstrapProjectSource(dir, EMPTY_REPOS);
     expect(result.bootstrapped).toBe(true);
-    expect(await exists(path.join(dir, ".git"))).toBe(true);
+    expect(await exists(path.join(dir, ".git"))).toBe(false);
 
-    // And the repo set commits straight afterwards, which is the sequence
-    // saveRepoSet performs.
+    // And the repo set is written in place straight afterwards, which is the
+    // sequence saveRepoSet performs.
     const written = await writeReposJson(
       dir,
       `{"version":1,"repos":[{"dir":"a","url":"https://example.com/a"}]}\n`,
       "Update the repo set",
+      undefined,
+      "directory",
     );
-    expect(written.committed).toBe(true);
-    expect(parseReposFile((await readReposJson(dir))!).ok).toBe(true);
+    expect(written.ok).toBe(true);
+    expect(written.mode).toBe("none");
+    expect(parseReposFile((await readReposJson(dir, "directory"))!).ok).toBe(true);
   });
 
   it("writing a repo set without bootstrapping first refuses rather than half-succeeding", async () => {
-    // The old behavior, kept honest: a directory that is not a repo gets a
-    // named failure, not a silent uncommitted write.
+    // A plain directory that was never bootstrapped has no `.bb/`, and a
+    // primary write against a non-git directory is refused with a named
+    // failure rather than a silent uncommitted write.
     const dir = path.join(scratch, "plain-directory");
     await mkdir(dir, { recursive: true });
-    const written = await writeReposJson(dir, `{"version":1,"repos":[]}\n`, "Update the repo set");
+    const written = await writeReposJson(dir, `{"version":1,"repos":[]}\n`, "Update the repo set", undefined, "primary");
     expect(written.committed).toBe(false);
     expect(written.message).not.toBeNull();
   });
 });
 
 describe("creating a project source", () => {
-  it("seeds a fresh .bb with the repos it was given, and leaves an existing one alone", async () => {
+  it("creates a fresh .bb with the repos it was given, and does not overwrite it", async () => {
     const dir = path.join(scratch, "fresh");
     const seeded = await bootstrapProjectSource(dir, {
       version: 1,
       repos: [{ dir: "alpha", url: "https://example.com/alpha", inferredDir: true }],
     });
     expect(seeded.bootstrapped).toBe(true);
-    const text = await readReposJson(dir);
+    const text = await readReposJson(dir, "directory");
     expect(text).not.toBeNull();
     const parsed = parseReposFile(text ?? "");
     expect(parsed.ok && parsed.value.repos.map((repo) => repo.dir)).toEqual(["alpha"]);
     // The inferred dir is written as the absence it was.
     expect(JSON.parse(text ?? "")).toEqual({ version: 1, repos: [{ url: "https://example.com/alpha" }] });
-    // Committed, so the project can be cloned from here on.
-    expect(await gitLine(dir, ["rev-parse", "HEAD"])).not.toBeNull();
+    // No git repo: a plain directory is just a directory.
+    expect(await exists(path.join(dir, ".git"))).toBe(false);
 
-    const again = await bootstrapProjectSource(dir, {
+    await bootstrapProjectSource(dir, {
       version: 1,
       repos: [{ dir: "beta", url: "https://example.com/beta" }],
     });
-    expect(again.bootstrapped).toBe(false);
-    expect(await readReposJson(dir)).toBe(text);
+    expect(await readReposJson(dir, "directory")).toBe(text);
   });
 
-  it("clones an existing .bb repo into an empty or absent directory", async () => {
+  it("clones an existing project source into an empty or absent directory", async () => {
     const remote = await makeRemote("shared-bb");
-    await writeFile(path.join(remote, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await mkdir(path.join(remote, ".bb"), { recursive: true });
+    await writeFile(path.join(remote, ".bb", "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
     await gitIn(remote, ["add", "-A"]);
     await gitIn(remote, ["commit", "--quiet", "-m", "repo set"]);
 
     const absent = path.join(scratch, "projects", "absent");
     expect(await cloneProjectSource(remote, absent)).toEqual({ ok: true, message: null });
-    expect(await readReposJson(absent)).toBe('{"version":1,"repos":[]}\n');
+    expect(await readReposJson(absent, "primary")).toBe('{"version":1,"repos":[]}\n');
     expect(await gitLine(absent, ["config", "--get", "remote.origin.url"])).toBe(remote);
 
     const empty = path.join(scratch, "projects", "empty");

@@ -21,7 +21,6 @@ import { readPullRequests, runPrAction } from "./gh.js";
 import { EMPTY_REPOS, resolveRepoEntry, type ReposFile } from "./repos.js";
 import type { RepoSeed } from "./contract.js";
 import {
-  adoptProjectSource,
   bootstrapProjectSource,
   cloneProjectSource,
   defaultProjectSourcePath,
@@ -33,7 +32,7 @@ import {
   projectSourceRemote,
   projectSourceUnpushed,
   pushGuidance,
-  readCommittedFiles,
+  readDefinitionFiles,
   readReposJson,
   refreshProjectSource,
   writeReposJson,
@@ -93,32 +92,37 @@ export function createMultiRepoHostEntry() {
     handlers: {
       async prepareProjectSource(input, context) {
         const warnings: string[] = [];
-        const bootstrap = input.bootstrap
-          ? await bootstrapProjectSource(input.path, seedFile(input.seed), context.signal)
-          : { bootstrapped: false, warnings: [] as string[] };
+        // `detectProjectLayout` throws the move-it message for a git repo
+        // holding a leftover root `repos.json`, which is exactly how the
+        // upgrade refuses such a project without touching it.
+        const layout = await detectProjectLayout(input.path, context.signal);
+        const bootstrap =
+          input.bootstrap && layout === "directory"
+            ? await bootstrapProjectSource(input.path, seedFile(input.seed), context.signal)
+            : { bootstrapped: false, warnings: [] as string[] };
         warnings.push(...bootstrap.warnings);
-        if (!bootstrap.bootstrapped) {
+        if (!bootstrap.bootstrapped && layout === "primary") {
           warnings.push(...(await refreshProjectSource(input.path, input.fetchTtlMs, context.signal)));
         }
-        const layout = await detectProjectLayout(input.path, context.signal);
         return {
           bootstrapped: bootstrap.bootstrapped,
           reposJson: await readReposJson(input.path, layout, context.signal),
-          remote: await projectSourceRemote(input.path, context.signal),
-          defaultBranch: await projectSourceBranch(input.path, context.signal),
-          unpushed: await projectSourceUnpushed(input.path, context.signal),
+          remote: layout === "primary" ? await projectSourceRemote(input.path, context.signal) : null,
+          defaultBranch: layout === "primary" ? await projectSourceBranch(input.path, context.signal) : null,
+          unpushed: layout === "primary" ? await projectSourceUnpushed(input.path, context.signal) : null,
           layout,
           warnings: warnings.slice(0, 20),
         };
       },
 
       async readProjectSourceFiles(input, context) {
-        // Never bootstraps: a read must not `git init` anyone's directory.
-        const warnings = await refreshProjectSource(input.path, input.fetchTtlMs, context.signal);
+        // Never bootstraps: a read must not create or commit a definition.
         const layout = await detectProjectLayout(input.path, context.signal);
-        const read = await readCommittedFiles(input.path, input.files, PROJECT_FILE_MAX_CHARS, context.signal, {
-          prefix: layout === "primary" ? ".bb/" : "",
-        });
+        const warnings =
+          layout === "primary"
+            ? await refreshProjectSource(input.path, input.fetchTtlMs, context.signal)
+            : [];
+        const read = await readDefinitionFiles(input.path, layout, input.files, PROJECT_FILE_MAX_CHARS, context.signal);
         return { ...read, warnings: warnings.slice(0, 20) };
       },
 
@@ -144,7 +148,7 @@ export function createMultiRepoHostEntry() {
           input.reposJson,
           input.message,
           context.signal,
-          input.layout ?? "standalone",
+          input.layout ?? "primary",
           input.publish,
         );
         return {
@@ -172,7 +176,7 @@ export function createMultiRepoHostEntry() {
           dataDir: context.experimental_paths.dataDir,
           pathKey: input.pathKey,
           projectSourcePath: input.projectSourcePath,
-          layout: input.layout ?? "standalone",
+          layout: input.layout ?? "directory",
           primaryDir: input.primaryDir ?? null,
           repos: input.repos,
           branchName: input.branchName,
@@ -291,17 +295,6 @@ export function createMultiRepoHostEntry() {
           input.text,
           context.signal,
         );
-      },
-
-      async adoptProjectSource(input, context) {
-        return adoptProjectSource({
-          standalonePath: input.standalonePath,
-          primaryUrl: input.primaryUrl,
-          primaryPath: input.primaryPath,
-          branch: input.branch,
-          openPullRequest: input.openPullRequest,
-          ...(context.signal === undefined ? {} : { signal: context.signal }),
-        });
       },
 
       async preparePrimaryProjectSource(input, context) {

@@ -76,20 +76,20 @@ object of path → mode:
 - `"pull-request"` pushes a `guidance-` branch and opens a pull request,
   never moving the default branch.
 
-With no key set, the default follows the layout:
-
-- **In a primary-repo project** (`.bb/` on a code repo's default branch), every
-  path defaults to `pull-request`, `repos.json` included.
-- **In a standalone `.bb` repo**, `repos.json` defaults to `push`, while
-  `AGENTS.md`, `skills/` and `stewards/` default to `pull-request`.
+With no key set, a **primary-repo project** (`.bb/` on a code repo's default
+branch) defaults every path to `pull-request`, `repos.json` included. A
+**plain directory** never commits or publishes anything, so its `publish` key
+is not read.
 
 To publish the whole `.bb` tree from a thread: edit the files under
-`<workspace>/.bb`, then call `workspace_publish_guidance`. It commits them
-host-side and lands them on a `guidance-<thread>` branch in the canonical
-checkout, for a person to review and merge. There is no need to commit inside
-`.bb` yourself. Its push to `origin` is still best-effort: read the result
-message, which says whether the branch reached `origin` or only the local
-canonical checkout, and push it yourself when it did not.
+`<workspace>/.bb`, then call `workspace_publish_guidance`. In a primary project
+it commits them host-side and lands them on a `guidance-<thread>` branch in the
+canonical checkout, for a person to review and merge. There is no need to
+commit inside `.bb` yourself. Its push to `origin` is still best-effort: read
+the result message, which says whether the branch reached `origin` or only the
+local canonical checkout, and push it yourself when it did not. In a plain
+directory the files are already in place, and the tool says nothing is
+published.
 
 In the primary layout, `<workspace>/.bb` is a symlink to `<primary>/.bb`: the
 primary repo carries `.bb/` on its default branch, and the link shows you the
@@ -99,6 +99,10 @@ to land it: commit it there and push it with the thread's code, or call
 `workspace_publish_guidance` to send only the `.bb/` changes on a
 `guidance-<thread>` branch cut from the default branch. `bb repos status` shows
 the `.bb` row as "Linked to"; the primary's row carries its change counts.
+
+In a plain-directory project, `<workspace>/.bb` is a symlink straight to the
+project directory's `.bb/`. An edit under it is the project's file at once;
+there is no commit, no branch and nothing to publish.
 
 ## A shared checkout
 

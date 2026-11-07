@@ -17,7 +17,7 @@ function manifest(overrides: Partial<WorkspaceManifest> = {}): WorkspaceManifest
     threadId: "thr_1",
     projectId: "proj_1",
     branchName: "dylan/fix-the-thing",
-    layout: "standalone",
+    layout: "primary",
     projectSourcePath: "/home/me/projects/acme",
     definitionBase: null,
     unpushed: null,
@@ -123,6 +123,13 @@ describe("formatInstructions", () => {
     expect(text).toContain("A failed publish keeps the local commit");
     // The old sentence said the plugin commits locally and never pushes.
     expect(text).not.toContain("do not push it");
+  });
+
+  it("says a plain directory edits .bb in place and publishes nothing", () => {
+    const text = formatInstructions(manifest({ layout: "directory", definitionBase: null }));
+    expect(text).toContain("is not a git repo");
+    expect(text).toContain("Nothing is committed and nothing is published");
+    expect(text).not.toContain("publishes to `origin`");
   });
 
   it("prints count, subjects, the server-only warning and the push command when ahead", () => {

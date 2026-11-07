@@ -23,7 +23,6 @@ import { repoSetViewSchema } from "./contract.js";
 import plugin from "./server.js";
 import { ENVIRONMENT_PROVIDER_ID } from "./shared.js";
 import {
-  adoptProjectSource,
   bootstrapProjectSource,
   detectProjectLayout,
   mergeGuidance,
@@ -97,25 +96,46 @@ describe("the panel's repo-set view", () => {
 });
 
 describe("layout detection", () => {
-  it("calls a root-level definition standalone and a .bb/ one primary", async () => {
-    const standalone = path.join(scratch, "standalone");
-    await mkdir(standalone, { recursive: true });
-    await bootstrapProjectSource(standalone, EMPTY_REPOS);
-    expect(await detectProjectLayout(standalone)).toBe("standalone");
+  it("calls a plain directory `directory` and a git repo `primary`", async () => {
+    const plain = path.join(scratch, "directory");
+    await mkdir(plain, { recursive: true });
+    await bootstrapProjectSource(plain, EMPTY_REPOS);
+    expect(await detectProjectLayout(plain)).toBe("directory");
 
     const primary = await makeRepo("primary");
     await commitDefinition(primary);
     expect(await detectProjectLayout(primary)).toBe("primary");
   });
 
-  it("does not flip layout on an uncommitted .bb/ in the working tree", async () => {
-    const standalone = path.join(scratch, "standalone");
-    await mkdir(standalone, { recursive: true });
-    await bootstrapProjectSource(standalone, EMPTY_REPOS);
-    // A person halfway through creating `.bb/`: not committed, so not the layout.
-    await mkdir(path.join(standalone, ".bb"), { recursive: true });
-    await writeFile(path.join(standalone, ".bb", "repos.json"), "{}\n", "utf8");
-    expect(await detectProjectLayout(standalone)).toBe("standalone");
+  it("never falls back for a git repo with no definition: it is an unseeded primary", async () => {
+    const primary = await makeRepo("unseeded");
+    expect(await detectProjectLayout(primary)).toBe("primary");
+  });
+
+  it("refuses a git repo carrying a leftover root repos.json with the move-it message", async () => {
+    // A former standalone directory that `create()` once git-init'ed: a real
+    // `.git`, a root `repos.json`, no `.bb/repos.json` and no origin.
+    const former = path.join(scratch, "former-standalone");
+    await mkdir(former, { recursive: true });
+    await git(["init", "--quiet", "--initial-branch=main", former]);
+    await gitIn(former, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(former, ["config", "user.name", "Test"]);
+    await writeFile(path.join(former, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await gitIn(former, ["add", "-A"]);
+    await gitIn(former, ["commit", "--quiet", "-m", "old definition"]);
+
+    await expect(detectProjectLayout(former)).rejects.toThrow(/move it to \.bb\/repos\.json/iu);
+    // The refusal touches nothing.
+    expect(await readFile(path.join(former, "repos.json"), "utf8")).toContain('"repos"');
+  });
+
+  it("does not refuse a primary that carries both .bb/repos.json and a stale root copy", async () => {
+    const primary = await makeRepo("both");
+    await commitDefinition(primary);
+    await writeFile(path.join(primary, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await gitIn(primary, ["add", "-A"]);
+    await gitIn(primary, ["commit", "--quiet", "-m", "stale root copy"]);
+    expect(await detectProjectLayout(primary)).toBe("primary");
   });
 });
 
@@ -321,81 +341,18 @@ describe("guidance on a primary repo", () => {
     expect(result.message).toMatch(/No guidance branch refs\/heads\/guidance-thr_lesson has been published/u);
   });
 
-  it("commits the workspace's uncommitted .bb edits before publishing (standalone)", async () => {
-    const canonical = path.join(scratch, "standalone-canonical");
-    await mkdir(canonical, { recursive: true });
-    await bootstrapProjectSource(canonical, EMPTY_REPOS);
-    const workspaceBb = path.join(scratch, "standalone-workspace-bb");
-    await git(["clone", "--quiet", canonical, workspaceBb]);
-    await writeFile(path.join(workspaceBb, "AGENTS.md"), "edited but not committed\n", "utf8");
-
-    const result = await pushGuidance(canonical, workspaceBb, "thr_uncommitted");
-    expect(result.ok).toBe(true);
-    expect(await gitLine(canonical, ["show", "guidance-thr_uncommitted:AGENTS.md"])).toBe("edited but not committed");
-  });
-});
-
-describe("adopting a standalone .bb into a primary repo", () => {
-  async function standalone(): Promise<string> {
-    const dir = path.join(scratch, "standalone");
+  it("does not publish from a plain directory: the edit is already in place", async () => {
+    const dir = path.join(scratch, "plain-canonical");
     await mkdir(dir, { recursive: true });
     await bootstrapProjectSource(dir, EMPTY_REPOS);
-    await gitIn(dir, ["config", "user.email", "test@example.invalid"]);
-    await gitIn(dir, ["config", "user.name", "Test"]);
-    await writeFile(path.join(dir, "AGENTS.md"), "project conventions\n", "utf8");
-    await gitIn(dir, ["add", "-A"]);
-    await gitIn(dir, ["commit", "--quiet", "-m", "conventions"]);
-    return dir;
-  }
+    const workspaceBb = path.join(dir, ".bb");
+    await writeFile(path.join(workspaceBb, "AGENTS.md"), "edited in place\n", "utf8");
 
-  it("copies the tree to .bb/ on a branch, then reports already-adopted after the merge", async () => {
-    const source = await standalone();
-    const primary = await makeRepo("primary");
-    const primaryPath = path.join(scratch, "primary-clone");
-
-    const first = await adoptProjectSource({
-      standalonePath: source,
-      primaryUrl: primary,
-      primaryPath,
-      branch: "bb/adopt-bb-test",
-      openPullRequest: false,
-    });
-    expect(first.status).toBe("pull-request");
-    // The tree is on the branch, and the default branch is untouched.
-    expect(await gitLine(primaryPath, ["show", "bb/adopt-bb-test:.bb/AGENTS.md"])).toBe("project conventions");
-    expect(await gitLine(primaryPath, ["show", "bb/adopt-bb-test:.bb/repos.json"])).toContain('"repos"');
-    expect(await gitLine(primaryPath, ["show", "main:.bb/AGENTS.md"])).toBeNull();
-
-    // Simulate the pull request merging.
-    await gitIn(primaryPath, ["checkout", "--quiet", "main"]);
-    await gitIn(primaryPath, ["merge", "--ff-only", "--quiet", "bb/adopt-bb-test"]);
-
-    const second = await adoptProjectSource({
-      standalonePath: source,
-      primaryUrl: primary,
-      primaryPath,
-      branch: "bb/adopt-bb-again",
-      openPullRequest: false,
-    });
-    expect(second.status).toBe("already");
-    expect(second.primaryPath).toBe(primaryPath);
-  });
-
-  it("is idempotent: a second run finds .bb/ and copies nothing", async () => {
-    const source = await standalone();
-    const primary = await makeRepo("primary");
-    await commitDefinition(primary, "already here\n");
-    const primaryPath = path.join(scratch, "primary-clone");
-
-    const result = await adoptProjectSource({
-      standalonePath: source,
-      primaryUrl: primary,
-      primaryPath,
-      branch: "bb/adopt-bb-test",
-      openPullRequest: false,
-    });
-    expect(result.status).toBe("already");
-    expect(await gitLine(primaryPath, ["show", "main:.bb/AGENTS.md"])).toBe("already here");
+    const result = await pushGuidance(dir, workspaceBb, "thr_plain");
+    expect(result.ok).toBe(true);
+    expect(result.ref).toBeNull();
+    expect(result.message).toMatch(/nothing is published/iu);
+    expect(await readFile(path.join(workspaceBb, "AGENTS.md"), "utf8")).toBe("edited in place\n");
   });
 });
 
@@ -562,7 +519,7 @@ describe("seeding an empty repo set", () => {
   const THREAD = makeThreadResponse({ id: THREAD_ID, projectId: PROJECT_ID, environmentId: null });
 
   function hostResponder(
-    layout: "primary" | "standalone",
+    layout: "primary" | "directory",
     remote: string | null,
     options: { reposJson?: string | null } = {},
   ) {
@@ -617,7 +574,7 @@ describe("seeding an empty repo set", () => {
   }
 
   async function runCreate(
-    layout: "primary" | "standalone",
+    layout: "primary" | "directory",
     remote: string | null,
     options: { reposJson?: string | null } = {},
   ) {
@@ -660,8 +617,8 @@ describe("seeding an empty repo set", () => {
     expect(repos.some((repo) => repo.url === SIBLING_URL)).toBe(false);
   });
 
-  it("standalone layout with an empty repos.json seeds nothing and holds only .bb", async () => {
-    const { result, harness } = await runCreate("standalone", PRIMARY_URL);
+  it("directory layout with an empty repos.json seeds nothing and holds no primary", async () => {
+    const { result, harness } = await runCreate("directory", PRIMARY_URL);
 
     expect(result).toMatchObject({ status: "created", path: ROOT });
     // No seed commit: an empty set is the owner's, not an invitation to fill it
@@ -673,17 +630,17 @@ describe("seeding an empty repo set", () => {
     expect(repos).toEqual([]);
   });
 
-  it("a plain repo with no committed repos.json seeds nothing and never writes to it", async () => {
-    // A plain repo adopted as the project source has no definition at all;
-    // `prepareProjectSource` reports `reposJson: null` and `standalone`. A seed
-    // write here lands `repos.json` at the root of someone's real repo.
-    const { result, harness } = await runCreate("standalone", PRIMARY_URL, { reposJson: null });
+  it("an unseeded primary is read without seeding it", async () => {
+    // A git repo with no `.bb/` is an unseeded primary. Thread start reads it
+    // and provisions the primary only; it must not commit `.bb/` anywhere.
+    const { result, harness } = await runCreate("primary", PRIMARY_URL, { reposJson: null });
 
     expect(result).toMatchObject({ status: "created", path: ROOT });
     expect(harness.experimental_hostRpcCalls.some((call) => call.method === "writeProjectSourceRepos")).toBe(false);
+    expect(harness.experimental_hostRpcCalls.some((call) => call.method === "preparePrimaryProjectSource")).toBe(false);
 
     const provision = harness.experimental_hostRpcCalls.find((call) => call.method === "provisionWorkspace");
     const repos = (provision?.input as { repos: { dir: string; url: string }[] }).repos;
-    expect(repos).toEqual([]);
+    expect(repos.map((repo) => repo.dir)).toEqual(["primary"]);
   });
 });

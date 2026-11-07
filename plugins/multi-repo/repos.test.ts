@@ -352,31 +352,31 @@ describe("resolvePublishMode", () => {
     }
   });
 
-  it("defaults a standalone repo to push for repos.json and a pull request elsewhere", () => {
-    expect(resolvePublishMode(undefined, "standalone", "repos.json")).toBe("push");
-    expect(resolvePublishMode(undefined, "standalone", "AGENTS.md")).toBe("pull-request");
-    expect(resolvePublishMode(undefined, "standalone", "skills/x.md")).toBe("pull-request");
-    expect(resolvePublishMode(undefined, "standalone", "stewards/project.json")).toBe("pull-request");
+  it("keeps the legacy push default for a plain directory, which never publishes", () => {
+    expect(resolvePublishMode(undefined, "directory", "repos.json")).toBe("push");
+    expect(resolvePublishMode(undefined, "directory", "AGENTS.md")).toBe("pull-request");
+    expect(resolvePublishMode(undefined, "directory", "skills/x.md")).toBe("pull-request");
+    expect(resolvePublishMode(undefined, "directory", "stewards/project.json")).toBe("pull-request");
   });
 
   it("lets a whole-project value override the layout default", () => {
     expect(resolvePublishMode("push", "primary", "AGENTS.md")).toBe("push");
-    expect(resolvePublishMode("pull-request", "standalone", "repos.json")).toBe("pull-request");
+    expect(resolvePublishMode("pull-request", "directory", "repos.json")).toBe("pull-request");
   });
 
   it("picks the most specific split key, and the default when none matches", () => {
     const policy = { "repos.json": "pull-request", "stewards/": "push", "stewards/playbooks/": "pull-request" } as const;
-    expect(resolvePublishMode(policy, "standalone", "repos.json")).toBe("pull-request");
-    expect(resolvePublishMode(policy, "standalone", "stewards/roles.json")).toBe("push");
-    expect(resolvePublishMode(policy, "standalone", "stewards/playbooks/x.md")).toBe("pull-request");
-    // Nothing matches, so the standalone default applies.
-    expect(resolvePublishMode(policy, "standalone", "AGENTS.md")).toBe("pull-request");
+    expect(resolvePublishMode(policy, "directory", "repos.json")).toBe("pull-request");
+    expect(resolvePublishMode(policy, "directory", "stewards/roles.json")).toBe("push");
+    expect(resolvePublishMode(policy, "directory", "stewards/playbooks/x.md")).toBe("pull-request");
+    // Nothing matches, so the plain-directory default applies (unused: a plain directory never publishes).
+    expect(resolvePublishMode(policy, "directory", "AGENTS.md")).toBe("pull-request");
   });
 
   it("matches a key without a trailing slash as a directory too", () => {
-    expect(resolvePublishMode({ skills: "push" }, "standalone", "skills/x.md")).toBe("push");
-    expect(resolvePublishMode({ skills: "push" }, "standalone", "skills")).toBe("push");
-    expect(resolvePublishMode({ skills: "push" }, "standalone", "skill-set/x.md")).toBe("pull-request");
+    expect(resolvePublishMode({ skills: "push" }, "directory", "skills/x.md")).toBe("push");
+    expect(resolvePublishMode({ skills: "push" }, "directory", "skills")).toBe("push");
+    expect(resolvePublishMode({ skills: "push" }, "directory", "skill-set/x.md")).toBe("pull-request");
   });
 });
 

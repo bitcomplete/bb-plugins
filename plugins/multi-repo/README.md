@@ -10,13 +10,23 @@ containing a checkout of each**.
   .bb/                  the project definition: repos.json, AGENTS.md, skills/
 ```
 
-A project's source is the **primary repo** — one real repo whose default
-branch carries `.bb/`, a directory holding the repo set, cross-repo guidance
-and project skills. `.bb/repos.json` lists only the *other* repos; the primary
-is derived from the project source's own `origin` and is not repeated. The
-standalone `.bb`-repo layout is still supported, so a machine that has not
-adopted keeps working; `bb repos adopt` moves a standalone definition into the
-primary, per machine.
+A project's source is either a **git repo** or a **plain directory**, and that
+one question decides the layout:
+
+- **A git repo is the primary.** Its default branch carries `.bb/`, a
+directory holding the repo set, cross-repo guidance and project skills.
+`.bb/repos.json` lists only the *other* repos; the primary is derived from the
+project source's own `origin` and is not repeated. A repo with no `.bb/` yet is
+an unseeded primary, seeded on the first explicit write.
+- **A plain directory** has no git at all. `.bb/` is an ordinary subdirectory of
+it, created with `repos.json`, `AGENTS.md` and `skills/` when missing, and the
+workspace `.bb/` is a symlink straight to it. Nothing is committed and nothing
+is published: edits are in place, and the surfaces say so.
+
+A git repo that carries `repos.json` at its root and no `.bb/repos.json` is a
+leftover standalone definition from before this layout existed. It is refused
+with a message to move it to `.bb/repos.json`; nothing is guessed at or
+destroyed.
 
 Every repo is equal in the workspace; the primary is one of them.
 
@@ -39,11 +49,11 @@ machine). Nothing else is shown until, on blur or Enter, the plugin probes the
 remote's default branch (through the per-machine object cache) and says what
 it found:
 
-- a root `repos.json` — a **standalone `.bb` repo**, cloned as the project
-  source;
 - `.bb/repos.json` — a **primary repo** carrying the definition, cloned and
   linked;
-- neither — a **plain repo**, cloned and made a single-repo project;
+- neither — a **plain repo**, cloned and made an unseeded primary;
+- a root `repos.json` — a leftover standalone definition, refused with a
+  message to move it to `.bb/repos.json`;
 - an absolute path that is already a checkout — adopted as the project
   source, nothing cloned.
 
@@ -62,10 +72,9 @@ there.
 The same two ways in exist without the panel, and are identical afterwards.
 
 **From scratch.** Create a project pointing at an empty directory. The first
-thread initializes `.bb` in it — `git init`, a seeded `AGENTS.md`, an empty
-`repos.json`, a commit — and proposes a repo set from the checkouts already on
-the machine. Add `git remote add origin …` and push whenever you want it to
-travel.
+thread creates `.bb/` in it — `repos.json`, a seeded `AGENTS.md` and `skills/`,
+with **no** `git init` and no commit — and the project holds exactly the repos
+in that file. Nothing is discovered from the checkouts on the machine.
 
 **Shared.** Clone an existing `.bb` repo and create the project pointing at it.
 A teammate gets the whole workspace definition from one URL.
@@ -108,11 +117,10 @@ bb repos list --project proj_abc123
   branch. It may be one mode for the whole project, or an object mapping a
   `.bb`-relative path (`repos.json`, `AGENTS.md`, `skills/`, `stewards/`) to
   one of those modes; the most specific key wins, and an unknown value is a
-  clear error. With no key set the layout decides: a **primary** project
-  (`.bb/` on a code repo's default branch) is `pull-request` for every path,
-  `repos.json` included; a **standalone** `.bb` repo pushes `repos.json` and
-  reviews `AGENTS.md`, `skills/` and `stewards/` by pull request. `push` is
-  opt-in in a primary project through this key.
+  clear error. With no key set, a **primary** project (`.bb/` on a code repo's
+  default branch) is `pull-request` for every path, `repos.json` included;
+  `push` is opt-in through this key. A **plain directory** never publishes
+  anything, so the policy is not read for it.
 
 **Branches float; SHAs are never pinned.** This is a dev workspace, not a
 release manifest.
@@ -130,7 +138,7 @@ parse fails the launch with a message naming the offending entry.
 | **Repos** nav panel | The repo set as a list — add by URL with completions from local checkouts, change a base branch inline, remove — each change one commit in `.bb`. A **New project** form whose first field is a git remote (or local checkout); a probe then reveals the name, machine and location. `repos.json` as text behind a disclosure, which opens itself when the file does not parse. |
 | **Changes** thread panel | Per-repo diff and pull request. Opened from the thread panel's Actions list. |
 | Composer banner | One row above the composer naming the repos that changed, their file counts and the `+`/`−` totals. Click it to open the Changes panel. Hidden when nothing has changed. |
-| `bb repos` | `list`, `add`, `remove` (each takes `--project`), `adopt <primary>`, and `status` for the current thread. |
+| `bb repos` | `list`, `add`, `remove` (each takes `--project`), and `status` for the current thread. |
 | Agent tools | `workspace_list_repos`, `workspace_add_repo`, `workspace_remove_repo`, `workspace_publish_guidance`. |
 | Agent instructions | A generated table of `repo → branch → path`, plus a `multi-repo` skill. |
 
@@ -164,30 +172,33 @@ workspace.
 
 ### Where `.bb` lives
 
-`.bb/` is a directory on the primary repo's default branch, next to the code,
-reviewed like code. The project source is a clone of that primary repo, and
-core reads `<workspace>/.bb/AGENTS.md` and `<workspace>/.bb/skills` from the
-workspace root — so each thread gets `<workspace>/.bb` as a symlink to
-`<workspace>/<primary>/.bb`, and sees what its own checkout of the primary
-carries, exactly as a single-repo thread sees its checkout's `.bb/`. An edit
-under `.bb/` is a working-tree change in the primary clone: it can go with the
-thread's code, or on its own through `workspace_publish_guidance`. When the
-link cannot be made (the primary failed to clone, its branch has no `.bb/`, or
-the platform refuses a symlink) the thread gets a copy of `.bb/` from the
-default branch's committed tip instead. Reads (`readProjectFiles`, `repoSet`)
-come from the default branch's committed tip, never the working tree or a
-feature branch.
+**A git repo (primary).** `.bb/` is a directory on the primary repo's default
+branch, next to the code, reviewed like code. The project source is a clone of
+that primary repo, and core reads `<workspace>/.bb/AGENTS.md` and
+`<workspace>/.bb/skills` from the workspace root — so each thread gets
+`<workspace>/.bb` as a symlink to `<workspace>/<primary>/.bb`, and sees what its
+own checkout of the primary carries, exactly as a single-repo thread sees its
+checkout's `.bb/`. An edit under `.bb/` is a working-tree change in the primary
+clone: it can go with the thread's code, or on its own through
+`workspace_publish_guidance`. When the link cannot be made (the primary failed
+to clone, its branch has no `.bb/`, or the platform refuses a symlink) the
+thread gets a copy of `.bb/` from the default branch's committed tip instead.
+Reads (`readProjectFiles`, `repoSet`) come from the default branch's committed
+tip, never the working tree or a feature branch.
 
-The **standalone** layout — a small `.bb` git repo that is the project source —
-is still read and written exactly as before. `bb repos adopt <primary>` copies
-a standalone tree into `.bb/` on a branch of the primary and opens a pull
-request; once it merges, running `bb repos adopt` again re-points
-`project_sources.path` in place. The project id, every stewards binding and
-every thread stay as they are (BB-106, Case A).
+**A plain directory.** There is no git and no primary clone. `.bb/` is an
+ordinary subdirectory of the project directory and `<workspace>/.bb` is a
+relative symlink straight to it, so an edit under `.bb/` is the project's file
+at once. `readProjectFiles` reads the working tree (there is no commit), and
+the publish paths (`workspace_publish_guidance`, the Repos panel, `bb repos`)
+edit in place and return "nothing is published" — no commit, no branch, no
+`definitionBase`.
 
-A workspace built before an adopt keeps publishing guidance to the old
-standalone checkout; `bb repos status` and the Changes panel say so, and a
-branch it publishes has to be re-applied to the primary by hand.
+A **legacy standalone** manifest (a workspace row written before this layout
+existed, with `layout: "standalone"`) is read without crashing but cannot be
+published from: its canonical checkout still has a root `repos.json`, so
+`detectProjectLayout` refuses it with the move-it message. Its checkout is
+never deleted or rewritten by the upgrade.
 
 ### The object cache
 
@@ -263,12 +274,10 @@ plugin keeps reading that local branch while it is strictly ahead (see
 and reported, and `preparePrimaryProjectSource` can seed a project and
 provision from it before the seed pull request merges.
 
-On the **standalone** layout, `workspace_publish_guidance` still fetches from
-the workspace clone onto a `guidance-<threadId>` branch:
-
-```
-git -C <canonical-.bb> fetch <workspace>/.bb HEAD:refs/heads/guidance-<threadId>
-```
+On a **plain directory**, `workspace_publish_guidance` is a no-op: the
+workspace's `.bb` is a symlink straight to the project directory, so the files
+are already in place and the result says nothing is published. `mergeGuidance`
+checks the lesson file is there and stops, with no branch to fast-forward.
 
 On the **primary** layout, `.bb/` is a directory in the primary repo and the
 default branch is reviewed like code, so `workspace_publish_guidance` builds a

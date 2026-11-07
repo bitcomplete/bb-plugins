@@ -61,12 +61,12 @@ afterEach(async () => {
 });
 
 describe("probing a remote", () => {
-  it("reads a root repos.json as a standalone .bb repo", async () => {
+  it("refuses a root repos.json in a git repo with the move-it message", async () => {
     const work = await makeRepo("standalone");
     await commitFile(work, "repos.json", '{"version":1,"repos":[]}\n');
-    const result = await probeRemote({ dataDir, url: await makeBare(work, "standalone") });
-    expect(result.outcome).toBe("standalone");
-    expect(result.defaultBranch).toBe("main");
+    await expect(probeRemote({ dataDir, url: await makeBare(work, "standalone") })).rejects.toThrow(
+      /move it to \.bb\/repos\.json/iu,
+    );
   });
 
   it("reads .bb/repos.json as a primary repo", async () => {
@@ -122,7 +122,7 @@ describe("createProject's source kinds", () => {
     remote: null,
     defaultBranch: null,
     unpushed: null,
-    layout: "standalone" as const,
+    layout: "primary" as const,
     warnings: [],
   };
 
@@ -299,7 +299,7 @@ describe("seeding a plain project source on the first write", () => {
               remote: "https://example.com/acme.git",
               defaultBranch: "main",
               unpushed: null,
-              layout: seeded ? ("primary" as const) : ("standalone" as const),
+              layout: "primary" as const,
               warnings: [],
             };
           case "preparePrimaryProjectSource":
@@ -347,7 +347,7 @@ describe("seeding a plain project source on the first write", () => {
               remote: "https://example.com/acme.git",
               defaultBranch: "main",
               unpushed: null,
-              layout: "standalone" as const,
+              layout: "primary" as const,
               warnings: [],
             };
           case "preparePrimaryProjectSource":
@@ -393,7 +393,7 @@ describe("seeding a plain project source on the first write", () => {
               remote: null,
               defaultBranch: "main",
               unpushed: null,
-              layout: seeded ? ("primary" as const) : ("standalone" as const),
+              layout: "primary" as const,
               warnings: [],
             };
           case "preparePrimaryProjectSource":
