@@ -316,8 +316,17 @@ export type RawLook = Omit<OpsLook, "at" | "target" | "error" | "findings"> & { 
 /** A fingerprint map row, as classification needs it. */
 export type FingerprintRow = { fingerprint: string; ticketKey: string | null; firstSeenAt: number; lastCommentedAt: number | null; filedByThread?: string | null };
 
-/** A ticket's state as the linear plugin reports it; null when it could not be read. `labels` and `url` are read for the dependency watch. */
+/** A ticket's state as the linear or github plugin reports it; null when it could not be read. `labels` and `url` are read for the dependency watch. */
 export type TicketState = { state: string; stateType: string | null; closedAt?: string | null; labels?: string[]; url?: string | null } | null;
+
+/**
+ * Whether a ticket is resolved: Linear marks it completed or canceled, and a
+ * GitHub issue is resolved when its state starts with `closed` (BB-235). The
+ * search results share this shape, so dedup reads a closed GitHub issue the
+ * same way.
+ */
+export const ticketResolved = (t: { state: string; stateType: string | null } | null): boolean =>
+  t !== null && (t.stateType === "completed" || t.stateType === "canceled" || (t.stateType === null && t.state.toLowerCase().startsWith("closed")));
 
 /** How long a resolved ticket is still "within two weeks" for a returned problem. */
 export const CLOSED_WINDOW_MS = 14 * 86_400_000;
@@ -333,7 +342,7 @@ export const closedWindow = (closedAt: string | null, now: number): "within" | "
 export const hasFingerprintLine = (description: string | null, fingerprint: string): boolean =>
   description !== null && description.split(/\r?\n/u).some((line) => line.trim() === `Fingerprint: \`${fingerprint}\``);
 
-const resolvedTicket = (t: TicketState) => t !== null && (t.stateType === "completed" || t.stateType === "canceled");
+const resolvedTicket = (t: TicketState) => ticketResolved(t);
 
 /**
  * Each sighting against the fingerprint map: new when it has no ticket,

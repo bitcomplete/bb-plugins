@@ -105,6 +105,17 @@ export function batchAlert(alert: Pick<DependabotAlert, "repo" | "ecosystem" | "
 /** "urgent" for critical, "high" for high, and so on. */
 export const priorityFor = (severity: DependabotSeverity): string => PRIORITY_BY_SEVERITY[severity];
 
+/**
+ * The label a GitHub issue carries in place of Linear's priority field
+ * (BB-235): `priority:<level>`. `ops.autoAdopt` names levels directly; a
+ * Dependabot severity maps through `priorityFor`. The onboarding label step
+ * (BB-236/BB-234) creates these labels; the watches only add the label of the
+ * priority an issue is filed at, and `check` reports a filing repo that lacks
+ * one.
+ */
+export const priorityLabel = (priority: string): string => `priority:${priority}`;
+export const priorityLabelForSeverity = (severity: DependabotSeverity): string => priorityLabel(priorityFor(severity));
+
 /** One alert as a Markdown bullet for a ticket body or a comment. */
 export function alertLine(alert: Pick<DependabotAlert, "package" | "ecosystem" | "severity" | "ghsaId" | "fixedVersion" | "manifestPath" | "url">): string {
   const where = [alert.ecosystem, alert.manifestPath].filter((v): v is string => v !== null && v !== "").join(" / ");

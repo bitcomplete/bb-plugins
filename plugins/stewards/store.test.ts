@@ -89,6 +89,20 @@ describe("the fingerprint map", () => {
     expect(s.fingerprint("p2", fp)).toBeNull();
   });
 
+  it("keeps a GitHub issue key's spelling and folds a Linear key to upper case (BB-235)", () => {
+    const { s } = store();
+    const b = ops(s);
+    s.sight("p1", b.id, [{ fingerprint: fp, summary: "web crashes" }]);
+    s.recordTicket("p1", fp, "acme/web#50", "filed");
+    expect(s.fingerprint("p1", fp)).toMatchObject({ ticketKey: "acme/web#50" });
+    s.recordTicket("p1", fp, "eng-12", "commented");
+    expect(s.fingerprint("p1", fp)).toMatchObject({ ticketKey: "ENG-12" });
+    // A dependency decision keyed by a GitHub issue keeps its spelling too.
+    const decision = s.raiseDepsDecision({ projectId: "p1", ticketKey: "acme/web#50", entityId: "dependabot/acme/web", fingerprints: [fp], severity: "medium", raisedBy: null, needId: null });
+    expect(decision.decision).toMatchObject({ ticketKey: "acme/web#50" });
+    expect(s.depsDecision("p1", "acme/web#50")).toMatchObject({ ticketKey: "acme/web#50" });
+  });
+
   it("keeps an ops binding's last look", () => {
     const { s } = store();
     const b = ops(s);

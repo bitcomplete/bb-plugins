@@ -702,9 +702,13 @@ project }], resolveOnDone? }, dependabot?: [repo, …] | "all", pulls?: [{ repo,
 playbook }] }`; the fields
 mean what they did in version 1. `k8sNamespaces` are watched with kubectl on
 that person's machine (their kubeconfig `context` when named); `team` is
-where their ops tickets are filed (the first of `linear.teams` by default,
-and it must be one of them); `autoAdopt` names the Linear priorities whose
-tickets the ops steward labels for a steward itself when it files them; every
+where their ops tickets are filed: a Linear team key (the first of
+`linear.teams` by default, and it must be one of them) or a GitHub
+`owner/repo` that must be in `repos.json`; `autoAdopt` names the Linear
+priorities whose
+tickets the ops steward labels for a steward itself when it files them (on a
+GitHub target the issue gets `bb-managed`, `status:todo` and a
+`priority:<level>` label instead of a Linear priority); every
 ticket a watch files is assigned to this server's owner, the login the role
 belongs to, and never to anyone else.
 `sentry.projects` watches Sentry projects with the plugin's **Sentry token**
@@ -813,9 +817,17 @@ unchanged.
 The `deps` object is the dependency watch: `sla` (a duration or `asap` per
 severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
 window a medium or low alert may wait for company), and `autoAdopt` (the
-severities whose tickets are labelled and moved to Todo when filed; any
+severities whose tickets are labelled and moved to Todo when filed — on a
+GitHub target the issue gets `bb-managed`, `status:todo` and a
+`priority:<level>` label; any
 other severity's ticket raises the owner's adoption decision, kept by the
-plugin until answered, with one overdue reminder).
+plugin until answered, with one overdue reminder). A GitHub filing target
+(`ops.team`, or a role's `team`, an `owner/repo` in `repos.json`) files with
+`gh issue create`, assigned to this server's GitHub login, and reads state,
+dedup and auto-adoption through the github source exactly as a Linear team
+does through linear; `bb stewards check --create-labels` creates the
+`priority:<level>` labels its `autoAdopt` names in the filing repo (and
+`status:todo` when no `github-issues` playbook already creates it there).
 `deps-alerts.md` and `deps-prs.md` are optional: a project that has not
 written them runs no dependency watch. `bb stewards init` writes them, and
 `bb stewards check` validates `deps.sla`, `deps.batch` and `deps.autoAdopt`

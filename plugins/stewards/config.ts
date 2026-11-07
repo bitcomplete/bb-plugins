@@ -95,6 +95,9 @@ export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-
 /** The ticket playbook a GitHub-tracked project carries; the default for a project with no Linear teams. */
 export const DEFAULT_GITHUB_TICKET_PLAYBOOK = "github-issues";
 
+/** The label a GitHub issue carries to mean "todo", the phase a filed autoAdopt issue starts in (BB-234, BB-235). */
+export const GITHUB_TODO_LABEL = "status:todo";
+
 /** The playbooks the dependency watch uses: one for alert targets, one for the bot's pull requests. */
 export const DEPS_ALERTS_PLAYBOOK = "deps-alerts";
 export const DEPS_PRS_PLAYBOOK = "deps-prs";
@@ -111,6 +114,33 @@ function validTimezone(tz: string): boolean {
 }
 
 const teamKey = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase());
+
+/**
+ * A filing target (BB-235): where an ops or dependency watch files its
+ * tickets, either a Linear team key or a GitHub `owner/repo`. A repo is kept
+ * as GitHub spells it; a team key is folded to upper case. The source is read
+ * from the shape; membership in `linear.teams` (checked here) or in the repo
+ * set (`filingTargetProblems`, where the repo set is known) is a separate
+ * question. This is what `ops.team` and a role's `ops.team` accept.
+ */
+export const filingTargetSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .transform((value, ctx): string => {
+    if (REPO_NAME.test(value)) return value;
+    if (/^[A-Za-z][A-Za-z0-9]*$/u.test(value)) return value.toUpperCase();
+    ctx.addIssue({ code: "custom", message: `${JSON.stringify(value)} is not a Linear team key or a GitHub owner/repo` });
+    return z.NEVER;
+  });
+
+/** Where a filing target lives: a Linear team or a GitHub repo. */
+export type FilingTargetSource = "linear" | "github";
+export type FilingTarget = { target: string; source: FilingTargetSource };
+
+/** The source of a filing target from its shape: a repo has a slash, a team key does not. */
+export const filingTargetOf = (target: string): FilingTarget => ({ target, source: REPO_NAME.test(target) ? "github" : "linear" });
 
 /** Linear's priorities, as `ops.autoAdopt` names them. */
 export const LINEAR_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
@@ -302,7 +332,7 @@ export const projectFileSchema = z
     ops: z
       .object({
         targets: z.array(opsTargetSchema).max(10).default([]),
-        team: teamKey.optional(),
+        team: filingTargetSchema.optional(),
         /** The kubeconfig context kubectl uses on the developer's machine; its current context when left out. */
         context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
         autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
@@ -338,7 +368,10 @@ export const projectFileSchema = z
     if (file.ops.targets.length === 0) return;
     // A ticket filed outside the project's teams is never adopted, so the project steward could not act on it.
     if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a Linear team to file tickets in: set ops.team or linear.teams" });
-    if (file.ops.team !== undefined && !file.linear.teams.includes(file.ops.team)) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: `${file.ops.team} is not one of linear.teams, so a ticket filed there would never be stewarded` });
+    // A repo target (BB-235) is checked against the repo set by
+    // `filingTargetProblems`, which the caller runs where repos are known; a
+    // team key is checked here against the project's own teams.
+    if (file.ops.team !== undefined && !REPO_NAME.test(file.ops.team) && !file.linear.teams.includes(file.ops.team)) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: `${file.ops.team} is not one of linear.teams, so a ticket filed there would never be stewarded` });
   });
 export type ProjectFile = z.infer<typeof projectFileSchema>;
 
@@ -422,8 +455,8 @@ export const roleOpsSchema = z
     k8sNamespaces: z.array(z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production")).max(50).default([]),
     /** The kubeconfig context kubectl uses on this person's machine; its current context when left out. */
     context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
-    /** Where this person's ops tickets are filed (the first of linear.teams when left out). */
-    team: teamKey.optional(),
+    /** Where this person's ops tickets are filed (the first of linear.teams when left out): a Linear team key or a GitHub owner/repo. */
+    team: filingTargetSchema.optional(),
     autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
     sentry: roleSentrySchema,
     /** Repos whose Dependabot alerts this person watches; `"all"` is every repo in repos.json less github.exclude. */
@@ -621,8 +654,11 @@ export function rolePullWatches(role: Role | null, repos: readonly string[], dep
   return [...synthesized, ...rolePulls(role)];
 }
 
-/** The Linear team a role's ops steward files in (the first of linear.teams when the role names none). */
-export const roleOpsTeam = (role: Role | null, project: ProjectFile): string | null => role?.ops?.team ?? project.linear.teams[0] ?? null;
+/** The Linear team a role's ops steward files in (the first of linear.teams when the role names none), with its source. */
+export const roleOpsTeam = (role: Role | null, project: ProjectFile): FilingTarget | null => {
+  const target = role?.ops?.team ?? project.linear.teams[0] ?? null;
+  return target === null ? null : filingTargetOf(target);
+};
 
 /**
  * Whether a role watches a namespace or Sentry project, so the ops-watch
@@ -670,8 +706,11 @@ export function depsTargets(project: ProjectFile, repos: readonly string[]): Dep
 export const depsAlertsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_ALERTS_PLAYBOOK] ?? DEPS_ALERTS_PLAYBOOK;
 export const depsPrsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_PRS_PLAYBOOK] ?? DEPS_PRS_PLAYBOOK;
 
-/** The Linear team an ops steward files in. */
-export const opsTeam = (project: ProjectFile): string | null => project.ops.team ?? project.linear.teams[0] ?? null;
+/** The Linear team or GitHub repo an ops steward files in, with its source. */
+export const opsTeam = (project: ProjectFile): FilingTarget | null => {
+  const target = project.ops.team ?? project.linear.teams[0] ?? null;
+  return target === null ? null : filingTargetOf(target);
+};
 
 // ---- migration and the project steward's role problems ---------------------------------
 
@@ -876,6 +915,32 @@ export function roleWarnings(roles: RolesFile): string[] {
   return Object.keys(roles.definitions)
     .filter((name) => !held.has(name))
     .map((name) => `role ${JSON.stringify(name)} has no holder`);
+}
+
+/**
+ * The problems with a project's filing targets (BB-235): a GitHub `owner/repo`
+ * that is not in the project's repo set, and a role's Linear team key that is
+ * not one of `linear.teams`. A project file's team key is checked by the
+ * schema itself; this adds the repo case the schema cannot see (the repo set
+ * comes from `repos.json`) and the role cases the schema never checks.
+ */
+export function filingTargetProblems(project: ProjectFile, roles: RolesFile | null, repos: readonly string[]): string[] {
+  const out: string[] = [];
+  const repoProblem = (where: string, target: string) => {
+    if (!repos.some((r) => r.toLowerCase() === target.toLowerCase())) out.push(`${where}: ${target} is not in repos.json, so a ticket filed there would never be stewarded`);
+  };
+  const teamProblem = (where: string, target: string) => {
+    if (!project.linear.teams.includes(target)) out.push(`${where}: ${target} is not one of linear.teams, so a ticket filed there would never be stewarded`);
+  };
+  const projectTarget = project.ops.team;
+  if (projectTarget !== undefined && REPO_NAME.test(projectTarget)) repoProblem(`${PROJECT_FILE} ops.team`, projectTarget);
+  for (const [login, role] of Object.entries(roles?.roles ?? {})) {
+    const target = role.ops?.team;
+    if (target === undefined) continue;
+    if (REPO_NAME.test(target)) repoProblem(`${ROLES_FILE} ${login}'s ops.team`, target);
+    else teamProblem(`${ROLES_FILE} ${login}'s ops.team`, target);
+  }
+  return out;
 }
 
 // ---- playbooks ---------------------------------------------------------------------

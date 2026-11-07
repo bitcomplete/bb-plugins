@@ -38,6 +38,8 @@ function world() {
   let searchError: string | null = null;
   /** The login `sourceValidate` reports, per source; tests override one to make it unreadable (BB-105). */
   const viewers: Partial<Record<"linear" | "github", string | null>> = {};
+  /** Labels a fake source reports missing for a unit, by `${source}:${lowercased unit}` (BB-235). */
+  const missingStates = new Map<string, string[]>();
   /** The Linear teams `sourceValidate` reports as the viewer's, for `init` with no `--teams` (BB-234). */
   let linearMine: Array<{ unit: string; name: string }> = [{ unit: "ENG", name: "Engineering" }];
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
@@ -212,7 +214,12 @@ function world() {
       sourceContract.sourceValidate.input.parse(input);
       const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
       const viewer = source in viewers ? viewers[source]! : "Jane";
-      out = { viewer, units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: args.pluginId === SOURCE_PLUGIN_IDS.github ? [] : linearMine, error: null };
+      out = {
+        viewer,
+        units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: missingStates.get(`${source}:${unit.toLowerCase()}`) ?? [] })),
+        mine: args.pluginId === SOURCE_PLUGIN_IDS.github ? [] : linearMine,
+        error: null,
+      };
     } else if (args.method === "sourceEnsureLabel") {
       // The real plugins validate the input and create idempotently; the fake
       // remembers what it created so a second run is `existed` (BB-236).
@@ -444,7 +451,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -8767,6 +8774,211 @@ describe("dependency stewards", () => {
     expect(check.stdout).toMatch(/deps-alerts: deps-alerts@/u);
     expect(check.stdout).toMatch(/deps-prs: deps-prs@/u);
     expect(check.stdout).toMatch(/deps: watching 1 repo for alerts: acme\/web/u);
+  });
+});
+
+// BB-235: a project with no Linear team files ops and Dependabot tickets as
+// GitHub issues in a repo it names, reads their state and dedup through the
+// github source, and labels an autoAdopt severity so adoption picks it up.
+describe("GitHub filing targets (BB-235)", () => {
+  const TARGET = "k8s-namespace/bb-gate-production";
+  const FP = `${TARGET}/bb-gate-router/router#CrashLoopBackOff:Error:1`;
+
+  /** A fake kubectl on the project's machine, serving one namespace. */
+  function cluster() {
+    const state = { pods: [] as unknown[], events: [] as unknown[] };
+    const kubectl = async (args: string[], where: { hostId: string | null }): Promise<KubectlResult> => {
+      const ok = (stdout: string): KubectlResult => ({ exitCode: 0, stdout, stderr: "" });
+      const a = args.filter((x) => !x.startsWith("--request-timeout") && !x.startsWith("--context"));
+      if (a[0] === "get") {
+        const items = a[1] === "pods" ? state.pods : a[1] === "events" ? state.events : [{ metadata: { name: "bb-gate-router" }, spec: { replicas: 1 }, status: { readyReplicas: 0 } }];
+        return ok(a.includes("json") ? JSON.stringify({ items }) : "");
+      }
+      if (a[0] === "logs") return ok("");
+      if (a[0] === "auth") return { exitCode: 1, stdout: "no\n", stderr: "" };
+      return { exitCode: 1, stdout: "", stderr: `unexpected kubectl ${args.join(" ")}` };
+    };
+    return { state, kubectl };
+  }
+
+  const githubProject = (ops: Record<string, unknown> = {}) => JSON.stringify({ version: 1, linear: { teams: [] }, ops: { targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }], team: "acme/web", ...ops } });
+
+  async function opsWatched(over: { githubLogin?: string | null; entities?: Array<[string, EntitySnapshot]> } = {}) {
+    const c = cluster();
+    const t = await setup({ kubectl: c.kubectl });
+    t.files[PROJECT_FILE] = githubProject();
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    c.state.pods = [crashingPod()];
+    c.state.events = [warningEvent("bb-gate-router-6d4f9c7b8-x2k4q")];
+    if (over.githubLogin !== undefined) t.viewers.github = over.githubLogin;
+    for (const [id, entity] of over.entities ?? []) t.entities.set(id, entity);
+    await t.hooks.sweep();
+    await t.flush();
+    const steward = () => t.spawns.find((x) => String(x.title).startsWith("Ops watch"));
+    const wakes = () => {
+      const id = steward()?.id;
+      return id === undefined ? [] : [String(steward()!.prompt), ...t.sends.filter((x) => x.threadId === id).map((x) => x.text)];
+    };
+    return { t, c, steward, wakes };
+  }
+
+  const alert = (over: Record<string, unknown> = {}) => ({
+    id: "acme/web#4",
+    repo: "acme/web",
+    number: 4,
+    severity: "high",
+    package: "lodash",
+    ecosystem: "npm",
+    manifestPath: "package-lock.json",
+    state: "open",
+    ghsaId: "GHSA-xxxx-yyyy-zzzz",
+    fixedVersion: "4.17.21",
+    summary: "Prototype pollution",
+    url: "https://github.com/acme/web/security/dependabot/4",
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-01T00:00:00Z",
+    ...over,
+  });
+
+  async function depsWatched(alerts: unknown[], ops: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = []) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, ops: { team: "acme/web", ...ops }, github: { exclude: ["acme/bb"] } });
+    t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.dependabotAlerts.set("acme/web", alerts);
+    for (const [id, entity] of entities) t.entities.set(id, entity);
+    await t.hooks.sweep();
+    await t.flush();
+    const steward = () => t.spawns.find((x) => String(x.title).startsWith("Deps watch"));
+    const wakes = () => {
+      const id = steward()?.id;
+      return id === undefined ? [] : [String(steward()!.prompt), ...t.sends.filter((x) => x.threadId === id).map((x) => x.text)];
+    };
+    return { t, steward, wakes };
+  }
+
+  /** The one `#### <fingerprint>` block of a wake. */
+  const blockOf = (wake: string, heading: string): string => {
+    const start = wake.indexOf(`#### ${heading}`);
+    if (start < 0) return "";
+    const rest = wake.slice(start);
+    const next = rest.indexOf("\n#### ", 1);
+    return next < 0 ? rest : rest.slice(0, next);
+  };
+
+  it("files through the GitHub repo the filing target names, assigned to this server's GitHub login", async () => {
+    const { wakes } = await opsWatched();
+    const first = wakes()[0]!;
+    expect(first).toMatch(/^# Ops watch: k8s-namespace\/bb-gate-production/u);
+    expect(first).toMatch(/File issues in the GitHub repo acme\/web with `gh issue create`/u);
+    expect(first).toMatch(/Assign every issue you file to this server's GitHub login, Jane/u);
+    expect(first).toMatch(/pass `--assignee Jane` to `gh issue create`/u);
+    expect(first).toMatch(/Sign every `gh` body by hand/u);
+    expect(first).not.toMatch(/linear_create_issue/u);
+  });
+
+  it("files unassigned when the GitHub login cannot be read, never guessing", async () => {
+    const { wakes } = await opsWatched({ githubLogin: null });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/This server's GitHub login could not be read, so file every issue unassigned; never guess an assignee/u);
+    expect(first).not.toMatch(/Assign every issue you file to this server's GitHub login/u);
+  });
+
+  it("adopts an unmapped fingerprint from an open GitHub issue with the exact Fingerprint line, through the github search", async () => {
+    const found = githubIssue({ id: "acme/web#77", key: "acme/web#77", state: "status:todo", labels: ["bb-managed", "status:todo"], assignees: ["jane"], description: `Fingerprint: \`${FP}\`` });
+    const { t, wakes } = await opsWatched({ entities: [["acme/web#77", found]] });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### Recurring: its ticket is open/u);
+    expect(first).toMatch(/Recurring on acme\/web#77 \(open\)/u);
+    expect(first).not.toMatch(/### New: no ticket yet/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "acme/web#77" });
+    // Dedup and the ticket read went through the github source, not linear.
+    expect(t.rpcCalls.some((c) => c.method === "sourceSearchIssues" && c.pluginId === "github-watcher")).toBe(true);
+    expect(t.rpcCalls.some((c) => c.method === "sourceSearchIssues" && c.pluginId === "linear")).toBe(false);
+    expect(t.rpcCalls.some((c) => c.method === "sourceSnapshot" && c.pluginId === "github-watcher" && (c.input as { id?: string }).id === "acme/web#77")).toBe(true);
+  });
+
+  it("reads a resolved GitHub issue as returned, taking its state through the github source", async () => {
+    const closed = githubIssue({ id: "acme/web#77", key: "acme/web#77", state: "closed (completed)", labels: ["bb-managed", "status:todo"], description: `Fingerprint: \`${FP}\``, updatedAt: "2026-10-13T00:00:00Z" });
+    const { wakes } = await opsWatched({ entities: [["acme/web#77", closed]] });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### Returned: its ticket was resolved/u);
+    expect(first).toMatch(/Returned: acme\/web#77 closed 2026-10-13T00:00:00Z, within two weeks/u);
+    expect(first).not.toMatch(/### New: no ticket yet/u);
+  });
+
+  it("does not refile a Dependabot alert an open GitHub issue already carries, and reads it as recurring", async () => {
+    const found = githubIssue({ id: "acme/web#50", key: "acme/web#50", state: "open", labels: [], description: "Fingerprint: `acme/web#4`" });
+    const { t, wakes } = await depsWatched([alert({ number: 4, severity: "high" })], {}, [["acme/web#50", found]]);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### Recurring: its ticket is open/u);
+    expect(first).toMatch(/Recurring on acme\/web#50 \(open\)/u);
+    expect(first).not.toMatch(/### New: no ticket yet/u);
+    expect(t.hooks.store.fingerprint("p1", "acme/web#4")).toMatchObject({ ticketKey: "acme/web#50" });
+    expect(t.rpcCalls.some((c) => c.method === "sourceSearchIssues" && c.pluginId === "github-watcher")).toBe(true);
+  });
+
+  it("tells the steward to add the project, status and priority labels for an autoAdopt severity on GitHub", async () => {
+    const { wakes } = await depsWatched([alert({ number: 4, severity: "critical", ghsaId: "GHSA-crit" })]);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/File issues in the GitHub repo acme\/web with `gh issue create`/u);
+    expect(first).toMatch(/add the labels `bb-managed`, `status:todo` and `priority:<level>` \(the priority the alert is filed at\)/u);
+  });
+
+  it("files a medium or low GitHub issue with neither label, and the plugin raises the adoption decision", async () => {
+    const { t, steward, wakes } = await depsWatched([alert({ number: 4, severity: "medium", ghsaId: "GHSA-med" })]);
+    const first = wakes()[0]!;
+    // The medium alert's own block carries no label instruction.
+    expect(blockOf(first, "acme/web#4")).not.toMatch(/status:todo|priority:/u);
+    // After the steward files it, the plugin raises the owner's decision, as in Linear.
+    t.entities.set("acme/web#50", githubIssue({ id: "acme/web#50", key: "acme/web#50", state: "open", labels: [], description: "Fingerprint: `acme/web#4`" }));
+    const ops = steward()!.id;
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed acme/web#50.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "acme/web#50", did: "filed" }] }, ops)).error).toBe(false);
+    expect(t.hooks.store.depsDecision("p1", "acme/web#50")).toMatchObject({ status: "pending", severity: "medium" });
+    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.what).toMatch(/Adopt acme\/web#50\?/u);
+  });
+
+  it("reports a filing repo not in repos.json, and a GitHub filing repo that lacks a priority label", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, ops: { team: "acme/gone" } });
+    const stray = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(stray.exitCode).toBe(1);
+    expect(stray.stdout).toMatch(/problem: stewards\/project\.json ops\.team: acme\/gone is not in repos\.json/u);
+
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, ops: { team: "acme/web", autoAdopt: ["urgent"] } });
+    t.setMissingStates("github", "acme/web", ["priority:urgent"]);
+    const missing = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stdout).toMatch(/problem: github: acme\/web has no state priority:urgent/u);
+    const validate = t.rpcCalls.filter((c) => c.method === "sourceValidate" && c.pluginId === "github-watcher").at(-1)!;
+    expect(validate.input).toMatchObject({ units: ["acme/web"], states: expect.arrayContaining(["priority:urgent", "priority:high"]) });
+  });
+
+  it("creates the priority labels and status:todo in the GitHub filing repo with check --create-labels", async () => {
+    const t = await setup();
+    // A role names the GitHub filing target, so the legacy-ops migration line
+    // is not in play.
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { ops: { team: "acme/web", autoAdopt: ["urgent"] } }, holders: { jane: ["ops", "projectSteward"] } });
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).toContain("created label priority:urgent in github repo acme/web");
+    expect(check.stdout).toContain("created label priority:high in github repo acme/web");
+    expect(check.stdout).toContain("created label status:todo in github repo acme/web");
+    // The project label is ensured in every repo; the priority labels and
+    // status:todo only in the filing repo (BB-236's ensureLabels, no new RPC).
+    expect(t.labelEnsureCalls).toEqual([
+      { source: "github", units: ["acme/web", "acme/bb"], label: "bb-managed" },
+      { source: "github", units: ["acme/web"], label: "priority:urgent" },
+      { source: "github", units: ["acme/web"], label: "priority:high" },
+      { source: "github", units: ["acme/web"], label: "status:todo" },
+    ]);
+    // A second run is idempotent: everything is `existed`.
+    const again = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(again.exitCode).toBe(0);
+    expect(again.stdout).toContain("existed label priority:urgent in github repo acme/web");
+    expect(again.stdout).toContain("existed label status:todo in github repo acme/web");
+    expect(again.stdout).not.toContain("created label priority:urgent");
   });
 });
 

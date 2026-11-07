@@ -3,6 +3,7 @@ import {
   bindingRoles,
   DEPENDENCY_BOTS,
   depsTargets,
+  filingTargetProblems,
   githubStateLabels,
   isTerminal,
   k8sTargets,
@@ -139,12 +140,12 @@ describe("ops in the project file", () => {
     if (!r.ok) throw new Error(r.error);
     expect(r.value.ops).toEqual({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "OPS", autoAdopt: ["urgent"], sentry: { resolveOnDone: false } });
     expect(usesKind(r.value, "ops")).toBe(true);
-    expect(opsTeam(r.value)).toBe("OPS");
+    expect(opsTeam(r.value)).toEqual({ target: "OPS", source: "linear" });
   });
 
   it("files in the first Linear team when no team is named", () => {
     const r = file({ targets: [{ kind: "k8s-namespace", name: "prod" }] });
-    expect(r.ok && opsTeam(r.value)).toBe("ENG");
+    expect(r.ok && opsTeam(r.value)).toEqual({ target: "ENG", source: "linear" });
     expect(r.ok && r.value.ops.autoAdopt).toEqual([]);
   });
 
@@ -194,6 +195,26 @@ describe("ops in the project file", () => {
     expect(error({ targets: [], watch: true })).toMatch(/ops/u);
     // No targets, no team needed.
     expect(file({ targets: [] }, []).ok).toBe(true);
+  });
+
+  it("accepts a GitHub owner/repo filing target with no Linear teams, and rejects one outside the repo set (BB-235)", () => {
+    const r = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: [] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "acme/web" } }));
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.ops.team).toBe("acme/web");
+    expect(opsTeam(r.value)).toEqual({ target: "acme/web", source: "github" });
+    // The repo target satisfies the "needs a Linear team" check.
+    expect(filingTargetProblems(r.value, null, ["acme/web", "acme/other"])).toEqual([]);
+    // Not in the repo set: a problem.
+    expect(filingTargetProblems(r.value, null, ["acme/other"])).toEqual([expect.stringMatching(/stewards\/project\.json ops\.team: acme\/web is not in repos\.json/u)]);
+    // A Linear team key must still be one of linear.teams.
+    expect(parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "SALES" } }))).toMatchObject({ ok: false });
+    // A role's repo target is checked against the repo set, and its team key against linear.teams.
+    const roleRepo = parseRolesFile(JSON.stringify({ version: 2, roles: { ops: { team: "acme/other" } }, holders: { jane: ["ops"] } }));
+    if (!roleRepo.ok) throw new Error(roleRepo.error);
+    expect(filingTargetProblems(r.value, roleRepo.value, ["acme/web"])).toEqual([expect.stringMatching(/roles\.json jane's ops\.team: acme\/other is not in repos\.json/u)]);
+    const roleTeam = parseRolesFile(JSON.stringify({ version: 2, roles: { ops: { team: "OPS" } }, holders: { jane: ["ops"] } }));
+    if (!roleTeam.ok) throw new Error(roleTeam.error);
+    expect(filingTargetProblems(r.value, roleTeam.value, ["acme/web"])).toEqual([expect.stringMatching(/roles\.json jane's ops\.team: OPS is not one of linear\.teams/u)]);
   });
 });
 
@@ -594,7 +615,7 @@ describe("roles.json (BB-105)", () => {
     const role = legacyRole(legacy.value);
     expect(role.projectSteward).toBe(true);
     expect(role.ops).toMatchObject({ team: "ENG", context: "bc-prod", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web" }], resolveOnDone: true }, dependabot: "all" });
-    expect(roleOpsTeam(role, legacy.value)).toBe("ENG");
+    expect(roleOpsTeam(role, legacy.value)).toEqual({ target: "ENG", source: "linear" });
     expect(usesKind(legacy.value, "ops", role)).toBe(true);
   });
 
@@ -658,7 +679,7 @@ describe("roles.json version 2 (BB-163)", () => {
     expect(modern.value.roles["jane"]).toEqual(v1.value.roles["jane"]);
     expect(roleOpsTargets(modern.value.roles["jane"]!)).toEqual(roleOpsTargets(v1.value.roles["jane"]!));
     expect(roleDepsTargets(modern.value.roles["jane"]!, ["acme/web", "acme/other"])).toEqual(roleDepsTargets(v1.value.roles["jane"]!, ["acme/web", "acme/other"]));
-    expect(roleOpsTeam(modern.value.roles["jane"]!, project())).toBe(roleOpsTeam(v1.value.roles["jane"]!, project()));
+    expect(roleOpsTeam(modern.value.roles["jane"]!, project())).toEqual(roleOpsTeam(v1.value.roles["jane"]!, project()));
     expect(projectStewardProblem(modern.value)).toBeNull();
     expect(watchProblems(project(), modern.value, [], false)).toEqual(watchProblems(project(), v1.value, [], false));
   });
