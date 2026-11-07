@@ -85,6 +85,7 @@ import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
   entitySnapshotSchema,
+  isMissingPlugin,
   signatureLine,
   sourceContract,
   stewardsContract,
@@ -3259,9 +3260,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const changes: Change[] = [];
       let ready = b.ready;
       const approval = playbook.ready?.approval;
-      if (typeof approval === "object" && lc(entity.state) === lc(approval["linear-state"]) && ready.approval === null) {
-        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "linear" }, voidedAt: null };
-        changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
+      const sourceLabel = entity.source === "github" ? "GitHub" : "Linear";
+      if (typeof approval === "object" && lc(entity.state) === lc(approval.state) && ready.approval === null) {
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source }, voidedAt: null };
+        changes.push({ text: `Approved in ${sourceLabel} (now ${entity.state})`, actionable: true });
       }
       const workers = store.workers(b.id);
       const workerInFlight = anyWorkerInFlight(workers);
@@ -8622,7 +8624,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const playbook = config === null ? null : playbookFor(config, target.kind);
               const mode = playbook?.ready?.approval ?? null;
               if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
-              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode["linear-state"]} in Linear.`));
+              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode.state} in ${target.source === "github" ? "GitHub" : "Linear"}.`));
               if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
               const entity = (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
               const byProject = mode === "project" && isProjectSteward(threadId, target);
@@ -9463,7 +9465,48 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return `${who} (${config.roleNames.length > 0 ? config.roleNames.join(", ") : "no roles"})`;
     }
 
-    async function check(projectId: string): Promise<{ ok: boolean; lines: string[] }> {
+    /**
+     * Whether a `sourceEnsureLabel` failure means the source does not serve
+     * the RPC at all: an unloaded/absent plugin (`isMissingPlugin`), or a
+     * loaded plugin whose contract predates it (the SDK's `unknown_method`).
+     * Anything else is a real failure and prints its own message.
+     */
+    function rpcUnavailable(error: unknown): boolean {
+      if (isMissingPlugin(error)) return true;
+      const e = error as { code?: unknown; message?: unknown };
+      if (e?.code === "unknown_method") return true;
+      return typeof e?.message === "string" && /unknown rpc method/iu.test(e.message);
+    }
+
+    /**
+     * `check --create-labels` first creates the project's label in every
+     * unit, then validates as plain `check` does. A unit that could not be
+     * created is a `failed:` line and a `problem:` line, never a silent
+     * skip; a source that does not serve the RPC is reported unavailable.
+     */
+    async function ensureLabels(source: Source, units: string[], label: string, lines: string[]): Promise<void> {
+      if (units.length === 0) return;
+      let results: z.infer<typeof sourceContract.sourceEnsureLabel.output>["results"];
+      try {
+        results = (await sourceRpc(source, "sourceEnsureLabel", { units, label }, sourceContract.sourceEnsureLabel.output)).results;
+      } catch (error) {
+        const why = rpcUnavailable(error) ? "sourceEnsureLabel is unavailable (the source plugin does not support it)" : errorMessage(error);
+        lines.push(`problem: ${source}: could not create label ${label}: ${why}`);
+        return;
+      }
+      for (const r of results) {
+        const what = source === "linear" ? `linear team ${r.unit}` : `github repo ${r.unit}`;
+        if (r.status === "created") lines.push(`created label ${label} in ${what}`);
+        else if (r.status === "existed") lines.push(`existed label ${label} in ${what}`);
+        else {
+          const detail = r.error ?? "unknown error";
+          lines.push(`failed to create label ${label} in ${what}: ${detail}`);
+          lines.push(`problem: ${source}: ${r.unit}: could not create label ${label}: ${detail}`);
+        }
+      }
+    }
+
+    async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
@@ -9483,6 +9526,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // (BB-164).
       const watches = rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file));
       if (watches.length > 0) lines.push(`pulls: ${watches.map((w) => pullWatchId(w)).join(", ")}`);
+      if (options.createLabels === true) {
+        await ensureLabels("linear", config.file.linear.teams, config.file.label, lines);
+        await ensureLabels("github", config.repos, config.file.label, lines);
+      }
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
         try {
@@ -9862,9 +9909,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           check: cliCommand({
             summary: "Validate the project file and every playbook against Linear and GitHub, and that kubectl can read every ops target",
-            options: { project: PROJECT_OPTION },
+            description: "--create-labels first creates the project's label in every Linear team and every non-excluded GitHub repo, reporting each as created, existed or failed, then validates. Plain check only reads.",
+            options: { project: PROJECT_OPTION, "create-labels": { type: "boolean", description: "Create the project's label in every unit first, then validate" } },
             async run(input, ctx) {
-              const result = await check(projectOf(input.options.project, ctx));
+              const result = await check(projectOf(input.options.project, ctx), { createLabels: input.options["create-labels"] === true });
               return { exitCode: result.ok ? 0 : 1, stdout: [...result.lines, result.ok ? "OK" : "Problems found."].join("\n") };
             },
           }),

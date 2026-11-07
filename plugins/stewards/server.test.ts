@@ -48,6 +48,16 @@ function world() {
   const sourceRuns = new Map<string, unknown>();
   /** Compare statuses the fake github serves, by `lowercased repo base head` (BB-132). */
   const sourceCompares = new Map<string, string>();
+  /** Every `sourceEnsureLabel` call, in order (BB-236). */
+  const labelEnsureCalls: Array<{ source: string; units: string[]; label: string }> = [];
+  /** Units a fake source already carries the label in, so a second ensure is `existed` (BB-236). */
+  const labelsEnsured = new Set<string>();
+  /** Units whose `sourceEnsureLabel` call fails, by `${source}:${lowercased unit}` (BB-236). */
+  const labelEnsureFailures = new Map<string, string>();
+  /** When true, the fake source does not serve `sourceEnsureLabel` at all (BB-236). */
+  let labelEnsureUnavailable = false;
+  /** A plain thrown failure for `sourceEnsureLabel`, to tell it from unavailable (BB-236). */
+  let labelEnsureThrow: string | null = null;
   const rpcCalls: Call[] = [];
   const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; projectId?: string; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null; environmentStatus?: string | null; environmentPhase?: string | null; sendError?: { code: string; status: number; message: string } }>();
   /** Every `threads.delete` the plugin asked for; the plugin must only ever archive. */
@@ -201,6 +211,25 @@ function world() {
       const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
       const viewer = source in viewers ? viewers[source]! : "Jane";
       out = { viewer, units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: [{ unit: "ENG", name: "Engineering" }], error: null };
+    } else if (args.method === "sourceEnsureLabel") {
+      // The real plugins validate the input and create idempotently; the fake
+      // remembers what it created so a second run is `existed` (BB-236).
+      sourceContract.sourceEnsureLabel.input.parse(input);
+      if (labelEnsureUnavailable) throw Object.assign(new Error("Unknown RPC method: sourceEnsureLabel"), { code: "unknown_method" });
+      if (labelEnsureThrow !== null) throw new Error(labelEnsureThrow);
+      const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
+      const units = input.units as string[];
+      labelEnsureCalls.push({ source, units, label: String(input.label) });
+      out = {
+        results: units.map((unit) => {
+          const key = `${source}:${unit.toLowerCase()}`;
+          const failure = labelEnsureFailures.get(key);
+          if (failure !== undefined) return { unit, status: "error", error: failure };
+          if (labelsEnsured.has(key)) return { unit, status: "existed", error: null };
+          labelsEnsured.add(key);
+          return { unit, status: "created", error: null };
+        }),
+      };
     }
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
@@ -412,7 +441,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -3142,6 +3171,72 @@ describe("pull requests", () => {
     expect(check.exitCode).toBe(1);
     expect(check.stdout).toMatch(/problem: github\.exclude names acme\/wbe, not in repos\.json/u);
     expect(check.stdout).toMatch(/repos: acme\/web/u);
+  });
+});
+
+describe("check --create-labels (BB-236)", () => {
+  it("is read-only without the flag, and creates each unit's label once with it", async () => {
+    const t = await setup();
+    const plain = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(plain.exitCode).toBe(0);
+    expect(t.labelEnsureCalls).toEqual([]);
+
+    const first = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toContain("created label bb-managed in linear team ENG");
+    expect(first.stdout).toContain("created label bb-managed in github repo acme/web");
+    expect(first.stdout).toContain("created label bb-managed in github repo acme/bb");
+    expect(t.labelEnsureCalls).toEqual([
+      { source: "linear", units: ["ENG"], label: "bb-managed" },
+      { source: "github", units: ["acme/web", "acme/bb"], label: "bb-managed" },
+    ]);
+
+    const second = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("existed label bb-managed in linear team ENG");
+    expect(second.stdout).toContain("existed label bb-managed in github repo acme/web");
+    expect(second.stdout).toContain("existed label bb-managed in github repo acme/bb");
+    expect(second.stdout).not.toContain("created label");
+  });
+
+  it("reports a refused create as failed and a problem line, and keeps going", async () => {
+    const t = await setup();
+    t.labelEnsureFailures.set("github:acme/web", "403 Resource not accessible by integration");
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toContain("failed to create label bb-managed in github repo acme/web: 403 Resource not accessible by integration");
+    expect(check.stdout).toContain("problem: github: acme/web: could not create label bb-managed: 403 Resource not accessible by integration");
+    expect(check.stdout).toContain("created label bb-managed in github repo acme/bb");
+  });
+
+  it("leaves excluded repos out of the ensure", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/web"] } });
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(t.labelEnsureCalls).toEqual([
+      { source: "linear", units: ["ENG"], label: "bb-managed" },
+      { source: "github", units: ["acme/bb"], label: "bb-managed" },
+    ]);
+    expect(check.stdout).not.toContain("created label bb-managed in github repo acme/web");
+  });
+
+  it("says a source whose contract predates the RPC is unavailable rather than failing", async () => {
+    const t = await setup();
+    t.setLabelEnsureUnavailable(true);
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toContain("problem: linear: could not create label bb-managed: sourceEnsureLabel is unavailable (the source plugin does not support it)");
+    expect(check.stdout).toContain("problem: github: could not create label bb-managed: sourceEnsureLabel is unavailable (the source plugin does not support it)");
+  });
+
+  it("prints a real call failure's own message rather than calling it unavailable", async () => {
+    const t = await setup();
+    t.setLabelEnsureThrow("the source is on fire");
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toContain("problem: linear: could not create label bb-managed: the source is on fire");
+    expect(check.stdout).not.toContain("unavailable");
   });
 });
 

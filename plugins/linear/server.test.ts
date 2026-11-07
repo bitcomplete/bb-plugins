@@ -1202,6 +1202,43 @@ describe("the source contract", () => {
     });
   });
 
+  it("sourceEnsureLabel creates the team label once and treats an existing label, team or workspace, as existed", async () => {
+    const team = (id: string, key: string, labels: Array<{ id: string; name: string }>) => ({ id, key, name: key, states: { nodes: [] }, labels: { nodes: labels } });
+    const { harness, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("query($key: String!) { teams")) {
+            const key = body.variables!.key as string;
+            const nodes = key === "GONE" ? [] : key === "ENG" ? [team("t-eng", "ENG", [{ id: "l-bb", name: "BB-Managed" }])] : key === "OPS" ? [team("t-ops", "OPS", [{ id: "l-bug", name: "Bug" }])] : [team(`t-${key.toLowerCase()}`, key, [])];
+            return { data: { teams: { nodes }, issueLabels: { nodes: key === "OPS" ? [{ id: "l-ws", name: "bb-managed" }] : [] } } };
+          }
+          if (body.query.startsWith("mutation($input: IssueLabelCreateInput!)")) {
+            const input = body.variables!.input as { teamId: string };
+            if (input.teamId === "t-boom") return { data: null, errors: [{ message: "Permission denied" }] };
+            return { data: { issueLabelCreate: { success: true, issueLabel: { id: "l-created", name: "bb-managed" } } } };
+          }
+          return { data: {} };
+        },
+      },
+    });
+    expect(await harness.callRpc("sourceEnsureLabel", { units: ["eng", "OPS", "NEW", "BOOM", "GONE"], label: "bb-managed" })).toEqual({
+      results: [
+        { unit: "eng", status: "existed", error: null },
+        { unit: "OPS", status: "existed", error: null },
+        { unit: "NEW", status: "created", error: null },
+        { unit: "BOOM", status: "error", error: expect.stringContaining("Permission denied") },
+        { unit: "GONE", status: "error", error: expect.stringContaining("no such Linear team") },
+      ],
+    });
+    // A workspace label of the same name is never shadowed by a new team label, and only the two missing teams are asked to create.
+    const mutations = linear.calls.filter((c) => c.body?.query.startsWith("mutation($input: IssueLabelCreateInput!)"));
+    expect(mutations.map((c) => c.body!.variables!.input)).toEqual([
+      { name: "bb-managed", teamId: "t-new" },
+      { name: "bb-managed", teamId: "t-boom" },
+    ]);
+  });
+
   it("sourceAdoptable lists labelled open issues per team, oldest first, with each team's failure on its own", async () => {
     const node = (id: string, team: string, createdAt: string) => ({ id, identifier: `${team}-${id}`, createdAt, state: { name: "Todo" }, team: { key: team }, creator: { name: "Bob" }, labels: { nodes: [{ name: "bb-managed" }] } });
     const { harness, linear } = await setup({

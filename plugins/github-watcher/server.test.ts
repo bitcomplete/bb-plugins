@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -76,6 +76,18 @@ function fakeGitHub() {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
       return Response.json(state.deploymentStatuses[Number(statuses[3])] ?? []);
     }
+    const labelCreate = /\/repos\/([^/]+)\/([^/]+)\/labels(?:\?|$)/u.exec(u);
+    if (labelCreate !== null && init?.method === "POST") {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      const repo = `${labelCreate[1]}/${labelCreate[2]}`;
+      const body = JSON.parse(String(init.body)) as { name: string };
+      state.labelCreates.push(`${repo}:${body.name}`);
+      if (state.labelCreateStatus === 422) return Response.json({ message: state.labelCreateMessage, errors: [{ resource: "Label", code: "already_exists", field: "name" }] }, { status: 422 });
+      if (state.labelCreateStatus >= 400) return Response.json({ message: state.labelCreateMessage }, { status: state.labelCreateStatus });
+      const key = repo.toLowerCase();
+      state.labels[key] = [...(state.labels[key] ?? []), body.name];
+      return Response.json({ id: 1, name: body.name }, { status: 201 });
+    }
     const dependabot = /\/repos\/([^/]+)\/([^/]+)\/dependabot\/alerts(?:\?|$)/u.exec(u);
     if (dependabot !== null) {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
@@ -94,7 +106,10 @@ function fakeGitHub() {
     const v = body.variables as { owner: string; name: string; number: number; label?: string };
     if (!body.query.includes("repository(")) return Response.json({ data: { viewer: { login: "dev" } } });
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
-    if (body.query.includes("label(name:")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: v.label === "bb-managed" ? { name: "bb-managed" } : null } } });
+    if (body.query.includes("label(name:")) {
+      const has = (state.labels[`${v.owner}/${v.name}`.toLowerCase()] ?? []).some((n) => n.toLowerCase() === String(v.label).toLowerCase());
+      return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: has ? { name: String(v.label) } : null } } });
+    }
     if (body.query.includes("pullRequests(")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: state.openPulls } } } });
     if (body.query.includes("object(expression:")) {
       const expression = String((body.variables as { expression?: unknown }).expression ?? "");
@@ -540,6 +555,30 @@ describe("stewards' source contract", () => {
 
     const out = await setup({ token: async () => { throw new NotSignedInError("no oauth token"); } });
     expect(await out.harness.callRpc("sourceValidate", { units: ["acme/widgets"], label: "bb-managed", states: [] }, STEWARDS)).toEqual({ viewer: null, units: [], mine: [], error: expect.stringContaining("not signed in") });
+  });
+
+  it("creates a repository's label idempotently and answers each unit on its own", async () => {
+    const w = await setup();
+    w.github.state.labels = {};
+    expect(await w.harness.callRpc("sourceEnsureLabel", { units: ["Acme/Widgets", "acme/gone", "not-a-repo"], label: "bb-managed" }, STEWARDS)).toEqual({
+      results: [
+        { unit: "Acme/Widgets", status: "created", error: null },
+        { unit: "acme/gone", status: "error", error: expect.stringContaining("no such repository") },
+        { unit: "not-a-repo", status: "error", error: "not owner/repo" },
+      ],
+    });
+    expect(w.github.state.labelCreates).toEqual(["Acme/Widgets:bb-managed"]);
+    // A second run finds the label and writes nothing.
+    expect(await w.harness.callRpc("sourceEnsureLabel", { units: ["Acme/Widgets"], label: "bb-managed" }, STEWARDS)).toEqual({ results: [{ unit: "Acme/Widgets", status: "existed", error: null }] });
+    expect(w.github.state.labelCreates).toHaveLength(1);
+    // A 422 already_exists is existed too, and any other refusal is an error.
+    w.github.state.labels = {};
+    w.github.state.labelCreateStatus = 422;
+    expect(await w.harness.callRpc("sourceEnsureLabel", { units: ["Acme/Widgets"], label: "bb-managed" }, STEWARDS)).toEqual({ results: [{ unit: "Acme/Widgets", status: "existed", error: null }] });
+    w.github.state.labels = {};
+    w.github.state.labelCreateStatus = 403;
+    w.github.state.labelCreateMessage = "Resource not accessible by integration";
+    expect(await w.harness.callRpc("sourceEnsureLabel", { units: ["Acme/Widgets"], label: "bb-managed" }, STEWARDS)).toEqual({ results: [{ unit: "Acme/Widgets", status: "error", error: expect.stringContaining("403") }] });
   });
 
   it("lists open pull requests oldest first up to the limit, with per-repository errors", async () => {

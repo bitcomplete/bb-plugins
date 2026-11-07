@@ -887,8 +887,21 @@ const phaseSchema = z
   })
   .strict();
 
-/** Who approves a substantial ticket: the project steward (default), the user, or a Linear state. */
-export const approvalModeSchema = z.union([z.literal("project"), z.literal("user"), z.object({ "linear-state": z.string().trim().min(1).max(100) }).strict()]);
+/** Who approves a substantial ticket: the project steward (default), the user, or a source state (a Linear workflow state, or a GitHub status label). */
+export const approvalModeSchema = z.union([
+  z.literal("project"),
+  z.literal("user"),
+  z
+    .object({
+      state: z.string().trim().min(1).max(100).optional(),
+      /** The pre-BB-232 spelling; accepted and normalised to `state`. */
+      "linear-state": z.string().trim().min(1).max(100).optional(),
+    })
+    .strict()
+    .refine((v) => v.state !== undefined || v["linear-state"] !== undefined, { message: "approval needs a state" })
+    .refine((v) => v.state === undefined || v["linear-state"] === undefined, { message: "name either state or linear-state, not both" })
+    .transform((v) => ({ state: v.state ?? v["linear-state"]! })),
+]);
 export type ApprovalMode = z.infer<typeof approvalModeSchema>;
 
 const readySchema = z
@@ -1212,5 +1225,5 @@ export function phaseInstructions(playbook: Playbook, state: string): string | n
   return key === undefined ? null : playbook.sections[key]!;
 }
 
-/** Every Linear state the playbook names, for validation against the teams' workflows. */
-export const playbookStates = (playbook: Playbook): string[] => [...Object.keys(playbook.phases), ...playbook.terminal, ...(playbook.ready !== null && typeof playbook.ready.approval === "object" ? [playbook.ready.approval["linear-state"]] : [])];
+/** Every source state the playbook names, for validation against the source (Linear workflow states, or GitHub status labels). */
+export const playbookStates = (playbook: Playbook): string[] => [...Object.keys(playbook.phases), ...playbook.terminal, ...(playbook.ready !== null && typeof playbook.ready.approval === "object" ? [playbook.ready.approval.state] : [])];

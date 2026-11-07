@@ -199,7 +199,10 @@ export const entitySnapshotSchema = z.object({
   title: z.string().nullable(),
   /**
    * The name a playbook keys its phases on. Linear: the workflow state's name.
-   * GitHub: open, draft, merged or closed.
+   * GitHub: for a pull request, open, draft, merged or closed; for an issue, a
+   * status label -- a label named `status:<phase>` -- when the issue carries
+   * exactly one, else `open` or `closed (reason)`. The label's name is the
+   * state, so an issue playbook keys its phases on `status:todo` and the like.
    */
   state: z.string(),
   /** Linear's state type (triage, backlog, unstarted, started, completed, canceled); null on GitHub. */
@@ -227,7 +230,11 @@ export const entitySnapshotSchema = z.object({
   parent: z.object({ id: z.string(), key: z.string() }).nullable(),
   /** Sub-issues. Empty on GitHub. */
   children: z.array(snapshotChildSchema),
-  /** Pull requests linked to a Linear issue, by URL; "owner/repo#12" when it parses. Empty on GitHub. */
+  /**
+   * Pull requests linked to the entity, by URL; "owner/repo#12" when it
+   * parses. Linear: the issue's linked pull requests. GitHub: an issue's
+   * closing references and cross-references, populated from the issue.
+   */
   linkedPulls: z.array(z.object({ url: z.string(), key: z.string().nullable() })),
   pull: snapshotPullSchema.nullable(),
   /** Who the source acts as: the connected Linear user's name, or the gh login. */
@@ -250,8 +257,7 @@ export type AdoptableEntity = z.infer<typeof adoptableEntitySchema>;
 
 /**
  * One issue a source's search returned, with the description the caller
- * matches an exact `Fingerprint:` line in. Linear serves it; GitHub has no
- * issue search and declines with `unsupported: true`.
+ * matches an exact `Fingerprint:` line in.
  */
 export const searchIssueSchema = z.object({
   id: z.string(),
@@ -310,7 +316,8 @@ export const sourceContract = {
   /**
    * Whether a project's configuration makes sense to this source: each unit
    * (team key, or owner/repo) exists and is visible, carries the label, and
-   * has every named state (Linear workflow states; ignored by GitHub).
+   * has every named state (Linear workflow states; on GitHub, label names to
+   * check for).
    */
   sourceValidate: {
     input: z.object({
@@ -335,6 +342,30 @@ export const sourceContract = {
     }),
   },
   /**
+   * Create the project's label in each unit that does not already carry it,
+   * for onboarding: a repeat is `existed`, not an error. Matched ignoring
+   * case, and a label of that name anywhere the unit can see (a Linear
+   * workspace label, say) counts as `existed` rather than being shadowed by
+   * a new one. Additive and optional -- a source that does not serve it is
+   * unavailable to the caller. `status` is created, existed or error;
+   * `error` says why a unit could not be created (permission, API failure).
+   */
+  sourceEnsureLabel: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      label: z.string().min(1).max(100),
+    }),
+    output: z.object({
+      results: z.array(
+        z.object({
+          unit: z.string(),
+          status: z.enum(["created", "existed", "error"]),
+          error: z.string().nullable().default(null),
+        }),
+      ),
+    }),
+  },
+  /**
    * What a nightly pass may adopt. Linear: open issues in these teams carrying
    * the label. GitHub: every open pull request in these repos, oldest first;
    * stewards decides which are labelled and which want a review.
@@ -356,9 +387,9 @@ export const sourceContract = {
    * fingerprint the map has lost but the source still has a ticket for.
    * Linear serves it team-scoped, closed issues included, with a small
    * result count; the caller verifies the exact `Fingerprint:` line itself.
-   * GitHub has no issue search and answers `unsupported: true`; an older
-   * source without the method at all is a missing RPC. Stewards treats
-   * either as "dedup unavailable".
+   * A source that does not offer the capability answers `unsupported: true`;
+   * an older source without the method at all is a missing RPC. Stewards
+   * treats either as "dedup unavailable".
    */
   sourceSearchIssues: {
     input: z.object({

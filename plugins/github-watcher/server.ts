@@ -36,6 +36,8 @@ import {
   deploymentsPath,
   graphql,
   kindName,
+  labelAlreadyExists,
+  labelPath,
   parseCompare,
   parseDependabotAlerts,
   parseDeploymentStatus,
@@ -185,6 +187,28 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const link = response.headers.get("link") ?? "";
         const next = /<([^>]+)>;\s*rel="next"/u.exec(link)?.[1] ?? null;
         return { body, next };
+      });
+    }
+
+    /**
+     * Create one label in one repository. A 422 `already_exists` is the label
+     * already being there, which an idempotent create reports as `existed`;
+     * every other non-2xx answer throws with its status. The token is re-read
+     * from gh on a 401 by `asDeveloper`.
+     */
+    async function createLabel(repo: string, label: string, signal: AbortSignal): Promise<"created" | "existed"> {
+      return asDeveloper(async (token) => {
+        const response = await deps.fetch(new URL(labelPath(repo), apiUrl), {
+          method: "POST",
+          headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "user-agent": "bb-plugin-github", "x-github-api-version": "2022-11-28", "content-type": "application/json" },
+          body: JSON.stringify({ name: label }),
+          signal,
+        });
+        if (response.ok) return "created";
+        const body: unknown = await response.json().catch(() => null);
+        if (response.status === 422 && labelAlreadyExists(body)) return "existed";
+        const message = body !== null && typeof body === "object" && typeof (body as { message?: unknown }).message === "string" ? (body as { message: string }).message : "";
+        throw new GitHubRequestError(`GitHub answered HTTP ${response.status}${message === "" ? "" : `: ${message}`}`, response.status);
       });
     }
 
@@ -556,6 +580,39 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           return { viewer, units: [], mine: [], error: errorMessage(error) };
         }
         return { viewer, units: checked, mine: [], error: null };
+      },
+
+      // The project's label in each repository, for onboarding. A repository
+      // that is not visible, or a label that is already there, is answered
+      // per unit rather than failing the call. The units are stewards'
+      // project config, which has already dropped `github.exclude`, so an
+      // excluded repository is never passed here.
+      async sourceEnsureLabel({ units, label }) {
+        const results: Array<{ unit: string; status: "created" | "existed" | "error"; error: string | null }> = [];
+        for (const unit of units) {
+          const repo = parseRepo(unit);
+          if (repo === null) {
+            results.push({ unit, status: "error", error: "not owner/repo" });
+            continue;
+          }
+          try {
+            const check = parseRepoCheck(await query(REPO_CHECK_QUERY, { ...repo, label }, checkSignal()));
+            if (!check.found) {
+              results.push({ unit, status: "error", error: "no such repository, or it is not visible to the signed-in GitHub user" });
+              continue;
+            }
+            if (check.labelFound) {
+              results.push({ unit, status: "existed", error: null });
+              continue;
+            }
+            // Use the parsed owner/name, not the raw unit: it is the canonical
+            // spelling the lookup already used.
+            results.push({ unit, status: await createLabel(`${repo.owner}/${repo.name}`, label, checkSignal()), error: null });
+          } catch (error) {
+            results.push({ unit, status: "error", error: errorMessage(error) });
+          }
+        }
+        return { results };
       },
 
       // Each repository is read oldest first up to the limit, so the oldest

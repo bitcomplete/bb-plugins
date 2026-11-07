@@ -95,11 +95,14 @@ lessons mechanism grows `.bb` from real decisions afterwards.
 ## 4. Validate and land
 
 ```sh
-bb stewards check
+bb stewards check --create-labels
 ```
 
-Fix every `problem:` line before going on. A problem is a fact about the
-project, not a warning to explain away.
+The flag creates the project's label in every Linear team and every
+non-excluded GitHub repo first, reporting each as created, existed or
+failed, so the label is not left as a by-hand step. Then fix every
+`problem:` line before going on; a `failed to create` line is one of them.
+A problem is a fact about the project, not a warning to explain away.
 
 Commit inside `.bb`, publish with `workspace_publish_guidance`, and open a
 pull request on the primary repo. The body lists **every assumption** you made

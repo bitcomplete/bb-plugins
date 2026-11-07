@@ -26,6 +26,19 @@ describe("source-contract.ts", () => {
     expect(isMissingPlugin(Object.assign(new Error("boom"), { code: "handler_error" }))).toBe(false);
   });
 
+  it("parses sourceEnsureLabel and its per-unit results", () => {
+    expect(sourceContract.sourceEnsureLabel.input.parse({ units: ["ENG", "acme/web"], label: "bb-managed" })).toEqual({ units: ["ENG", "acme/web"], label: "bb-managed" });
+    expect(sourceContract.sourceEnsureLabel.input.safeParse({ units: [""], label: "bb-managed" }).success).toBe(false);
+    expect(sourceContract.sourceEnsureLabel.output.parse({ results: [{ unit: "ENG", status: "created" }, { unit: "acme/web", status: "existed", error: null }, { unit: "acme/gone", status: "error", error: "no such repository" }] })).toEqual({
+      results: [
+        { unit: "ENG", status: "created", error: null },
+        { unit: "acme/web", status: "existed", error: null },
+        { unit: "acme/gone", status: "error", error: "no such repository" },
+      ],
+    });
+    expect(sourceContract.sourceEnsureLabel.output.safeParse({ results: [{ unit: "ENG", status: "failed" }] }).success).toBe(false);
+  });
+
   it("parses the deployment-read RPCs and the merge commit on the pull snapshot (BB-132)", () => {
     expect(sourceContract.sourceFileAtRef.input.parse({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" })).toEqual({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" });
     expect(sourceContract.sourceFileAtRef.input.safeParse({ repo: "", path: "x", ref: "main" }).success).toBe(false);
@@ -41,5 +54,39 @@ describe("source-contract.ts", () => {
     const pull = snapshotPullSchema.parse({ draft: false, merged: true, base: "main", head: "x", headSha: "h", headAuthor: null, reviewDecision: null, requestedReviewers: [], reviews: [], checks: null, mergeCommit: "m", files: ["a"] });
     expect(pull).toMatchObject({ mergeCommit: "m", files: ["a"] });
     expect(snapshotPullSchema.parse({ draft: false, merged: false, base: null, head: null, headSha: null, headAuthor: null, reviewDecision: null, requestedReviewers: [], reviews: [], checks: null })).toMatchObject({ mergeCommit: null, files: [] });
+  });
+
+  it("parses a GitHub issue snapshot whose state is a status label, with linked pulls (BB-232)", () => {
+    const snapshot = {
+      source: "github" as const,
+      kind: "issue" as const,
+      id: "acme/web#42",
+      key: "acme/web#42",
+      url: "https://github.com/acme/web/issues/42",
+      title: "Fix login",
+      // A status label is a label named `status:<phase>`; with exactly one, state is its name and stateType stays null.
+      state: "status:todo",
+      stateType: null,
+      unit: "acme/web",
+      labels: ["bb-managed", "status:todo"],
+      author: "dylan",
+      assignees: ["dylan"],
+      priority: null,
+      estimate: null,
+      description: "Users cannot log in.",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-02T00:00:00Z",
+      comments: [],
+      parent: null,
+      children: [],
+      linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }],
+      pull: null,
+      viewer: "dylan",
+    };
+    const parsed = sourceContract.sourceSnapshot.output.parse({ snapshot });
+    expect(parsed.snapshot).toMatchObject({ source: "github", kind: "issue", state: "status:todo", stateType: null, linkedPulls: [{ key: "acme/web#7" }] });
+    // With no status label the issue is open; closed carries its reason.
+    expect(sourceContract.sourceSnapshot.output.parse({ snapshot: { ...snapshot, state: "open", labels: ["bb-managed"] } }).snapshot).toMatchObject({ state: "open", stateType: null });
+    expect(sourceContract.sourceSnapshot.output.parse({ snapshot: { ...snapshot, state: "closed (not planned)" } }).snapshot).toMatchObject({ state: "closed (not planned)", stateType: null });
   });
 });

@@ -652,7 +652,7 @@ ready:
     - schema or data migration
     - public API or contract change
     - estimate >= 3
-  approval: project       # or user, or { linear-state: Approved }
+  approval: project       # or user, or { state: Approved }
 ```
 
 - **Specifying is done in comments.** In a `spec` stage the steward checks the

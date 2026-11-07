@@ -14,6 +14,21 @@ export const GRAPHQL_PATH = "/graphql";
 export const dependabotAlertsPath = (repo: string, state: string, perPage = 100): string => `/repos/${repo}/dependabot/alerts?state=${encodeURIComponent(state)}&per_page=${perPage}`;
 export const dependabotAlertPath = (repo: string, number: number): string => `/repos/${repo}/dependabot/alerts/${number}`;
 
+/** The create-label REST path for one repository. */
+export const labelPath = (repo: string): string => `/repos/${repo}/labels`;
+
+/**
+ * Whether a create-label response is GitHub's "this label already exists"
+ * (a 422), which an idempotent create reports as `existed` rather than an
+ * error.
+ */
+export function labelAlreadyExists(payload: unknown): boolean {
+  if (payload === null || typeof payload !== "object") return false;
+  const errors = (payload as { errors?: unknown }).errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((e) => e !== null && typeof e === "object" && (e as { code?: unknown }).code === "already_exists");
+}
+
 export class GitHubRequestError extends Error {
   constructor(
     message: string,
