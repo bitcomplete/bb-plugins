@@ -5971,6 +5971,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether a linked pull request belongs to a ticket binding rather than
+     * merely mentioning it (BB-239). A pull request cross-referenced in the
+     * ticket's timeline but belonging to another ticket's binding files no
+     * `approve-pr`/`merge` item and raises no approval escalation here; it
+     * stays in the wake as context. It belongs when a worker of the binding
+     * reported or opened it (`ownPulls`), or its head branch or title names
+     * the ticket: the worker branch convention `bb/<owner>-<repo>-<n>-…`, or
+     * the ticket named in the title (`(#<n>)` for a GitHub issue, the key
+     * `ENG-12`/`BB-239` for a Linear ticket). The closing set is not in the
+     * snapshot contract, so a closing pull request with neither a worker nor a
+     * naming branch or title is not recognized in this first cut (BB-239 spec).
+     */
+    function pullBelongsToTicket(b: Binding, pull: EntitySnapshot, ownPulls: ReadonlySet<string>): boolean {
+      const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      if (ownPulls.has(lc(pull.key)) || (pull.url !== null && ownPulls.has(lc(pull.url)))) return true;
+      const key = b.entityKey.trim();
+      const number = /(\d+)$/u.exec(key)?.[1] ?? null;
+      if (number === null) return false;
+      const slug = lc(key).replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "");
+      const head = lc(pull.pull?.head ?? "");
+      if (head !== "" && slug !== "" && new RegExp(`(?:^|[-/])${escape(slug)}(?:[-/]|$)`, "u").test(head)) return true;
+      const title = pull.title ?? "";
+      // A GitHub issue's worker titles its pull request with the issue number,
+      // and only a pull request in the issue's own repo counts (a different
+      // repo's #12 is not this ticket). A Linear ticket's title names the key
+      // (e.g. "… (ENG-12)"); `(#<n>)` there would be a GitHub number and could
+      // match another repo's pull request (BB-239 review round 1).
+      const repo = key.includes("#") ? key.slice(0, key.indexOf("#")) : "";
+      if (b.source === "github") return title.includes(`(#${number})`) && lc(pull.unit) === lc(repo);
+      return new RegExp(`(?:^|[^a-z0-9])${escape(lc(key))}(?:[^a-z0-9]|$)`, "u").test(lc(title));
+    }
+
+    /**
      * The schedule wake's pull request facts (BB-89): how many of a binding's
      * linked pull requests are open and how many merged, and whether its
      * steward has reported that no more are coming. Facts only; the wake draws
@@ -6141,8 +6174,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const config = await loadConfig(b.projectId);
       const decisions = config?.file.bigDecisions ?? [];
       const ownerLogin = config?.githubLogin ?? null;
+      // BB-239: the pull requests a worker of this binding opened or reported.
+      // A ticket's other linked pull requests (GitHub cross-references) only
+      // mention it and must not file gate items here.
+      const ownPulls = b.kind === "ticket" ? await ownPullKeys(b, store.workers(b.id), observed) : null;
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
+        if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
+          // The pull request belongs to another ticket's binding; close any
+          // item filed before this rule and leave it in the wake as context.
+          store.closeNeedByKey(b.id, "approve-pr", url, "The pull request belongs to another ticket.");
+          store.closeNeedByKey(b.id, "merge", url, "The pull request belongs to another ticket.");
+          const esc = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
+          if (esc !== null) store.resolve(esc.id, "The pull request belongs to another ticket.");
+          continue;
+        }
         const hadApprove = store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url);
         const { gate: g, closed, approvalRaised: raised } = await syncPullApproval(approvalsCtx, b, pull, decisions);
         if (raised) approvalRaised = true;

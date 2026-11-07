@@ -551,16 +551,16 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     const model = over.model === undefined ? "claude-opus-5-5" : over.model;
     const reasoningLevel = over.reasoningLevel === undefined ? "high" : over.reasoningLevel;
     const environmentProviderId = over.environmentProviderId === undefined ? "multi-repo-workspace" : over.environmentProviderId;
-    // The worker's workspace branch; the pull() fixture's head is "retry", so
-    // a worker owns it unless a test says otherwise (BB-52 rule 0).
-    const branchName = over.branchName === undefined ? "retry" : over.branchName;
+    // The worker's workspace branch; the pull() fixture's head names ENG-12
+    // (BB-239), so a worker owns it unless a test says otherwise (BB-52 rule 0).
+    const branchName = over.branchName === undefined ? "bb/eng-12-retry" : over.branchName;
     w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
   const createdOwned = async (id: string, owner: string, title = "Implement", sectionId: string | null = null) => {
-    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace", branchName: "retry" });
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace", branchName: "bb/eng-12-retry" });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code", sectionId }) });
     await flush();
   };
@@ -1791,10 +1791,10 @@ describe("scheduling overlapping work", () => {
     expect(toProject()).toHaveLength(1);
     const wake = toProject()[0]!.text;
     expect(wake).toMatch(/^# Project steward: scheduling requested for ENG-13/u);
-    expect(wake).toMatch(/from ENG-13 \(schedule\): Schedule ENG-13 \(Add SSO\)\? Its ready gate has passed, and it overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry\. The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update \{ binding: "ENG-13", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" \}; when it has no pull request yet, steward_update \{ binding: "ENG-13", hold: "<why>", stack: \["ENG-12"\] \}/u);
+    expect(wake).toMatch(/from ENG-13 \(schedule\): Schedule ENG-13 \(Add SSO\)\? Its ready gate has passed, and it overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on bb\/eng-12-retry\. The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update \{ binding: "ENG-13", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" \}; when it has no pull request yet, steward_update \{ binding: "ENG-13", hold: "<why>", stack: \["ENG-12"\] \}/u);
     expect(wake).toMatch(/A schedule escalation is the plugin's/u);
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): .*\[touches web\/src\/login\]/u);
-    expect(wake).toMatch(/- ENG-13 \(ticket, Todo\): .*\[touches web\/src; file-level overlap: ENG-12 on web\/src\/login \(its pull request acme\/web#7 is open on retry\); 1 escalation\(s\): schedule→project\]/u);
+    expect(wake).toMatch(/- ENG-13 \(ticket, Todo\): .*\[touches web\/src; file-level overlap: ENG-12 on web\/src\/login \(its pull request acme\/web#7 is open on bb\/eng-12-retry\); 1 escalation\(s\): schedule→project\]/u);
     const id = /(esc_[\w-]+) from ENG-13 \(schedule\)/u.exec(wake)![1]!;
 
     // Asked once, however often the steward reports; its own wake carries the overlap and the wait.
@@ -1855,7 +1855,7 @@ describe("scheduling overlapping work", () => {
     await t.tool("steward_report", { ...building, touches: ["web/src/audit"] }, third);
     await t.tool("steward_report", ready, second);
     expect(toProject()).toHaveLength(2);
-    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13 \(Add SSO\)\? .* overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on retry; ENG-14 \(In Progress; 0 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/audit\. The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update \{ binding: "ENG-13", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" \}; when it has no pull request yet, steward_update \{ binding: "ENG-13", hold: "<why>", stack: \["ENG-12", "ENG-14"\] \}/u);
+    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13 \(Add SSO\)\? .* overlaps at file level with what is already being changed by ENG-12 \(In Progress; 1 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/login; its pull request acme\/web#7 is open on bb\/eng-12-retry; ENG-14 \(In Progress; 0 open, 0 merged, no more pull requests: not reported\) on the overlapping files web\/src\/audit\. The default is to stack it, not to wait for the merge: when the earlier pull request is open, steward_update \{ binding: "ENG-13", guidance: "Start now, branch from <its head branch> with that branch as PR base", resolve: "<this escalation>" \}; when it has no pull request yet, steward_update \{ binding: "ENG-13", hold: "<why>", stack: \["ENG-12", "ENG-14"\] \}/u);
 
     // Held behind both; ENG-14 is canceled, ENG-12 ends: the hold lifts when the last one goes.
     await t.tool("steward_update", { binding: "ENG-13", hold: "After the login and audit work", behind: ["ENG-12", "ENG-14"] }, project);
@@ -3070,7 +3070,7 @@ describe("pull requests", () => {
     const before = t.sends.filter((s) => s.threadId === steward).length;
     const head = "aaaaaaa1";
     const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
-    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the owner.", actor: "user" }, steward);
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeDefined();
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
@@ -3085,7 +3085,7 @@ describe("pull requests", () => {
     const b = t.hooks.store.find("ENG-12")!;
     const before = t.sends.filter((s) => s.threadId === steward).length;
     const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=changes-requested lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
-    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the worker.", actor: "other" }, steward);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
@@ -3100,7 +3100,7 @@ describe("pull requests", () => {
     const b = t.hooks.store.find("ENG-12")!;
     const before = t.sends.filter((s) => s.threadId === steward).length;
     const plain = comment({ id: "c9", author: "sam", body: "Looks good to me.", createdAt: "2026-10-14T16:00:00Z" });
-    t.entities.set("acme/web#7", pull({ author: "sam", comments: [plain] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [plain] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.tool("steward_report", { phase: "Review", summary: "A comment landed.", nextAction: "Wait.", actor: "other" }, steward);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
@@ -3114,7 +3114,7 @@ describe("pull requests", () => {
     const steward = t.spawns[1]!.id;
     const b = t.hooks.store.find("ENG-12")!;
     const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
-    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the owner.", actor: "user" }, steward);
     expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "approve-pr")).toHaveLength(1);
     // The doorbell reconcile that follows syncs the same marker again.
@@ -3129,11 +3129,11 @@ describe("pull requests", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     const b = t.hooks.store.find("ENG-12")!;
-    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "bb/eng-12-retry" });
     await t.idle("thr_w1", "Waiting on the reviewer.");
     const before = t.sends.filter((s) => s.threadId === steward).length;
     const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
-    t.entities.set("acme/web#7", pull({ author: "jane", comments: [marker] }, { headAuthor: "jane", checks: { state: "success", failing: [] }, reviews: [{ author: "jane", state: "commented", submittedAt: "2026-10-14T16:00:00Z", commit: "aaaaaaa1" }] }));
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [marker] }, { head: "bb/eng-12-retry", headAuthor: "jane", checks: { state: "success", failing: [] }, reviews: [{ author: "jane", state: "commented", submittedAt: "2026-10-14T16:00:00Z", commit: "aaaaaaa1" }] }));
     await t.ring("github", "acme/web#7");
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeDefined();
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
@@ -5948,7 +5948,9 @@ describe("needs you items", () => {
   async function withPull(comments: ReturnType<typeof comment>[], pullOver: Record<string, unknown> = {}, entityOver: Record<string, unknown> = {}) {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
-    t.entities.set("acme/web#7", pull({ comments, ...entityOver }, { checks: { state: "success", failing: [] }, ...pullOver }));
+    // The worker branch convention names the ticket, so the linked pull
+    // belongs to it rather than merely mentioning it (BB-239).
+    t.entities.set("acme/web#7", pull({ comments, ...entityOver }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] }, ...pullOver }));
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     return { ...t, project, steward, binding: () => t.hooks.store.find("ENG-12")! };
@@ -7348,6 +7350,114 @@ describe("needs you items", () => {
     expect(out.error).toBe(false);
     expect(out.text).toMatch(new RegExp(`Approval of acme/web#7 is requested from the user, on the Stewards page \\(${need.id}\\)`));
     expect(out.text).not.toMatch(/Approval of the spec is requested/u);
+  });
+
+  // BB-239: a linked pull request that only mentions the ticket (a GitHub
+  // cross-reference) files no gate item on this binding; one PR carries one
+  // set of items, on the binding whose worker opened it.
+  it("BB-239: a mentioned-only linked pull request files no gate item, while the ticket's own does", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/web#8", url: "https://github.com/acme/web/pull/8" },
+    ] }));
+    // #7 only mentions ENG-12: neither its branch nor its title names the
+    // ticket, so its gate items belong to the binding that owns it.
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Related to the login work", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    // #8 follows the worker branch convention for ENG-12 and belongs to it.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Fix login", comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "merge").map((n) => n.url)).toEqual(["https://github.com/acme/web/pull/8"]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === "https://github.com/acme/web/pull/7")).toBe(false);
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "approval" && x.url === "https://github.com/acme/web/pull/7")).toBe(false);
+  });
+
+  it("BB-239: closes items and an escalation already filed for a non-belonging pull request", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Related to the login work", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const url = "https://github.com/acme/web/pull/7";
+    const merge = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url, what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+    const approve = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url, what: "Approve acme/web#7 on GitHub", how: null, filedBy: "plugin" });
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve acme/web#7", meanwhile: "Wait.", route: "user", recommendation: null, resolutionKind: "approve-decline", url, headSha: "aaaaaaa1", projectId: "p1" });
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.need(merge.id)!.status).toBe("done");
+    expect(t.hooks.store.need(merge.id)!.resolution).toBe("The pull request belongs to another ticket.");
+    expect(t.hooks.store.need(approve.id)!.status).toBe("done");
+    expect(t.hooks.store.need(approve.id)!.resolution).toBe("The pull request belongs to another ticket.");
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+    expect(t.hooks.store.escalation(esc.id)!.resolution).toBe("The pull request belongs to another ticket.");
+  });
+
+  it("BB-239: a pull request that names one ticket files its items only there, not on a ticket that cross-references it", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ ...linked }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", ...linked }));
+    // #7 belongs to ENG-12 by branch and title, and merely mentions ENG-13.
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (#12)", comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const a = t.hooks.store.find("ENG-12")!;
+    const b = t.hooks.store.find("ENG-13")!;
+    expect(t.hooks.store.openNeeds(a.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "approval")).toBe(false);
+  });
+
+  // Each belonging rule in isolation, so a future change that drops one is
+  // caught (BB-239 review round 1).
+  it("BB-239: a worker's branch owns a pull request on that head even when the branch does not name the ticket", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", comments: [marker, owner] }, { head: "retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "retry" });
+    t.hooks.store.setWorker("thr_w1", "stopped", null);
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+  });
+
+  it("BB-239: a worker's final message that names the pull request owns it on a foreign branch", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "retry" });
+    t.hooks.store.setWorker("thr_w1", "stopped", "Opened https://github.com/acme/web/pull/7 for review.");
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+  });
+
+  it("BB-239: a title that names the ticket owns the pull request on a foreign branch", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+  });
+
+  it("BB-239: a GitHub issue's title number owns only a pull request in the issue's repo", async () => {
+    const t = await setup();
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", linkedPulls: [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/other#14", url: "https://github.com/acme/other/pull/14" },
+    ] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", unit: "acme/web", title: "Fix login (#14)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/other#14", pull({ id: "acme/other#14", key: "acme/other#14", url: "https://github.com/acme/other/pull/14", unit: "acme/other", title: "Fix login (#14)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#14");
+    const b = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "merge").map((n) => n.url)).toEqual(["https://github.com/acme/web/pull/7"]);
   });
 });
 
@@ -11802,7 +11912,9 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const t = await setup();
     if (over.project !== undefined) t.files[PROJECT_FILE] = JSON.stringify(over.project);
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key, url: `https://github.com/${repo}/pull/${number}` }] }));
-    t.entities.set(key, pull({ id: key, key, url: `https://github.com/${repo}/pull/${number}`, unit: repo, comments, ...over.entityOver }, { checks: { state: "success", failing: [] }, ...over.pullOver }));
+    // The worker branch convention names the ticket, so the linked pull
+    // belongs to it rather than merely mentioning it (BB-239).
+    t.entities.set(key, pull({ id: key, key, url: `https://github.com/${repo}/pull/${number}`, unit: repo, comments, ...over.entityOver }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] }, ...over.pullOver }));
     if (over.files !== undefined) t.githubFiles.set(key, over.files);
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
@@ -12315,7 +12427,7 @@ describe("mechanical status and quiet notes (BB-203)", () => {
   async function withPull(comments: ReturnType<typeof comment>[] = [marker]) {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
-    t.entities.set("acme/web#7", pull({ comments }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ comments }, { head: "bb/eng-12-retry", headAuthor: "jane", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     return { ...t, project, steward, binding: () => t.hooks.store.find("ENG-12")!, stewardSends: () => t.sends.filter((s) => s.threadId === steward).length };
