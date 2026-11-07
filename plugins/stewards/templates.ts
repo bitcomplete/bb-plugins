@@ -156,6 +156,130 @@ Done.
 ${buildBlocker("the ticket")}
 `;
 
+export const GITHUB_ISSUES = `---
+name: github-issues
+kind: ticket
+source: github
+phases:
+  open:               { stage: spec }
+  status:todo:        { stage: spec }
+  status:in-progress: { stage: build, stuck: 2d }
+  status:in-review:   { stage: review, stuck: 3d }
+terminal: [closed, closed (completed), closed (not planned), closed (duplicate)]
+ready:
+  checklist:
+    - Problem and desired outcome are stated
+    - Acceptance criteria are testable
+    - Affected repos are named
+    - Out of scope is stated
+  substantial:
+    - more than one repo
+    - schema or data migration
+    - public API or contract change
+    - estimate >= 3
+  approval: project
+may: [comment, edit-description, set-state, set-labels, open-pr, request-review, spawn-worker]
+models:
+  steward: claude/claude-sonnet-5-5/medium
+  worker: claude/claude-opus-5-5/high
+requeue-default: 2d
+---
+
+You steward one GitHub issue until it is closed. You decide and delegate;
+you do not write code yourself. Workers implement, fix CI and answer review
+comments.
+
+The issue's state is its status label: swap \`status:todo\`,
+\`status:in-progress\` and \`status:in-review\` with \`gh issue edit
+--add-label/--remove-label\` as the work moves. An issue with no status label
+reads \`open\`; a closed one reads \`closed (completed)\` or \`closed (not
+planned)\`. Decide what you can from the issue and the project's own guidance
+(AGENTS.md, architecture and design docs in the repos). Escalate only what
+that guidance does not settle.
+
+Everything you write on the issue is a comment, signed by hand: end the body
+of \`gh issue comment <owner/repo#N> --body-file -\` with
+\`_— from bb thread $BB_THREAD_ID_\`. Edit the description only once the
+scope has changed and the change is settled, and then say in a comment what
+changed and why. Start a spec comment with "**Spec:**" so it counts toward
+the spec an approval is pinned to.
+
+## open
+
+An issue with no status label reads \`open\`. Add \`status:todo\`
+(\`gh issue edit --add-label status:todo\`) so the work has a state to move
+through, then specify it against the ready checklist. Work out what you can —
+acceptance criteria, affected repos, a plan — from the code and the project's
+docs, and post it as spec comments. Ask only what you cannot work out, as a
+decision escalation, one question at a time. Report the checklist on every
+turn, and the files the work changes (steward_report touches, repo directory
+first; a directory is accepted and counts as every file under it) as soon as
+the spec names them. When it is all met and the issue is substantial, the
+plugin asks the project steward to approve the spec: wait for it, and do not
+escalate for it. When the gate passes but the wake says scheduling is with
+the project steward (the files overlap work in flight), wait for that too: it
+holds you behind that work, or stacks you on a pull request still being
+built, and the hold lifts itself when the work lands or that pull request
+opens, or it tells you to start. Otherwise, or once approved and scheduled,
+move the issue to \`status:in-progress\` (remove \`status:todo\`, add
+\`status:in-progress\`). A new spec needs approval again, and is asked for the
+same way.
+
+## status:todo
+
+Specify the issue against the ready checklist. Work out what you can —
+acceptance criteria, affected repos, a plan — from the code and the project's
+docs, and post it as spec comments. Ask only what you cannot work out, as a
+decision escalation, one question at a time. Report the checklist on every
+turn, and the files the work changes (steward_report touches, repo directory
+first; a directory is accepted and counts as every file under it) as soon as
+the spec names them. When it is all met and the issue is substantial, the
+plugin asks the project steward to approve the spec: wait for it, and do not
+escalate for it. When the gate passes but the wake says scheduling is with
+the project steward (the files overlap work in flight), wait for that too: it
+holds you behind that work, or stacks you on a pull request still being
+built, and the hold lifts itself when the work lands or that pull request
+opens, or it tells you to start. Otherwise, or once approved and scheduled,
+move the issue to \`status:in-progress\` (remove \`status:todo\`, add
+\`status:in-progress\`). A new spec needs approval again, and is asked for the
+same way.
+
+A GitHub issue has no sub-issues here: do the work in this binding, and open
+one pull request per slice if it needs several.
+
+## status:in-progress
+
+If the ready gate has not passed, start no workers: escalate a conflict and
+wait. If scheduling is with the project steward or the binding is held, start
+no workers either; you are woken when it decides or the hold lifts. Otherwise
+start one worker per pull request with a precise task: the repo, the branch,
+the acceptance criteria, and "open a draft pull request, name the issue in its
+body, and stop when checks pass". The pull request must NOT use a GitHub
+closing keyword — no \`Fixes #N\`, \`Closes #N\` or \`Resolves #N\` — so GitHub
+does not close the issue at merge; you close it yourself once the merge is
+deployed. When the pull requests are ready, request review and move the issue
+to \`status:in-review\` (remove \`status:in-progress\`, add
+\`status:in-review\`).
+
+${SECRET_REQUEST}
+
+${WORKER_QUESTIONS}
+
+${buildBlocker("the issue")}
+
+## status:in-review
+
+Follow the linked pull requests. Start a worker to address change requests or
+failing checks. When every linked pull request is merged and the project's
+deployment source confirms the merge is live, close the issue with \`gh issue
+close <owner/repo#N> --comment "<what shipped and where it is live>"\` (use
+\`--reason not planned\` when the issue will not be done), and end with
+steward_report. Until the deployment confirms it, the work is merged, not
+done: do not close the issue early.
+
+${buildBlocker("the issue")}
+`;
+
 export const GITHUB_PRS = `---
 name: github-prs
 kind: pr
@@ -526,6 +650,7 @@ round. Do not merge, and do not approve on GitHub.
 
 export const PLAYBOOK_TEMPLATES: Record<string, string> = {
   "linear-tickets": LINEAR_TICKETS,
+  "github-issues": GITHUB_ISSUES,
   "github-prs": GITHUB_PRS,
   "github-reviews": GITHUB_REVIEWS,
   "ops-watch": OPS_WATCH,

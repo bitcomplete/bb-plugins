@@ -100,7 +100,10 @@ bb stewards check --create-labels
 
 The flag creates the project's label in every Linear team and every
 non-excluded GitHub repo first, reporting each as created, existed or
-failed, so the label is not left as a by-hand step. Then fix every
+failed, so the label is not left as a by-hand step. For a `github-issues`
+ticket playbook it also creates each status label the playbook names
+(`status:todo`, `status:in-progress`, …) in every repo, since a GitHub
+issue's state is a label. Then fix every
 `problem:` line before going on; a `failed to create` line is one of them.
 A problem is a fact about the project, not a warning to explain away.
 

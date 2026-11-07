@@ -3,6 +3,7 @@ import {
   bindingRoles,
   DEPENDENCY_BOTS,
   depsTargets,
+  githubStateLabels,
   isTerminal,
   k8sTargets,
   legacyOpsPresent,
@@ -14,6 +15,7 @@ import {
   parseRolesFile,
   phaseInstructions,
   phaseOf,
+  playbookNameFor,
   playbookStates,
   projectStewardProblem,
   pullWatchId,
@@ -32,7 +34,7 @@ import {
   usesKind,
   watchProblems,
 } from "./config.js";
-import { DEPS_ALERTS, DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
+import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
   it("parses the template with defaults filled in", () => {
@@ -424,7 +426,7 @@ describe("playbooks", () => {
   it("refuses what would misbehave", () => {
     expect(parsePlaybook("no front matter", "x")).toMatchObject({ ok: false });
     expect(parsePlaybook(LINEAR_TICKETS, "other-name")).toMatchObject({ ok: false });
-    const wrongSource = LINEAR_TICKETS.replace("source: linear", "source: github");
+    const wrongSource = LINEAR_TICKETS.replace("source: linear", "source: k8s");
     expect(parsePlaybook(wrongSource, "linear-tickets")).toMatchObject({ ok: false });
     const noGate = LINEAR_TICKETS.replace(/ready:[\s\S]*?approval: project\n/u, "");
     const r = parsePlaybook(noGate, "linear-tickets");
@@ -459,6 +461,44 @@ describe("the ops playbook", () => {
     const noPhases = GITHUB_PRS.replace(/phases:\n(?: {2}.*\n)+/u, "");
     expect(noPhases).not.toMatch(/phases:/u);
     expect(parsePlaybook(noPhases, "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/phases: map the entity's states to stages/u) });
+  });
+});
+
+// BB-234: a project may carry both ticket playbooks, chosen by source; a
+// GitHub issue's state is a status label, so only label states are validated.
+describe("the GitHub issue playbook (BB-234)", () => {
+  it("parses as a github ticket playbook with label phases and derived closed states", () => {
+    const parsed = parsePlaybook(GITHUB_ISSUES, "github-issues");
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value).toMatchObject({ kind: "ticket", source: "github" });
+    expect(Object.keys(parsed.value.phases)).toEqual(["open", "status:todo", "status:in-progress", "status:in-review"]);
+    expect(parsed.value.terminal).toEqual(["closed", "closed (completed)", "closed (not planned)", "closed (duplicate)"]);
+    // No sub-issue handling: create-sub-issue is not in `may`, and there is no promote rule.
+    expect(parsed.value.may).not.toContain("create-sub-issue");
+    expect(parsed.value.promote).toBeNull();
+    expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/gh issue\s+close/u);
+    expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
+    expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");
+  });
+
+  it("returns only the label states to validate and create, not GitHub's derived states", () => {
+    const parsed = parsePlaybook(GITHUB_ISSUES, "github-issues");
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(playbookStates(parsed.value)).toContain("closed (completed)");
+    expect(githubStateLabels(parsed.value)).toEqual(["status:todo", "status:in-progress", "status:in-review"]);
+  });
+
+  it("defaults a no-teams project's ticket playbook to github-issues and keeps linear-tickets otherwise", () => {
+    const noTeams = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: [] } }));
+    if (!noTeams.ok) throw new Error(noTeams.error);
+    expect(playbookNameFor(noTeams.value, "ticket")).toBe("github-issues");
+    const teams = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] } }));
+    if (!teams.ok) throw new Error(teams.error);
+    expect(playbookNameFor(teams.value, "ticket")).toBe("linear-tickets");
+    // An explicit playbook still wins.
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, playbooks: { ticket: "my-tickets" } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(playbookNameFor(explicit.value, "ticket")).toBe("my-tickets");
   });
 });
 

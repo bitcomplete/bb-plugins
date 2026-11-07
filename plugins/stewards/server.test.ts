@@ -3,14 +3,14 @@ import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadRe
 import { describe, expect, it } from "vitest";
 import { PROJECT_CHANGED } from "./channels.js";
 import { PROJECT_FILE, ROLES_FILE, playbookPath } from "./config.js";
-import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
+import { comment, crashingPod, githubIssue, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
 import { createStewardsPlugin, needActions, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, sourceContract, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
+import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { STANDING_RULES } from "./wake.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
@@ -38,6 +38,8 @@ function world() {
   let searchError: string | null = null;
   /** The login `sourceValidate` reports, per source; tests override one to make it unreadable (BB-105). */
   const viewers: Partial<Record<"linear" | "github", string | null>> = {};
+  /** The Linear teams `sourceValidate` reports as the viewer's, for `init` with no `--teams` (BB-234). */
+  let linearMine: Array<{ unit: string; name: string }> = [{ unit: "ENG", name: "Engineering" }];
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
   const sourceDeployments = new Map<string, unknown[]>();
   /** Files the fake github serves, by `lowercased repo path ref` (BB-132). */
@@ -210,7 +212,7 @@ function world() {
       sourceContract.sourceValidate.input.parse(input);
       const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
       const viewer = source in viewers ? viewers[source]! : "Jane";
-      out = { viewer, units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: [{ unit: "ENG", name: "Engineering" }], error: null };
+      out = { viewer, units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: args.pluginId === SOURCE_PLUGIN_IDS.github ? [] : linearMine, error: null };
     } else if (args.method === "sourceEnsureLabel") {
       // The real plugins validate the input and create idempotently; the fake
       // remembers what it created so a second run is `existed` (BB-236).
@@ -223,10 +225,11 @@ function world() {
       out = {
         results: units.map((unit) => {
           const key = `${source}:${unit.toLowerCase()}`;
+          const ensuredKey = `${key}:${String(input.label).toLowerCase()}`;
           const failure = labelEnsureFailures.get(key);
           if (failure !== undefined) return { unit, status: "error", error: failure };
-          if (labelsEnsured.has(key)) return { unit, status: "existed", error: null };
-          labelsEnsured.add(key);
+          if (labelsEnsured.has(ensuredKey)) return { unit, status: "existed", error: null };
+          labelsEnsured.add(ensuredKey);
           return { unit, status: "created", error: null };
         }),
       };
@@ -441,7 +444,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, viewers, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -3237,6 +3240,234 @@ describe("check --create-labels (BB-236)", () => {
     expect(check.exitCode).toBe(1);
     expect(check.stdout).toContain("problem: linear: could not create label bb-managed: the source is on fire");
     expect(check.stdout).not.toContain("unavailable");
+  });
+});
+
+// BB-234: a labelled GitHub issue assigned to this server's GitHub login gets a
+// ticket steward that follows a `source: github` playbook, with the same
+// ownership and release rules as a Linear ticket.
+describe("a GitHub issue ticket steward (BB-234)", () => {
+  const problemsOf = async (t: Awaited<ReturnType<typeof setup>>): Promise<string[]> => {
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ problems: string[] }> };
+    return overview.projects[0]!.problems;
+  };
+
+  it("adopts a labelled issue assigned to this server's GitHub login, and none assigned elsewhere or unlabelled", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    // Assigned to another login: adopted nowhere here.
+    t.entities.set("acme/web#12", githubIssue({ assignees: ["sam"] }));
+    await t.ring("github", "acme/web#12");
+    expect(await t.list()).toEqual([]);
+    // Labelled but assigned to nobody: adopted nowhere.
+    t.entities.set("acme/web#13", githubIssue({ id: "acme/web#13", key: "acme/web#13", assignees: [] }));
+    await t.ring("github", "acme/web#13");
+    expect(await t.list()).toEqual([]);
+    // Labelled but not `bb-managed`: adopted nowhere.
+    t.entities.set("acme/web#15", githubIssue({ id: "acme/web#15", key: "acme/web#15", labels: ["status:todo"] }));
+    await t.ring("github", "acme/web#15");
+    expect(await t.list()).toEqual([]);
+    // Labelled and assigned to me: a ticket, under the github-issues playbook.
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    expect(await t.list()).toMatchObject([{ key: "acme/web#14", kind: "ticket" }]);
+    const b = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(b).toMatchObject({ source: "github", playbook: "github-issues", endedAt: null });
+    // The wake names the source and the playbook, so the steward knows which
+    // system it acts in.
+    const steward = t.spawns.find((s) => String(s.title).startsWith("acme/web#14"))!;
+    expect(String(steward.prompt)).toMatch(/playbook github-issues@/u);
+    expect(String(steward.prompt)).toMatch(/ticket \(GitHub\)/u);
+  });
+
+  it("selects the ticket playbook by source when a project carries both", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const config = await t.hooks.loadConfig("p1", true);
+    expect(config!.ticketPlaybooks.linear!.name).toBe("linear-tickets");
+    expect(config!.ticketPlaybooks.github!.name).toBe("github-issues");
+    expect((await t.list()).map((b) => b.key).sort()).toEqual(["ENG-12", "acme/web#14"].sort());
+  });
+
+  it("approves the ready gate on a GitHub label state and names the source in the change", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES.replace("approval: project", 'approval: { state: "status:approved" }');
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const steward = t.hooks.store.find("acme/web#14", "p1")!.threadId!;
+    // Move the issue to the approval label: the gate approves on the state.
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", state: "status:approved", labels: ["bb-managed", "status:approved"] }));
+    await t.ring("github", "acme/web#14");
+    const b = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(b.ready.approval).not.toBeNull();
+    expect(b.ready.approval!.by).toBe("github");
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Approved in GitHub \(now status:approved\)/u);
+  });
+
+  it("releases an adopted issue on reassignment or unassignment with one stop turn, leaving labels alone", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const steward = t.hooks.store.find("acme/web#14", "p1")!.threadId!;
+
+    // Reassigning away releases it with one stop turn; the label stays.
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", assignees: ["sam"] }));
+    await t.ring("github", "acme/web#14");
+    const released = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(released.ending).toBe("reassigned");
+    expect(released.lastSnapshot!.entity.labels).toContain("bb-managed");
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/assignee no longer includes this server's login/u);
+    await t.idle(steward);
+    const ended = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(ended.endedAt).not.toBeNull();
+    expect(ended.endReason).toBe("reassigned");
+  });
+
+  it("releases an unassigned issue too", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const steward = t.hooks.store.find("acme/web#14", "p1")!.threadId!;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", assignees: [] }));
+    await t.ring("github", "acme/web#14");
+    expect(t.hooks.store.find("acme/web#14", "p1")!.ending).toBe("reassigned");
+    await t.idle(steward);
+    expect(t.hooks.store.find("acme/web#14", "p1")!.endedAt).not.toBeNull();
+  });
+
+  it("keeps the binding when the read that carries the assignee set fails", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const before = t.hooks.store.find("acme/web#14", "p1")!;
+    // The issue now names Sam, but the read fails: keep it and retry later.
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", assignees: ["sam"] }));
+    t.setSnapshotError("acme/web#14", true);
+    await t.ring("github", "acme/web#14");
+    const after = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(after.ending).toBeNull();
+    expect(after.endedAt).toBeNull();
+    expect(after.threadId).toBe(before.threadId);
+    // The next successful read releases it.
+    t.setSnapshotError("acme/web#14", false);
+    await t.ring("github", "acme/web#14");
+    expect(t.hooks.store.find("acme/web#14", "p1")!.ending).toBe("reassigned");
+  });
+
+  it("adopts nothing and shows one problem line when the GitHub login cannot be read", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.viewers.github = null;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    expect(await t.list()).toEqual([]);
+    expect((await problemsOf(t)).filter((p) => p.includes("GitHub login cannot be read"))).toHaveLength(1);
+  });
+
+  it("passes check for a project with repos and no Linear teams, validating the GitHub playbook's labels", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    // The Linear plugin need not be connected: a GitHub-only project does not
+    // read the Linear login at all.
+    t.viewers.linear = null;
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.stdout).not.toMatch(/Linear login/u);
+    expect(check.stdout).toMatch(/github-issues@/u);
+    // The GitHub ticket playbook's label states are validated as labels.
+    const validate = t.rpcCalls.filter((c) => c.method === "sourceValidate" && c.pluginId === "github-watcher").at(-1);
+    expect(validate?.input).toMatchObject({ units: ["acme/web", "acme/bb"], states: ["status:todo", "status:in-progress", "status:in-review"] });
+  });
+
+  it("creates each GitHub ticket status label in every repo with check --create-labels", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).toContain("created label status:todo in github repo acme/web");
+    expect(check.stdout).toContain("created label status:in-progress in github repo acme/bb");
+    expect(check.stdout).toContain("created label status:in-review in github repo acme/web");
+    expect(t.labelEnsureCalls).toEqual([
+      { source: "github", units: ["acme/web", "acme/bb"], label: "bb-managed" },
+      { source: "github", units: ["acme/web", "acme/bb"], label: "status:todo" },
+      { source: "github", units: ["acme/web", "acme/bb"], label: "status:in-progress" },
+      { source: "github", units: ["acme/web", "acme/bb"], label: "status:in-review" },
+    ]);
+  });
+
+  it("writes github-issues from init when the project has no Linear teams, and not when it has", async () => {
+    const withTeams = await setup();
+    delete withTeams.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete withTeams.files[playbookPath(name)];
+    await withTeams.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect([...withTeams.writtenContent.keys()].some((p) => p.endsWith(playbookPath("github-issues")))).toBe(false);
+
+    const noTeams = await setup();
+    noTeams.setLinearMine([]);
+    delete noTeams.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete noTeams.files[playbookPath(name)];
+    await noTeams.harness.behavior.runCli(["init"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect([...noTeams.writtenContent.keys()].some((p) => p.endsWith(playbookPath("github-issues")))).toBe(true);
+    // Apply what init wrote and check the no-teams project passes.
+    for (const [path, content] of noTeams.writtenContent) {
+      if (path.startsWith("/w/.bb/")) noTeams.files[path.slice("/w/.bb/".length)] = content;
+    }
+    const check = await noTeams.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.exitCode).toBe(0);
+  });
+
+  it("passes check for a no-teams project that carries only linear-tickets", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    // No github-issues file: linear-tickets is the only ticket playbook, and
+    // an existing project like this must keep passing check (BB-234 review).
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.stdout).toMatch(/ticket: linear-tickets@/u);
+    expect(check.stdout).not.toMatch(/github-issues\.md does not exist/u);
+  });
+
+  it("gates a spec approval on the binding's own source playbook", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    // linear-tickets stays approval: project; github-issues reserves its spec for the user.
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES.replace("approval: project", "approval: user");
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14" }));
+    await t.ring("github", "acme/web#14");
+    const project = t.hooks.store.project("p1").threadId!;
+    // The project steward must not approve a GitHub spec its own playbook gives to the user.
+    const denied = await t.tool("steward_update", { binding: "acme/web#14", approve: true }, project);
+    expect(denied.error).toBe(true);
+    expect(denied.text).toMatch(/approved by the user/u);
+    // The same project steward still approves a Linear ticket under linear-tickets.
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const ok = await t.tool("steward_update", { binding: "ENG-12", approve: true }, project);
+    expect(ok.error).toBe(false);
+  });
+
+  it("adopts an issue with no status label into the open phase and tells it to add status:todo", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", state: "open", labels: ["bb-managed"] }));
+    await t.ring("github", "acme/web#14");
+    const b = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(b).toMatchObject({ phase: "open", stage: "spec" });
+    const prompt = String(t.spawns.find((s) => String(s.title).startsWith("acme/web#14"))!.prompt);
+    expect(prompt).toMatch(/### open/u);
+    expect(prompt).toMatch(/Add `status:todo`/u);
   });
 });
 

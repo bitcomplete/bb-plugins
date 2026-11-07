@@ -199,9 +199,10 @@ export const entitySnapshotSchema = z.object({
   title: z.string().nullable(),
   /**
    * The name a playbook keys its phases on. Linear: the workflow state's name.
-   * GitHub: for a pull request, open, draft, merged or closed; for an issue, a
-   * status label -- a label named `status:<phase>` -- when the issue carries
-   * exactly one, else `open` or `closed (reason)`. The label's name is the
+   * GitHub: for a pull request, open, draft, merged or closed; for an issue,
+   * `closed` or `closed (reason)` when it is closed, else the one label named
+   * `status:<phase>` when it carries exactly one, else `open`. A closed issue
+   * is closed whatever status label it still carries. The label's name is the
    * state, so an issue playbook keys its phases on `status:todo` and the like.
    */
   state: z.string(),
