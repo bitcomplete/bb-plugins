@@ -240,8 +240,8 @@ The canonical `.bb` checkout is outside the agent's sandbox, so the write is
 inverted: the plugin's host entry does it. **Every committed `.bb` write goes
 through one publish step**, by the project's `publish` policy (see
 `repos.json` above). The Repos panel, `bb repos add`/`remove`/base-branch,
-`workspace_add_repo`/`workspace_remove_repo`, the raw `repos.json` editor, the
-discovery seed and `mergeGuidance` all call it.
+`workspace_add_repo`/`workspace_remove_repo`, the raw `repos.json` editor and
+`mergeGuidance` all call it.
 
 - **`push`** writes and commits on the canonical checkout's default branch and
   pushes it to `origin` at once. The change is live everywhere immediately.

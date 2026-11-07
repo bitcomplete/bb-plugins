@@ -64,7 +64,7 @@ It is the **wrong** place for anything specific to one thread.
 
 **Every committed `.bb` write is published by the project's policy.** The
 Repos panel, `bb repos add`/`remove`, `workspace_add_repo`, the raw
-`repos.json` editor, the discovery seed and `mergeGuidance` all go through the
+`repos.json` editor and `mergeGuidance` all go through the
 same step, so a change never stays on one server. A failed push or pull
 request keeps the local commit and is reported on the panel, the CLI and the
 tool result; nothing force-pushes or resets the default branch.

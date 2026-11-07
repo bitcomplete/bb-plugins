@@ -790,9 +790,10 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   /**
    * Every git checkout bb knows about on one machine.
    *
-   * Feeds two things: the object cache's local-mirror step, and the repo-set
-   * proposal for a project that has none. Failure is never fatal — the worst
-   * case is a cold network clone, which is what would have happened anyway.
+   * Feeds the object cache's local-mirror step and the Repos panel's
+   * suggestions, never the repo set itself: nothing here is written to
+   * `repos.json`. Failure is never fatal — the worst case is a cold network
+   * clone, which is what would have happened anyway.
    */
   async function localCheckouts(
     hostId: string,
@@ -903,26 +904,23 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           };
         }
 
-        // An empty `repos.json` in a primary project is a complete definition:
-        // the workspace is the primary and nothing else, so seeding from
-        // whatever happens to be checked out on this machine would invent repos
-        // the owner never configured. Only a standalone `.bb` project, where an
-        // empty file is a project with nothing set up yet, is seeded.
-        if (repoSet.repos.length === 0 && layout !== "primary") {
-          const seeded = proposeRepoSet(mirrors, prepared.remote);
-          if (seeded.repos.length === 0) {
-            return {
-              status: "failed",
-              message: `No repos are configured. Add some to ${REPOS_FILE} in ${location.path}, or run \`bb repos add <url>\`.`,
-            };
-          }
+        // An empty repo set is never filled in from this machine. It used to
+        // be, for a standalone `.bb`, from every checkout next to the project
+        // source and every other project bb knows about on the host — which on
+        // a server that keeps all its projects under one directory proposed
+        // every other project's primary into the file, and for a plain repo
+        // adopted as the project source (no committed `repos.json` at all,
+        // which `detectProjectLayout` also reports as standalone) committed
+        // that list at the root of someone's real repo. An empty set is the
+        // owner's definition: the workspace is the project source and nothing
+        // else, and repos are added with `bb repos add <url>` or the Repos
+        // panel.
+        if (repoSet.repos.length === 0) {
           context.report.log(
-            `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
-              .map((repo) => repo.dir)
-              .join(", ")}`,
+            layout === "primary"
+              ? `No repos in ${REPOS_FILE}: the workspace holds only the primary repo. Add more with \`bb repos add <url>\`.`
+              : `No repos in ${REPOS_FILE}: the workspace holds only ${PROJECT_SOURCE_DIR}. Add repos with \`bb repos add <url>\`.`,
           );
-          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
-          repoSet = seeded;
         }
 
         const repoRequests = repoSet.repos.map(toRepoRequest);
@@ -1088,39 +1086,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     if (remote === null) return null;
     const request = primaryRepoRequest(remote);
     return request === null ? null : { dir: request.dir, url: request.url };
-  }
-
-  /**
-   * Turn discovered checkouts into a starting repo set.
-   *
-   * Only ever used when `repos.json` holds nothing: the alternative is handing
-   * someone an empty directory and no explanation. Deduplicated by remote and
-   * capped, because a machine with forty checkouts should not produce a forty
-   * repo workspace by accident. `projectRemote` is the project source's own
-   * `origin`; it is skipped, because `repos.json` never repeats it.
-   */
-  function proposeRepoSet(
-    mirrors: readonly { path: string; url: string }[],
-    projectRemote: string | null = null,
-  ): ReposFile {
-    const seen = new Set<string>();
-    const repos: ReposFile["repos"] = [];
-    // The project source's own origin is the primary in a primary layout and
-    // the definition repo in a standalone one. `repos.json` never repeats it,
-    // so it must not be proposed into the file either.
-    const projectKey = projectRemote === null ? null : normalizeRemoteUrl(projectRemote);
-    for (const mirror of mirrors) {
-      if (repos.length >= 8) break;
-      const key = normalizeRemoteUrl(mirror.url);
-      if (projectKey !== null && key === projectKey) continue;
-      if (seen.has(key)) continue;
-      const dir = dirFromUrl(mirror.url);
-      if (dir === null || dir === PROJECT_SOURCE_DIR) continue;
-      if (repos.some((repo) => repo.dir === dir)) continue;
-      seen.add(key);
-      repos.push({ dir, url: mirror.url, inferredDir: true });
-    }
-    return { version: 1, repos };
   }
 
   /* --------------------------------------------------- the agent surface */
