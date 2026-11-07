@@ -824,7 +824,8 @@ and reports each repo whose alerts the `gh` login cannot read.
 Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
 `source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
 stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
-`substantial`, `approval: project` (default), `user` or `{ linear-state: … }`),
+`substantial`, `approval: project` (default), `user` or `{ state: … }` (the
+pre-BB-232 `{ linear-state: … }` still parses),
 `substantial` (reviews only, BB-207: the criteria a reviewer judges the diff
 against; a substantial pull request with no approved spec on a referenced
 ticket is the owner's, with reason `product`),

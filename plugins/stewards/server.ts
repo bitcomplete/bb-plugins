@@ -3260,9 +3260,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const changes: Change[] = [];
       let ready = b.ready;
       const approval = playbook.ready?.approval;
-      if (typeof approval === "object" && lc(entity.state) === lc(approval["linear-state"]) && ready.approval === null) {
-        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "linear" }, voidedAt: null };
-        changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
+      const sourceLabel = entity.source === "github" ? "GitHub" : "Linear";
+      if (typeof approval === "object" && lc(entity.state) === lc(approval.state) && ready.approval === null) {
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source }, voidedAt: null };
+        changes.push({ text: `Approved in ${sourceLabel} (now ${entity.state})`, actionable: true });
       }
       const workers = store.workers(b.id);
       const workerInFlight = anyWorkerInFlight(workers);
@@ -8623,7 +8624,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const playbook = config === null ? null : playbookFor(config, target.kind);
               const mode = playbook?.ready?.approval ?? null;
               if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
-              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode["linear-state"]} in Linear.`));
+              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode.state} in ${target.source === "github" ? "GitHub" : "Linear"}.`));
               if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
               const entity = (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
               const byProject = mode === "project" && isProjectSteward(threadId, target);
