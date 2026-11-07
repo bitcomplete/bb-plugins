@@ -32,6 +32,8 @@ import {
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
   durationSchema,
+  filingTargetOf,
+  filingTargetProblems,
   formatDuration,
   githubStateLabels,
   isTerminal,
@@ -63,6 +65,7 @@ import {
   watchProblems,
   type BindingKind,
   type EscalationKind,
+  type FilingTarget,
   type LessonRules,
   type ModelSpec,
   type Playbook,
@@ -72,13 +75,13 @@ import {
   type RolesFile,
 } from "./config.js";
 import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
+import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate, PRODUCT_APPROVAL_REFUSAL } from "./gate.js";
@@ -1676,6 +1679,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // repo (BB-164).
         problems.push(...pullWatchProblems(roles, repos, file.github.exclude, watchPlaybooks));
       }
+      // BB-235: a filing target must be one of `linear.teams` or a repo the
+      // project leases. The project file's team key is checked by the schema;
+      // a repo target and a role's team are checked here, where the repo set
+      // is known.
+      problems.push(...filingTargetProblems(file, roles, repos));
       // BB-209: a playbook that still writes the pre-rename `approval: me`
       // alias parses as `user`; surface one warning per playbook, however many
       // of the load paths reached it.
@@ -3599,12 +3607,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return createKubectlReader((args) => runKubectl(config.projectId, args), context === undefined ? {} : { context });
     };
 
-    /** The states of the tickets a look's problems are filed under, read through linear; null for one that cannot be read. */
-    async function ticketStates(keys: string[]): Promise<Map<string, TicketState>> {
+    /**
+     * The states of the tickets a look's problems are filed under, read through
+     * the filing target's source (BB-235): Linear by key, GitHub by
+     * `owner/repo#n`. A GitHub issue is resolved when its state starts with
+     * `closed`; its close date is the snapshot's `updatedAt`, since the source
+     * contract carries no separate `closedAt`. Null for one that cannot be read.
+     */
+    async function ticketStates(target: FilingTarget | null, keys: string[]): Promise<Map<string, TicketState>> {
       const out = new Map<string, TicketState>();
+      const source: Source = target?.source ?? "linear";
       for (const key of [...new Set(keys)].slice(0, 20)) {
-        const e = await snapshot("linear", key).catch(() => null);
-        const resolved = e !== null && (e.stateType === "completed" || e.stateType === "canceled");
+        const e = await snapshot(source, key).catch(() => null);
+        const resolved = e !== null && ticketResolved(e);
         out.set(key, e === null ? null : { state: e.state, stateType: e.stateType, closedAt: e.completedAt ?? e.canceledAt ?? (resolved ? (e.updatedAt ?? null) : null), labels: e.labels, url: e.url });
       }
       return out;
@@ -3614,24 +3629,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const DEDUP_LIMIT = 10;
 
     /**
-     * The tickets a fingerprint map has lost, found by searching the team for
-     * the exact `Fingerprint:` line the steward put in the ticket. Returns the
-     * fingerprints adopted, or null when the search could not run or was
-     * partial (an older source, github, a read error), so the caller marks the
+     * The tickets a fingerprint map has lost, found by searching the filing
+     * target's source for the exact `Fingerprint:` line the steward put in the
+     * ticket (BB-233's search, read through the target's source since BB-235).
+     * Returns the fingerprints adopted, or null when the search could not run
+     * or was partial (an older source, a read error), so the caller marks the
      * new findings "dedup unavailable" and the wake tells the steward to
-     * `linear_search` itself rather than risk a duplicate. It only reads; it
-     * never files, comments or reassigns.
+     * search itself rather than risk a duplicate. It only reads; it never
+     * files, comments or reassigns.
      */
-    async function dedupFingerprints(team: string | null, fingerprints: string[]): Promise<Map<string, string> | null> {
+    async function dedupFingerprints(target: FilingTarget | null, fingerprints: string[]): Promise<Map<string, string> | null> {
       const adopted = new Map<string, string>();
       if (fingerprints.length === 0) return adopted;
-      // No team to search is not "nothing found": dedup did not run, so the
+      // No target to search is not "nothing found": dedup did not run, so the
       // caller marks the new findings unavailable rather than risk a duplicate.
-      if (team === null) return null;
+      if (target === null) return null;
       for (const fingerprint of fingerprints) {
         let out: z.infer<typeof sourceContract.sourceSearchIssues.output>;
         try {
-          out = await sourceRpc("linear", "sourceSearchIssues", { units: [team], query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
+          out = await sourceRpc(target.source, "sourceSearchIssues", { units: [target.target], query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
         } catch (error) {
           if (!sourceRpcMissing(error)) bb.log.warn(`stewards: the dedup search for ${fingerprint} failed: ${errorMessage(error)}`);
           return null;
@@ -3640,7 +3656,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const matches = out.issues.filter((issue) => hasFingerprintLine(issue.description, fingerprint));
         // A duplicate line is meant to be impossible, but if two tickets carry
         // it, prefer one that can still be commented on over one already resolved.
-        const open = matches.find((issue) => issue.stateType !== "completed" && issue.stateType !== "canceled");
+        const open = matches.find((issue) => !ticketResolved(issue));
         if (matches.length > 0) adopted.set(fingerprint, (open ?? matches[0]!).key);
       }
       return adopted;
@@ -3658,6 +3674,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /** Where a project's ops and dependency watches file: the role's target, or the first Linear team (BB-235). */
+    const filingTargetFor = (config: ProjectConfig): FilingTarget | null => roleOpsTeam(config.role, config.file);
+
+    /** The login a filing target files under: this server's GitHub login for a repo, its Linear login for a team. */
+    const filingLogin = (target: FilingTarget | null, config: ProjectConfig): string | null => (target?.source === "github" ? config.githubLogin : config.linearLogin);
+
     /** Every ops target a project watches: the k8s namespaces, the Sentry projects and the Dependabot repositories. */
     const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...roleK8sTargets(config.role), ...roleSentryTargets(config.role), ...roleDepsTargets(config.role, config.repos)];
 
@@ -3665,13 +3687,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function lookAt(b: Binding, config: ProjectConfig, target: K8sTarget, playbook: Playbook): Promise<OpsLook> {
       const at = now();
       const since = b.opsLook !== null && b.opsLook.error === null ? b.opsLook.at : at - playbook.requeueDefaultMs;
+      const filing = filingTargetFor(config);
       try {
         const { sightings, ...rest } = await opsReaderFor(config).look(target, { now: at, since });
         const rows = store.sight(b.projectId, b.id, sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.summary })));
-        const adopted = await dedupFingerprints(roleOpsTeam(config.role, config.file), unmappedFingerprints(rows));
+        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows));
         if (adopted !== null) adoptTickets(b, rows, adopted);
-        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
-        const findings = classify(sightings, rows, tickets, at, config.linearLogin).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
+        const tickets = await ticketStates(filing, [...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const findings = classify(sightings, rows, tickets, at, filingLogin(filing, config)).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
         return { ...rest, at, target: opsTargetKey(target), error: null, findings };
       } catch (error) {
         return { at, target: opsTargetKey(target), error: errorMessage(error), pods: 0, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [] };
@@ -3694,7 +3717,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (r.ticketKey === null || r.severity === null || r.ecosystem === null) continue;
         if (!isBatchable(r.severity as DependabotSeverity)) continue;
         const state = tickets.get(r.ticketKey) ?? null;
-        if (state !== null && (state.stateType === "completed" || state.stateType === "canceled")) continue;
+        if (ticketResolved(state)) continue;
         const repo = repoOfFingerprint(r.fingerprint);
         if (repo === null) continue;
         // The plugin owns the deadline: it is the alert's own created_at plus
@@ -3711,6 +3734,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** One look at a Dependabot alert target: the repository's open alerts, classified and batched. */
     async function lookAtDeps(b: Binding, config: ProjectConfig, target: DependabotTarget): Promise<DepsLook> {
       const at = now();
+      const filing = filingTargetFor(config);
       try {
         const out = await sourceRpc("github", "sourceDependabotAlerts", { units: [target.repo], state: "open" }, sourceContract.sourceDependabotAlerts.output);
         const alerts: DependabotAlert[] = out.alerts;
@@ -3726,15 +3750,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // adopted here, exactly as in the ops look, before the batch plan reads
         // the map: an adopted medium or low alert then joins its ticket like
         // any mapped one.
-        const adopted = await dedupFingerprints(roleOpsTeam(config.role, config.file), unmappedFingerprints(rows));
+        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows));
         if (adopted !== null) adoptTickets(b, rows, adopted);
         // Every fingerprint row, not just this look's: a batched ticket that
         // is no longer in the open alerts still has rows, and whether it is
         // open decides if a new medium or low alert may join it.
         const allRows = store.fingerprints(b.id);
         const sightings: Sighting[] = alerts.map((a) => ({ fingerprint: alertFingerprint(a), workload: a.package, pods: [], container: null, signature: a.severity, summary: `${a.severity} ${a.package}`, restarts: 0, events: [], logs: null, previous: false }));
-        const tickets = await ticketStates([...allRows].map((r) => r.ticketKey).filter((k): k is string => k !== null));
-        const findings = classify(sightings, rows, tickets, at, config.linearLogin).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
+        const tickets = await ticketStates(filing, [...allRows].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const findings = classify(sightings, rows, tickets, at, filingLogin(filing, config)).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
         const byFingerprint = new Map(alerts.map((a) => [alertFingerprint(a), a]));
         // The SLA clock is the alert's own created_at, so a binding recreated
         // later does not hand a ticket a fresh deadline (SC-111); a row whose
@@ -3904,7 +3928,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // A ticket whose state could not be read is left as it is: neither
         // raised (it may be adopted) nor settled (it may still be open).
         if (ticket === null) continue;
-        const closed = ticket.stateType === "completed" || ticket.stateType === "canceled";
+        const closed = ticketResolved(ticket);
         const labelled = (ticket.labels ?? []).some((l) => lc(l) === label);
         if (decision !== null && decision.status === "pending") {
           const need = decision.needId === null ? null : store.need(decision.needId);
@@ -4038,9 +4062,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: b,
         playbook,
         look,
-        team: roleOpsTeam(config.role, config.file),
+        target: filingTargetFor(config),
         label: config.file.label,
-        owner: config.linearLogin,
+        owner: filingLogin(filingTargetFor(config), config),
         autoAdopt: config.role?.ops?.autoAdopt ?? [],
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
@@ -4096,9 +4120,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: b,
         playbook,
         look,
-        team: roleOpsTeam(config.role, config.file),
+        target: filingTargetFor(config),
         label: config.file.label,
-        owner: config.linearLogin,
+        owner: filingLogin(filingTargetFor(config), config),
         autoAdopt: config.file.deps.autoAdopt,
         timeZone: config.file.nightly.timezone,
         escalations: store.openEscalations(b.id),
@@ -4151,7 +4175,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         });
 
     /** One look at a Sentry project: the issues new, regressed, rung or still firing since the last look, classified against the fingerprint map. */
-    async function lookAtSentry(b: Binding, target: SentryTarget, playbook: Playbook, resolveOnDone: boolean): Promise<SentryLook> {
+    async function lookAtSentry(b: Binding, config: ProjectConfig, target: SentryTarget, playbook: Playbook): Promise<SentryLook> {
       const at = now();
       const key = opsTargetKey(target);
       const since = b.sentryLook !== null && b.sentryLook.error === null ? b.sentryLook.at : at - playbook.requeueDefaultMs;
@@ -4180,14 +4204,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           b.id,
           sightings.map((s) => ({ fingerprint: s.fingerprint, summary: sentrySummary(s.issue) })),
         );
-        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const tickets = await ticketStates(filingTargetFor(config), [...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         // The one write: with ops.sentry.resolveOnDone on, a mapped ticket
         // that is Done while its issue is still unresolved is resolved in
         // Sentry. Canceled and open tickets, and issues Sentry has already
         // resolved, are left alone. A 403 (the token lacks event:write) is
         // one note per look, and the rest of the look's resolves are skipped.
         const unresolvedById = new Map(issues.filter((i) => i.status === "unresolved").map((i) => [i.id, i]));
-        if (resolveOnDone) {
+        if (config.role?.ops?.sentry?.resolveOnDone ?? false) {
           let refused = false;
           for (const t of sentryResolveTargets(rows.values(), tickets, new Set(unresolvedById.keys()))) {
             if (refused) break;
@@ -4201,7 +4225,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         }
         const asSightings: Sighting[] = sightings.map((s) => ({ fingerprint: s.fingerprint, workload: s.issue.shortId, pods: [], container: null, signature: s.reasons[0] ?? "ongoing", summary: sentrySummary(s.issue), restarts: 0, events: [], logs: null, previous: false }));
-        const classified = classify(asSightings, rows, tickets, at);
+        const classified = classify(asSightings, rows, tickets, at, filingLogin(filingTargetFor(config), config));
         const findings: SentryFinding[] = [];
         let eventsRead = 0;
         for (const [i, s] of sightings.entries()) {
@@ -4254,7 +4278,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function reconcileSentry(b: Binding, config: ProjectConfig, playbook: Playbook, target: SentryTarget, force: WakeReason | null): Promise<void> {
       const before = b.sentryLook;
-      const look = await lookAtSentry(b, target, playbook, config.role?.ops?.sentry?.resolveOnDone ?? false);
+      const look = await lookAtSentry(b, config, target, playbook);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
       const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
       b = store.patch(b.id, { sentryLook: look, requeueAt });
@@ -4293,9 +4317,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: b,
         playbook,
         look,
-        team: roleOpsTeam(config.role, config.file),
+        target: filingTargetFor(config),
         label: config.file.label,
-        owner: config.linearLogin,
+        owner: filingLogin(filingTargetFor(config), config),
         autoAdopt: config.role?.ops?.autoAdopt ?? [],
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
@@ -4519,16 +4543,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function disabledOpsWake(b: Binding, config: ProjectConfig, playbook: Playbook): string {
       const changes = ["Stewards for this project were switched off on this server. This is your stop turn: take no new actions and start no workers."];
       const target = parseOpsTargetKey(b.entityId);
-      const team = roleOpsTeam(config.role, config.file);
+      const filing = roleOpsTeam(config.role, config.file);
+      const owner = filingLogin(filing, config);
       const escalations = store.openEscalations(b.id);
       if (target?.kind === "dependabot" && b.depsLook !== null) {
-        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, decisions: store.depsDecisions(b.projectId, b.entityId).filter((d) => d.status === "pending"), changes });
+        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, target: filing, label: config.file.label, owner, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, decisions: store.depsDecisions(b.projectId, b.entityId).filter((d) => d.status === "pending"), changes });
       }
       if (target?.kind === "sentry-project" && b.sentryLook !== null) {
-        return formatSentryWake({ reason: "disabled", binding: b, playbook, look: b.sentryLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
+        return formatSentryWake({ reason: "disabled", binding: b, playbook, look: b.sentryLook, target: filing, label: config.file.label, owner, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
       }
       if (target?.kind === "k8s-namespace" && b.opsLook !== null) {
-        return formatOpsWake({ reason: "disabled", binding: b, playbook, look: b.opsLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
+        return formatOpsWake({ reason: "disabled", binding: b, playbook, look: b.opsLook, target: filing, label: config.file.label, owner, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
       }
       return `# ${b.entityKey}\n\nStewards for this project were switched off on this server. This is your stop turn: take no new actions on the target and start no workers; running workers have been stopped. End with steward_report, saying where things stand. Switching the project back on resumes this binding.`;
     }
@@ -7961,7 +7986,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .array(
             z.object({
               fingerprint: z.string().trim().min(1).max(400).describe("The problem's fingerprint, as the wake gives it."),
-              ticket: z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*-\d+$/u, "a Linear key such as OPS-12").describe("The Linear ticket."),
+              ticket: z.string().trim().regex(/^(?:[A-Za-z][A-Za-z0-9]*-\d+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+)$/u, "a Linear key such as OPS-12 or a GitHub issue key such as acme/web#12").describe("The Linear ticket or GitHub issue."),
               did: z.enum(["filed", "commented", "reopened"]),
             }),
           )
@@ -8113,8 +8138,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               for (const [ticketKey, rows] of filed) {
                 if (rows.every((r) => autoAdopted(r.severity, config))) continue;
                 const alerts = (b.depsLook?.alerts ?? []).filter((a) => rows.some((r) => r.fingerprint === a.fingerprint));
-                const ticket = await ticketStates([ticketKey]).then((m) => m.get(ticketKey) ?? null).catch(() => null);
-                if (ticket !== null && (ticket.stateType === "completed" || ticket.stateType === "canceled" || (ticket.labels ?? []).some((l) => lc(l) === lc(config.file.label)))) continue;
+                const ticket = await ticketStates(filingTargetFor(config), [ticketKey]).then((m) => m.get(ticketKey) ?? null).catch(() => null);
+                if (ticket !== null && (ticketResolved(ticket) || (ticket.labels ?? []).some((l) => lc(l) === lc(config.file.label)))) continue;
                 // The deadline is the earliest the look computed for the
                 // ticket's alerts (alert created_at + SLA), the same date the
                 // wake showed the steward when it filed.
@@ -9698,10 +9723,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket));
       await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket));
+      const filing = roleOpsTeam(config.role, config.file);
+      // BB-235: a GitHub filing target needs the priority labels its autoAdopt
+      // names. The onboarding label step (BB-236/BB-234) creates them; check
+      // only reports a filing repo that lacks one, in the repo set above.
+      if (filing !== null && filing.source === "github") {
+        const priorities = new Set<string>();
+        for (const p of config.role?.ops?.autoAdopt ?? []) priorities.add(priorityLabel(p));
+        for (const s of config.file.deps.autoAdopt) priorities.add(priorityLabelForSeverity(s));
+        if (priorities.size > 0) await validate("github", [filing.target], [...priorities]);
+      }
       if (usesKind(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];
         const context = config.role?.ops?.context;
-        lines.push(`ops: tickets filed in ${roleOpsTeam(config.role, config.file) ?? "(no team)"}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);
+        lines.push(`ops: tickets filed in ${filing === null ? "(no target)" : `${filing.target} (${filing.source})`}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);
         const host = await projectHost(projectId);
         lines.push(`ops: kubectl runs on ${host ?? "no machine"}${context === undefined ? ", in its current context" : `, in context ${context}`}`);
         const reader = opsReaderFor(config);

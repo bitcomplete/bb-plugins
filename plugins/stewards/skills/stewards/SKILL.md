@@ -301,22 +301,35 @@ broad, and nothing else stops a write. You cannot query Sentry: the token
 is the plugin's, so diagnose from the wake and the code in your workspace.
 
 **Defaults.** Put every problem's fingerprint in the ticket description on a
-line of its own, ``Fingerprint: `<fingerprint>` ``. Assign every ticket you
-file to this server's owner with `assignee: "me"` and to no one else; when
-the wake says the login cannot be read, file it unassigned rather than
-guessing. A ticket already assigned to someone else is classified and
-commented on, never reassigned. A recurrence is a comment on its ticket,
-never a second ticket. Before you file, the plugin searches the team for the
-exact `Fingerprint:` line and reports a hit as Recurring or Returned; if the
-wake says dedup is unavailable, run `linear_search` yourself for that
+line of its own, ``Fingerprint: `<fingerprint>` ``. The wake names the filing
+target and its source: a Linear team, where you file with
+`linear_create_issue` and assign with `assignee: "me"`, or a GitHub repo,
+where you file with `gh issue create` and assign with `--assignee <login>`.
+Assign every ticket you file to this server's owner for that source and to no
+one else; when the wake says the login cannot be read, file it unassigned
+rather than guessing. A ticket already assigned to someone else is classified
+and commented on, never reassigned. A recurrence is a comment on its ticket,
+never a second ticket. Before you file, the plugin searches the filing
+target's source for the exact `Fingerprint:` line and reports a hit as
+Recurring or Returned; if the wake says dedup is unavailable, search the
+target yourself (`linear_search`, or `gh issue list --search`) for that
 fingerprint before filing.
 
-- **New:** file one ticket per problem with `linear_create_issue`: pod and
-  container, since when, the evidence quoted, your diagnosis, a priority, and
-  the fingerprint line. Raise one `decision` escalation for the tickets of the
-  turn: "Filed BB-N (high): …. Recommend adopting." A priority the wake says
-  `ops.autoAdopt` covers you label and move to Todo yourself, with no
-  escalation.
+On a **GitHub** target there is no priority or due-date field. Put the
+fingerprint on its own line and, for a dependency deadline, a
+`Due: YYYY-MM-DD` line beside it. Add the labels the wake names: for a
+priority or severity `autoAdopt` names, `bb-managed`, `status:todo` and
+`priority:<level>`, so adoption picks the issue up; for any other, no label,
+and the plugin files the owner's adoption decision instead. Sign every `gh`
+body by hand with `_— from bb thread <your thread id>_`.
+
+- **New:** file one ticket per problem with `linear_create_issue`, or with
+  `gh issue create` on a GitHub target: pod and container, since when, the
+  evidence quoted, your diagnosis, a priority, and the fingerprint line.
+  Raise one `decision` escalation for the tickets of the turn: "Filed BB-N
+  (high): …. Recommend adopting." A priority the wake says `ops.autoAdopt`
+  covers you label and move to Todo (Linear) or add `bb-managed`,
+  `status:todo` and `priority:<level>` (GitHub) yourself, with no escalation.
 - **Recurring:** comment on its ticket when the evidence moved; file nothing.
 - **Returned:** as the playbook says: comment and escalate a reopen, or file
   anew linking the old ticket.
@@ -330,7 +343,10 @@ fingerprint before filing.
   filed, keeps it by ticket until answered, and reminds the owner once its
   deadline has passed. The answer arrives under "What changed" as "The user
   chose …"; the wake says what Adopt, Dismiss as not used and Keep tracking
-  each mean. Dismiss an alert only when the owner answered with that choice
+  each mean. On GitHub, Adopt adds `bb-managed` and `status:todo` (and the
+  `priority:<level>` label); on Linear it adds `bb-managed` and moves the
+  ticket to Todo. Dismiss an alert only when the owner answered with that
+  choice
   on the ticket's decide item, and re-read each alert first so an already
   fixed or dismissed one is skipped; the playbook's `may` list must declare
   `dismiss-alert` or the choice is not offered. The plugin owns the

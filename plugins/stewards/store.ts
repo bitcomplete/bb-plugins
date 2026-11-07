@@ -19,6 +19,13 @@ import type { GuidanceCitation } from "./guidance.js";
 import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
 
+/**
+ * How a ticket key is stored: a Linear key is folded to upper case, a GitHub
+ * issue key (`owner/repo#n`) is kept exactly as GitHub spells it (BB-235). The
+ * two are told apart by the slash, which a Linear key never has.
+ */
+export const normalizeTicketKey = (ticketKey: string): string => (ticketKey.includes("/") ? ticketKey : ticketKey.toUpperCase());
+
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
 export const BASE_MIGRATIONS = [
@@ -2215,7 +2222,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
      */
     recordTicket(projectId: string, fingerprint: string, ticketKey: string, did: TicketAction, threadId: string | null = null): boolean {
       const at = now();
-      const key = ticketKey.toUpperCase();
+      const key = normalizeTicketKey(ticketKey);
       // A filing or reopening records the acting thread on the row as
       // provenance, so `bb stewards show` answers "who filed it?" after the
       // thread is gone. A comment is the same steward's later word, not a filing.
@@ -2228,13 +2235,13 @@ export function createStore(db: Database.Database, now: () => number, options: S
      * so `last_commented_at` stays null.
      */
     adoptTicket(projectId: string, fingerprint: string, ticketKey: string): boolean {
-      const changed = setAdopted.run(ticketKey.toUpperCase(), projectId, fingerprint);
+      const changed = setAdopted.run(normalizeTicketKey(ticketKey), projectId, fingerprint);
       return changed.changes > 0;
     },
 
     // adoption decisions on dependency tickets, keyed by ticket
     depsDecision(projectId: string, ticketKey: string): DepsDecision | null {
-      const r = getDepsDecision().get(projectId, ticketKey.toUpperCase());
+      const r = getDepsDecision().get(projectId, normalizeTicketKey(ticketKey));
       return r === undefined ? null : toDepsDecision(r);
     },
     /** Every decision ever raised for a target, pending and resolved, oldest first. */
@@ -2247,14 +2254,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     /** Record a pending decision on a ticket; a ticket that already has one keeps it. Returns the row, new or existing. */
     raiseDepsDecision(fields: { projectId: string; ticketKey: string; entityId: string; fingerprints: string[]; severity: string | null; raisedBy: string | null; needId: string | null }): { decision: DepsDecision; raised: boolean } {
-      const key = fields.ticketKey.toUpperCase();
+      const key = normalizeTicketKey(fields.ticketKey);
       const existing = getDepsDecision().get(fields.projectId, key);
       if (existing !== undefined) return { decision: toDepsDecision(existing), raised: false };
       insertDepsDecision().run({ project_id: fields.projectId, ticket_key: key, entity_id: fields.entityId, fingerprints: JSON.stringify(fields.fingerprints), severity: fields.severity, raised_at: now(), raised_by: fields.raisedBy, need_id: fields.needId });
       return { decision: toDepsDecision(getDepsDecision().get(fields.projectId, key)!), raised: true };
     },
     patchDepsDecision(projectId: string, ticketKey: string, fields: Partial<Pick<DepsDecision, "needId" | "reminded" | "fingerprints" | "entityId" | "severity" | "snoozedUntil">>): DepsDecision | null {
-      const key = ticketKey.toUpperCase();
+      const key = normalizeTicketKey(ticketKey);
       if (getDepsDecision().get(projectId, key) === undefined) return null;
       if (fields.needId !== undefined) db.prepare("UPDATE deps_decisions SET need_id = ? WHERE project_id = ? AND ticket_key = ?").run(fields.needId, projectId, key);
       if (fields.reminded !== undefined) db.prepare("UPDATE deps_decisions SET reminded = ? WHERE project_id = ? AND ticket_key = ?").run(JSON.stringify(fields.reminded), projectId, key);
@@ -2266,7 +2273,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     /** Resolve a pending decision with how it was settled; false when it was not pending. */
     resolveDepsDecision(projectId: string, ticketKey: string, resolution: string): boolean {
-      const changed = db.prepare("UPDATE deps_decisions SET status = 'resolved', resolution = ?, resolved_at = ? WHERE project_id = ? AND ticket_key = ? AND status = 'pending'").run(resolution, now(), projectId, ticketKey.toUpperCase());
+      const changed = db.prepare("UPDATE deps_decisions SET status = 'resolved', resolution = ?, resolved_at = ? WHERE project_id = ? AND ticket_key = ? AND status = 'pending'").run(resolution, now(), projectId, normalizeTicketKey(ticketKey));
       return changed.changes > 0;
     },
 

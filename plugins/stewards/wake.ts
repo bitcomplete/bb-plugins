@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, phaseInstructions, type LessonRules, type Playbook } from "./config.js";
+import { formatDuration, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
@@ -712,10 +712,10 @@ export type OpsWakeInput = {
   binding: Binding;
   playbook: Playbook;
   look: OpsLook;
-  /** The Linear team tickets are filed in. */
-  team: string | null;
+  /** The Linear team or GitHub repo tickets are filed in, with its source. */
+  target: FilingTarget | null;
   label: string;
-  /** This server's connected Linear login, which owns every ticket it files; null when unreadable. */
+  /** This server's connected login for the target's source, which owns every ticket it files; null when unreadable. */
   owner: string | null;
   /** Priorities whose tickets are labelled when filed (ops.autoAdopt). */
   autoAdopt: string[];
@@ -727,16 +727,53 @@ export type OpsWakeInput = {
  * The defaults a watcher files by (BB-115, BB-136): the fingerprint line
  * every ticket carries, who it is assigned to, and that a recurrence is a
  * comment rather than a second ticket. The owner is this server's connected
- * Linear user, the person the watch belongs to; a login that could not be
- * read files unassigned and never guesses. The problem line itself is
- * already on `bb stewards check`.
+ * login for the target's source (the Linear user or the GitHub login), the
+ * person the watch belongs to; a login that could not be read files
+ * unassigned and never guesses. The problem line itself is already on `bb
+ * stewards check`.
  */
-function assignInstruction(owner: string | null): string {
+function assignInstruction(owner: string | null, source: "linear" | "github"): string {
   const fingerprint = "Put the problem's fingerprint in the ticket description on a line of its own, ``Fingerprint: `<fingerprint>` ``.";
   const recurrence = "A recurrence is a comment on its ticket, never a second ticket.";
+  if (source === "github") {
+    const who =
+      owner === null
+        ? "This server's GitHub login could not be read, so file every issue unassigned; never guess an assignee. `bb stewards check` says why."
+        : `Assign every issue you file to this server's GitHub login, ${owner}, and to no one else: pass \`--assignee ${owner}\` to \`gh issue create\`.`;
+    return `Defaults: ${fingerprint} ${who} Sign every \`gh\` body by hand with \`_— from bb thread $BB_THREAD_ID_\`. ${recurrence}`;
+  }
   return owner === null
     ? `Defaults: ${fingerprint} This server's Linear login could not be read, so file every ticket unassigned; never guess an assignee. \`bb stewards check\` says why. ${recurrence}`
     : `Defaults: ${fingerprint} Assign every ticket you file to this server's owner, ${owner}, and to no one else: pass assignee: "me" to linear_create_issue (it resolves to ${owner}). ${recurrence}`;
+}
+
+/** Where a watcher files, and with what tool: a Linear team, or a GitHub repo (BB-235). */
+function filingInstruction(target: FilingTarget | null, due: boolean): string {
+  if (target === null) return "No filing target is configured: escalate a blocked question instead of filing.";
+  if (target.source === "github") return `File issues in the GitHub repo ${target.target} with \`gh issue create\`, and put the fingerprint${due ? " and a `Due: YYYY-MM-DD` line" : ""} in the body.`;
+  return due ? `File tickets in the Linear team ${target.target} with linear_create_issue, and set each ticket's due date to the deadline the alert names.` : `File tickets in the Linear team ${target.target} with linear_create_issue.`;
+}
+
+/** The example ticket key a wake's steward_report uses: a Linear key, or a GitHub issue key. */
+function ticketExample(target: FilingTarget | null): string {
+  if (target === null) return "ENG-123";
+  return target.source === "github" ? `${target.target}#123` : `${target.target}-123`;
+}
+
+/**
+ * The autoAdopt instruction: a ticket for a priority (ops) or severity (deps)
+ * the list names is adopted at once. On a Linear target it is labelled and
+ * moved to Todo; on a GitHub target it gets the project label, `status:todo`
+ * and the `priority:<level>` label that stands in for Linear's priority field
+ * (BB-235).
+ */
+function autoAdoptInstruction(target: FilingTarget | null, autoAdopt: string[], label: string, kind: "ops" | "deps"): string {
+  const what = kind === "deps" ? `a ticket you file for a ${autoAdopt.join(" or ")} alert` : `a ticket you file at ${autoAdopt.join(" or ")} priority`;
+  const adopt =
+    target?.source === "github"
+      ? `add the labels \`${label}\`, \`status:todo\` and \`priority:<level>\` (the priority the ${kind === "deps" ? "alert" : "ticket"} is filed at) when you file it`
+      : `add the label \`${label}\` and move it to Todo when you file it`;
+  return `${kind}.autoAdopt: ${what} is adopted at once: ${adopt}, and raise no escalation for it. Say in your report that you did.`;
 }
 
 const OPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
@@ -797,13 +834,9 @@ export function formatOpsWake(input: OpsWakeInput): string {
     if (section !== null) out.push("", `### ${c.charAt(0).toUpperCase()}${c.slice(1)}`, "", section);
   }
   out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
-  out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue.`);
-  if (input.team !== null) out.push(assignInstruction(input.owner));
-  if (input.autoAdopt.length > 0) {
-    out.push(
-      `ops.autoAdopt: a ticket you file at ${input.autoAdopt.join(" or ")} priority is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`,
-    );
-  }
+  out.push(filingInstruction(input.target, false));
+  if (input.target !== null) out.push(assignInstruction(input.owner, input.target.source));
+  if (input.autoAdopt.length > 0) out.push(autoAdoptInstruction(input.target, input.autoAdopt, input.label, "ops"));
 
   out.push("", "## 2. Guidance, priority and holds", "");
   if (binding.guidance.length === 0) out.push("No standing guidance.");
@@ -837,7 +870,7 @@ export function formatOpsWake(input: OpsWakeInput): string {
     "",
     "---",
     "Before filing, look for evidence that you already did (a signed ticket or comment with the fingerprint). " +
-      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${input.team ?? "ENG"}-123", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${ticketExample(input.target)}", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
   );
   return fit(head, snapshot, out);
 }
@@ -847,10 +880,10 @@ export type DepsWakeInput = {
   binding: Binding;
   playbook: Playbook;
   look: DepsLook;
-  /** The Linear team tickets are filed in. */
-  team: string | null;
+  /** The Linear team or GitHub repo tickets are filed in, with its source. */
+  target: FilingTarget | null;
   label: string;
-  /** This server's connected Linear login, which owns every ticket it files; null when unreadable. */
+  /** This server's connected login for the target's source, which owns every ticket it files; null when unreadable. */
   owner: string | null;
   /** Severities whose tickets are labelled when filed (deps.autoAdopt). */
   autoAdopt: string[];
@@ -911,19 +944,23 @@ export function formatDepsWake(input: DepsWakeInput): string {
     if (section !== null) out.push("", `### ${c.charAt(0).toUpperCase()}${c.slice(1)}`, "", section);
   }
   out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
-  out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue, and set each ticket's due date to the deadline the alert names.`);
-  if (input.team !== null) out.push(assignInstruction(input.owner));
-  if (input.autoAdopt.length > 0) {
-    out.push(`deps.autoAdopt: a ticket you file for a ${input.autoAdopt.join(" or ")} alert is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`);
-  }
+  out.push(filingInstruction(input.target, true));
+  if (input.target !== null) out.push(assignInstruction(input.owner, input.target.source));
+  if (input.autoAdopt.length > 0) out.push(autoAdoptInstruction(input.target, input.autoAdopt, input.label, "deps"));
   const allowDismiss = playbook.may.includes("dismiss-alert");
+  const githubTarget = input.target?.source === "github";
+  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`status:todo\`` : `add the label \`${input.label}\` and move the ticket to Todo`;
+  const dismissAction = githubTarget ? "close the issue with a comment saying why" : "move the ticket to Done with a comment saying why";
+  const keepAction = githubTarget
+    ? "keep the issue open and unadopted and update the due date in the body to the one the note gives, or by one SLA window from today when it gives none"
+    : "keep the ticket open and unadopted and move its due date to the one the note gives, or by one SLA window from today when it gives none, with a comment on the ticket saying so";
   out.push(
     `Adoption of any other ticket is the owner's decision, and the plugin asks it: once your report lists the ticket as filed, a decide item appears on the Stewards page and in \`bb stewards needs\`, kept by ticket until the owner answers, the ticket is labelled \`${input.label}\`, or it closes. Do not raise a decision escalation for it yourself, and do not ask the owner in prose. ` +
-      `The answer arrives under "What changed" as "The user chose <choice> for …". ${ADOPTION_CHOICES.adopt}: add the label \`${input.label}\` and move the ticket to Todo. ` +
+      `The answer arrives under "What changed" as "The user chose <choice> for …". ${ADOPTION_CHOICES.adopt}: ${adoptAction}. ` +
       (allowDismiss
-        ? `${ADOPTION_CHOICES.dismiss}: only when the owner answered with it on that ticket's decide item — never on a steward's own initiative — re-read each of that decision's alerts on GitHub first and skip any already fixed or dismissed, then dismiss the rest as "not used" and move the ticket to Done with a comment saying why. The item and this wake list the exact alert numbers. `
+        ? `${ADOPTION_CHOICES.dismiss}: only when the owner answered with it on that ticket's decide item — never on a steward's own initiative — re-read each of that decision's alerts on GitHub first and skip any already fixed or dismissed, then dismiss the rest as "not used" and ${dismissAction}. The item and this wake list the exact alert numbers. `
         : "") +
-      `${ADOPTION_CHOICES.keep}: keep the ticket open and unadopted and move its due date to the one the note gives, or by one SLA window from today when it gives none, with a comment on the ticket saying so.`,
+      `${ADOPTION_CHOICES.keep}: ${keepAction}.`,
   );
 
   out.push("", "## 2. Guidance, priority and holds", "");
@@ -973,7 +1010,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
     "",
     "---",
     "Before filing, look for evidence that you already did (a signed ticket or comment with the fingerprint). " +
-      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${input.team ?? "ENG"}-123", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${ticketExample(input.target)}", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
   );
   return fit(head, snapshot, out);
 }
@@ -983,10 +1020,10 @@ export type SentryWakeInput = {
   binding: Binding;
   playbook: Playbook;
   look: SentryLook;
-  /** The Linear team tickets are filed in. */
-  team: string | null;
+  /** The Linear team or GitHub repo tickets are filed in, with its source. */
+  target: FilingTarget | null;
   label: string;
-  /** This server's connected Linear login, which owns every ticket it files; null when unreadable. */
+  /** This server's connected login for the target's source, which owns every ticket it files; null when unreadable. */
   owner: string | null;
   /** Priorities whose tickets are labelled when filed (ops.autoAdopt). */
   autoAdopt: string[];
@@ -1045,13 +1082,9 @@ export function formatSentryWake(input: SentryWakeInput): string {
   out.push(
     "This target is a Sentry project, not a Kubernetes namespace: the plugin reads it with its own Sentry token, which your thread does not hold, so you cannot query Sentry yourself. Diagnose from the evidence below (the stack trace names the code) and the code in your workspace, and link the issue's permalink in the ticket. The fingerprint is the Sentry issue id.",
   );
-  out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue.`);
-  if (input.team !== null) out.push(assignInstruction(input.owner));
-  if (input.autoAdopt.length > 0) {
-    out.push(
-      `ops.autoAdopt: a ticket you file at ${input.autoAdopt.join(" or ")} priority is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`,
-    );
-  }
+  out.push(filingInstruction(input.target, false));
+  if (input.target !== null) out.push(assignInstruction(input.owner, input.target.source));
+  if (input.autoAdopt.length > 0) out.push(autoAdoptInstruction(input.target, input.autoAdopt, input.label, "ops"));
 
   out.push("", "## 2. Guidance, priority and holds", "");
   if (binding.guidance.length === 0) out.push("No standing guidance.");
@@ -1093,7 +1126,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
     "",
     "---",
     "Before filing, look for evidence that you already did (a signed ticket or comment with the fingerprint). " +
-      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${input.team ?? "ENG"}-123", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${ticketExample(input.target)}", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
   );
   return fit(head, snapshot, out);
 }
