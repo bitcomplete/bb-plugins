@@ -85,6 +85,7 @@ import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
   entitySnapshotSchema,
+  isMissingPlugin,
   signatureLine,
   sourceContract,
   stewardsContract,
@@ -9463,7 +9464,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return `${who} (${config.roleNames.length > 0 ? config.roleNames.join(", ") : "no roles"})`;
     }
 
-    async function check(projectId: string): Promise<{ ok: boolean; lines: string[] }> {
+    /**
+     * `check --create-labels` first creates the project's label in every
+     * unit, then validates as plain `check` does. A unit that could not be
+     * created is a `failed:` line and a `problem:` line, never a silent
+     * skip; a source that does not serve the RPC is reported unavailable.
+     */
+    async function ensureLabels(source: Source, units: string[], label: string, lines: string[]): Promise<void> {
+      if (units.length === 0) return;
+      let results: z.infer<typeof sourceContract.sourceEnsureLabel.output>["results"];
+      try {
+        results = (await sourceRpc(source, "sourceEnsureLabel", { units, label }, sourceContract.sourceEnsureLabel.output)).results;
+      } catch (error) {
+        const why = isMissingPlugin(error) ? "sourceEnsureLabel is unavailable (the source plugin does not support it)" : errorMessage(error);
+        lines.push(`problem: ${source}: could not create label ${label}: ${why}`);
+        return;
+      }
+      for (const r of results) {
+        const what = source === "linear" ? `linear team ${r.unit}` : `github repo ${r.unit}`;
+        if (r.status === "created") lines.push(`created label ${label} in ${what}`);
+        else if (r.status === "existed") lines.push(`existed label ${label} in ${what}`);
+        else {
+          const detail = r.error ?? "unknown error";
+          lines.push(`failed to create label ${label} in ${what}: ${detail}`);
+          lines.push(`problem: ${source}: ${r.unit}: could not create label ${label}: ${detail}`);
+        }
+      }
+    }
+
+    async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
@@ -9483,6 +9512,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // (BB-164).
       const watches = rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file));
       if (watches.length > 0) lines.push(`pulls: ${watches.map((w) => pullWatchId(w)).join(", ")}`);
+      if (options.createLabels === true) {
+        await ensureLabels("linear", config.file.linear.teams, config.file.label, lines);
+        await ensureLabels("github", config.repos, config.file.label, lines);
+      }
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
         try {
@@ -9862,9 +9895,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           check: cliCommand({
             summary: "Validate the project file and every playbook against Linear and GitHub, and that kubectl can read every ops target",
-            options: { project: PROJECT_OPTION },
+            description: "--create-labels first creates the project's label in every Linear team and every non-excluded GitHub repo, reporting each as created, existed or failed, then validates. Plain check only reads.",
+            options: { project: PROJECT_OPTION, "create-labels": { type: "boolean", description: "Create the project's label in every unit first, then validate" } },
             async run(input, ctx) {
-              const result = await check(projectOf(input.options.project, ctx));
+              const result = await check(projectOf(input.options.project, ctx), { createLabels: input.options["create-labels"] === true });
               return { exitCode: result.ok ? 0 : 1, stdout: [...result.lines, result.ok ? "OK" : "Problems found."].join("\n") };
             },
           }),

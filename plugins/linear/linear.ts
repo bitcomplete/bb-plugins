@@ -136,6 +136,7 @@ export const ISSUE_REF_QUERY =
 export const COMMENT_CREATE = "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { url } } }";
 export const ISSUE_UPDATE = "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { identifier state { name } assignee { name displayName email } labels { nodes { name } } priority } } }";
 export const ISSUE_CREATE = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }";
+export const ISSUE_LABEL_CREATE = "mutation($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) { success issueLabel { id name } } }";
 export const ISSUE_RELATION_CREATE = "mutation($input: IssueRelationCreateInput!) { issueRelationCreate(input: $input) { success issueRelation { id } } }";
 export const ISSUE_RELATION_DELETE = "mutation($id: String!) { issueRelationDelete(id: $id) { success } }";
 /** A team by key, with the states and labels an issue in it can take. Workspace labels apply to every team. */
@@ -290,6 +291,13 @@ export function parseIssueUpdate(payload: unknown): IssueUpdated {
   if (!parsed.success || parsed.issue === null || parsed.issue === undefined) throw new Error("Linear did not update the issue");
   const issue = parsed.issue;
   return { identifier: issue.identifier, state: issue.state?.name ?? null, assignee: personName(issue.assignee), labels: (issue.labels?.nodes ?? []).map((l) => l.name), priority: issue.priority ?? null };
+}
+
+export function parseIssueLabelCreate(payload: unknown): { id: string; name: string } {
+  const data = dataOf(payload);
+  const parsed = z.object({ success: z.boolean(), issueLabel: z.object({ id: z.string().nullish(), name: z.string() }).nullish() }).parse(data.issueLabelCreate);
+  if (!parsed.success || parsed.issueLabel === null || parsed.issueLabel === undefined) throw new Error("Linear did not create the label");
+  return { id: parsed.issueLabel.id ?? "", name: parsed.issueLabel.name };
 }
 
 export function parseIssueCreate(payload: unknown): { id: string; identifier: string; url: string | null } {

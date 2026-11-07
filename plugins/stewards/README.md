@@ -644,7 +644,11 @@ stewards/
 ```
 
 `bb stewards init` writes starting points ([templates.ts](templates.ts));
-`bb stewards check` validates them against Linear and GitHub. A playbook that
+`bb stewards check` validates them against Linear and GitHub, and
+`bb stewards check --create-labels` first creates the project's label in
+every Linear team and every non-excluded GitHub repo (each reported as
+created, existed or failed) so onboarding does not leave the label as a
+by-hand step. A playbook that
 fails to parse is reported and bindings keep running under the last good
 version. Project file fields beyond the design: `nightly.until`,
 `nightly.max`, `playbooks` (which playbook governs each kind),
@@ -898,7 +902,9 @@ The flow, in order: survey and read each repo's README; one batched interview
 under ten questions for what only the owner knows; `bb stewards init` for the
 skeleton, then fill `project.json` (`bigDecisions` with repo-dir-prefixed
 `paths`, `deps`), `roles.json` and a short `AGENTS.md`, touching playbooks only
-where the survey found a deviation; `bb stewards check`; then
+where the survey found a deviation; `bb stewards check --create-labels`,
+which creates the project's label in each Linear team and non-excluded
+GitHub repo before validating; then
 `workspace_publish_guidance` and a pull request on the primary repo whose body
 lists every assumption. Stewards read committed `origin/main` only, so nothing
 is live until that pull request merges, and `bb stewards enable` runs only
@@ -928,8 +934,10 @@ playbook keep the steward to reading.
 [source-contract.ts](source-contract.ts) is copied byte for byte into
 `plugins/linear` and `plugins/github-watcher`; `contract.test.ts` fails when the
 copies drift. Sources serve `sourceSnapshot`, `sourceValidate`,
-`sourceAdoptable` and `sourceSetInterest`; stewards serves `stewardsRing`,
-and `stewardsSession` for linear's `@bb` mentions.
+`sourceEnsureLabel` (the label create `check --create-labels` uses, optional
+so a source without it is unavailable), `sourceAdoptable` and
+`sourceSetInterest`; stewards serves `stewardsRing`, and `stewardsSession`
+for linear's `@bb` mentions.
 
 ## Develop
 

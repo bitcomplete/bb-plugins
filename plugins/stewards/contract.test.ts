@@ -26,6 +26,19 @@ describe("source-contract.ts", () => {
     expect(isMissingPlugin(Object.assign(new Error("boom"), { code: "handler_error" }))).toBe(false);
   });
 
+  it("parses sourceEnsureLabel and its per-unit results", () => {
+    expect(sourceContract.sourceEnsureLabel.input.parse({ units: ["ENG", "acme/web"], label: "bb-managed" })).toEqual({ units: ["ENG", "acme/web"], label: "bb-managed" });
+    expect(sourceContract.sourceEnsureLabel.input.safeParse({ units: [""], label: "bb-managed" }).success).toBe(false);
+    expect(sourceContract.sourceEnsureLabel.output.parse({ results: [{ unit: "ENG", status: "created" }, { unit: "acme/web", status: "existed", error: null }, { unit: "acme/gone", status: "error", error: "no such repository" }] })).toEqual({
+      results: [
+        { unit: "ENG", status: "created", error: null },
+        { unit: "acme/web", status: "existed", error: null },
+        { unit: "acme/gone", status: "error", error: "no such repository" },
+      ],
+    });
+    expect(sourceContract.sourceEnsureLabel.output.safeParse({ results: [{ unit: "ENG", status: "failed" }] }).success).toBe(false);
+  });
+
   it("parses the deployment-read RPCs and the merge commit on the pull snapshot (BB-132)", () => {
     expect(sourceContract.sourceFileAtRef.input.parse({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" })).toEqual({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" });
     expect(sourceContract.sourceFileAtRef.input.safeParse({ repo: "", path: "x", ref: "main" }).success).toBe(false);

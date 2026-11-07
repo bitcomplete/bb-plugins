@@ -39,6 +39,7 @@ import {
   ISSUE_ID_QUERY,
   ISSUE_KEYS_QUERY,
   ISSUE_QUERY,
+  ISSUE_LABEL_CREATE,
   ISSUE_REF_QUERY,
   ISSUE_RELATION_CREATE,
   ISSUE_RELATION_DELETE,
@@ -72,6 +73,7 @@ import {
   parseIssueCreate,
   parseIssueId,
   parseIssueKeys,
+  parseIssueLabelCreate,
   parseIssueList,
   parseIssueRef,
   parseIssueRelationCreate,
@@ -611,6 +613,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       },
       sourceSnapshot: ({ id }) => sourceSnapshot(id),
       sourceValidate: (input) => sourceValidate(input),
+      sourceEnsureLabel: (input) => sourceEnsureLabel(input),
       sourceAdoptable: (input) => sourceAdoptable(input),
       sourceSearchIssues: (input) => sourceSearchIssues(input),
       // Dependabot alerts are a GitHub thing; linear has none. Stewards only
@@ -1401,6 +1404,36 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       } catch (error) {
         return { viewer: null, units: [], mine: [], error: errorMessage(error) };
       }
+    }
+
+    // Create the project's label in each team for onboarding. An existing
+    // label of that name, on the team or in the workspace, is `existed` and
+    // no mutation is sent: a team label is never created beside a workspace
+    // label of the same name. `findLabels` matches ignoring case, exactly as
+    // validation does.
+    async function sourceEnsureLabel(input: { units: string[]; label: string }) {
+      if (!(await isConnected())) return { results: input.units.map((unit) => ({ unit, status: "error" as const, error: NOT_CONNECTED })) };
+      const results: Array<{ unit: string; status: "created" | "existed" | "error"; error: string | null }> = [];
+      for (const unit of input.units) {
+        const key = unit.trim().toUpperCase();
+        try {
+          const account = await pick({ team: key }, checkSignal());
+          const team = parseTeam(await query(account.key, TEAM_QUERY, { key }, checkSignal()));
+          if (team === null) {
+            results.push({ unit, status: "error", error: `no such Linear team, or it is not visible to the connected user` });
+            continue;
+          }
+          if (findLabels(team.labels, [input.label]).missing.length === 0) {
+            results.push({ unit, status: "existed", error: null });
+            continue;
+          }
+          parseIssueLabelCreate(await query(account.key, ISSUE_LABEL_CREATE, { input: { name: input.label, teamId: team.id } }, checkSignal()));
+          results.push({ unit, status: "created", error: null });
+        } catch (error) {
+          results.push({ unit, status: "error", error: errorMessage(error) });
+        }
+      }
+      return { results };
     }
 
     /** At most this many labelled open issues are read per team, a page at a time. */

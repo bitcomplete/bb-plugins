@@ -335,6 +335,30 @@ export const sourceContract = {
     }),
   },
   /**
+   * Create the project's label in each unit that does not already carry it,
+   * for onboarding: a repeat is `existed`, not an error. Matched ignoring
+   * case, and a label of that name anywhere the unit can see (a Linear
+   * workspace label, say) counts as `existed` rather than being shadowed by
+   * a new one. Additive and optional -- a source that does not serve it is
+   * unavailable to the caller. `status` is created, existed or error;
+   * `error` says why a unit could not be created (permission, API failure).
+   */
+  sourceEnsureLabel: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      label: z.string().min(1).max(100),
+    }),
+    output: z.object({
+      results: z.array(
+        z.object({
+          unit: z.string(),
+          status: z.enum(["created", "existed", "error"]),
+          error: z.string().nullable().default(null),
+        }),
+      ),
+    }),
+  },
+  /**
    * What a nightly pass may adopt. Linear: open issues in these teams carrying
    * the label. GitHub: every open pull request in these repos, oldest first;
    * stewards decides which are labelled and which want a review.

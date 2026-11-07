@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, TARGET_QUERY } from "./github.js";
+import { labelAlreadyExists, labelPath, parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, TARGET_QUERY } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -245,6 +245,14 @@ describe("repositories", () => {
     expect(parseRepoCheck({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: null } } })).toEqual({ viewer: "dev", found: true, labelFound: false });
     expect(parseRepoCheck({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] })).toEqual({ viewer: "dev", found: false, labelFound: false });
     expect(() => parseRepoCheck({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] })).toThrow(/rate limit/u);
+  });
+
+  it("names the create-label path and reads GitHub's already_exists answer", () => {
+    expect(labelPath("Acme/Widgets")).toBe("/repos/Acme/Widgets/labels");
+    expect(labelAlreadyExists({ message: "Validation Failed", errors: [{ resource: "Label", code: "already_exists", field: "name" }] })).toBe(true);
+    expect(labelAlreadyExists({ message: "Validation Failed", errors: [{ resource: "Label", code: "missing_field", field: "name" }] })).toBe(false);
+    expect(labelAlreadyExists({ message: "Not Found" })).toBe(false);
+    expect(labelAlreadyExists(null)).toBe(false);
   });
 
   it("reads a page of open pull requests named as doorbells name them, with the next cursor", () => {

@@ -553,9 +553,13 @@ when asked to "set up stewards".
 2. Review them, commit inside `.bb`, publish with
    `workspace_publish_guidance`, and merge the `guidance-<thread>` branch.
    Edits take effect only once merged.
-3. `bb stewards check` validates the project file and playbooks against
-   Linear (teams, states, label) and GitHub (repos, label), and that this
-   server can read every ops target (and holds no write there).
+3. `bb stewards check --create-labels` first creates the project's label
+   in every Linear team and every non-excluded GitHub repo, reporting each
+   as created, existed or failed, and then validates the project file and
+   playbooks against Linear (teams, states, label) and GitHub (repos,
+   label) and that this server can read every ops target (and holds no
+   write there). A unit whose label could not be created is a `problem:`
+   line. Plain `bb stewards check` only reads and changes nothing.
 4. Label a ticket `bb-managed`. Its steward thread appears under the project
    steward's: stewards are spawned as the project steward's children with
    parent notifications off, so the sidebar nests them without waking the
