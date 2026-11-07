@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { labelAlreadyExists, labelPath, parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, TARGET_QUERY } from "./github.js";
+import { labelAlreadyExists, labelPath, parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -221,7 +221,7 @@ describe("parseSnapshot", () => {
     expect(changes.comments.at(-1)!.id).toBe("carol@2026-10-09T12:00:00Z");
     expect(changes.pull!.reviews).toEqual([{ author: "carol", state: "changes requested", submittedAt: "2026-10-09T12:00:00Z", commit: null }]);
     const issue = parseSnapshot({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: { __typename: "Issue", number: 3, title: "Bug", body: null, state: "CLOSED", stateReason: "COMPLETED", comments: { nodes: [] } } } } })!;
-    expect(issue).toMatchObject({ kind: "issue", key: "Acme/Widgets#3", state: "closed", description: null, pull: null, viewer: null });
+    expect(issue).toMatchObject({ kind: "issue", key: "Acme/Widgets#3", state: "closed (completed)", description: null, pull: null, viewer: null });
     expect(parseSnapshot({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] })).toBeNull();
   });
 
@@ -236,6 +236,116 @@ describe("parseSnapshot", () => {
     expect(last.body).toContain("more characters");
     expect(s.description!.length).toBeLessThan(SNAPSHOT_DESCRIPTION_CHARS + 40);
     expect(s.description).toContain("(5 more characters)");
+  });
+});
+
+// BB-233: a GitHub issue as a stewards entity.
+const issue = (over: Record<string, unknown> = {}) => ({
+  data: {
+    repository: {
+      nameWithOwner: "Acme/Widgets",
+      issueOrPullRequest: {
+        __typename: "Issue",
+        number: 42,
+        title: "Fix login",
+        url: "https://github.com/Acme/Widgets/issues/42",
+        createdAt: "2026-10-01T00:00:00Z",
+        updatedAt: "2026-10-02T00:00:00Z",
+        author: { login: "bob" },
+        assignees: { nodes: [] },
+        labels: { nodes: [] },
+        milestone: null,
+        comments: { nodes: [] },
+        state: "OPEN",
+        stateReason: null,
+        closedByPullRequestsReferences: { nodes: [] },
+        timelineItems: { nodes: [] },
+        ...over,
+      },
+    },
+  },
+});
+
+describe("an issue as a stewards entity (BB-233)", () => {
+  it("takes the state from exactly one status label, else open or closed with the reason", () => {
+    expect(statusLabel(["bb-managed", "status:todo"])).toBe("status:todo");
+    expect(statusLabel(["status:a", "status:b"])).toBeNull();
+    expect(statusLabel(["bb-managed"])).toBeNull();
+
+    const labelled = parseSnapshot(issue({ labels: { nodes: [{ name: "bb-managed" }, { name: "status:todo" }] } }))!;
+    expect(labelled).toMatchObject({ kind: "issue", state: "status:todo", stateType: null, labels: ["bb-managed", "status:todo"] });
+    expect(entitySnapshotSchema.parse(labelled)).toEqual(labelled);
+
+    // Several status labels are ambiguous: open. No status label: open or closed with the reason.
+    expect(parseSnapshot(issue({ labels: { nodes: [{ name: "status:a" }, { name: "status:b" }] } }))!.state).toBe("open");
+    expect(parseSnapshot(issue())!.state).toBe("open");
+    expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "NOT_PLANNED" }))!.state).toBe("closed (not planned)");
+    // A status label is the state even when the issue is closed.
+    expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "COMPLETED", labels: { nodes: [{ name: "status:done" }] } }))!.state).toBe("status:done");
+  });
+
+  it("reads linked pulls from closing references and timeline cross-references, deduped as owner/repo#n", () => {
+    const linked = parseSnapshot(
+      issue({
+        closedByPullRequestsReferences: { nodes: [{ number: 7, url: "https://github.com/Acme/Widgets/pull/7", repository: { nameWithOwner: "Acme/Widgets" } }] },
+        timelineItems: {
+          nodes: [
+            { source: { number: 7, url: "https://github.com/Acme/Widgets/pull/7", repository: { nameWithOwner: "Acme/Widgets" } } },
+            { source: { number: 9, url: "https://github.com/Other/Repo/pull/9", repository: { nameWithOwner: "Other/Repo" } } },
+            // A cross-reference from an issue, or a node GitHub returned no fields for, contributes nothing.
+            { source: {} },
+            {},
+          ],
+        },
+      }),
+    )!;
+    expect(linked.linkedPulls).toEqual([
+      { url: "https://github.com/Acme/Widgets/pull/7", key: "Acme/Widgets#7" },
+      { url: "https://github.com/Other/Repo/pull/9", key: "Other/Repo#9" },
+    ]);
+    // A pull request's linkedPulls stays empty.
+    expect(parseSnapshot(pull())!.linkedPulls).toEqual([]);
+  });
+
+  it("reads a page of open issues as adoptable entities, oldest first, with the next cursor", () => {
+    const page = (hasNextPage: boolean) => ({
+      data: {
+        viewer: { login: "dev" },
+        repository: {
+          nameWithOwner: "Acme/Widgets",
+          issues: { pageInfo: { hasNextPage, endCursor: "Y3Vy" }, nodes: [{ number: 4, createdAt: "2026-10-01T00:00:00Z", author: { login: "jane" }, labels: { nodes: [{ name: "bb-managed" }, { name: "status:todo" }] } }] },
+        },
+      },
+    });
+    expect(parseOpenIssues(page(true))).toEqual({
+      viewer: "dev",
+      entities: [{ id: "Acme/Widgets#4", key: "Acme/Widgets#4", unit: "Acme/Widgets", kind: "issue", state: "status:todo", labels: ["bb-managed", "status:todo"], author: "jane", draft: false, createdAt: "2026-10-01T00:00:00Z" }],
+      next: "Y3Vy",
+    });
+    expect(parseOpenIssues(page(false))!.next).toBeNull();
+    expect(parseOpenIssues({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] })).toBeNull();
+  });
+
+  it("reads a search page as the contract's issues, closed included, the body as the description", () => {
+    const payload = {
+      data: {
+        search: {
+          nodes: [
+            { number: 42, title: "Fix login", body: "Fingerprint: abc123", url: "https://github.com/Acme/Widgets/issues/42", state: "OPEN", stateReason: null, repository: { nameWithOwner: "Acme/Widgets" }, author: { login: "bob" }, labels: { nodes: [{ name: "status:todo" }] }, assignees: { nodes: [{ login: "dylan" }] } },
+            { number: 7, title: "Old", body: "Fingerprint: abc123", url: "https://github.com/Acme/Widgets/issues/7", state: "CLOSED", stateReason: "COMPLETED", repository: { nameWithOwner: "Acme/Widgets" }, author: { login: "jane" }, labels: { nodes: [] }, assignees: { nodes: [] } },
+            { number: 9, title: "Other repo", body: "Fingerprint: abc123", state: "OPEN", repository: { nameWithOwner: "Acme/Gadgets" }, author: { login: "bob" }, labels: { nodes: [] }, assignees: { nodes: [] } },
+            // A pull request in the search results carries no Issue fragment fields and is skipped.
+            {},
+          ],
+        },
+      },
+    };
+    expect(parseSearchIssues(payload)).toEqual([
+      { id: "Acme/Widgets#42", key: "Acme/Widgets#42", title: "Fix login", description: "Fingerprint: abc123", state: "status:todo", stateType: null, unit: "Acme/Widgets", assignee: "dylan" },
+      { id: "Acme/Widgets#7", key: "Acme/Widgets#7", title: "Old", description: "Fingerprint: abc123", state: "closed (completed)", stateType: null, unit: "Acme/Widgets", assignee: null },
+      { id: "Acme/Gadgets#9", key: "Acme/Gadgets#9", title: "Other repo", description: "Fingerprint: abc123", state: "open", stateType: null, unit: "Acme/Gadgets", assignee: null },
+    ]);
+    expect(() => parseSearchIssues({ data: null, errors: [{ type: "RATE_LIMITED", message: "slow down" }] })).toThrow(/slow down/u);
   });
 });
 

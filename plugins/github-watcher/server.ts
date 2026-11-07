@@ -26,8 +26,10 @@ import {
   GITHUB_API_URL,
   GitHubRequestError,
   LATEST_COMMIT_QUERY,
+  OPEN_ISSUES_QUERY,
   OPEN_PULLS_QUERY,
   REPO_CHECK_QUERY,
+  SEARCH_ISSUES_QUERY,
   TARGET_QUERY,
   VIEWER_QUERY,
   comparePath,
@@ -44,11 +46,13 @@ import {
   parseDeployments,
   parseFileAtRef,
   parseLatestCommit,
+  parseOpenIssues,
   parseOpenPulls,
   parseRef,
   parseRefKey,
   parseRepo,
   parseRepoCheck,
+  parseSearchIssues,
   parseSnapshot,
   parseTarget,
   parseViewer,
@@ -61,7 +65,7 @@ import {
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
-import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type WorkflowRun } from "./source-contract.js";
+import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type SearchIssue, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -559,10 +563,11 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { snapshot: parseSnapshot(await readTargetPayload(ref, checkSignal())) };
       },
 
-      // States are Linear's; GitHub has none to check. A gh that is not
-      // signed in is an answer here (`error`), not a failure: it is the
-      // first thing `bb stewards check` should say.
-      async sourceValidate({ units, label }) {
+      // The repository's label, and each of `states` as a label name (the
+      // GitHub side of a playbook's states: a status label). A gh that is not
+      // signed in is an answer here (`error`), not a failure: it is the first
+      // thing `bb stewards check` should say.
+      async sourceValidate({ units, label, states }) {
         let viewer: string;
         try {
           viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
@@ -573,8 +578,19 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         try {
           for (const unit of units) {
             const repo = parseRepo(unit);
-            const found = repo === null ? { found: false, labelFound: false } : parseRepoCheck(await query(REPO_CHECK_QUERY, { ...repo, label }, checkSignal()));
-            checked.push({ unit, found: found.found, labelFound: found.labelFound, missingStates: [] });
+            if (repo === null) {
+              checked.push({ unit, found: false, labelFound: false, missingStates: [] });
+              continue;
+            }
+            const found = parseRepoCheck(await query(REPO_CHECK_QUERY, { ...repo, label }, checkSignal()));
+            const missingStates: string[] = [];
+            if (found.found) {
+              for (const state of states) {
+                const check = parseRepoCheck(await query(REPO_CHECK_QUERY, { ...repo, label: state }, checkSignal()));
+                if (!check.labelFound) missingStates.push(state);
+              }
+            }
+            checked.push({ unit, found: found.found, labelFound: found.labelFound, missingStates });
           }
         } catch (error) {
           return { viewer, units: [], mine: [], error: errorMessage(error) };
@@ -616,8 +632,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       },
 
       // Each repository is read oldest first up to the limit, so the oldest
-      // `limit` across all of them are among what was read.
-      async sourceAdoptable({ units, limit }) {
+      // `limit` across all of them are among what was read. Pull requests and
+      // the open issues carrying the label are merged into the one list.
+      async sourceAdoptable({ units, label, limit }) {
         let viewer: string;
         try {
           viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
@@ -626,25 +643,39 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         }
         const entities: AdoptableEntity[] = [];
         const errors: string[] = [];
+        // One list paged oldest first up to `limit`; null when the repository
+        // is not there or not visible.
+        const readAll = async (document: string, variables: Record<string, unknown>, parse: (payload: unknown) => { entities: AdoptableEntity[]; next: string | null } | null): Promise<AdoptableEntity[] | null> => {
+          const out: AdoptableEntity[] = [];
+          let after: string | null = null;
+          do {
+            const page = parse(await query(document, { ...variables, first: Math.min(100, limit - out.length), after }, checkSignal()));
+            if (page === null) return null;
+            out.push(...page.entities);
+            after = page.next;
+          } while (after !== null && out.length < limit);
+          return out;
+        };
         for (const unit of units) {
           const repo = parseRepo(unit);
           if (repo === null) {
             errors.push(`${unit}: not owner/repo`);
             continue;
           }
+          const missing = `${unit}: no such repository, or it is not visible to the signed-in GitHub user`;
           try {
-            let after: string | null = null;
-            let read = 0;
-            do {
-              const page = parseOpenPulls(await query(OPEN_PULLS_QUERY, { ...repo, first: Math.min(100, limit - read), after }, checkSignal()));
-              if (page === null) {
-                errors.push(`${unit}: no such repository, or it is not visible to the signed-in GitHub user`);
-                break;
-              }
-              entities.push(...page.entities);
-              read += page.entities.length;
-              after = page.next;
-            } while (after !== null && read < limit);
+            const pulls = await readAll(OPEN_PULLS_QUERY, { ...repo }, parseOpenPulls);
+            if (pulls === null) {
+              errors.push(missing);
+              continue;
+            }
+            entities.push(...pulls);
+            const issues = await readAll(OPEN_ISSUES_QUERY, { ...repo, labels: [label] }, parseOpenIssues);
+            if (issues === null) {
+              errors.push(missing);
+              continue;
+            }
+            entities.push(...issues);
           } catch (error) {
             errors.push(`${unit}: ${errorMessage(error)}`);
           }
@@ -653,11 +684,26 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { viewer, entities: entities.slice(0, limit), errors };
       },
 
-      // GitHub has no issue search; stewards' dedup asks for it, and this
-      // says so rather than failing, so the wake can tell the steward to
-      // search itself before filing. Only Linear serves it.
-      async sourceSearchIssues() {
-        return { issues: [], unsupported: true, errors: [] };
+      // Issues matching a body term, one search per repository, closed
+      // included: what stewards' dedup asks for. A repository that cannot be
+      // read is an error rather than a failure of the whole call.
+      async sourceSearchIssues({ units, query: term, limit }) {
+        const issues: SearchIssue[] = [];
+        const errors: string[] = [];
+        for (const unit of units) {
+          const repo = parseRepo(unit);
+          if (repo === null) {
+            errors.push(`${unit}: not owner/repo`);
+            continue;
+          }
+          try {
+            const q = `repo:${repo.owner}/${repo.name} in:body ${term}`;
+            issues.push(...parseSearchIssues(await query(SEARCH_ISSUES_QUERY, { q, first: limit }, checkSignal())));
+          } catch (error) {
+            errors.push(`${unit}: ${errorMessage(error)}`);
+          }
+        }
+        return { issues: issues.slice(0, limit), unsupported: false, errors };
       },
 
       // A repository's Dependabot alerts, read with the token through the

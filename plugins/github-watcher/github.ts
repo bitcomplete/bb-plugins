@@ -4,7 +4,7 @@
 // function that talks to the network takes its fetch as an argument, and no
 // token appears in anything this module returns or throws.
 import { z } from "zod";
-import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type CompareStatus, type DependabotAlert, type DependabotSeverity, type EntitySnapshot, type WorkflowRunInfo } from "./source-contract.js";
+import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type CompareStatus, type DependabotAlert, type DependabotSeverity, type EntitySnapshot, type SearchIssue, type WorkflowRunInfo } from "./source-contract.js";
 
 export const GITHUB_URL = "https://github.com";
 export const GITHUB_API_URL = "https://api.github.com";
@@ -81,6 +81,19 @@ export function parseRepo(input: string): { owner: string; name: string } | null
   return m === null ? null : { owner: m[1]!, name: m[2]! };
 }
 
+/** The prefix of the label names source-contract.ts documents as status labels (`status:<phase>`). */
+export const STATUS_LABEL_PREFIX = "status:";
+
+/**
+ * The issue's state from its labels: the one label named `status:<phase>`,
+ * exactly one, or null when there is none or several. The label's name is the
+ * state a playbook keys its phases on (source-contract.ts).
+ */
+export function statusLabel(labels: readonly string[]): string | null {
+  const found = labels.filter((l) => l.toLowerCase().startsWith(STATUS_LABEL_PREFIX));
+  return found.length === 1 ? found[0]! : null;
+}
+
 // ---- the request ---------------------------------------------------------------
 
 type FetchLike = (url: string | URL, init: RequestInit) => Promise<Response>;
@@ -132,7 +145,9 @@ const COMMON_FIELDS = `number title body url createdAt updatedAt author ${ACTOR}
  * head, and who the token is).
  */
 export const TARGET_QUERY = `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner issueOrPullRequest(number: $number) { __typename
-  ... on Issue { ${COMMON_FIELDS} state stateReason }
+  ... on Issue { ${COMMON_FIELDS} state stateReason
+    closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { number url repository { nameWithOwner } } }
+    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) { nodes { ... on CrossReferencedEvent { source { ... on PullRequest { number url repository { nameWithOwner } } } } } } }
   ... on PullRequest { ${COMMON_FIELDS} state isDraft merged reviewDecision headRefName headRefOid baseRefName
     mergeCommit { oid }
     files(first: 100) { nodes { path } }
@@ -177,7 +192,15 @@ const common = {
   milestone: z.object({ title: z.string() }).nullish(),
   comments: z.object({ nodes: z.array(commentNode) }).nullish(),
 };
-const issueNode = z.object({ __typename: z.literal("Issue"), ...common, state: z.string(), stateReason: z.string().nullish() });
+const linkedPullNode = z.object({ number: z.number().nullish(), url: z.string().nullish(), repository: z.object({ nameWithOwner: z.string() }).nullish() });
+const issueNode = z.object({
+  __typename: z.literal("Issue"),
+  ...common,
+  state: z.string(),
+  stateReason: z.string().nullish(),
+  closedByPullRequestsReferences: z.object({ nodes: z.array(linkedPullNode) }).nullish(),
+  timelineItems: z.object({ nodes: z.array(z.object({ source: linkedPullNode.nullish() })) }).nullish(),
+});
 const pullNode = z.object({
   __typename: z.literal("PullRequest"),
   ...common,
@@ -370,6 +393,31 @@ const sortComments = <C extends Comment>(comments: C[]): C[] => [...comments].so
 export const clipText = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 
 /**
+ * An issue's linked pull requests: the ones that close it, plus the pull
+ * requests cross-referenced in its timeline, deduped, each as its URL and
+ * "owner/repo#n" when the number and repository are there (source-contract.ts).
+ */
+function linkedPullsOf(node: z.infer<typeof issueNode>): Array<{ url: string; key: string | null }> {
+  const out: Array<{ url: string; key: string | null }> = [];
+  const seen = new Set<string>();
+  const add = (p: z.infer<typeof linkedPullNode> | null | undefined) => {
+    if (p === null || p === undefined) return;
+    const repo = p.repository?.nameWithOwner ?? null;
+    const number = typeof p.number === "number" ? p.number : null;
+    const key = repo !== null && number !== null ? `${repo}#${number}` : null;
+    const url = p.url ?? (key === null ? null : `https://github.com/${key}`);
+    if (url === null) return;
+    const dedupe = key ?? url;
+    if (seen.has(dedupe)) return;
+    seen.add(dedupe);
+    out.push({ url, key });
+  };
+  for (const p of node.closedByPullRequestsReferences?.nodes ?? []) add(p);
+  for (const item of node.timelineItems?.nodes ?? []) add(item.source);
+  return out;
+}
+
+/**
  * The same read as stewards' contract wants it (source-contract.ts): the
  * state a playbook keys its phases on (open, draft, merged, closed), the
  * description, the newest comments with ids and the thread whose signature
@@ -409,7 +457,7 @@ export function parseSnapshot(payload: unknown): EntitySnapshot | null {
     pull: null,
     viewer: read.viewer,
   };
-  if (node.__typename === "Issue") return { ...snapshot, state: node.state.toLowerCase() === "closed" ? "closed" : "open" };
+  if (node.__typename === "Issue") return { ...snapshot, state: statusLabel(target.labels) ?? (node.state.toLowerCase() === "closed" ? target.state : "open"), linkedPulls: linkedPullsOf(node) };
   const merged = node.merged === true;
   const draft = node.isDraft === true;
   const state = merged ? "merged" : node.state.toLowerCase() !== "open" ? "closed" : draft ? "draft" : "open";
@@ -522,6 +570,116 @@ export function parseOpenPulls(payload: unknown): { viewer: string | null; entit
 
 /** "pull request" or "issue", for prose. */
 export const kindName = (kind: Target["kind"]): string => (kind === "pull" ? "pull request" : "issue");
+
+// ---- issues, for stewards -----------------------------------------------------
+
+/** One page of a repository's open issues carrying a label, oldest created first: the other half of what a nightly pass may adopt. */
+export const OPEN_ISSUES_QUERY = `query($owner: String!, $name: String!, $labels: [String!]!, $first: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner
+  issues(states: OPEN, labels: $labels, first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) { pageInfo { hasNextPage endCursor }
+    nodes { number createdAt author ${ACTOR} labels(first: 50) { nodes { name } } } } } }`;
+
+const openIssuesPayload = z.object({
+  data: z
+    .object({
+      viewer: actor,
+      repository: z
+        .object({
+          nameWithOwner: z.string(),
+          issues: z.object({
+            pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullish() }),
+            nodes: z.array(z.object({ number: z.number(), createdAt: z.string().nullish(), author: actor, labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish() })),
+          }),
+        })
+        .nullable(),
+    })
+    .nullable(),
+});
+
+/** One page as adoptable entities, an issue's state its status label or open; null when the repository is not there or not visible. */
+export function parseOpenIssues(payload: unknown): { viewer: string | null; entities: AdoptableEntity[]; next: string | null } | null {
+  const errors = graphqlErrors(payload);
+  const parsed = openIssuesPayload.safeParse(payload);
+  if (!parsed.success) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : "GitHub answered without data");
+  if (errors.length > 0 && errorTypes(payload).some((t) => t !== "NOT_FOUND")) throw new Error(`GitHub: ${errors.join("; ")}`);
+  const repository = parsed.data.data?.repository ?? null;
+  if (repository === null) return null;
+  const repo = repository.nameWithOwner;
+  const page = repository.issues;
+  return {
+    viewer: parsed.data.data?.viewer?.login ?? null,
+    entities: page.nodes.map((n) => {
+      const labels = (n.labels?.nodes ?? []).map((l) => l.name).sort();
+      return {
+        id: `${repo}#${n.number}`,
+        key: `${repo}#${n.number}`,
+        unit: repo,
+        kind: "issue" as const,
+        state: statusLabel(labels) ?? "open",
+        labels,
+        author: n.author?.login ?? null,
+        draft: false,
+        createdAt: n.createdAt ?? null,
+      };
+    }),
+    next: page.pageInfo.hasNextPage ? (page.pageInfo.endCursor ?? null) : null,
+  };
+}
+
+/** Issues matching a body term in one repository, closed included, for stewards' dedup. */
+export const SEARCH_ISSUES_QUERY = `query($q: String!, $first: Int!) { search(type: ISSUE, query: $q, first: $first) { nodes { ... on Issue {
+  number title body url state stateReason repository { nameWithOwner } author ${ACTOR} labels(first: 50) { nodes { name } } assignees(first: 1) { nodes { login } } } } } }`;
+
+const searchIssuesPayload = z.object({
+  data: z
+    .object({
+      search: z
+        .object({
+          nodes: z.array(
+            z.object({
+              number: z.number().nullish(),
+              title: z.string().nullish(),
+              body: z.string().nullish(),
+              url: z.string().nullish(),
+              state: z.string().nullish(),
+              stateReason: z.string().nullish(),
+              repository: z.object({ nameWithOwner: z.string() }).nullish(),
+              author: actor,
+              labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+              assignees: z.object({ nodes: z.array(z.object({ login: z.string() })) }).nullish(),
+            }),
+          ),
+        })
+        .nullable(),
+    })
+    .nullable(),
+});
+
+/** The search results as the contract's issues: "owner/repo#n", state from the status label, and the description the caller matches a fingerprint in. */
+export function parseSearchIssues(payload: unknown): SearchIssue[] {
+  const errors = graphqlErrors(payload);
+  const parsed = searchIssuesPayload.safeParse(payload);
+  if (!parsed.success) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : "GitHub answered without data");
+  if (errors.length > 0) throw new Error(`GitHub: ${errors.join("; ")}`);
+  const issues: SearchIssue[] = [];
+  for (const n of parsed.data.data?.search?.nodes ?? []) {
+    const repo = n.repository?.nameWithOwner;
+    if (repo === undefined || repo === null || n.number === null || n.number === undefined) continue;
+    const labels = (n.labels?.nodes ?? []).map((l) => l.name).sort();
+    const closed = (n.state ?? "").toLowerCase() === "closed";
+    const state = statusLabel(labels) ?? (closed ? (n.stateReason ? `closed (${lower(n.stateReason)})` : "closed") : "open");
+    issues.push({
+      id: `${repo}#${n.number}`,
+      key: `${repo}#${n.number}`,
+      title: n.title ?? null,
+      description: n.body ?? null,
+      state,
+      stateType: null,
+      unit: repo,
+      assignee: n.assignees?.nodes[0]?.login ?? null,
+    });
+  }
+  return issues;
+}
 
 // ---- Dependabot alerts -------------------------------------------------------------
 
