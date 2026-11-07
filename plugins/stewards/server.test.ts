@@ -8953,6 +8953,33 @@ describe("GitHub filing targets (BB-235)", () => {
     const validate = t.rpcCalls.filter((c) => c.method === "sourceValidate" && c.pluginId === "github-watcher").at(-1)!;
     expect(validate.input).toMatchObject({ units: ["acme/web"], states: expect.arrayContaining(["priority:urgent", "priority:high"]) });
   });
+
+  it("creates the priority labels and status:todo in the GitHub filing repo with check --create-labels", async () => {
+    const t = await setup();
+    // A role names the GitHub filing target, so the legacy-ops migration line
+    // is not in play.
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { ops: { team: "acme/web", autoAdopt: ["urgent"] } }, holders: { jane: ["ops", "projectSteward"] } });
+    const check = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).toContain("created label priority:urgent in github repo acme/web");
+    expect(check.stdout).toContain("created label priority:high in github repo acme/web");
+    expect(check.stdout).toContain("created label status:todo in github repo acme/web");
+    // The project label is ensured in every repo; the priority labels and
+    // status:todo only in the filing repo (BB-236's ensureLabels, no new RPC).
+    expect(t.labelEnsureCalls).toEqual([
+      { source: "github", units: ["acme/web", "acme/bb"], label: "bb-managed" },
+      { source: "github", units: ["acme/web"], label: "priority:urgent" },
+      { source: "github", units: ["acme/web"], label: "priority:high" },
+      { source: "github", units: ["acme/web"], label: "status:todo" },
+    ]);
+    // A second run is idempotent: everything is `existed`.
+    const again = await t.harness.behavior.runCli(["check", "--create-labels", "--project", "p1"]);
+    expect(again.exitCode).toBe(0);
+    expect(again.stdout).toContain("existed label priority:urgent in github repo acme/web");
+    expect(again.stdout).toContain("existed label status:todo in github repo acme/web");
+    expect(again.stdout).not.toContain("created label priority:urgent");
+  });
 });
 
 describe("lessons", () => {

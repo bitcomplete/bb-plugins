@@ -95,6 +95,9 @@ export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-
 /** The ticket playbook a GitHub-tracked project carries; the default for a project with no Linear teams. */
 export const DEFAULT_GITHUB_TICKET_PLAYBOOK = "github-issues";
 
+/** The label a GitHub issue carries to mean "todo", the phase a filed autoAdopt issue starts in (BB-234, BB-235). */
+export const GITHUB_TODO_LABEL = "status:todo";
+
 /** The playbooks the dependency watch uses: one for alert targets, one for the bot's pull requests. */
 export const DEPS_ALERTS_PLAYBOOK = "deps-alerts";
 export const DEPS_PRS_PLAYBOOK = "deps-prs";

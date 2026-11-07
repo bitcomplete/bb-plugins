@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { formatDuration, GITHUB_TODO_LABEL, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
@@ -771,7 +771,7 @@ function autoAdoptInstruction(target: FilingTarget | null, autoAdopt: string[], 
   const what = kind === "deps" ? `a ticket you file for a ${autoAdopt.join(" or ")} alert` : `a ticket you file at ${autoAdopt.join(" or ")} priority`;
   const adopt =
     target?.source === "github"
-      ? `add the labels \`${label}\`, \`status:todo\` and \`priority:<level>\` (the priority the ${kind === "deps" ? "alert" : "ticket"} is filed at) when you file it`
+      ? `add the labels \`${label}\`, \`${GITHUB_TODO_LABEL}\` and \`priority:<level>\` (the priority the ${kind === "deps" ? "alert" : "ticket"} is filed at) when you file it`
       : `add the label \`${label}\` and move it to Todo when you file it`;
   return `${kind}.autoAdopt: ${what} is adopted at once: ${adopt}, and raise no escalation for it. Say in your report that you did.`;
 }
@@ -949,7 +949,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
   if (input.autoAdopt.length > 0) out.push(autoAdoptInstruction(input.target, input.autoAdopt, input.label, "deps"));
   const allowDismiss = playbook.may.includes("dismiss-alert");
   const githubTarget = input.target?.source === "github";
-  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`status:todo\`` : `add the label \`${input.label}\` and move the ticket to Todo`;
+  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`${GITHUB_TODO_LABEL}\`` : `add the label \`${input.label}\` and move the ticket to Todo`;
   const dismissAction = githubTarget ? "close the issue with a comment saying why" : "move the ticket to Done with a comment saying why";
   const keepAction = githubTarget
     ? "keep the issue open and unadopted and update the due date in the body to the one the note gives, or by one SLA window from today when it gives none"

@@ -825,7 +825,9 @@ plugin until answered, with one overdue reminder). A GitHub filing target
 (`ops.team`, or a role's `team`, an `owner/repo` in `repos.json`) files with
 `gh issue create`, assigned to this server's GitHub login, and reads state,
 dedup and auto-adoption through the github source exactly as a Linear team
-does through linear.
+does through linear; `bb stewards check --create-labels` creates the
+`priority:<level>` labels its `autoAdopt` names in the filing repo (and
+`status:todo` when no `github-issues` playbook already creates it there).
 `deps-alerts.md` and `deps-prs.md` are optional: a project that has not
 written them runs no dependency watch. `bb stewards init` writes them, and
 `bb stewards check` validates `deps.sla`, `deps.batch` and `deps.autoAdopt`

@@ -578,7 +578,11 @@ when asked to "set up stewards".
    as created, existed or failed. For a `github-issues` ticket playbook it
    also creates each status label the playbook names (`status:todo`,
    `status:in-progress`, …) in every repo, since a GitHub issue's state is
-   a label. It then validates the project file and
+   a label. When `ops.team` or a role's `team` is a GitHub repo, it also
+   creates the `priority:<level>` labels `ops.autoAdopt` and
+   `deps.autoAdopt` name in that repo (and `status:todo` when no
+   `github-issues` playbook already creates it there). It then validates the
+   project file and
    playbooks against Linear (teams, states, label) and GitHub (repos,
    label, status labels) and that this server can read every ops target (and
    holds no write there). A unit whose label could not be created is a

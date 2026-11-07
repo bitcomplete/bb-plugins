@@ -35,6 +35,7 @@ import {
   filingTargetOf,
   filingTargetProblems,
   formatDuration,
+  GITHUB_TODO_LABEL,
   githubStateLabels,
   isTerminal,
   legacyOpsPresent,
@@ -9698,6 +9699,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // (BB-164).
       const watches = rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file));
       if (watches.length > 0) lines.push(`pulls: ${watches.map((w) => pullWatchId(w)).join(", ")}`);
+      const filing = roleOpsTeam(config.role, config.file);
+      // BB-235: a GitHub filing target needs the priority labels its autoAdopt
+      // names, and `status:todo` so an autoAdopt issue is adopted as a ticket.
+      // BB-236's `ensureLabels` creates them; check reports a filing repo that
+      // lacks one. The labels are computed once, for the ensure and the check.
+      const filingGithub = filing !== null && filing.source === "github" ? filing.target : null;
+      const priorityLabels: string[] = [];
+      if (filingGithub !== null) {
+        const priorities = new Set<string>();
+        for (const p of config.role?.ops?.autoAdopt ?? []) priorities.add(priorityLabel(p));
+        for (const s of config.file.deps.autoAdopt) priorities.add(priorityLabelForSeverity(s));
+        priorityLabels.push(...priorities);
+      }
       if (options.createLabels === true) {
         await ensureLabels("linear", config.file.linear.teams, config.file.label, lines);
         await ensureLabels("github", config.repos, config.file.label, lines);
@@ -9706,6 +9720,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // repo, reporting created/existed/failed per label. GitHub's own
         // derived states (open, closed (reason)) are not labels and are skipped.
         if (githubTicket !== null) for (const label of githubStateLabels(githubTicket)) await ensureLabels("github", config.repos, label, lines);
+        // BB-235: the filing repo's priority labels, and `status:todo` when no
+        // `github-issues` playbook already creates it in every repo.
+        if (filingGithub !== null && priorityLabels.length > 0) {
+          for (const label of priorityLabels) await ensureLabels("github", [filingGithub], label, lines);
+          if (githubTicket === null) await ensureLabels("github", [filingGithub], GITHUB_TODO_LABEL, lines);
+        }
       }
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
@@ -9723,16 +9743,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket));
       await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket));
-      const filing = roleOpsTeam(config.role, config.file);
-      // BB-235: a GitHub filing target needs the priority labels its autoAdopt
-      // names. The onboarding label step (BB-236/BB-234) creates them; check
-      // only reports a filing repo that lacks one, in the repo set above.
-      if (filing !== null && filing.source === "github") {
-        const priorities = new Set<string>();
-        for (const p of config.role?.ops?.autoAdopt ?? []) priorities.add(priorityLabel(p));
-        for (const s of config.file.deps.autoAdopt) priorities.add(priorityLabelForSeverity(s));
-        if (priorities.size > 0) await validate("github", [filing.target], [...priorities]);
-      }
+      if (filingGithub !== null && priorityLabels.length > 0) await validate("github", [filingGithub], priorityLabels);
       if (usesKind(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];
         const context = config.role?.ops?.context;
