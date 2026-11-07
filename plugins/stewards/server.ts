@@ -5978,19 +5978,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * stays in the wake as context. It belongs when a worker of the binding
      * reported or opened it (`ownPulls`), or its head branch or title names
      * the ticket: the worker branch convention `bb/<owner>-<repo>-<n>-…`, or
-     * `(#<n>)` in the title. The closing set is not in the snapshot contract,
-     * so a closing pull request with neither a worker nor a naming branch or
-     * title is not recognized in this first cut (BB-239 spec).
+     * the ticket named in the title (`(#<n>)` for a GitHub issue, the key
+     * `ENG-12`/`BB-239` for a Linear ticket). The closing set is not in the
+     * snapshot contract, so a closing pull request with neither a worker nor a
+     * naming branch or title is not recognized in this first cut (BB-239 spec).
      */
     function pullBelongsToTicket(b: Binding, pull: EntitySnapshot, ownPulls: ReadonlySet<string>): boolean {
+      const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
       if (ownPulls.has(lc(pull.key)) || (pull.url !== null && ownPulls.has(lc(pull.url)))) return true;
       const key = b.entityKey.trim();
       const number = /(\d+)$/u.exec(key)?.[1] ?? null;
       if (number === null) return false;
       const slug = lc(key).replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "");
       const head = lc(pull.pull?.head ?? "");
-      if (head !== "" && slug !== "" && new RegExp(`(?:^|[-/])${slug.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?:[-/]|$)`, "u").test(head)) return true;
-      return (pull.title ?? "").includes(`(#${number})`);
+      if (head !== "" && slug !== "" && new RegExp(`(?:^|[-/])${escape(slug)}(?:[-/]|$)`, "u").test(head)) return true;
+      const title = pull.title ?? "";
+      // A GitHub issue's worker titles its pull request with the issue number,
+      // and only a pull request in the issue's own repo counts (a different
+      // repo's #12 is not this ticket). A Linear ticket's title names the key
+      // (e.g. "… (ENG-12)"); `(#<n>)` there would be a GitHub number and could
+      // match another repo's pull request (BB-239 review round 1).
+      const repo = key.includes("#") ? key.slice(0, key.indexOf("#")) : "";
+      if (b.source === "github") return title.includes(`(#${number})`) && lc(pull.unit) === lc(repo);
+      return new RegExp(`(?:^|[^a-z0-9])${escape(lc(key))}(?:[^a-z0-9]|$)`, "u").test(lc(title));
     }
 
     /**

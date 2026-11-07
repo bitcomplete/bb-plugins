@@ -7363,7 +7363,7 @@ describe("needs you items", () => {
     ] }));
     // #7 only mentions ENG-12: neither its branch nor its title names the
     // ticket, so its gate items belong to the binding that owns it.
-    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Mentions ENG-12", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Related to the login work", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
     // #8 follows the worker branch convention for ENG-12 and belongs to it.
     t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Fix login", comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
@@ -7376,7 +7376,7 @@ describe("needs you items", () => {
   it("BB-239: closes items and an escalation already filed for a non-belonging pull request", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
-    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Mentions ENG-12", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Related to the login work", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
     const url = "https://github.com/acme/web/pull/7";
@@ -7407,6 +7407,57 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "approval")).toBe(false);
+  });
+
+  // Each belonging rule in isolation, so a future change that drops one is
+  // caught (BB-239 review round 1).
+  it("BB-239: a worker's branch owns a pull request on that head even when the branch does not name the ticket", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", comments: [marker, owner] }, { head: "retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "retry" });
+    t.hooks.store.setWorker("thr_w1", "stopped", null);
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+  });
+
+  it("BB-239: a worker's final message that names the pull request owns it on a foreign branch", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "retry" });
+    t.hooks.store.setWorker("thr_w1", "stopped", "Opened https://github.com/acme/web/pull/7 for review.");
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+  });
+
+  it("BB-239: a title that names the ticket owns the pull request on a foreign branch", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+  });
+
+  it("BB-239: a GitHub issue's title number owns only a pull request in the issue's repo", async () => {
+    const t = await setup();
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", linkedPulls: [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/other#14", url: "https://github.com/acme/other/pull/14" },
+    ] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", unit: "acme/web", title: "Fix login (#14)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/other#14", pull({ id: "acme/other#14", key: "acme/other#14", url: "https://github.com/acme/other/pull/14", unit: "acme/other", title: "Fix login (#14)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#14");
+    const b = t.hooks.store.find("acme/web#14", "p1")!;
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "merge").map((n) => n.url)).toEqual(["https://github.com/acme/web/pull/7"]);
   });
 });
 
