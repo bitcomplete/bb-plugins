@@ -1889,10 +1889,12 @@ itself opens the effort's detail view (BB-85), where the free-text answer and
 the secret form live. The inline block adds no write path the page does not
 already make. The
 project picker popover (BB-181) carries each project's count in its row. That
-count is the server's needs-you binding count (`needsCount`, the open bindings with
-`needsUser`, so the stewarded half and the yellow rows cannot disagree) plus the
-project's unread one-off thread roots, computed on the client from the host's
-live thread view so every option gets it (BB-160). The RPC carries, per project,
+count is the server's needs-you binding count (`needsCount`, every open binding
+with an open need, question or route-`user` escalation — broader than
+`needsUser` since BB-237, which drops a need the server cannot act on yet, so
+the pill can exceed the yellow rows) plus the project's unread one-off thread
+roots, computed on the client from the host's live thread view so every option
+gets it (BB-160). The RPC carries, per project,
 the claimed thread ids — the project steward, each binding's steward thread, and
 every worker the store holds — so a steward or worker thread in a project whose
 bindings this call does not carry is not mistaken for a one-off root (BB-160). A

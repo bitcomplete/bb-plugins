@@ -1208,14 +1208,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
   /**
    * The picker's needs count (BB-104): one statement per project, so the
    * sidebar does not parse every binding and run three more queries each. It
-   * mirrors `needsUser`: an open escalation routed to the user (route `user`),
-   * need or question. The open predicates are the ones `openEscalations`,
-   * `openNeeds` and `openQuestions` use, so the count and the yellow rows
-   * cannot disagree. An escalation routed to the project steward, the binding's
-   * own steward or its parent does not count (BB-208). A report whose actor is
-   * `user` no longer counts by itself: the plugin files a need from it (BB-213),
-   * so the actor contributes only through that open row, and a "needs you"
-   * binding always has an item to press.
+   * counts an open escalation routed to the user (route `user`), an open need
+   * or a question, the open predicates `openEscalations`, `openNeeds` and
+   * `openQuestions` use. An escalation routed to the project steward, the
+   * binding's own steward or its parent does not count (BB-208). A report whose
+   * actor is `user` no longer counts by itself: the plugin files a need from it
+   * (BB-213), so the actor contributes only through that open row. Since
+   * BB-237 the row phrase is narrower than this count — a need the server cannot
+   * act on yet is not a yellow row — so the picker may count a binding the
+   * sidebar does not list; the count stays "everything waiting on the user".
    */
   const countNeedsUserStmt = db.prepare<[string], { n: number }>(
     `SELECT COUNT(*) AS n FROM bindings b
@@ -1808,6 +1809,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return rowToBinding(getBinding.get(id)!);
     },
     patch,
+    /**
+     * Ring the project's refetch channel without writing a column, for a change
+     * only the caller can compute: a snapshot that flips an open need's
+     * actionability or `why` (BB-237). It joins the turn's coalesced signal, so
+     * a reconcile that also changed a visible column still publishes once.
+     */
+    signal(projectId: string, columns: readonly string[] = []): void {
+      projectChanged(projectId, columns);
+    },
     /** Queue a reason for the next judgment turn; a quiet one waits for a turn something else makes due. */
     note(id: string, text: string, quiet = false): Binding {
       const b = rowToBinding(getBinding.get(id)!);

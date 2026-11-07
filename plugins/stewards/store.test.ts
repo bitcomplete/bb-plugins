@@ -123,11 +123,12 @@ describe("needs you items", () => {
 });
 
 describe("countNeedsUser (BB-104)", () => {
-  // The same predicate `needsUser` in server.ts evaluates from the store's own
-  // reads, so the SQL count and the yellow rows cannot drift. Only a route-`me`
-  // escalation counts (BB-208); project, steward and parent ones do not. The
-  // status actor does not count by itself (BB-213): the report files a need, so
-  // the actor is true only through the open row, and a badge always has an item.
+  // The same predicate the SQL count evaluates from the store's own reads.
+  // Only a route-`me` escalation counts (BB-208); project, steward and parent
+  // ones do not. The status actor does not count by itself (BB-213): the report
+  // files a need, so the actor is true only through the open row. The server's
+  // row predicate is narrower since BB-237 (a non-actionable need is not a
+  // yellow row), but the count is still every open item waiting on the user.
   const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
     s.openEscalations(b.id).some((x) => x.route === "user") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
 

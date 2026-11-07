@@ -2406,23 +2406,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Whether anything on a binding needs the user: an escalation routed to the
-     * user (route `user`) is open, a question about it is unanswered, or a needs
-     * item is on the Stewards page. An escalation routed to the project
-     * steward, the binding's own steward or its parent does not: the owner has
-     * nothing to press for it (BB-208). A report whose `actor` is `user` does
-     * not count by itself (BB-213): the report files a need from its
-     * `nextAction`, so the actor is true only as far as that item makes it true,
-     * and a "needs you" row always has a non-empty "Needs you" section. Such a
-     * steward's row stays visible and unread; a "nothing to do yet" turn is
-     * neither.
+     * Whether anything on a binding needs the user: an actionable open need, an
+     * open question about it, or an escalation routed to the user (route
+     * `user`) that no question or need covers. An escalation routed to the
+     * project steward, the binding's own steward or its parent does not: the
+     * owner has nothing to press for it (BB-208). A report whose `actor` is
+     * `user` does not count by itself (BB-213): the report files a need from its
+     * `nextAction`, so the actor is true only as far as that item makes it true.
+     * A need the server cannot act on yet is not listed by the sidebar, so it
+     * does not make the row say "needs you" either (BB-237): the phrase and the
+     * items under it are `needsYou(projectId, { actionableOnly: true })`.
      */
     function needsUser(b: Binding): boolean {
-      return (
-        store.openEscalations(b.id).some((x) => x.route === "user") ||
-        store.openNeeds(b.id).length > 0 ||
-        store.openQuestions(b.projectId).some((q) => q.bindingId === b.id)
+      // The same predicate as `needsYou(projectId, { actionableOnly: true })`,
+      // read per binding so the board and sidebar can ask about one row without
+      // recomputing every binding's needs (BB-237). A need only counts when
+      // `needView` would offer a button; a with-user escalation a question or a
+      // need covers is that item's, not the raw row's, so the `covered` set is
+      // the one `needsYou` builds.
+      if (store.openNeeds(b.id).some((n) => needView(n, b).actionable)) return true;
+      const questions = store.openQuestions(b.projectId);
+      if (questions.some((q) => q.bindingId === b.id)) return true;
+      const escalations = store.openEscalations(b.id).filter((x) => x.route === "user" && !x.isQuestion && x.resolutionKind === null);
+      if (escalations.length === 0) return false;
+      const openIds = new Set(store.open(b.projectId).map((x) => x.id));
+      const covered = new Set<string>(
+        [
+          ...store.openNeedsForProject(b.projectId).filter((n) => openIds.has(n.bindingId)).map((n) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null)),
+          ...questions.map((q) => q.escalationId),
+          ...store.openQuestionEscalationIds(b.projectId),
+        ].filter((id): id is string => id !== null),
       );
+      return escalations.some((x) => !covered.has(x.id));
     }
 
     /**
@@ -3224,6 +3239,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let reason: WakeReason | null = force ?? (b.threadId === null ? "adopted" : null);
       if (life.kind === "stay-ended") {
         const labelled = b.kind === "review" || adoptedByWatch(config, b) !== null || hasLabel(entity, config.file.label);
+        signalNeedActionability(b, observed);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
         return;
       }
@@ -3243,6 +3259,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // Following through, the steward is woken as before; otherwise its
         // one last turn is under way and there is nothing to add to it.
         if (life.kind !== "terminal" || !followingThrough(b)) {
+          signalNeedActionability(b, observed);
           store.patch(b.id, { lastSnapshot: observed });
           return;
         }
@@ -3251,6 +3268,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return;
         }
       } else if (b.ending !== null) {
+        signalNeedActionability(b, observed);
         store.patch(b.id, { lastSnapshot: observed });
         return;
       }
@@ -3356,6 +3374,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         else changes.push({ text: n.text, actionable: n.quiet !== true });
       }
 
+      signalNeedActionability(b, observed, ready);
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
       // BB-54 item 4: a ticket that links a new pull request re-runs the
       // overlap check, even past its ready gate, and a new pull request clears
@@ -4381,6 +4400,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         kind === "terminal" &&
         store.workers(b.id).some((w) => w.result !== null && (w.endedAt === null || now() - w.endedAt <= TERMINAL_WORKER_REPORT_MS) && workerReportedTerminal(w.result, observed.entity.key, playbook));
       const ownDone = kind === "terminal" && (stewardDone || workerDone);
+      signalNeedActionability(b, observed);
       b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
       await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : "was detached");
@@ -7134,8 +7154,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           claim(b.projectId, b.threadId);
           for (const w of store.workers(b.id)) claim(b.projectId, w.threadId);
         }
-        // The picker's count is the server's own: the open bindings that need
-        // the user, so the pill and the yellow rows cannot disagree (BB-100).
+        // The picker's count is the server's own: every open binding with an
+        // open need, question or route-`user` escalation. It is broader than
+        // `needsUser` since BB-237 (a need the server cannot act on yet is not
+        // a yellow row), so the pill can exceed the yellow rows (BB-100).
         const picker = projects.map((p) => ({
           ...p,
           // One SQL count per project, so the picker never parses every binding
@@ -8966,6 +8988,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Ring the project's refetch channel when the patch about to be written
+     * would change an open need's `actionable` or `why`, as `needView` computes
+     * them (BB-237). The page disables Approve from that flag, so a snapshot or
+     * spec approval the reconcile just refreshed must reach it without waiting
+     * for the half-minute poll; a patch that flips nothing stays silent. Called
+     * before the patch, with the binding as it stands. `observed` is the
+     * snapshot being written, and `ready` the `ReadyState` when the patch also
+     * changes it (it feeds `needView` through `ticketApprovedSpec`); the other
+     * call sites write only the snapshot and ending fields. An ended binding's
+     * needs are off the board, so it never rings.
+     */
+    function signalNeedActionability(b: Binding, observed: Observed, ready?: ReadyState): void {
+      if (b.endedAt !== null) return;
+      const needs = store.openNeeds(b.id);
+      if (needs.length === 0) return;
+      const after: Binding = { ...b, lastSnapshot: observed, ...(ready === undefined ? {} : { ready }) };
+      const flipped = needs.some((n) => {
+        const before = needView(n, b);
+        const next = needView(n, after);
+        return before.actionable !== next.actionable || before.why !== next.why;
+      });
+      if (flipped) store.signal(b.projectId, ["last_snapshot"]);
+    }
+
+    /**
      * The board's "waiting on you" lists for one project, in one place so the
      * board and the sidebar cannot disagree: open questions, the route-`user`
      * escalations no question or item covers, and open needs. `actionableOnly`
@@ -10504,12 +10551,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

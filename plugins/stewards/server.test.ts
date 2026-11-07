@@ -5333,7 +5333,7 @@ describe("the sidebar's needs you block (BB-46)", () => {
     withUser: Array<{ id: string }>;
     needs: Array<{ id: string; kind: string; actionable: boolean }>;
   };
-  type SidebarView = { projectId: string | null; needs: { count: number; items: Array<{ type: string; id: string }> } };
+  type SidebarView = { projectId: string | null; needs: { count: number; items: Array<{ type: string; id: string }> }; bindings: Array<{ key: string; needsUser: boolean }> };
   const boardView = async (t: Awaited<ReturnType<typeof setup>>): Promise<BoardView> => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: BoardView }).board;
   const sidebarView = async (t: Awaited<ReturnType<typeof setup>>) => (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as SidebarView;
 
@@ -5369,6 +5369,80 @@ describe("the sidebar's needs you block (BB-46)", () => {
     );
     // The board keeps the non-actionable need; the sidebar drops it from items and count.
     expect(sidebar.needs.items.some((i) => i.id === unobserved.id)).toBe(false);
+  });
+
+  it("a binding with only a non-actionable need says needs you nowhere: the row and the list agree (BB-237)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    // The server cannot act on this item until it has observed the pull
+    // request, so the sidebar lists nothing and the row must not say "needs
+    // you" either (BB-237).
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/999", what: "Approve an unobserved pull request", how: null });
+
+    const board = await boardView(t);
+    expect(board.needs.find((n) => n.id === need.id)!.actionable).toBe(false);
+
+    const sidebar = await sidebarView(t);
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")!.needsUser).toBe(false);
+    expect(sidebar.needs.items.some((i) => i.id === need.id)).toBe(false);
+    expect(sidebar.needs.count).toBe(0);
+  });
+
+  it("rings the refetch channel when a snapshot flips an open need's actionability, and stays silent when it flips nothing (BB-237)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub", how: null });
+    // No pull request has been observed yet, so the item is not actionable.
+    expect((await boardView(t)).needs.find((n) => n.id === need.id)!.actionable).toBe(false);
+
+    // The snapshot the reconcile is about to write carries the approved pull
+    // request with green checks, so the item flips actionable.
+    const marker = comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    const success = { entity: t.entities.get("uuid-12")!, pulls: [t.entities.get("acme/web#7")!] };
+
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.signalNeedActionability(b.id, success);
+    expect(t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED)).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
+
+    // Writing that snapshot makes the same call flip nothing: no signal.
+    t.hooks.store.patch(b.id, { lastSnapshot: success });
+    const before2 = t.harness.inspection.realtimeSignals.length;
+    t.hooks.signalNeedActionability(b.id, success);
+    expect(t.harness.inspection.realtimeSignals.slice(before2).filter((s) => s.channel === PROJECT_CHANGED)).toEqual([]);
+  });
+
+  it("rings when the ready the same patch writes flips a need's actionability (BB-237)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub", how: null });
+    // A no-review pull request the reviewer judged substantial with no approved
+    // spec: the product reason makes it the owner's, so the item is actionable.
+    const marker = comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review substantial=yes spec=no -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    const snapshot = { entity: t.entities.get("uuid-12")!, pulls: [t.entities.get("acme/web#7")!] };
+    const ready = { ...b.ready, approval: null };
+    t.hooks.store.patch(b.id, { lastSnapshot: snapshot, ready });
+    expect((await boardView(t)).needs.find((n) => n.id === need.id)!.actionable).toBe(true);
+
+    // The spec approval the reconcile writes in the same patch clears the
+    // product reason, so the item flips not actionable.
+    const approved = { ...ready, approval: { at: t.now(), specHash: "spec", by: "user" } };
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.signalNeedActionability(b.id, snapshot, approved);
+    expect(t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED)).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
+
+    // With the ready written, the same call flips nothing: no signal.
+    t.hooks.store.patch(b.id, { ready: approved });
+    const before2 = t.harness.inspection.realtimeSignals.length;
+    t.hooks.signalNeedActionability(b.id, snapshot, approved);
+    expect(t.harness.inspection.realtimeSignals.slice(before2).filter((s) => s.channel === PROJECT_CHANGED)).toEqual([]);
   });
 
   it("publishes exactly one event carrying the project id when a question is filed", async () => {
