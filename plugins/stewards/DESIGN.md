@@ -2064,8 +2064,10 @@ Three pieces, in order:
    touching playbooks only where the survey found a deviation; `bb stewards
    check`; `workspace_publish_guidance` and a pull request on the primary
    whose body lists every assumption, so review is the second interview. It
-   runs `bb stewards enable` only after that pull request merges, because
-   stewards read committed `origin/main` only. On a partial `.bb` the same
+   runs `bb stewards enable` only after that pull request merges, because a git
+   repo is read at committed `origin/main` only; a plain project directory is
+   read from `.bb` on disk, so its files are live as soon as they are written
+   and there is no pull request to wait for. On a partial `.bb` the same
    flow proposes additions only, matching `init`'s never-overwrite rule, so
    adopting a project is the same as creating one. It is short on day one by
    design: the lessons mechanism grows `.bb` from real decisions.

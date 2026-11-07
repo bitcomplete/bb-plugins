@@ -920,9 +920,10 @@ where the survey found a deviation; `bb stewards check --create-labels`,
 which creates the project's label in each Linear team and non-excluded
 GitHub repo before validating; then
 `workspace_publish_guidance` and a pull request on the primary repo whose body
-lists every assumption. Stewards read committed `origin/main` only, so nothing
-is live until that pull request merges, and `bb stewards enable` runs only
-after. On a partial `.bb` the same flow proposes additions only, matching
+lists every assumption. A git repo is read at committed `origin/main` only, so
+nothing is live until that pull request merges and `bb stewards enable` runs
+only after. A plain project directory is read from `.bb` on disk, so its files
+are live as soon as they are written and there is no pull request to wait for. On a partial `.bb` the same flow proposes additions only, matching
 `init`'s never-overwrite rule, so adopting a project is the same as creating
 one. It is deliberately short on day one; the lessons mechanism grows `.bb`
 from real decisions afterwards.
