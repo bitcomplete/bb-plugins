@@ -296,7 +296,7 @@ const repoSetOutput = z
     repos: z.array(z.object({ dir: z.string(), url: z.string() }).loose()),
     /** The project source's own origin, for a lesson's pull request (BB-108). */
     primary: z.object({ dir: z.string(), url: z.string() }).loose().nullable().default(null),
-    layout: z.enum(["primary", "directory", "standalone"]).default("standalone"),
+    layout: z.enum(["primary", "directory"]),
     error: z.string().nullable(),
   })
   .loose();
@@ -1261,6 +1261,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * makes one read rather than one per caller (BB-104).
      */
     const configReads = new Map<string, Promise<ProjectConfig | null>>();
+    /**
+     * The last configuration-read failure per project. A project whose layout
+     * multi-repo refuses (a leftover root `repos.json`, say) has no last good
+     * config to carry the problem line, so the failure is kept here and shown
+     * for that project alone. A successful read clears it.
+     */
+    const configErrors = new Map<string, string>();
 
     /** The RPC-backed multi-repo source for one project: the three RPCs as they always were. */
     function multiRepoSourceFor(projectId: string): ProjectSource {
@@ -1354,16 +1361,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const promise = readConfig(projectId)
         .then((value) => {
           configs.set(projectId, { at: now(), value });
+          configErrors.delete(projectId);
           return value;
         })
         .catch((error: unknown) => {
           // Unreachable `.bb` is not "no stewards": keep what we had. A
           // non-missing RPC failure stays on the last good source (BB-107) and
           // is shown as a problem line rather than silently swallowed.
-          bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${errorMessage(error)}`);
+          const message = errorMessage(error);
+          bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${message}`);
+          configErrors.set(projectId, message);
           const last = configs.get(projectId)?.value ?? null;
           if (last !== null) {
-            const line = `could not read the configuration: ${errorMessage(error)}`;
+            const line = `could not read the configuration: ${message}`;
             if (!last.problems.includes(line)) last.problems.push(line);
           }
           return last;
@@ -7096,7 +7106,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             repos: config?.repos ?? [],
             excludedRepos: config?.file.github.exclude ?? [],
             playbooks: overviewPlaybooks(config),
-            problems: config?.problems ?? [],
+            // A project with no readable config still reports why, from the
+            // last failed read, so a refused layout shows for it alone.
+            problems: config?.problems ?? (configErrors.has(projectId) ? [`could not read the configuration: ${configErrors.get(projectId)}`] : []),
             nightly: config === null ? null : { at: config.file.nightly.at, timezone: config.file.nightly.timezone },
             lastNight: row.nightlyDate,
             projectStewardThreadId: row.threadId,
@@ -9670,7 +9682,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
-      if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
+      if (config === null) {
+        const error = configErrors.get(projectId);
+        if (error !== undefined) return { ok: false, lines: [`problem: could not read the configuration: ${error}`] };
+        return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
+      }
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
       if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);

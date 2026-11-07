@@ -1,7 +1,8 @@
 // What stewards' server asks of its host entry (host.ts), on the developer's
 // machine. Two methods: run kubectl for the ops kind, with arguments that
-// pass kubectlRefusal on both sides, and read `.bb` from a project checkout's
-// `origin/<default>` for the native project source (project-git.ts).
+// pass kubectlRefusal on both sides, and read `.bb` for the native project
+// source (project-git.ts): from a git repo's `origin/<default>`, or from disk
+// under a plain directory's `.bb/`.
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
@@ -21,7 +22,7 @@ export const hostContract = defineRpcContract({
         files: z.array(z.object({ path: z.string().max(300), content: z.string().nullable() })).max(64),
         remote: z.string().max(2000).nullable(),
         defaultBranch: z.string().max(300).nullable(),
-        layout: z.enum(["primary", "directory", "standalone"]),
+        layout: z.enum(["primary", "directory"]),
         error: z.string().max(2000).nullable(),
       })
       .strict(),

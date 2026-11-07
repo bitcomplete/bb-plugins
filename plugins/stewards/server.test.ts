@@ -27,7 +27,7 @@ function world() {
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   /** The primary repo a lesson's pull request opens on (BB-108). */
   let primary: { dir: string; url: string } | null = { dir: "bb", url: "https://github.com/acme/bb.git" };
-  let layout: "primary" | "directory" | "standalone" = "primary";
+  let layout: "primary" | "directory" = "primary";
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
@@ -451,7 +451,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory" | "standalone") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -5251,11 +5251,13 @@ describe("the native project source (BB-107)", () => {
   const nativeWorld = async (missing = true) => {
     let files: Record<string, string | null> = defaultFiles();
     let hostError: string | null = null;
+    let layout: "primary" | "directory" = "primary";
+    let remote: string | null = "https://github.com/acme/web.git";
     const gitCalls: Array<{ path: string; hostId: string | null; files: string[]; fetch: boolean }> = [];
     const t = await setup({
       git: async ({ hostId, path, files: paths, fetch }) => {
         gitCalls.push({ path, hostId, files: paths, fetch });
-        return { head: "abc", files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote: "https://github.com/acme/web.git", defaultBranch: "main", layout: "primary" as const, error: hostError };
+        return { head: layout === "primary" ? "abc" : null, files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote, defaultBranch: layout === "primary" ? "main" : null, layout, error: hostError };
       },
     });
     files = t.files;
@@ -5267,7 +5269,15 @@ describe("the native project source (BB-107)", () => {
         return original(args);
       });
     }
-    return { t, gitCalls, setHostError: (message: string | null) => (hostError = message) };
+    return {
+      t,
+      gitCalls,
+      setHostError: (message: string | null) => (hostError = message),
+      setLayout: (value: "primary" | "directory") => {
+        layout = value;
+        remote = value === "directory" ? null : "https://github.com/acme/web.git";
+      },
+    };
   };
 
   it("loads from native git when the multi-repo RPC reports unknown plugin", async () => {
@@ -5280,6 +5290,21 @@ describe("the native project source (BB-107)", () => {
     expect(config!.repos).toEqual(["acme/web"]);
     // It read the project file through the git handler, on the checkout.
     expect(gitCalls.some((c) => c.files.includes(PROJECT_FILE))).toBe(true);
+  });
+
+  it("reads a plain directory's .bb from disk in native mode, with no primary repo", async () => {
+    const { t, setLayout } = await nativeWorld();
+    setLayout("directory");
+    t.hooks.forgetConfigs();
+    const config = await load(t);
+    expect(config).not.toBeNull();
+    expect(config!.source.kind).toBe("native");
+    expect(config!.file.linear.teams).toEqual(["ENG"]);
+    // A plain directory has no origin to call the primary, so the repo set is empty.
+    expect(config!.repos).toEqual([]);
+    const report = JSON.parse((await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"])).stdout) as { layout: string; primary: unknown };
+    expect(report.layout).toBe("directory");
+    expect(report.primary).toBeNull();
   });
 
   it("keeps the multi-repo source and reports a problem line when the RPC fails for another reason", async () => {
@@ -5296,6 +5321,46 @@ describe("the native project source (BB-107)", () => {
     expect(after).not.toBeNull();
     expect(after!.source.kind).toBe("multi-repo");
     expect(after!.problems.some((p) => p.includes("the .bb is unreachable"))).toBe(true);
+  });
+
+  it("isolates a project whose layout multi-repo refuses, and keeps the others (BB-238)", async () => {
+    const t = await setup();
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Beta" }]);
+    const original = t.sdk.plugins.callRpc;
+    const refusal = "/p2 has a repos.json at its root, which is a leftover standalone definition. This project is a git repo now: move it to .bb/repos.json.";
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "multi-repo" && args.method === "readProjectFiles" && (args.input as { projectId?: string } | undefined)?.projectId === "p2") {
+        return { projectSourcePath: "/p2/.bb", head: null, files: [], error: refusal };
+      }
+      return original(args);
+    });
+    t.hooks.forgetConfigs();
+
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; configured: boolean; problems: string[] }> };
+    const p1 = overview.projects.find((p) => p.projectId === "p1")!;
+    const p2 = overview.projects.find((p) => p.projectId === "p2")!;
+    expect(p1.configured).toBe(true);
+    expect(p1.problems).toEqual([]);
+    expect(p2.configured).toBe(false);
+    expect(p2.problems).toEqual([`could not read the configuration: ${refusal}`]);
+    // The refused project is isolated: p1 still loads, and p2 says why it cannot.
+    expect(await t.hooks.loadConfig("p1", true)).not.toBeNull();
+    expect((await t.harness.behavior.runCli(["check", "--project", "p2"])).stdout).toContain(`problem: could not read the configuration: ${refusal}`);
+  });
+
+  it("rejects the removed standalone layout from multi-repo's repoSet parser (BB-238)", async () => {
+    const t = await setup();
+    await t.flush();
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.method === "repoSet") return args.outputSchema.parse({ repos: t.repos, primary: t.primary, layout: "standalone", error: null });
+      return original(args);
+    });
+    t.hooks.forgetConfigs();
+    const config = await t.hooks.loadConfig("p1", true);
+    expect(config).not.toBeNull();
+    expect(config!.problems.some((p) => p.includes("could not read the repo set"))).toBe(true);
   });
 
   it("spawns on project-default and carries no multi-repo flag in native mode", async () => {

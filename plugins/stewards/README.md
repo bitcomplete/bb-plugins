@@ -627,8 +627,8 @@ the choice is per developer.
 
 In the project's `.bb`, read from the default branch's committed tip through
 multi-repo's `readProjectFiles` and `repoSet`, or — when multi-repo is not
-installed — through native git on the project checkout's `origin/<default>`
-(`project-source.ts`):
+installed — through stewards' own host entry: a git repo's
+`origin/<default>`, or a plain directory's `.bb/` on disk (`project-source.ts`):
 
 ```
 stewards/

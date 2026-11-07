@@ -1,8 +1,9 @@
 // The host entry: the part of stewards that runs on the developer's machine,
 // where kubectl and its kubeconfig are. It runs only what kubectlRefusal
 // allows (get, describe, logs, auth can-i), whatever the server sends, and it
-// reads a project checkout's `.bb` from `origin/<default>` for the native
-// project source (project-git.ts).
+// reads a project's `.bb` for the native project source (project-git.ts):
+// from `origin/<default>` for a git repo, from disk under `.bb/` for a plain
+// directory.
 import { execFile } from "node:child_process";
 import { experimental_defineHostEntry, experimental_sanitizeInheritedChildProcessEnv } from "@get-bb/plugin-sdk/host";
 import { hostContract } from "./host-contract.js";

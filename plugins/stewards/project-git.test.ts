@@ -1,11 +1,13 @@
-// The native project source's git handler (project-git.ts): it must read the
-// committed `origin/<default>`, never the working tree or a local branch, and
-// must not touch the working tree while doing so.
+// The native project source's handler (project-git.ts): for a git repo it must
+// read the committed `origin/<default>`, never the working tree or a local
+// branch, and must not touch the working tree while doing so; for a plain
+// directory it must read `<dir>/.bb` from disk and create nothing.
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { hostContract } from "./host-contract.js";
 import { readProjectGit } from "./project-git.js";
 
 const roots: string[] = [];
@@ -92,25 +94,29 @@ describe("the native git project source", () => {
     expect(listing()).toEqual(before);
   });
 
-  it("reads a standalone .bb checkout at its root, and reports its origin", async () => {
-    const { origin, checkout } = await world();
-    const standalone = path.join(path.dirname(checkout), "standalone");
-    git(path.dirname(checkout), "clone", "--quiet", origin, standalone);
-    git(standalone, "config", "user.email", "test@example.com");
-    git(standalone, "config", "user.name", "Test");
-    // A standalone checkout keeps the definition at the root instead of `.bb/`.
-    await rm(path.join(standalone, ".bb"), { recursive: true, force: true });
-    await mkdir(path.join(standalone, "stewards"), { recursive: true });
-    await writeFile(path.join(standalone, "stewards", "project.json"), '{"version":1,"marker":"standalone"}\n', "utf8");
-    git(standalone, "add", "-A");
-    git(standalone, "commit", "--quiet", "-m", "standalone layout");
-    git(standalone, "push", "--quiet", "origin", "main");
+  it("reads a plain directory's .bb from disk, with no git and no origin", async () => {
+    const root = await tempRoot();
+    const project = path.join(root, "project");
+    await mkdir(path.join(project, ".bb", "stewards"), { recursive: true });
+    await writeFile(path.join(project, ".bb", "stewards", "project.json"), '{"version":1,"marker":"directory"}\n', "utf8");
+    await writeFile(path.join(project, ".bb", "AGENTS.md"), "on-disk guidance\n", "utf8");
 
-    const read = await readProjectGit({ path: standalone, files: ["stewards/project.json"] });
+    const read = await readProjectGit({ path: project, files: ["stewards/project.json", "AGENTS.md", "stewards/roles.json"] });
     expect(read.error).toBeNull();
-    expect(read.layout).toBe("standalone");
-    expect(read.files[0]?.content).toContain("standalone");
-    expect(read.remote).toBe(origin);
+    expect(read.layout).toBe("directory");
+    expect(read.remote).toBeNull();
+    expect(read.defaultBranch).toBeNull();
+    const byPath = new Map(read.files.map((f) => [f.path, f.content]));
+    expect(byPath.get("stewards/project.json")).toContain("directory");
+    expect(byPath.get("AGENTS.md")).toBe("on-disk guidance\n");
+    expect(byPath.get("stewards/roles.json")).toBeNull();
+    // A plain directory is never turned into a repo: no `.git` is created.
+    await expect(access(path.join(project, ".git"))).rejects.toThrow();
+  });
+
+  it("rejects the removed standalone layout at the host contract", () => {
+    const parsed = hostContract.gitProjectFiles.output.safeParse({ head: null, files: [], remote: null, defaultBranch: null, layout: "standalone", error: null });
+    expect(parsed.success).toBe(false);
   });
 
   it("refuses a traversal path rather than running git with it", async () => {

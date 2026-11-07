@@ -263,13 +263,14 @@ installed and falls back to native git when it is not (BB-107). Only committed
 `guidance-<threadId>` branch and takes effect when it is merged. That is the
 review step, and it is deliberate.
 
-When multi-repo is not installed, stewards reads `.bb` through a git handler in
-its own host entry: `origin/<default>` after a fetch, never the developer's
-working tree, with the repo set taken from the checkout's own `origin`. The two
-reads sit behind one `ProjectSource` seam (`project-source.ts`), chosen once
-per project at config load and cached with the config; only an unknown-plugin
-RPC error selects native, and a spawn in native mode uses core's
-`project-default` environment.
+When multi-repo is not installed, stewards reads `.bb` through a handler in
+its own host entry: for a git repo, `origin/<default>` after a fetch, never the
+developer's working tree, with the repo set taken from the checkout's own
+`origin`; for a plain directory, `<dir>/.bb` on disk. The two reads sit behind
+one `ProjectSource` seam (`project-source.ts`), chosen once per project at
+config load and cached with the config; only an unknown-plugin RPC error
+selects native, and a spawn in native mode uses core's `project-default`
+environment.
 
 multi-repo's host-side read fetches and fast-forwards (`--ff-only`) the
 canonical checkout at most once every ten minutes, then reads committed
@@ -1077,7 +1078,7 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 The cross-plugin RPC contract in §3, plus `mergeGuidance`: the narrow
 fast-forward of the canonical `.bb` to a thread's published guidance branch
-for a standalone `.bb` repo. Since BB-108 a lesson lands as a pull request on
+for a `.bb` repo. Since BB-108 a lesson lands as a pull request on
 the primary repo and stewards no longer calls `mergeGuidance`; `pushGuidance`
 (`workspace_publish_guidance`) is still the branch push. Only the stewards
 plugin may call `mergeGuidance`.

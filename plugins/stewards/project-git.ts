@@ -1,19 +1,25 @@
-// The native project source's git half, run on the developer's machine by the
+// The native project source's read half, run on the developer's machine by the
 // host entry (host.ts) beside the kubectl handler.
 //
-// It reads `.bb` from the default branch's tip on `origin`, after a fetch:
-// never the working tree, never a feature branch, never a local commit. The
-// checkout is a person's directory as well as the plugin's, so an edit
-// someone is halfway through there is not the project's. `git fetch` is the
-// only command that changes anything, and it changes only remote-tracking
-// refs; nothing here checks out, resets, stashes, commits or writes the
-// working tree or a local branch, and this handler leaves no state of its own
-// in the checkout (the caller throttles the fetch).
+// A git repo is a primary: it reads `.bb` from the default branch's tip on
+// `origin`, after a fetch: never the working tree, never a feature branch,
+// never a local commit. The checkout is a person's directory as well as the
+// plugin's, so an edit someone is halfway through there is not the project's.
+// `git fetch` is the only command that changes anything, and it changes only
+// remote-tracking refs; nothing here checks out, resets, stashes, commits or
+// writes the working tree or a local branch, and this handler leaves no state
+// of its own in the checkout (the caller throttles the fetch).
+//
+// A directory that is not a git repo is a plain-directory project: `.bb/` is
+// an ordinary subdirectory and there is no commit to read, so the files come
+// from disk under `<dir>/.bb`. Nothing is created or written there.
 //
 // Every path is a fixed argument from the plugin, passed after `--`, so a
 // file name can never become an option. Paths are validated again here even
 // though the host contract already checks them: this is the boundary.
 import { execFile } from "node:child_process";
+import { access, readFile } from "node:fs/promises";
+import path from "node:path";
 import { experimental_sanitizeInheritedChildProcessEnv } from "@get-bb/plugin-sdk/host";
 import type { NativeGitRead, ProjectGitFile } from "./project-source.js";
 
@@ -62,9 +68,14 @@ async function refExists(dir: string, ref: string): Promise<boolean> {
   return r.code === 0 && r.stdout.trim() !== "";
 }
 
-async function objectExists(dir: string, spec: string): Promise<boolean> {
-  const r = await runGit(dir, ["cat-file", "-e", spec]);
-  return r.code === 0;
+/** Is this directory itself a git repo? A `.git` file counts (a worktree or submodule). */
+async function isGitRepo(dir: string): Promise<boolean> {
+  try {
+    await access(path.join(dir, ".git"));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -81,14 +92,29 @@ async function originDefaultBranch(dir: string): Promise<string | null> {
 }
 
 /**
- * The committed `.bb` prefix: `.bb/` for the primary layout (a directory on
- * the primary repo's default branch, BB-106), `""` for a standalone `.bb`
- * checkout whose root is the definition.
+ * Read `.bb/<file>` from a plain project directory's disk. There is no commit
+ * and no origin, so the working tree is the project's `.bb`; nothing is
+ * created, written or committed. `projectGitPathProblem` has already checked
+ * every path before this runs.
  */
-async function definitionPrefix(dir: string, head: string): Promise<".bb/" | ""> {
-  if (await objectExists(dir, `${head}:.bb/stewards/project.json`)) return ".bb/";
-  if (await objectExists(dir, `${head}:stewards/project.json`)) return "";
-  return ".bb/";
+async function readDirectoryFiles(dir: string, files: readonly string[]): Promise<{ files: ProjectGitFile[]; error: string | null }> {
+  const out: ProjectGitFile[] = [];
+  const tooLarge: string[] = [];
+  for (const file of files) {
+    const content = await readFile(path.join(dir, ".bb", file), "utf8").catch(() => null);
+    if (content === null) {
+      out.push({ path: file, content: null });
+      continue;
+    }
+    if (content.length > MAX_FILE_CHARS) {
+      tooLarge.push(file);
+      out.push({ path: file, content: null });
+      continue;
+    }
+    out.push({ path: file, content });
+  }
+  const error = tooLarge.length === 0 ? null : `Larger than ${MAX_FILE_CHARS} characters, so not read: ${tooLarge.join(", ")}`;
+  return { files: out, error };
 }
 
 /** Whether every path is a fixed, relative, traversal-free path the plugin may ask for. */
@@ -98,18 +124,29 @@ export function projectGitPathProblem(path: string): string | null {
 }
 
 /**
- * Read the named files out of the project checkout's `origin/<default>` at
- * its committed tip. `fetch` (default true) asks for a `git fetch origin`
- * first; the caller throttles it, so the checkout gets no plugin-owned state
- * of its own. A fetch that fails (no network, no remote) still reads the last
- * fetched commit rather than failing the read. The working tree and every
- * local branch are untouched.
+ * Read the named files out of a project's `.bb`.
+ *
+ * A git repo is a primary and is read from `origin/<default>` at its committed
+ * tip. `fetch` (default true) asks for a `git fetch origin` first; the caller
+ * throttles it, so the checkout gets no plugin-owned state of its own. A fetch
+ * that fails (no network, no remote) still reads the last fetched commit
+ * rather than failing the read. The working tree and every local branch are
+ * untouched.
+ *
+ * A directory that is not a git repo is a plain-directory project with no
+ * commit: its files come from `<dir>/.bb` on disk, and nothing there is
+ * created, written or committed.
  */
 export async function readProjectGit(input: { path: string; files: readonly string[]; fetch?: boolean }): Promise<NativeGitRead> {
   const dir = input.path;
+  const git = await isGitRepo(dir);
   for (const file of input.files) {
     const problem = projectGitPathProblem(file);
-    if (problem !== null) return { head: null, files: [], remote: null, defaultBranch: null, layout: "primary", error: problem };
+    if (problem !== null) return { head: null, files: [], remote: null, defaultBranch: null, layout: git ? "primary" : "directory", error: problem };
+  }
+  if (!git) {
+    const { files, error } = await readDirectoryFiles(dir, input.files);
+    return { head: null, files, remote: null, defaultBranch: null, layout: "directory", error };
   }
   const remote = await gitLine(dir, ["config", "--get", "remote.origin.url"]);
   const fetched = input.fetch === false ? null : await runGit(dir, ["fetch", "--quiet", "origin"]);
@@ -123,14 +160,13 @@ export async function readProjectGit(input: { path: string; files: readonly stri
   if (head === null) {
     return { head: null, files: [], remote, defaultBranch: branch, layout: "primary", error: `Could not fetch the project source: ${fetched === null ? "no commit on origin's default branch" : firstProblemLine(fetched)}` };
   }
-  const prefix = await definitionPrefix(dir, head);
-  const layout = prefix === "" ? ("standalone" as const) : ("primary" as const);
-  if (input.files.length === 0) return { head, files: [], remote, defaultBranch: branch, layout, error: null };
+  if (input.files.length === 0) return { head, files: [], remote, defaultBranch: branch, layout: "primary", error: null };
 
   // One `ls-tree` for every path: which the commit holds, and as what.
-  // Literal pathspecs and `--`, so a name is only ever a name.
-  const listed = await runGit(dir, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", head, "--", ...input.files.map((file) => `${prefix}${file}`)]);
-  if (listed.code !== 0) return { head, files: [], remote, defaultBranch: branch, layout, error: firstProblemLine(listed) };
+  // Literal pathspecs and `--`, so a name is only ever a name. `.bb/` is the
+  // definition prefix for every primary (BB-106).
+  const listed = await runGit(dir, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", head, "--", ...input.files.map((file) => `.bb/${file}`)]);
+  if (listed.code !== 0) return { head, files: [], remote, defaultBranch: branch, layout: "primary", error: firstProblemLine(listed) };
   const blobs = new Map<string, string>();
   for (const entry of listed.stdout.split("\0")) {
     const match = /^(\d+) (\w+) ([0-9a-f]+)\t(.*)$/su.exec(entry);
@@ -141,7 +177,7 @@ export async function readProjectGit(input: { path: string; files: readonly stri
   const files: ProjectGitFile[] = [];
   const tooLarge: string[] = [];
   for (const file of input.files) {
-    const object = blobs.get(`${prefix}${file}`);
+    const object = blobs.get(`.bb/${file}`);
     if (object === undefined) {
       files.push({ path: file, content: null });
       continue;
@@ -153,7 +189,7 @@ export async function readProjectGit(input: { path: string; files: readonly stri
         files.push({ path: file, content: null });
         continue;
       }
-      return { head, files: [], remote, defaultBranch: branch, layout, error: firstProblemLine(read) };
+      return { head, files: [], remote, defaultBranch: branch, layout: "primary", error: firstProblemLine(read) };
     }
     if (read.stdout.length > MAX_FILE_CHARS) {
       tooLarge.push(file);
@@ -163,5 +199,5 @@ export async function readProjectGit(input: { path: string; files: readonly stri
     files.push({ path: file, content: read.stdout });
   }
   const error = tooLarge.length === 0 ? null : `Larger than ${MAX_FILE_CHARS} characters, so not read: ${tooLarge.join(", ")}`;
-  return { head, files, remote, defaultBranch: branch, layout, error };
+  return { head, files, remote, defaultBranch: branch, layout: "primary", error };
 }
