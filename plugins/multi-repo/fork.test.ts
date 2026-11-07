@@ -293,6 +293,17 @@ describe("a forked thread keeps its source's workspace", () => {
     await harness.emitThreadEvent("thread.deleted", { thread: fork({ deletedAt: 1 }) });
     expect(instructions(harness, SOURCE_THREAD)).not.toContain("This checkout is shared.");
   });
+
+  it("reads a legacy standalone manifest as a plain directory instead of crashing", async () => {
+    const { bb, harness } = await setup();
+    await provision(harness);
+    // A workspace row written before the standalone layout was removed.
+    bb.storage.database().prepare("UPDATE workspaces SET layout = 'standalone'").run();
+
+    const result = await harness.runCli(["status"], { threadId: SOURCE_THREAD });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("layout\tdirectory");
+  });
 });
 
 describe("a thread with no workspace", () => {

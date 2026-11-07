@@ -492,4 +492,29 @@ describe("the write paths share the publish step", () => {
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/push rejected/u);
   });
+
+  it("surfaces the move-it refusal for a leftover root repos.json", async () => {
+    // A legacy standalone project source: a git repo with `repos.json` at its
+    // root and no `.bb/repos.json`. The host refuses it, and every write path
+    // must show that refusal rather than writing anywhere new.
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string }) => {
+        if (call.method === "prepareProjectSource") {
+          throw new Error(
+            "/checkouts/acme has a repos.json at its root, which is a leftover standalone definition. This project is a git repo now: move it to .bb/repos.json.",
+          );
+        }
+        throw new Error(`unexpected host method ${call.method}`);
+      },
+    });
+    harness.sdk.stub("projects.get", () => PROJECT);
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("addRepo", {
+      projectId: PROJECT_ID,
+      repo: { dir: "b", url: "https://example.com/b" },
+    })) as { ok: boolean; error: string | null };
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/move it to \.bb\/repos\.json/u);
+  });
 });
