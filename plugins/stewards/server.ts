@@ -9465,12 +9465,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * `check --create-labels` first creates the project's label in every
-     * unit, then validates as plain `check` does. A unit that could not be
-     * created is a `failed:` line and a `problem:` line, never a silent
-     * skip; a source that does not serve the RPC is reported unavailable.
-     */
-    /**
      * Whether a `sourceEnsureLabel` failure means the source does not serve
      * the RPC at all: an unloaded/absent plugin (`isMissingPlugin`), or a
      * loaded plugin whose contract predates it (the SDK's `unknown_method`).
@@ -9483,6 +9477,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return typeof e?.message === "string" && /unknown rpc method/iu.test(e.message);
     }
 
+    /**
+     * `check --create-labels` first creates the project's label in every
+     * unit, then validates as plain `check` does. A unit that could not be
+     * created is a `failed:` line and a `problem:` line, never a silent
+     * skip; a source that does not serve the RPC is reported unavailable.
+     */
     async function ensureLabels(source: Source, units: string[], label: string, lines: string[]): Promise<void> {
       if (units.length === 0) return;
       let results: z.infer<typeof sourceContract.sourceEnsureLabel.output>["results"];
