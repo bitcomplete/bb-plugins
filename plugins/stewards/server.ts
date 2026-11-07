@@ -18,6 +18,7 @@ import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPlugin
 import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
+  DEFAULT_GITHUB_TICKET_PLAYBOOK,
   DEFAULT_LABEL,
   DEFAULT_PLAYBOOKS,
   DEPENDENCY_BOTS,
@@ -32,6 +33,7 @@ import {
   depsPrsPlaybookName,
   durationSchema,
   formatDuration,
+  githubStateLabels,
   isTerminal,
   legacyOpsPresent,
   legacyRole,
@@ -889,6 +891,8 @@ type ProjectConfig = {
   /** The role names this server's login holds (version 2), or the synthesized login (version 1); empty with no entry. */
   roleNames: string[];
   playbooks: Partial<Record<BindingKind, Playbook>>;
+  /** The ticket playbooks by source (BB-234): a project may carry both `linear-tickets` and `github-issues`. */
+  ticketPlaybooks: Partial<Record<Source, Playbook>>;
   /** The dependency watch's alert playbook, when it parses. */
   depsAlerts: Playbook | null;
   /** The Dependabot pull request playbook, when it parses. */
@@ -1453,12 +1457,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let role: StewardRole | null;
       let roleNames: string[] = [];
       let rolesUnreadable = false;
-      // The logins are read whether or not roles.json is present: a ticket is
-      // adopted only where this server's Linear login is an assignee, and a
-      // review only where its GitHub login is a requested reviewer (BB-115).
+      // The GitHub login is read whether or not roles.json is present: a
+      // labelled pull request is adopted only where its GitHub login is the
+      // author, a review only where it is a requested reviewer, and a GitHub
+      // issue only where it is an assignee (BB-234). The Linear login is read
+      // only when the project tracks Linear teams: a GitHub-only project does
+      // not need it, and a Linear plugin that is not connected must not make
+      // `check` fail for one (BB-234).
+      const usesLinear = file.linear.teams.length > 0;
       githubLogin = await readViewer("github", file.label);
-      linearLogin = await readViewer("linear", file.label);
-      if (githubLogin === null || linearLogin === null) {
+      linearLogin = usesLinear ? await readViewer("linear", file.label) : null;
+      if (githubLogin === null || (usesLinear && linearLogin === null)) {
         rolesUnreadable = true;
         const which = githubLogin === null ? "GitHub" : "Linear";
         if (rolesPresent) {
@@ -1491,32 +1500,61 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (legacyOpsPresent(file)) problems.push(`ops now belongs in ${ROLES_FILE}`);
 
       const kinds = KINDS.filter((k) => usesKind(file, k, role));
-      const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
+      const names = new Map(kinds.filter((k) => k !== "ticket").map((k) => [k, playbookNameFor(file, k)] as const));
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
+      // BB-234: a project may carry both a Linear and a GitHub ticket
+      // playbook. The project file names one (or the default for the source it
+      // tracks); the other source's default is loaded too when its file
+      // exists, and `playbookFor(config, "ticket", source)` picks by source.
+      const ticketPrimary = playbookNameFor(file, "ticket");
+      const ticketExtras = [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK].filter((n) => n !== ticketPrimary);
       // The playbooks a role's declared pull watches name (BB-164). They are
       // read with the rest so one `.bb` read serves every playbook, and parsed
       // into `watchPlaybooks` below.
       const watchNames = new Set<string>();
       for (const r of Object.values(roles?.roles ?? {})) for (const watch of rolePulls(r)) watchNames.add(watch.playbook);
-      const texts = await source.readFiles([...new Set([...names.values(), depsAlertsName, depsPrsName, ...watchNames])].map(playbookPath));
+      const texts = await source.readFiles([...new Set([...names.values(), ticketPrimary, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
-      for (const [kind, name] of names) {
+      const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
+      /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
+      const loadPlaybook = async (name: string, kind: BindingKind, required: boolean): Promise<Playbook | null> => {
         const text = texts.get(playbookPath(name)) ?? null;
+        if (text === null) {
+          if (required) problems.push(`${playbookPath(name)} does not exist`);
+          return null;
+        }
         const goodKey = `good/${projectId}/playbook/${name}`;
-        let result = text === null ? ({ ok: false, error: `${playbookPath(name)} does not exist` } as const) : parsePlaybook(text, name);
+        let result = parsePlaybook(text, name);
         if (result.ok && result.value.kind !== kind) result = { ok: false, error: `${playbookPath(name)} is a ${result.value.kind} playbook, but the project file uses it for ${kind}` };
         if (result.ok) {
-          playbooks[kind] = result.value;
           await bb.storage.kv.set(goodKey, text);
-          continue;
+          return result.value;
         }
         problems.push(result.error);
         const last = await bb.storage.kv.get<string>(goodKey);
         const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
         if (lastParsed !== null && lastParsed.ok) {
-          playbooks[kind] = lastParsed.value;
           problems.push(`${kind} bindings keep running under the last good ${name} (${lastParsed.value.version}).`);
+          return lastParsed.value;
+        }
+        return null;
+      };
+      for (const [kind, name] of names) {
+        const p = await loadPlaybook(name, kind, true);
+        if (p !== null) playbooks[kind] = p;
+      }
+      if (kinds.includes("ticket")) {
+        const primary = await loadPlaybook(ticketPrimary, "ticket", true);
+        if (primary !== null) {
+          playbooks.ticket = primary;
+          if (primary.source === "linear" || primary.source === "github") ticketPlaybooks[primary.source] = primary;
+        }
+        for (const name of ticketExtras) {
+          const extra = await loadPlaybook(name, "ticket", false);
+          // The configured (primary) playbook wins its source; an extra only
+          // fills the other source.
+          if (extra !== null && (extra.source === "linear" || extra.source === "github") && ticketPlaybooks[extra.source] === undefined) ticketPlaybooks[extra.source] = extra;
         }
       }
 
@@ -1635,7 +1673,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         warnedPlaybooks.add(p.name);
         for (const w of p.warnings) warnings.push(`${p.name}: ${w}`);
       }
-      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, ticketPlaybooks, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -1747,7 +1785,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return (await configuredProjects(force, projects)).filter((c) => c.enabled);
     }
 
-    const playbookFor = (config: ProjectConfig, kind: BindingKind) => config.playbooks[kind] ?? null;
+    const playbookFor = (config: ProjectConfig, kind: BindingKind, source?: Source): Playbook | null => {
+      // A ticket playbook is chosen by source (BB-234): a project may carry
+      // both `linear-tickets` and `github-issues`.
+      if (kind === "ticket" && source !== undefined) return config.ticketPlaybooks[source] ?? null;
+      return config.playbooks[kind] ?? null;
+    };
 
     /**
      * The watch that adopted a binding: the recorded `adoptedBy`, or, for a
@@ -1785,13 +1828,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * deps-alerts playbook; a pull request a watch adopted uses the playbook
      * its watch named; everything else uses its kind's playbook.
      */
-    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId" | "adoptedBy">): Playbook | null {
+    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId" | "adoptedBy" | "source">): Playbook | null {
       if (b.kind === "ops") {
         const target = parseOpsTargetKey(b.entityId);
         if (target?.kind === "dependabot") return config.depsAlerts;
       }
       if (b.kind === "pr" && adoptedByWatch(config, b) !== null) return playbookForWatchName(config, b.playbook);
-      return playbookFor(config, b.kind);
+      return playbookFor(config, b.kind, b.source === "ops" ? undefined : b.source);
     }
 
     /**
@@ -3232,7 +3275,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const awaitingDeploy = deployTargets.length > 0 && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 
-      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner: config.linearLogin });
+      // The assignee set follows the entity's own source: a Linear ticket the
+      // Linear login, a GitHub issue the GitHub login (BB-234). A read that
+      // failed never reaches here, so a partial or rate-limited read keeps the
+      // binding.
+      const owner = entity.source === "github" ? config.githubLogin : config.linearLogin;
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner });
       // A binding with no steward thread is still awaiting adoption: a first
       // wake lost to a transient read is retried on the next reconcile, as the
       // ops, deps and sentry paths already do (BB-92).
@@ -4615,7 +4663,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     ): BindingKind | null {
       const labelled = e.labels.some((l) => lc(l) === lc(config.file.label));
       if (e.source === "linear") {
-        const playbook = playbookFor(config, "ticket");
+        const playbook = playbookFor(config, "ticket", "linear");
         if (!labelled || playbook === null || isTerminal(playbook, e.state)) return null;
         // A login that cannot be read adopts nothing (BB-115, addendum 2).
         if (config.rolesUnreadable) return null;
@@ -4625,6 +4673,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // on the nightly list, so `maybeAdopt` re-checks the full snapshot.
         if (e.assignees !== undefined) {
           const mine = config.linearLogin !== null && e.assignees.some((a) => lc(a) === lc(config.linearLogin));
+          if (!mine) return null;
+        }
+        return "ticket";
+      }
+      if (e.source === "github" && e.kind === "issue") {
+        // A labelled GitHub issue in a listed repo, assigned to this server's
+        // GitHub login, is a ticket too (BB-234). The same ownership rule as
+        // Linear: another assignee, or nobody, is adopted nowhere. The
+        // nightly list lacks assignees, so `maybeAdopt` re-checks the full
+        // snapshot; an unreadable githubLogin adopts nothing (BB-115).
+        const playbook = playbookFor(config, "ticket", "github");
+        if (!labelled || playbook === null || isTerminal(playbook, e.state)) return null;
+        if (config.githubLogin === null) return null;
+        if (e.assignees !== undefined) {
+          const mine = e.assignees.some((a) => lc(a) === lc(config.githubLogin));
           if (!mine) return null;
         }
         return "ticket";
@@ -4682,9 +4745,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const watch = matchPullWatch(config, { unit: entity.unit, title: entity.title, branch: entity.pull?.head ?? null, author: entity.author, files: entity.pull?.files });
       const kind = adoptionKind(config, full, entity.viewer);
       if (kind === null) return null;
-      const playbook = watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind);
+      const playbook = watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
       if (playbook === null) return null;
-      const parent = kind === "ticket" ? await managedAncestor(entity) : null;
+      // A GitHub issue has no Linear parents: sub-issue handling is skipped
+      // rather than reading Linear for an entity that lives on GitHub (BB-234).
+      const parent = kind === "ticket" && entity.source === "linear" ? await managedAncestor(entity) : null;
       const { phase, stage } = phaseAndStage(playbook, entity.state);
       let b: Binding;
       try {
@@ -9559,7 +9624,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
       if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
-      const ticket = config.playbooks.ticket;
+      const linearTicket = config.ticketPlaybooks.linear ?? null;
+      const githubTicket = config.ticketPlaybooks.github ?? null;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
       lines.push(`roles: ${roleSummary(config)}`);
       for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
@@ -9576,6 +9642,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (options.createLabels === true) {
         await ensureLabels("linear", config.file.linear.teams, config.file.label, lines);
         await ensureLabels("github", config.repos, config.file.label, lines);
+        // BB-234: a GitHub issue playbook keys its phases on status labels, so
+        // the same step ensures each label state exists in every stewarded
+        // repo, reporting created/existed/failed per label. GitHub's own
+        // derived states (open, closed (reason)) are not labels and are skipped.
+        if (githubTicket !== null) for (const label of githubStateLabels(githubTicket)) await ensureLabels("github", config.repos, label, lines);
       }
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
@@ -9591,8 +9662,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           lines.push(`problem: could not validate against ${source}: ${errorMessage(error)}`);
         }
       };
-      await validate("linear", config.file.linear.teams, ticket === undefined ? [] : playbookStates(ticket));
-      await validate("github", config.repos, []);
+      await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket));
+      await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket));
       if (usesKind(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];
         const context = config.role?.ops?.context;
@@ -9689,7 +9760,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** The workflow states the project's ticket playbook expects, for the survey's Linear section. */
     function surveyExpectedStates(config: ProjectConfig | null): string[] {
-      const playbook = config?.playbooks.ticket ?? (() => { const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets"); return parsed.ok ? parsed.value : null; })();
+      const playbook = config?.ticketPlaybooks.linear ?? (() => { const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets"); return parsed.ok ? parsed.value : null; })();
       return playbook === null ? [] : playbookStates(playbook);
     }
 
@@ -9856,7 +9927,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // write lands on the server's own daemon, which bb-gate's servers lack.
               const threadHost = ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null);
               const hostId = threadHost ?? (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ?? undefined;
-              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [playbookPath(name), text] as [string, string])];
+              // BB-234: a project with no Linear teams is GitHub-tracked, so
+              // init writes the github-issues ticket playbook too. A project
+              // with Linear teams keeps the Linear ticket playbook alone.
+              const templates = Object.entries(PLAYBOOK_TEMPLATES).filter(([name]) => name !== DEFAULT_GITHUB_TICKET_PLAYBOOK || teams.length === 0);
+              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...templates.map(([name, text]) => [playbookPath(name), text] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {
                 const path = `${dir}/${rel}`;

@@ -514,7 +514,10 @@ export function formatWake(input: WakeInput): string {
   const e = observed.entity;
   const out: string[] = [];
   out.push(`# Steward wake: ${e.key} — ${e.title ?? "(untitled)"}`);
-  out.push(`Binding ${binding.id} · ${binding.kind} · playbook ${playbook.name}@${playbook.version} · phase ${binding.phase ?? e.state}${binding.stage === null ? "" : ` (stage ${binding.stage})`}`);
+  // A ticket may live on Linear or on GitHub now (BB-234), so the wake names
+  // the source it is on; the phase and the playbook are keyed on it.
+  const sourceLabel = e.source === "github" ? "GitHub" : "Linear";
+  out.push(`Binding ${binding.id} · ${binding.kind} (${sourceLabel}) · playbook ${playbook.name}@${playbook.version} · phase ${binding.phase ?? e.state}${binding.stage === null ? "" : ` (stage ${binding.stage})`}`);
   // Stewards share the project steward's workspace, whose path names that
   // thread; a steward that read its id from there signed as the project steward.
   out.push(

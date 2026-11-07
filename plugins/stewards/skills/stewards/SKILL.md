@@ -12,14 +12,15 @@ steward** per project sits above all of them.
 
 | Binding | Made when | Playbook |
 |---|---|---|
-| `ticket` | the label (default `bb-managed`) is on a Linear issue in a listed team and this server's Linear login is an assignee | `linear-tickets` |
+| `ticket` | the label (default `bb-managed`) is on a Linear issue in a listed team and this server's Linear login is an assignee, or on a GitHub issue in a listed repo and this server's GitHub login is an assignee | `linear-tickets` on Linear, `github-issues` on GitHub |
 | `pr` | the label is on a pull request in one of the project's repos and this server's GitHub login is its author | `github-prs` |
 | `pr` (watch) | a pull request matches a `pulls` watch on this server's `roles.json` role, with no label needed (BB-164) | the watch's playbook |
 | `review` | a teammate opens, or marks ready, a pull request in one of the project's repos and this server's GitHub login is a requested reviewer (checked once, at adoption) | `github-reviews` |
 | `ops` | this server's `roles.json` entry watches a namespace or Sentry project | `ops-watch` |
 
-Each kind of work has one owner, set by a human: a ticket follows the Linear
-assignee, a labelled pull request its author, a review the GitHub requested
+Each kind of work has one owner, set by a human: a ticket follows its
+source's assignee (the Linear assignee on Linear, the GitHub assignee on
+GitHub), a labelled pull request its author, a review the GitHub requested
 reviewer. An unassigned labelled ticket is adopted nowhere. Reassigning or
 unassigning an adopted ticket releases the old server with one stop turn and
 stops its workers; the new assignee's server adopts it. The rule is the same
@@ -159,7 +160,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   tell the user.
 - **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
   `linear_create_issue` sign for you: add no signature to what you pass
-  them. With `gh`, end what you write with
+  them. On a GitHub issue, comment with `gh issue comment`, move the state
+  by swapping the status label with `gh issue edit --add-label/--remove-label`,
+  and close with `gh issue close`; sign every `gh` body by hand. With `gh`,
+  end what you write with
   `_— from bb thread <your thread id>_`. Your thread id is in the wake and in
   `$BB_THREAD_ID`; never take it from your workspace's path, which names the
   project steward. The playbook's `may` list is what you may do.
@@ -555,11 +559,14 @@ when asked to "set up stewards".
    Edits take effect only once merged.
 3. `bb stewards check --create-labels` first creates the project's label
    in every Linear team and every non-excluded GitHub repo, reporting each
-   as created, existed or failed, and then validates the project file and
+   as created, existed or failed. For a `github-issues` ticket playbook it
+   also creates each status label the playbook names (`status:todo`,
+   `status:in-progress`, …) in every repo, since a GitHub issue's state is
+   a label. It then validates the project file and
    playbooks against Linear (teams, states, label) and GitHub (repos,
-   label) and that this server can read every ops target (and holds no
-   write there). A unit whose label could not be created is a `problem:`
-   line. Plain `bb stewards check` only reads and changes nothing.
+   label, status labels) and that this server can read every ops target (and
+   holds no write there). A unit whose label could not be created is a
+   `problem:` line. Plain `bb stewards check` only reads and changes nothing.
 4. Label a ticket `bb-managed`. Its steward thread appears under the project
    steward's: stewards are spawned as the project steward's children with
    parent notifications off, so the sidebar nests them without waking the
@@ -590,9 +597,12 @@ above which a steward is compacted after its turn.
 
 - **Nothing is adopted.** `bb stewards check`. The label must be on the
   ticket, its team in `linear.teams`, and the linear plugin connected; the
-  ticket must be assigned to this server's Linear login, a labelled pull
-  request authored by its GitHub login, and a teammate's review requested from
-  it. An unassigned labelled ticket is adopted nowhere. Rings need
+  ticket must be assigned to this server's Linear login. A GitHub issue is
+  adopted instead when the label is on an issue in one of the project's
+  repos, the `github-issues` ticket playbook parses, and this server's
+  GitHub login is an assignee; a labelled pull request must be authored by
+  its GitHub login, and a teammate's review requested from it. An
+  unassigned labelled ticket is adopted nowhere. Rings need
   bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
   half-hourly sweep.
 - **An ops steward never wakes.** `bb stewards list` shows `cannot read the
