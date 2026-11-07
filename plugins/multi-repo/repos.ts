@@ -79,6 +79,13 @@ export const publishModeSchema = z.enum(["push", "pull-request"]);
 export type PublishMode = z.infer<typeof publishModeSchema>;
 
 /**
+ * The mode a write actually used. `none` is a plain project directory, which
+ * edits `.bb/` in place and never commits, pushes or opens anything.
+ */
+export const writeModeSchema = z.enum(["push", "pull-request", "none"]);
+export type WriteMode = z.infer<typeof writeModeSchema>;
+
+/**
  * A `.bb`-relative path that a publish policy may be keyed by.
  *
  * A trailing slash is allowed so a directory — `skills/`, `stewards/` — can
@@ -141,9 +148,8 @@ export function publishPolicyProblem(value: unknown): string | null {
  * - A **primary** project's `.bb/` sits on a code repo's default branch, so
  *   every path — `repos.json` included — is reviewed like code and defaults to
  *   `pull-request`; `push` is opt-in through the key.
- * - A **standalone** `.bb` repo's `repos.json` is a mechanical one-line diff
- *   and defaults to `push`; `AGENTS.md`, `skills/`, `stewards/` and anything
- *   else default to `pull-request`.
+ * - A **plain directory** never publishes anything, so the mode is unused;
+ *   the standalone-era defaults are kept only so the function is total.
  *
  * Pure, so the defaults and the split are testable without git or a server.
  */

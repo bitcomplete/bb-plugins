@@ -85,7 +85,7 @@ describe("the probe gate", () => {
 
 describe("choosing the source from the probe", () => {
   it("clones every remote outcome and adopts only a local checkout", () => {
-    for (const outcome of ["standalone", "primary", "plain"] as const) {
+    for (const outcome of ["primary", "plain"] as const) {
       expect(sourceFromProbe(outcome, "https://example.com/acme.git")).toEqual({
         kind: "clone",
         url: "https://example.com/acme.git",
@@ -98,7 +98,7 @@ describe("choosing the source from the probe", () => {
   });
 
   it("never produces the removed auto kind", () => {
-    for (const outcome of ["standalone", "primary", "plain", "checkout"] as const) {
+    for (const outcome of ["primary", "plain", "checkout"] as const) {
       expect(sourceFromProbe(outcome, "x").kind).not.toBe("auto");
     }
   });

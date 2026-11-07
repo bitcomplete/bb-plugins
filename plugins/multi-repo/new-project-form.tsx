@@ -13,12 +13,11 @@
  * The URL comes first and everything else is derived from it. The name is the
  * URL's last component and the location follows the name. Nothing else is
  * shown until a probe of the remote answers: the probe decides how the project
- * is stood up (a standalone `.bb` repo, a primary repo, a plain repo or a
- * local checkout), and there is nothing useful to ask before it does. A probe
- * error stays under the field and reveals nothing. Every derived field stays
- * editable — it is recomputed until the user edits it, and then left alone —
- * because an edited field that silently reverts is the kind of form nobody
- * trusts twice.
+ * is stood up (a primary repo, a plain repo or a local checkout), and there
+ * is nothing useful to ask before it does. A probe error stays under the
+ * field and reveals nothing. Every derived field stays editable — it is
+ * recomputed until the user edits it, and then left alone — because an edited
+ * field that silently reverts is the kind of form nobody trusts twice.
  *
  * The probe runs on blur or Enter, never per keystroke, and changing the
  * machine runs it again on the new one.

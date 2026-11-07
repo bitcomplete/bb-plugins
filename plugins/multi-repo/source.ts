@@ -20,14 +20,14 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { projectFilePathProblem, slugify } from "./names.js";
 import { GitError, git, gitIn, gitInOrThrow, gitLine, firstProblemLine, run, splitNul } from "./git.js";
-import { REPOS_FILE, parseReposFile, resolvePublishMode, serializeReposFile, type PublishMode, type PublishPolicy, type ReposFile } from "./repos.js";
+import { REPOS_FILE, parseReposFile, resolvePublishMode, serializeReposFile, type PublishMode, type PublishPolicy, type ReposFile, type WriteMode } from "./repos.js";
 import { parseCreatedUrl } from "./gh-parse.js";
 import { cacheDefaultBranch, ensureCache } from "./cache.js";
 import { CACHE_FRESH_MS } from "./shared.js";
 import type { ProbeRemoteResult, UnpushedSummary } from "./contract.js";
 import {
+  DEFINITION_PREFIX,
   PROJECT_SOURCE_DIR,
-  projectDefinitionPrefix,
   type ProjectLayout,
 } from "./paths.js";
 
@@ -103,31 +103,38 @@ export async function resolveDefaultBranchRef(dir: string, signal?: AbortSignal)
 }
 
 /**
- * Which layout a project source checkout has.
+ * Which layout a project source has.
  *
- * Decided from the default branch's committed tree, never the working tree, so
- * an uncommitted `.bb/` someone is halfway through creating does not flip the
- * layout under them. A directory that is not a repo, or has no commit yet, is
- * `standalone` — that is the layout `bootstrapProjectSource` initializes, and
- * the fallback only reaches a directory whose committed tree has neither
- * definition.
+ * One question decides it: is the project directory a git repo? A git repo is
+ * a primary (`.bb/` on its default branch); anything else is a plain directory
+ * whose `.bb/` is an ordinary subdirectory. Never a fallback and never decided
+ * from the definition's presence: a git repo with no `.bb/` is an unseeded
+ * primary, and the seeding happens on the first explicit write.
+ *
+ * A git repo that carries `repos.json` at its root and no `.bb/repos.json` is
+ * a leftover standalone definition (the layout this replaced). It is refused
+ * rather than guessed at, so the owner moves the file to `.bb/repos.json`
+ * instead of the plugin committing it somewhere new.
  */
 export async function detectProjectLayout(dir: string, signal?: AbortSignal): Promise<ProjectLayout> {
-  const ref = await resolveDefaultBranchRef(dir, signal);
-  if (ref !== null) {
-    const primary = await gitIn(dir, ["cat-file", "-e", `${ref}:${PROJECT_SOURCE_DIR}/${REPOS_FILE}`], {
-      timeoutMs: GIT_TIMEOUT_MS,
-      ...(signal === undefined ? {} : { signal }),
-    });
-    if (primary.code === 0) return "primary";
-    const standalone = await gitIn(dir, ["cat-file", "-e", `${ref}:${REPOS_FILE}`], {
-      timeoutMs: GIT_TIMEOUT_MS,
-      ...(signal === undefined ? {} : { signal }),
-    });
-    if (standalone.code === 0) return "standalone";
-  }
-  if (await exists(path.join(dir, PROJECT_SOURCE_DIR, REPOS_FILE))) return "primary";
-  return "standalone";
+  if (!(await isGitRepo(dir))) return "directory";
+  const refusal = await rootDefinitionProblem(dir, signal);
+  if (refusal !== null) throw new Error(refusal);
+  return "primary";
+}
+
+/**
+ * The move-it message for a git repo holding a former standalone definition,
+ * or null when there is nothing to move.
+ *
+ * `.bb/repos.json` wins when both exist: a primary that carries a stale root
+ * copy is not refused, because the committed definition is unambiguous.
+ */
+export async function rootDefinitionProblem(dir: string, _signal?: AbortSignal): Promise<string | null> {
+  if (!(await isGitRepo(dir))) return null;
+  if (await exists(path.join(dir, PROJECT_SOURCE_DIR, REPOS_FILE))) return null;
+  if (!(await exists(path.join(dir, REPOS_FILE)))) return null;
+  return `${dir} has a ${REPOS_FILE} at its root, which is a leftover standalone definition. This project is a git repo now: move it to ${PROJECT_SOURCE_DIR}/${REPOS_FILE}.`;
 }
 
 export interface ProbeRemoteArgs {
@@ -142,10 +149,11 @@ export interface ProbeRemoteArgs {
  * Which shape the thing at `url` has, without checking it out.
  *
  * This is the New project form's replacement for its old mode radio. The
- * answer is read from the default branch's committed tree — `repos.json` at
- * the root is a standalone `.bb` repo, `.bb/repos.json` is a primary repo,
- * neither is a plain repo — through the per-machine bare cache, which is the
- * same clone a real checkout borrows from, so the fetch is not wasted.
+ * answer is read from the default branch's committed tree — `.bb/repos.json`
+ * is a primary repo, neither is a plain (unseeded primary) repo — through the
+ * per-machine bare cache, which is the same clone a real checkout borrows
+ * from, so the fetch is not wasted. A root `repos.json` is a leftover
+ * standalone definition and is refused with the move-it message.
  *
  * A local path that is already a checkout is `checkout`: the caller adopts it
  * as the project source rather than cloning beside it. A remote the machine
@@ -165,10 +173,12 @@ export async function probeRemote(args: ProbeRemoteArgs): Promise<ProbeRemoteRes
   }
 
   if (path.isAbsolute(url) && (await isGitRepo(url))) {
-    const layout = await detectProjectLayout(url, signal);
+    const refusal = await rootDefinitionProblem(url, signal);
+    if (refusal !== null) throw new Error(refusal);
     const ref = await resolveDefaultBranchRef(url, signal);
     const defaultBranch = ref?.replace(/^refs\/(heads|remotes\/origin)\//u, "") ?? null;
-    const what = layout === "primary" ? "a primary repo carrying .bb/" : "an existing checkout";
+    const primary = await gitIn(url, ["cat-file", "-e", `${ref ?? "HEAD"}:${PROJECT_SOURCE_DIR}/${REPOS_FILE}`], options);
+    const what = primary.code === 0 ? "a primary repo carrying .bb/" : "an existing checkout (a primary repo with no .bb/ yet)";
     return { outcome: "checkout", defaultBranch, message: `${url} is ${what}; it is used as the project source.` };
   }
 
@@ -191,11 +201,13 @@ export async function probeRemote(args: ProbeRemoteArgs): Promise<ProbeRemoteRes
   if (primary.code === 0) {
     return { outcome: "primary", defaultBranch, message: `Primary repo: .bb/repos.json on ${defaultBranch}.` };
   }
-  const standalone = await gitIn(entry.path, ["cat-file", "-e", `${ref}:${REPOS_FILE}`], options);
-  if (standalone.code === 0) {
-    return { outcome: "standalone", defaultBranch, message: `Standalone .bb repo: repos.json on ${defaultBranch}.` };
+  const root = await gitIn(entry.path, ["cat-file", "-e", `${ref}:${REPOS_FILE}`], options);
+  if (root.code === 0) {
+    throw new Error(
+      `${url} carries a ${REPOS_FILE} at its root, which is a leftover standalone definition. Move it to ${PROJECT_SOURCE_DIR}/${REPOS_FILE} before using this repo.`,
+    );
   }
-  return { outcome: "plain", defaultBranch, message: `Plain repo: no .bb definition on ${defaultBranch}.` };
+  return { outcome: "plain", defaultBranch, message: `Plain repo: no .bb definition on ${defaultBranch}; it becomes a primary repo with an unseeded .bb/.` };
 }
 
 /**
@@ -226,8 +238,66 @@ export function probeRemoteError(url: string, error: unknown): string {
  * the directory as scaffolding and never writes anything durable into it,
  * which is the failure mode that makes cross-repo knowledge evaporate at the
  * end of every thread.
+ *
+ * The publish half differs by layout and so does the file: a primary project
+ * publishes committed `.bb/` writes, while a plain directory edits them in
+ * place and never publishes anything. See {@link SEEDED_AGENTS_MD_PRIMARY}.
  */
 export const SEEDED_AGENTS_MD = `# Cross-repo guidance
+
+This file lives in \`.bb/\`, an ordinary subdirectory of this project's
+directory. It is **shared by every thread in this project**, so it is the
+right place to record durable cross-repo knowledge — and the wrong place for
+anything specific to one thread.
+
+\`.bb/\` holds three things:
+
+- \`repos.json\` — the repo set. Every thread gets a checkout of each entry.
+- \`AGENTS.md\` — this file. bb reads it natively into every thread here.
+- \`skills/\` — project skills, also read natively.
+
+The plugin generates a separate block listing each repo's directory, branch and
+path. Do not duplicate those facts here: paths written into this file go stale
+the first time a repo is renamed, and the generated block is always current as
+of thread start.
+
+## How a \`.bb\` change lands
+
+This project directory is not a git repo, so \`.bb/\` is edited in place.
+Nothing is committed and nothing is published: a change here reaches other
+machines only if the project directory itself is shared or synced some other
+way. The Repos panel, \`bb repos add\`/\`remove\` and \`workspace_add_repo\`
+all edit \`.bb/repos.json\` in place and say so.
+
+## What belongs here
+
+Write down the things a newcomer to this workspace would get wrong:
+
+- **Which repo depends on which**, and in which direction.
+- **What has to be rebuilt, republished, or redeployed** when a given repo
+  changes — especially when the trigger lives in a different repo than the
+  change.
+- **What belongs in which repo**, when that is not obvious from the names.
+- **Cross-repo conventions** — shared version numbers, coordinated releases,
+  contracts that two repos both implement.
+
+## Repos
+
+_Describe each repo in a line or two: what it is, and what depends on it._
+
+## Working across repos
+
+_How a change that spans repos should be landed here: order, PR conventions,
+whether anything must merge first._
+`;
+
+/**
+ * The seeded `AGENTS.md` for a primary project.
+ *
+ * Same shape as {@link SEEDED_AGENTS_MD}; the publish half describes the
+ * policy a git-backed `.bb/` is published by.
+ */
+export const SEEDED_AGENTS_MD_PRIMARY = `# Cross-repo guidance
 
 This file lives in \`.bb/\`, a directory on the primary repo's default branch.
 It is **shared by every thread in this project and versioned**, so it is the
@@ -262,13 +332,9 @@ as one mode for the project or as an object of path → mode:
   the default branch is never moved, so the change lands when the pull request
   is reviewed and merged.
 
-With no key set, the default follows the layout:
-
-- **In a primary-repo project** (\`.bb/\` on a code repo's default branch, as
-  on bb-gate), every path — \`repos.json\` included — defaults to
-  \`pull-request\`. Set \`publish\` to \`"push"\` to opt in to direct pushes.
-- **In a standalone \`.bb\` repo**, \`repos.json\` defaults to \`push\`, while
-  \`AGENTS.md\`, \`skills/\` and \`stewards/\` default to \`pull-request\`.
+With no key set, every path — \`repos.json\` included — defaults to
+\`pull-request\`, because \`.bb/\` sits on a code repo's default branch and is
+reviewed like code. Set \`publish\` to \`"push"\` to opt in to direct pushes.
 
 Either way the change reaches other machines only once it is on \`origin\` —
 for a \`push\` immediately, for a \`pull-request\` when it merges.
@@ -311,18 +377,17 @@ export interface BootstrapResult {
 }
 
 /**
- * Initialize an empty project source in place.
+ * Create a plain directory's `.bb/` skeleton in place.
  *
- * Only ever runs when the directory has no `.git`. A project pointed at a
- * cloned `.bb` repo takes none of this path, and nothing here overwrites a
- * file that already exists — a directory holding an `AGENTS.md` and no repo
- * keeps its `AGENTS.md`.
+ * Runs only when the directory has no `.git`. A git repo is a primary and is
+ * never seeded here: this runs on the thread-start read path, and committing
+ * `.bb/` onto whatever branch the checkout has is not a read's job. The
+ * explicit write paths (the Repos panel's add and the raw editor) seed a
+ * primary through {@link preparePrimaryProjectSource} instead.
  *
- * A git repo with no definition is **not** seeded here: this runs on the
- * thread-start read path, and committing `.bb/` onto whatever branch the
- * checkout has is not a read's job. The explicit write paths (the Repos
- * panel's add and the raw editor) seed it through
- * {@link preparePrimaryProjectSource} instead.
+ * Nothing here overwrites a file that already exists — a directory holding an
+ * `AGENTS.md` and no repo keeps its `AGENTS.md` — and there is no `git init`,
+ * no commit and no `.git` anywhere: a plain directory is just a directory.
  */
 export async function bootstrapProjectSource(
   dir: string,
@@ -331,24 +396,19 @@ export async function bootstrapProjectSource(
 ): Promise<BootstrapResult> {
   const warnings: string[] = [];
   if (await isGitRepo(dir)) return { bootstrapped: false, warnings };
+  void signal;
 
-  const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
-  await mkdir(dir, { recursive: true });
-  await gitInOrThrow(dir, ["init", "--quiet"], options);
-
-  const reposPath = path.join(dir, REPOS_FILE);
+  const definitionDir = path.join(dir, PROJECT_SOURCE_DIR);
+  await mkdir(path.join(definitionDir, "skills"), { recursive: true });
+  const reposPath = path.join(definitionDir, REPOS_FILE);
   if (!(await exists(reposPath))) await writeFile(reposPath, serializeReposFile(seed), "utf8");
-  const agentsPath = path.join(dir, "AGENTS.md");
+  const agentsPath = path.join(definitionDir, "AGENTS.md");
   if (!(await exists(agentsPath))) await writeFile(agentsPath, SEEDED_AGENTS_MD, "utf8");
-  await mkdir(path.join(dir, "skills"), { recursive: true });
   // An empty directory is not a thing git can track, and a project with no
   // skills yet should still show the agent where they go.
-  const keepPath = path.join(dir, "skills", ".gitkeep");
+  const keepPath = path.join(definitionDir, "skills", ".gitkeep");
   if (!(await exists(keepPath))) await writeFile(keepPath, "", "utf8");
 
-  await gitIn(dir, ["add", "--", REPOS_FILE, "AGENTS.md", "skills"], options);
-  const commit = await commitAll(dir, "Initialize the multi-repo workspace definition", signal);
-  if (!commit.committed && commit.message !== null) warnings.push(commit.message);
   return { bootstrapped: true, warnings };
 }
 
@@ -379,7 +439,7 @@ export async function seedPrimaryDefinition(
   const reposPath = path.join(definitionDir, REPOS_FILE);
   if (!(await exists(reposPath))) await writeFile(reposPath, serializeReposFile(seed), "utf8");
   const agentsPath = path.join(definitionDir, "AGENTS.md");
-  if (!(await exists(agentsPath))) await writeFile(agentsPath, SEEDED_AGENTS_MD, "utf8");
+  if (!(await exists(agentsPath))) await writeFile(agentsPath, SEEDED_AGENTS_MD_PRIMARY, "utf8");
   const keepPath = path.join(definitionDir, "skills", ".gitkeep");
   if (!(await exists(keepPath))) await writeFile(keepPath, "", "utf8");
 
@@ -597,14 +657,60 @@ export async function refreshProjectSource(
 
 export async function readReposJson(
   dir: string,
-  layout: ProjectLayout = "standalone",
+  layout: ProjectLayout = "primary",
   signal?: AbortSignal,
 ): Promise<string | null> {
+  if (layout === "directory") return readDefinitionFileFromDisk(dir, REPOS_FILE);
   const read = await readCommittedFiles(dir, [REPOS_FILE], 200_000, signal, {
-    prefix: projectDefinitionPrefix(layout),
+    prefix: DEFINITION_PREFIX,
   });
   if (read.error !== null || read.files.length === 0) return null;
   return read.files[0].content;
+}
+
+/**
+ * Read one `.bb/`-relative file from a plain project directory's disk.
+ *
+ * A plain directory has no commit to read from, so this is the working tree
+ * itself — there is nothing else it could be. The path is validated by the
+ * caller (the RPC schema and {@link projectFilePathProblem}), and the read is
+ * capped so a runaway file cannot be loaded whole.
+ */
+async function readDefinitionFileFromDisk(
+  dir: string,
+  file: string,
+  maxChars = 200_000,
+): Promise<string | null> {
+  const problem = projectFilePathProblem(file);
+  if (problem !== null) return null;
+  const content = await readFile(path.join(dir, PROJECT_SOURCE_DIR, file), "utf8").catch(() => null);
+  if (content === null || content.length > maxChars) return null;
+  return content;
+}
+
+/**
+ * Read `.bb/`-relative files for another plugin: from the committed default
+ * branch for a primary, from disk for a plain directory.
+ *
+ * The primary half is {@link readCommittedFiles} with the `.bb/` prefix; the
+ * plain half is the working tree, because there is no commit. Both return the
+ * same shape so the caller cannot tell them apart.
+ */
+export async function readDefinitionFiles(
+  dir: string,
+  layout: ProjectLayout,
+  paths: readonly string[],
+  maxChars: number,
+  signal?: AbortSignal,
+): Promise<CommittedFiles> {
+  if (layout === "primary") {
+    return readCommittedFiles(dir, paths, maxChars, signal, { prefix: DEFINITION_PREFIX });
+  }
+  const files: CommittedFiles["files"] = [];
+  for (const file of paths) {
+    files.push({ path: file, content: await readDefinitionFileFromDisk(dir, file, maxChars) });
+  }
+  return { head: null, files, error: null };
 }
 
 export interface CommittedFiles {
@@ -701,25 +807,49 @@ export async function readCommittedFiles(
  *
  * Runs host-side, so it works while the agent is sandboxed — this is the write
  * behind `workspace_add_repo`, `bb repos add`/`remove`, the discovery seed and
- * the panel's editor. The commit and the publish are the shared
- * {@link publishDefinition} step, so this function decides nothing about how
- * the change reaches `origin`.
+ * the panel's editor. For a primary the commit and the publish are the shared
+ * {@link publishDefinition} step; for a plain directory the file is written in
+ * place and nothing is published, and the result says so.
  */
 export async function writeReposJson(
   dir: string,
   text: string,
   message: string,
   signal?: AbortSignal,
-  layout: ProjectLayout = "standalone",
+  layout: ProjectLayout = "primary",
   policy?: PublishPolicy,
 ): Promise<{
   ok: boolean;
   committed: boolean;
   head: string | null;
   message: string | null;
-  mode: PublishMode;
+  mode: WriteMode;
   prUrl: string | null;
 }> {
+  if (layout === "directory") {
+    const target = path.join(dir, PROJECT_SOURCE_DIR, REPOS_FILE);
+    try {
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, text, "utf8");
+    } catch (error) {
+      return {
+        ok: false,
+        committed: false,
+        head: null,
+        message: error instanceof Error ? error.message : String(error),
+        mode: "none",
+        prUrl: null,
+      };
+    }
+    return {
+      ok: true,
+      committed: false,
+      head: null,
+      message: `Wrote ${PROJECT_SOURCE_DIR}/${REPOS_FILE} in place. This project is a plain directory, so nothing is published.`,
+      mode: "none",
+      prUrl: null,
+    };
+  }
   const result = await publishDefinition({
     kind: "content",
     dir,
@@ -875,7 +1005,7 @@ async function publishByPush(
   let outcome: CommitOutcome;
   let target = baseName;
   if (request.kind === "content") {
-    const relative = `${projectDefinitionPrefix(request.layout)}${request.path}`;
+    const relative = `${DEFINITION_PREFIX}${request.path}`;
     const current = await gitLine(request.dir, ["rev-parse", "--abbrev-ref", "HEAD"], options);
     outcome =
       current === baseName
@@ -953,7 +1083,7 @@ async function publishByPullRequest(
   let branchName: string;
   if (request.kind === "content") {
     branchName = guidanceBranchName(request.path);
-    const relative = `${projectDefinitionPrefix(request.layout)}${request.path}`;
+    const relative = `${DEFINITION_PREFIX}${request.path}`;
     // Stack on the branch's own tip when it already exists. A second write
     // while the first pull request is still open must fast-forward the same
     // branch, not replace its earlier commit: basing on the default branch
@@ -1180,43 +1310,17 @@ export async function pushGuidance(
   definitionBase?: string | null,
 ): Promise<{ ok: boolean; ref: string | null; message: string }> {
   const layout = await detectProjectLayout(projectSourcePath, signal);
-  return layout === "primary"
-    ? pushGuidancePrimary(projectSourcePath, workspaceBbPath, threadId, signal, definitionBase ?? null)
-    : pushGuidanceStandalone(projectSourcePath, workspaceBbPath, threadId, signal);
-}
-
-async function pushGuidanceStandalone(
-  projectSourcePath: string,
-  workspaceBbPath: string,
-  threadId: string,
-  signal?: AbortSignal,
-): Promise<{ ok: boolean; ref: string | null; message: string }> {
-  const safeId = threadId.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 60);
-  const ref = `refs/heads/guidance-${safeId}`;
-  const options = { timeoutMs: FETCH_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
-
-  // Commit whatever the agent left uncommitted. Publishing must not depend on
-  // the agent remembering a `git commit`: in the primary layout `.bb/` has no
-  // git repo at all, and the tool has to mean the same thing in both layouts.
-  await gitIn(workspaceBbPath, ["add", "-A"], options);
-  await commitAll(workspaceBbPath, `Guidance from ${threadId}`, signal);
-
-  const head = await gitLine(workspaceBbPath, ["rev-parse", "HEAD"], options);
-  if (head === null) {
-    return { ok: false, ref: null, message: `${workspaceBbPath} is not a git repo.` };
+  if (layout === "directory") {
+    return {
+      ok: true,
+      ref: null,
+      // The workspace's `.bb` is a symlink straight to the project directory's
+      // `.bb/`, so an edit under it is already the project's file. There is no
+      // commit and no branch to publish.
+      message: `${workspaceBbPath} is a plain directory's .bb/: the files are already in place in ${projectSourcePath}. Nothing is published.`,
+    };
   }
-  const result = await git(
-    ["-C", projectSourcePath, "fetch", "--quiet", "--force", workspaceBbPath, `HEAD:${ref}`],
-    options,
-  );
-  if (result.code !== 0) {
-    return { ok: false, ref: null, message: firstProblemLine(result) };
-  }
-  return {
-    ok: true,
-    ref,
-    message: `Published ${head.slice(0, 8)} to ${ref} in ${projectSourcePath}. Merge it there when you are happy with it.`,
-  };
+  return pushGuidancePrimary(projectSourcePath, workspaceBbPath, threadId, signal, definitionBase ?? null);
 }
 
 /**
@@ -1336,6 +1440,24 @@ export async function mergeGuidance(
   signal?: AbortSignal,
 ): Promise<MergeGuidanceResult> {
   const layout = await detectProjectLayout(projectSourcePath, signal);
+  if (layout === "directory") {
+    // The workspace's `.bb` symlinks straight to the project directory, so the
+    // lesson is already on disk there. Verify it carries the text and stop;
+    // there is no branch to fast-forward and nothing to publish.
+    const content = await readDefinitionFileFromDisk(projectSourcePath, file, 2_000_000);
+    if (content === null) {
+      return { ok: false, sha: null, branch: null, message: `${PROJECT_SOURCE_DIR}/${file} is not in ${projectSourcePath}.` };
+    }
+    if (!normalized(content).includes(normalized(text))) {
+      return { ok: false, sha: null, branch: null, message: `${PROJECT_SOURCE_DIR}/${file} does not carry the lesson text; write it, then try again.` };
+    }
+    return {
+      ok: true,
+      sha: null,
+      branch: null,
+      message: `${PROJECT_SOURCE_DIR}/${file} is already in place in ${projectSourcePath}; this is a plain directory, so nothing is published.`,
+    };
+  }
   const branch = guidanceRef(threadId);
   const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
   const refuse = (message: string): MergeGuidanceResult => ({ ok: false, sha: null, branch, message });
@@ -1392,169 +1514,6 @@ export async function mergeGuidance(
   };
 }
 
-/**
- * Copy a project-definition tree, skipping any nested `.git`.
- *
- * The standalone checkout is a git repo; the destination is a directory inside
- * the primary repo, which owns the git history. A `.git` copied in would make
- * git treat `.bb/` as a nested repository and the `git add` would produce a
- * gitlink instead of the files.
- */
-async function copyDefinitionTree(src: string, dest: string): Promise<void> {
-  await cp(src, dest, {
-    recursive: true,
-    filter: (source) => path.basename(source) !== ".git",
-  });
-}
-
-export interface AdoptProjectSourceArgs {
-  /** The standalone `.bb` checkout whose tree is copied into the primary. */
-  standalonePath: string;
-  /** URL or local path of the primary repo. */
-  primaryUrl: string;
-  /** Where the primary clone lives; cloned when absent, fetched when present. */
-  primaryPath: string;
-  /** Branch the seed commit is pushed on. */
-  branch: string;
-  /** Attempt `gh pr create` after the push. */
-  openPullRequest: boolean;
-  signal?: AbortSignal;
-}
-
-export interface AdoptProjectSourceResult {
-  status: "already" | "pull-request" | "failed";
-  message: string;
-  prUrl: string | null;
-  warnings: string[];
-  primaryPath: string;
-  defaultBranch: string | null;
-}
-
-/**
- * Adopt a standalone `.bb` repo into a primary repo (BB-106, Case A).
- *
- * Idempotent and per-machine, exactly as the ticket requires:
- *
- * - The primary's default branch already carries `.bb/` — a previous run, or a
- *   teammate's merge — so nothing is copied; the caller re-points the project
- *   source at this checkout.
- * - It does not — the standalone tree is copied to `.bb/` on `branch`, pushed,
- *   and a pull request is opened. The project source is re-pointed on a later
- *   run, once the merge has landed `.bb/` on the default branch.
- *
- * The standalone checkout keeps working throughout; this only ever adds a
- * branch to the primary and never touches the default branch.
- */
-export async function adoptProjectSource(args: AdoptProjectSourceArgs): Promise<AdoptProjectSourceResult> {
-  const warnings: string[] = [];
-  const options = { timeoutMs: FETCH_TIMEOUT_MS, ...(args.signal === undefined ? {} : { signal: args.signal }) };
-  const fail = (message: string): AdoptProjectSourceResult => ({
-    status: "failed",
-    message,
-    prUrl: null,
-    warnings,
-    primaryPath: args.primaryPath,
-    defaultBranch: null,
-  });
-
-  if (await isGitRepo(args.primaryPath)) {
-    const fetched = await gitIn(args.primaryPath, ["fetch", "--quiet", "origin"], options);
-    if (fetched.code !== 0) warnings.push(`Could not fetch the primary: ${firstProblemLine(fetched)}`);
-  } else {
-    const cloned = await cloneProjectSource(args.primaryUrl, args.primaryPath, args.signal);
-    if (!cloned.ok) return fail(cloned.message ?? `Could not clone ${args.primaryUrl}.`);
-  }
-
-  const base = await resolveDefaultBranchRef(args.primaryPath, args.signal);
-  if (base === null) return fail(`${args.primaryPath} has no default branch to adopt into.`);
-  const defaultBranch = base.replace(/^refs\/(heads|remotes\/origin)\//u, "");
-  const existing = await gitIn(
-    args.primaryPath,
-    ["cat-file", "-e", `${base}:${PROJECT_SOURCE_DIR}/${REPOS_FILE}`],
-    options,
-  );
-  if (existing.code === 0) {
-    return {
-      status: "already",
-      message: `${args.primaryPath} already carries .bb/ on ${defaultBranch}; re-point the project source at this checkout.`,
-      prUrl: null,
-      warnings,
-      primaryPath: args.primaryPath,
-      defaultBranch,
-    };
-  }
-
-  const worktree = await mkdtemp(path.join(tmpdir(), "bb-adopt-"));
-  try {
-    const added = await gitIn(
-      args.primaryPath,
-      ["worktree", "add", "--detach", "--force", worktree, base],
-      options,
-    );
-    if (added.code !== 0) return fail(firstProblemLine(added));
-    await rm(path.join(worktree, PROJECT_SOURCE_DIR), { recursive: true, force: true });
-    await copyDefinitionTree(args.standalonePath, path.join(worktree, PROJECT_SOURCE_DIR));
-    await gitIn(worktree, ["add", "-A", "--", PROJECT_SOURCE_DIR], options);
-    const commit = await commitAll(worktree, "Move the project definition into .bb/ on the primary repo", args.signal);
-    if (!commit.committed || commit.head === null) {
-      return fail(commit.message ?? "There was nothing to adopt.");
-    }
-    const head = commit.head;
-    const recorded = await gitIn(args.primaryPath, ["update-ref", `refs/heads/${args.branch}`, head], options);
-    if (recorded.code !== 0) return fail(firstProblemLine(recorded));
-
-    const pushed = await gitIn(
-      args.primaryPath,
-      ["push", "--quiet", "--force-with-lease", "origin", `refs/heads/${args.branch}`],
-      options,
-    );
-    if (pushed.code !== 0) {
-      warnings.push(`The adopt branch was created locally but not pushed: ${firstProblemLine(pushed)}`);
-    }
-
-    let prUrl: string | null = null;
-    if (args.openPullRequest && pushed.code === 0) {
-      const title = "Move the project definition into .bb/ on the primary repo";
-      const body =
-        "Adopts the standalone `.bb` project definition into `.bb/` on this repo's default branch (BB-106). " +
-        "`repos.json` lists only the other repos; the primary is derived from this repo's origin. " +
-        "Merge this to make the project source this repo.";
-      const pr = await run(
-        "gh",
-        [
-          "pr",
-          "create",
-          "--base",
-          defaultBranch,
-          "--head",
-          args.branch,
-          "--title",
-          title,
-          "--body",
-          body,
-        ],
-        { cwd: args.primaryPath, timeoutMs: FETCH_TIMEOUT_MS, ...(args.signal === undefined ? {} : { signal: args.signal }) },
-      );
-      if (pr.code === 0) prUrl = pr.stdout.trim().split("\n").pop() ?? null;
-      else warnings.push(`Could not open the pull request: ${firstProblemLine(pr)}`);
-    }
-
-    return {
-      status: "pull-request",
-      message: prUrl === null
-        ? `Copied the standalone .bb tree to ${args.branch} in ${args.primaryPath}. Push it and open a pull request, then run adopt again.`
-        : `Opened ${prUrl}. Merge it, then run adopt again to re-point the project source.`,
-      prUrl,
-      warnings,
-      primaryPath: args.primaryPath,
-      defaultBranch,
-    };
-  } finally {
-    await gitIn(args.primaryPath, ["worktree", "remove", "--force", worktree], options).catch(() => undefined);
-    await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
-
 export interface PreparePrimaryProjectSourceArgs {
   /** URL or local path of the primary repo. */
   url: string;
@@ -1582,8 +1541,7 @@ export interface PreparePrimaryProjectSourceResult {
  *
  * Clone the repo if it is not on this machine, then:
  *
- * - it already carries `.bb/` (or is a standalone `.bb` repo) — use it as it
- *   is;
+ * - it already carries `.bb/` — use it as it is;
  * - it does not — seed `.bb/` with `AGENTS.md`, `skills/` and a `repos.json`
  *   listing the other repos, commit it on the checkout's default branch so the
  *   first thread can provision, and publish a `guidance-<seed>` branch with a
@@ -1596,7 +1554,7 @@ export async function preparePrimaryProjectSource(
   const options = { timeoutMs: FETCH_TIMEOUT_MS, ...(args.signal === undefined ? {} : { signal: args.signal }) };
   const fail = (message: string): PreparePrimaryProjectSourceResult => ({
     ok: false,
-    layout: "standalone",
+    layout: "primary",
     seeded: false,
     prUrl: null,
     warnings,
@@ -1615,17 +1573,8 @@ export async function preparePrimaryProjectSource(
   if (base === null) return fail(`${args.path} has no default branch.`);
   const defaultBranch = base.replace(/^refs\/(heads|remotes\/origin)\//u, "");
 
-  const rootDefinition = await gitIn(args.path, ["cat-file", "-e", `${base}:${REPOS_FILE}`], options);
-  if (rootDefinition.code === 0) {
-    return {
-      ok: true,
-      layout: "standalone",
-      seeded: false,
-      prUrl: null,
-      warnings,
-      message: `${args.path} is a standalone .bb repo.`,
-    };
-  }
+  const rootDefinition = await rootDefinitionProblem(args.path, args.signal);
+  if (rootDefinition !== null) return fail(rootDefinition);
   const existing = await gitIn(
     args.path,
     ["cat-file", "-e", `${base}:${PROJECT_SOURCE_DIR}/${REPOS_FILE}`],
@@ -1645,7 +1594,7 @@ export async function preparePrimaryProjectSource(
   // Build the seed commit in a detached worktree at the default-branch base,
   // never on the checkout's current branch: a checkout the user points at may
   // sit on a feature branch, and seeding there would publish their unpushed
-  // work on the seed branch. `adoptProjectSource` uses the same pattern.
+  // work on the seed branch.
   const worktree = await mkdtemp(path.join(tmpdir(), "bb-seed-"));
   let seedSha: string | null = null;
   try {

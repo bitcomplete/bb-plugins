@@ -39,7 +39,7 @@ export type ProjectRepoSet = {
   repos: Array<{ dir: string; url: string }>;
   /** The project source's own origin, for a lesson's pull request (BB-108). */
   primary: { dir: string; url: string } | null;
-  layout: "primary" | "standalone";
+  layout: "primary" | "directory" | "standalone";
   error: string | null;
 };
 
@@ -52,7 +52,7 @@ export type NativeGitRead = {
   files: ProjectGitFile[];
   remote: string | null;
   defaultBranch: string | null;
-  layout: "primary" | "standalone";
+  layout: "primary" | "directory" | "standalone";
   error: string | null;
 };
 

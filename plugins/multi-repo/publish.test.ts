@@ -1,18 +1,19 @@
 /**
- * BB-148 deliverable 2: the publish policy, end to end against real git repos.
+ * BB-148 deliverable 2, as BB-238 reshaped it: the publish policy, end to end
+ * against real git repos.
  *
- * Every committed `.bb` write goes through one `publishDefinition` step.
- * `push` puts the default branch on `origin`; `pull-request` puts a
- * `guidance-` branch there and opens a pull request without moving the
- * default branch. The defaults follow the layout, a `publish` key overrides
- * them, and a rejected push or a failed `gh pr create` keeps the local commit
- * and never force-pushes or resets the default branch.
+ * A primary project's committed `.bb` writes go through one
+ * `publishDefinition` step. `push` puts the default branch on `origin`;
+ * `pull-request` puts a `guidance-` branch there and opens a pull request
+ * without moving the default branch. A `publish` key overrides the default.
+ * A plain directory never commits or publishes: the file is written in place
+ * and the result says so.
  *
  * `gh` is faked on `PATH`, because the assertions are about what git and the
  * host were asked to do, not about GitHub. The structured-write wiring is
  * checked at the RPC boundary with a fake host.
  */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -36,6 +37,15 @@ afterEach(async () => {
   await rm(scratch, { recursive: true, force: true });
 });
 
+async function exists(target: string): Promise<boolean> {
+  try {
+    await access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function makeBareRemote(name: string): Promise<string> {
   const work = path.join(scratch, "seed-work", name);
   await mkdir(work, { recursive: true });
@@ -50,29 +60,25 @@ async function makeBareRemote(name: string): Promise<string> {
   return bare;
 }
 
-/** Clone `remote` into a standalone `.bb` checkout with a committed definition. */
-async function makeStandalone(remote: string, name: string, policy?: unknown): Promise<string> {
+/** A plain project directory: `.bb/` on disk, no git anywhere. */
+async function makePlainDirectory(name: string, policy?: unknown): Promise<string> {
   const dir = path.join(scratch, name);
-  await git(["clone", "--quiet", remote, dir]);
-  await gitIn(dir, ["config", "user.email", "test@example.invalid"]);
-  await gitIn(dir, ["config", "user.name", "Test"]);
+  await mkdir(path.join(dir, ".bb", "skills"), { recursive: true });
   const file = { version: 1, repos: [], ...(policy === undefined ? {} : { publish: policy }) };
-  await writeFile(path.join(dir, "repos.json"), `${JSON.stringify(file, null, 2)}\n`, "utf8");
-  await writeFile(path.join(dir, "AGENTS.md"), "# guidance\n", "utf8");
-  await gitIn(dir, ["add", "-A"]);
-  await gitIn(dir, ["commit", "--quiet", "-m", "seed definition"]);
-  await gitIn(dir, ["push", "--quiet", "origin", "main"]);
+  await writeFile(path.join(dir, ".bb", "repos.json"), `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  await writeFile(path.join(dir, ".bb", "AGENTS.md"), "# guidance\n", "utf8");
   return dir;
 }
 
 /** Clone `remote` into a primary checkout whose default branch carries `.bb/`. */
-async function makePrimary(remote: string, name: string): Promise<string> {
+async function makePrimary(remote: string, name: string, policy?: unknown): Promise<string> {
   const dir = path.join(scratch, name);
   await git(["clone", "--quiet", remote, dir]);
   await gitIn(dir, ["config", "user.email", "test@example.invalid"]);
   await gitIn(dir, ["config", "user.name", "Test"]);
   await mkdir(path.join(dir, ".bb", "skills"), { recursive: true });
-  await writeFile(path.join(dir, ".bb", "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+  const file = { version: 1, repos: [], ...(policy === undefined ? {} : { publish: policy }) };
+  await writeFile(path.join(dir, ".bb", "repos.json"), `${JSON.stringify(file, null, 2)}\n`, "utf8");
   await writeFile(path.join(dir, ".bb", "AGENTS.md"), "# primary guidance\n", "utf8");
   await gitIn(dir, ["add", "-A"]);
   await gitIn(dir, ["commit", "--quiet", "-m", "add .bb"]);
@@ -110,58 +116,93 @@ function reposText(policy?: unknown): string {
 async function writeByPolicy(
   dir: string,
   text: string,
-  layout: "standalone" | "primary",
+  layout: "directory" | "primary",
 ): Promise<Awaited<ReturnType<typeof writeReposJson>>> {
   const parsed = parseReposFile(text);
   if (!parsed.ok) throw new Error(parsed.error);
   return writeReposJson(dir, text, "Add added", undefined, layout, parsed.value.publish);
 }
 
-describe("push (standalone default)", () => {
+describe("a plain directory writes in place and publishes nothing", () => {
+  it("writes .bb/repos.json with no git, no commit and mode none", async () => {
+    const dir = await makePlainDirectory("plain-canonical");
+    const result = await writeByPolicy(dir, NEW_REPOS, "directory");
+    expect(result.ok).toBe(true);
+    expect(result.mode).toBe("none");
+    expect(result.committed).toBe(false);
+    expect(result.message).toMatch(/nothing is published/iu);
+    expect(await readFile(path.join(dir, ".bb", "repos.json"), "utf8")).toContain('"added"');
+    // No hidden repo was created anywhere.
+    expect(await exists(path.join(dir, ".git"))).toBe(false);
+    expect(await exists(path.join(dir, ".bb", ".git"))).toBe(false);
+  });
+
+  it("publishes workspace guidance as a no-op, because the file is already in place", async () => {
+    const dir = await makePlainDirectory("plain-guidance");
+    const workspaceBb = path.join(dir, ".bb");
+    await writeFile(path.join(workspaceBb, "AGENTS.md"), "learned through the link\n", "utf8");
+    const result = await pushGuidance(dir, workspaceBb, "thr_plain");
+    expect(result.ok).toBe(true);
+    expect(result.ref).toBeNull();
+    expect(result.message).toMatch(/nothing is published/iu);
+    expect(await readFile(path.join(workspaceBb, "AGENTS.md"), "utf8")).toBe("learned through the link\n");
+  });
+
+  it("merges a lesson in place when it is already on disk", async () => {
+    const dir = await makePlainDirectory("plain-lesson");
+    await writeFile(path.join(dir, ".bb", "AGENTS.md"), "# guidance\nA plain lesson.\n", "utf8");
+    const result = await mergeGuidance(dir, "thr_plain", "AGENTS.md", "A plain lesson.");
+    expect(result.ok).toBe(true);
+    expect(result.sha).toBeNull();
+    expect(result.message).toMatch(/nothing is published/iu);
+  });
+});
+
+describe("push (a primary repo's override)", () => {
   it("commits on the default branch and pushes it to origin", async () => {
     const remote = await makeBareRemote("push-remote");
-    const dir = await makeStandalone(remote, "push-canonical");
-    const result = await writeByPolicy(dir, NEW_REPOS, "standalone");
+    const dir = await makePrimary(remote, "push-canonical", "push");
+    const result = await writeByPolicy(dir, reposText("push"), "primary");
     expect(result.ok).toBe(true);
     expect(result.mode).toBe("push");
     const local = await gitLine(dir, ["rev-parse", "HEAD"]);
     expect(await gitLine(remote, ["rev-parse", "main"])).toBe(local);
-    expect(await gitLine(dir, ["show", "HEAD:repos.json"])).toContain('"added"');
+    expect(await gitLine(dir, ["show", "HEAD:.bb/repos.json"])).toContain('"added"');
   });
 
   it("keeps the local commit and leaves origin alone when the push is rejected", async () => {
     const remote = await makeBareRemote("reject-remote");
-    const dir = await makeStandalone(remote, "reject-canonical");
+    const dir = await makePrimary(remote, "reject-canonical", "push");
     const before = await gitLine(remote, ["rev-parse", "main"]);
     // A remote that cannot be reached rejects the push. Nothing may force the
     // push through, and nothing may reset the local commit.
     await gitIn(dir, ["remote", "set-url", "origin", path.join(scratch, "does-not-exist.git")]);
-    const result = await writeByPolicy(dir, NEW_REPOS, "standalone");
+    const result = await writeByPolicy(dir, reposText("push"), "primary");
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/pushing it to origin failed/u);
-    expect(await gitLine(dir, ["show", "HEAD:repos.json"])).toContain('"added"');
+    expect(await gitLine(dir, ["show", "HEAD:.bb/repos.json"])).toContain('"added"');
     expect(await gitLine(remote, ["rev-parse", "main"])).toBe(before);
   });
 
   it("commits locally and reports a note when the project has no origin", async () => {
     const dir = path.join(scratch, "local-only");
-    await mkdir(dir, { recursive: true });
+    await mkdir(path.join(dir, ".bb"), { recursive: true });
     await git(["init", "--quiet", "--initial-branch=main", dir]);
     await gitIn(dir, ["config", "user.email", "test@example.invalid"]);
     await gitIn(dir, ["config", "user.name", "Test"]);
-    await writeFile(path.join(dir, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await writeFile(path.join(dir, ".bb", "repos.json"), '{"version":1,"repos":[],"publish":"push"}\n', "utf8");
     await gitIn(dir, ["add", "-A"]);
     await gitIn(dir, ["commit", "--quiet", "-m", "seed"]);
-    const result = await writeByPolicy(dir, NEW_REPOS, "standalone");
+    const result = await writeByPolicy(dir, reposText("push"), "primary");
     expect(result.ok).toBe(true);
     expect(result.mode).toBe("push");
     expect(result.message).toMatch(/No origin remote/u);
-    expect(await gitLine(dir, ["show", "HEAD:repos.json"])).toContain('"added"');
+    expect(await gitLine(dir, ["show", "HEAD:.bb/repos.json"])).toContain('"added"');
   });
 });
 
-describe("pull-request (primary default and standalone override)", () => {
-  it("opens a pull request from a guidance branch without moving the default branch (primary)", async () => {
+describe("pull-request (a primary repo's default)", () => {
+  it("opens a pull request from a guidance branch without moving the default branch", async () => {
     await installFakeGh(GH_CREATE_OK);
     const remote = await makeBareRemote("primary-remote");
     const dir = await makePrimary(remote, "primary-canonical");
@@ -176,25 +217,16 @@ describe("pull-request (primary default and standalone override)", () => {
     expect(await gitLine(remote, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"added"');
   });
 
-  it("honours a whole-project pull-request override in a standalone repo", async () => {
+  it("honours a whole-project pull-request override", async () => {
     await installFakeGh(GH_CREATE_OK);
-    const remote = await makeBareRemote("standalone-pr-remote");
-    const dir = await makeStandalone(remote, "standalone-pr-canonical", "pull-request");
+    const remote = await makeBareRemote("override-pr-remote");
+    const dir = await makePrimary(remote, "override-pr-canonical", "pull-request");
     const beforeOrigin = await gitLine(remote, ["rev-parse", "main"]);
-    const result = await writeByPolicy(dir, reposText("pull-request"), "standalone");
+    const result = await writeByPolicy(dir, reposText("pull-request"), "primary");
     expect(result.ok).toBe(true);
     expect(result.mode).toBe("pull-request");
     expect(await gitLine(remote, ["rev-parse", "main"])).toBe(beforeOrigin);
-    expect(await gitLine(remote, ["show", "guidance-repos-json:repos.json"])).toContain('"added"');
-  });
-
-  it("honours a push override in a primary repo", async () => {
-    const remote = await makeBareRemote("primary-push-remote");
-    const dir = await makePrimary(remote, "primary-push-canonical");
-    const result = await writeByPolicy(dir, reposText("push"), "primary");
-    expect(result.ok).toBe(true);
-    expect(result.mode).toBe("push");
-    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+    expect(await gitLine(remote, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"added"');
   });
 
   it("keeps the commit and does not move the default branch when the PR cannot be opened", async () => {
@@ -202,33 +234,33 @@ describe("pull-request (primary default and standalone override)", () => {
 echo "gh: pull request creation failed" >&2
 exit 1`);
     const remote = await makeBareRemote("pr-fail-remote");
-    const dir = await makeStandalone(remote, "pr-fail-canonical", "pull-request");
+    const dir = await makePrimary(remote, "pr-fail-canonical");
     const beforeLocal = await gitLine(dir, ["rev-parse", "main"]);
     const beforeOrigin = await gitLine(remote, ["rev-parse", "main"]);
-    const result = await writeByPolicy(dir, reposText("pull-request"), "standalone");
+    const result = await writeByPolicy(dir, reposText("pull-request"), "primary");
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/opening the pull request failed/u);
     // The commit is on the pushed guidance branch, locally and on origin; the
     // default branch is exactly where it was.
-    expect(await gitLine(dir, ["show", "guidance-repos-json:repos.json"])).toContain('"added"');
-    expect(await gitLine(remote, ["show", "guidance-repos-json:repos.json"])).toContain('"added"');
+    expect(await gitLine(dir, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"added"');
+    expect(await gitLine(remote, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"added"');
     expect(await gitLine(dir, ["rev-parse", "main"])).toBe(beforeLocal);
     expect(await gitLine(remote, ["rev-parse", "main"])).toBe(beforeOrigin);
   });
 
   it("keeps the branch commit and fails clearly when a pull-request project has no origin", async () => {
     const dir = path.join(scratch, "pr-local-only");
-    await mkdir(dir, { recursive: true });
+    await mkdir(path.join(dir, ".bb"), { recursive: true });
     await git(["init", "--quiet", "--initial-branch=main", dir]);
     await gitIn(dir, ["config", "user.email", "test@example.invalid"]);
     await gitIn(dir, ["config", "user.name", "Test"]);
-    await writeFile(path.join(dir, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await writeFile(path.join(dir, ".bb", "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
     await gitIn(dir, ["add", "-A"]);
     await gitIn(dir, ["commit", "--quiet", "-m", "seed"]);
-    const result = await writeByPolicy(dir, reposText("pull-request"), "standalone");
+    const result = await writeByPolicy(dir, reposText("pull-request"), "primary");
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/no origin remote/u);
-    expect(await gitLine(dir, ["show", "guidance-repos-json:repos.json"])).toContain('"added"');
+    expect(await gitLine(dir, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"added"');
   });
 
   it("returns the open pull request when the branch already has one", async () => {
@@ -236,8 +268,8 @@ exit 1`);
 echo "should not create" >&2
 exit 1`);
     const remote = await makeBareRemote("pr-existing-remote");
-    const dir = await makeStandalone(remote, "pr-existing-canonical", "pull-request");
-    const result = await writeByPolicy(dir, reposText("pull-request"), "standalone");
+    const dir = await makePrimary(remote, "pr-existing-canonical");
+    const result = await writeByPolicy(dir, reposText("pull-request"), "primary");
     expect(result.ok).toBe(true);
     expect(result.prUrl).toBe("https://github.com/you/bb/pull/9");
   });
@@ -256,7 +288,7 @@ if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
 fi
 exit 1`);
     const remote = await makeBareRemote("stack-remote");
-    const dir = await makeStandalone(remote, "stack-canonical", "pull-request");
+    const dir = await makePrimary(remote, "stack-canonical");
     const first = `${JSON.stringify({ version: 1, repos: [{ dir: "one", url: "https://example.com/one" }], publish: "pull-request" })}\n`;
     const second = `${JSON.stringify({
       version: 1,
@@ -266,10 +298,10 @@ exit 1`);
       ],
       publish: "pull-request",
     })}\n`;
-    const r1 = await writeByPolicy(dir, first, "standalone");
+    const r1 = await writeByPolicy(dir, first, "primary");
     expect(r1.ok).toBe(true);
     expect(r1.prUrl).toBe("https://github.com/you/bb/pull/7");
-    const r2 = await writeByPolicy(dir, second, "standalone");
+    const r2 = await writeByPolicy(dir, second, "primary");
     expect(r2.ok).toBe(true);
     expect(r2.prUrl).toBe("https://github.com/you/bb/pull/7");
     // The second commit descends from the first, so the push is a
@@ -278,36 +310,41 @@ exit 1`);
     expect(r2.head).not.toBeNull();
     const ancestor = await gitIn(remote, ["merge-base", "--is-ancestor", r1.head as string, r2.head as string]);
     expect(ancestor.code).toBe(0);
-    expect(await gitLine(remote, ["show", "guidance-repos-json:repos.json"])).toContain('"two"');
+    expect(await gitLine(remote, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"two"');
     // The default branch is still untouched.
-    expect(await gitLine(remote, ["show", "main:repos.json"])).not.toContain('"one"');
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).not.toContain('"one"');
   });
 });
 
 describe("mergeGuidance by policy", () => {
   async function withGuidance(
     policy: "push" | "pull-request",
-  ): Promise<{ canonical: string; remote: string; lesson: string }> {
+  ): Promise<{ canonical: string; remote: string; workspaceBb: string; lesson: string }> {
     const remote = await makeBareRemote(`merge-${policy}-remote`);
-    const canonical = await makeStandalone(remote, `merge-${policy}-canonical`, policy);
+    const canonical = await makePrimary(remote, `merge-${policy}-canonical`, policy);
+    // The workspace's `.bb` is what a thread edits; for a primary it is the
+    // link into the primary clone's `.bb/`, so a copy of that directory is the
+    // closest thing a unit test can stand in with.
     const workspace = path.join(scratch, `merge-${policy}-workspace`);
     await git(["clone", "--quiet", canonical, workspace]);
     await gitIn(workspace, ["config", "user.email", "test@example.invalid"]);
     await gitIn(workspace, ["config", "user.name", "Test"]);
+    const workspaceBb = path.join(workspace, ".bb");
     const lesson = `Lesson for ${policy}.`;
-    const current = await readFile(path.join(workspace, "AGENTS.md"), "utf8");
-    await writeFile(path.join(workspace, "AGENTS.md"), `${current}\n${lesson}\n`, "utf8");
-    await gitIn(workspace, ["add", "--", "AGENTS.md"]);
+    const current = await readFile(path.join(workspaceBb, "AGENTS.md"), "utf8");
+    await writeFile(path.join(workspaceBb, "AGENTS.md"), `${current}\n${lesson}\n`, "utf8");
+    await gitIn(workspace, ["add", "--", ".bb/AGENTS.md"]);
     await gitIn(workspace, ["commit", "--quiet", "-m", "record a lesson"]);
-    await pushGuidance(canonical, workspace, "thr_lesson");
-    return { canonical, remote, lesson };
+    const pushed = await pushGuidance(canonical, workspaceBb, "thr_lesson");
+    expect(pushed.ok).toBe(true);
+    return { canonical, remote, workspaceBb, lesson };
   }
 
   it("pushes the fast-forward under push", async () => {
     const { canonical, remote, lesson } = await withGuidance("push");
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", ".bb/AGENTS.md", lesson);
     expect(result.ok).toBe(true);
-    expect(await gitLine(remote, ["show", "main:AGENTS.md"])).toContain(lesson);
+    expect(await gitLine(remote, ["show", "main:.bb/AGENTS.md"])).toContain(lesson);
     expect(await gitLine(canonical, ["rev-parse", "HEAD"])).toBe(await gitLine(remote, ["rev-parse", "main"]));
   });
 
@@ -316,7 +353,7 @@ describe("mergeGuidance by policy", () => {
     const { canonical, remote, lesson } = await withGuidance("pull-request");
     const beforeLocal = await gitLine(canonical, ["rev-parse", "main"]);
     const beforeOrigin = await gitLine(remote, ["rev-parse", "main"]);
-    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    const result = await mergeGuidance(canonical, "thr_lesson", ".bb/AGENTS.md", lesson);
     expect(result.ok).toBe(true);
     expect(result.message).toContain("https://github.com/you/bb/pull/7");
     expect(await gitLine(canonical, ["rev-parse", "main"])).toBe(beforeLocal);
@@ -354,7 +391,7 @@ async function setupServer(reposJson: string) {
           remote: "git@github.com:you/acme.git",
           defaultBranch: "main",
           unpushed: null,
-          layout: "standalone",
+          layout: "primary",
           warnings: [],
         };
       }
@@ -391,7 +428,7 @@ describe("the write paths share the publish step", () => {
     })) as { ok: boolean; mode: string | null; prUrl: string | null };
     expect(result).toMatchObject({ ok: true, mode: "pull-request", prUrl: "https://github.com/you/acme/pull/1" });
     const write = hostCalls.find((call) => call.method === "writeProjectSourceRepos");
-    expect(write?.input).toMatchObject({ publish: "pull-request", layout: "standalone" });
+    expect(write?.input).toMatchObject({ publish: "pull-request", layout: "primary" });
     const written = parseReposFile((write?.input as { reposJson: string }).reposJson);
     expect(written.ok && written.value.publish).toBe("pull-request");
   });
@@ -435,7 +472,7 @@ describe("the write paths share the publish step", () => {
             remote: "git@github.com:you/acme.git",
             defaultBranch: "main",
             unpushed: null,
-            layout: "standalone",
+            layout: "primary",
             warnings: [],
           };
         }
@@ -454,5 +491,30 @@ describe("the write paths share the publish step", () => {
     })) as { ok: boolean; error: string | null };
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/push rejected/u);
+  });
+
+  it("surfaces the move-it refusal for a leftover root repos.json", async () => {
+    // A legacy standalone project source: a git repo with `repos.json` at its
+    // root and no `.bb/repos.json`. The host refuses it, and every write path
+    // must show that refusal rather than writing anywhere new.
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string }) => {
+        if (call.method === "prepareProjectSource") {
+          throw new Error(
+            "/checkouts/acme has a repos.json at its root, which is a leftover standalone definition. This project is a git repo now: move it to .bb/repos.json.",
+          );
+        }
+        throw new Error(`unexpected host method ${call.method}`);
+      },
+    });
+    harness.sdk.stub("projects.get", () => PROJECT);
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("addRepo", {
+      projectId: PROJECT_ID,
+      repo: { dir: "b", url: "https://example.com/b" },
+    })) as { ok: boolean; error: string | null };
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/move it to \.bb\/repos\.json/u);
   });
 });

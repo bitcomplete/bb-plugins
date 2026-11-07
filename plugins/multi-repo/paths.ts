@@ -37,27 +37,25 @@ export function assertSafeSegment(value: string, what: string): string {
 export const PROJECT_SOURCE_DIR = ".bb";
 
 /**
- * Which of the two shapes a project source has.
+ * Which shape a project source has.
  *
- * - `standalone` — the project source is a `.bb` git repo of its own; the
- *   definition (`repos.json`, `AGENTS.md`, `skills/`) sits at its root. This is
- *   the original layout, still supported so a machine that has not adopted yet
- *   keeps working.
- * - `primary` — the project source is a clone of the primary repo P and the
- *   definition sits at `P/.bb/`. `repos.json` lists only the *other* repos;
- *   P is derived from the checkout's `origin`.
+ * One question decides it: is the project directory a git repo?
+ *
+ * - `primary` — yes. The project directory is the primary repo; `.bb/` lives
+ *   on its default branch and is published by the project policy. A repo with
+ *   no `.bb/` yet is an unseeded primary, seeded on the first explicit write.
+ * - `directory` — no. `.bb/` is an ordinary subdirectory of the project
+ *   directory, edited in place: no commit, no `definitionBase`, no publish.
  */
-export type ProjectLayout = "standalone" | "primary";
+export type ProjectLayout = "primary" | "directory";
 
 /**
  * The path prefix under the project source that holds the definition.
  *
- * Empty for `standalone`, `.bb/` for `primary` — always a POSIX-style prefix
- * because it is used both as a filesystem path segment and as a git pathspec.
+ * `.bb/` in both layouts — always a POSIX-style prefix because it is used both
+ * as a filesystem path segment and as a git pathspec.
  */
-export function projectDefinitionPrefix(layout: ProjectLayout): string {
-  return layout === "primary" ? `${PROJECT_SOURCE_DIR}/` : "";
-}
+export const DEFINITION_PREFIX = `${PROJECT_SOURCE_DIR}/`;
 
 /**
  * A stable cache directory name for a repo URL.

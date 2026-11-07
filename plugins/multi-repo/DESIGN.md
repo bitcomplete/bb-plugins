@@ -72,7 +72,7 @@ Keep it strict JSON. Documentation lives in the seeded `AGENTS.md` and the plugi
 
 `project_sources.path` is the canonical project-source checkout, per
 `(projectId, hostId)` — one per machine (`packages/db/src/schema.ts:496`).
-There are two layouts, detected from the default branch's committed tree:
+One question decides the layout: **is the project directory a git repo?**
 
 - **primary** — the checkout is a clone of the primary repo and the definition
   sits at `P/.bb/`. `repos.json` lists only the other repos; P is derived from
@@ -81,29 +81,29 @@ There are two layouts, detected from the default branch's committed tree:
   reads `<workspacePath>/.bb/AGENTS.md` and `.bb/skills` from the workspace
   root only; a copy from the default branch's committed tip is the fallback
   when the link cannot be made.
-- **standalone** — the checkout is a `.bb` git repo with the definition at its
-  root. This is the original layout, still read and written as before so a
-  machine that has not adopted keeps working.
+- **directory** — the project directory is not a git repo. `.bb/` is an
+  ordinary subdirectory of it, created with `repos.json`, `AGENTS.md` and
+  `skills/` when missing, with no `git init`. `<workspace>/.bb` is a symlink
+  straight to it; there is no commit, no `definitionBase` and no publish.
+- A git repo carrying a root `repos.json` and no `.bb/repos.json` is a leftover
+  standalone definition. It is refused with a message to move it to
+  `.bb/repos.json`; nothing is guessed at.
 
 Reads (`readProjectFiles`, `repoSet`) resolve the default branch's committed
-tip — `origin/<default>`, or the local default branch when the plugin's own
-commit is ahead of it — never the working tree or a feature branch.
+tip for a primary — `origin/<default>`, or the local default branch when the
+plugin's own commit is ahead of it — never the working tree or a feature
+branch. For a plain directory there is no commit, so the read is the working
+tree itself.
 
 Ways in:
 
 - **Primary, from an existing repo** — point the project at a clone of P. If it
   does not carry `.bb/`, the plugin seeds it on the default branch and publishes
   a `guidance-<seed>` branch with a pull request.
-- **Shared** — the standalone `.bb` repo has a remote. Clone it, create the
-  project pointing at it.
+- **Shared** — a primary repo has a remote. Clone it, create the project
+  pointing at it.
 - **Local, from scratch** — create the project pointing at a fresh directory;
-  the plugin initializes a standalone `.bb` there.
-
-`bb repos adopt <primary>` (and the panel) copies a standalone tree into
-`.bb/` on a branch of the primary and opens a pull request; once it merges, a
-later run re-points `project_sources.path` in place. That is BB-106 Case A: the
-SDK's `bb.sdk.projects.sources.update` re-points the source row for the same
-project id, so no store re-key and no steward respawn is needed.
+  the plugin creates a plain-directory `.bb/` there, with no git.
 
 ## 3. Why a plain-directory workspace root
 
@@ -156,11 +156,31 @@ Declares `requires: { projectCheckout: true }`, which guarantees a non-null `con
 
 ### `create()`
 
-1. **Bootstrap `.bb`** if `projectCheckout.path` has no `.git`: `git init`, seed `AGENTS.md` and `repos.json`, commit.
-2. **Refresh** the project-source checkout (fetch-if-stale), then parse and validate `repos.json`.
-3. **An empty repo set stays empty.** The workspace then holds only the project source (the primary clone, or the standalone `.bb`). Nothing is ever proposed into `repos.json` from the checkouts on the machine: on a server that keeps its projects side by side that proposed every other project's primary, and for a plain repo adopted as the project source it committed that list at the repo root.
-4. **Populate the cache** per repo (§5), under a file lock. Concurrent thread creation against one cache entry is normal, not an edge case.
-5. **Materialize the workspace**: claim the root with `context.experimental_claimPath(root)` before writing to it, create it, clone each repo plus `.bb`, rewrite each work repo's `origin` to its real remote, and create the shared thread branch in each work repo. `.bb` stays on its default branch.
+1. **Bootstrap a plain directory's `.bb/`** if `projectCheckout.path` is not a
+git repo: create `.bb/{repos.json,AGENTS.md,skills/}` where missing, with **no**
+`git init` and no commit. A git repo is never seeded here — it is an unseeded
+primary, seeded through `preparePrimaryProjectSource` on the first explicit
+write (the Repos panel, `bb repos`, `ensureProjectDefinition`), because
+committing `.bb/` onto whatever branch a read happens to see is not a read's
+job.
+2. **Refresh** the project-source checkout (fetch-if-stale) for a primary, then
+parse and validate `repos.json`.
+3. **An empty repo set stays empty.** The workspace then holds only the project
+source (the primary clone) or nothing but the linked `.bb/` for a plain
+directory. Nothing is ever proposed into `repos.json` from the checkouts on the
+machine: on a server that keeps its projects side by side that proposed every
+other project's primary, and for a git repo adopted as the project source it
+committed that list at the repo root.
+4. **Populate the cache** per repo (§5), under a file lock. Concurrent thread
+creation against one cache entry is normal, not an edge case.
+5. **Materialize the workspace**: claim the root with
+`context.experimental_claimPath(root)` before writing to it, create it, clone
+each repo, rewrite each work repo's `origin` to its real remote, and create the
+shared thread branch in each work repo. `.bb` is a symlink: to
+`<workspace>/<primary>/.bb` for a primary (with a copy from the default
+branch's committed tip as fallback), or straight to `<project>/.bb` for a plain
+directory. A primary `.bb` stays on its default branch; a plain-directory `.bb`
+has no branch.
 6. **Precompute the layout** table and write it to plugin storage keyed by environment (see §8).
 7. Return `{ status: "created", path: <root>, ownsPath: true, resource: { workspaces: [...] } }`.
 
