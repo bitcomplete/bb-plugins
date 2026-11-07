@@ -382,7 +382,7 @@ export function buildSurvey(input: SurveyInput): SurveyReport {
 }
 
 /** The `.bb` playbook files `bb stewards init` writes, plus the optional ones. */
-export const KNOWN_PLAYBOOKS = ["linear-tickets", "github-prs", "github-reviews", "ops-watch", "deps-alerts", "deps-prs"] as const;
+export const KNOWN_PLAYBOOKS = ["linear-tickets", "github-issues", "github-prs", "github-reviews", "ops-watch", "deps-alerts", "deps-prs"] as const;
 
 /** A short human rendering of the survey, for `bb stewards survey` without `--json`. */
 export function formatSurvey(report: SurveyReport): string {

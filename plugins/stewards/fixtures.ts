@@ -53,6 +53,26 @@ export const pull = (over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNu
   ...over,
 });
 
+/** A GitHub issue, the shape github-watcher serves for a `bb-managed` ticket (BB-234). */
+export const githubIssue = (over: Partial<EntitySnapshot> = {}): EntitySnapshot => ({
+  ...issue(),
+  source: "github",
+  kind: "issue",
+  id: "acme/web#12",
+  key: "acme/web#12",
+  url: "https://github.com/acme/web/issues/12",
+  title: "Fix login",
+  state: "status:todo",
+  stateType: null,
+  unit: "acme/web",
+  labels: ["bb-managed", "status:todo"],
+  author: "sam",
+  assignees: ["jane"],
+  viewer: "jane",
+  description: "Users cannot log in.",
+  ...over,
+});
+
 export const comment = (over: Partial<SnapshotComment> = {}): SnapshotComment => ({
   id: "c1",
   author: "Sam",
