@@ -4027,6 +4027,29 @@ describe("project-level ticket watches (BB-246)", () => {
     expect(t.hooks.store.find("ENG-13", "p1")).toMatchObject({ playbook: "linear-tickets" });
   });
 
+  it("keeps an adopted ticket's playbook after its watch is removed, until the playbook file itself goes", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "goals" }]);
+    t.files[playbookPath("goals")] = GOALS;
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "docs"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals", adoptedBy: "goals@ticket" });
+    // The watch is removed, but `goals.md` remains: the binding keeps running
+    // under it, and `check` reports no problem for the removed watch.
+    t.files[PROJECT_FILE] = project([]);
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals", endedAt: null });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/goals/u);
+    // With the playbook file gone too, and no last-good copy, it ends.
+    delete t.files[playbookPath("goals")];
+    await t.bb.storage.kv.delete("good/p1/playbook/goals");
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "unconfigured" });
+  });
+
   it("check reports a ticket watch naming a missing or non-ticket playbook", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[PROJECT_FILE] = project([{ playbook: "gone" }, { playbook: "github-prs" }]);

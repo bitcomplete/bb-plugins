@@ -1541,7 +1541,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // loaded here so one `.bb` read serves it; `ticketWatchProblems` reports a
       // name that is missing or not a ticket playbook.
       const ticketWatchNames = new Set(file.tickets.map((w) => w.playbook));
-      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames, ...ticketWatchNames])].map(playbookPath));
+      // BB-246: a ticket already adopted under a watch keeps its playbook even
+      // after the watch is removed, so its file is read too (the binding ends
+      // `unconfigured` only when that file itself is gone). No `check` problem
+      // is reported for a removed watch's playbook.
+      const adoptedTicketNames = new Set<string>();
+      for (const b of store.open(projectId)) if (b.kind === "ticket" && b.adoptedBy !== null) adoptedTicketNames.add(b.playbook);
+      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames, ...ticketWatchNames, ...adoptedTicketNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
       /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
@@ -1629,13 +1635,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
        */
       const watchPlaybooks = new Map<string, Playbook>();
       const watchErrors = new Map<string, string>();
-      if (watchNames.size > 0 || ticketWatchNames.size > 0) {
+      if (watchNames.size > 0 || ticketWatchNames.size > 0 || adoptedTicketNames.size > 0) {
         const known = new Map<string, Playbook>();
         for (const p of Object.values(playbooks)) if (p !== undefined) known.set(p.name, p);
         for (const p of Object.values(ticketPlaybooks)) if (p !== undefined) known.set(p.name, p);
         if (depsAlerts !== null) known.set(depsAlerts.name, depsAlerts);
         if (depsPrs !== null) known.set(depsPrs.name, depsPrs);
-        for (const name of new Set([...watchNames, ...ticketWatchNames])) {
+        for (const name of new Set([...watchNames, ...ticketWatchNames, ...adoptedTicketNames])) {
           const reused = known.get(name);
           if (reused !== undefined) {
             watchPlaybooks.set(name, reused);
@@ -1658,6 +1664,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A ticket watch's failure is reported by `ticketWatchProblems`,
             // with the watch it belongs to; a pull watch's here.
             watchErrors.set(name, result.error);
+          } else if (adoptedTicketNames.has(name)) {
+            // A playbook a ticket was adopted under and whose watch has since
+            // been removed: read so the binding keeps running, not reported.
           } else {
             problems.push(result.error);
           }
