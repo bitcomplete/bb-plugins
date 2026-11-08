@@ -40,6 +40,8 @@ function world() {
   const viewers: Partial<Record<"linear" | "github", string | null>> = {};
   /** Labels a fake source reports missing for a unit, by `${source}:${lowercased unit}` (BB-235). */
   const missingStates = new Map<string, string[]>();
+  /** Labels a fake source reports absent for a unit, by `${source}:${lowercased unit}` (BB-248). */
+  const missingLabels = new Map<string, string[]>();
   /** The Linear teams `sourceValidate` reports as the viewer's, for `init` with no `--teams` (BB-234). */
   let linearMine: Array<{ unit: string; name: string }> = [{ unit: "ENG", name: "Engineering" }];
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
@@ -216,7 +218,11 @@ function world() {
       const viewer = source in viewers ? viewers[source]! : "Jane";
       out = {
         viewer,
-        units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: missingStates.get(`${source}:${unit.toLowerCase()}`) ?? [] })),
+        units: (input.units as string[]).map((unit) => {
+          const label = String(input.label).toLowerCase();
+          const absent = (missingLabels.get(`${source}:${unit.toLowerCase()}`) ?? []).some((l) => l.toLowerCase() === label);
+          return { unit, found: true, labelFound: !absent, missingStates: missingStates.get(`${source}:${unit.toLowerCase()}`) ?? [] };
+        }),
         mine: args.pluginId === SOURCE_PLUGIN_IDS.github ? [] : linearMine,
         error: null,
       };
@@ -451,7 +457,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -821,6 +827,30 @@ describe("a Linear ticket steward", () => {
     expect(t.sends).toHaveLength(1);
     expect(t.sends[0]!.text).toMatch(/1 new comment from Sam/u);
     expect(t.sends[0]!.text).toMatch(/Can we also cover SSO\?/u);
+  });
+
+  // BB-248: a label that moves the phase with no state change is news of its
+  // own, and the wake carries the label phase's section.
+  it("wakes the steward when a label moves the phase, with the label phase's section (BB-248)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace(
+      "  In Progress: { stage: build, stuck: 2d }",
+      '  In Progress: { stage: build, stuck: 2d }\n  "label:goal:awaiting-outcome": { stage: spec, stuck: 120d }',
+    ).replace("## In Review", "## label:goal:awaiting-outcome\n\nWait for the outcome.\n\n## In Review");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("Todo");
+    t.sends.length = 0;
+    // The label moves the phase; the state stays `Todo`.
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal:awaiting-outcome"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("label:goal:awaiting-outcome");
+    const wakes = t.sends.filter((s) => s.threadId === steward);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.text).toMatch(/Phase: Todo → label:goal:awaiting-outcome/u);
+    expect(wakes[0]!.text).toContain("### label:goal:awaiting-outcome");
+    expect(wakes[0]!.text).toContain("Wait for the outcome.");
   });
 
   it("passes the ready gate on the checklist reported by number, and refuses a paraphrase", async () => {
@@ -3389,6 +3419,43 @@ describe("check --create-labels (BB-236)", () => {
     expect(check.exitCode).toBe(1);
     expect(check.stdout).toContain("problem: linear: could not create label bb-managed: the source is on fire");
     expect(check.stdout).not.toContain("unavailable");
+  });
+});
+
+// BB-248: a playbook phase keyed `label:<name>` is checked as a label, not as
+// a missing workflow state, on Linear and GitHub alike.
+describe("check on a `label:` phase key (BB-248)", () => {
+  const withLabel = (text: string, stateLine: string) => text.replace(stateLine, `${stateLine}\n  "label:goal:awaiting-outcome": { stage: build, stuck: 120d }`);
+
+  it("checks a Linear label phase key as a label, not a missing workflow state", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = withLabel(LINEAR_TICKETS, "  In Progress: { stage: build, stuck: 2d }");
+    t.setMissingLabel("linear", "ENG", ["goal:awaiting-outcome"]);
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toMatch(/problem: linear: ENG has no label goal:awaiting-outcome/u);
+    expect(check.stdout).not.toMatch(/has no state (?:label:)?goal:awaiting-outcome/u);
+    // The label is read through the source's single-label field, with no states.
+    const calls = t.rpcCalls.filter((c) => c.method === "sourceValidate" && c.pluginId === "linear");
+    expect(calls.some((c) => c.input.label === "goal:awaiting-outcome" && (c.input.states as string[]).length === 0)).toBe(true);
+  });
+
+  it("checks a GitHub repo label phase key the same way", async () => {
+    const t = await setup();
+    t.files[playbookPath("github-issues")] = withLabel(GITHUB_ISSUES, "  status:in-progress: { stage: build, stuck: 2d }");
+    t.setMissingLabel("github", "acme/web", ["goal:awaiting-outcome"]);
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toMatch(/problem: github: acme\/web has no label goal:awaiting-outcome/u);
+    expect(check.stdout).not.toMatch(/has no state (?:label:)?goal:awaiting-outcome/u);
+  });
+
+  it("is silent when the label exists, and existing playbooks are unchanged", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = withLabel(LINEAR_TICKETS, "  In Progress: { stage: build, stuck: 2d }");
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).not.toMatch(/goal:awaiting-outcome/u);
   });
 });
 

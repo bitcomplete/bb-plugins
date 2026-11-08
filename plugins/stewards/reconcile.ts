@@ -6,7 +6,7 @@
 // The rule throughout: an event is a hint to look again, never the input a
 // decision is made from. Every function here compares two states.
 import { createHash } from "node:crypto";
-import { isTerminal, phaseOf, type Playbook } from "./config.js";
+import { isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
 import type { Deployments } from "./deploy.js";
 import { isMarkerComment } from "./gate.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
@@ -294,15 +294,22 @@ const ownPull = (key: string | null, url: string | null, own: ReadonlySet<string
 /** The stages a worker of the binding moves an entity between: a move within them is its own (rule 1). */
 const OWN_MOVE_STAGES = new Set(["build", "review"]);
 /**
+ * Whether a move between two stages is the worker's own build/review loop
+ * (BB-52): both stages are build or review and they differ. Used for a state
+ * move and, since a label can move the phase too, for a label-driven one
+ * (BB-248).
+ */
+export const isOwnStageChange = (before: string | null, after: string | null): boolean =>
+  before !== null && after !== null && before !== after && OWN_MOVE_STAGES.has(before) && OWN_MOVE_STAGES.has(after);
+
+/**
  * Whether a state change is the worker's own build/review loop: both states map
  * to a build or review stage and they differ. A terminal state is handled by
  * the lifecycle before this, and any other move still wakes the steward.
  */
 export function isOwnStageMove(stageOf: ((state: string) => string | null) | undefined, before: string, after: string): boolean {
   if (stageOf === undefined) return false;
-  const a = stageOf(before);
-  const b = stageOf(after);
-  return a !== null && b !== null && a !== b && OWN_MOVE_STAGES.has(a) && OWN_MOVE_STAGES.has(b);
+  return isOwnStageChange(stageOf(before), stageOf(after));
 }
 
 /**
@@ -890,8 +897,18 @@ export function endingDeadline(b: Pick<Binding, "ending" | "endingAt" | "followT
   return b.endingAt === null ? null : b.endingAt + turnTimeoutMs;
 }
 
-/** The phase and stage for the entity's state, or nulls when the playbook does not name it. */
-export function phaseAndStage(playbook: Playbook, state: string): { phase: string; stage: Binding["stage"] } {
+/**
+ * The phase and stage for an entity: a present `label:<name>` phase key first,
+ * in playbook order and matching the label ignoring case, then its state
+ * (BB-248). `labels` defaults to none, which is the state-only behaviour.
+ */
+export function phaseAndStage(playbook: Playbook, state: string, labels: readonly string[] = []): { phase: string; stage: Binding["stage"] } {
+  const present = new Set(labels.map((l) => l.toLowerCase()));
+  const key = Object.keys(playbook.phases).find((p) => {
+    const name = labelPhaseName(p);
+    return name !== null && present.has(name.toLowerCase());
+  });
+  if (key !== undefined) return { phase: key, stage: playbook.phases[key]!.stage ?? null };
   const p = phaseOf(playbook, state);
   return { phase: p?.name ?? state, stage: p?.stage ?? null };
 }

@@ -45,6 +45,7 @@ import {
   parseProjectFile,
   parseRolesFile,
   phaseOf,
+  playbookLabels,
   playbookNameFor,
   playbookPath,
   playbookStates,
@@ -84,7 +85,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate, PRODUCT_APPROVAL_REFUSAL } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
@@ -3378,7 +3379,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
 
-      const { phase, stage } = phaseAndStage(playbook, entity.state);
+      const { phase, stage } = phaseAndStage(playbook, entity.state, entity.labels);
       const currentSpec = specHashFor(b, entity);
       const changes: Change[] = [];
       let ready = b.ready;
@@ -3400,6 +3401,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
       changes.push(...fresh);
+      // BB-248: a label that changes the phase with no state change is news
+      // on its own; a state move already carries its own actionable line. The
+      // worker's own build/review loop stays quiet (BB-52).
+      const stateMoved = prev !== null && prev.entity.state !== entity.state;
+      if (!stateMoved && phase !== b.phase) {
+        const own = workerInFlight && isOwnStageChange(b.stage, stage);
+        changes.push({ text: `Phase: ${b.phase ?? entity.state} → ${phase}`, actionable: !own });
+      }
       changes.push(...deploymentChanges);
       // BB-83: a binding in a build or review stage with nothing to wait on is
       // woken once per idle period, after the grace. The period starts at the
@@ -3461,7 +3470,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Only an entry into build from spec: review → build is the worker's
       // normal loop, and an unreported checklist is not an unmet one.
       if (stage === "build" && b.stage === "spec" && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
-        changes.push({ text: `Moved into a build stage (${entity.state}) before the ready gate passed`, actionable: true });
+        changes.push({ text: `Moved into a build stage (${phase}) before the ready gate passed`, actionable: true });
       }
       if (b.requeueAt !== null && b.requeueAt <= now()) changes.push({ text: "Requeue time came", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
@@ -4838,7 +4847,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Both sources nest: a GitHub issue with a managed parent gets its
       // `parentBindingId` like a Linear one (BB-244).
       const parent = kind === "ticket" ? await managedAncestor(entity, config) : null;
-      const { phase, stage } = phaseAndStage(playbook, entity.state);
+      const { phase, stage } = phaseAndStage(playbook, entity.state, entity.labels);
       let b: Binding;
       try {
         b = store.create({
@@ -7905,7 +7914,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (taken !== null && taken.id !== b.id) return { error: `${entity.key} already has a steward (${taken.endedAt === null ? "open" : "ended"}); it cannot replace ${b.entityKey}.` };
       const config = await loadConfig(b.projectId);
       const playbook = config === null ? null : bindingPlaybook(config, b);
-      const { phase, stage } = playbook === null ? { phase: entity.state, stage: null } : phaseAndStage(playbook, entity.state);
+      const { phase, stage } = playbook === null ? { phase: entity.state, stage: null } : phaseAndStage(playbook, entity.state, entity.labels);
       const oldKey = b.entityKey;
       const oldUrl = b.url ?? b.entityKey;
       const why = `Replaced by ${entity.key}.`;
@@ -9857,11 +9866,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (githubTicket === null) await ensureLabels("github", [filingGithub], GITHUB_TODO_LABEL, lines);
         }
       }
-      const validate = async (source: Source, units: string[], states: string[]) => {
+      const validate = async (source: Source, units: string[], states: string[], labels: string[] = []) => {
         if (units.length === 0) return;
         try {
           const out = await sourceRpc(source, "sourceValidate", { units, label: config.file.label, states }, sourceContract.sourceValidate.output);
-          if (out.error !== null) lines.push(`problem: ${source}: ${out.error}`);
+          if (out.error !== null) {
+            lines.push(`problem: ${source}: ${out.error}`);
+            return;
+          }
           for (const u of out.units) {
             if (!u.found) lines.push(`problem: ${source}: ${u.unit} is not visible`);
             else if (!u.labelFound) lines.push(`problem: ${source}: ${u.unit} has no label ${config.file.label}`);
@@ -9869,10 +9881,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         } catch (error) {
           lines.push(`problem: could not validate against ${source}: ${errorMessage(error)}`);
+          return;
+        }
+        // BB-248: a `label:` phase key names a label, not a workflow state, so
+        // it is checked through the source's single-label field. The source
+        // reads one label per call, so this is one read per distinct name.
+        for (const name of labels) {
+          if (lc(name) === lc(config.file.label)) continue;
+          try {
+            const out = await sourceRpc(source, "sourceValidate", { units, label: name, states: [] }, sourceContract.sourceValidate.output);
+            if (out.error !== null) {
+              lines.push(`problem: ${source}: ${out.error}`);
+              continue;
+            }
+            for (const u of out.units) if (u.found && !u.labelFound) lines.push(`problem: ${source}: ${u.unit} has no label ${name}`);
+          } catch (error) {
+            lines.push(`problem: could not validate against ${source}: ${errorMessage(error)}`);
+          }
         }
       };
-      await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket));
-      await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket));
+      await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket), linearTicket === null ? [] : playbookLabels(linearTicket));
+      await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket), githubTicket === null ? [] : playbookLabels(githubTicket));
       if (filingGithub !== null && priorityLabels.length > 0) await validate("github", [filingGithub], priorityLabels);
       if (usesKind(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];

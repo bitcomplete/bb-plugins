@@ -167,6 +167,13 @@ Two tools are yours; everything else you do with the tools every thread has.
   `_— from bb thread <your thread id>_`. Your thread id is in the wake and in
   `$BB_THREAD_ID`; never take it from your workspace's path, which names the
   project steward. The playbook's `may` list is what you may do.
+- **A phase keyed on a label.** A playbook phase keyed `label:<name>` is
+  entered by adding that label and leaving the workflow state where it is; a
+  present label matching such a key wins over the state-keyed phase. Add the
+  label with the source's own tooling (`gh issue edit --add-label <name>` on a
+  GitHub issue; the Linear label on a Linear issue). github-watcher's
+  synthesised `status:*` state is unchanged, so a GitHub playbook may key on
+  either form.
 - **Comments, not description edits.** Start a spec comment with
   `**Spec:**`. Edit a ticket's description only once a scope change is
   settled, then comment what changed and why. A substantial ticket's spec is

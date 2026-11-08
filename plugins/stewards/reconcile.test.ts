@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, ownerApproval, prGate, projectApprovalMarker, reviewWorkerThread, type ProjectApprovalRecord } from "./gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
-import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
+import { GITHUB_ISSUES, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
 const tickets = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -19,6 +19,40 @@ const reviews = (() => {
 
 const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerInFlight: false };
 const actionable = (cs: Array<{ text: string; actionable: boolean }>) => cs.filter((c) => c.actionable).map((c) => c.text);
+
+const LABEL_PHASE = '\n  "label:goal:awaiting-outcome": { stage: build, stuck: 120d }';
+const labelledTickets = (() => {
+  const p = parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", `  In Progress: { stage: build, stuck: 2d }${LABEL_PHASE}`), "linear-tickets");
+  if (!p.ok) throw new Error(p.error);
+  return p.value;
+})();
+const labelledGithubIssues = (() => {
+  const p = parsePlaybook(GITHUB_ISSUES.replace("  status:in-progress: { stage: build, stuck: 2d }", `  status:in-progress: { stage: build, stuck: 2d }${LABEL_PHASE}`), "github-issues");
+  if (!p.ok) throw new Error(p.error);
+  return p.value;
+})();
+
+describe("phaseAndStage keys a phase on a present label (BB-248)", () => {
+  it("selects a matching label phase ahead of the state, on Linear", () => {
+    expect(phaseAndStage(labelledTickets, "In Progress", ["bb-managed", "goal:awaiting-outcome"])).toEqual({ phase: "label:goal:awaiting-outcome", stage: "build" });
+    // The label match ignores case.
+    expect(phaseAndStage(labelledTickets, "In Progress", ["Goal:Awaiting-Outcome"])).toEqual({ phase: "label:goal:awaiting-outcome", stage: "build" });
+    // No such label, or no labels at all: the state decides, as today.
+    expect(phaseAndStage(labelledTickets, "In Progress", ["bb-managed"])).toEqual({ phase: "In Progress", stage: "build" });
+    expect(phaseAndStage(labelledTickets, "In Progress")).toEqual({ phase: "In Progress", stage: "build" });
+  });
+
+  it("selects it on a GitHub entity too, over the synthesised status state", () => {
+    expect(phaseAndStage(labelledGithubIssues, "status:in-progress", ["bb-managed", "goal:awaiting-outcome"])).toEqual({ phase: "label:goal:awaiting-outcome", stage: "build" });
+    // A present status label is still a state, and decides when no label phase matches.
+    expect(phaseAndStage(labelledGithubIssues, "status:in-progress", ["bb-managed", "status:in-progress"])).toEqual({ phase: "status:in-progress", stage: "build" });
+  });
+
+  it("resolves the stored label phase for stuckDue", () => {
+    expect(phaseAndStage(labelledTickets, "In Progress", ["goal:awaiting-outcome"]).phase).toBe("label:goal:awaiting-outcome");
+    expect(stuckDue({ advancedAt: 1_000, createdAt: 0, phase: "label:goal:awaiting-outcome" }, labelledTickets, [], 1_000 + 120 * 86_400_000)).toBe(120 * 86_400_000);
+  });
+});
 
 describe("what changed", () => {
   it("wakes for others' comments and not for the steward's own", () => {
@@ -150,6 +184,12 @@ describe("the worker's own pull requests and state moves (BB-52)", () => {
     expect(isOwnStageMove(stageOf, "In Progress", "Backlog")).toBe(false);
     expect(isOwnStageMove(stageOf, "Todo", "In Progress")).toBe(false);
     expect(isOwnStageMove(undefined, "In Progress", "In Review")).toBe(false);
+    // BB-248: the same judgment for a stage change with no state move.
+    expect(isOwnStageChange("build", "review")).toBe(true);
+    expect(isOwnStageChange("review", "build")).toBe(true);
+    expect(isOwnStageChange("build", "build")).toBe(false);
+    expect(isOwnStageChange("spec", "build")).toBe(false);
+    expect(isOwnStageChange(null, "review")).toBe(false);
   });
 
   it("keeps a linked pull request quiet when no worker is in flight, as before", () => {
