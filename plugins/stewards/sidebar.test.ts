@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, compareMonitors, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, compareMonitors, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
 
 const thread = (over: Partial<SidebarLiveThread> & { id: string }): SidebarLiveThread => ({
   projectId: "p1",
@@ -18,6 +18,7 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   kind: "ticket",
   stage: "build",
   phase: null,
+  parentKey: null,
   hold: null,
   holdBehind: [],
   waitingOn: null,
@@ -68,6 +69,8 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   state: "quiet",
   section: "inflight",
   phrase: "",
+  nested: [],
+  parentTitle: null,
   children: [],
   ...over,
 });
@@ -174,6 +177,66 @@ describe("stewards sidebar grouping", () => {
     });
     expect(tabs[0]!.efforts).toHaveLength(0);
     expect(tabs[0]!.threads.map((e) => e.key)).toEqual(["thread:thr_other"]);
+  });
+
+  // BB-245: a binding's `parentKey` nests its effort one level under the parent
+  // effort in the same tab. An effort whose parent is not in the tab (ended, or
+  // another project) stays top-level.
+  it("nests a child effort under its parent effort and out of the top level", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_parent" }), thread({ id: "thr_child" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1" })] })],
+    });
+    expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
+    expect(tabs[0]!.efforts[0]!.nested.map((e) => e.key)).toEqual(["ENG-2"]);
+    expect(tabs[0]!.efforts[0]!.nested[0]!.parentTitle).toBeNull();
+  });
+
+  it("keeps a child top-level when its parentKey names no effort in the tab", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_orphan" }), thread({ id: "thr_plain" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-2", threadId: "thr_orphan", parentKey: "ENG-9" }), binding({ key: "ENG-3", threadId: "thr_plain", parentKey: null })] })],
+    });
+    expect(tabs[0]!.efforts.map((e) => e.key).sort()).toEqual(["ENG-2", "ENG-3"]);
+    expect(tabs[0]!.efforts.every((e) => e.nested.length === 0)).toBe(true);
+  });
+
+  it("nests only one level: a grandchild whose parent is itself nested stays top-level", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_a" }), thread({ id: "thr_b" }), thread({ id: "thr_c" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_a" }), binding({ key: "ENG-2", threadId: "thr_b", parentKey: "ENG-1" }), binding({ key: "ENG-3", threadId: "thr_c", parentKey: "ENG-2" })] })],
+    });
+    expect(tabs[0]!.efforts.map((e) => e.key).sort()).toEqual(["ENG-1", "ENG-3"]);
+    expect(tabs[0]!.efforts.find((e) => e.key === "ENG-1")!.nested.map((e) => e.key)).toEqual(["ENG-2"]);
+  });
+
+  it("lists a nested blocked effort flat in Blocked too, with its parent named on line two", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Parent work" }), thread({ id: "thr_child" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1", hold: "a freeze" })] })],
+    });
+    // The child is nested under its in-flight parent and also flat in Blocked,
+    // so a collapsed parent hides nothing that needs the user.
+    expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
+    expect(tabs[0]!.efforts[0]!.nested.map((e) => e.key)).toEqual(["ENG-2"]);
+    expect(tabs[0]!.efforts[0]!.nested[0]!.parentTitle).toBeNull();
+    const flat = tabs[0]!.blocked.find((e) => e.key === "ENG-2")!;
+    expect(flat.parentTitle).toBe("Parent work");
+    expect(flat.section).toBe("blocked");
+  });
+
+  it("keeps an ended child flat in Ended, with no nesting", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_parent" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_parent" })], ended: [{ key: "ENG-2", kind: "ticket", threadId: "thr_child", title: "Child work", phase: "Done", endReason: "terminal", endedAt: 2_000 }] })],
+    });
+    expect(tabs[0]!.ended.map((e) => e.key)).toEqual(["ENG-2"]);
+    expect(tabs[0]!.ended[0]!.nested).toEqual([]);
   });
 
   it("gives every live project a tab, stewarded or not, including the personal project", () => {
@@ -610,6 +673,15 @@ describe("stewards sidebar unread (BB-80)", () => {
     expect(hasUnread([], flags([]))).toBe(false);
     expect(hasUnread([child("a"), child("b")], flags([["a", {}], ["b", { indicator: "draft" }]]))).toBe(false);
     expect(hasUnread([child("a", [child("b")])], flags([]))).toBe(false);
+  });
+
+  // BB-245: an unread thread inside a nested effort bubbles up to the parent
+  // row, as it already does for a worker tree.
+  it("finds an unread thread in a nested effort, at any depth", () => {
+    const parent = effort({ key: "ENG-1", nested: [effort({ key: "ENG-2", rootThreadId: "thr_child", children: [child("thr_worker")] })] });
+    expect(effortHasUnread(parent, flags([["thr_child", { isUnread: true }]]))).toBe(true);
+    expect(effortHasUnread(parent, flags([["thr_worker", { indicator: "unread-error" }]]))).toBe(true);
+    expect(effortHasUnread(parent, flags([["thr_child", {}], ["thr_worker", { indicator: "draft" }]]))).toBe(false);
   });
 });
 

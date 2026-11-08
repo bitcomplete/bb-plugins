@@ -69,6 +69,7 @@ const binding = (over: Record<string, unknown> = {}) => ({
   stage: "build",
   phase: null,
   threadId: "thr_steward",
+  parentKey: null,
   hold: null,
   holdBehind: [],
   waitingOn: null,
@@ -353,6 +354,56 @@ describe("the stewards sidebar list (BB-44)", () => {
     fireEvent.click(slot.getByRole("button", { name: /Expand Implement retry/u }));
     await waitFor(() => expect(slot.getByText("Review the PR")).toBeTruthy());
     expect(glyphOf(slot, "Review the PR")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+
+  // BB-245: a child effort nests under its parent effort's row, with its own
+  // glyph and line two; a nested blocked effort is also flat in Blocked with
+  // its parent named.
+  it("nests a child effort under its parent, and lists a blocked child flat too (BB-245)", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Parent work" }), thread({ id: "thr_child", displayTitle: "ENG-2: Child work" })],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1", hold: "a freeze" })],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Parent work")).toBeTruthy());
+    // The child row is mounted inside the parent's collapsible block, with its
+    // own line two and no `in <parent>` (the indent already says it).
+    const parentLi = slot.getByText("Parent work").closest("li")!;
+    expect(parentLi.textContent).toContain("Child work");
+    const nested = slot.getAllByText("Child work").find((el) => parentLi.contains(el));
+    expect(nested).toBeTruthy();
+    expect(nested!.closest("li")!.textContent).not.toContain("in Parent work");
+    // The blocked child is also flat in Blocked, with its parent named on line two.
+    const flat = slot.getAllByText("Child work").find((el) => el.closest("li")!.textContent!.includes("in Parent work"));
+    expect(flat).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  // BB-85/BB-245: a route to a nested child steward's own thread opens the
+  // parent row, so the active child is not hidden under a collapsed parent.
+  it("opens a nested child effort's parent when the route lands on the child (BB-245)", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: {
+          projects,
+          threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Parent work" }), thread({ id: "thr_child", displayTitle: "ENG-2: Child work" })],
+        },
+        rpc: {
+          stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1" })] }),
+        } as never,
+      },
+      { activeThreadId: "thr_child" },
+    );
+    await waitFor(() => expect(slot.getByText("Parent work")).toBeTruthy());
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Parent work" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 

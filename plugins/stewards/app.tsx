@@ -41,7 +41,7 @@ import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { setStewardsSidebarCommand, getStewardsSidebarCommand } from "./sidebar-command.js";
 import { readLastPlace, writeLastPlace } from "./last-place.js";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import {
   AUTOMATIC_NAVIGATION_PROVIDER,
   AUTOMATIC_THREAD_LIST_PROVIDER,
@@ -1668,6 +1668,15 @@ function unreadKey(children: readonly SidebarChild[], byId: ReadonlyMap<string, 
 }
 
 /**
+ * The read-state signature of an effort's threads, its nested efforts'
+ * included, so a memoised parent row re-renders when a nested child is read
+ * (BB-95, BB-245).
+ */
+function effortUnreadKey(e: SidebarEffort, byId: ReadonlyMap<string, PluginSidebarThread>): string {
+  return `${unreadKey(e.children, byId)}${e.nested.map((n) => effortUnreadKey(n, byId)).join("|")}`;
+}
+
+/**
  * Per-row render counters, for the sidebar tests to assert that a same-content
  * refetch or host tick re-renders only the row whose data changed (BB-95).
  * Exported for `sidebar-app.test.tsx`; the production cost is one map write per
@@ -2050,6 +2059,8 @@ type SidebarEffortRowProps = {
   trailing?: ReactNode;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
+  /** The nesting depth of a child effort row under its parent; 0 at top level (BB-245). */
+  depth?: number;
 };
 
 /**
@@ -2070,6 +2081,7 @@ function sameEffortRowProps(a: SidebarEffortRowProps, b: SidebarEffortRowProps):
     a.onChanged !== b.onChanged ||
     a.trailing !== b.trailing ||
     a.entered !== b.entered ||
+    a.depth !== b.depth ||
     a.unreadKey !== b.unreadKey ||
     a.openThreads.has(a.effort.rootThreadId) !== b.openThreads.has(b.effort.rootThreadId)
   ) {
@@ -2096,6 +2108,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   onChanged,
   trailing,
   entered = false,
+  depth = 0,
 }: SidebarEffortRowProps) {
   useRenderProbe(`effort:${effort.key}`);
   const root = byId.get(effort.rootThreadId);
@@ -2109,6 +2122,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   // from the live view; its title comes from the RPC (BB-88).
   const title = effortTitle(root?.displayTitle ?? effort.title, key);
   const count = countThreads(effort.children);
+  const hasChildren = count > 0 || effort.nested.length > 0;
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
   const selected = activeKey !== null && activeKey === key;
   const revealed = openThreads.has(effort.rootThreadId);
@@ -2123,10 +2137,10 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   const body = (
     <div
       className={`bb-sidebar-hover-actions-row relative flex min-h-[var(--bb-sidebar-row-height)] flex-col rounded-md py-1 pr-1 max-md:pointer-coarse:min-h-[var(--bb-sidebar-row-height-coarse)] ${ROW_TEXT_CLASS} ${selected ? ROW_SELECTED_CLASS : ROW_INTERACTIVE_CLASS}`}
-      style={{ paddingLeft: `${rowPaddingLeft(0)}px` }}
+      style={{ paddingLeft: `${rowPaddingLeft(depth)}px` }}
     >
       <div className="relative flex items-center gap-1">
-        {count > 0 ? (
+        {hasChildren ? (
           <button
             type="button"
             aria-label={`${open ? "Collapse" : "Expand"} ${root?.displayTitle ?? effort.title}`}
@@ -2160,11 +2174,12 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
           {trailing}
         </span>
       </div>
-      <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: `${rowTitleLeft(0) - rowPaddingLeft(0)}px` }} data-sidebar-line-two="">
+      <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: `${rowTitleLeft(depth) - rowPaddingLeft(depth)}px` }} data-sidebar-line-two="">
         {kindLabel(effort.kind)}
         {effort.phase !== null ? ` · ${effort.phase}` : ""}
         {" · "}
         <span className={phraseClass(effort.state)}>{effort.phrase}</span>
+        {effort.parentTitle !== null ? <span className="text-muted-foreground"> · in {effort.parentTitle}</span> : null}
       </p>
     </div>
   );
@@ -2172,13 +2187,13 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
     <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       {body}
       {mine.length > 0 ? (
-        <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: `${rowTitleLeft(0)}px` }}>
+        <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: `${rowTitleLeft(depth)}px` }}>
           {mine.map((item) => (
             <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} projectId={projectId} effortKey={key} onChanged={onChanged} />
           ))}
         </div>
       ) : null}
-      {effort.children.length > 0 ? (
+      {hasChildren ? (
         <div data-sidebar-workers="" className={`grid motion-safe:transition-[grid-template-rows,visibility] motion-safe:duration-200 ${open ? "visible grid-rows-[1fr]" : "invisible grid-rows-[0fr]"}`}>
           <ul className="flex min-h-0 flex-col overflow-hidden">
             {effort.children.map((c) => {
@@ -2187,6 +2202,23 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
                 <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} threadActions={false} entered={entered} />
               );
             })}
+            {effort.nested.map((n) => (
+              <SidebarEffortRow
+                key={n.key}
+                effort={n}
+                needs={needs}
+                byId={byId}
+                projectId={projectId}
+                activeKey={activeKey}
+                activeThreadId={activeThreadId}
+                openThreads={openThreads}
+                unreadKey={effortUnreadKey(n, byId)}
+                onNavigate={onNavigate}
+                onChanged={onChanged}
+                entered={entered}
+                depth={depth + 1}
+              />
+            ))}
           </ul>
         </div>
       ) : null}
@@ -2411,12 +2443,9 @@ function subtreeHas(children: readonly SidebarChild[], id: string): boolean {
   return children.some((c) => c.threadId === id || subtreeHas(c.children, id));
 }
 
-/** Whether any effort in a section has an unread root or descendant thread (BB-80). */
+/** Whether any effort in a section has an unread root or descendant thread, nested efforts included (BB-80, BB-245). */
 function sectionHasUnread(efforts: readonly SidebarEffort[], byId: ReadonlyMap<string, PluginSidebarThread>): boolean {
-  return efforts.some((e) => {
-    const root = byId.get(e.rootThreadId);
-    return (root !== undefined && isUnread(root)) || hasUnread(e.children, byId);
-  });
+  return efforts.some((e) => effortHasUnread(e, byId));
 }
 
 /** The ancestor thread ids from the direct parent up, or null when `id` is not in the tree. */
@@ -2429,21 +2458,33 @@ function ancestorThreads(children: readonly SidebarChild[], id: string): string[
   return null;
 }
 
-/** Every effort row a tab renders, whatever its section. */
+/** Every effort row a tab renders, whatever its section, nested efforts included (BB-245). */
 function tabEfforts(tab: SidebarTab): SidebarEffort[] {
-  return [...tab.blocked, ...tab.efforts, ...tab.monitors, ...tab.threads];
+  const all = [...tab.blocked, ...tab.efforts, ...tab.monitors, ...tab.threads];
+  return all.flatMap((e) => [e, ...e.nested]);
 }
 
 /** The effort and thread rows that must be open so the active thread is revealed (BB-85). */
-function revealThreads(tabs: readonly SidebarTab[], activeThreadId: string | null): ReadonlySet<string> {
+function revealThreads(tabs: readonly SidebarTab[], activeThreadId: string | null, activeKey: string | null): ReadonlySet<string> {
   const open = new Set<string>();
-  if (activeThreadId === null) return open;
   for (const tab of tabs) {
-    for (const effort of tabEfforts(tab)) {
+    const all = tabEfforts(tab);
+    for (const effort of all) {
+      // A nested effort's row sits inside its parent's collapsible block, so
+      // the parent opens for the child's own thread or the board's effort
+      // (BB-245).
+      const parent = all.find((p) => p.nested.includes(effort));
+      if (parent === undefined) continue;
+      if ((activeThreadId !== null && effort.rootThreadId === activeThreadId) || (activeKey !== null && effort.bindingKey === activeKey)) open.add(parent.rootThreadId);
+    }
+    if (activeThreadId === null) continue;
+    for (const effort of all) {
       const chain = ancestorThreads(effort.children, activeThreadId);
       if (chain === null) continue;
       open.add(effort.rootThreadId);
       for (const id of chain) open.add(id);
+      const parent = all.find((p) => p.nested.includes(effort));
+      if (parent !== undefined) open.add(parent.rootThreadId);
     }
   }
   return open;
@@ -2455,7 +2496,7 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
   for (const tab of tabs) {
     if ((activeThreadId !== null && tab.ended.some((e) => e.rootThreadId === activeThreadId)) || (activeKey !== null && tab.ended.some((e) => e.key === activeKey))) open.add("Recently ended");
     if (activeThreadId !== null && tab.threads.some((e) => e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))) open.add("Threads");
-    if (tab.monitors.some((e) => (activeKey !== null && e.bindingKey === activeKey) || (activeThreadId !== null && (e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))))) open.add("Monitors");
+    if (tab.monitors.some((e) => (activeKey !== null && (e.bindingKey === activeKey || e.nested.some((n) => n.bindingKey === activeKey))) || (activeThreadId !== null && (e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId) || e.nested.some((n) => n.rootThreadId === activeThreadId || subtreeHas(n.children, activeThreadId)))))) open.add("Monitors");
   }
   return open;
 }
@@ -2654,7 +2695,7 @@ function StewardsSidebarCore({
   const needsFor = (tab: SidebarTab) => (data?.projectId === tab.projectId ? data.needs.items : EMPTY_NEEDS);
   const now = useNow();
   const activeKey = boardRoute.key;
-  const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
+  const openThreads = useMemo(() => revealThreads(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
   const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
   // The picker switches the list and, on a project-scoped route, moves the main
   // pane back to that project's last place (BB-113): its remembered thread when
@@ -2712,7 +2753,7 @@ function StewardsSidebarCore({
         activeKey={activeKey}
         activeThreadId={activeThreadId}
         openThreads={openThreads}
-        unreadKey={unreadKey(e.children, byId)}
+        unreadKey={effortUnreadKey(e, byId)}
         onNavigate={onNavigate}
         onChanged={refetch}
         entered={loaded}
@@ -2769,7 +2810,7 @@ function StewardsSidebarCore({
                 activeKey={activeKey}
                 activeThreadId={activeThreadId}
                 openThreads={openThreads}
-                unreadKey={unreadKey(e.children, byId)}
+                unreadKey={effortUnreadKey(e, byId)}
                 onNavigate={onNavigate}
                 onChanged={refetch}
                 trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}

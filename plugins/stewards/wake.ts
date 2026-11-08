@@ -348,7 +348,11 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     for (const r of p.reviews) latest.set(r.author, `${r.state}${r.commit === null ? "" : ` at ${r.commit.slice(0, 7)}`}`);
     if (latest.size > 0) lines.push(`- Latest reviews: ${[...latest].map(([a, s]) => `${a} ${s}`).join("; ")}`);
   }
-  if (e.children.length > 0) lines.push(`- Sub-issues: ${e.children.map((c) => `${c.key} (${c.state ?? "?"}${c.labels.length > 0 ? `; ${c.labels.join(", ")}` : ""})`).join(", ")}`);
+  if (e.children.length > 0) {
+    const total = e.childrenTotal ?? e.children.length;
+    const more = total > e.children.length ? ` (and ${total - e.children.length} more not shown)` : "";
+    lines.push(`- Sub-issues: ${e.children.map((c) => `${c.key} (${c.state ?? "?"}${c.labels.length > 0 ? `; ${c.labels.join(", ")}` : ""})`).join(", ")}${more}`);
+  }
   if (e.linkedPulls.length > 0) lines.push(`- Linked pull requests: ${e.linkedPulls.map((l) => l.key ?? l.url).join(", ")}`);
   if (e.description !== null && e.description.trim() !== "") lines.push("", "Description:", "", quote(clip(e.description.trim(), DESCRIPTION_CHARS)));
   const fresh = newHumanComments(e, cursor, own);
