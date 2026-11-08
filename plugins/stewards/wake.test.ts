@@ -6,11 +6,11 @@ import { explainDecision, formatDecisionListing } from "./decisions.js";
 import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
-import { ESCALATED_NEED_KINDS } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS } from "./templates.js";
-import { STANDING_RULES, formatDepsWake, formatOpsWake, formatProjectWake, formatWake, goalProgress, goalProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, goalProgress, goalProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 import type { OpsFinding } from "./ops.js";
 import type { DepsFinding } from "./deps.js";
+import { ESCALATED_NEED_KINDS, type Assumption } from "./store.js";
 import type { EntitySnapshot } from "./source-contract.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
@@ -768,5 +768,39 @@ describe("goal progress (BB-243)", () => {
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\), moved .*\[goal met 2\/3\]/u);
     expect(wake).toMatch(/- ENG-12: on hold: .*\[goal met 2\/3\]/u);
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): waiting with no wake source.*\[goal met 2\/3\]/u);
+  });
+});
+
+describe("recorded assumptions (BB-251)", () => {
+  const assumption = (over: Partial<Assumption> = {}): Assumption => ({ id: "asm_1", projectId: "p1", bindingId: "bnd_1", text: "SSO is out of scope", context: "the spec does not name it", recordedBy: "thr_s", recordedAt: T, state: "open", answer: null, resolvedBy: null, resolvedAt: null, ...over });
+
+  it("carries the open assumptions in their own section of the binding's wake", () => {
+    const wake = formatWake(wakeInput({ assumptions: [assumption()] }));
+    expect(wake).toContain("## Assumptions (open)");
+    expect(wake).toContain("Assuming: SSO is out of scope");
+    expect(wake).toContain("the spec does not name it");
+    expect(wake).toContain('steward_update { confirm: "<id>" }');
+    // With none open, the section is absent.
+    expect(formatWake(wakeInput({ assumptions: [] }))).not.toContain("## Assumptions (open)");
+  });
+
+  it("names them in the project steward's wake and digest", () => {
+    const { s, bind } = world();
+    const binding = bind("ENG-12");
+    const rows = [{ assumption: assumption({ bindingId: binding.id }), binding }];
+    const wake = formatProjectWake({ reason: "nightly", bindings: [{ binding, openEscalations: [] }], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], assumptions: rows });
+    expect(wake).toContain("## Assumptions (open)");
+    expect(wake).toContain("Assuming: SSO is out of scope");
+    const records: DigestRecords = { previous: null, since: T, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [], assumptions: rows };
+    const digest = formatRecords(records, []).join("\n");
+    expect(digest).toContain("### Assumptions (open)");
+    expect(digest).toContain("Assuming: SSO is out of scope");
+    expect(digest).toContain("asm_1");
+    // A project-level assumption has no binding and reads as `project`.
+    const projectRow = [{ assumption: assumption({ bindingId: null }), binding: null }];
+    const projectWake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], assumptions: projectRow });
+    expect(projectWake).toContain("project: Assuming: SSO is out of scope");
+    const projectDigest = formatRecords({ ...records, assumptions: projectRow }, []).join("\n");
+    expect(projectDigest).toContain("project: Assuming: SSO is out of scope");
   });
 });

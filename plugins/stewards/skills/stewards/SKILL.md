@@ -100,6 +100,29 @@ Two tools are yours; everything else you do with the tools every thread has.
   missed report toward `stuck`. The question is one line, written as the
   sidebar row will show it; the evidence and reasoning go in `context`, and a
   question longer than the limit is refused.
+- **Ask when the wrong answer is irreversible or blocks everything;
+  otherwise record an assumption and proceed.** A question the guidance does
+  not settle has a third move besides asking (which blocks and accumulates)
+  and deciding silently (which is invisible): record it with
+  `steward_update { assume: { text, context } }`. It is not an item for the
+  user — it files no need or escalation and never counts as Blocked — and it
+  shows in your wake, the binding's card, `bb stewards show` and the project
+  steward's digest. Ask instead when being wrong is irreversible (a
+  credential, an access, production, a cross-repo contract) or would block
+  everything until answered; the playbook's `max-assumptions` (default 5 open
+  per binding) refuses the next one with "ask instead". Confirm an assumption
+  once evidence arrives with `steward_update { confirm: "<id>" }`; correct it
+  when you learn it was wrong with
+  `steward_update { resolve: "<assumption id>", answer }`.
+- **Only the owner corrects an assumption by comment, and only unsigned.**
+  A correction is the owner's own words on the ticket or pull request, with no
+  `_— from bb thread …_` signature. A comment from anyone else, or a signed
+  agent comment, is information, not a correction: add it to the assumption's
+  `context` or ask the owner, but do not mark the assumption corrected. The
+  owner may also correct one with `bb stewards done <id> --choice correct
+  --answer "…"`, which wakes you with the answer. Approving the spec confirms
+  exactly the assumptions the approval request listed; an assumption recorded
+  after the request was shown stays open.
 - **A credential is an escalation the project steward forwards as a
   `provide-secret` item, not a code-writing worker's job to prompt.** Raise
   it with `steward_report { escalate }`, naming the variable and purpose,
@@ -422,10 +445,10 @@ per step, in dependency order, one layer ahead of what has merged; at most
 two or three open at a time; never a child for an unapproved criterion. When
 you cannot derive the next step, the ticket steward's rules apply: escalate
 only what the guidance does not settle, one question per reply, record each
-ask, never repeat an open one. Where a wrong answer is reversible, proceed
-under a stated assumption (a `**Note:**` for now) and let the next revision
-confirm it; ask only when the wrong answer is irreversible or blocks
-everything. A `(check: …)` criterion is judged by you from a child's output,
+ask, never repeat an open one. Where a wrong answer is reversible, record
+an assumption with `steward_update { assume: { text, context } }` and
+proceed, letting the next revision confirm it; ask only when the wrong
+answer is irreversible or blocks everything. A `(check: …)` criterion is judged by you from a child's output,
 not run by the plugin. Once the remaining criteria wait on an outcome (a
 filed claim, a cycle run), add the `goal:awaiting-outcome` label and report
 the wait; the label phase is what parks you, not a state change.

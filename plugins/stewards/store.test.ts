@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -485,7 +485,7 @@ describe("the actor rename migration (BB-97)", () => {
     // it. BB-164 appended the pull-watch group after BB-184's server settings,
     // and BB-215's stack group follows it (migrations.test.ts pins the whole
     // list, this only checks the group order).
-    const groups = [WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    const groups = [ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -570,10 +570,13 @@ describe("the escalation route rename migration (BB-209)", () => {
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
     // The deps-decision group (the adoption-decision table and the fingerprint
-    // provenance column) was appended after this one, and BB-242's
-    // worker-stop-reason column after that.
-    const tail = MIGRATIONS.slice(0, -WORKER_STOP_REASON_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-WORKER_STOP_REASON_MIGRATIONS.length)).toEqual([...WORKER_STOP_REASON_MIGRATIONS]);
+    // provenance column) was appended after this one, BB-242's
+    // worker-stop-reason column after that, and BB-251's assumptions table
+    // after that.
+    const withAssumptions = MIGRATIONS.slice(0, -ASSUMPTION_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-ASSUMPTION_MIGRATIONS.length)).toEqual([...ASSUMPTION_MIGRATIONS]);
+    const tail = withAssumptions.slice(0, -WORKER_STOP_REASON_MIGRATIONS.length);
+    expect(withAssumptions.slice(-WORKER_STOP_REASON_MIGRATIONS.length)).toEqual([...WORKER_STOP_REASON_MIGRATIONS]);
     const depsTail = tail.slice(0, -DEPS_DECISION_MIGRATIONS.length);
     expect(tail.slice(-DEPS_DECISION_MIGRATIONS.length)).toEqual([...DEPS_DECISION_MIGRATIONS]);
     expect(depsTail.slice(-ESCALATION_ROUTE_MIGRATIONS.length)).toEqual([...ESCALATION_ROUTE_MIGRATIONS]);
@@ -1017,5 +1020,56 @@ describe("adoption decisions (keyed by ticket, not by binding)", () => {
     // A comment is not a filing: it leaves the filing thread in place.
     s.recordTicket("p1", "acme/web#23", "sc-111", "commented", "thr_other");
     expect(s.fingerprint("p1", "acme/web#23")).toMatchObject({ filedByThread: "thr_filed", lastCommentedAt: expect.any(Number) });
+  });
+});
+
+describe("recorded assumptions (BB-251)", () => {
+  it("records, confirms, corrects and counts open ones, and confirms exactly the approve-spec list", () => {
+    const { s, binding, advance } = store();
+    const a = s.addAssumption({ projectId: "p1", bindingId: binding.id, text: "SSO is out of scope", context: "the spec does not name it", recordedBy: "thr_s" });
+    expect(a).toMatchObject({ id: expect.stringMatching(/^asm_/u), projectId: "p1", bindingId: binding.id, state: "open", answer: null, recordedBy: "thr_s", recordedAt: 1_000 });
+    const b = s.addAssumption({ projectId: "p1", bindingId: binding.id, text: "the API is stable", context: null, recordedBy: "thr_s" });
+    expect(s.openAssumptions(binding.id).map((x) => x.id)).toEqual([a.id, b.id]);
+    expect(s.countOpenAssumptions(binding.id)).toBe(2);
+    expect(s.openAssumptionsForProject("p1").map((x) => x.id)).toEqual([a.id, b.id]);
+
+    advance(100);
+    expect(s.resolveAssumption(a.id, "confirmed", null, "thr_s")).toBe(true);
+    // A retry of the same resolve changes nothing.
+    expect(s.resolveAssumption(a.id, "confirmed", null, "thr_s")).toBe(false);
+    expect(s.assumption(a.id)).toMatchObject({ state: "confirmed", resolvedBy: "thr_s", resolvedAt: 1_100 });
+    expect(s.countOpenAssumptions(binding.id)).toBe(1);
+
+    // The approval confirms exactly the ids the request listed, and only while open.
+    s.fileNeed({ bindingId: binding.id, kind: "approve-spec", url: "", what: "Approve", how: null, data: { assumptionIds: [b.id, a.id] }, filedBy: "plugin" });
+    expect(s.confirmApprovalAssumptions(binding.id, "thr_p")).toEqual([b.id]);
+    expect(s.assumption(b.id)).toMatchObject({ state: "confirmed-by-approval", resolvedBy: "thr_p" });
+
+    const c = s.addAssumption({ projectId: "p1", bindingId: binding.id, text: "third", context: null, recordedBy: "thr_s" });
+    expect(s.resolveAssumption(c.id, "corrected", "it is not", "user")).toBe(true);
+    expect(s.assumption(c.id)).toMatchObject({ state: "corrected", answer: "it is not", resolvedBy: "user" });
+
+    // A project-level assumption lives with no binding.
+    const p = s.addAssumption({ projectId: "p1", bindingId: null, text: "freeze on Friday", context: null, recordedBy: "thr_p" });
+    expect(p.bindingId).toBeNull();
+    expect(s.openAssumptionsForProject("p1").map((x) => x.id)).toEqual([p.id]);
+    expect(s.openAssumptions(binding.id)).toEqual([]);
+  });
+
+  it("confirms the ids recorded on an open approval escalation when there is no approve-spec need", () => {
+    const { s, binding } = store();
+    const a = s.addAssumption({ projectId: "p1", bindingId: binding.id, text: "x", context: null, recordedBy: "thr_s" });
+    s.escalate({ bindingId: binding.id, kind: "approval", question: "Approve?", meanwhile: "Wait.", route: "project", recommendation: null, data: { assumptionIds: [a.id] } });
+    expect(s.confirmApprovalAssumptions(binding.id, "thr_p")).toEqual([a.id]);
+    expect(s.assumption(a.id)).toMatchObject({ state: "confirmed-by-approval", resolvedBy: "thr_p" });
+  });
+
+  it("does not return an ended binding's open assumptions from openAssumptionsForProject", () => {
+    const { s, binding } = store();
+    s.addAssumption({ projectId: "p1", bindingId: binding.id, text: "on the binding", context: null, recordedBy: "thr_s" });
+    s.addAssumption({ projectId: "p1", bindingId: null, text: "project-wide", context: null, recordedBy: "thr_p" });
+    expect(s.openAssumptionsForProject("p1").map((a) => a.text)).toEqual(["on the binding", "project-wide"]);
+    s.patch(binding.id, { endedAt: 2_000 });
+    expect(s.openAssumptionsForProject("p1").map((a) => a.text)).toEqual(["project-wide"]);
   });
 });

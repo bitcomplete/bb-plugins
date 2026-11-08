@@ -1230,6 +1230,11 @@ export const frontMatterSchema = z
     "idle-grace": durationSchema.default(15 * 60_000),
     /** How long a steward may keep a binding open past a terminal state to finish its work. */
     "follow-through": durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
+    /**
+     * BB-251: how many recorded assumptions a binding may have open at once.
+     * Past the cap the steward asks instead of assuming. Default 5.
+     */
+    "max-assumptions": z.number().int().min(0).max(50).default(5),
     /** Reviews: pull request authors no review steward is made for (bots). */
     "skip-authors": z.array(z.string().trim().min(1).max(100)).default([]),
     /**
@@ -1259,6 +1264,8 @@ export type Playbook = {
   /** How long a binding may sit idle in an active stage before its steward is woken (BB-83). */
   idleGraceMs: number;
   followThroughMs: number;
+  /** How many recorded assumptions a binding may have open at once (BB-251); past it the steward asks instead. */
+  maxAssumptions: number;
   skipAuthors: string[];
   /** Whether a teammate's pull request still files the owner's Merge item (BB-170; off by default). */
   ownerMerges: boolean;
@@ -1342,6 +1349,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       requeueDefaultMs: fm["requeue-default"],
       idleGraceMs: fm["idle-grace"],
       followThroughMs: fm["follow-through"],
+      maxAssumptions: fm["max-assumptions"],
       skipAuthors: fm["skip-authors"],
       ownerMerges: fm["owner-merges"],
       deployments: fm.deployment === undefined ? [] : Array.isArray(fm.deployment) ? fm.deployment : [fm.deployment],
