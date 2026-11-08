@@ -696,35 +696,58 @@ describe("goal progress (BB-243)", () => {
   it("counts distinct Met: comments against the description's criteria", () => {
     const { s, bind } = world();
     const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments: [met("Scope memo approved (owner)"), met("Expenses gathered (check: npm run expenses)")] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 2, criteria: 3 });
+    expect(goalProgress(b)).toEqual({ met: 2, criteria: 3, capped: false });
     expect(goalProgressFlag(b)).toBe("goal met 2/3");
   });
 
   it("counts a criterion once when its Met: comment repeats", () => {
     const { s, bind } = world();
     const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments: [met("Scope memo approved (owner)", "c1"), met("scope   memo approved (owner)", "c2")] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 1, criteria: 3 });
+    expect(goalProgress(b)).toEqual({ met: 1, criteria: 3, capped: false });
     expect(goalProgressFlag(b)).toBe("goal met 1/3");
+  });
+
+  it("counts the criteria a signed, evidenced Met: comment names, never above the checklist", () => {
+    const { s, bind } = world();
+    const signed = (id: string, text: string) => comment({ id, body: `**Met:** ${text}\n\n_— from bb thread thr_steward_` });
+    const b = s.patch(bind("ENG-12").id, {
+      lastSnapshot: {
+        entity: goal({
+          comments: [signed("c1", "Scope memo approved (owner)"), signed("c2", "Scope memo approved — see docs/memo.md"), signed("c3", "Expenses gathered (check: npm run expenses)"), signed("c4", "Claim filed (owner)")],
+        }),
+        pulls: [],
+      },
+    });
+    expect(goalProgress(b)).toEqual({ met: 3, criteria: 3, capped: false });
+    expect(goalProgressFlag(b)).toBe("goal met 3/3");
   });
 
   it("shows unknown, never 0, when no Met: comment can be read", () => {
     const { s, bind } = world();
     const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments: [] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: null, criteria: 3 });
+    expect(goalProgress(b)).toEqual({ met: null, criteria: 3, capped: false });
     expect(goalProgressFlag(b)).toBe("goal met unknown");
+  });
+
+  it("shows a lower bound when the snapshot held a full page of comments", () => {
+    const { s, bind } = world();
+    const comments = Array.from({ length: 50 }, (_, i) => (i < 2 ? comment({ id: `c${i}`, body: `**Met:** ${i === 0 ? "Scope memo approved" : "Expenses gathered"}` }) : comment({ id: `c${i}`, body: `**Note:** noise ${i}` })));
+    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments }), pulls: [] } });
+    expect(goalProgress(b)).toEqual({ met: 2, criteria: 3, capped: true });
+    expect(goalProgressFlag(b)).toBe("goal met ≥2/3");
   });
 
   it("shows met without a criteria count when the description has no criteria section", () => {
     const { s, bind } = world();
     const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ description: "## Outcome\n\nJust an outcome.", comments: [met("Something")] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 1, criteria: null });
+    expect(goalProgress(b)).toEqual({ met: 1, criteria: null, capped: false });
     expect(goalProgressFlag(b)).toBe("goal met 1");
   });
 
   it("knows a goal by its playbook before the first snapshot, and shows unknown", () => {
     const { s, bind } = world();
     const b = s.patch(bind("ENG-12").id, { playbook: "goal" });
-    expect(goalProgress(b)).toEqual({ met: null, criteria: null });
+    expect(goalProgress(b)).toEqual({ met: null, criteria: null, capped: false });
     expect(goalProgressFlag(b)).toBe("goal met unknown");
   });
 

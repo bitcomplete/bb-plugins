@@ -16,7 +16,7 @@ import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, 
 import { newHumanComments, productGateOptions, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { prGate, type ProjectApprovalRecord } from "./gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
-import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
+import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
@@ -1202,61 +1202,89 @@ const CRITERIA_HEADING = /^#{1,6}\s+criteria\b/iu;
 const ANY_HEADING = /^#{1,6}\s+\S/u;
 /** A checklist line, the shape a criterion is written in. */
 const CHECKLIST_ITEM = /^\s*[-*]\s*\[[ xX]\]\s*\S/u;
+/** The checkbox a checklist line opens with. */
+const CHECKBOX = /^\s*[-*]\s*\[[ xX]\]\s*/u;
 
 /**
- * A goal's progress (BB-243): `met` is the number of distinct criteria a
- * `**Met:**` comment records, `criteria` the number of checklist lines under
- * the description's `Criteria` heading. Null when the ticket is not a goal —
- * it carries neither the `goal` label nor the `goal` playbook — so a binding
- * that merely looks like one is left alone.
- *
- * `met` is null rather than 0 when no `**Met:**` comment can be read (or the
- * snapshot has not been read yet), so a goal that has not been driven reads
- * `unknown`, never `0`: an empty count cannot be told from an unread history,
- * and only one of them means no criterion is met.
+ * Normalise a criterion or a `**Met:**` first line for matching: case and
+ * whitespace, and the trailing `(owner)` / `(check: …)` marker the criteria
+ * syntax uses to name who says a criterion is met. Evidence after a dash and
+ * the signature line survive, so a prefix match below still names the
+ * criterion.
  */
-export function goalProgress(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): { met: number | null; criteria: number | null } | null {
-  if (binding.kind !== "ticket") return null;
-  const entity = binding.lastSnapshot?.entity;
-  const byLabel = entity !== undefined && entity.labels.some((l) => l.toLowerCase() === GOAL_LABEL);
-  if (!byLabel && binding.playbook !== GOAL_PLAYBOOK) return null;
-  if (entity === undefined) return { met: null, criteria: null };
-  const met = new Set<string>();
-  for (const c of entity.comments) {
-    const m = MET_PREFIX.exec(c.body);
-    if (m === null) continue;
-    const criterion = c.body.slice(m[0].length).trim().replace(/\s+/gu, " ").toLowerCase();
-    if (criterion !== "") met.add(criterion);
-  }
-  return { met: met.size === 0 ? null : met.size, criteria: criteriaCount(entity.description ?? "") };
-}
+const criterionKey = (text: string): string => text.replace(/\s+/gu, " ").trim().replace(/\s*\([^()]*\)\s*$/u, "").trim().toLowerCase();
 
-/** The number of checklist lines under the description's `Criteria` heading, or null when it has none. */
-function criteriaCount(description: string): number | null {
+/** The description's checklist criteria, normalised; empty when it has no `Criteria` heading with items. */
+function criteriaKeys(description: string): string[] {
+  const keys: string[] = [];
   let inCriteria = false;
-  let count = 0;
   for (const line of description.split("\n")) {
     if (!inCriteria) {
       if (CRITERIA_HEADING.test(line)) inCriteria = true;
       continue;
     }
     if (ANY_HEADING.test(line)) break;
-    if (CHECKLIST_ITEM.test(line)) count += 1;
+    if (!CHECKLIST_ITEM.test(line)) continue;
+    const key = criterionKey(line.replace(CHECKBOX, ""));
+    if (key !== "") keys.push(key);
   }
-  return count === 0 ? null : count;
+  return keys;
+}
+
+/**
+ * A goal's progress (BB-243): `met` is the number of the description's
+ * criteria a `**Met:**` comment names, `criteria` the number of checklist
+ * lines under its `Criteria` heading. Null when the ticket is not a goal — it
+ * carries neither the `goal` label nor the `goal` playbook.
+ *
+ * A criterion is named when a `**Met:**` comment's first line, normalised,
+ * equals it or either is a prefix of the other. Evidence and the signature on
+ * the comment do not matter, and a Met comment for a criterion a revision
+ * dropped stops counting, so `met` never exceeds `criteria`. With no criteria
+ * section, the distinct Met first lines are counted instead and `criteria` is
+ * null.
+ *
+ * `met` is null rather than 0 when no `**Met:**` comment can be read (or the
+ * snapshot has not been read yet), so a goal that has not been driven reads
+ * `unknown`, never `0`: an empty count cannot be told from an unread history,
+ * and only one of them means no criterion is met. `capped` is true when the
+ * snapshot held a full page of comments, so the count is a lower bound.
+ */
+export function goalProgress(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): { met: number | null; criteria: number | null; capped: boolean } | null {
+  if (binding.kind !== "ticket") return null;
+  const entity = binding.lastSnapshot?.entity;
+  const byLabel = entity !== undefined && entity.labels.some((l) => l.toLowerCase() === GOAL_LABEL);
+  if (!byLabel && binding.playbook !== GOAL_PLAYBOOK) return null;
+  if (entity === undefined) return { met: null, criteria: null, capped: false };
+  const criteria = criteriaKeys(entity.description ?? "");
+  const names = new Set<string>();
+  for (const c of entity.comments) {
+    const m = MET_PREFIX.exec(c.body);
+    if (m === null) continue;
+    const key = criterionKey(c.body.slice(m[0].length).split("\n")[0]!);
+    if (key !== "") names.add(key);
+  }
+  const named = (criterion: string): boolean => {
+    for (const name of names) if (name === criterion || name.startsWith(criterion) || criterion.startsWith(name)) return true;
+    return false;
+  };
+  const met = criteria.length > 0 ? criteria.filter(named).length : names.size;
+  return { met: met === 0 ? null : met, criteria: criteria.length === 0 ? null : criteria.length, capped: entity.comments.length >= SNAPSHOT_COMMENTS_MAX };
 }
 
 /**
  * A goal's progress as one flag for the project steward's binding list and
  * digest, or null for a binding that is not a goal. `met 3/7` counts the
- * `**Met:**` comments against the approved criteria; `met unknown` is an
- * unreadable history and `met 3` a description with no criteria section.
+ * criteria the `**Met:**` comments name; `met unknown` is an unreadable
+ * history, `met ≥3/7` a truncated one, and `met 3` a description with no
+ * criteria section.
  */
 export function goalProgressFlag(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): string | null {
   const p = goalProgress(binding);
   if (p === null) return null;
   if (p.met === null) return "goal met unknown";
-  return p.criteria === null ? `goal met ${p.met}` : `goal met ${p.met}/${p.criteria}`;
+  const met = `${p.capped ? "≥" : ""}${p.met}`;
+  return p.criteria === null ? `goal met ${met}` : `goal met ${met}/${p.criteria}`;
 }
 
 /** What the project steward is woken with, at the end of a nightly pass or when an escalation reaches it. */

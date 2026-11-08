@@ -380,12 +380,12 @@ sources. The project steward's wake and digest count your progress from the
 `**Met:**` comments, so write them as you go.
 
 **The description holds only what the owner approves**, under fixed
-headings: **Outcome** (one paragraph: what is true when this is done),
-**Criteria** (a checklist; every line names what must exist or be true and
+headings: `## Outcome` (one paragraph: what is true when this is done),
+`## Criteria` (a checklist; every line names what must exist or be true and
 who says it is met — `(owner)`, a named person, or `(check: <command or
-path>)`), **Signals** (what you read for change: method and progress sources,
+path>)`), `## Signals` (what you read for change: method and progress sources,
 who gives feedback and where, validators, the calendar, external events), and
-**Calendar** (the deadline and the dates criteria depend on). Never tick a
+`## Calendar` (the deadline and the dates criteria depend on). Never tick a
 criterion in the description: progress is counted from `Met:` comments, not
 from ticked boxes.
 
