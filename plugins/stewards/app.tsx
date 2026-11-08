@@ -2465,18 +2465,24 @@ function tabEfforts(tab: SidebarTab): SidebarEffort[] {
 }
 
 /** The effort and thread rows that must be open so the active thread is revealed (BB-85). */
-function revealThreads(tabs: readonly SidebarTab[], activeThreadId: string | null): ReadonlySet<string> {
+function revealThreads(tabs: readonly SidebarTab[], activeThreadId: string | null, activeKey: string | null): ReadonlySet<string> {
   const open = new Set<string>();
-  if (activeThreadId === null) return open;
   for (const tab of tabs) {
     const all = tabEfforts(tab);
+    for (const effort of all) {
+      // A nested effort's row sits inside its parent's collapsible block, so
+      // the parent opens for the child's own thread or the board's effort
+      // (BB-245).
+      const parent = all.find((p) => p.nested.includes(effort));
+      if (parent === undefined) continue;
+      if ((activeThreadId !== null && effort.rootThreadId === activeThreadId) || (activeKey !== null && effort.bindingKey === activeKey)) open.add(parent.rootThreadId);
+    }
+    if (activeThreadId === null) continue;
     for (const effort of all) {
       const chain = ancestorThreads(effort.children, activeThreadId);
       if (chain === null) continue;
       open.add(effort.rootThreadId);
       for (const id of chain) open.add(id);
-      // A nested effort's row sits inside its parent's collapsible block, so
-      // the parent opens too (BB-245).
       const parent = all.find((p) => p.nested.includes(effort));
       if (parent !== undefined) open.add(parent.rootThreadId);
     }
@@ -2689,7 +2695,7 @@ function StewardsSidebarCore({
   const needsFor = (tab: SidebarTab) => (data?.projectId === tab.projectId ? data.needs.items : EMPTY_NEEDS);
   const now = useNow();
   const activeKey = boardRoute.key;
-  const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
+  const openThreads = useMemo(() => revealThreads(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
   const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
   // The picker switches the list and, on a project-scoped route, moves the main
   // pane back to that project's last place (BB-113): its remembered thread when

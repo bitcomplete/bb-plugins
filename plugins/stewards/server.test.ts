@@ -637,8 +637,8 @@ describe("a Linear ticket steward", () => {
   // the project steward, as before. The environment is the project steward's
   // either way.
   describe("BB-245: the spawn parent", () => {
-    const makeBinding = (t: Awaited<ReturnType<typeof setup>>, over: { key: string; entityId: string; parentBindingId: string | null }) =>
-      t.hooks.store.create({ projectId: "p1", source: "linear", entityId: over.entityId, entityKey: over.key, url: null, title: over.key, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: over.parentBindingId, phase: "Todo", stage: "spec" });
+    const makeBinding = (t: Awaited<ReturnType<typeof setup>>, over: { key: string; entityId: string; parentBindingId: string | null; projectId?: string }) =>
+      t.hooks.store.create({ projectId: over.projectId ?? "p1", source: "linear", entityId: over.entityId, entityKey: over.key, url: null, title: over.key, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: over.parentBindingId, phase: "Todo", stage: "spec" });
 
     it("spawns under the parent binding's thread when the parent is open and has one", async () => {
       const t = await setup();
@@ -669,6 +669,18 @@ describe("a Linear ticket steward", () => {
     it("falls back to the project steward when there is no parent binding", async () => {
       const t = await setup();
       makeBinding(t, { key: "ENG-2", entityId: "uuid-2", parentBindingId: null });
+      t.entities.set("uuid-2", issue({ id: "uuid-2", key: "ENG-2", title: "Child work" }));
+      await t.ring("linear", "uuid-2");
+      const project = t.spawns.find((s) => s.title === "Acme project steward")!;
+      expect(t.spawns.find((s) => s.title === "ENG-2: Child work")).toMatchObject({ parentThreadId: project.id, parentNotifications: "off" });
+    });
+
+    it("falls back to the project steward when the parent binding is in another project", async () => {
+      const t = await setup();
+      const parent = makeBinding(t, { projectId: "p2", key: "ENG-1", entityId: "uuid-1", parentBindingId: null });
+      t.hooks.store.patch(parent.id, { threadId: "thr_other_project" });
+      t.threads.set("thr_other_project", { status: "idle", archivedAt: null, parentThreadId: null });
+      makeBinding(t, { key: "ENG-2", entityId: "uuid-2", parentBindingId: parent.id });
       t.entities.set("uuid-2", issue({ id: "uuid-2", key: "ENG-2", title: "Child work" }));
       await t.ring("linear", "uuid-2");
       const project = t.spawns.find((s) => s.title === "Acme project steward")!;

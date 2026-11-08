@@ -2877,7 +2877,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // project steward's. bb cannot re-parent a live thread, so a child stays
       // under a parent that later ends (DESIGN.md §4/§15).
       const parent = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
-      const parentThread = parent !== null && parent.endedAt === null && parent.threadId !== null ? parent.threadId : null;
+      const parentThread = parent !== null && parent.projectId === b.projectId && parent.endedAt === null && parent.threadId !== null ? parent.threadId : null;
       const treeParent = parentThread ?? projectThread;
       const base = {
         projectId: b.projectId,

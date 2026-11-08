@@ -387,6 +387,26 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-85/BB-245: a route to a nested child steward's own thread opens the
+  // parent row, so the active child is not hidden under a collapsed parent.
+  it("opens a nested child effort's parent when the route lands on the child (BB-245)", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: {
+          projects,
+          threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Parent work" }), thread({ id: "thr_child", displayTitle: "ENG-2: Child work" })],
+        },
+        rpc: {
+          stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1" })] }),
+        } as never,
+      },
+      { activeThreadId: "thr_child" },
+    );
+    await waitFor(() => expect(slot.getByText("Parent work")).toBeTruthy());
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Parent work" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
   it("gives worker, reviewer and one-off child rows the same one-off glyphs", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
