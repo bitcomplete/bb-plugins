@@ -17,7 +17,7 @@ import { newHumanComments, productGateOptions, reportedItem, unheardWait, type G
 import { prGate, type ProjectApprovalRecord } from "./gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
-import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
+import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -305,6 +305,8 @@ export type WakeInput = {
   label: string;
   /** Per-pull-request deployment state (BB-53); empty when the playbook names no deployment target. */
   deployments?: Deployments;
+  /** The binding's open recorded assumptions (BB-251), so the steward does not re-make or contradict one. */
+  assumptions?: Assumption[];
   /** Open bindings already at work on what this one touches. */
   conflicts?: Conflict[];
   /** Trial lessons of the project, already capped to `lessons.trial.max`; candidates never appear. */
@@ -512,6 +514,22 @@ function schedulingLines(binding: Binding, conflicts: Conflict[], escalations: E
   return lines;
 }
 
+/**
+ * The `## Assumptions (open)` section of a binding's wake (BB-251): what the
+ * steward is proceeding under, so it is not re-made or contradicted. One line
+ * each; a resolved assumption is not listed.
+ */
+function assumptionLines(assumptions: Assumption[]): string[] {
+  if (assumptions.length === 0) return [];
+  return [
+    "",
+    "## Assumptions (open)",
+    "",
+    "Questions the guidance did not settle that you are proceeding under. They are recorded, not asked: the owner sees them in the project digest and can correct one. Confirm one once evidence arrives with `steward_update { confirm: \"<id>\" }`; correct it with `steward_update { resolve: \"<id>\", answer }`.",
+    ...assumptions.map((a) => `- ${a.id}: Assuming: ${oneLine(a.text)}${a.context === null ? "" : ` — ${oneLine(a.context)}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})`),
+  ];
+}
+
 /** One wake, in the fixed form: instructions, ready gate, steering, snapshot, changes. */
 export function formatWake(input: WakeInput): string {
   const { binding, playbook, observed } = input;
@@ -576,6 +594,7 @@ export function formatWake(input: WakeInput): string {
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
   out.push(...trialLessonsLines(input.lessons ?? []));
+  out.push(...assumptionLines(input.assumptions ?? []));
   // BB-154: a wait with no structured source gets one paragraph, before the
   // snapshot, so a clipped wake keeps it.
   if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
@@ -1302,6 +1321,8 @@ export function formatProjectWake(input: {
   questions?: Array<{ question: Question; about: Binding | null }>;
   /** Open `needs` items, with the binding each is about. */
   needs?: Array<{ need: Need; binding: Binding }>;
+  /** Open recorded assumptions (BB-251), with the binding each is about (null for a project-level one); one `Assuming:` line each. */
+  assumptions?: Array<{ assumption: Assumption; binding: Binding | null }>;
   /** Pending lessons: general rules waiting to be landed in `.bb`. */
   lessons?: Lesson[];
   /** The project's lesson rules, for the trial cap and the wake headings. */
@@ -1398,6 +1419,14 @@ export function formatProjectWake(input: {
       out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${needListing(n) === null ? "" : `\n  ${needListing(n)!.split("\n").join("\n  ")}`}`);
     }
     out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
+  }
+  // BB-251: what the stewards below are proceeding under. The owner sees them
+  // in passing rather than being asked; a correction comes back as an answer.
+  const assumptions = input.assumptions ?? [];
+  if (assumptions.length > 0) {
+    out.push("## Assumptions (open)", "");
+    out.push(...capped(assumptions.map(({ assumption: a, binding }) => `- ${binding?.entityKey ?? "project"}: Assuming: ${oneLine(a.text)}${a.context === null ? "" : ` — ${oneLine(a.context)}`} (${a.id}, recorded ${day(a.recordedAt)})`), "Nothing."));
+    out.push("", "Recorded, not asked: the owner sees these here and can correct one; a confirmation is the steward's own. Do not ask the user about one in prose.", "");
   }
   const lessons = input.lessons ?? [];
   out.push(...projectLessonsLines(lessons, input.lessonRules));
@@ -1530,6 +1559,8 @@ export type DigestRecords = {
   withUser: Array<{ escalation: Escalation; from: Binding }>;
   /** Open `needs` items filed by the plugin or a steward, for the digest. */
   needs?: Array<{ need: Need; binding: Binding }>;
+  /** Open recorded assumptions (BB-251), one `Assuming:` line each; binding is null for a project-level one. */
+  assumptions?: Array<{ assumption: Assumption; binding: Binding | null }>;
   /** Open `stuck` escalations, wherever they are. */
   stuck: Array<{ escalation: Escalation; from: Binding }>;
   /** Bindings marked waiting with no wake source (BB-154). */
@@ -1578,6 +1609,13 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.answered.map((q) => `- Answered: ${q.id} "${oneLine(q.question, 200)}" → ${oneLine(q.answer ?? "", 300)} (${q.answeredBy === "user" ? "by the user, on the stewards page" : "recorded by you"})`),
   ];
   out.push("### What moved", "", ...capped(moved, "Nothing moved."), "");
+
+  // BB-251: what the stewards below are proceeding under, one Assuming line
+  // each, so the owner sees them in passing rather than being asked.
+  const assumptions = r.assumptions ?? [];
+  if (assumptions.length > 0) {
+    out.push("### Assumptions (open)", "", ...capped(assumptions.map(({ assumption: a, binding: b }) => `- ${b?.entityKey ?? "project"}: Assuming: ${oneLine(a.text)}${a.context === null ? "" : ` — ${oneLine(a.context)}`} (${a.id})`), "Nothing."), "");
+  }
 
   if ((r.notes ?? []).length > 0) out.push("### Notes", "", ...capped((r.notes ?? []).map((n) => `- ${n}`), "Nothing."), "");
 

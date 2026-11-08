@@ -13056,3 +13056,202 @@ describe("the approval alias rename (BB-209)", () => {
     expect(check.stdout).not.toMatch(/renamed to "user"/u);
   });
 });
+
+describe("recorded assumptions (BB-251)", () => {
+  const bound = async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { t, project, steward };
+  };
+  const idOf = (text: string) => text.split(" ")[0]!;
+
+  it("records on a binding, files no user item, and shows in the wake and show", async () => {
+    const { t, steward } = await bound();
+    const recorded = await t.tool("steward_update", { assume: { text: "SSO is out of scope", context: "the spec does not name it" } }, steward);
+    expect(recorded.error, recorded.text).toBe(false);
+    const id = idOf(recorded.text);
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(t.hooks.store.assumption(id)).toMatchObject({ bindingId: b.id, text: "SSO is out of scope", state: "open", recordedBy: steward });
+    // It is not a user item: no need, escalation or question.
+    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(0);
+    expect(t.hooks.store.openEscalations(b.id)).toHaveLength(0);
+    expect(t.hooks.store.openQuestions("p1")).toHaveLength(0);
+    // The next wake carries it.
+    t.entities.set("uuid-12", issue({ comments: [comment({ id: "c1", author: "lee", body: "Any update?" })] }));
+    await t.ring("linear", "uuid-12");
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toContain("## Assumptions (open)");
+    expect(wake).toContain("Assuming: SSO is out of scope");
+    // `bb stewards show` lists it.
+    const show = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(show).toContain(`Assumption ${id} (open)`);
+    expect(show).toContain("Assuming: SSO is out of scope");
+  });
+
+  it("refuses a sixth open assumption with ask instead", async () => {
+    const { t, steward } = await bound();
+    for (let i = 0; i < 5; i++) {
+      const r = await t.tool("steward_update", { assume: { text: `assumption ${i}` } }, steward);
+      expect(r.error, r.text).toBe(false);
+    }
+    const sixth = await t.tool("steward_update", { assume: { text: "sixth" } }, steward);
+    expect(sixth).toMatchObject({ error: true, text: expect.stringMatching(/ask instead/iu) });
+    expect(t.hooks.store.openAssumptions(t.hooks.store.find("ENG-12", "p1")!.id)).toHaveLength(5);
+  });
+
+  it("records a project-level assumption from the project steward", async () => {
+    const { t, project } = await bound();
+    const r = await t.tool("steward_update", { assume: { text: "freeze on Friday" } }, project);
+    expect(r.error, r.text).toBe(false);
+    expect(t.hooks.store.assumption(idOf(r.text))).toMatchObject({ projectId: "p1", bindingId: null, state: "open" });
+  });
+
+  it("confirms from the steward and corrects with resolve", async () => {
+    const { t, steward } = await bound();
+    const a = idOf((await t.tool("steward_update", { assume: { text: "the API is stable" } }, steward)).text);
+    expect((await t.tool("steward_update", { confirm: a }, steward)).error).toBe(false);
+    expect(t.hooks.store.assumption(a)).toMatchObject({ state: "confirmed" });
+
+    const c = idOf((await t.tool("steward_update", { assume: { text: "the retry is safe" } }, steward)).text);
+    expect((await t.tool("steward_update", { resolve: c, answer: "the retry is not safe" }, steward)).error).toBe(false);
+    expect(t.hooks.store.assumption(c)).toMatchObject({ state: "corrected", answer: "the retry is not safe" });
+  });
+
+  it("confirms and corrects from the CLI, and a correction wakes the steward", async () => {
+    const { t, project, steward } = await bound();
+    const a = idOf((await t.tool("steward_update", { assume: { text: "the API is stable" } }, steward)).text);
+    expect((await t.harness.behavior.runCli(["done", a, "--choice", "confirm", "--project", "p1"])).exitCode).toBe(0);
+    expect(t.hooks.store.assumption(a)).toMatchObject({ state: "confirmed", resolvedBy: "user" });
+
+    const c = idOf((await t.tool("steward_update", { assume: { text: "the retry is safe" } }, steward)).text);
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    expect((await t.harness.behavior.runCli(["done", c, "--choice", "correct", "--answer", "the retry is not safe", "--project", "p1"])).exitCode).toBe(0);
+    await t.flush();
+    expect(t.hooks.store.assumption(c)).toMatchObject({ state: "corrected", answer: "the retry is not safe", resolvedBy: "user" });
+    const wakes = t.sends.filter((s) => s.threadId === steward);
+    expect(wakes.length).toBeGreaterThan(before);
+    expect(wakes.at(-1)!.text).toContain("corrected");
+    // The project steward is offered the correction as a lesson candidate.
+    expect(t.sends.filter((s) => s.threadId === project).at(-1)!.text).toContain("record it as a lesson");
+  });
+
+  it("an approval confirms exactly the assumptions the approve-spec request listed", async () => {
+    const { t, project, steward } = await bound();
+    const first = idOf((await t.tool("steward_update", { assume: { text: "first" } }, steward)).text);
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-spec", url: b.url ?? "", what: "Approve ENG-12's spec", how: "x", data: { specHash: "h", assumptionIds: [first] }, filedBy: "plugin" });
+    const second = idOf((await t.tool("steward_update", { assume: { text: "second" } }, steward)).text);
+    const res = await t.tool("steward_update", { binding: "ENG-12", approve: true }, project);
+    expect(res.error, res.text).toBe(false);
+    expect(t.hooks.store.assumption(first)).toMatchObject({ state: "confirmed-by-approval" });
+    expect(t.hooks.store.assumption(second)).toMatchObject({ state: "open" });
+  });
+
+  // BB-251 review blocker 1: an assumption call is its own call; a mixed call
+  // is refused and writes nothing rather than silently dropping the steer.
+  it("refuses an assumption call mixed with another field, writing nothing", async () => {
+    const { t, steward } = await bound();
+    const res = await t.tool("steward_update", { assume: { text: "combined" }, guidance: "GUIDE-XYZ" }, steward);
+    expect(res).toMatchObject({ error: true, text: expect.stringMatching(/their own call|alone/iu) });
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(t.hooks.store.openAssumptions(b.id)).toHaveLength(0);
+    expect(b.guidance).toEqual([]);
+  });
+
+  // BB-251 review round 2: a resolve or answer must not ride along with
+  // assume/confirm, or the early return would silently drop it.
+  it("refuses a resolve or answer riding along with assume or confirm", async () => {
+    const { t, steward } = await bound();
+    const a = idOf((await t.tool("steward_update", { assume: { text: "a" } }, steward)).text);
+    const b = idOf((await t.tool("steward_update", { assume: { text: "b" } }, steward)).text);
+    const esc = t.hooks.store.escalate({ bindingId: t.hooks.store.find("ENG-12", "p1")!.id, kind: "decision", question: "Q?", meanwhile: "Wait.", route: "steward", recommendation: null });
+    const assumePlusResolve = await t.tool("steward_update", { assume: { text: "c" }, resolve: esc.id }, steward);
+    expect(assumePlusResolve).toMatchObject({ error: true, text: expect.stringMatching(/alone|separate/iu) });
+    const confirmPlusResolve = await t.tool("steward_update", { confirm: a, resolve: b, answer: "x" }, steward);
+    expect(confirmPlusResolve).toMatchObject({ error: true, text: expect.stringMatching(/separate/iu) });
+    // Nothing was written.
+    expect(t.hooks.store.assumption(a)).toMatchObject({ state: "open" });
+    expect(t.hooks.store.assumption(b)).toMatchObject({ state: "open" });
+    expect(t.hooks.store.openAssumptions(t.hooks.store.find("ENG-12", "p1")!.id)).toHaveLength(2);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
+  });
+
+  // BB-251 review round 2: an ended binding's assumptions are no longer open,
+  // so they do not list in the project wake and digest for good.
+  it("drops an ended binding's assumptions from the project wake and digest", async () => {
+    const { t, project, steward } = await bound();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const id = idOf((await t.tool("steward_update", { assume: { text: "open thing" } }, steward)).text);
+    expect(t.hooks.store.openAssumptionsForProject("p1").map((x) => x.id)).toEqual([id]);
+    t.hooks.store.patch(b.id, { endedAt: t.now(), endReason: "done" });
+    expect(t.hooks.store.openAssumptionsForProject("p1")).toEqual([]);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === project).at(-1)!.text).not.toContain("Assuming: open thing");
+  });
+
+  // BB-251 review blocker 2: a project-level assumption appears in the project
+  // steward's wake and digest, so the owner can see and correct it.
+  it("shows a project-level assumption in the project wake and digest", async () => {
+    const { t, project } = await bound();
+    const recorded = await t.tool("steward_update", { assume: { text: "freeze on Friday" } }, project);
+    const id = idOf(recorded.text);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).toContain("project: Assuming: freeze on Friday");
+    expect(wake).toContain(id);
+  });
+
+  // BB-251 review blocker 3: the default project-steward approval request
+  // records the open assumptions it covers, and the approval confirms exactly
+  // those; one recorded after the request was shown stays open.
+  it("records the open assumptions on the project-steward approval request and confirms exactly those", async () => {
+    const { t, project, steward } = await bound();
+    const first = idOf((await t.tool("steward_update", { assume: { text: "first" } }, steward)).text);
+    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { ...base, ready: met }, steward);
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const approval = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval");
+    expect(approval).toBeDefined();
+    expect(approval!.data.assumptionIds).toEqual([first]);
+    expect(approval!.question).toContain("It covers");
+    expect(approval!.question).toContain(first);
+    const second = idOf((await t.tool("steward_update", { assume: { text: "second" } }, steward)).text);
+    const res = await t.tool("steward_update", { binding: "ENG-12", approve: true }, project);
+    expect(res.error, res.text).toBe(false);
+    expect(t.hooks.store.assumption(first)).toMatchObject({ state: "confirmed-by-approval" });
+    expect(t.hooks.store.assumption(second)).toMatchObject({ state: "open" });
+  });
+
+  // BB-251 review blocker 3: the plugin's own capture on the user's
+  // approve-spec item, and that a same-spec refresh keeps the list it was
+  // shown with.
+  it("captures the open assumptions on the user's approve-spec item and keeps the list on refresh", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const first = idOf((await t.tool("steward_update", { assume: { text: "first" } }, steward)).text);
+    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { ...base, ready: met }, steward);
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+    expect(need.data.assumptionIds).toEqual([first]);
+    expect(need.how).toContain("It covers");
+    expect(need.how).toContain(first);
+    // A later assumption is not captured by a same-spec refresh.
+    const second = idOf((await t.tool("steward_update", { assume: { text: "second" } }, steward)).text);
+    t.entities.set("uuid-12", issue({ comments: [comment({ id: "c9", author: "lee", body: "a note" })] }));
+    await t.ring("linear", "uuid-12");
+    const refreshed = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+    expect(refreshed.data.assumptionIds).toEqual([first]);
+    expect(refreshed.data.assumptionIds).not.toContain(second);
+  });
+});

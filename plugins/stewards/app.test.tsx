@@ -1069,6 +1069,18 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-251: the binding card shows the open recorded assumptions.
+  it("shows the open assumptions on the binding card", async () => {
+    const slot = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", assumptions: [{ id: "asm_1", text: "SSO is out of scope", context: "the spec does not name it", recordedAt: 1_000, recordedBy: "thr_s" }] })],
+    });
+    await waitFor(() => expect(slot.getByText(/Assuming: SSO is out of scope/u)).toBeTruthy());
+    expect(slot.getByText("Assumptions")).toBeTruthy();
+    expect(slot.getByText(/the spec does not name it/u)).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
   it("shows what the board knows about an ended effort, and an unknown key says so", async () => {
     const ended = await renderBoardWith({
       subPath: "p1/ENG-0",

@@ -110,7 +110,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -759,6 +759,8 @@ export const rpcContract = defineRpcContract({
               roles: z.array(z.string()).optional(),
               /** The running workers, each a link; the count is their length. */
               workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
+              /** The binding's open recorded assumptions (BB-251), shown on its card. */
+              assumptions: z.array(z.object({ id: z.string(), text: z.string(), context: z.string().nullable(), recordedAt: z.number(), recordedBy: z.string() })),
             }),
           ),
           stuck: z.array(z.object({ key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), why: z.string(), since: z.number().nullable() })),
@@ -3173,6 +3175,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         label: config.file.label,
         conflicts: conflictsOf(b, store.open(b.projectId)),
         deployments: b.deployments,
+        assumptions: store.openAssumptions(b.id),
         lessons: store.lessonsByTier(b.projectId, "trial").slice(0, config.file.lessons.trial.max),
         now: now(),
       });
@@ -5184,7 +5187,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, lessons: store.allLessons(projectId), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const assumptions = store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }));
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -5213,6 +5217,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         answered: store.answeredSince(projectId, since),
         withUser: openWith((x) => x.route === "user" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
+        assumptions: store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) })),
         stuck: openWith((x) => x.kind === "stuck"),
         noWakeSource: open.filter((b) => b.noWakeSource),
         stall: openWith((x) => x.kind === "stall"),
@@ -5846,15 +5851,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return null;
       }
       if (open.length > 0) return null;
+      // BB-251: the request lists the open assumptions it covers, and records
+      // their ids, so the approval confirms exactly those. An assumption
+      // recorded after this request was shown is not on the list and stays open.
+      const coveredAssumptions = store.openAssumptions(b.id);
+      const assumptionListing =
+        coveredAssumptions.length === 0 ? "" : ` It covers ${coveredAssumptions.length} open assumption${coveredAssumptions.length === 1 ? "" : "s"}: ${coveredAssumptions.map((a) => `${a.id} — ${a.text}`).join("; ")}.`;
       const x = store.escalate({
         bindingId: b.id,
         kind: "approval",
         question:
           `Approve ${b.entityKey}'s spec${b.title === null ? "" : ` (${b.title})`}? The ready checklist is met and the ticket is ${b.ready.substantial === null ? "not yet judged, so treated as substantial" : "substantial"}${b.ready.why === null ? "" : ` (${b.ready.why})`}; ` +
-          (gate.approvalStale ? "the spec has changed since its last approval." : "the current spec has no approval."),
+          (gate.approvalStale ? "the spec has changed since its last approval." : "the current spec has no approval.") +
+          assumptionListing,
         meanwhile: "Waiting: no implementation workers start until it is approved.",
         route: "project",
         recommendation: null,
+        data: { assumptionIds: coveredAssumptions.map((a) => a.id) },
       });
       bb.log.info(`stewards: ${b.entityKey}'s ready gate waits on the project steward; asked for approval (${x.id})`);
       return x;
@@ -6140,13 +6153,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * linked in `data.escalationId` rather than a second item filed.
      */
     function fileApproveSpecNeed(b: Binding, entity: EntitySnapshot, escalationId: string | null): void {
+      const specHash = specHashFor(b, entity);
+      // BB-251: the request lists the open assumptions it covers. The list is
+      // captured when the request is made or updated (the spec changed); a
+      // routine refresh of the same spec keeps the list it was shown with, so an
+      // assumption recorded after the request was shown stays open.
+      const existing = store.openNeeds(b.id).find((n) => n.kind === "approve-spec" && n.url === (b.url ?? ""));
+      const carried = existing === undefined || existing.data.specHash !== specHash ? null : z.array(z.string()).safeParse(existing.data.assumptionIds);
+      const assumptionIds = carried !== null && carried.success ? carried.data : store.openAssumptions(b.id).map((a) => a.id);
+      // The item lists the open assumptions it covers, so the approver sees
+      // them before pressing Approve. A corrected one is no longer open and
+      // drops off the list; a new one recorded after the request was shown is
+      // not in `assumptionIds`, so it stays open.
+      const openById = new Map(store.openAssumptions(b.id).map((a) => [a.id, a]));
+      const covered = assumptionIds.map((id) => openById.get(id)).filter((a): a is NonNullable<typeof a> => a !== undefined);
+      const how =
+        "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes." +
+        (covered.length === 0 ? "" : ` It covers ${covered.length} open assumption${covered.length === 1 ? "" : "s"}: ${covered.map((a) => `${a.id} — ${a.text}`).join("; ")}.`);
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-spec",
         url: b.url ?? "",
         what: `Approve ${b.entityKey}'s spec`,
-        how: "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes.",
-        data: { specHash: specHashFor(b, entity), ...(escalationId === null ? {} : { escalationId }) },
+        how,
+        data: { specHash, ...(escalationId === null ? {} : { escalationId }), assumptionIds },
         filedBy: "plugin",
       });
     }
@@ -7424,6 +7454,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               wokeAt: b.wokeAt,
               advancedAt: b.advancedAt,
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
+              assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
             })),
             stuck: stuck.map(({ b, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, why, since })),
             ended: ended.map((b) => ({ key: b.entityKey, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt!, threadId: b.threadId })),
@@ -8031,6 +8062,98 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       scheduleReconcile(target.id);
     }
 
+    /**
+     * BB-251: the recorded-assumption path of `steward_update`, kept separate so
+     * recording files no need, escalation or question. `assume` records,
+     * `confirm` confirms an open one, and `resolve: "<asm_…>"` corrects one.
+     * Returns the tool reply, or null when the call carries none of the three.
+     */
+    async function handleAssumptionUpdate(
+      input: { assume?: { text: string; context?: string; binding?: string }; confirm?: string; resolve?: string; answer?: string; binding?: string },
+      threadId: string,
+      projectOf: string | null,
+    ): Promise<string | ReturnType<typeof toolError> | null> {
+      const resolveId = input.resolve !== undefined && input.resolve.startsWith("asm_") ? input.resolve : undefined;
+      const hasAssume = input.assume !== undefined;
+      const hasConfirm = input.confirm !== undefined;
+      const hasAsmResolve = resolveId !== undefined;
+      if (!hasAssume && !hasConfirm && !hasAsmResolve) return null;
+      // BB-251 review: an assumption call is its own call. Exactly one of
+      // `assume`, `confirm` and an assumption `resolve` is allowed, and no
+      // other field may ride along, or the early return would silently drop it.
+      // `answer` corrects an assumption, so it goes only with that resolve.
+      if ([hasAssume, hasConfirm, hasAsmResolve].filter(Boolean).length > 1) return toolError(new Error("assume, confirm and an assumption resolve are separate calls; give exactly one."));
+      const allowed = hasAssume ? ["assume", "binding"] : hasConfirm ? ["confirm", "binding"] : ["resolve", "answer", "binding"];
+      const extra = Object.keys(input).filter((k) => !allowed.includes(k) && (input as Record<string, unknown>)[k] !== undefined);
+      if (extra.length > 0) return toolError(new Error(`assume, confirm and an assumption resolve are their own call; give one of them alone, not with ${extra.join(", ")}.`));
+      if (input.answer !== undefined && !hasAsmResolve) return toolError(new Error("answer corrects an assumption: give it with resolve: \"<assumption id>\"."));
+
+      if (input.assume !== undefined) {
+        const bindingRef = input.assume.binding ?? input.binding;
+        let target: Binding | null = null;
+        if (bindingRef !== undefined) {
+          target = store.find(bindingRef, projectOf ?? undefined);
+          if (target === null) return toolError(new Error(`No binding for ${bindingRef}.`));
+        } else if (projectOf === null) {
+          try {
+            target = ownBinding(threadId);
+          } catch {
+            return toolError(new Error("Name the binding (binding: ENG-12) to record an assumption."));
+          }
+        }
+        if (target !== null) {
+          if (!mayDirect(threadId, target)) return toolError(new Error(`This thread does not steer ${target.entityKey}.`));
+          const config = await loadConfig(target.projectId);
+          const playbook = config === null ? null : bindingPlaybook(config, target);
+          const cap = playbook?.maxAssumptions ?? 5;
+          if (store.countOpenAssumptions(target.id) >= cap) {
+            return toolError(new Error(`${target.entityKey} already has ${cap} open assumption${cap === 1 ? "" : "s"}, the playbook's max-assumptions. Ask instead: raise the question as an escalation rather than assuming.`));
+          }
+        } else if (projectOf === null) {
+          return toolError(new Error("Name the binding (binding: ENG-12) to record an assumption."));
+        }
+        const a = store.addAssumption({ projectId: target?.projectId ?? projectOf!, bindingId: target?.id ?? null, text: input.assume.text, context: input.assume.context ?? null, recordedBy: threadId });
+        return `${a.id} recorded${target === null ? " on the project" : ` on ${target.entityKey}`}: ${a.text}. It is not an item for the user; it appears in your wake, the card, \`bb stewards show\` and the project steward's digest. Confirm it with steward_update { confirm: "${a.id}" } once evidence arrives, or correct it with steward_update { resolve: "${a.id}", answer }.`;
+      }
+
+      const id = input.confirm ?? resolveId!;
+      const a = store.assumption(id);
+      if (a === null) return toolError(new Error(`No assumption ${id}.`));
+      if (a.state !== "open") return toolError(new Error(`Assumption ${a.id} is already ${a.state}.`));
+      let owner: Binding | null = null;
+      if (a.bindingId !== null) {
+        owner = store.binding(a.bindingId);
+        if (owner === null) return toolError(new Error(`Assumption ${a.id}'s binding is gone.`));
+        if (!mayDirect(threadId, owner)) return toolError(new Error(`This thread does not steer ${owner.entityKey}.`));
+      } else if (projectOf === null || a.projectId !== projectOf) {
+        return toolError(new Error(`Only the project steward resolves a project-level assumption (${a.id}).`));
+      }
+      if (input.confirm !== undefined) {
+        store.resolveAssumption(a.id, "confirmed", null, threadId);
+        return `Assumption ${a.id} confirmed.`;
+      }
+      if (input.answer === undefined) return toolError(new Error("Correcting an assumption needs the answer it was wrong about: resolve with `answer`."));
+      store.resolveAssumption(a.id, "corrected", input.answer, threadId);
+      // A correction wakes the steward with the answer, so a steward that made
+      // the wrong call learns it; its own correction needs no wake.
+      if (owner !== null && owner.threadId !== null && owner.threadId !== threadId) tell(threadId, owner, `Assumption ${a.id} was corrected: ${input.answer}`);
+      await offerAssumptionLesson(a.projectId, a, input.answer);
+      return `Assumption ${a.id} corrected: ${input.answer}.${owner !== null && owner.threadId !== null && owner.threadId !== threadId ? " Its steward has been woken with the answer." : ""}`;
+    }
+
+    /**
+     * BB-251: a corrected assumption is a lesson candidate for the project
+     * steward, by the same path and caps as a forwarded escalation's reasoning:
+     * a note in its next wake, which it may turn into a lesson itself.
+     */
+    async function offerAssumptionLesson(projectId: string, a: Assumption, answer: string): Promise<void> {
+      const where = a.bindingId === null ? "the project" : (store.binding(a.bindingId)?.entityKey ?? a.bindingId);
+      await wakeProject(projectId, "an assumption was corrected", {
+        digestDue: false,
+        notes: [`Assumption ${a.id} on ${where} was corrected: ${answer}. If the correction is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }.`],
+      });
+    }
+
     /** Whether the user said these words in this thread lately, in their own turn rather than the plugin's own wake (BB-178). */
     async function userSaid(threadId: string, quote: string): Promise<boolean> {
       const want = normalizeText(quote);
@@ -8623,6 +8746,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       name: "steward_update",
       description:
         "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions, and may put it on hold but not lift the hold; a parent steward or the project steward may update the bindings below it, which wakes them. " +
+        "A steward may also record an assumption it proceeds under (assume), confirm one once evidence arrives (confirm), or correct one (resolve with the assumption id and answer); recording files nothing for the user. " +
         "The project steward also records each question it puts to the user (ask, with or without a binding) and closes it when they answer (resolve with the question id, and answer).",
       presentation: { label: { pending: "Updating a binding", completed: "Updated a binding" } },
       parameters: z.object({
@@ -8634,7 +8758,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(20)
           .optional()
           .describe("With resolve (or forward): the lesson ids (lsn_…) and hand-written guidance unit ids (gu_…, from AGENTS.md or a playbook at .bb HEAD) this decision rested on. A lesson's hits count once per distinct binding, and a later reversal of the decision counts a correction. A guidance unit's citations are counted the same way for the efficacy view. Counts only — nothing is promoted, retired or written here."),
-        answer: z.string().trim().min(1).max(4000).optional().describe("With resolve and a question id: the user's answer, kept on the question."),
+        answer: z.string().trim().min(1).max(4000).optional().describe("With resolve and a question id: the user's answer, kept on the question. With resolve and an assumption id: the answer it was corrected with."),
+        assume: z
+          .object({
+            text: z.string().trim().min(1).max(1500).describe("The assumption, as one sentence: what you are proceeding under."),
+            context: z.string().trim().max(3000).optional().describe("What makes it an assumption rather than a settled fact, and what you would do if it were wrong."),
+            binding: z.string().trim().min(1).max(300).optional().describe("The binding it is about (ENG-12, owner/repo#3); defaults to the target binding, or to the project when the project steward records one about no single binding."),
+          })
+          .optional()
+          .describe("Record an assumption: a question the guidance does not settle that you proceed under, instead of asking (which blocks) or deciding silently (which is invisible). It files no need, escalation or question and never counts as Blocked; it appears in your wake, the card, `bb stewards show` and the project steward's digest. Past the playbook's `max-assumptions` (default 5 open per binding) you must ask instead."),
+        confirm: z.string().trim().min(1).max(100).optional().describe("Confirm an open assumption (asm_…) once evidence arrives, so it is no longer open. An assumption corrected instead is resolved with `resolve: \"<assumption id>\", answer`, the same string-id form as an escalation or question; a correction wakes the steward with the answer."),
         ask: z
           .object({
             question: z.string().trim().min(1).max(1500).describe("The question, as you put it to the user."),
@@ -8769,6 +8902,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           // Questions to the user are the project steward's, and kept until answered.
           const projectOf = store.projectByThread(threadId)?.projectId ?? null;
+          // BB-251: assume / confirm / resolve an assumption id is its own path,
+          // so it files nothing for the user and is not read as an escalation or
+          // a question. It runs before the answer/question checks below.
+          const assumptionReply = await handleAssumptionUpdate(input, threadId, projectOf);
+          if (assumptionReply !== null) return assumptionReply;
           let closing: { question: Question; answer: string; guidanceDropped: boolean } | null = null;
           if (input.answer !== undefined && resolve?.startsWith("qst_") !== true) return toolError(new Error('answer closes a question: give it with resolve: "<question id>".'));
           if (projectOf === null && (input.ask !== undefined || resolve?.startsWith("qst_") === true)) {
@@ -9172,11 +9310,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           if (approval !== null) {
             const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
+            // BB-251: the approval confirms exactly the assumptions the
+            // request listed, before the request closes.
+            const confirmedAssumptions = store.confirmApprovalAssumptions(target.id, threadId);
             store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
             store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
             done.push(others.length === 0 ? "spec approved" : `spec approved; still open on it: ${others.map((x) => `${x.id} (${x.kind}, with ${x.route}): ${x.question}`).join(" | ")} — resolve any this approval answers`);
+            if (confirmedAssumptions.length > 0) done.push(`confirmed ${confirmedAssumptions.length} assumption${confirmedAssumptions.length === 1 ? "" : "s"} by approval: ${confirmedAssumptions.join(", ")}`);
             notes.push(`The spec was approved${by}.`);
           }
 
@@ -10473,7 +10615,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
               const config = await loadConfig(b.projectId);
-              const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id) };
+              const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id), assumptions: store.assumptions(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
               const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
               const lines = [formatBindings([b], (x) => rolesForBinding(roleMap, x)), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
@@ -10486,6 +10628,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
               for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
               for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+              for (const a of detail.assumptions) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
               for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
               for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
               for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.filedByThread === null || f.filedByThread === undefined ? "" : `, filed by ${f.filedByThread}`}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
@@ -10571,18 +10714,37 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           done: cliCommand({
-            summary: "Close a waiting item from a thread, record a choice, or approve a spec item",
-            description: "Closes a `needs` item (need_…) or a question to the user (qst_…), and wakes the steward with it under What changed. With --choice it records the label the user gave in chat, saved as guidance; a forwarded escalation resolves with it. On an `approve-spec` item it records the approval on the gate, resolves the escalation that asked for it, and wakes the steward and the project steward; decline a spec on the Stewards page instead.",
-            positionals: [{ name: "id", description: "The item id (need_…) or question id (qst_…)", required: true }],
+            summary: "Close a waiting item from a thread, record a choice, approve a spec item, or confirm or correct an assumption",
+            description: "Closes a `needs` item (need_…) or a question to the user (qst_…), and wakes the steward with it under What changed. With --choice it records the label the user gave in chat, saved as guidance; a forwarded escalation resolves with it. On an `approve-spec` item it records the approval on the gate, resolves the escalation that asked for it, and wakes the steward and the project steward; decline a spec on the Stewards page instead. An assumption (asm_…) is confirmed with --choice confirm or corrected with --choice correct --answer \"<what is true>\"; a correction wakes the steward with the answer.",
+            positionals: [{ name: "id", description: "The item id (need_…), question id (qst_…) or assumption id (asm_…)", required: true }],
             options: {
               project: PROJECT_OPTION,
-              choice: { type: "string", description: "A label the user picked, which must be one of the item's choices" },
+              choice: { type: "string", description: "A label the user picked, which must be one of the item's choices; confirm or correct for an assumption" },
               note: { type: "string", description: "An optional note to save with the choice" },
+              answer: { type: "string", description: "With an assumption and --choice correct: what is actually true, which is saved as the correction" },
             },
             async run(input, ctx) {
               const id = input.positionals.id;
               const choice = input.options.choice;
               const note = input.options.note === undefined || input.options.note.trim() === "" ? null : input.options.note.trim();
+              const answer = input.options.answer === undefined || input.options.answer.trim() === "" ? null : input.options.answer.trim();
+              // BB-251: an assumption is confirmed or corrected here. A
+              // correction wakes the steward with the answer.
+              const assumption = store.assumption(id);
+              if (assumption !== null) {
+                if (assumption.state !== "open") return { exitCode: 0, stdout: `Assumption ${id} is already ${assumption.state}.` };
+                if (choice !== "confirm" && choice !== "correct") throw new PluginCliError(`Assumption ${id} is confirm or correct; pass --choice confirm or --choice correct.`, { code: "choice_required" });
+                if (choice === "correct" && answer === null) throw new PluginCliError(`Correcting assumption ${id} needs the answer it was wrong about: --answer "<what is true>".`, { code: "answer_required" });
+                store.resolveAssumption(id, choice === "confirm" ? "confirmed" : "corrected", answer, "user");
+                const ab = assumption.bindingId === null ? null : store.binding(assumption.bindingId);
+                const where = ab === null ? "the project" : ab.entityKey;
+                if (ab !== null) {
+                  store.note(ab.id, choice === "confirm" ? `Assumption ${id} was confirmed by the user from a thread.` : `Assumption ${id} was corrected by the user from a thread: ${answer}`);
+                  scheduleReconcile(ab.id);
+                }
+                if (choice === "correct" && answer !== null) await offerAssumptionLesson(assumption.projectId, assumption, answer);
+                return { exitCode: 0, stdout: `${choice === "confirm" ? "Confirmed" : "Corrected"} assumption ${id} on ${where}${choice === "correct" ? "; its steward has been told" : ""}.` };
+              }
               // A question is the `decide` kind's mechanism; close it the same way.
               const q = store.question(id);
               if (q !== null) {

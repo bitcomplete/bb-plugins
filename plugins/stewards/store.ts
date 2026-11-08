@@ -563,7 +563,33 @@ export const DEPS_DECISION_MIGRATIONS = [
 // archive case, and a pre-migration build never reads the column.
 export const WORKER_STOP_REASON_MIGRATIONS = [`ALTER TABLE workers ADD COLUMN stop_reason TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS];
+// BB-251: a recorded assumption. A steward that proceeds under a question the
+// guidance does not settle records it here instead of asking (which blocks) or
+// deciding silently (which is invisible). It is not a user item: it files no
+// need or escalation and never counts as Blocked. `binding_id` is null for a
+// project-level assumption the project steward records. `state` is open,
+// confirmed, corrected, or confirmed-by-approval; a resolved row keeps its
+// answer, who resolved it and when. Additive and defaulted: a store from
+// before this step simply has an empty table.
+export const ASSUMPTION_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS assumptions (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     binding_id TEXT,
+     text TEXT NOT NULL,
+     context TEXT,
+     recorded_by TEXT NOT NULL,
+     recorded_at INTEGER NOT NULL,
+     state TEXT NOT NULL DEFAULT 'open',
+     answer TEXT,
+     resolved_by TEXT,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS assumptions_binding ON assumptions (binding_id, state)`,
+  `CREATE INDEX IF NOT EXISTS assumptions_project ON assumptions (project_id, state)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1087,6 +1113,37 @@ export function needChoices(n: Pick<Need, "data">): string[] {
 }
 
 /**
+ * A recorded assumption (BB-251): a question the guidance does not settle that
+ * a steward proceeds under rather than asking, so it is visible instead of
+ * silent and blocks nothing. It is not a user item: no need, escalation or
+ * question is filed, and it never counts as Blocked. `bindingId` is null for a
+ * project-level assumption the project steward records.
+ */
+export const ASSUMPTION_STATES = ["open", "confirmed", "corrected", "confirmed-by-approval"] as const;
+export type AssumptionState = (typeof ASSUMPTION_STATES)[number];
+
+/** A row's state, failing closed to `open` for a missing or unknown value. */
+export const assumptionState = (value: unknown): AssumptionState => (ASSUMPTION_STATES.includes(value as AssumptionState) ? (value as AssumptionState) : "open");
+
+export type Assumption = {
+  id: string;
+  projectId: string;
+  /** The binding it is about, or null for a project-level assumption. */
+  bindingId: string | null;
+  text: string;
+  context: string | null;
+  /** The thread that recorded it. */
+  recordedBy: string;
+  recordedAt: number;
+  state: AssumptionState;
+  /** The answer when it was resolved: the correction, or the confirmation's words. */
+  answer: string | null;
+  /** The thread that resolved it, or "user" from the CLI. */
+  resolvedBy: string | null;
+  resolvedAt: number | null;
+};
+
+/**
  * A lesson: a general rule the project steward drew from an escalation or its
  * own judgement. `procedure` restates what it may already decide and it lands
  * itself at `.bb` HEAD; `boundary` would change its own escalation boundary
@@ -1343,6 +1400,19 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // opened without the migration must still start (migrations.test.ts).
   const setTicket = lazy<[string, number, number, string | null, string, string], unknown>("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ?, filed_by_thread = ? WHERE project_id = ? AND fingerprint = ?");
 
+  // BB-251: assumptions, prepared lazily for the same reason: a store from
+  // before this group has no `assumptions` table yet.
+  const insertAssumptionStmt = lazy<[Record<string, unknown>], unknown>(
+    "INSERT INTO assumptions (id, project_id, binding_id, text, context, recorded_by, recorded_at, state) VALUES (@id, @project_id, @binding_id, @text, @context, @recorded_by, @recorded_at, 'open')",
+  );
+  const getAssumptionStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assumptions WHERE id = ?");
+  const assumptionsForBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assumptions WHERE binding_id = ? ORDER BY recorded_at");
+  const openAssumptionsForBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assumptions WHERE binding_id = ? AND state = 'open' ORDER BY recorded_at");
+  const openAssumptionsForProjectStmt = lazy<[string], Record<string, unknown>>("SELECT a.* FROM assumptions a LEFT JOIN bindings b ON b.id = a.binding_id WHERE a.project_id = ? AND a.state = 'open' AND (a.binding_id IS NULL OR b.ended_at IS NULL) ORDER BY a.recorded_at");
+  const countOpenAssumptionsStmt = lazy<[string], { n: number }>("SELECT COUNT(*) AS n FROM assumptions WHERE binding_id = ? AND state = 'open'");
+  const resolveAssumptionStmt = lazy<[AssumptionState, string | null, string, number, string], unknown>("UPDATE assumptions SET state = ?, answer = ?, resolved_by = ?, resolved_at = ? WHERE id = ? AND state = 'open'");
+  const openApproveSpecNeedStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND kind = 'approve-spec' AND status = 'open' ORDER BY created_at LIMIT 1");
+
   const getProject = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE project_id = ?");
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
   const upsertProject = db.prepare("INSERT INTO project_stewards (project_id) VALUES (?) ON CONFLICT (project_id) DO NOTHING");
@@ -1473,6 +1543,20 @@ export function createStore(db: Database.Database, now: () => number, options: S
     status: String(r.status) as "open" | "done",
     resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
     createdAt: Number(r.created_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+  });
+
+  const toAssumption = (r: Record<string, unknown>): Assumption => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    bindingId: r.binding_id === null || r.binding_id === undefined ? null : String(r.binding_id),
+    text: String(r.text),
+    context: r.context === null || r.context === undefined ? null : String(r.context),
+    recordedBy: String(r.recorded_by),
+    recordedAt: Number(r.recorded_at),
+    state: assumptionState(r.state),
+    answer: r.answer === null || r.answer === undefined ? null : String(r.answer),
+    resolvedBy: r.resolved_by === null || r.resolved_by === undefined ? null : String(r.resolved_by),
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
   });
 
@@ -1772,6 +1856,41 @@ export function createStore(db: Database.Database, now: () => number, options: S
     return b;
   }
 
+  /**
+   * Confirm exactly the assumptions the open `approve-spec` request listed when
+   * it was made or last updated, marking them confirmed-by-approval. An
+   * assumption recorded after the request was shown is not on the list, so it
+   * stays open. Shared by `approve` and the object method so every approval
+   * path is the same. Returns the ids it confirmed.
+   */
+  function confirmApprovalAssumptionsFor(bindingId: string, by: string): string[] {
+    // The request that listed them: the `approve-spec` need (a user-mode spec),
+    // or the open `approval` escalation (the default project-steward gate).
+    // BB-251 records the ids on whichever was made or last updated.
+    let ids: string[] | null = null;
+    const needRow = openApproveSpecNeedStmt.get(bindingId);
+    if (needRow !== undefined) {
+      const parsed = z.array(z.string()).safeParse(toNeed(needRow).data.assumptionIds);
+      if (parsed.success) ids = parsed.data;
+    }
+    if (ids === null) {
+      const approval = openEscalations.all(bindingId).map(toEscalation).find((x) => x.kind === "approval");
+      if (approval !== undefined) {
+        const parsed = z.array(z.string()).safeParse(approval.data.assumptionIds);
+        if (parsed.success) ids = parsed.data;
+      }
+    }
+    if (ids === null) return [];
+    const confirmed: string[] = [];
+    for (const id of ids) {
+      const a = getAssumptionStmt().get(id);
+      if (a === undefined || String(a.binding_id ?? "") !== bindingId || String(a.state) !== "open") continue;
+      if (resolveAssumptionStmt().run("confirmed-by-approval", "Confirmed by approving the spec.", by, now(), id).changes > 0) confirmed.push(id);
+    }
+    if (confirmed.length > 0) projectChanged(projectIdForBinding(bindingId));
+    return confirmed;
+  }
+
   return {
     /** Run a synchronous handler as one operation, publishing at most one signal per project (BB-90). */
     coalescing,
@@ -1881,6 +2000,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
       coalescing(() =>
         db.transaction(() => {
           const b = rowToBinding(getBinding.get(bindingId)!);
+          // BB-251: the approval confirms exactly the assumptions the request
+          // listed, before the request closes. An assumption recorded after the
+          // request was shown is not on the list and stays open.
+          confirmApprovalAssumptionsFor(bindingId, by);
           patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
           closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
@@ -2104,6 +2227,70 @@ export function createStore(db: Database.Database, now: () => number, options: S
         }
         return changed;
       });
+    },
+
+    // assumptions (BB-251): a recorded assumption, confirmed, corrected, or
+    // confirmed-by-approval. Recording files nothing for the user.
+    addAssumption(fields: { projectId: string; bindingId: string | null; text: string; context?: string | null; recordedBy: string }): Assumption {
+      const id = newId("asm");
+      const at = now();
+      insertAssumptionStmt().run({
+        id,
+        project_id: fields.projectId,
+        binding_id: fields.bindingId,
+        text: fields.text,
+        context: fields.context === undefined || fields.context === null || fields.context === "" ? null : fields.context,
+        recorded_by: fields.recordedBy,
+        recorded_at: at,
+      });
+      projectChanged(fields.projectId);
+      return toAssumption(getAssumptionStmt().get(id)!);
+    },
+    assumption(id: string): Assumption | null {
+      const r = getAssumptionStmt().get(id);
+      return r === undefined ? null : toAssumption(r);
+    },
+    /** Every assumption of a binding, open and resolved, oldest first. */
+    assumptions(bindingId: string): Assumption[] {
+      return assumptionsForBindingStmt().all(bindingId).map(toAssumption);
+    },
+    /** A binding's open assumptions, oldest first. */
+    openAssumptions(bindingId: string): Assumption[] {
+      return openAssumptionsForBindingStmt().all(bindingId).map(toAssumption);
+    },
+    /** Every open assumption in a project, binding-scoped and project-scoped, oldest first. An ended binding's assumptions are not open any more. */
+    openAssumptionsForProject(projectId: string): Assumption[] {
+      return openAssumptionsForProjectStmt().all(projectId).map(toAssumption);
+    },
+    /** How many assumptions are open on a binding: the playbook's max-assumptions reads this. */
+    countOpenAssumptions(bindingId: string): number {
+      return Number(countOpenAssumptionsStmt().get(bindingId)?.n ?? 0);
+    },
+    /**
+     * Resolve an open assumption with its state (confirmed, corrected or
+     * confirmed-by-approval). False when it was already resolved, so a retry
+     * changes nothing. `by` is the thread that resolved it, or "user" from the
+     * CLI.
+     */
+    resolveAssumption(id: string, state: AssumptionState, answer: string | null, by: string): boolean {
+      return coalescing(() => {
+        const changed = resolveAssumptionStmt().run(state, answer, by, now(), id).changes > 0;
+        if (changed) {
+          const a = getAssumptionStmt().get(id);
+          if (a !== undefined) projectChanged(String(a.project_id));
+        }
+        return changed;
+      });
+    },
+    /**
+     * Confirm exactly the assumptions the open `approve-spec` request listed
+     * when it was made or last updated, marking them confirmed-by-approval. An
+     * assumption recorded after the request was shown is not on the list, so it
+     * stays open. Called from every approval path, before the request closes.
+     * Returns the ids it confirmed.
+     */
+    confirmApprovalAssumptions(bindingId: string, by: string): string[] {
+      return confirmApprovalAssumptionsFor(bindingId, by);
     },
 
     // needs: what waits on the user
@@ -2560,7 +2747,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         db.prepare(`DELETE FROM secret_requesters WHERE thread_id IN (SELECT thread_id FROM workers WHERE binding_id IN (${byBinding}))`).run(projectId);
         for (const table of ["escalations", "workers", "needs", "project_approvals"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
         db.prepare(`DELETE FROM pending_deliveries WHERE origin_binding_id IN (${byBinding})`).run(projectId);
-        for (const table of ["ops_fingerprints", "deps_decisions", "lessons", "guidance_citations", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
+        for (const table of ["ops_fingerprints", "deps_decisions", "lessons", "guidance_citations", "assumptions", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
         options.onProjectChange?.(projectId, ["purged"]);
         return ids;
       })();

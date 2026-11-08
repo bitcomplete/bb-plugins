@@ -1138,6 +1138,19 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           </p>
         </div>
       </Section>
+      {(s.assumptions ?? []).length > 0 ? (
+        <Section title="Assumptions" count={(s.assumptions ?? []).length}>
+          <ul className="flex flex-col gap-1 rounded-lg border border-border p-3">
+            {(s.assumptions ?? []).map((a) => (
+              <li key={a.id}>
+                <span className="text-muted-foreground">{a.id}: </span>
+                Assuming: {a.text}
+                {a.context === null ? null : <span className="text-muted-foreground"> — {a.context}</span>}
+              </li>
+            ))}
+          </ul>
+        </Section>
+      ) : null}
       <Section title="Threads">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border p-3">
           {s.threadId === null ? null : <ThreadLink threadId={s.threadId}>Open the steward</ThreadLink>}
