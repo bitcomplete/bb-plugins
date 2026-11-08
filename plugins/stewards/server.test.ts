@@ -1593,6 +1593,92 @@ describe("a Linear ticket steward", () => {
     expect(t.hooks.store.workers(binding)[0]).toMatchObject({ status: "running", result: "Watching acme/web#7 for the review." });
   });
 
+  // BB-242: a worker the plugin archived after its report was consumed, then
+  // unarchived (as the wake text advises), is working again. Its next
+  // `thread.idle` must record the result and wake the steward, where a
+  // `stopped` record made the idle handler return early.
+  it("revives a stopped worker on thread.active, then records its next finish and wakes the steward (BB-242)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+
+    // A quiet finish: the plugin archives the worker and the thread.archived
+    // event flips its record to stopped.
+    await t.idle("thr_w1", "Implemented the fix.");
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+    await t.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "stopped", stopReason: "archived" });
+
+    // The steward brings it back with `bb thread unarchive`: the thread goes
+    // active again and the record is running, so the sidebar reads the worker
+    // count, not "hand-off lost".
+    t.threads.get("thr_w1")!.archivedAt = null;
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "running", stopReason: null });
+
+    // Its next turn ends with a result: the finish is recorded and the steward
+    // is woken, which the stopped record used to swallow.
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    await t.idle("thr_w1", "Done. Should I open the follow-up ticket?");
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "finished", result: "Done. Should I open the follow-up ticket?" });
+    const wakes = t.sends.filter((s) => s.threadId === steward);
+    expect(wakes.length).toBeGreaterThan(before);
+    expect(wakes.at(-1)!.text).toMatch(/Should I open the follow-up ticket\?/u);
+  });
+
+  it("does not revive a worker the runaway guard stopped (BB-242)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    for (let i = 0; i < 7; i++) await t.created(`thr_w${i}`, steward);
+    expect(t.hooks.store.worker("thr_w6")).toMatchObject({ status: "stopped", stopReason: "runaway" });
+
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w6" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w6")!.status).toBe("stopped");
+  });
+
+  it("does not revive a worker stopWorkers stopped on an ending binding (BB-242)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"], state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+    await t.created("thr_w1", steward);
+
+    // Reassigning the ticket stops the worker now, while the binding is ending.
+    t.entities.set("uuid-12", issue({ assignees: ["Sam"], state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "stopped", stopReason: "stopped" });
+
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("stopped");
+  });
+
+  it("does not revive a worker whose thread was deleted (BB-242)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Done.");
+
+    await t.harness.behavior.emitThreadEvent("thread.deleted", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "stopped", stopReason: "deleted" });
+
+    // A deleted thread never comes back; an active event (were one to arrive)
+    // still must not revive it.
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("stopped");
+  });
+
   it("compacts a steward whose context has grown past the setting, once per reading", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());

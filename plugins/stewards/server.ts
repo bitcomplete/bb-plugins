@@ -4461,7 +4461,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function stopWorkers(b: Binding): Promise<void> {
       for (const w of store.workers(b.id)) {
         if (!workerInFlight(w)) continue;
-        store.setWorker(w.threadId, "stopped", w.result);
+        store.setWorker(w.threadId, "stopped", w.result, "stopped");
         await quietly(`stop worker ${w.threadId}`, () => bb.sdk.threads.stop({ threadId: w.threadId }));
       }
     }
@@ -6364,7 +6364,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       store.setWorkerModelCheckPending(thread.id, false);
       const flags = [environmentFlags(config.source, hostId), workerFlags(expected)].filter((f) => f !== "").join(" ");
-      store.setWorker(thread.id, "stopped", `Started with the wrong ${problems.join(", ")}; stopped.`);
+      store.setWorker(thread.id, "stopped", `Started with the wrong ${problems.join(", ")}; stopped.`, "misspawn");
       await quietly(`stop mis-spawned worker ${thread.id}`, () => bb.sdk.threads.stop({ threadId: thread.id }));
       bb.log.warn(`stewards: stopped worker ${thread.id}: ${problems.join(", ")}`);
       store.note(
@@ -6395,7 +6395,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       // The runaway guard: not a budget, a stop for a looping steward.
-      store.setWorker(thread.id, "stopped", null);
+      store.setWorker(thread.id, "stopped", null, "runaway");
       await quietly(`stop runaway worker ${thread.id}`, () => bb.sdk.threads.stop({ threadId: thread.id }));
       bb.log.warn(`stewards: ${owner.entityKey} started more than ${limit} workers in an hour; stopped ${thread.id}`);
       store.note(owner.id, `Runaway guard: more than ${limit} workers in the last hour, so worker ${thread.id} was stopped. If something is looping, stop and escalate.`);
@@ -6595,13 +6595,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * BB-242: whether a `stopped` worker is one the plugin put down as a
+     * consumed finish and may revive when its thread comes back. `archived` is
+     * that stop; `stopWorkers`, the runaway guard, a mis-spawn and a deletion
+     * carry a reason that keeps it stopped. A record from before the reason
+     * existed reads as `null` and is treated like `archived`, so the upgrade
+     * also fixes a worker already stopped; the open binding is the other half.
+     */
+    const revivableWorkerStop = (worker: { stopReason: string | null }): boolean => worker.stopReason === null || worker.stopReason === "archived";
+
     // A worker that ended its turn to wait (on a watch, a reviewer) is
-    // running again when that wakes it; it is working its pull request.
+    // running again when that wakes it; it is working its pull request. A
+    // worker the plugin archived after its report was consumed, then
+    // unarchived (as the wake text advises), is running again too (BB-242):
+    // its next `thread.idle` records the result and wakes the steward, and
+    // the sidebar does not read "hand-off lost" while it works.
     bb.events.on("thread.active", store.coalescingTool(async ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker === null) return;
-      if (worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
       const owner = store.binding(worker.bindingId);
+      const openBinding = owner !== null && owner.endedAt === null;
+      if (worker.status === "finished") {
+        store.setWorker(thread.id, "running", worker.result);
+      } else if (worker.status === "stopped" && openBinding && revivableWorkerStop(worker)) {
+        store.setWorker(thread.id, "running", worker.result);
+        bb.log.info(`stewards: revived worker ${thread.id} (${worker.stopReason ?? "legacy"} stop) on thread.active`);
+      }
       // The first turn is dispatched now, so the spawn's model can be read.
       if (worker.modelCheckPending && worker.status !== "stopped") {
         store.setWorkerModelCheckPending(thread.id, false);
@@ -6625,7 +6645,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.archived", ({ thread }) =>
       store.coalescing(() => {
         const worker = store.worker(thread.id);
-        if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+        // The plugin's own archive of a consumed finish is revivable; an
+        // archived running worker is too, so unarchiving brings it back.
+        if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result, "archived");
         if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
         // An archived requester can no longer import; drop its binding so the
         // page's next Provide spawns a fresh one.
@@ -6635,7 +6657,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.deleted", ({ thread }) =>
       store.coalescing(() => {
         const worker = store.worker(thread.id);
-        if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+        if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result, "deleted");
         if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
         const b = store.byThread(thread.id);
         if (b === null || b.endedAt !== null) return;
