@@ -2545,6 +2545,47 @@ describe("escalations delivered once, updates safe to retry", () => {
   });
 });
 
+// BB-243: a goal is a ticket under the `goal` playbook. All three endings
+// (reached, superseded, retired) are the goal closing; a child's merge is not
+// one, so the binding carries on. The fixture is a fake goal, never the pilot's.
+describe("goal endings end the binding (BB-243)", () => {
+  const GOAL = LINEAR_TICKETS.replace("name: linear-tickets", "name: goal");
+  async function goalBinding() {
+    const t = await setup();
+    const file = JSON.parse(t.files[PROJECT_FILE]!) as { playbooks?: Record<string, string> };
+    file.playbooks = { ticket: "goal" };
+    t.files[PROJECT_FILE] = JSON.stringify(file);
+    t.files[playbookPath("goal")] = GOAL;
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal"], state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    return { t, steward: t.spawns[1]!.id };
+  }
+  const closeGoal = async (t: Awaited<ReturnType<typeof goalBinding>>["t"], steward: string, state: string, stateType: string) => {
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal"], state, stateType }));
+    await t.ring("linear", "uuid-12");
+    await t.tool("steward_report", { phase: state, summary: "Ending.", nextAction: "Nothing", actor: "steward" }, steward);
+    await t.idle(steward);
+  };
+
+  it("ends on reached (Done), and not on a child merge", async () => {
+    const { t, steward } = await goalBinding();
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goal", endedAt: null });
+    // A child merging does not close the goal, so the binding carries on.
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal"], state: "In Progress", stateType: "started", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: null });
+    // Reached: Done ends the binding once the wrap-up turn is over.
+    await closeGoal(t, steward, "Done", "completed");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "terminal" });
+  });
+
+  it("ends on retired (Canceled)", async () => {
+    const { t, steward } = await goalBinding();
+    await closeGoal(t, steward, "Canceled", "canceled");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "terminal" });
+  });
+});
+
 describe("terminal states and follow-through", () => {
   /** A ticket in progress with its steward and one worker at work. */
   async function working() {

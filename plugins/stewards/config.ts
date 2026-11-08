@@ -20,6 +20,16 @@ export const playbookPath = (name: string) => `${STEWARDS_DIR}/playbooks/${name}
 export const DEFAULT_LABEL = "bb-managed";
 
 /**
+ * The label a goal ticket carries besides the adoption label, and the playbook
+ * that stewards it (BB-243). A ticket is a goal when it carries the label or
+ * runs under the playbook: the project steward's wake and digest read a goal's
+ * progress from the `**Met:**` comments, and the playbook name is known even
+ * before the first snapshot, so an unread history reads `unknown`, never `0`.
+ */
+export const GOAL_LABEL = "goal";
+export const GOAL_PLAYBOOK = "goal";
+
+/**
  * Authors whose pull requests the dependency watch adopts under deps-prs
  * (BB-164). The synthesized Dependabot watch names them as its `match.author`,
  * so the bot path and a declared watch are the same matcher.

@@ -450,6 +450,32 @@ describe("lifecycle", () => {
   });
 });
 
+// BB-243: a goal is a ticket routed to the `goal` playbook. All three endings
+// (reached, superseded, retired) are the goal closing; a child's merge is not
+// one, so the binding carries on. The fixture is a fake goal, never the pilot's.
+describe("goal endings (BB-243)", () => {
+  const goal = (() => {
+    const p = parsePlaybook(GITHUB_ISSUES.replace("name: github-issues", "name: goal").replace("approval: project", "approval: user"), "goal");
+    if (!p.ok) throw new Error(p.error);
+    return p.value;
+  })();
+  const open = { kind: "ticket" as const, endedAt: null, endReason: null, manualDetach: false, ending: null };
+
+  it("ends the binding when the goal is reached, superseded or retired, and never on a child merge", () => {
+    // Reached: every criterion met, the owner closes it as completed.
+    expect(lifecycle(open, goal, issue({ state: "closed (completed)" }), "bb-managed").kind).toBe("terminal");
+    // Retired: the owner closes it as not planned.
+    expect(lifecycle(open, goal, issue({ state: "closed (not planned)" }), "bb-managed").kind).toBe("terminal");
+    // Superseded: a successor is filed and this goal is closed with a Revision comment.
+    const superseded = issue({ state: "closed", comments: [comment({ id: "r1", author: "Jane", body: "**Revision:** superseded by Goal: file the 2027 claim." })] });
+    expect(lifecycle(open, goal, superseded, "bb-managed").kind).toBe("terminal");
+    // A child merging does not close the goal, so the binding carries on.
+    expect(lifecycle(open, goal, issue({ state: "status:in-progress" }), "bb-managed").kind).toBe("continue");
+    // An ended goal stays ended while it is closed, whatever an earlier digest said.
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "terminal" }, goal, issue({ state: "closed" }), "bb-managed").kind).toBe("stay-ended");
+  });
+});
+
 describe("the stuck backstop", () => {
   it("fires after the phase's limit without progress, once", () => {
     const b = { advancedAt: 0, createdAt: 0, phase: "In Progress" };

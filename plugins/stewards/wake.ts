@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, GITHUB_TODO_LABEL, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { formatDuration, GITHUB_TODO_LABEL, GOAL_LABEL, GOAL_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
@@ -1194,6 +1194,71 @@ function needListing(n: Need): string | null {
   return typeof n.data.decideListing === "string" && n.data.decideListing !== "" ? n.data.decideListing : null;
 }
 
+/** A `**Met:**` comment's prefix, at the start of the body. */
+const MET_PREFIX = /^\s*\*{0,2}Met:\*{0,2}\s*/iu;
+/** A Markdown heading that names the criteria section. */
+const CRITERIA_HEADING = /^#{1,6}\s+criteria\b/iu;
+/** Any Markdown heading, which ends the criteria section. */
+const ANY_HEADING = /^#{1,6}\s+\S/u;
+/** A checklist line, the shape a criterion is written in. */
+const CHECKLIST_ITEM = /^\s*[-*]\s*\[[ xX]\]\s*\S/u;
+
+/**
+ * A goal's progress (BB-243): `met` is the number of distinct criteria a
+ * `**Met:**` comment records, `criteria` the number of checklist lines under
+ * the description's `Criteria` heading. Null when the ticket is not a goal —
+ * it carries neither the `goal` label nor the `goal` playbook — so a binding
+ * that merely looks like one is left alone.
+ *
+ * `met` is null rather than 0 when no `**Met:**` comment can be read (or the
+ * snapshot has not been read yet), so a goal that has not been driven reads
+ * `unknown`, never `0`: an empty count cannot be told from an unread history,
+ * and only one of them means no criterion is met.
+ */
+export function goalProgress(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): { met: number | null; criteria: number | null } | null {
+  if (binding.kind !== "ticket") return null;
+  const entity = binding.lastSnapshot?.entity;
+  const byLabel = entity !== undefined && entity.labels.some((l) => l.toLowerCase() === GOAL_LABEL);
+  if (!byLabel && binding.playbook !== GOAL_PLAYBOOK) return null;
+  if (entity === undefined) return { met: null, criteria: null };
+  const met = new Set<string>();
+  for (const c of entity.comments) {
+    const m = MET_PREFIX.exec(c.body);
+    if (m === null) continue;
+    const criterion = c.body.slice(m[0].length).trim().replace(/\s+/gu, " ").toLowerCase();
+    if (criterion !== "") met.add(criterion);
+  }
+  return { met: met.size === 0 ? null : met.size, criteria: criteriaCount(entity.description ?? "") };
+}
+
+/** The number of checklist lines under the description's `Criteria` heading, or null when it has none. */
+function criteriaCount(description: string): number | null {
+  let inCriteria = false;
+  let count = 0;
+  for (const line of description.split("\n")) {
+    if (!inCriteria) {
+      if (CRITERIA_HEADING.test(line)) inCriteria = true;
+      continue;
+    }
+    if (ANY_HEADING.test(line)) break;
+    if (CHECKLIST_ITEM.test(line)) count += 1;
+  }
+  return count === 0 ? null : count;
+}
+
+/**
+ * A goal's progress as one flag for the project steward's binding list and
+ * digest, or null for a binding that is not a goal. `met 3/7` counts the
+ * `**Met:**` comments against the approved criteria; `met unknown` is an
+ * unreadable history and `met 3` a description with no criteria section.
+ */
+export function goalProgressFlag(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): string | null {
+  const p = goalProgress(binding);
+  if (p === null) return null;
+  if (p.met === null) return "goal met unknown";
+  return p.criteria === null ? `goal met ${p.met}` : `goal met ${p.met}/${p.criteria}`;
+}
+
 /** What the project steward is woken with, at the end of a nightly pass or when an escalation reaches it. */
 export function formatProjectWake(input: {
   reason: string;
@@ -1314,7 +1379,7 @@ export function formatProjectWake(input: {
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
     const conflicts = conflictsOf(b, allOpen);
-    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
+    const flags = [goalProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   const bindings = out.splice(0);
@@ -1471,10 +1536,15 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   if (r.previous === null) out.push("### Your previous digest", "", "None yet.", "");
   else out.push(`### Your previous digest (${iso(r.previous.at)})`, "", quote(clip(r.previous.text, PREVIOUS_DIGEST_CHARS)), "");
 
+  // A goal's progress rides on its line, wherever the digest lists it (BB-243).
+  const goalFlag = (b: Binding): string => {
+    const flag = goalProgressFlag(b);
+    return flag === null ? "" : ` [${flag}]`;
+  };
   const moved = [
     ...r.moved.map((b) => {
       const s = b.status;
-      return `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}), moved ${b.advancedAt === null ? "?" : iso(b.advancedAt)}: ${s === null ? "no report yet" : `${oneLine(s.summary)} Next: ${oneLine(s.nextAction)} (${s.actor})`}`;
+      return `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}), moved ${b.advancedAt === null ? "?" : iso(b.advancedAt)}: ${s === null ? "no report yet" : `${oneLine(s.summary)} Next: ${oneLine(s.nextAction)} (${s.actor})`}${goalFlag(b)}`;
     }),
     ...r.ended.map((b) => `- Ended: ${b.entityKey} (${b.kind}${b.title === null ? "" : `, ${oneLine(b.title, 120)}`}), ${b.endReason ?? "ended"} at ${b.endedAt === null ? "?" : iso(b.endedAt)}`),
     ...r.answered.map((q) => `- Answered: ${q.id} "${oneLine(q.question, 200)}" → ${oneLine(q.answer ?? "", 300)} (${q.answeredBy === "user" ? "by the user, on the stewards page" : "recorded by you"})`),
@@ -1501,7 +1571,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
 
   const stuck = [
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
-    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`),
+    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}${goalFlag(b)}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
 
@@ -1510,7 +1580,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   // a stall can be open with the mark already cleared (the stall is itself a
   // live source), so the two lists are separate.
   const noWake = [
-    ...r.noWakeSource.map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting with no wake source${b.status?.waitingOn === null || b.status?.waitingOn === undefined ? "" : `: ${oneLine(b.status.waitingOn)}`}${b.requeueWakeCount > 0 ? ` (${b.requeueWakeCount} requeue-only wake${b.requeueWakeCount === 1 ? "" : "s"})` : ""}`),
+    ...r.noWakeSource.map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting with no wake source${b.status?.waitingOn === null || b.status?.waitingOn === undefined ? "" : `: ${oneLine(b.status.waitingOn)}`}${b.requeueWakeCount > 0 ? ` (${b.requeueWakeCount} requeue-only wake${b.requeueWakeCount === 1 ? "" : "s"})` : ""}${goalFlag(b)}`),
     ...r.stall.map(({ escalation: x, from }) => `- ${from.entityKey}: stall escalation ${x.id} with the project steward, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
   ];
   out.push("### Waiting with no wake source", "", ...capped(noWake, "Nothing."), "");
@@ -1525,6 +1595,7 @@ export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Line
 - Before you ask the user something in a reply, record it with steward_update { ask: { question, context } } (with binding when it concerns one); close it with steward_update { resolve: "<question id>", answer } when they answer. Every wake lists the questions still open, so list them from there, not from memory.
 - You are woken by escalations, at the end of each nightly pass to write the morning digest, and by the user. When the user says something like "hold everything touching billing", turn it into steward_update calls on the bindings it concerns, and say what you changed.
 - You schedule the work so that two tickets do not change the same files at once. Every binding reports what it touches; when a ready ticket overlaps work in flight at file level, the plugin asks you with a schedule escalation. Hold it behind that work (steward_update { binding, hold, behind: [keys] }: the hold lifts itself when the work lands), stack it on a pull request still being built (steward_update { binding, hold, stack: [keys] }: the hold lifts itself, with the branch, when that pull request opens), or let it start (guidance + resolve). Use the same holds to sequence any two tickets whose overlap you can see in the bindings list.
+- A goal's binding line carries \`goal met <met>/<criteria>\`, counted from its \`**Met:**\` comments against the criteria in its description (BB-243). \`unknown\` means no \`**Met:**\` comment could be read — never that none is met — so a goal that has not been driven yet is not mistaken for one with nothing met.
 - Budget is advisory: keep the total work sensible through priority and holds.
 
 Wait for the user or a wake; there is nothing to do right now.`;
