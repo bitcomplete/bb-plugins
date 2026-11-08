@@ -493,6 +493,22 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(tabs[0]!.efforts[0]!.phrase).toBe("hand-off lost: worker finished");
   });
 
+  it("does not read a lost hand-off for a worker that is running again (BB-242)", () => {
+    // A worker the plugin archived, then revived on thread.active, is running:
+    // the wait on it reads the running count, never the lost hand-off.
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "worker thr_w1 (merge)", workers: [{ threadId: "thr_w1", title: "Implement", status: "running" }] })],
+        }),
+      ],
+    });
+    expect(tabs[0]!.efforts[0]!.phrase).toBe("1 worker running");
+  });
+
   it("derives state, section and phrase for every effort a tab builds", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],

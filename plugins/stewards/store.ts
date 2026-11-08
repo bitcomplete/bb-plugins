@@ -556,7 +556,14 @@ export const DEPS_DECISION_MIGRATIONS = [
   `ALTER TABLE ops_fingerprints ADD COLUMN filed_by_thread TEXT`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS];
+// BB-242: why a worker was stopped, so `thread.active` can revive the
+// plugin's own archive of a finished worker without reviving one the runaway
+// guard, `stopWorkers` or a deletion put down. Nullable and additive: an
+// existing row reads as `null`, which the revival treats as the legacy
+// archive case, and a pre-migration build never reads the column.
+export const WORKER_STOP_REASON_MIGRATIONS = [`ALTER TABLE workers ADD COLUMN stop_reason TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1148,7 +1155,15 @@ export type Lesson = {
 };
 
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
-export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean };
+/**
+ * Why a worker was stopped (BB-242). `archived` is the plugin's own archive
+ * of a finished, consumed worker, which `thread.active` revives when the
+ * binding is still open; the others are deliberate stops that stay stopped.
+ * `null` is a record from before this field existed, read as revivable so an
+ * already-stopped worker is fixed by the upgrade.
+ */
+export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | "misspawn";
+export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null };
 
 /** The requester thread the plugin spawned for an open provide-secret need (BB-22). */
 export type SecretRequester = { threadId: string; needId: string; createdAt: number };
@@ -1291,7 +1306,11 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const getWorker = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE thread_id = ?");
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
   const spawnsSince = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM workers WHERE binding_id = ? AND started_at >= ?");
-  const setWorker = db.prepare("UPDATE workers SET status = ?, result = ?, ended_at = ? WHERE thread_id = ?");
+  // Prepared on first use (BB-242): a legacy store opened by the migration
+  // tests has no `stop_reason` column yet, so preparing this at startup would
+  // fail the plugin before the migration runs.
+  let setWorkerStmt: Database.Statement<[string, string | null, number | null, WorkerStopReason | null, string], unknown> | null = null;
+  const setWorker = () => (setWorkerStmt ??= db.prepare<[string, string | null, number | null, WorkerStopReason | null, string], unknown>("UPDATE workers SET status = ?, result = ?, ended_at = ?, stop_reason = ? WHERE thread_id = ?"));
   const setWorkerModelCheckPending = db.prepare("UPDATE workers SET model_check_pending = ? WHERE thread_id = ?");
   const insertSecretRequester = db.prepare("INSERT OR REPLACE INTO secret_requesters (thread_id, need_id, created_at) VALUES (?, ?, ?)");
   const getSecretRequester = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE thread_id = ?");
@@ -1487,6 +1506,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null ? null : Number(r.ended_at),
     modelCheckPending: Number(r.model_check_pending ?? 0) === 1,
+    // A store from before the BB-242 column reads as no reason: the legacy
+    // fallback treats it like `archived` when the binding is open.
+    stopReason: r.stop_reason === null || r.stop_reason === undefined ? null : (String(r.stop_reason) as WorkerStopReason),
   });
   const toSecretRequester = (r: Record<string, unknown>): SecretRequester => ({
     threadId: String(r.thread_id),
@@ -2165,9 +2187,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
     spawnsSince(bindingId: string, since: number): number {
       return spawnsSince.get(bindingId, since)!.n;
     },
-    setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
+    setWorker(threadId: string, status: WorkerStatus, result: string | null, stopReason: WorkerStopReason | null = null): void {
       const before = getWorker.get(threadId);
-      setWorker.run(status, result, status === "running" ? null : now(), threadId);
+      setWorker().run(status, result, status === "running" ? null : now(), stopReason, threadId);
       const w = getWorker.get(threadId);
       // A worker finishing or being stopped moves its row at once, but a repeat
       // write of the same status changes nothing visible and stays silent.
