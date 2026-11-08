@@ -283,6 +283,7 @@ HEAD; a checkout with local commits is left as it is and read as it is.
 | Kind | Trigger | Default playbook |
 |---|---|---|
 | `ticket` | `bb-managed` added to an issue in a listed Linear team | `linear-tickets` |
+| `ticket` (watch) | a `tickets` watch in `.bb/stewards/project.json` matches a labelled, assigned issue by its labels and title (BB-246) | the watch's playbook |
 | `pr` | `bb-managed` added to a pull request in a repo from `repos.json` not in `github.exclude` | `github-prs` |
 | `review` | a non-draft pull request, authored by someone other than you, opened or marked ready in a repo from `repos.json` not in `github.exclude`; once `roles.json` names a project steward, only where your review is requested | `github-reviews` |
 | `ops` | a namespace, Sentry project or Dependabot repo in this server's `roles.json` entry (§18) | `ops-watch`, `deps-alerts` |
@@ -312,6 +313,15 @@ HEAD; a checkout with local commits is left as it is and read as it is.
 - Turning stewards on for a project with many open pull requests would adopt
   them all at once. Adoption is capped per pass, oldest first, and the rest
   wait for the next one.
+- **A ticket watch picks the ticket playbook by shape (BB-246).** A
+  project-level `tickets` list in `.bb/stewards/project.json` matches a
+  labelled, assigned issue by its labels (every named label present,
+  ignoring case) and title (the decide list's `*`/`**` glob dialect). The
+  first matching watch wins and the binding runs under that playbook; with
+  none, the kind's default is unchanged. A label change after adoption does
+  not re-route the binding: it keeps the playbook it was adopted under
+  until it ends. `check` reports a watch naming a missing or non-ticket
+  playbook.
 
 ### Binding record
 

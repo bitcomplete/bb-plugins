@@ -273,6 +273,36 @@ export const mergeDispatchSchema = z
   .strict();
 export type MergeDispatch = z.infer<typeof mergeDispatchSchema>;
 
+/**
+ * One ticket watch's match fields (BB-246): `labels` means every named label
+ * is present on the issue, ignoring case, and `title` is a glob in the decide
+ * list's `*`/`**` dialect. The same shape the pull watches use, without a
+ * repo: a ticket watch is project-level.
+ */
+export const ticketMatchSchema = z
+  .object({
+    labels: z.array(z.string().trim().min(1).max(100)).min(1).max(50).optional(),
+    title: z.string().trim().min(1).max(300).optional(),
+  })
+  .strict();
+
+/**
+ * One project-level ticket watch (BB-246): an issue that already carries the
+ * adoption label and is assigned to this server's login, and whose shape
+ * matches, is adopted under `playbook`. The first matching watch wins; with
+ * none, adoption is unchanged. A label change after adoption does not
+ * re-route the binding.
+ */
+export const ticketWatchSchema = z.object({ match: ticketMatchSchema.default({}), playbook: playbookName }).strict();
+export type TicketWatch = z.infer<typeof ticketWatchSchema>;
+
+/**
+ * The stable id of a ticket watch, recorded on the binding it adopts as
+ * `adoptedBy` (BB-246): `<playbook>@ticket`. A ticket keeps its adoption
+ * label, so unlike a pull watch this never replaces the label path.
+ */
+export const ticketWatchId = (watch: Pick<TicketWatch, "playbook">): string => `${watch.playbook}@ticket`;
+
 export const projectFileSchema = z
   .object({
     version: z.literal(1),
@@ -310,6 +340,12 @@ export const projectFileSchema = z
     /** Reviews: on unless turned off. */
     reviews: z.object({ enabled: z.boolean().default(true) }).strict().default({ enabled: true }),
     adoption: z.object({ perPass: z.number().int().min(1).max(100).default(10) }).strict().default({ perPass: 10 }),
+    /**
+     * Project-level ticket watches (BB-246): a labelled, assigned issue whose
+     * shape matches is adopted under the named ticket playbook, before the
+     * kind's default. The first match wins. Empty, adoption is unchanged.
+     */
+    tickets: z.array(ticketWatchSchema).max(50).default([]),
     /**
      * The decisions that reach the user. Everything else is decided by the
      * stewards and the project steward, from the project's own guidance.
@@ -839,6 +875,30 @@ export function pullWatchProblems(roles: RolesFile, repos: readonly string[], ex
   for (const [repo, owners] of repoOwners) {
     if (owners.length > 1) problems.push(`two roles with holders declare pull watches on ${repo}: ${owners.join(", ")} — only one server can adopt a pull request, so remove one`);
   }
+  return problems;
+}
+
+/**
+ * The `check` problems of every declared ticket watch (BB-246): its playbook
+ * must exist and be kind `ticket`, and its `title` glob must parse. `playbooks`
+ * holds every watch and ticket playbook that parsed; `errors` holds the
+ * load-time reason for a ticket watch playbook that did not (the loader
+ * reports those here instead, so one watch gets one problem line).
+ */
+export function ticketWatchProblems(file: ProjectFile, playbooks: ReadonlyMap<string, Playbook>, errors: ReadonlyMap<string, string> = new Map()): string[] {
+  const problems: string[] = [];
+  file.tickets.forEach((watch, i) => {
+    const where = `project.json: tickets[${i}]`;
+    const playbook = playbooks.get(watch.playbook);
+    if (playbook === undefined) {
+      const reason = errors.get(watch.playbook);
+      problems.push(reason === undefined ? `${where}: the playbook ${JSON.stringify(watch.playbook)} does not exist` : `${where}: the playbook ${JSON.stringify(watch.playbook)}: ${reason}`);
+    } else if (playbook.kind !== "ticket") problems.push(`${where}: the playbook ${JSON.stringify(watch.playbook)} is a ${playbook.kind} playbook, not a ticket playbook`);
+    if (watch.match.title !== undefined) {
+      const bad = globError(watch.match.title);
+      if (bad !== null) problems.push(`${where}: match.title is not a glob: ${bad}`);
+    }
+  });
   return problems;
 }
 

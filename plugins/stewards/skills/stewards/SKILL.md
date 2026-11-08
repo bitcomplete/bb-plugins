@@ -13,6 +13,7 @@ steward** per project sits above all of them.
 | Binding | Made when | Playbook |
 |---|---|---|
 | `ticket` | the label (default `bb-managed`) is on a Linear issue in a listed team and this server's Linear login is an assignee, or on a GitHub issue in a listed repo and this server's GitHub login is an assignee | `linear-tickets` on Linear, `github-issues` on GitHub |
+| `ticket` (watch) | an issue carrying the adoption label and assigned to this server matches a `tickets` watch in `project.json` | the watch's playbook |
 | `pr` | the label is on a pull request in one of the project's repos and this server's GitHub login is its author | `github-prs` |
 | `pr` (watch) | a pull request matches a `pulls` watch on this server's `roles.json` role, with no label needed (BB-164) | the watch's playbook |
 | `review` | a teammate opens, or marks ready, a pull request in one of the project's repos and this server's GitHub login is a requested reviewer (checked once, at adoption) | `github-reviews` |
@@ -579,6 +580,23 @@ when asked to "set up stewards".
    of `.bb`: edit the file, commit and publish it as a guidance pull request
    like every other `.bb` change — never a per-server setting. Nothing
    per-server is written under `.bb`.
+
+   A project-level `tickets` list in `project.json` routes a kind of ticket
+   to its own playbook, the mirror of a role's `pulls`:
+
+   ```json
+   { "tickets": [{ "match": { "labels": ["docs"], "title": "Docs: *" }, "playbook": "docs-tickets" }] }
+   ```
+
+   `match.labels` means every named label is present on the issue, ignoring
+   case; `match.title` is an optional `*`/`**` glob. An issue that already
+   carries the adoption label and is assigned to this server is adopted
+   under the first watch that matches, before the kind's default
+   (`linear-tickets` on Linear, `github-issues` on GitHub); with no match,
+   adoption is unchanged. A label change after adoption does not re-route
+   the binding: it keeps the playbook it was adopted under until it ends.
+   `check` reports a watch naming a playbook that is missing or not a
+   ticket playbook.
 2. Review them, commit inside `.bb`, publish with
    `workspace_publish_guidance`, and merge the `guidance-<thread>` branch.
    Edits take effect only once merged.
