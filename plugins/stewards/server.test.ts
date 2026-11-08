@@ -632,6 +632,50 @@ describe("a Linear ticket steward", () => {
     expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/bb", "acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
+  // BB-245: a steward whose binding has an open parent binding with a thread
+  // nests under that parent's thread in bb's tree; otherwise it falls back to
+  // the project steward, as before. The environment is the project steward's
+  // either way.
+  describe("BB-245: the spawn parent", () => {
+    const makeBinding = (t: Awaited<ReturnType<typeof setup>>, over: { key: string; entityId: string; parentBindingId: string | null }) =>
+      t.hooks.store.create({ projectId: "p1", source: "linear", entityId: over.entityId, entityKey: over.key, url: null, title: over.key, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: over.parentBindingId, phase: "Todo", stage: "spec" });
+
+    it("spawns under the parent binding's thread when the parent is open and has one", async () => {
+      const t = await setup();
+      const parent = makeBinding(t, { key: "ENG-1", entityId: "uuid-1", parentBindingId: null });
+      t.hooks.store.patch(parent.id, { threadId: "thr_parent" });
+      t.threads.set("thr_parent", { status: "idle", archivedAt: null, parentThreadId: null });
+      makeBinding(t, { key: "ENG-2", entityId: "uuid-2", parentBindingId: parent.id });
+      t.entities.set("uuid-2", issue({ id: "uuid-2", key: "ENG-2", title: "Child work" }));
+      await t.ring("linear", "uuid-2");
+      const spawn = t.spawns.find((s) => s.title === "ENG-2: Child work");
+      expect(spawn).toMatchObject({ parentThreadId: "thr_parent", parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" } });
+      expect(t.spawns[0]).toMatchObject({ title: "Acme project steward" });
+      expect((await t.list()).find((b) => b.key === "ENG-2")).toMatchObject({ threadId: spawn!.id });
+    });
+
+    it("falls back to the project steward when the parent binding has ended", async () => {
+      const t = await setup();
+      const parent = makeBinding(t, { key: "ENG-1", entityId: "uuid-1", parentBindingId: null });
+      t.hooks.store.patch(parent.id, { threadId: "thr_parent", endedAt: 1, endReason: "terminal" });
+      t.threads.set("thr_parent", { status: "idle", archivedAt: null, parentThreadId: null });
+      makeBinding(t, { key: "ENG-2", entityId: "uuid-2", parentBindingId: parent.id });
+      t.entities.set("uuid-2", issue({ id: "uuid-2", key: "ENG-2", title: "Child work" }));
+      await t.ring("linear", "uuid-2");
+      const project = t.spawns.find((s) => s.title === "Acme project steward")!;
+      expect(t.spawns.find((s) => s.title === "ENG-2: Child work")).toMatchObject({ parentThreadId: project.id, parentNotifications: "off" });
+    });
+
+    it("falls back to the project steward when there is no parent binding", async () => {
+      const t = await setup();
+      makeBinding(t, { key: "ENG-2", entityId: "uuid-2", parentBindingId: null });
+      t.entities.set("uuid-2", issue({ id: "uuid-2", key: "ENG-2", title: "Child work" }));
+      await t.ring("linear", "uuid-2");
+      const project = t.spawns.find((s) => s.title === "Acme project steward")!;
+      expect(t.spawns.find((s) => s.title === "ENG-2: Child work")).toMatchObject({ parentThreadId: project.id, parentNotifications: "off" });
+    });
+  });
+
   // BB-111: `ensureProjectSteward` spawns the project steward with an
   // environment that attaches asynchronously, so a read taken at once is null
   // and the first stewards of a new project got their own environment. The

@@ -811,6 +811,8 @@ export const rpcContract = defineRpcContract({
           /** The entity's own phase, for line two; null when the binding has none (ops). */
           phase: z.string().nullable(),
           threadId: z.string().nullable(),
+          /** The parent binding's entity key, or null; the sidebar nests the effort under it (BB-245). */
+          parentKey: z.string().nullable(),
           hold: z.string().nullable(),
           /** Entity keys this hold waits behind, for `held behind <keys>`. */
           holdBehind: z.array(z.string()),
@@ -2807,12 +2809,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * A steward is a child of the project steward, with parent notifications
-     * off: the sidebar trees it under the project steward, and bb does not wake
-     * the parent every time the steward finishes a turn. A steward spawned by
-     * an earlier version is parented with `auto`; that is set to `off` here,
-     * once per run, keeping the parent. A steward that is no thread's child is
-     * left alone: it nests only when it is next spawned (no migration).
+     * A steward is a child of its parent steward, or of the project steward
+     * when it has none, with parent notifications off (BB-245): bb's tree and
+     * the sidebar nest it under that parent, and bb does not wake the parent
+     * every time the steward finishes a turn. A steward spawned by an earlier
+     * version is parented with `auto`; that is set to `off` here, once per run,
+     * keeping the parent. A steward that is no thread's child is left alone: it
+     * nests only when it is next spawned (no migration).
      */
     const kept = new Set<string>();
     async function keepSteward(projectId: string, threadId: string): Promise<void> {
@@ -2867,13 +2870,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Stewards decide and delegate; they need no checkout of their own. They
       // share the project steward's environment, and workers get fresh ones.
       const env = projectThread === null ? null : await sharedEnvironment(projectThread, b.entityKey);
+      // BB-245: a steward whose binding has an open parent binding with a
+      // thread nests under that parent's thread in bb's tree, so a promoted
+      // sub-issue appears under its parent steward rather than the project
+      // steward. The parent only changes the tree; the environment is still the
+      // project steward's. bb cannot re-parent a live thread, so a child stays
+      // under a parent that later ends (DESIGN.md §4/§15).
+      const parent = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
+      const parentThread = parent !== null && parent.endedAt === null && parent.threadId !== null ? parent.threadId : null;
+      const treeParent = parentThread ?? projectThread;
       const base = {
         projectId: b.projectId,
-        // A steward is the project steward's child, with parent notifications
-        // off: it trees under the project steward in the sidebar without waking
-        // it on every turn. The parent and the notification mode are set in the
-        // same spawn call, so a parented steward is never left on `auto`.
-        ...(projectThread === null ? {} : { parentThreadId: projectThread, parentNotifications: "off" as const }),
+        // A steward is a child of its parent steward, or of the project steward
+        // when it has none, with parent notifications off: it trees under that
+        // row in the sidebar without waking it on every turn. The parent and
+        // the notification mode are set in the same spawn call, so a parented
+        // steward is never left on `auto`.
+        ...(treeParent === null ? {} : { parentThreadId: treeParent, parentNotifications: "off" as const }),
         prompt,
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : b.kind === "ops" ? (b.title ?? `Ops watch: ${b.entityKey}`) : `${b.entityKey}: ${b.title ?? ""}`.trim(),
         ...modelArgs(stewardModel(b, playbook)),
@@ -7393,6 +7406,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               stage: b.stage,
               phase: b.phase,
               threadId: b.threadId,
+              // BB-245: the parent binding's key, so the sidebar nests the
+              // effort under its parent; null when it has none. A parent in
+              // another project, or an ended one, names no effort and the
+              // child stays top-level (the client decides from the tab's own
+              // list).
+              parentKey: b.parentBindingId === null ? null : (store.binding(b.parentBindingId)?.entityKey ?? null),
               hold: b.hold,
               holdBehind: b.holdBehind,
               holdStack: b.holdStack,

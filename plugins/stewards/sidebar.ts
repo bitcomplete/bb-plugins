@@ -21,6 +21,8 @@ export interface SidebarBinding {
   /** The entity's own state, as the playbook's `phases` table names it; null when the binding has none. */
   phase: string | null;
   threadId: string | null;
+  /** The parent binding's key, or null; the effort nests under that parent effort when it is in the same project (BB-245). */
+  parentKey: string | null;
   hold: string | null;
   /** Entity keys this hold waits behind. */
   holdBehind: string[];
@@ -146,6 +148,10 @@ export interface SidebarEffort {
   section: SidebarSection;
   /** Derived: line two's status phrase. */
   phrase: string;
+  /** Child efforts nested one level under this one by `parentKey` (BB-245). */
+  nested: SidebarEffort[];
+  /** The parent effort's title, on the flat Blocked duplicate of a nested effort; null otherwise (BB-245). */
+  parentTitle: string | null;
   children: SidebarChild[];
 }
 
@@ -205,6 +211,16 @@ export function hasUnread(children: readonly SidebarChild[], byId: ReadonlyMap<s
     const t = byId.get(c.threadId);
     return (t !== undefined && isUnread(t)) || hasUnread(c.children, byId);
   });
+}
+
+/**
+ * Whether any thread in an effort's own tree, or a nested effort's tree, is
+ * unread (BB-80, BB-245). The parent row and its section open when a nested
+ * child is unread, as they already do for a worker tree.
+ */
+export function effortHasUnread(e: SidebarEffort, byId: ReadonlyMap<string, UnreadFlags>): boolean {
+  const root = byId.get(e.rootThreadId);
+  return (root !== undefined && isUnread(root)) || hasUnread(e.children, byId) || e.nested.some((n) => effortHasUnread(n, byId));
 }
 
 /**
@@ -413,6 +429,8 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     state: "quiet",
     section: "inflight",
     phrase: endReasonPhrase(e.endReason ?? null),
+    nested: [],
+    parentTitle: null,
     children: [],
     endedAt: e.endedAt,
   };
@@ -586,6 +604,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
   const roleByThread = new Map<string, SidebarChildRole | "steward">();
   const claimed = new Set<string>();
   const efforts: SidebarEffort[] = [];
+  /** Each stewarded effort's binding `parentKey`, for the one-level nesting below (BB-245). */
+  const parentKeyOf = new Map<string, string | null>();
 
   const touch = (effort: SidebarEffort, t: SidebarLiveThread): void => {
     if (t.updatedAt > effort.recency) effort.recency = t.updatedAt;
@@ -626,11 +646,14 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       state: "quiet",
       section: "inflight",
       phrase: "",
+      nested: [],
+      parentTitle: null,
       children: [],
     };
     const byThread = new Map<string, SidebarChild>();
     index.set(root.id, { effort, byThread });
     efforts.push(effort);
+    parentKeyOf.set(b.key, b.parentKey);
 
     // Workers from the plugin's own table: the binding relationship, whatever
     // the thread's parent or lifecycle owner says.
@@ -719,6 +742,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       state: "quiet",
       section: "inflight",
       phrase: "",
+      nested: [],
+      parentTitle: null,
       children: [],
     };
     const visit = (t: SidebarLiveThread): SidebarChild => {
@@ -729,16 +754,41 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     efforts.push(derive(effort, now));
   }
 
+  // BB-245: a binding's `parentKey` nests its effort one level under the
+  // parent effort in the same tab. A parent that is not an effort here (an
+  // ended binding, another project, or a thread not in the live view) leaves
+  // the child top-level. One level only: an effort whose parent is itself
+  // nested stays top-level, and a self-parent nests nothing. A nested effort
+  // that is blocked is also listed flat in Blocked, with its parent named on
+  // line two, so a collapsed parent hides nothing that needs the user.
+  const byKey = new Map(efforts.map((e) => [e.key, e] as const));
+  const parentOfEffort = (e: SidebarEffort): SidebarEffort | null => {
+    const pk = parentKeyOf.get(e.key);
+    if (pk === undefined || pk === null) return null;
+    const p = byKey.get(pk);
+    return p === undefined || p === e ? null : p;
+  };
+  const nestedEfforts = new Set<SidebarEffort>();
+  const blockedDuplicates: SidebarEffort[] = [];
+  for (const e of efforts) {
+    const parent = parentOfEffort(e);
+    if (parent === null || parentOfEffort(parent) !== null) continue;
+    nestedEfforts.add(e);
+    parent.nested.push(e);
+    if (e.section === "blocked") blockedDuplicates.push({ ...e, parentTitle: effortTitle(parent.title, parent.key), nested: [] });
+  }
+  const topLevel = (e: SidebarEffort): boolean => !nestedEfforts.has(e);
+
   const nonOps = efforts.filter((e) => e.bindingKey !== null && e.kind !== "ops");
   const ops = efforts.filter((e) => e.kind === "ops");
   return {
     projectId: project.id,
     name: project.name,
     isPersonal: project.isPersonal,
-    blocked: [...nonOps, ...ops].filter((e) => e.section === "blocked").sort(compareBlocked),
-    efforts: nonOps.filter((e) => e.section === "inflight").sort(compareInflight),
+    blocked: [...[...nonOps, ...ops].filter((e) => e.section === "blocked" && topLevel(e)), ...blockedDuplicates].sort(compareBlocked),
+    efforts: nonOps.filter((e) => e.section === "inflight" && topLevel(e)).sort(compareInflight),
     threads: efforts.filter((e) => e.bindingKey === null).sort(compareEfforts),
-    monitors: ops.filter((e) => e.section === "monitors").sort(compareMonitors),
+    monitors: ops.filter((e) => e.section === "monitors" && topLevel(e)).sort(compareMonitors),
     projectStewardThreadId: stewardThreadId,
     ended: (data?.ended ?? []).map(endedEffort),
   };
