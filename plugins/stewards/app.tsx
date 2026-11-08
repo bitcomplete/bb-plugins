@@ -1416,13 +1416,14 @@ function ActionButtons({
 }
 
 /**
- * A need's buttons, rendered from the server's `actions` list (BB-122). A
- * button is offered only when the server can verify the item's preconditions
- * now; otherwise the item says why it is not actionable yet. Every action runs
- * on the server, as the user.
+ * BB-177/BB-240: navigating to a thread the client does not know yet leaves
+ * the steward's sidebar row collapsed and routes to nowhere useful. Wait,
+ * bounded, for the spawned thread to reach the live list, then navigate; if it
+ * never does, navigate anyway so the user still lands in the requester. Shared
+ * by the page's Provide controls and the sidebar's inline need, which both
+ * navigate to the requester thread Provide spawns.
  */
-function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void }) {
-  const rpc = useRpc<typeof rpcContract>();
+function useNavigateToThreadWhenKnown(): (threadId: string) => void {
   const navigate = useBbNavigate();
   // A thread the server spawns (Provide's requester) reaches the client
   // through the thread-list subscription, separately from the RPC reply
@@ -1437,30 +1438,39 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
     },
     [],
   );
+  return useCallback(
+    (threadId: string) => {
+      if (navTimer.current !== null) clearTimeout(navTimer.current);
+      const deadline = Date.now() + THREAD_NAV_WAIT_MS;
+      const attempt = () => {
+        navTimer.current = null;
+        if (threadsRef.current.some((t) => t.id === threadId) || Date.now() >= deadline) {
+          navigate.toThread(threadId);
+          return;
+        }
+        navTimer.current = setTimeout(attempt, THREAD_NAV_RETRY_MS);
+      };
+      attempt();
+    },
+    [navigate],
+  );
+}
+
+/**
+ * A need's buttons, rendered from the server's `actions` list (BB-122). A
+ * button is offered only when the server can verify the item's preconditions
+ * now; otherwise the item says why it is not actionable yet. Every action runs
+ * on the server, as the user.
+ */
+function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const navigateToThreadWhenKnown = useNavigateToThreadWhenKnown();
   const [note, setNote] = useState("");
   // With choices, the text box answers a choice's note until Other… turns it
   // into the free-text answer.
   const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
-  /**
-   * BB-177: navigating to a thread the client does not know yet leaves the
-   * steward's sidebar row collapsed and routes to nowhere useful. Wait,
-   * bounded, for the spawned thread to reach the live list, then navigate; if
-   * it never does, navigate anyway so the user still lands in the requester.
-   */
-  const navigateToThreadWhenKnown = (threadId: string) => {
-    if (navTimer.current !== null) clearTimeout(navTimer.current);
-    const deadline = Date.now() + THREAD_NAV_WAIT_MS;
-    const attempt = () => {
-      navTimer.current = null;
-      if (threadsRef.current.some((t) => t.id === threadId) || Date.now() >= deadline) {
-        navigate.toThread(threadId);
-        return;
-      }
-      navTimer.current = setTimeout(attempt, THREAD_NAV_RETRY_MS);
-    };
-    attempt();
-  };
   const act = (a: BoardActionButton) => {
     setState("running");
     rpc
@@ -1953,6 +1963,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
 function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: SidebarNeedItem; projectId: string; effortKey: string; onChanged: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
+  const navigateToThreadWhenKnown = useNavigateToThreadWhenKnown();
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
   // The fallback timer that opens the URL externally when the page never takes
   // the handoff (a hidden panel, a chunk that failed to load) (BB-102).
@@ -1966,11 +1977,15 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
   // and on the page; context is never shown here (BB-79).
   const clamped = item.actions.length === 0;
   const disabled = state === "running" || (item.type === "need" && !item.actionable);
-  const run = (call: Promise<{ ok: boolean; message: string }>) => {
+  const run = (call: Promise<{ ok: boolean; message: string; threadId?: string | null }>) => {
     setState("running");
     call.then(
       (r) => {
         if (!r.ok) return setState({ error: r.message });
+        // BB-240: a Provide reply carries the spawned requester thread;
+        // navigate to it (bounded) before refetching, as the page does (BB-177).
+        // Question answers and Done carry no thread id and do not navigate.
+        if (r.threadId !== null && r.threadId !== undefined) navigateToThreadWhenKnown(r.threadId);
         onChanged();
       },
       (e: unknown) => setState({ error: message(e) }),
