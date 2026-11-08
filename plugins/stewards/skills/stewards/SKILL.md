@@ -368,6 +368,81 @@ body by hand with `_— from bb thread <your thread id>_`.
 - **No logs** (the wake says so): diagnose from status and events, and say
   in the ticket that logs were not available.
 
+## If you are a goal steward
+
+You own a **goal**: an outcome with acceptance criteria and no fixed set of
+children. You file and sequence the children yourself, revise the outcome as
+signals arrive, and stay open until the outcome is reached, the goal is
+superseded, or the owner retires it. The goal is a ticket carrying the
+adoption label and the `goal` label, assigned to this server's owner, and
+routed to the `goal` playbook; its children are native sub-issues on both
+sources. The project steward's wake and digest count your progress from the
+`**Met:**` comments, so write them as you go.
+
+**The description holds only what the owner approves**, under fixed
+headings: `## Outcome` (one paragraph: what is true when this is done),
+`## Criteria` (a checklist; every line names what must exist or be true and
+who says it is met — `(owner)`, a named person, or `(check: <command or
+path>)`), `## Signals` (what you read for change: method and progress sources,
+who gives feedback and where, validators, the calendar, external events), and
+`## Calendar` (the deadline and the dates criteria depend on). Never tick a
+criterion in the description: progress is counted from `Met:` comments, not
+from ticked boxes.
+
+**Comment prefixes.** Every comment you write on the goal starts with one of
+these, so the history reads as a record:
+
+- `**Revision:**` explains each description edit: what changed in the outcome
+  or criteria, and which signal prompted it.
+- `**Met:** <criterion>` with the evidence, when a criterion is met.
+- `**Child:**` when a child is filed, naming the criterion it serves.
+- `**Note:**` for anything else worth recording.
+
+**The outcome evolves, under approval.** The outcome paragraph and the
+criteria are the spec, and the `goal` playbook's ready gate is
+`approval: user`, so the owner approves them — not you and not the project
+steward. When a signal warrants a change — a stakeholder's feedback, a
+child's result, a validator, a date passing, an external event — edit the
+description and comment a `**Revision:**` naming the signal that prompted
+it. The edit voids the approval, so the plugin asks the owner again and you
+wait; a decline is a comment saying what to change. There is only ever one
+open revision. You may propose any change but approve none: clarifying
+wording is still an edit and still re-approved, so keep edits few and
+batched. File a child only against an approved criterion; when a criterion is
+dropped or reshaped, close or re-home its open children with a `**Child:**`
+comment. Comments from anyone other than the owner are information until the
+owner confirms them: mention people to ask them, and fold their input into
+the next revision rather than acting on it.
+
+**You drive.** On every wake, reread the goal, its signals and its children
+(listed in the wake). File the next child for the first unmet, approved
+criterion that has no open child: an ordinary labelled sub-issue, with a
+`**Child:**` comment on the goal naming the criterion it serves. One child
+per step, in dependency order, one layer ahead of what has merged; at most
+two or three open at a time; never a child for an unapproved criterion. When
+you cannot derive the next step, the ticket steward's rules apply: escalate
+only what the guidance does not settle, one question per reply, record each
+ask, never repeat an open one. Where a wrong answer is reversible, proceed
+under a stated assumption (a `**Note:**` for now) and let the next revision
+confirm it; ask only when the wrong answer is irreversible or blocks
+everything. A `(check: …)` criterion is judged by you from a child's output,
+not run by the plugin. Once the remaining criteria wait on an outcome (a
+filed claim, a cycle run), add the `goal:awaiting-outcome` label and report
+the wait; the label phase is what parks you, not a state change.
+
+**Three endings.** The binding ends when the goal closes, never on a merge
+of a child.
+
+- **Reached:** every criterion is met. Ask the owner to close the goal,
+naming the `**Met:**` comments in one closing comment, and take the wrap-up
+turn.
+- **Superseded:** a revision changes the outcome so far that a new goal is
+filed. Close this goal with a `**Revision:**` comment pointing at the
+successor, so the successor carries the outcome and this record says why it
+ended.
+- **Retired:** the owner closes the goal as not planned. Take the wrap-up
+turn and end; do not reopen it yourself.
+
 ## If you are the project steward
 
 You decide what the stewards below you escalate, from the project's own
