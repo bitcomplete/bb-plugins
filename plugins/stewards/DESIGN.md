@@ -291,14 +291,20 @@ HEAD; a checkout with local commits is left as it is and read as it is.
   which already exist. The nightly pass re-lists labelled tickets and open
   pull requests as the correctness backstop.
 - A new steward reports to its nearest managed ancestor's steward, or to the
-  project steward when it has none. That is the binding's parent; the thread is
-  spawned as a child of the project steward with `parentNotifications: off`, so
-  the sidebar nests it under the project steward without waking it on every
-  turn. `off` suppresses every automatic notification — turn outcomes, setup
-  failures and exhausted retries — while explicit `bb thread tell` messages
-  still arrive. Before bb 0.47.0 the thread was not parented at all: bb woke a
-  parent every time a child finished a turn, 88 of the project steward's first
-  96 turns on bithub.
+  project steward when it has none. That is the binding's parent. The thread is
+  spawned as a child of the parent binding's steward thread when that parent is
+  open and has a thread (BB-245), and of the project steward otherwise, with
+  `parentNotifications: off`, so bb's thread tree and the sidebar nest it under
+  its parent without waking the parent on every turn. The environment is always
+  the project steward's; the parent only changes the tree. `off` suppresses
+  every automatic notification — turn outcomes, setup failures and exhausted
+  retries — while explicit `bb thread tell` messages still arrive. Before bb
+  0.47.0 the thread was not parented at all: bb woke a parent every time a
+  child finished a turn, 88 of the project steward's first 96 turns on bithub.
+  bb cannot re-parent a live thread, so when a parent steward ends an open child
+  stays under it in bb's tree; the binding's `parentBindingId` is still moved up
+  by `endBinding`, and only a later spawn (a respawn after the child's thread is
+  lost) follows it.
 - `--lifecycle-owner-thread` is used only between a steward and its workers.
   Stewards end on their own entity's terms.
 - Your own pull requests get no review steward. They belong to the ticket
@@ -979,8 +985,13 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 ## 15. Organization
 
-- Stewards are children of the project steward with parent notifications off
-  (§4), so they nest under it in bb's thread tree. Who reports to whom is in
+- Stewards are children of their parent steward, or of the project steward
+  when they have none, with parent notifications off (§4), so bb's thread tree
+  nests each under its parent. bb does not re-parent a live thread when its
+  parent ends: a child spawned under a goal that later ends stays under it
+  visually, even though the binding's `parentBindingId` moved up (`endBinding`).
+  The sidebar's own list (§21) derives the same nesting from each binding's
+  `parentKey`, one level deep, so the two views agree. Who reports to whom is in
   the bindings. Grouping in the sidebar is bb's: the project organization
   groups a project's threads by itself, and the stewards thread list (§21)
   groups by binding. The plugin makes no sidebar sections and pins nothing.
@@ -1867,6 +1878,15 @@ places what the records do not cover: a worker an older steward parented under
 it, and a one-off thread's children. BB-72 restored the parent link — stewards
 under the project steward, workers under their steward, reviewers under their
 worker — so the tree and the records agree.
+**A child steward's effort nests under its parent's (BB-245).** The RPC carries
+each binding's `parentKey`, and `buildSidebar` attaches an effort whose parent
+is another effort in the same tab one level under it, with its own glyph and
+line two; a parent that is ended, in another project, or itself nested leaves
+the child top-level, so nesting stops at one level. A nested effort that is
+blocked is also listed flat in **Blocked**, with `in <parent title>` on line
+two, so a collapsed parent hides nothing that needs the user; an unread thread
+in a nested effort opens the parent's row as a worker tree's does, and an ended
+child is flat in **Recently ended**, as before.
 The pure grouping and ordering live in `sidebar.ts` and are unit tested; the
 component joins them to `experimental_useSidebarThreads` and polls
 `stewardsSidebar` on the board's half-minute visibility-aware cadence.

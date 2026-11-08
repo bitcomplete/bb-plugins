@@ -811,6 +811,8 @@ export const rpcContract = defineRpcContract({
           /** The entity's own phase, for line two; null when the binding has none (ops). */
           phase: z.string().nullable(),
           threadId: z.string().nullable(),
+          /** The parent binding's entity key, or null; the sidebar nests the effort under it (BB-245). */
+          parentKey: z.string().nullable(),
           hold: z.string().nullable(),
           /** Entity keys this hold waits behind, for `held behind <keys>`. */
           holdBehind: z.array(z.string()),
@@ -2009,6 +2011,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot);
     }
 
+    /**
+     * An unread sub-issue relation is not "no parent": it leaves the previous
+     * snapshot's parent and children in place, so a read that lost them does
+     * not look like a removal and adoption keeps the existing nesting (BB-244).
+     */
+    function keepRelations(prev: EntitySnapshot | null, entity: EntitySnapshot): EntitySnapshot {
+      if (entity.relationsUnread !== true || prev === null) return entity;
+      return { ...entity, parent: prev.parent, children: prev.children, childrenTotal: prev.childrenTotal };
+    }
+
     /** A ticket's linked pull requests, read from github. One that cannot be read is left out. */
     async function linkedPulls(entity: EntitySnapshot): Promise<EntitySnapshot[]> {
       const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
@@ -2034,8 +2046,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function freshObserved(b: Binding): Promise<{ observed: Observed; complete: boolean } | null> {
       if (b.lastSnapshot === null) return null;
       if (b.source === "ops") return { observed: b.lastSnapshot, complete: true };
-      const entity = await snapshot(b.source, b.entityId).catch(() => null);
-      if (entity === null) return { observed: b.lastSnapshot, complete: false };
+      const fresh = await snapshot(b.source, b.entityId).catch(() => null);
+      if (fresh === null) return { observed: b.lastSnapshot, complete: false };
+      const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
       if (b.kind !== "ticket") return { observed: { entity, pulls: [] }, complete: true };
       const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
       const pulls = await linkedPulls(entity);
@@ -2807,12 +2820,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * A steward is a child of the project steward, with parent notifications
-     * off: the sidebar trees it under the project steward, and bb does not wake
-     * the parent every time the steward finishes a turn. A steward spawned by
-     * an earlier version is parented with `auto`; that is set to `off` here,
-     * once per run, keeping the parent. A steward that is no thread's child is
-     * left alone: it nests only when it is next spawned (no migration).
+     * A steward is a child of its parent steward, or of the project steward
+     * when it has none, with parent notifications off (BB-245): bb's tree and
+     * the sidebar nest it under that parent, and bb does not wake the parent
+     * every time the steward finishes a turn. A steward spawned by an earlier
+     * version is parented with `auto`; that is set to `off` here, once per run,
+     * keeping the parent. A steward that is no thread's child is left alone: it
+     * nests only when it is next spawned (no migration).
      */
     const kept = new Set<string>();
     async function keepSteward(projectId: string, threadId: string): Promise<void> {
@@ -2867,13 +2881,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Stewards decide and delegate; they need no checkout of their own. They
       // share the project steward's environment, and workers get fresh ones.
       const env = projectThread === null ? null : await sharedEnvironment(projectThread, b.entityKey);
+      // BB-245: a steward whose binding has an open parent binding with a
+      // thread nests under that parent's thread in bb's tree, so a promoted
+      // sub-issue appears under its parent steward rather than the project
+      // steward. The parent only changes the tree; the environment is still the
+      // project steward's. bb cannot re-parent a live thread, so a child stays
+      // under a parent that later ends (DESIGN.md §4/§15).
+      const parent = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
+      const parentThread = parent !== null && parent.projectId === b.projectId && parent.endedAt === null && parent.threadId !== null ? parent.threadId : null;
+      const treeParent = parentThread ?? projectThread;
       const base = {
         projectId: b.projectId,
-        // A steward is the project steward's child, with parent notifications
-        // off: it trees under the project steward in the sidebar without waking
-        // it on every turn. The parent and the notification mode are set in the
-        // same spawn call, so a parented steward is never left on `auto`.
-        ...(projectThread === null ? {} : { parentThreadId: projectThread, parentNotifications: "off" as const }),
+        // A steward is a child of its parent steward, or of the project steward
+        // when it has none, with parent notifications off: it trees under that
+        // row in the sidebar without waking it on every turn. The parent and
+        // the notification mode are set in the same spawn call, so a parented
+        // steward is never left on `auto`.
+        ...(treeParent === null ? {} : { parentThreadId: treeParent, parentNotifications: "off" as const }),
         prompt,
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : b.kind === "ops" ? (b.title ?? `Ops watch: ${b.entityKey}`) : `${b.entityKey}: ${b.title ?? ""}`.trim(),
         ...modelArgs(stewardModel(b, playbook)),
@@ -3187,6 +3211,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.endedAt === null) await finishEnding(b, "gone");
         return;
       }
+      // An unread relation keeps the last known parent and children (BB-244).
+      entity = keepRelations(b.lastSnapshot?.entity ?? null, entity);
       const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
       const prev = b.lastSnapshot;
 
@@ -4771,13 +4797,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return "review";
     }
 
-    /** The nearest bound ancestor of a Linear issue, walking up a few parents. */
-    async function managedAncestor(entity: EntitySnapshot): Promise<Binding | null> {
+    /** Whether a GitHub parent key ("owner/repo#N") is in the project's repo set, ignoring case (BB-244). */
+    function parentInRepoSet(config: ProjectConfig, key: string): boolean {
+      const repo = key.split("#")[0] ?? "";
+      return config.repos.some((r) => lc(r) === lc(repo));
+    }
+
+    /**
+     * The nearest bound ancestor of an issue, walking up a few parents, on
+     * either source. An unread relation is not "no parent": it leaves the
+     * binding's nesting alone. On GitHub the walk stays inside the project's
+     * repo set, compared ignoring case; a parent in another repository counts
+     * as unmanaged and is not read (BB-244).
+     */
+    async function managedAncestor(entity: EntitySnapshot, config: ProjectConfig): Promise<Binding | null> {
+      if (entity.relationsUnread === true) return null;
       let parent = entity.parent;
       for (let depth = 0; parent !== null && depth < 5; depth++) {
-        const bound = store.byEntity("linear", parent.id);
+        if (entity.source === "github" && !parentInRepoSet(config, parent.key)) return null;
+        const bound = store.byEntity(entity.source, parent.id);
         if (bound !== null && bound.endedAt === null) return bound;
-        const snap = await snapshot("linear", parent.id).catch(() => null);
+        const snap = await snapshot(entity.source, parent.id).catch(() => null);
         parent = snap?.parent ?? null;
       }
       return null;
@@ -4795,9 +4835,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (kind === null) return null;
       const playbook = watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
       if (playbook === null) return null;
-      // A GitHub issue has no Linear parents: sub-issue handling is skipped
-      // rather than reading Linear for an entity that lives on GitHub (BB-234).
-      const parent = kind === "ticket" && entity.source === "linear" ? await managedAncestor(entity) : null;
+      // Both sources nest: a GitHub issue with a managed parent gets its
+      // `parentBindingId` like a Linear one (BB-244).
+      const parent = kind === "ticket" ? await managedAncestor(entity, config) : null;
       const { phase, stage } = phaseAndStage(playbook, entity.state);
       let b: Binding;
       try {
@@ -7393,6 +7433,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               stage: b.stage,
               phase: b.phase,
               threadId: b.threadId,
+              // BB-245: the parent binding's key, so the sidebar nests the
+              // effort under its parent; null when it has none. A parent in
+              // another project, or an ended one, names no effort and the
+              // child stays top-level (the client decides from the tab's own
+              // list).
+              parentKey: b.parentBindingId === null ? null : (store.binding(b.parentBindingId)?.entityKey ?? null),
               hold: b.hold,
               holdBehind: b.holdBehind,
               holdStack: b.holdStack,
