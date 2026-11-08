@@ -294,15 +294,22 @@ const ownPull = (key: string | null, url: string | null, own: ReadonlySet<string
 /** The stages a worker of the binding moves an entity between: a move within them is its own (rule 1). */
 const OWN_MOVE_STAGES = new Set(["build", "review"]);
 /**
+ * Whether a move between two stages is the worker's own build/review loop
+ * (BB-52): both stages are build or review and they differ. Used for a state
+ * move and, since a label can move the phase too, for a label-driven one
+ * (BB-248).
+ */
+export const isOwnStageChange = (before: string | null, after: string | null): boolean =>
+  before !== null && after !== null && before !== after && OWN_MOVE_STAGES.has(before) && OWN_MOVE_STAGES.has(after);
+
+/**
  * Whether a state change is the worker's own build/review loop: both states map
  * to a build or review stage and they differ. A terminal state is handled by
  * the lifecycle before this, and any other move still wakes the steward.
  */
 export function isOwnStageMove(stageOf: ((state: string) => string | null) | undefined, before: string, after: string): boolean {
   if (stageOf === undefined) return false;
-  const a = stageOf(before);
-  const b = stageOf(after);
-  return a !== null && b !== null && a !== b && OWN_MOVE_STAGES.has(a) && OWN_MOVE_STAGES.has(b);
+  return isOwnStageChange(stageOf(before), stageOf(after));
 }
 
 /**

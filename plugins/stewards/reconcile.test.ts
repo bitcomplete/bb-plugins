@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, ownerApproval, prGate, projectApprovalMarker, reviewWorkerThread, type ProjectApprovalRecord } from "./gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
@@ -184,6 +184,12 @@ describe("the worker's own pull requests and state moves (BB-52)", () => {
     expect(isOwnStageMove(stageOf, "In Progress", "Backlog")).toBe(false);
     expect(isOwnStageMove(stageOf, "Todo", "In Progress")).toBe(false);
     expect(isOwnStageMove(undefined, "In Progress", "In Review")).toBe(false);
+    // BB-248: the same judgment for a stage change with no state move.
+    expect(isOwnStageChange("build", "review")).toBe(true);
+    expect(isOwnStageChange("review", "build")).toBe(true);
+    expect(isOwnStageChange("build", "build")).toBe(false);
+    expect(isOwnStageChange("spec", "build")).toBe(false);
+    expect(isOwnStageChange(null, "review")).toBe(false);
   });
 
   it("keeps a linked pull request quiet when no worker is in flight, as before", () => {

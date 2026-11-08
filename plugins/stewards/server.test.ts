@@ -829,6 +829,30 @@ describe("a Linear ticket steward", () => {
     expect(t.sends[0]!.text).toMatch(/Can we also cover SSO\?/u);
   });
 
+  // BB-248: a label that moves the phase with no state change is news of its
+  // own, and the wake carries the label phase's section.
+  it("wakes the steward when a label moves the phase, with the label phase's section (BB-248)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace(
+      "  In Progress: { stage: build, stuck: 2d }",
+      '  In Progress: { stage: build, stuck: 2d }\n  "label:goal:awaiting-outcome": { stage: spec, stuck: 120d }',
+    ).replace("## In Review", "## label:goal:awaiting-outcome\n\nWait for the outcome.\n\n## In Review");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("Todo");
+    t.sends.length = 0;
+    // The label moves the phase; the state stays `Todo`.
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal:awaiting-outcome"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("label:goal:awaiting-outcome");
+    const wakes = t.sends.filter((s) => s.threadId === steward);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.text).toMatch(/Phase: Todo → label:goal:awaiting-outcome/u);
+    expect(wakes[0]!.text).toContain("### label:goal:awaiting-outcome");
+    expect(wakes[0]!.text).toContain("Wait for the outcome.");
+  });
+
   it("passes the ready gate on the checklist reported by number, and refuses a paraphrase", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
