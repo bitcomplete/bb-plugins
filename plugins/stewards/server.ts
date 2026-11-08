@@ -2011,6 +2011,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot);
     }
 
+    /**
+     * An unread sub-issue relation is not "no parent": it leaves the previous
+     * snapshot's parent and children in place, so a read that lost them does
+     * not look like a removal and adoption keeps the existing nesting (BB-244).
+     */
+    function keepRelations(prev: EntitySnapshot | null, entity: EntitySnapshot): EntitySnapshot {
+      if (entity.relationsUnread !== true || prev === null) return entity;
+      return { ...entity, parent: prev.parent, children: prev.children, childrenTotal: prev.childrenTotal };
+    }
+
     /** A ticket's linked pull requests, read from github. One that cannot be read is left out. */
     async function linkedPulls(entity: EntitySnapshot): Promise<EntitySnapshot[]> {
       const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
@@ -2036,8 +2046,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function freshObserved(b: Binding): Promise<{ observed: Observed; complete: boolean } | null> {
       if (b.lastSnapshot === null) return null;
       if (b.source === "ops") return { observed: b.lastSnapshot, complete: true };
-      const entity = await snapshot(b.source, b.entityId).catch(() => null);
-      if (entity === null) return { observed: b.lastSnapshot, complete: false };
+      const fresh = await snapshot(b.source, b.entityId).catch(() => null);
+      if (fresh === null) return { observed: b.lastSnapshot, complete: false };
+      const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
       if (b.kind !== "ticket") return { observed: { entity, pulls: [] }, complete: true };
       const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
       const pulls = await linkedPulls(entity);
@@ -3200,6 +3211,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.endedAt === null) await finishEnding(b, "gone");
         return;
       }
+      // An unread relation keeps the last known parent and children (BB-244).
+      entity = keepRelations(b.lastSnapshot?.entity ?? null, entity);
       const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
       const prev = b.lastSnapshot;
 
@@ -4784,13 +4797,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return "review";
     }
 
-    /** The nearest bound ancestor of a Linear issue, walking up a few parents. */
-    async function managedAncestor(entity: EntitySnapshot): Promise<Binding | null> {
+    /** Whether a GitHub parent key ("owner/repo#N") is in the project's repo set, ignoring case (BB-244). */
+    function parentInRepoSet(config: ProjectConfig, key: string): boolean {
+      const repo = key.split("#")[0] ?? "";
+      return config.repos.some((r) => lc(r) === lc(repo));
+    }
+
+    /**
+     * The nearest bound ancestor of an issue, walking up a few parents, on
+     * either source. An unread relation is not "no parent": it leaves the
+     * binding's nesting alone. On GitHub the walk stays inside the project's
+     * repo set, compared ignoring case; a parent in another repository counts
+     * as unmanaged and is not read (BB-244).
+     */
+    async function managedAncestor(entity: EntitySnapshot, config: ProjectConfig): Promise<Binding | null> {
+      if (entity.relationsUnread === true) return null;
       let parent = entity.parent;
       for (let depth = 0; parent !== null && depth < 5; depth++) {
-        const bound = store.byEntity("linear", parent.id);
+        if (entity.source === "github" && !parentInRepoSet(config, parent.key)) return null;
+        const bound = store.byEntity(entity.source, parent.id);
         if (bound !== null && bound.endedAt === null) return bound;
-        const snap = await snapshot("linear", parent.id).catch(() => null);
+        const snap = await snapshot(entity.source, parent.id).catch(() => null);
         parent = snap?.parent ?? null;
       }
       return null;
@@ -4808,9 +4835,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (kind === null) return null;
       const playbook = watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
       if (playbook === null) return null;
-      // A GitHub issue has no Linear parents: sub-issue handling is skipped
-      // rather than reading Linear for an entity that lives on GitHub (BB-234).
-      const parent = kind === "ticket" && entity.source === "linear" ? await managedAncestor(entity) : null;
+      // Both sources nest: a GitHub issue with a managed parent gets its
+      // `parentBindingId` like a Linear one (BB-244).
+      const parent = kind === "ticket" ? await managedAncestor(entity, config) : null;
       const { phase, stage } = phaseAndStage(playbook, entity.state);
       let b: Binding;
       try {

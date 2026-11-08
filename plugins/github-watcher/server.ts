@@ -31,6 +31,7 @@ import {
   REPO_CHECK_QUERY,
   SEARCH_ISSUES_QUERY,
   TARGET_QUERY,
+  TARGET_QUERY_BASE,
   VIEWER_QUERY,
   comparePath,
   dependabotAlertsPath,
@@ -65,7 +66,7 @@ import {
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
-import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type SearchIssue, type WorkflowRun } from "./source-contract.js";
+import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -157,10 +158,38 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
     const query = (document: string, variables: Record<string, unknown>, signal: AbortSignal) => asDeveloper((token) => graphql(apiUrl, token, document, variables, deps.fetch, signal));
 
-    /** The target's one read, unparsed: a watch and stewards' snapshot read the same answer two ways. */
-    function readTargetPayload(ref: { repo: string; number: number }, signal: AbortSignal): Promise<unknown> {
+    /** One target read with the given document, unparsed: a watch and stewards' snapshot read the same answer two ways. */
+    function readTargetDocument(document: string, ref: { repo: string; number: number }, signal: AbortSignal): Promise<unknown> {
       const [owner, name] = ref.repo.split("/") as [string, string];
-      return query(TARGET_QUERY, { owner, name, number: ref.number }, signal);
+      return query(document, { owner, name, number: ref.number }, signal);
+    }
+
+    /**
+     * The target's read for the watch: the sub-issue relations ride along, and
+     * a GitHub that rejects them (or a read that failed) falls back to the
+     * target without them, so a watch never stops on a relation it does not
+     * use (BB-244).
+     */
+    function readTargetPayload(ref: { repo: string; number: number }, signal: AbortSignal): Promise<unknown> {
+      return readTargetDocument(TARGET_QUERY, ref, signal).catch(() => readTargetDocument(TARGET_QUERY_BASE, ref, signal));
+    }
+
+    /**
+     * The target and its sub-issue relations for stewards' snapshot. When the
+     * relation fields are rejected, or the read errors or is rate-limited, the
+     * target is read again without them and the snapshot is marked unread, so
+     * its other fields survive (BB-244).
+     */
+    async function readSnapshot(ref: { repo: string; number: number }, signal: AbortSignal): Promise<EntitySnapshot | null> {
+      try {
+        return parseSnapshot(await readTargetDocument(TARGET_QUERY, ref, signal));
+      } catch (error) {
+        try {
+          return parseSnapshot(await readTargetDocument(TARGET_QUERY_BASE, ref, signal), true);
+        } catch {
+          throw error;
+        }
+      }
     }
 
     /** The target as the developer, or null when it does not exist or is not visible. */
@@ -560,7 +589,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       async sourceSnapshot({ id }) {
         const ref = parseRef(id);
         if (ref === null) return { snapshot: null };
-        return { snapshot: parseSnapshot(await readTargetPayload(ref, checkSignal())) };
+        return { snapshot: await readSnapshot(ref, checkSignal()) };
       },
 
       // The repository's label, and each of `states` as a label name (the
