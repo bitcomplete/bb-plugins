@@ -358,7 +358,7 @@ describe("GitHub sub-issue relations (BB-244)", () => {
       issue({
         parent: { id: "I_parent", number: 1, title: "Parent", repository: { nameWithOwner: "Acme/Widgets" } },
         subIssues: {
-          totalCount: 2,
+          totalCount: 3,
           nodes: [
             { id: "I_2", number: 2, title: "Child", state: "OPEN", labels: { nodes: [{ name: "bb-managed" }, { name: "status:todo" }] } },
             { id: "I_3", number: 3, title: "Done child", state: "CLOSED", labels: { nodes: [] } },
@@ -374,12 +374,16 @@ describe("GitHub sub-issue relations (BB-244)", () => {
       { id: "I_3", key: "Acme/Widgets#3", title: "Done child", state: "closed", stateType: null, labels: [] },
     ]);
     // The full count rides along when the first 50 are not all of them.
-    expect(s.childrenTotal).toBe(2);
+    expect(s.childrenTotal).toBe(3);
     expect(entitySnapshotSchema.parse(s)).toEqual(s);
+    // A complete list carries no count: absent means it is complete.
+    expect(parseSnapshot(issue({ subIssues: { totalCount: 1, nodes: [{ id: "I_4", number: 4, title: "Only", state: "OPEN", labels: { nodes: [] } }] } }))!.childrenTotal).toBeUndefined();
   });
 
-  it("keys the parent by its own repository and degrades a missing or null relation to none", () => {
+  it("keys the parent and a cross-repository child by their own repository, and degrades a missing or null relation to none", () => {
     expect(parseSnapshot(issue({ parent: { id: "I_x", number: 9, title: "Other", repository: { nameWithOwner: "Other/Repo" } } }))!.parent).toEqual({ id: "Other/Repo#9", key: "Other/Repo#9" });
+    const cross = parseSnapshot(issue({ subIssues: { totalCount: 1, nodes: [{ id: "I_9", number: 9, title: "Other", state: "OPEN", labels: { nodes: [] }, repository: { nameWithOwner: "Acme/Other" } }] } }))!;
+    expect(cross.children).toEqual([{ id: "I_9", key: "Acme/Other#9", title: "Other", state: "open", stateType: null, labels: [] }]);
     const none = parseSnapshot(issue({ parent: null, subIssues: null }))!;
     expect(none.parent).toBeNull();
     expect(none.children).toEqual([]);
@@ -403,6 +407,7 @@ describe("GitHub sub-issue relations (BB-244)", () => {
 
   it("requests the sub-issue relations in the target query and keeps a base without them", () => {
     expect(TARGET_QUERY).toContain("subIssues(first: 50)");
+    expect(TARGET_QUERY).toContain("repository { nameWithOwner } } }");
     expect(TARGET_QUERY).toContain("parent { id number title repository { nameWithOwner } }");
     expect(TARGET_QUERY_BASE).not.toContain("subIssues");
     expect(TARGET_QUERY_BASE).toContain("issueOrPullRequest(number: $number)");

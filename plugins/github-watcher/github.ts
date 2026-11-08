@@ -145,7 +145,7 @@ const COMMON_FIELDS = `number title body url createdAt updatedAt author ${ACTOR}
  * rate-limited, still answers the rest of the snapshot (marked unread).
  */
 const ISSUE_RELATION_FIELDS = `parent { id number title repository { nameWithOwner } }
-    subIssues(first: 50) { totalCount nodes { id number title state labels(first: 20) { nodes { name } } } }`;
+    subIssues(first: 50) { totalCount nodes { id number title state labels(first: 20) { nodes { name } } repository { nameWithOwner } } }`;
 
 const targetDocument = (issueRelations: string) => `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner issueOrPullRequest(number: $number) { __typename
   ... on Issue { ${COMMON_FIELDS} state stateReason ${issueRelations}
@@ -217,7 +217,7 @@ const issueNode = z.object({
     .object({
       totalCount: z.number().nullish(),
       nodes: z
-        .array(z.object({ id: z.string().nullish(), number: z.number().nullish(), title: z.string().nullish(), state: z.string().nullish(), labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish() }))
+        .array(z.object({ id: z.string().nullish(), number: z.number().nullish(), title: z.string().nullish(), state: z.string().nullish(), labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(), repository: z.object({ nameWithOwner: z.string() }).nullish() }))
         .nullish(),
     })
     .nullish(),
@@ -457,10 +457,12 @@ function relationsOf(node: z.infer<typeof issueNode>, repo: string): Pick<Entity
     if (c.id === null || c.id === undefined || c.number === null || c.number === undefined) continue;
     const labels = (c.labels?.nodes ?? []).map((l) => l.name).sort();
     const closed = (c.state ?? "").toLowerCase() === "closed";
-    children.push({ id: c.id, key: `${repo}#${c.number}`, title: c.title ?? null, state: closed ? "closed" : statusLabel(labels) ?? "open", stateType: null, labels });
+    // A sub-issue may live in another repository; key it by its own when the read names one.
+    const childRepo = c.repository?.nameWithOwner ?? repo;
+    children.push({ id: c.id, key: `${childRepo}#${c.number}`, title: c.title ?? null, state: closed ? "closed" : statusLabel(labels) ?? "open", stateType: null, labels });
   }
   const total = node.subIssues?.totalCount ?? null;
-  return { parent, children, ...(total === null ? {} : { childrenTotal: total }) };
+  return { parent, children, ...(total !== null && total > children.length ? { childrenTotal: total } : {}) };
 }
 
 /**
@@ -505,7 +507,12 @@ export function parseSnapshot(payload: unknown, relationsUnread = false): Entity
     pull: null,
     viewer: read.viewer,
   };
-  if (node.__typename === "Issue") return { ...snapshot, state: node.state.toLowerCase() === "closed" ? target.state : statusLabel(target.labels) ?? "open", linkedPulls: linkedPullsOf(node), ...relationsOf(node, read.repo), ...(relationsUnread ? { relationsUnread: true } : {}) };
+  if (node.__typename === "Issue") {
+    const issue = { ...snapshot, state: node.state.toLowerCase() === "closed" ? target.state : statusLabel(target.labels) ?? "open", linkedPulls: linkedPullsOf(node) };
+    // An unread relation is not read: leave parent and children as none, and
+    // mark it so stewards keeps the binding's existing nesting (BB-244).
+    return relationsUnread ? { ...issue, relationsUnread: true } : { ...issue, ...relationsOf(node, read.repo) };
+  }
   const merged = node.merged === true;
   const draft = node.isDraft === true;
   const state = merged ? "merged" : node.state.toLowerCase() !== "open" ? "closed" : draft ? "draft" : "open";

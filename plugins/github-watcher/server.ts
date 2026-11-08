@@ -165,13 +165,12 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     }
 
     /**
-     * The target's read for the watch: the sub-issue relations ride along, and
-     * a GitHub that rejects them (or a read that failed) falls back to the
-     * target without them, so a watch never stops on a relation it does not
-     * use (BB-244).
+     * The target's read for the watch, without the sub-issue relations a watch
+     * never uses: a GitHub that rejects those fields answers 200 with `errors`
+     * and no data, which would fail the whole watch if they rode along (BB-244).
      */
     function readTargetPayload(ref: { repo: string; number: number }, signal: AbortSignal): Promise<unknown> {
-      return readTargetDocument(TARGET_QUERY, ref, signal).catch(() => readTargetDocument(TARGET_QUERY_BASE, ref, signal));
+      return readTargetDocument(TARGET_QUERY_BASE, ref, signal);
     }
 
     /**

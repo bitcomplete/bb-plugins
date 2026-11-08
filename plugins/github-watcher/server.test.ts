@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -103,6 +103,8 @@ function fakeGitHub() {
     calls.push({ token, variables: body.variables });
     if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
     if (state.fail) return Response.json({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] });
+    // A GitHub that does not know the sub-issue fields: the whole document is rejected, 200 with no data (BB-244).
+    if (state.rejectSubIssues && body.query.includes("subIssues")) return Response.json({ data: null, errors: [{ type: "undefinedField", message: "Field 'subIssues' doesn't exist on type 'Issue'" }] });
     if (body.query.includes("search(")) return Response.json({ data: { search: { nodes: state.searchIssues } } });
     const v = body.variables as { owner: string; name: string; number: number; label?: string };
     if (!body.query.includes("repository(")) return Response.json({ data: { viewer: { login: "dev" } } });
@@ -280,6 +282,16 @@ describe("the tool", () => {
     advance(TOKEN_CACHE_MS + 1);
     await tool({ ref: "Acme/Widgets#12" });
     expect(token).toHaveBeenCalledTimes(3);
+  });
+
+  it("watches an issue on a GitHub that rejects the sub-issue fields, reading the target without them (BB-244)", async () => {
+    const w = await setup(WITH_HOOKS);
+    w.github.state.rejectSubIssues = true;
+    w.github.state.node = issueNode();
+    const result = await w.tool({ ref: "Acme/Widgets#7" });
+    expect(result).not.toMatchObject({ isError: true });
+    expect(w.text(result)).toContain("Watching issue Acme/Widgets#7");
+    expect(w.rows()).toHaveLength(1);
   });
 });
 
@@ -539,6 +551,21 @@ describe("stewards' source contract", () => {
     expect(snapshot.pull).toMatchObject({ draft: true, merged: false, headSha: "0123456789abcdef", reviews: [{ author: "carol", state: "changes requested", submittedAt: "2026-10-09T08:00:01Z", commit: "aaaa" }] });
     expect(await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#13" }, STEWARDS)).toEqual({ snapshot: null });
     expect(await w.harness.callRpc("sourceSnapshot", { id: "nonsense" }, STEWARDS)).toEqual({ snapshot: null });
+  });
+
+  it("reads an issue's parent and children, and marks the relation unread when GitHub rejects the fields (BB-244)", async () => {
+    const w = await setup();
+    w.github.state.node = issueNode({
+      parent: { id: "I_1", number: 1, title: "Parent", repository: { nameWithOwner: "Acme/Widgets" } },
+      subIssues: { totalCount: 1, nodes: [{ id: "I_2", number: 2, title: "Child", state: "OPEN", labels: { nodes: [{ name: "status:todo" }] }, repository: { nameWithOwner: "Acme/Widgets" } }] },
+    });
+    const read = (await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#7" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    expect(read.snapshot).toMatchObject({ kind: "issue", parent: { id: "Acme/Widgets#1", key: "Acme/Widgets#1" }, children: [{ key: "Acme/Widgets#2", state: "status:todo" }] });
+    expect(read.snapshot.relationsUnread).toBeUndefined();
+    // The same GitHub without the fields: the rest of the snapshot survives, marked unread.
+    w.github.state.rejectSubIssues = true;
+    const unread = (await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#7" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    expect(unread.snapshot).toMatchObject({ kind: "issue", title: "Bug", relationsUnread: true, parent: null, children: [] });
   });
 
   it("validates repositories and their label, and says so when gh is not signed in rather than failing", async () => {
