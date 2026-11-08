@@ -2792,6 +2792,7 @@ function StewardsSidebarCore({
             activeThreadId={activeThreadId}
             openThreads={openThreads}
             unreadKey=""
+            threadActions={false}
             entered={loaded}
             meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
           />

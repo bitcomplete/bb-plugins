@@ -465,6 +465,36 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-241: the pinned project steward is a plugin-owned, long-lived thread the
+  // plugin restarts and retitles, so its row carries no hover actions and no
+  // context menu either.
+  it("gives the pinned project-steward row no hover actions or context menu", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_ps", displayTitle: "Project steward" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding()],
+            projectStewardThreadId: "thr_ps",
+          }),
+      } as never,
+      threadActions: () => archiveEntry() as never,
+    });
+    const ps = await waitFor(() => slot.getByText("project steward"));
+    const row = ps.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    expect(row.querySelector("[data-sidebar-row-actions]")).toBeNull();
+    expect(row.querySelector("[data-thread-actions-trigger]")).toBeNull();
+    expect(row.querySelector(".bb-sidebar-hover-actions-inset")).toBeNull();
+    expect(slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_ps"]')).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   // BB-182: stewards rows take bb's own row height and hover/selected tokens,
   // and the effort row's second line lines up with its title. BB-202: only the
   // Threads section's rows carry the hover actions.
@@ -552,7 +582,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("keeps the project-steward stamp out from under the hover actions and the ended stamp in a plain title span", async () => {
+  it("keeps the project-steward and ended stamps in a plain title span", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -572,11 +602,12 @@ describe("the stewards sidebar list (BB-44)", () => {
       } as never,
       threadActions: () => archiveEntry() as never,
     });
-    // The project-steward row keeps its actions; its label lives inside the
-    // title's inset content span, so the hover actions take the right edge
-    // without covering it.
+    // BB-241: the project-steward row is plugin-owned too, so it carries no
+    // hover actions and no inset; its label sits in the plain content span.
     const ps = await waitFor(() => slot.getByText("project steward"));
-    expect(ps.closest(".bb-sidebar-hover-actions-inset")).not.toBeNull();
+    const psRow = ps.closest(".bb-sidebar-hover-actions-row") as HTMLElement;
+    expect(ps.closest(".bb-sidebar-hover-actions-inset")).toBeNull();
+    expect(psRow.querySelector(".bb-sidebar-hover-actions")).toBeNull();
     // BB-202: a Recently ended effort row keeps its stamp but has no inset and
     // no hover actions.
     fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
