@@ -228,9 +228,28 @@ export const entitySnapshotSchema = z.object({
   canceledAt: z.string().nullable().optional(),
   /** The newest comments (and, on a pull request, reviews and review comments), oldest first. */
   comments: z.array(snapshotCommentSchema),
+  /**
+   * The entity's parent, when the source reads one: Linear's parent issue, or
+   * a GitHub issue's native parent. `id` is what `byEntity` and `sourceSnapshot`
+   * key on (Linear's UUID, GitHub's "owner/repo#N"); `key` is what a wake shows.
+   */
   parent: z.object({ id: z.string(), key: z.string() }).nullable(),
-  /** Sub-issues. Empty on GitHub. */
+  /**
+   * Sub-issues: Linear's child issues, or a GitHub issue's first 50 native
+   * sub-issues. `childrenTotal` is the full count when the source capped the
+   * list, so a wake can say how many it did not show; absent means the list is
+   * complete.
+   */
   children: z.array(snapshotChildSchema),
+  childrenTotal: z.number().int().nonnegative().optional(),
+  /**
+   * True when the source could not read the entity's parent and sub-issues
+   * (GitHub rejected the fields, or the relation read errored or was
+   * rate-limited) while the rest of the snapshot was read. Adoption,
+   * re-parenting and release then leave the existing `parentBindingId` and
+   * children untouched. Absent means the relation was read (BB-244).
+   */
+  relationsUnread: z.boolean().optional(),
   /**
    * Pull requests linked to the entity, by URL; "owner/repo#12" when it
    * parses. Linear: the issue's linked pull requests. GitHub: an issue's

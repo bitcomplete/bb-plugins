@@ -139,13 +139,16 @@ const COMMENT_FIELDS = `id author ${ACTOR} body createdAt url`;
 const COMMON_FIELDS = `number title body url createdAt updatedAt author ${ACTOR} assignees(first: 20) { nodes { login } } labels(first: 50) { nodes { name } } milestone { title } comments(last: 50) { nodes { ${COMMENT_FIELDS} } }`;
 
 /**
- * One read of a pull request or issue: everything a watch compares, the
- * newest comments and reviews, and what stewards' snapshot adds on top (the
- * description, ids, the commit each review was given on, who pushed the
- * head, and who the token is).
+ * An issue's native sub-issue relations (BB-244): the parent issue and the
+ * first 50 children. They ride with the target read, but `TARGET_QUERY_BASE`
+ * drops them, so a GitHub that rejects the fields, or a read that errors or is
+ * rate-limited, still answers the rest of the snapshot (marked unread).
  */
-export const TARGET_QUERY = `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner issueOrPullRequest(number: $number) { __typename
-  ... on Issue { ${COMMON_FIELDS} state stateReason
+const ISSUE_RELATION_FIELDS = `parent { id number title repository { nameWithOwner } }
+    subIssues(first: 50) { totalCount nodes { id number title state labels(first: 20) { nodes { name } } repository { nameWithOwner } } }`;
+
+const targetDocument = (issueRelations: string) => `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner issueOrPullRequest(number: $number) { __typename
+  ... on Issue { ${COMMON_FIELDS} state stateReason ${issueRelations}
     closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { number url repository { nameWithOwner } } }
     timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) { nodes { ... on CrossReferencedEvent { source { ... on PullRequest { number url repository { nameWithOwner } } } } } } }
   ... on PullRequest { ${COMMON_FIELDS} state isDraft merged reviewDecision headRefName headRefOid baseRefName
@@ -155,6 +158,17 @@ export const TARGET_QUERY = `query($owner: String!, $name: String!, $number: Int
     latestReviews(first: 50) { nodes { author ${ACTOR} state } }
     reviews(last: 50) { nodes { id author ${ACTOR} state body createdAt submittedAt url commit { oid } comments(first: 50) { nodes { ${COMMENT_FIELDS} path } } } }
     commits(last: 1) { nodes { commit { oid author { user { login } } statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } } } } } }`;
+
+/**
+ * One read of a pull request or issue: everything a watch compares, the
+ * newest comments and reviews, and what stewards' snapshot adds on top (the
+ * description, ids, the commit each review was given on, who pushed the
+ * head, and who the token is).
+ */
+export const TARGET_QUERY = targetDocument(ISSUE_RELATION_FIELDS);
+
+/** The same target read without the sub-issue relations: the snapshot falls back to it and marks the relation unread (BB-244). */
+export const TARGET_QUERY_BASE = targetDocument("");
 
 const actor = z.object({ login: z.string() }).nullish();
 const commentNode = z.object({ id: z.string().nullish(), author: actor, body: z.string().nullish(), createdAt: z.string(), url: z.string().nullish(), path: z.string().nullish() });
@@ -198,6 +212,15 @@ const issueNode = z.object({
   ...common,
   state: z.string(),
   stateReason: z.string().nullish(),
+  parent: z.object({ id: z.string().nullish(), number: z.number().nullish(), title: z.string().nullish(), repository: z.object({ nameWithOwner: z.string() }).nullish() }).nullish(),
+  subIssues: z
+    .object({
+      totalCount: z.number().nullish(),
+      nodes: z
+        .array(z.object({ id: z.string().nullish(), number: z.number().nullish(), title: z.string().nullish(), state: z.string().nullish(), labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(), repository: z.object({ nameWithOwner: z.string() }).nullish() }))
+        .nullish(),
+    })
+    .nullish(),
   closedByPullRequestsReferences: z.object({ nodes: z.array(linkedPullNode) }).nullish(),
   timelineItems: z.object({ nodes: z.array(z.object({ source: linkedPullNode.nullish() })) }).nullish(),
 });
@@ -418,13 +441,40 @@ function linkedPullsOf(node: z.infer<typeof issueNode>): Array<{ url: string; ke
 }
 
 /**
+ * An issue's sub-issue relations from the read: the parent, keyed as
+ * "owner/repo#N" (the same key `entity.id` uses, so `byEntity` and
+ * `sourceSnapshot` find it), and the first 50 children, each with its state as
+ * the one status label or open/closed. `childrenTotal` is present when the
+ * source capped the list (BB-244).
+ */
+function relationsOf(node: z.infer<typeof issueNode>, repo: string): Pick<EntitySnapshot, "parent" | "children" | "childrenTotal"> {
+  const parentNode = node.parent;
+  const parentRepo = parentNode?.repository?.nameWithOwner ?? null;
+  const parentNumber = parentNode?.number ?? null;
+  const parent = parentNode !== null && parentNode !== undefined && parentRepo !== null && parentNumber !== null ? { id: `${parentRepo}#${parentNumber}`, key: `${parentRepo}#${parentNumber}` } : null;
+  const children: EntitySnapshot["children"] = [];
+  for (const c of node.subIssues?.nodes ?? []) {
+    if (c.id === null || c.id === undefined || c.number === null || c.number === undefined) continue;
+    const labels = (c.labels?.nodes ?? []).map((l) => l.name).sort();
+    const closed = (c.state ?? "").toLowerCase() === "closed";
+    // A sub-issue may live in another repository; key it by its own when the read names one.
+    const childRepo = c.repository?.nameWithOwner ?? repo;
+    children.push({ id: c.id, key: `${childRepo}#${c.number}`, title: c.title ?? null, state: closed ? "closed" : statusLabel(labels) ?? "open", stateType: null, labels });
+  }
+  const total = node.subIssues?.totalCount ?? null;
+  return { parent, children, ...(total !== null && total > children.length ? { childrenTotal: total } : {}) };
+}
+
+/**
  * The same read as stewards' contract wants it (source-contract.ts): the
  * state a playbook keys its phases on (open, draft, merged, closed), the
  * description, the newest comments with ids and the thread whose signature
  * each carries, and on a pull request every submitted review with the
- * commit it was given on. Null exactly when parseTarget is.
+ * commit it was given on. Null exactly when parseTarget is. `relationsUnread`
+ * marks a read that lost the sub-issue relation fields but kept the rest
+ * (BB-244).
  */
-export function parseSnapshot(payload: unknown): EntitySnapshot | null {
+export function parseSnapshot(payload: unknown, relationsUnread = false): EntitySnapshot | null {
   const read = readTargetPayload(payload);
   if (read === null) return null;
   const all = flattenComments(read.node);
@@ -457,7 +507,12 @@ export function parseSnapshot(payload: unknown): EntitySnapshot | null {
     pull: null,
     viewer: read.viewer,
   };
-  if (node.__typename === "Issue") return { ...snapshot, state: node.state.toLowerCase() === "closed" ? target.state : statusLabel(target.labels) ?? "open", linkedPulls: linkedPullsOf(node) };
+  if (node.__typename === "Issue") {
+    const issue = { ...snapshot, state: node.state.toLowerCase() === "closed" ? target.state : statusLabel(target.labels) ?? "open", linkedPulls: linkedPullsOf(node) };
+    // An unread relation is not read: leave parent and children as none, and
+    // mark it so stewards keeps the binding's existing nesting (BB-244).
+    return relationsUnread ? { ...issue, relationsUnread: true } : { ...issue, ...relationsOf(node, read.repo) };
+  }
   const merged = node.merged === true;
   const draft = node.isDraft === true;
   const state = merged ? "merged" : node.state.toLowerCase() !== "open" ? "closed" : draft ? "draft" : "open";

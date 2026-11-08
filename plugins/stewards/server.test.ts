@@ -3620,6 +3620,112 @@ describe("a GitHub issue ticket steward (BB-234)", () => {
   });
 });
 
+// BB-244: GitHub's native sub-issue relations nest GitHub issue bindings the
+// same way Linear's do, and an unread relation leaves nesting alone.
+describe("a GitHub issue's sub-issue relations (BB-244)", () => {
+  const githubParent = (over: Partial<EntitySnapshot> = {}) => githubIssue({ id: "acme/web#1", key: "acme/web#1", url: "https://github.com/acme/web/issues/1", title: "Parent", parent: null, children: [], ...over });
+  const githubChild = (over: Partial<EntitySnapshot> = {}) => githubIssue({ parent: { id: "acme/web#1", key: "acme/web#1" }, children: [], ...over });
+
+  it("adopts a labelled sub-issue under its managed parent", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#1", githubParent());
+    await t.ring("github", "acme/web#1");
+    const parent = t.hooks.store.find("acme/web#1", "p1")!;
+    t.entities.set("acme/web#12", githubChild());
+    await t.ring("github", "acme/web#12");
+    const child = t.hooks.store.find("acme/web#12", "p1")!;
+    expect(child).toMatchObject({ source: "github", kind: "ticket", parentBindingId: parent.id });
+  });
+
+  it("routes the child's escalation to the parent steward and lists the child in the parent's wake", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#1", githubParent({ children: [{ id: "acme/web#12", key: "acme/web#12", title: "Fix login", state: "status:todo", stateType: null, labels: ["bb-managed", "status:todo"] }] }));
+    await t.ring("github", "acme/web#1");
+    const parent = t.hooks.store.find("acme/web#1", "p1")!;
+    t.entities.set("acme/web#12", githubChild());
+    await t.ring("github", "acme/web#12");
+    const child = t.hooks.store.find("acme/web#12", "p1")!;
+    await t.flush();
+    // The parent's wake lists the promoted child under Sub-issues.
+    const parentWake = t.sends.filter((s) => s.threadId === parent.threadId).at(-1)!.text;
+    expect(parentWake).toMatch(/Sub-issues:/u);
+    expect(parentWake).toContain("acme/web#12");
+    // An escalation from the child goes to the parent steward, not the project steward.
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Blocked.", nextAction: "Ask the parent", actor: "steward", escalate: { kind: "decision", question: "Which way?", meanwhile: "Waiting." } }, child.threadId!);
+    expect(report.error).toBe(false);
+    await t.flush();
+    expect(t.hooks.store.openEscalations(child.id)).toMatchObject([{ route: "parent" }]);
+    const escalationWake = t.sends.filter((s) => s.threadId === parent.threadId).at(-1)!.text;
+    expect(escalationWake).toContain("Which way?");
+  });
+
+  it("re-parents the child to the project steward when the parent ends", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#1", githubParent());
+    await t.ring("github", "acme/web#1");
+    const parent = t.hooks.store.find("acme/web#1", "p1")!;
+    t.entities.set("acme/web#12", githubChild());
+    await t.ring("github", "acme/web#12");
+    expect(t.hooks.store.find("acme/web#12", "p1")!.parentBindingId).toBe(parent.id);
+    // The parent closes: its last turn ends it and hands the child up.
+    t.entities.set("acme/web#1", githubParent({ state: "closed (completed)", labels: ["bb-managed", "status:done"] }));
+    await t.ring("github", "acme/web#1");
+    await t.idle(parent.threadId!);
+    expect(t.hooks.store.find("acme/web#1", "p1")!.endedAt).not.toBeNull();
+    expect(t.hooks.store.find("acme/web#12", "p1")!.parentBindingId).toBeNull();
+  });
+
+  it("adopts a no-parent, unmanaged-parent or out-of-repo-set-parent issue exactly as before", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#20", githubIssue({ id: "acme/web#20", key: "acme/web#20", parent: null, children: [] }));
+    await t.ring("github", "acme/web#20");
+    expect(t.hooks.store.find("acme/web#20", "p1")!.parentBindingId).toBeNull();
+    // A parent with no binding is unmanaged.
+    t.entities.set("acme/web#21", githubIssue({ id: "acme/web#21", key: "acme/web#21", parent: { id: "acme/web#99", key: "acme/web#99" }, children: [] }));
+    await t.ring("github", "acme/web#21");
+    expect(t.hooks.store.find("acme/web#21", "p1")!.parentBindingId).toBeNull();
+    // A parent in another repository is unmanaged and is not even read.
+    t.entities.set("acme/web#22", githubIssue({ id: "acme/web#22", key: "acme/web#22", parent: { id: "other/repo#1", key: "other/repo#1" }, children: [] }));
+    await t.ring("github", "acme/web#22");
+    expect(t.hooks.store.find("acme/web#22", "p1")!.parentBindingId).toBeNull();
+    expect(t.rpcCalls.some((c) => c.method === "sourceSnapshot" && c.input.id === "other/repo#1")).toBe(false);
+  });
+
+  it("leaves an already-nested child's parent and children alone when the relation is unread", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.entities.set("acme/web#1", githubParent());
+    await t.ring("github", "acme/web#1");
+    const parent = t.hooks.store.find("acme/web#1", "p1")!;
+    const grandchild = { id: "acme/web#13", key: "acme/web#13", title: "Grandchild", state: "open", stateType: null, labels: [] };
+    t.entities.set("acme/web#12", githubChild({ children: [grandchild] }));
+    await t.ring("github", "acme/web#12");
+    expect(t.hooks.store.find("acme/web#12", "p1")!.parentBindingId).toBe(parent.id);
+    // The next read carries the other fields but not the relation.
+    t.entities.set("acme/web#12", githubChild({ parent: null, children: [], relationsUnread: true }));
+    await t.ring("github", "acme/web#12");
+    const after = t.hooks.store.find("acme/web#12", "p1")!;
+    expect(after.parentBindingId).toBe(parent.id);
+    expect(after.lastSnapshot!.entity.parent).toEqual({ id: "acme/web#1", key: "acme/web#1" });
+    expect(after.lastSnapshot!.entity.children).toEqual([grandchild]);
+  });
+
+  it("says how many sub-issues are not shown when the read capped them", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    const children = Array.from({ length: 50 }, (_, i) => ({ id: `acme/web#${100 + i}`, key: `acme/web#${100 + i}`, title: `Child ${i}`, state: "open", stateType: null, labels: [] }));
+    t.entities.set("acme/web#1", githubParent({ children, childrenTotal: 60 }));
+    await t.ring("github", "acme/web#1");
+    const parent = t.hooks.store.find("acme/web#1", "p1")!;
+    const prompt = String(t.spawns.find((s) => s.id === parent.threadId)!.prompt);
+    expect(prompt).toContain("(and 10 more not shown)");
+  });
+});
+
 describe("role-owned pull watches (BB-164)", () => {
   const SYNC_PRS = GITHUB_PRS.replace("name: github-prs", "name: sync-prs");
   const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => JSON.stringify({ version: 2, roles: definitions, holders });

@@ -56,7 +56,12 @@ export const pull = (over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNu
   ...over,
 });
 
-/** A GitHub issue, the shape github-watcher serves for a `bb-managed` ticket (BB-234). */
+/**
+ * A GitHub issue, the shape github-watcher serves for a `bb-managed` ticket
+ * (BB-234), with the native sub-issue relations a read now carries (BB-244).
+ * Tests override `parent` and `children` to exercise nesting; the default
+ * parent is unmanaged unless a test binds it.
+ */
 export const githubIssue = (over: Partial<EntitySnapshot> = {}): EntitySnapshot => ({
   ...issue(),
   source: "github",
@@ -73,6 +78,8 @@ export const githubIssue = (over: Partial<EntitySnapshot> = {}): EntitySnapshot 
   assignees: ["jane"],
   viewer: "jane",
   description: "Users cannot log in.",
+  parent: { id: "acme/web#1", key: "acme/web#1" },
+  children: [{ id: "acme/web#13", key: "acme/web#13", title: "Sub-task", state: "open", stateType: null, labels: [] }],
   ...over,
 });
 

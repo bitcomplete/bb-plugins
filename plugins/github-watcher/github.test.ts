@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { labelAlreadyExists, labelPath, parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY } from "./github.js";
+import { labelAlreadyExists, labelPath, parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY, TARGET_QUERY_BASE } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -348,6 +348,69 @@ describe("an issue as a stewards entity (BB-233)", () => {
       { id: "Acme/Gadgets#9", key: "Acme/Gadgets#9", title: "Other repo", description: "Fingerprint: abc123", state: "open", stateType: null, unit: "Acme/Gadgets", assignee: null },
     ]);
     expect(() => parseSearchIssues({ data: null, errors: [{ type: "RATE_LIMITED", message: "slow down" }] })).toThrow(/slow down/u);
+  });
+});
+
+// BB-244: an issue's native sub-issue relations, and the unread marker.
+describe("GitHub sub-issue relations (BB-244)", () => {
+  it("fills the parent and children from the snapshot read, the child's state a status label or open/closed", () => {
+    const s = parseSnapshot(
+      issue({
+        parent: { id: "I_parent", number: 1, title: "Parent", repository: { nameWithOwner: "Acme/Widgets" } },
+        subIssues: {
+          totalCount: 3,
+          nodes: [
+            { id: "I_2", number: 2, title: "Child", state: "OPEN", labels: { nodes: [{ name: "bb-managed" }, { name: "status:todo" }] } },
+            { id: "I_3", number: 3, title: "Done child", state: "CLOSED", labels: { nodes: [] } },
+          ],
+        },
+      }),
+    )!;
+    // `id` is the key the rest of the contract keys on, so byEntity and
+    // sourceSnapshot find the parent on GitHub (BB-244).
+    expect(s.parent).toEqual({ id: "Acme/Widgets#1", key: "Acme/Widgets#1" });
+    expect(s.children).toEqual([
+      { id: "I_2", key: "Acme/Widgets#2", title: "Child", state: "status:todo", stateType: null, labels: ["bb-managed", "status:todo"] },
+      { id: "I_3", key: "Acme/Widgets#3", title: "Done child", state: "closed", stateType: null, labels: [] },
+    ]);
+    // The full count rides along when the first 50 are not all of them.
+    expect(s.childrenTotal).toBe(3);
+    expect(entitySnapshotSchema.parse(s)).toEqual(s);
+    // A complete list carries no count: absent means it is complete.
+    expect(parseSnapshot(issue({ subIssues: { totalCount: 1, nodes: [{ id: "I_4", number: 4, title: "Only", state: "OPEN", labels: { nodes: [] } }] } }))!.childrenTotal).toBeUndefined();
+  });
+
+  it("keys the parent and a cross-repository child by their own repository, and degrades a missing or null relation to none", () => {
+    expect(parseSnapshot(issue({ parent: { id: "I_x", number: 9, title: "Other", repository: { nameWithOwner: "Other/Repo" } } }))!.parent).toEqual({ id: "Other/Repo#9", key: "Other/Repo#9" });
+    const cross = parseSnapshot(issue({ subIssues: { totalCount: 1, nodes: [{ id: "I_9", number: 9, title: "Other", state: "OPEN", labels: { nodes: [] }, repository: { nameWithOwner: "Acme/Other" } }] } }))!;
+    expect(cross.children).toEqual([{ id: "I_9", key: "Acme/Other#9", title: "Other", state: "open", stateType: null, labels: [] }]);
+    const none = parseSnapshot(issue({ parent: null, subIssues: null }))!;
+    expect(none.parent).toBeNull();
+    expect(none.children).toEqual([]);
+    expect(none.childrenTotal).toBeUndefined();
+  });
+
+  it("keeps parent null and children empty on a pull request", () => {
+    const s = parseSnapshot(pull())!;
+    expect(s.parent).toBeNull();
+    expect(s.children).toEqual([]);
+    expect(s.childrenTotal).toBeUndefined();
+  });
+
+  it("marks the relation unread when the read lost it, keeping the other fields", () => {
+    const s = parseSnapshot(issue({ title: "Still read" }), true)!;
+    expect(s.relationsUnread).toBe(true);
+    expect(s.title).toBe("Still read");
+    expect(s.parent).toBeNull();
+    expect(s.children).toEqual([]);
+  });
+
+  it("requests the sub-issue relations in the target query and keeps a base without them", () => {
+    expect(TARGET_QUERY).toContain("subIssues(first: 50)");
+    expect(TARGET_QUERY).toContain("repository { nameWithOwner } } }");
+    expect(TARGET_QUERY).toContain("parent { id number title repository { nameWithOwner } }");
+    expect(TARGET_QUERY_BASE).not.toContain("subIssues");
+    expect(TARGET_QUERY_BASE).toContain("issueOrPullRequest(number: $number)");
   });
 });
 
