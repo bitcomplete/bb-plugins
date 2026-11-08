@@ -63,6 +63,8 @@ import {
   roleUsesOps,
   roleWarnings,
   STAGES,
+  ticketWatchId,
+  ticketWatchProblems,
   usesKind,
   watchProblems,
   type BindingKind,
@@ -75,6 +77,7 @@ import {
   type PullWatch,
   type Role as StewardRole,
   type RolesFile,
+  type TicketWatch,
 } from "./config.js";
 import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
@@ -1534,7 +1537,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // into `watchPlaybooks` below.
       const watchNames = new Set<string>();
       for (const r of Object.values(roles?.roles ?? {})) for (const watch of rolePulls(r)) watchNames.add(watch.playbook);
-      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames])].map(playbookPath));
+      // BB-246: a project-level ticket watch names a ticket playbook too. It is
+      // loaded here so one `.bb` read serves it; `ticketWatchProblems` reports a
+      // name that is missing or not a ticket playbook.
+      const ticketWatchNames = new Set(file.tickets.map((w) => w.playbook));
+      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames, ...ticketWatchNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
       /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
@@ -1621,12 +1628,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
        * kept. The check reports a watch whose playbook did not parse.
        */
       const watchPlaybooks = new Map<string, Playbook>();
-      if (roles !== null && watchNames.size > 0) {
+      const watchErrors = new Map<string, string>();
+      if (watchNames.size > 0 || ticketWatchNames.size > 0) {
         const known = new Map<string, Playbook>();
         for (const p of Object.values(playbooks)) if (p !== undefined) known.set(p.name, p);
+        for (const p of Object.values(ticketPlaybooks)) if (p !== undefined) known.set(p.name, p);
         if (depsAlerts !== null) known.set(depsAlerts.name, depsAlerts);
         if (depsPrs !== null) known.set(depsPrs.name, depsPrs);
-        for (const name of watchNames) {
+        for (const name of new Set([...watchNames, ...ticketWatchNames])) {
           const reused = known.get(name);
           if (reused !== undefined) {
             watchPlaybooks.set(name, reused);
@@ -1640,15 +1649,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             await bb.storage.kv.set(goodKey, text!);
             continue;
           }
-          problems.push(result.error);
           const last = await bb.storage.kv.get<string>(goodKey);
           const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
           if (lastParsed !== null && lastParsed.ok) {
             watchPlaybooks.set(name, lastParsed.value);
-            problems.push(`the pull watch playbook ${name} keeps running under the last good version (${lastParsed.value.version}).`);
+            problems.push(`the watch playbook ${name} keeps running under the last good version (${lastParsed.value.version}).`);
+          } else if (ticketWatchNames.has(name)) {
+            // A ticket watch's failure is reported by `ticketWatchProblems`,
+            // with the watch it belongs to; a pull watch's here.
+            watchErrors.set(name, result.error);
+          } else {
+            problems.push(result.error);
           }
         }
       }
+
+      // BB-246: a ticket watch's playbook must exist and be kind `ticket`.
+      const ticketPlaybooksForWatch = new Map<string, Playbook>(watchPlaybooks);
+      for (const p of Object.values(ticketPlaybooks)) if (p !== undefined) ticketPlaybooksForWatch.set(p.name, p);
+      problems.push(...ticketWatchProblems(file, ticketPlaybooksForWatch, watchErrors));
 
       let repos: string[] = [];
       try {
@@ -1827,14 +1846,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     };
 
     /**
-     * The watch that adopted a binding: the recorded `adoptedBy`, or, for a
-     * Dependabot pull request adopted before BB-164 added the column, the
+     * The pull watch that adopted a binding: the recorded `adoptedBy`, or, for
+     * a Dependabot pull request adopted before BB-164 added the column, the
      * deps-prs playbook name (the fallback addition #2 asks for). Null means
-     * the label or review path adopted it.
+     * the label or review path adopted it. A ticket watch (BB-246) is recorded
+     * on `adoptedBy` too, but a ticket keeps its adoption label, so this stays
+     * null for one: the label path still governs its lifecycle.
      */
     function adoptedByWatch(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "adoptedBy">): string | null {
+      if (b.kind !== "pr") return null;
       if (b.adoptedBy !== null) return b.adoptedBy;
-      if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file)) return depsPrsPlaybookName(config.file);
+      if (b.playbook === depsPrsPlaybookName(config.file)) return depsPrsPlaybookName(config.file);
       return null;
     }
 
@@ -1858,9 +1880,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The ticket playbook a ticket watch names, or null when it is not
+     * readable (BB-246). A ticket watch names a `kind: ticket` playbook; one
+     * naming anything else is a `check` problem and adopts nothing.
+     */
+    function ticketWatchPlaybook(config: ProjectConfig, name: string): Playbook | null {
+      const found = config.watchPlaybooks.get(name) ?? null;
+      if (found !== null && found.kind === "ticket") return found;
+      for (const p of Object.values(config.ticketPlaybooks)) if (p !== undefined && p.name === name && p.kind === "ticket") return p;
+      return null;
+    }
+
+    /**
      * The playbook a binding runs under. A Dependabot alert target uses the
-     * deps-alerts playbook; a pull request a watch adopted uses the playbook
-     * its watch named; everything else uses its kind's playbook.
+     * deps-alerts playbook; a pull request or ticket a watch adopted uses the
+     * playbook its watch named; everything else uses its kind's playbook.
      */
     function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId" | "adoptedBy" | "source">): Playbook | null {
       if (b.kind === "ops") {
@@ -1868,6 +1902,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (target?.kind === "dependabot") return config.depsAlerts;
       }
       if (b.kind === "pr" && adoptedByWatch(config, b) !== null) return playbookForWatchName(config, b.playbook);
+      if (b.kind === "ticket" && b.adoptedBy !== null) return ticketWatchPlaybook(config, b.playbook);
       return playbookFor(config, b.kind, b.source === "ops" ? undefined : b.source);
     }
 
@@ -3190,10 +3225,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!config.enabled) return;
       const playbook = bindingPlaybook(config, b);
       if (playbook === null) {
-        // A pull request a watch adopted runs under its watch's playbook only.
-        // With that playbook gone, the binding ends rather than falling back
-        // to a merge-capable playbook the watch says must never merge.
-        if (b.kind === "pr" && adoptedByWatch(config, b) !== null && b.endedAt === null) await finishEnding(b, "unconfigured");
+        // A pull request or ticket a watch adopted runs under its watch's
+        // playbook only. With that playbook gone, the binding ends rather than
+        // falling back to a different playbook the watch did not name.
+        const watchAdopted = (b.kind === "pr" && adoptedByWatch(config, b) !== null) || (b.kind === "ticket" && b.adoptedBy !== null);
+        if (watchAdopted && b.endedAt === null) await finishEnding(b, "unconfigured");
         return;
       }
       if (b.source === "ops") {
@@ -4725,6 +4761,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The first ticket watch a labelled, assigned issue matches, or null
+     * (BB-246). `labels` means every named label is present, ignoring case;
+     * `title` is a glob in the decide list's dialect. First match wins. The
+     * caller has already checked the adoption label and the assignee.
+     */
+    function matchTicketWatch(config: ProjectConfig, e: { labels: string[]; title?: string | null }): TicketWatch | null {
+      for (const watch of config.file.tickets) {
+        const m = watch.match;
+        if (m.labels !== undefined && !m.labels.every((name) => e.labels.some((l) => lc(l) === lc(name)))) continue;
+        if (m.title !== undefined && (e.title === undefined || e.title === null || !watchPatternMatches(m.title, e.title))) continue;
+        return watch;
+      }
+      return null;
+    }
+
+    /**
      * Which kind of binding an entity wants in this project, or null for none.
      * `assignees`, `requestedReviewers`, `title`, `branch` and `files` are
      * absent on the nightly pass's list, which is permissive: `maybeAdopt`
@@ -4839,10 +4891,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (config === null) return null;
       if (store.byEntity(entity.source, entity.id) !== null) return null;
       const full = { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [], title: entity.title, branch: entity.pull?.head ?? null, files: entity.pull?.files };
-      const watch = matchPullWatch(config, { unit: entity.unit, title: entity.title, branch: entity.pull?.head ?? null, author: entity.author, files: entity.pull?.files });
       const kind = adoptionKind(config, full, entity.viewer);
       if (kind === null) return null;
-      const playbook = watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
+      // BB-246: once adoption says ticket, a ticket watch (if any) chooses the
+      // playbook; the pull watches only apply to a pull request.
+      const ticketWatch = kind === "ticket" ? matchTicketWatch(config, entity) : null;
+      const watch = kind === "pr" ? matchPullWatch(config, { unit: entity.unit, title: entity.title, branch: entity.pull?.head ?? null, author: entity.author, files: entity.pull?.files }) : null;
+      const playbook = ticketWatch !== null ? ticketWatchPlaybook(config, ticketWatch.playbook) : watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
       if (playbook === null) return null;
       // Both sources nest: a GitHub issue with a managed parent gets its
       // `parentBindingId` like a Linear one (BB-244).
@@ -4860,7 +4915,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           kind,
           playbook: playbook.name,
           playbookVersion: playbook.version,
-          adoptedBy: watch === null ? null : pullWatchId(watch),
+          adoptedBy: ticketWatch !== null ? ticketWatchId(ticketWatch) : watch === null ? null : pullWatchId(watch),
           parentBindingId: parent?.id ?? null,
           phase,
           stage,
@@ -9838,6 +9893,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // (BB-164).
       const watches = rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file));
       if (watches.length > 0) lines.push(`pulls: ${watches.map((w) => pullWatchId(w)).join(", ")}`);
+      // The project-level ticket watches, so `check` shows the shape and
+      // `list` shows which one adopted a binding (BB-246).
+      if (config.file.tickets.length > 0) lines.push(`tickets: ${config.file.tickets.map((w) => ticketWatchId(w)).join(", ")}`);
       const filing = roleOpsTeam(config.role, config.file);
       // BB-235: a GitHub filing target needs the priority labels its autoAdopt
       // names, and `status:todo` so an autoAdopt issue is adopted as a ticket.

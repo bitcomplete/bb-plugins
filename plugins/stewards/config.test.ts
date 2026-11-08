@@ -34,6 +34,8 @@ import {
   roleUsesOps,
   roleWarnings,
   sentryTargets,
+  ticketWatchId,
+  ticketWatchProblems,
   usesKind,
   watchProblems,
 } from "./config.js";
@@ -816,5 +818,63 @@ describe("role pull watches (BB-164)", () => {
     const parsed = v2({ ops: { pulls: [{ repo: "acme/web", match: {}, playbook: "sync-prs" }] } }, { jane: ["ops"] });
     if (!parsed.ok) throw new Error(parsed.error);
     expect(bindingRoles(parsed.value, "jane", []).get("sync-prs@acme/web")).toEqual(["ops"]);
+  });
+});
+
+describe("project-level ticket watches (BB-246)", () => {
+  const file = (tickets: unknown) => parseProjectFile(JSON.stringify({ version: 1, tickets }));
+  const playbooks = () => {
+    const tickets = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    const goals = parsePlaybook(LINEAR_TICKETS.replace("name: linear-tickets", "name: goals"), "goals");
+    const prs = parsePlaybook(GITHUB_PRS, "github-prs");
+    if (!tickets.ok || !goals.ok || !prs.ok) throw new Error("playbook parse failed");
+    return new Map([
+      ["linear-tickets", tickets.value],
+      ["goals", goals.value],
+      ["github-prs", prs.value],
+    ]);
+  };
+
+  it("parses a tickets list, defaulting match, and refuses a bad shape", () => {
+    const parsed = file([{ match: { labels: ["docs"], title: "Docs: *" }, playbook: "goals" }, { playbook: "linear-tickets" }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.tickets).toEqual([
+      { match: { labels: ["docs"], title: "Docs: *" }, playbook: "goals" },
+      { match: {}, playbook: "linear-tickets" },
+    ]);
+    const empty = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!empty.ok) throw new Error(empty.error);
+    expect(empty.value.tickets).toEqual([]);
+    expect(file([{ match: { labels: [] }, playbook: "goals" }])).toMatchObject({ ok: false });
+    expect(file([{ match: { labels: ["docs"] } }])).toMatchObject({ ok: false });
+    expect(file([{ match: { bogus: true }, playbook: "goals" }])).toMatchObject({ ok: false });
+    // A near-miss key is still refused by the strict project file.
+    expect(parseProjectFile(JSON.stringify({ version: 1, ticket: [] }))).toMatchObject({ ok: false });
+  });
+
+  it("reports a ticket watch naming a missing or non-ticket playbook, and a bad title glob", () => {
+    const parsed = file([{ match: { title: "x\\y" }, playbook: "github-prs" }, { playbook: "gone" }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const problems = ticketWatchProblems(parsed.value, playbooks());
+    expect(problems).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/tickets\[0\].*"github-prs" is a pr playbook, not a ticket playbook/),
+        expect.stringMatching(/tickets\[1\].*"gone" does not exist/),
+        expect.stringMatching(/tickets\[0\].*match\.title is not a glob: .*backslash/),
+      ]),
+    );
+  });
+
+  it("reports a ticket watch playbook that did not parse from the loader's error, once", () => {
+    const parsed = file([{ playbook: "goals" }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const problems = ticketWatchProblems(parsed.value, new Map(), new Map([["goals", "stewards/playbooks/goals.md: the front matter is not YAML"]]));
+    expect(problems).toEqual([expect.stringMatching(/tickets\[0\].*"goals".*not YAML/u)]);
+  });
+
+  it("names a ticket watch by its playbook", () => {
+    const parsed = file([{ playbook: "goals" }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.tickets.map((w) => ticketWatchId(w))).toEqual(["goals@ticket"]);
   });
 });
