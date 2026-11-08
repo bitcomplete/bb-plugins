@@ -1380,10 +1380,20 @@ describe("the sidebar's Provide navigation (BB-240)", () => {
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
-    fireEvent.click(slot.getByRole("button", { name: "Done" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "done", note: null, choice: null } }));
-    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_requester" });
-    slot.lifecycle.unmount();
+    // Advance past the whole bound: a Done reply that navigated anyway would
+    // have to fire its timer by now, so a `toThread` call at all is a failure.
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(slot.getByRole("button", { name: "Done" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(THREAD_NAV_WAIT_MS + THREAD_NAV_RETRY_MS);
+      });
+      expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "done", note: null, choice: null } });
+      expect(slot.inspection.navigateCalls.filter((c) => c.method === "toThread")).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      slot.lifecycle.unmount();
+    }
   });
 });
 
