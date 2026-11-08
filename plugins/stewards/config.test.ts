@@ -7,6 +7,7 @@ import {
   githubStateLabels,
   isTerminal,
   k8sTargets,
+  labelPhaseName,
   legacyOpsPresent,
   legacyRole,
   modelSpecSchema,
@@ -16,6 +17,7 @@ import {
   parseRolesFile,
   phaseInstructions,
   phaseOf,
+  playbookLabels,
   playbookNameFor,
   playbookStates,
   projectStewardProblem,
@@ -347,6 +349,24 @@ describe("playbooks", () => {
     expect(p.ready?.approval).toBe("project");
     expect(playbookStates(p)).toEqual(expect.arrayContaining(["Todo", "In Review", "Done", "Canceled"]));
     expect(p.version).toMatch(/^[0-9a-f]{12}$/u);
+  });
+
+  it("keys a phase on a label with `label:<name>`, keeping it out of the states (BB-248)", () => {
+    const withLabel = parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", '  In Progress: { stage: build, stuck: 2d }\n  "label:goal:awaiting-outcome": { stage: build, stuck: 120d }'), "linear-tickets");
+    if (!withLabel.ok) throw new Error(withLabel.error);
+    const p = withLabel.value;
+    expect(labelPhaseName("label:goal:awaiting-outcome")).toBe("goal:awaiting-outcome");
+    expect(labelPhaseName("In Progress")).toBeNull();
+    expect(playbookLabels(p)).toEqual(["goal:awaiting-outcome"]);
+    expect(playbookStates(p)).not.toContain("label:goal:awaiting-outcome");
+    expect(playbookStates(p)).toContain("In Progress");
+    // phaseOf still resolves the label key itself, for a binding's stored phase.
+    expect(phaseOf(p, "label:goal:awaiting-outcome")).toMatchObject({ name: "label:goal:awaiting-outcome", stage: "build" });
+    // A `label:` key with no name is refused; a state-only playbook has no label keys.
+    expect(parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", '  In Progress: { stage: build, stuck: 2d }\n  "label:": { stage: build }'), "linear-tickets")).toMatchObject({ ok: false });
+    const plain = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!plain.ok) throw new Error(plain.error);
+    expect(playbookLabels(plain.value)).toEqual([]);
   });
 
   it("normalises the pre-rename approval alias `me` to `user` with a warning (BB-209)", () => {

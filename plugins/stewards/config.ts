@@ -954,6 +954,25 @@ export const ESCALATION_KINDS = ["blocked", "decision", "scope", "conflict", "st
 /** Those, and the plugin's own: a ready gate waiting on its approver, a ready ticket waiting to be scheduled against work already under way, and a binding that has woken by requeue alone with an unchanged wait (BB-154). */
 export type EscalationKind = (typeof ESCALATION_KINDS)[number] | "approval" | "schedule" | "stall";
 
+/** A phase key that names a label rather than a workflow state (BB-248): `label:<name>`. */
+const LABEL_PHASE = /^label:(.+)$/iu;
+
+/** The label a `label:` phase key names, or null when the key is a workflow state. */
+export function labelPhaseName(key: string): string | null {
+  const m = LABEL_PHASE.exec(key);
+  return m === null ? null : m[1]!;
+}
+
+/** A phase key: a workflow state, or `label:<name>` with a non-empty name (BB-248). */
+const phaseKeySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .superRefine((key, ctx) => {
+    if (/^label:/iu.test(key) && labelPhaseName(key) === null) ctx.addIssue({ code: "custom", message: "a label: phase key needs a label name after the colon" });
+  });
+
 const phaseSchema = z
   .object({
     stage: z.enum(STAGES).optional(),
@@ -1117,7 +1136,7 @@ export const frontMatterSchema = z
     /** Where the entity lives; an ops playbook watches k8s, and has no entity state. */
     source: z.enum(PLAYBOOK_SOURCES),
     /** Required for every kind but ops, which has none. */
-    phases: z.record(z.string().trim().min(1).max(100), phaseSchema.nullable().transform((p) => p ?? {})).optional(),
+    phases: z.record(phaseKeySchema, phaseSchema.nullable().transform((p) => p ?? {})).optional(),
     terminal: z.array(z.string().trim().min(1).max(100)).default([]),
     ready: readySchema.optional(),
     /**
@@ -1300,8 +1319,11 @@ export function phaseInstructions(playbook: Playbook, state: string): string | n
   return key === undefined ? null : playbook.sections[key]!;
 }
 
-/** Every source state the playbook names, for validation against the source (Linear workflow states, or GitHub status labels). */
-export const playbookStates = (playbook: Playbook): string[] => [...Object.keys(playbook.phases), ...playbook.terminal, ...(playbook.ready !== null && typeof playbook.ready.approval === "object" ? [playbook.ready.approval.state] : [])];
+/** Every source state the playbook names, for validation against the source (Linear workflow states, or GitHub status labels). A `label:` phase key is not a state (BB-248). */
+export const playbookStates = (playbook: Playbook): string[] => [...Object.keys(playbook.phases).filter((p) => labelPhaseName(p) === null), ...playbook.terminal, ...(playbook.ready !== null && typeof playbook.ready.approval === "object" ? [playbook.ready.approval.state] : [])];
+
+/** The label names the playbook's `label:` phase keys name, for validation against the source (BB-248). */
+export const playbookLabels = (playbook: Playbook): string[] => Object.keys(playbook.phases).flatMap((p) => { const name = labelPhaseName(p); return name === null ? [] : [name]; });
 
 /**
  * The states GitHub produces itself rather than reading from a label: an open

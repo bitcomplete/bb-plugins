@@ -836,7 +836,10 @@ and reports each repo whose alerts the `gh` login cannot read.
 
 Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
 `source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
-stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
+stuck }`, or `label:<name>` → the same to key a phase on a label; a present
+matching label wins over the state, and a `label:` phase is entered by adding
+the label and leaving the workflow state; none for `ops`), `terminal` (at
+least one; none for `ops`), `ready` (`checklist`,
 `substantial`, `approval: project` (default), `user` or `{ state: … }` (the
 pre-BB-232 `{ linear-state: … }` still parses),
 `substantial` (reviews only, BB-207: the criteria a reviewer judges the diff

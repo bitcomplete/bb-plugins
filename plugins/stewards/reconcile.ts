@@ -6,7 +6,7 @@
 // The rule throughout: an event is a hint to look again, never the input a
 // decision is made from. Every function here compares two states.
 import { createHash } from "node:crypto";
-import { isTerminal, phaseOf, type Playbook } from "./config.js";
+import { isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
 import type { Deployments } from "./deploy.js";
 import { isMarkerComment } from "./gate.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
@@ -890,8 +890,18 @@ export function endingDeadline(b: Pick<Binding, "ending" | "endingAt" | "followT
   return b.endingAt === null ? null : b.endingAt + turnTimeoutMs;
 }
 
-/** The phase and stage for the entity's state, or nulls when the playbook does not name it. */
-export function phaseAndStage(playbook: Playbook, state: string): { phase: string; stage: Binding["stage"] } {
+/**
+ * The phase and stage for an entity: a present `label:<name>` phase key first,
+ * in playbook order and matching the label ignoring case, then its state
+ * (BB-248). `labels` defaults to none, which is the state-only behaviour.
+ */
+export function phaseAndStage(playbook: Playbook, state: string, labels: readonly string[] = []): { phase: string; stage: Binding["stage"] } {
+  const present = new Set(labels.map((l) => l.toLowerCase()));
+  const key = Object.keys(playbook.phases).find((p) => {
+    const name = labelPhaseName(p);
+    return name !== null && present.has(name.toLowerCase());
+  });
+  if (key !== undefined) return { phase: key, stage: playbook.phases[key]!.stage ?? null };
   const p = phaseOf(playbook, state);
   return { phase: p?.name ?? state, stage: p?.stage ?? null };
 }

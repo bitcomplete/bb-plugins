@@ -45,6 +45,7 @@ import {
   parseProjectFile,
   parseRolesFile,
   phaseOf,
+  playbookLabels,
   playbookNameFor,
   playbookPath,
   playbookStates,
@@ -3352,7 +3353,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
 
-      const { phase, stage } = phaseAndStage(playbook, entity.state);
+      const { phase, stage } = phaseAndStage(playbook, entity.state, entity.labels);
       const currentSpec = specHashFor(b, entity);
       const changes: Change[] = [];
       let ready = b.ready;
@@ -4798,7 +4799,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A GitHub issue has no Linear parents: sub-issue handling is skipped
       // rather than reading Linear for an entity that lives on GitHub (BB-234).
       const parent = kind === "ticket" && entity.source === "linear" ? await managedAncestor(entity) : null;
-      const { phase, stage } = phaseAndStage(playbook, entity.state);
+      const { phase, stage } = phaseAndStage(playbook, entity.state, entity.labels);
       let b: Binding;
       try {
         b = store.create({
@@ -7859,7 +7860,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (taken !== null && taken.id !== b.id) return { error: `${entity.key} already has a steward (${taken.endedAt === null ? "open" : "ended"}); it cannot replace ${b.entityKey}.` };
       const config = await loadConfig(b.projectId);
       const playbook = config === null ? null : bindingPlaybook(config, b);
-      const { phase, stage } = playbook === null ? { phase: entity.state, stage: null } : phaseAndStage(playbook, entity.state);
+      const { phase, stage } = playbook === null ? { phase: entity.state, stage: null } : phaseAndStage(playbook, entity.state, entity.labels);
       const oldKey = b.entityKey;
       const oldUrl = b.url ?? b.entityKey;
       const why = `Replaced by ${entity.key}.`;
@@ -9811,11 +9812,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (githubTicket === null) await ensureLabels("github", [filingGithub], GITHUB_TODO_LABEL, lines);
         }
       }
-      const validate = async (source: Source, units: string[], states: string[]) => {
+      const validate = async (source: Source, units: string[], states: string[], labels: string[] = []) => {
         if (units.length === 0) return;
         try {
           const out = await sourceRpc(source, "sourceValidate", { units, label: config.file.label, states }, sourceContract.sourceValidate.output);
-          if (out.error !== null) lines.push(`problem: ${source}: ${out.error}`);
+          if (out.error !== null) {
+            lines.push(`problem: ${source}: ${out.error}`);
+            return;
+          }
           for (const u of out.units) {
             if (!u.found) lines.push(`problem: ${source}: ${u.unit} is not visible`);
             else if (!u.labelFound) lines.push(`problem: ${source}: ${u.unit} has no label ${config.file.label}`);
@@ -9823,10 +9827,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         } catch (error) {
           lines.push(`problem: could not validate against ${source}: ${errorMessage(error)}`);
+          return;
+        }
+        // BB-248: a `label:` phase key names a label, not a workflow state, so
+        // it is checked through the source's single-label field. The source
+        // reads one label per call, so this is one read per distinct name.
+        for (const name of labels) {
+          if (lc(name) === lc(config.file.label)) continue;
+          try {
+            const out = await sourceRpc(source, "sourceValidate", { units, label: name, states: [] }, sourceContract.sourceValidate.output);
+            if (out.error !== null) {
+              lines.push(`problem: ${source}: ${out.error}`);
+              continue;
+            }
+            for (const u of out.units) if (u.found && !u.labelFound) lines.push(`problem: ${source}: ${u.unit} has no label ${name}`);
+          } catch (error) {
+            lines.push(`problem: could not validate against ${source}: ${errorMessage(error)}`);
+          }
         }
       };
-      await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket));
-      await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket));
+      await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket), linearTicket === null ? [] : playbookLabels(linearTicket));
+      await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket), githubTicket === null ? [] : playbookLabels(githubTicket));
       if (filingGithub !== null && priorityLabels.length > 0) await validate("github", [filingGithub], priorityLabels);
       if (usesKind(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];

@@ -404,7 +404,8 @@ Plugin code. No model turn.
    `requeueAfter` coming due. Rings are debounced per binding for a few
    seconds, so a push and its three check runs are one ring.
 2. The snapshot is built through the source plugin's `snapshot` RPC:
-   - entity fields, and the phase and stage they map to;
+   - entity fields, and the phase and stage they map to (a present
+     `label:<name>` phase key wins over the state, BB-248);
    - human comments since the last judgment turn, excluding this thread's
      signed ones;
    - linked pull requests with reviews and checks;
@@ -932,6 +933,16 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 - **Phases are the entity's own states**, so the playbook needs no state
   machine. A ticket moved by hand is followed.
+- **A phase may be keyed on a label too (BB-248).** A `label:<name>` key in
+  `phases` matches a present label on the entity, ignoring case, and wins over
+  the state-keyed phase; with no matching label the state decides as before.
+  A `label:` phase is entered by adding the label and leaving the workflow
+  state where it is, on both sources; `set-state` still covers moving a Linear
+  state and swapping GitHub status labels. github-watcher's synthesised
+  `status:*` state is unchanged, so a GitHub playbook may key on either form
+  and one playbook can carry both sources' keys. `bb stewards check` warns
+  when a `label:` key names a label the Linear team or GitHub repo does not
+  have, and does not report it as a missing workflow state.
 - **`deployment` is where a merge is confirmed live (BB-53).** It names the
   source (`github`), the target repo and environment, the rule the steward
   applies to decide whether a deployment carries a merge, and the timeout. A
