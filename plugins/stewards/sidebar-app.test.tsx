@@ -9,7 +9,7 @@ import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
 import { setBoardRoute } from "./board-route.js";
 import { setStewardsSidebarCommand } from "./sidebar-command.js";
-import { resetOpenPrHandoff, rowRenderCounts } from "./app.js";
+import { resetOpenPrHandoff, rowRenderCounts, THREAD_NAV_RETRY_MS, THREAD_NAV_WAIT_MS } from "./app.js";
 import { needActions, questionActions } from "./server.js";
 
 const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
@@ -1316,6 +1316,84 @@ describe("the inline needs-you actions (BB-76)", () => {
     await waitFor(() => expect(slot.queryByRole("button", { name: "Stack" })).toBeNull());
     expect(calls).toBeGreaterThan(1);
     slot.lifecycle.unmount();
+  });
+});
+
+// BB-240: the sidebar's Provide spawns the requester thread on the server, but
+// the thread reaches the client through the thread-list subscription, not the
+// RPC reply. Navigate only once the live list knows it, as the page does
+// (BB-177), so the steward's row is there to expand and highlight.
+describe("the sidebar's Provide navigation (BB-240)", () => {
+  const provideSidebar = (threads: PluginSidebarThread[]) => ({
+    sidebarThreads: { projects, threads },
+    rpc: {
+      stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "provide-secret", url: null, what: "Add the token" })] } }),
+      stewardsNeedAction: () => ({ ok: true, message: "opening", threadId: "thr_requester" }),
+    } as never,
+  });
+
+  it("returns the requester thread id and navigates once it is in the live list", async () => {
+    const slot = await renderSidebar(provideSidebar([thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_requester", displayTitle: "Provide the token" })]));
+    await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Provide" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "provide", note: null, choice: null } }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_requester" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("waits for a late subscription before navigating, then navigates when the thread appears", async () => {
+    const threads: PluginSidebarThread[] = [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })];
+    const slot = await renderSidebar(provideSidebar(threads));
+    await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Provide" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "provide", note: null, choice: null } }));
+    // The reply is in, but the list has not delivered the thread yet.
+    await new Promise((r) => setTimeout(r, THREAD_NAV_RETRY_MS / 2));
+    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_requester" });
+    threads.push(thread({ id: "thr_requester", displayTitle: "Provide the token" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_requester" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("navigates anyway once the bounded wait elapses", async () => {
+    const slot = await renderSidebar(provideSidebar([thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })]));
+    await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(slot.getByRole("button", { name: "Provide" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(THREAD_NAV_WAIT_MS + THREAD_NAV_RETRY_MS);
+      });
+      expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_requester" });
+    } finally {
+      vi.useRealTimers();
+      slot.lifecycle.unmount();
+    }
+  });
+
+  it("does not navigate on Done, which carries no thread id", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "provide-secret", url: null, what: "Add the token" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done", threadId: null }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
+    // Advance past the whole bound: a Done reply that navigated anyway would
+    // have to fire its timer by now, so a `toThread` call at all is a failure.
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(slot.getByRole("button", { name: "Done" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(THREAD_NAV_WAIT_MS + THREAD_NAV_RETRY_MS);
+      });
+      expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "done", note: null, choice: null } });
+      expect(slot.inspection.navigateCalls.filter((c) => c.method === "toThread")).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      slot.lifecycle.unmount();
+    }
   });
 });
 

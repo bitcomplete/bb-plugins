@@ -1332,7 +1332,7 @@ requester thread and bb's secure form) or `done`.
 | `approve-pr` | plugin, when a `user`-marked owner-reviewed pull request is forwarded to the user, or the project steward's approval is not the gate's | the pull request | owner approval seen in the snapshot | **Approve**: on a teammate's pull request posts an unsigned APPROVED review; on the owner's own (an agent PR) posts the unsigned comment "Approved <sha> from the Stewards page". **Decline** posts a CHANGES_REQUESTED review on a teammate's pull request (a comment when there is no note) and does not ask the same round again |
 | `merge` | plugin, when the lane gate is met, no worker is running and the pull request is the owner's own or a dependency bot's (a teammate's pull request files none unless its playbook sets `owner-merges: true`), or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
-| `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it; **Done** is the manual escape hatch |
+| `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it on both the page and the sidebar; **Done** is the manual escape hatch |
 | `configure` | steward, for a step outside the repos (install an app, grant a permission, enable an event, set a setting) | the external page where it happens | the user presses Done, or the steward observes it done | **Done** (with an optional note, saved as guidance) |
 
 The rules that hold:
@@ -1882,7 +1882,12 @@ cannot drift: a fixed-choice question or a `decide` need carries one button per
 choice, an `approve-spec` row **Open ticket** / **Approve** / **Decline**, an
 `approve-pr` row **Open PR** / **Approve** / **Decline**, a `merge` row
 **Open PR** / **Merge**, a `configure` row **Done**, a `provide-secret` row
-**Provide** / **Done**, and a free-text question or need **Answer**. A link
+**Provide** / **Done**, and a free-text question or need **Answer**. **Provide**
+is the one action that navigates to the thread it spawns: both surfaces carry
+the requester thread id in the reply and wait, bounded, for it to reach the
+live thread list before navigating, so the steward's row is expanded with the
+requester highlighted (BB-177, BB-240); a question's **Answer** and a
+`provide-secret` row's **Done** carry no thread id and do not navigate. A link
 action records its URL in the plugin's one-shot handoff and navigates to the
 effort's detail view, whose `navigate.openUrl` opens it from inside the pane
 (BB-102); the RPC actions make the same `stewardsAnswerQuestion` /
