@@ -186,6 +186,14 @@ export const sessionEventSchema = z
      * keeps requiring a reply as before.
      */
     tagged: z.boolean().default(true),
+    /**
+     * True when the service routed a reply in a conversation bb opened
+     * (BB-261): a DM or group DM the plugin started, or the thread of a
+     * channel message it started. A missing field (an older service) is read
+     * as false, so the hold-and-confirm path stands unless the plugin's own
+     * record agrees that it opened the conversation (BB-262).
+     */
+    opened: z.boolean().default(false),
     channel: z.string().min(1).max(200),
     /**
      * The channel the user was viewing, on an assistant context change; "" on
@@ -358,6 +366,36 @@ export function fetchBotChannels(fetchImpl: FetchLike, baseUrl: string, signal: 
 }
 
 /**
+ * POST /v1/slack/conversations (BB-261): open a DM, group DM or channel
+ * thread as the connection's owner, and return the leasable session. The
+ * opener is posted verbatim; the plugin prepends its own owner line. Exactly
+ * one of `users` or `channel` names the target.
+ */
+export const startConversationResponseSchema = z
+  .object({
+    session: z.string().min(1).max(200),
+    /** The opaque capability to echo to `POST /v1/subscribe`; secret-like. */
+    capability: z.string().max(2000).default(""),
+    permalink: z.string().max(2000).default(""),
+    channel: z.string().max(200).default(""),
+    participants: z.array(personWire).max(1000).default([]),
+  })
+  .loose();
+export type StartConversationResponse = z.infer<typeof startConversationResponseSchema>;
+
+/** A conversation to open: one user or several (`users`), or a channel id. */
+export type StartConversationTarget =
+  | { text: string; users: string[] }
+  | { text: string; channel: string };
+
+/** A conversation to open, with the connection that opens it. */
+export type StartConversationRequest = StartConversationTarget & { connection: string };
+
+export function startConversation(fetchImpl: FetchLike, baseUrl: string, request: StartConversationRequest, signal: AbortSignal): Promise<StartConversationResponse> {
+  return postJson(fetchImpl, baseUrl, "/v1/slack/conversations", request, startConversationResponseSchema, "the Slack conversation start", signal);
+}
+
+/**
  * POST /v1/slack/bot/join: have the app's bot join a public channel, so the
  * developer need not /invite it from Slack. The service joins with the bot
  * token it holds; the pod sends only its connection id and the channel id.
@@ -520,6 +558,8 @@ export interface HooksLoop {
   ephemeral(ephemeral: Omit<SessionEphemeral, "connection">, signal: AbortSignal): Promise<void>;
   /** Have the bot join a public channel. Throws HooksRequestError, or an Error when there is no connection. */
   joinChannel(channel: string, signal: AbortSignal): Promise<void>;
+  /** Open a DM, group DM or channel thread as the connection's owner. Throws HooksRequestError, or an Error when there is no connection. */
+  startConversation(request: StartConversationTarget, signal: AbortSignal): Promise<StartConversationResponse>;
   /** Mint a sign-in URL for this connection. Throws when there is no connection. */
   signinStart(signal: AbortSignal): Promise<SigninStartResponse>;
   /** Complete a sign-in flow on the connection that started it. */
@@ -739,6 +779,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
 
     async joinChannel(channel, signal) {
       await joinChannel(deps.fetch, deps.baseUrl, requireConnection(), channel, signal);
+    },
+
+    async startConversation(request, signal) {
+      return startConversation(deps.fetch, deps.baseUrl, { connection: requireConnection(), ...request }, signal);
     },
 
     async signinStart(signal) {
