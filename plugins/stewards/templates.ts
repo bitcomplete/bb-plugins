@@ -178,7 +178,8 @@ ready:
     - public API or contract change
     - estimate >= 3
   approval: project
-may: [comment, edit-description, set-state, set-labels, open-pr, request-review, spawn-worker]
+promote: "A sub-issue that needs more than one pull request, its own approval, or work in a repo the parent does not touch."
+may: [comment, edit-description, set-state, set-labels, create-sub-issue, open-pr, request-review, spawn-worker]
 models:
   steward: claude/claude-sonnet-5-5/medium
   worker: claude/claude-opus-5-5/high
@@ -244,8 +245,21 @@ move the issue to \`status:in-progress\` (remove \`status:todo\`, add
 \`status:in-progress\`). A new spec needs approval again, and is asked for the
 same way.
 
-A GitHub issue has no sub-issues here: do the work in this binding, and open
-one pull request per slice if it needs several.
+A GitHub issue can have native sub-issues, so file a child as a real
+sub-issue of its parent in the same action, keeping a \`Part of #{parent}\`
+line in the body for a reader. Create the child and read back its numeric id,
+then attach it:
+
+\`\`\`
+child=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
+
+…" | grep -oE '[0-9]+$' | xargs -I{} gh api repos/{owner}/{repo}/issues/{} --jq .id)
+gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$child
+\`\`\`
+
+\`-F\` sends the numeric id as an integer. A child missing from the parent's
+next wake under Sub-issues is re-attached with the second command, not
+re-filed.
 
 ## status:in-progress
 

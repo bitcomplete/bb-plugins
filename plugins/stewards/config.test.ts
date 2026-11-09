@@ -516,9 +516,11 @@ describe("the GitHub issue playbook (BB-234)", () => {
     expect(parsed.value).toMatchObject({ kind: "ticket", source: "github" });
     expect(Object.keys(parsed.value.phases)).toEqual(["open", "status:todo", "status:in-progress", "status:in-review"]);
     expect(parsed.value.terminal).toEqual(["closed", "closed (completed)", "closed (not planned)", "closed (duplicate)"]);
-    // No sub-issue handling: create-sub-issue is not in `may`, and there is no promote rule.
-    expect(parsed.value.may).not.toContain("create-sub-issue");
-    expect(parsed.value.promote).toBeNull();
+    // GitHub sub-issues (BB-250): create-sub-issue is in `may`, the promote rule is set,
+    // and the status:todo phase carries the attach commands.
+    expect(parsed.value.may).toContain("create-sub-issue");
+    expect(parsed.value.promote).toBe("A sub-issue that needs more than one pull request, its own approval, or work in a repo the parent does not touch.");
+    expect(phaseInstructions(parsed.value, "status:todo")).toContain("sub_issues");
     expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/gh issue\s+close/u);
     expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
     expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");
