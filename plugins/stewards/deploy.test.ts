@@ -109,6 +109,25 @@ describe("recording merged pull requests", () => {
     expect(resolved["acme/web#11"]!.note).toBe("Deployment 7 reported failure (Merge commit re-resolved to mergesh)");
   });
 
+  // BB-259: a `merged` watch whose sha is re-resolved while it already holds a
+  // success deployment is put back to `deploying`, so the reconcile's carries
+  // re-evaluation loop settles it in the same pass, and the stale not-yet note
+  // is replaced rather than left to contradict the re-resolved sha.
+  it("re-evaluates a merged watch that holds a success deployment when its merge sha is re-resolved (BB-259)", () => {
+    const before = recordMerged({}, { entity: pull({ key: "acme/web#12" }, { merged: true, headSha: "headsha4", mergeCommit: "stacked1" }), pulls: [] }, [target], NOW);
+    const deploying = applyDeployment(before, target, deployment(), NOW + 1000).deployments;
+    const notYet = reportDeployment(deploying, { state: "not-yet", note: "image-tag: run 1 pinned stacked1, which does not contain merge stacked1" }, NOW + 2000, target.timeout).deployments;
+    expect(notYet["acme/web#12"]).toMatchObject({ state: "merged", deploymentId: 7, deploymentState: "success" });
+    const after = recordMerged(notYet, { entity: pull({ key: "acme/web#12" }, { merged: true, headSha: "headsha4", mergeCommit: "base0001" }), pulls: [] }, [target], NOW + 3000);
+    expect(after["acme/web#12"]).toMatchObject({ state: "deploying", mergeSha: "base0001", deploymentId: 7, deploymentState: "success", note: "Merge commit re-resolved to base000" });
+  });
+
+  it("leaves a re-resolved watch merged when it holds no success deployment (BB-259)", () => {
+    const before = recordMerged({}, { entity: pull({ key: "acme/web#13" }, { merged: true, headSha: "headsha5", mergeCommit: null }), pulls: [] }, [target], NOW);
+    const after = recordMerged(before, { entity: pull({ key: "acme/web#13" }, { merged: true, headSha: "headsha5", mergeCommit: "mergesha5" }), pulls: [] }, [target], NOW + 1000);
+    expect(after["acme/web#13"]).toMatchObject({ state: "merged", mergeSha: "mergesha5", deploymentId: null });
+  });
+
   it("keys two targets on one pull request independently, and a single unnamed target as before", () => {
     const devbox: DeploymentTarget = { ...target, repo: "bitcomplete/devbox", environment: "production", name: "devbox" };
     const both = recordMerged({}, observed(), [target, devbox], NOW);

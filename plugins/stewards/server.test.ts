@@ -11751,6 +11751,46 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", note: expect.stringMatching(/contains merge aaaaaaa/u) });
   });
 
+  // BB-259: a `merged` watch judged not-yet against a stacked pull request's
+  // sha, then re-resolved to the base pull request's squash commit while it
+  // already holds the success deployment that pins that commit, must be
+  // re-evaluated in the same reconcile and settle deployed, not time out.
+  it("re-evaluates a re-resolved stacked watch against its existing success deployment (BB-259)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked" }));
+    // The base pull request is not merged when the steward reports it, so the
+    // override does not apply and the watch keeps the stacked sha.
+    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: false, base: "main", head: "feature-base" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "In Review", summary: "Stacked PR merged into the base.", nextAction: "Await the base deployment.", actor: "other", landedIn: "acme/web#9" }, steward);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ mergeSha: "stacked1" });
+
+    // A success deployment pins the stacked sha's absence: the carries check
+    // says not-yet and the watch goes back to `merged` holding deployment 7.
+    t.sourceCompares.set("acme/bb-gate stacked1 main", "behind");
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deploymentId: 7, deploymentState: "success", note: expect.stringMatching(/does not contain merge/u) });
+
+    // The base pull request is now observed merged with squash commit X, and
+    // the same success deployment pins X. The next reconcile re-resolves the
+    // watch and settles it deployed in the same pass.
+    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", head: "feature-base" }));
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", mergeSha: "aaaaaaa1", deploymentId: 7, deploymentState: "success", note: expect.stringMatching(/contains merge aaaaaaa/u) });
+
+    // The deadline does not fire a false timeout later.
+    t.advance(61 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    expect(t.sends.filter((s) => s.threadId === steward).map((s) => s.text).join("\n")).not.toMatch(/No matching deployment for acme\/web#7/u);
+  });
+
   // BB-204: a deployment that has not reached a final status cannot settle a
   // watch, so it is a quiet note, not a steward turn.
   it("records an in_progress or created deployment as a quiet note and wakes nobody (BB-204)", async () => {
