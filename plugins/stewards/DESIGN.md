@@ -1012,7 +1012,7 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 - Stewards are children of their parent steward, or of the project steward
   when they have none, with parent notifications off (§4), so bb's thread tree
   nests each under its parent. bb does not re-parent a live thread when its
-  parent ends: a child spawned under a goal that later ends stays under it
+  parent ends: a child spawned under an initiative that later ends stays under it
   visually, even though the binding's `parentBindingId` moved up (`endBinding`).
   The sidebar's own list (§21) derives the same nesting from each binding's
   `parentKey`, one level deep, so the two views agree. Who reports to whom is in

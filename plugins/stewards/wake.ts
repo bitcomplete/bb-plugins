@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, GITHUB_TODO_LABEL, GOAL_LABEL, GOAL_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
@@ -44,6 +44,7 @@ export const STANDING_RULES = [
   "- **A credential is a decision escalation the project steward forwards as a secret.** Raise it with `steward_report { escalate }`, naming the variable and purpose in `context`. Forward it with `resolution: \"secret\"` and either `writeEnv`/`worker` (the dotenv a worker reads) or `setting` (a plugin secret setting); the plugin spawns a requester thread that opens bb's secure form. `secret` is the only resolution even when the ticket or spec says the owner produces or seals it by hand, corrected at spec approval. Never paste a secret or route the user to a script.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
   '- **A spec that says "do not merge before X is Done" is a merge hold.** Report it with `steward_report { mergeBehind: ["X"] }`, never as a `merge` need or as free text alone: while it stands the plugin files no Merge item (so the effort shows as held, not "needs you"), it is a live wake source, and it lifts itself, waking you, once every named binding has merged its pull requests or ended. Each report replaces the set, and `mergeBehind: []` clears it.',
+  "- **The plugin merges once the lane gate is met, when the pull request targets the default branch.** When a pull request's gate is met, no worker is in flight, and its base is the repository's default branch, the plugin squash-merges it if the binding's playbook permits `merge` — a ticket binding always does, a `pr` binding when its `may` includes `merge` — and wakes you with the merge so you proceed to the deployment watch. Do not file a Merge item for such a pull request: the item on the page is for a playbook that does not permit `merge`, for a stacked pull request whose base is another pull request's branch (the worker or a person merges it into its parent's branch while that pull request is open), or for a merge the plugin attempted and GitHub refused (a conflict or branch protection), which is also raised to the project steward.",
 ];
 /**
  * The fixed first line of every brief, and of the per-turn system context the
@@ -87,10 +88,21 @@ const DESCRIPTION_CHARS = 4000;
 const WORKER_SKILLS =
   "Write the worker's task so it follows the `build-tickets` skill, which tells the worker to spawn its reviewer with the `pr-reviewer` skill; a `.bb/skills/<name>` copy overrides either.";
 
+/**
+ * Whether the plugin itself merges this binding's gate-met pull request
+ * (BB-257): a ticket binding always runs the full loop and so always merges;
+ * a `pr` binding only when its playbook's `may` includes `merge`; a `review`
+ * binding (a teammate's pull request) never does, because its author merges
+ * (BB-170). One function decides it, so the worker skill line and the
+ * gate-met branch of `syncNeeds` cannot disagree.
+ */
+export function bindingMayMerge(binding: Pick<Binding, "kind">, playbook: Pick<Playbook, "may">): boolean {
+  return binding.kind === "ticket" || (binding.kind === "pr" && playbook.may.includes("merge"));
+}
+
 /** The skill line for a binding, or empty when its playbook's worker does not merge. */
 function workerSkillsLine(binding: Binding, playbook: Playbook): string[] {
-  const runsTheLoop = binding.kind === "ticket" || (binding.kind === "pr" && playbook.may.includes("merge"));
-  return runsTheLoop ? ["", WORKER_SKILLS] : [];
+  return bindingMayMerge(binding, playbook) ? ["", WORKER_SKILLS] : [];
 }
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
@@ -1264,10 +1276,11 @@ function criteriaKeys(description: string): string[] {
 }
 
 /**
- * A goal's progress (BB-243): `met` is the number of the description's
+ * An initiative's progress (BB-243): `met` is the number of the description's
  * criteria a `**Met:**` comment names, `criteria` the number of checklist
- * lines under its `Criteria` heading. Null when the ticket is not a goal — it
- * carries neither the `goal` label nor the `goal` playbook.
+ * lines under its `Criteria` heading. Null when the ticket is not an
+ * initiative — it carries neither the `initiative` label nor the `initiative`
+ * playbook.
  *
  * A criterion is named when a `**Met:**` comment's first line, normalised,
  * equals it or either is a prefix of the other. Evidence and the signature on
@@ -1277,16 +1290,17 @@ function criteriaKeys(description: string): string[] {
  * null.
  *
  * `met` is null rather than 0 when no `**Met:**` comment can be read (or the
- * snapshot has not been read yet), so a goal that has not been driven reads
- * `unknown`, never `0`: an empty count cannot be told from an unread history,
- * and only one of them means no criterion is met. `capped` is true when the
- * snapshot held a full page of comments, so the count is a lower bound.
+ * snapshot has not been read yet), so an initiative that has not been driven
+ * reads `unknown`, never `0`: an empty count cannot be told from an unread
+ * history, and only one of them means no criterion is met. `capped` is true
+ * when the snapshot held a full page of comments, so the count is a lower
+ * bound.
  */
-export function goalProgress(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): { met: number | null; criteria: number | null; capped: boolean } | null {
+export function initiativeProgress(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): { met: number | null; criteria: number | null; capped: boolean } | null {
   if (binding.kind !== "ticket") return null;
   const entity = binding.lastSnapshot?.entity;
-  const byLabel = entity !== undefined && entity.labels.some((l) => l.toLowerCase() === GOAL_LABEL);
-  if (!byLabel && binding.playbook !== GOAL_PLAYBOOK) return null;
+  const byLabel = entity !== undefined && entity.labels.some((l) => l.toLowerCase() === INITIATIVE_LABEL);
+  if (!byLabel && binding.playbook !== INITIATIVE_PLAYBOOK) return null;
   if (entity === undefined) return { met: null, criteria: null, capped: false };
   const criteria = criteriaKeys(entity.description ?? "");
   const names = new Set<string>();
@@ -1305,18 +1319,18 @@ export function goalProgress(binding: Pick<Binding, "kind" | "playbook" | "lastS
 }
 
 /**
- * A goal's progress as one flag for the project steward's binding list and
- * digest, or null for a binding that is not a goal. `met 3/7` counts the
- * criteria the `**Met:**` comments name; `met unknown` is an unreadable
- * history, `met ≥3/7` a truncated one, and `met 3` a description with no
- * criteria section.
+ * An initiative's progress as one flag for the project steward's binding list
+ * and digest, or null for a binding that is not an initiative. `criteria 3/7`
+ * counts the criteria the `**Met:**` comments name; `criteria unknown` is an
+ * unreadable history, `criteria ≥3/7` a truncated one, and `criteria 3` a
+ * description with no criteria section.
  */
-export function goalProgressFlag(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): string | null {
-  const p = goalProgress(binding);
+export function initiativeProgressFlag(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): string | null {
+  const p = initiativeProgress(binding);
   if (p === null) return null;
-  if (p.met === null) return "goal met unknown";
+  if (p.met === null) return "criteria unknown";
   const met = `${p.capped ? "≥" : ""}${p.met}`;
-  return p.criteria === null ? `goal met ${met}` : `goal met ${met}/${p.criteria}`;
+  return p.criteria === null ? `criteria ${met}` : `criteria ${met}/${p.criteria}`;
 }
 
 /**
@@ -1463,7 +1477,7 @@ export function formatProjectWake(input: {
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
     const conflicts = conflictsOf(b, allOpen);
-    const flags = [goalProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
+    const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${day(b.requeueUntil)}`}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   const bindings = out.splice(0);
@@ -1624,15 +1638,15 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   if (r.previous === null) out.push("### Your previous digest", "", "None yet.", "");
   else out.push(`### Your previous digest (${iso(r.previous.at)})`, "", quote(clip(r.previous.text, PREVIOUS_DIGEST_CHARS)), "");
 
-  // A goal's progress rides on its line, wherever the digest lists it (BB-243).
-  const goalFlag = (b: Binding): string => {
-    const flag = goalProgressFlag(b);
+  // An initiative's progress rides on its line, wherever the digest lists it (BB-243).
+  const initiativeFlag = (b: Binding): string => {
+    const flag = initiativeProgressFlag(b);
     return flag === null ? "" : ` [${flag}]`;
   };
   const moved = [
     ...r.moved.map((b) => {
       const s = b.status;
-      return `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}), moved ${b.advancedAt === null ? "?" : iso(b.advancedAt)}: ${s === null ? "no report yet" : `${oneLine(s.summary)} Next: ${oneLine(s.nextAction)} (${s.actor})`}${goalFlag(b)}`;
+      return `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}), moved ${b.advancedAt === null ? "?" : iso(b.advancedAt)}: ${s === null ? "no report yet" : `${oneLine(s.summary)} Next: ${oneLine(s.nextAction)} (${s.actor})`}${initiativeFlag(b)}`;
     }),
     ...r.ended.map((b) => `- Ended: ${b.entityKey} (${b.kind}${b.title === null ? "" : `, ${oneLine(b.title, 120)}`}), ${b.endReason ?? "ended"} at ${b.endedAt === null ? "?" : iso(b.endedAt)}`),
     ...r.answered.map((q) => `- Answered: ${q.id} "${oneLine(q.question, 200)}" → ${oneLine(q.answer ?? "", 300)} (${q.answeredBy === "user" ? "by the user, on the stewards page" : "recorded by you"})`),
@@ -1666,14 +1680,14 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
 
   const stuck = [
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
-    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}${goalFlag(b)}`),
+    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}${initiativeFlag(b)}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
 
   // BB-247: a dated wait is not a quiet stall: the plugin will wake the steward
   // at the date, so it is listed in its own section rather than under "waiting
   // with no wake source".
-  const dated = (r.datedWaits ?? []).map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting on ${oneLine(b.status?.waitingOn ?? "")} until ${day(b.requeueUntil!)}${goalFlag(b)}`);
+  const dated = (r.datedWaits ?? []).map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting on ${oneLine(b.status?.waitingOn ?? "")} until ${day(b.requeueUntil!)}${initiativeFlag(b)}`);
   out.push("### Dated waits", "", ...capped(dated, "Nothing."), "");
 
   // BB-154: the quiet stall, visible once a day even before the requeue
@@ -1681,7 +1695,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   // a stall can be open with the mark already cleared (the stall is itself a
   // live source), so the two lists are separate.
   const noWake = [
-    ...r.noWakeSource.map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting with no wake source${b.status?.waitingOn === null || b.status?.waitingOn === undefined ? "" : `: ${oneLine(b.status.waitingOn)}`}${b.requeueWakeCount > 0 ? ` (${b.requeueWakeCount} requeue-only wake${b.requeueWakeCount === 1 ? "" : "s"})` : ""}${goalFlag(b)}`),
+    ...r.noWakeSource.map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting with no wake source${b.status?.waitingOn === null || b.status?.waitingOn === undefined ? "" : `: ${oneLine(b.status.waitingOn)}`}${b.requeueWakeCount > 0 ? ` (${b.requeueWakeCount} requeue-only wake${b.requeueWakeCount === 1 ? "" : "s"})` : ""}${initiativeFlag(b)}`),
     ...r.stall.map(({ escalation: x, from }) => `- ${from.entityKey}: stall escalation ${x.id} with the project steward, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
   ];
   out.push("### Waiting with no wake source", "", ...capped(noWake, "Nothing."), "");
@@ -1696,7 +1710,7 @@ export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Line
 - Before you ask the user something in a reply, record it with steward_update { ask: { question, context } } (with binding when it concerns one); close it with steward_update { resolve: "<question id>", answer } when they answer. Every wake lists the questions still open, so list them from there, not from memory.
 - You are woken by escalations, at the end of each nightly pass to write the morning digest, and by the user. When the user says something like "hold everything touching billing", turn it into steward_update calls on the bindings it concerns, and say what you changed.
 - You schedule the work so that two tickets do not change the same files at once. Every binding reports what it touches; when a ready ticket overlaps work in flight at file level, the plugin asks you with a schedule escalation. Hold it behind that work (steward_update { binding, hold, behind: [keys] }: the hold lifts itself when the work lands), stack it on a pull request still being built (steward_update { binding, hold, stack: [keys] }: the hold lifts itself, with the branch, when that pull request opens), or let it start (guidance + resolve). Use the same holds to sequence any two tickets whose overlap you can see in the bindings list.
-- A goal's binding line carries \`goal met <met>/<criteria>\`, counted from its \`**Met:**\` comments against the criteria in its description (BB-243). \`unknown\` means no \`**Met:**\` comment could be read — never that none is met — so a goal that has not been driven yet is not mistaken for one with nothing met.
+- An initiative's binding line carries \`criteria <met>/<criteria>\`, counted from its \`**Met:**\` comments against the criteria in its description (BB-243). \`unknown\` means no \`**Met:**\` comment could be read — never that none is met — so an initiative that has not been driven yet is not mistaken for one with nothing met.
 - Budget is advisory: keep the total work sensible through priority and holds.
 
 Wait for the user or a wake; there is nothing to do right now.`;
