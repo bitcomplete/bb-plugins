@@ -8233,6 +8233,82 @@ describe("needs you items", () => {
     const b = t.hooks.store.find("acme/web#14", "p1")!;
     expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "merge").map((n) => n.url)).toEqual(["https://github.com/acme/web/pull/7"]);
   });
+
+  // BB-256: a steward can hold its own merge behind another binding. While the
+  // hold stands the plugin files no Merge item, the effort shows as held, and
+  // the hold lifts itself, waking the steward, once every named binding has
+  // merged its pull requests or ended.
+  describe("a steward's merge hold (BB-256)", () => {
+    const waitReport = (waitingOn: string, mergeBehind: string[]) => ({ ...base, waitingOn, mergeBehind });
+    const blockedPull = (t: Awaited<ReturnType<typeof setup>>, over: Record<string, unknown> = {}) => {
+      t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Blocker", labels: ["bb-managed"], author: "jane", ...over }));
+    };
+
+    it("stores the hold, refuses an unknown, self or ended key, and clears it with []", async () => {
+      const t = await withPull([marker, owner]);
+      t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Blocker" }));
+      await t.ring("linear", "uuid-13");
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-99"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding in this project to hold the merge behind: ENG-99\./u) });
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-12"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding in this project to hold the merge behind: ENG-12\./u) });
+      // A key in any case is stored canonically, like `behind`.
+      const ok = await t.tool("steward_report", { ...base, mergeBehind: ["eng-13"] }, t.steward);
+      expect(ok.error, ok.text).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["ENG-13"]);
+      // An ended key is refused with a reason.
+      t.hooks.store.patch(t.hooks.store.find("ENG-13")!.id, { endedAt: 1, endReason: "terminal" });
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-13"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding in this project to hold the merge behind: ENG-13\./u) });
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["ENG-13"]);
+      // [] clears it.
+      await t.tool("steward_report", { ...base, mergeBehind: [] }, t.steward);
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
+    });
+
+    it("files no plugin Merge item while it stands, closes an open one, and leaves a steward-filed one alone", async () => {
+      const t = await withPull([marker, owner]);
+      const b = t.binding();
+      const pluginNeed = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
+      expect(pluginNeed.filedBy).toBe("plugin");
+      t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Blocker" }));
+      await t.ring("linear", "uuid-13");
+      const report = await t.tool("steward_report", waitReport("ENG-13 to be Done", ["ENG-13"]), t.steward);
+      expect(report.error, report.text).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["ENG-13"]);
+      expect(t.hooks.store.need(pluginNeed.id)).toMatchObject({ status: "done", resolution: "held behind ENG-13" });
+      // The row shows as held, not "needs you", with the steward's wait text.
+      const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; needsUser: boolean; hold: string | null; holdBehind: string[] }> };
+      expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ needsUser: false, hold: "ENG-13 to be Done", holdBehind: ["ENG-13"] });
+      // `bb stewards show` lists the merge hold alongside the start hold.
+      expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain("MERGE HOLD: behind ENG-13");
+      // The board row carries the same derived hold.
+      const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; hold: string | null; holdBehind: string[]; needsUser: boolean }> } };
+      expect(board.board.stewards.find((x) => x.key === "ENG-12")).toMatchObject({ hold: "ENG-13 to be Done", holdBehind: ["ENG-13"], needsUser: false });
+      // The steward's own item (a refused merge) survives a fresh look.
+      const stewardNeed = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "steward" });
+      await t.ring("linear", "uuid-12");
+      expect(t.hooks.store.need(stewardNeed.id)!.status).toBe("open");
+      expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(false);
+    });
+
+    it("lifts when the target merges, notes it, wakes the steward, and files the Merge item on the next look", async () => {
+      const t = await withPull([marker, owner]);
+      const b = t.binding();
+      blockedPull(t);
+      await t.ring("github", "acme/web#8");
+      expect(t.hooks.store.find("acme/web#8")!.kind).toBe("pr");
+      await t.tool("steward_report", waitReport("acme/web#8", ["acme/web#8"]), t.steward);
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["acme/web#8"]);
+      expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+      const wakes = t.sends.filter((s) => s.threadId === t.steward).length;
+      // The target merges: the hold clears and the steward is woken with the note.
+      t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Blocker", labels: ["bb-managed"], author: "jane", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40) }));
+      await t.ring("github", "acme/web#8");
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
+      expect(t.sends.filter((s) => s.threadId === t.steward).length).toBeGreaterThan(wakes);
+      expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/Merge hold lifted: acme\/web#8, which it waited behind, reached merged\./u);
+      // The next look files the Merge item again, so a stuck loop still surfaces.
+      expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
+    });
+  });
 });
 
 // BB-69: the CLI lists the same "waiting on you" set the Stewards page and the
@@ -13175,6 +13251,23 @@ describe("a wait with no wake source (BB-154)", () => {
     t.hooks.store.patch(id, { hold: null, holdBehind: [], deployments: deploying(t.now()) as never });
     await t.tool("steward_report", waitReport("the deploy"), steward);
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+  });
+
+  it("counts a merge hold as a live source: no mark and no stall across two requeues (BB-256)", async () => {
+    const { t, steward } = await bound();
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Blocker" }));
+    await t.ring("linear", "uuid-13");
+    const report = { ...waitReport("ENG-13"), mergeBehind: ["ENG-13"] };
+    await t.tool("steward_report", report, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.mergeBehind).toEqual(["ENG-13"]);
+    expect(b.noWakeSource).toBe(false);
+    await requeue(t);
+    await t.tool("steward_report", report, steward);
+    await requeue(t);
+    await t.tool("steward_report", report, steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(0);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stall")).toHaveLength(0);
   });
 
   it("raises one stall at the threshold, not again while it is open, and resets on a changed wake", async () => {
