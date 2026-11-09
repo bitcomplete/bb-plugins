@@ -494,6 +494,30 @@ describe("the decide-list listing in the wakes (BB-135)", () => {
   });
 });
 
+describe("the re-approval diff in the project wake (BB-249)", () => {
+  it("prints the diff an approval escalation carries", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const diff = "--- approved\n+++ current\n@@ -1,2 +1,2 @@\n line one\n-line two\n+line TWO";
+    const x = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "project", recommendation: null, data: { specDiff: diff, specChangedLines: 2 } });
+    const wake = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(wake).toContain("Re-approval: 2 lines changed from the approved spec:");
+    expect(wake).toContain("-line two");
+    expect(wake).toContain("+line TWO");
+  });
+
+  it("says so when the change was whitespace only, and stays quiet for a first approval", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const whitespace = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "project", recommendation: null, data: { specDiff: "", specChangedLines: 0 } });
+    const first = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "project", recommendation: null });
+    const wake = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: whitespace, from: b }, { escalation: first, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(wake).toContain("Re-approval: no visible change");
+    // Only once: the first approval has no diff to print.
+    expect(wake.match(/Re-approval:/gu)).toHaveLength(1);
+  });
+});
+
 describe("the spawn command (BB-133)", () => {
   const flags = "--environment-provider multi-repo-workspace --provider claude-code --model claude-opus-5-5";
 

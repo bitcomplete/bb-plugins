@@ -34,6 +34,10 @@ type Need = {
   prUrl: string | null;
   what: string;
   how: string | null;
+  specDiff: string | null;
+  specChangedLines: number | null;
+  specCommentUrl: string | null;
+  specFullText: string | null;
   destination: string | null;
   threadId: string | null;
   createdAt: number;
@@ -74,6 +78,10 @@ const need = (over: Partial<Need> = {}): Need => {
     prUrl: null,
     what: "Merge or close?",
     how: null,
+    specDiff: null,
+    specChangedLines: null,
+    specCommentUrl: null,
+    specFullText: null,
     destination: null,
     threadId: null,
     createdAt: 1_000,
@@ -195,6 +203,35 @@ describe("the Stewards page's decide items and questions (BB-20)", () => {
     await waitFor(() => expect(slot.getByRole("button", { name: "Merge" })).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: "Merge" }));
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Merge" } }));
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-249: a re-approval item leads with the diff from the text the owner
+// approved, and keeps the full current text behind a toggle. A whitespace-only
+// edit has no visible change and says so.
+describe("the Stewards page's re-approval item (BB-249)", () => {
+  const diff = "--- approved\n+++ current\n@@ -1,2 +1,2 @@\n line one\n-line two\n+line TWO";
+  const commentUrl = "https://linear.app/acme/issue/ENG-12#comment-s1";
+
+  it("shows the diff first and the full text behind a toggle", async () => {
+    const slot = await renderBoard([need({ kind: "approve-spec", what: "Re-approve: 2 lines changed", specDiff: diff, specChangedLines: 2, specCommentUrl: commentUrl, specFullText: "the full current spec" })], []);
+    await waitFor(() => expect(slot.getByText("Re-approve: 2 lines changed")).toBeTruthy());
+    expect(slot.getByText(/\+line TWO/u)).toBeTruthy();
+    expect(slot.queryByText("the full current spec")).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "The comment explaining the edit" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: commentUrl }));
+    fireEvent.click(slot.getByRole("button", { name: "Show full text" }));
+    await waitFor(() => expect(slot.getByText("the full current spec")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Hide full text" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("says no visible change for a whitespace-only edit", async () => {
+    const slot = await renderBoard([need({ kind: "approve-spec", what: "Re-approve: no visible change", specDiff: "", specChangedLines: 0, specFullText: "the full current spec" })], []);
+    await waitFor(() => expect(slot.getByText(/changed only in whitespace/u)).toBeTruthy());
+    expect(slot.queryByText(/^--- approved/u)).toBeNull();
+    expect(slot.getByRole("button", { name: "Show full text" })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 });

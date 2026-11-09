@@ -188,10 +188,141 @@ const DESCRIPTION_SIGNATURE = /\s*_— from bb thread ([A-Za-z0-9_-]+)_\s*$/u;
 /** The thread that signed the description, when its last edit was signed. */
 export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DESCRIPTION_SIGNATURE.exec(entity.description ?? "")?.[1] ?? null;
 
-export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
+/**
+ * The text an approval is pinned to: the description with its signature line
+ * removed, then each spec comment as `<id>\n<body>`, joined by a NUL
+ * separator. `specHash` hashes exactly this, and BB-249 stores it as the
+ * approval's `approvedText` so a later edit can be diffed against it.
+ */
+export function specText(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
   const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
   const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).map((c) => `${c.id}\n${c.body}`);
-  return createHash("sha256").update([description, ...specs].join("\n\u0000\n")).digest("hex").slice(0, 16);
+  return [description, ...specs].join("\n\u0000\n");
+}
+
+export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
+  return createHash("sha256").update(specText(entity, stewardThreadId, isUserThread)).digest("hex").slice(0, 16);
+}
+
+/**
+ * The spec comment nearest the latest edit: the newest spec comment (by
+ * `createdAt`) that carries a link, so a re-approval item can point at the
+ * comment that explains what changed. Null when there is none.
+ */
+export function newestSpecComment(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): SnapshotComment | null {
+  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread) && c.url !== null && c.url !== "");
+  let newest: SnapshotComment | null = null;
+  for (const c of specs) if (newest === null || c.createdAt > newest.createdAt) newest = c;
+  return newest;
+}
+
+/** A plain unified diff and the number of changed lines (insertions plus deletions). */
+export type SpecDiff = { diff: string; changedLines: number };
+
+/** Two texts that differ only in whitespace: strip it all and compare. */
+const withoutWhitespace = (s: string): string => s.replace(/\s+/gu, "");
+
+/** A line's identity for the diff: whitespace is not a change, so a line's key ignores it. */
+const lineKey = (line: string): string => line.replace(/\s+/gu, " ").trim();
+
+/** The diff line as it should read: the NUL separator between the description and a spec comment is dropped. */
+const displayLine = (line: string): string => line.replace(/\u0000/gu, "");
+
+type DiffOp = { type: "equal" | "del" | "ins"; line: string };
+
+/** A longest-common-subsequence line diff, oldest first. Lines are matched ignoring whitespace. */
+function lineOps(before: readonly string[], after: readonly string[]): DiffOp[] {
+  const n = before.length;
+  const m = after.length;
+  const a = before.map(lineKey);
+  const b = after.map(lineKey);
+  // lcs[i][j] is the LCS length of before[i:] and after[j:].
+  const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i]![j] = a[i] === b[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!);
+    }
+  }
+  const ops: DiffOp[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) ops.push({ type: "equal", line: before[i]! }), i++, j++;
+    else if (lcs[i + 1]![j]! >= lcs[i]![j + 1]!) ops.push({ type: "del", line: before[i]! }), i++;
+    else ops.push({ type: "ins", line: after[j]! }), j++;
+  }
+  while (i < n) ops.push({ type: "del", line: before[i]! }), i++;
+  while (j < m) ops.push({ type: "ins", line: after[j]! }), j++;
+  return ops;
+}
+
+/**
+ * The LCS table costs `lines × lines`; a spec is small, but a very large one
+ * must not be able to balloon the server's memory on every look. Above this
+ * many cells the diff falls back to common prefix and suffix around one block.
+ */
+const MAX_LCS_CELLS = 4_000_000;
+
+/** The same diff when the LCS table would be too large: keep the common prefix and suffix, mark the rest. */
+function coarseOps(before: readonly string[], after: readonly string[]): DiffOp[] {
+  let start = 0;
+  while (start < before.length && start < after.length && lineKey(before[start]!) === lineKey(after[start]!)) start++;
+  let endB = before.length;
+  let endA = after.length;
+  while (endB > start && endA > start && lineKey(before[endB - 1]!) === lineKey(after[endA - 1]!)) {
+    endB--;
+    endA--;
+  }
+  const ops: DiffOp[] = [];
+  for (let i = 0; i < start; i++) ops.push({ type: "equal", line: before[i]! });
+  for (let i = start; i < endB; i++) ops.push({ type: "del", line: before[i]! });
+  for (let i = start; i < endA; i++) ops.push({ type: "ins", line: after[i]! });
+  for (let i = endB; i < before.length; i++) ops.push({ type: "equal", line: before[i]! });
+  return ops;
+}
+
+/**
+ * A plain unified diff between an approved spec and the current one, with the
+ * number of changed lines. Dependency-free. A difference that is only
+ * whitespace has no visible change: the diff is empty and the count is zero,
+ * though the spec hash (and so the approval) still changes.
+ */
+export function specDiff(before: string, after: string, context = 3): SpecDiff {
+  if (withoutWhitespace(before) === withoutWhitespace(after)) return { diff: "", changedLines: 0 };
+  const a = before.split("\n");
+  const b = after.split("\n");
+  const ops = a.length * b.length <= MAX_LCS_CELLS ? lineOps(a, b) : coarseOps(a, b);
+  const changedLines = ops.filter((o) => o.type !== "equal").length;
+  // The line number each op starts at on either side, so a hunk header can name it.
+  const beforeAt: number[] = [];
+  const afterAt: number[] = [];
+  let bn = 1;
+  let an = 1;
+  for (const o of ops) {
+    beforeAt.push(bn);
+    afterAt.push(an);
+    if (o.type !== "ins") bn++;
+    if (o.type !== "del") an++;
+  }
+  const groups: Array<{ from: number; to: number }> = [];
+  ops.forEach((o, idx) => {
+    if (o.type === "equal") return;
+    const last = groups[groups.length - 1];
+    // Merge two changed runs when their context windows would overlap.
+    if (last !== undefined && idx - last.to <= context * 2 + 1) last.to = idx;
+    else groups.push({ from: idx, to: idx });
+  });
+  const out: string[] = ["--- approved", "+++ current"];
+  for (const g of groups) {
+    const from = Math.max(0, g.from - context);
+    const to = Math.min(ops.length - 1, g.to + context);
+    const slice = ops.slice(from, to + 1);
+    const beforeCount = slice.filter((o) => o.type !== "ins").length;
+    const afterCount = slice.filter((o) => o.type !== "del").length;
+    out.push(`@@ -${beforeAt[from]!},${beforeCount} +${afterAt[from]!},${afterCount} @@`);
+    for (const o of slice) out.push(`${o.type === "equal" ? " " : o.type === "del" ? "-" : "+"}${displayLine(o.line)}`);
+  }
+  return { diff: out.join("\n"), changedLines };
 }
 
 /**

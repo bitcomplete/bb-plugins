@@ -606,7 +606,10 @@ export const readyStateSchema = z.object({
   checklist: z.array(z.object({ item: z.string(), met: z.boolean(), note: z.string().nullable().default(null) })).default([]),
   substantial: z.boolean().nullable().default(null),
   why: z.string().nullable().default(null),
-  approval: z.object({ at: z.number(), specHash: z.string(), by: z.string() }).nullable().default(null),
+  // BB-249: the approved text itself, so a re-approval after an edit can show
+  // a diff. Null on an approval recorded before this field existed, which
+  // renders as "no previous version" rather than a diff against nothing.
+  approval: z.object({ at: z.number(), specHash: z.string(), by: z.string(), approvedText: z.string().nullable().default(null) }).nullable().default(null),
   /** Set when an approval was voided, so the steward knows to ask again. */
   voidedAt: z.number().nullable().default(null),
   /** The spec an approval request was declined for: not asked again until the spec changes. */
