@@ -90,6 +90,8 @@ function world() {
   const sends: Array<{ threadId: string; text: string; at?: number }> = [];
   /** Every `threads.retry` the plugin made (BB-255). */
   const retries: Array<{ threadId: string; turnRequestId: string; sendAt?: number; reason?: string }> = [];
+  /** The `client/turn/requested` events a retry leaves, for the chain-root read (BB-255). */
+  const retryEvents: Array<{ threadId: string; requestId: string; retryOfRequestId: string }> = [];
   /** Whether `threads.retry` answers 409 `retry_already_queued` (BB-255). */
   let retryConflict = false;
   /** Whether `threads.retry` returns a queued row instead of a sent one (BB-255). */
@@ -372,6 +374,10 @@ function world() {
         retries.push({ ...args });
         const attempt = retries.filter((r) => r.threadId === args.threadId).length + 1;
         const turnRequestId = `retry_${retries.length}`;
+        // Core's `retryOfRequestId` is the chain's original, not the immediate
+        // parent, so a retry of a retry still names the original.
+        const root = retryEvents.find((e) => e.threadId === args.threadId && e.requestId === args.turnRequestId)?.retryOfRequestId ?? args.turnRequestId;
+        retryEvents.push({ threadId: args.threadId, requestId: turnRequestId, retryOfRequestId: root });
         if (retryQueued) return { ok: true as const, delivery: "queued" as const, attempt, turnRequestId, queuedMessageId: `q_${retries.length}`, sendAt: args.sendAt ?? null, waitingOn: { kind: "time" as const } };
         return { ok: true as const, delivery: "sent" as const, attempt, turnRequestId };
       },
@@ -467,6 +473,7 @@ function world() {
             // only thing telling them from the owner's (BB-178).
             ...sends.filter((s) => s.threadId === threadId).map((s, i) => ({ id: `s${i}`, seq: i, threadId, createdAt: s.at ?? now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: "stewards", input: [{ type: "text", text: s.text }] } })),
             ...userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: t.at ?? now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: null, input: [{ type: "text", text: t.text }] } })),
+            ...retryEvents.filter((r) => r.threadId === threadId).map((r, i) => ({ id: `r${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: null, requestId: r.requestId, retryOfRequestId: r.retryOfRequestId, input: [] } })),
           ];
           return order === "desc" ? [...rows].reverse() : rows;
         },
@@ -487,7 +494,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -13744,6 +13751,25 @@ describe("retrying a failed wake (BB-255)", () => {
     expect(b.wakeFailure).toBeNull();
     expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(0);
     expect(b.wakeRetries[steward]).toMatchObject({ requestId: "req_1" });
+  });
+
+  it("follows a retry chain provider-retry queued past a 409 to the cap", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    // Attempt 1: stewards queues its own retry (retry_1, root req_1).
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    // Attempt 2 fails; provider-retry already queued retry_2, so the call 409s.
+    t.setRetryConflict(true);
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
+    // provider-retry's own queued retry (retry_2) fails at the cap; stewards
+    // never recorded that id, but the chain root matches.
+    t.retryEvents.push({ threadId: steward, requestId: "retry_2", retryOfRequestId: "req_1" });
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_2", attemptNumber: 3, category: "internal" });
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.wakeFailure).toBe("internal");
+    expect(b.pending.filter((n) => /^Wake failed after 3 attempts: internal\.$/u.test(n.text))).toHaveLength(1);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(1);
   });
 
   it("deletes a queued retry row when a report drops it", async () => {

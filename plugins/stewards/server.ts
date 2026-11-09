@@ -3431,13 +3431,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * binding, and a retry's own failure arrives with a null origin. In memory:
      * a restart loses it, which is the same as the retry being lost.
      */
-    type RetriedRequest = { threadId: string; queuedMessageId: string | null };
+    type RetriedRequest = { threadId: string; rootRequestId: string; queuedMessageId: string | null };
     const retriedRequests = new Map<string, RetriedRequest>();
 
     const hasRetriedRequest = (threadId: string): boolean => {
       for (const entry of retriedRequests.values()) if (entry.threadId === threadId) return true;
       return false;
     };
+
+    /** The original request id of the chain stewards is retrying on a thread, or null when none is pending. */
+    function chainRootFor(threadId: string): string | null {
+      const b = bindingForThread(threadId);
+      const retry = b === null ? undefined : b.wakeRetries[threadId];
+      if (retry !== undefined) return retry.rootRequestId ?? retry.requestId;
+      for (const entry of retriedRequests.values()) if (entry.threadId === threadId) return entry.rootRequestId;
+      return null;
+    }
+
+    /**
+     * The chain a failed turn belongs to: its `client/turn/requested` event's
+     * `retryOfRequestId` (the original request), or the request id itself for
+     * an original. Null when the event cannot be read.
+     */
+    async function retryChainRoot(threadId: string, requestId: string): Promise<string | null> {
+      try {
+        const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
+        for (const row of rows) {
+          const data = row.data as { requestId?: unknown; retryOfRequestId?: unknown };
+          if (data.requestId !== requestId) continue;
+          return typeof data.retryOfRequestId === "string" ? data.retryOfRequestId : requestId;
+        }
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the retry chain for ${threadId}: ${errorMessage(error)}`);
+      }
+      return null;
+    }
 
     /** Delete a queued retry row, best-effort; a no-op when there is none. */
     async function deleteQueuedRetry(threadId: string, queuedMessageId: string | null): Promise<void> {
@@ -3509,6 +3537,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function retryFailedWake(args: {
       threadId: string;
       requestId: string;
+      rootRequestId: string;
       attemptNumber: number;
       errorInfo: ProviderErrorInfo | null;
       rateLimits: ProviderRateLimitState | null;
@@ -3527,7 +3556,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // provider-retry (or a concurrent call) already holds the one live
           // retry for this turn. Treat it as pending so the failure is never
           // given up on; that caller owns the queued row.
-          if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: args.requestId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId: null });
+          if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: args.requestId, rootRequestId: args.rootRequestId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId: null });
           bb.log.info(`stewards: a retry for ${args.threadId} is already queued; leaving it to the other caller`);
           return true;
         }
@@ -3538,8 +3567,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const queuedMessageId = result.delivery === "queued" ? result.queuedMessageId : null;
       // The binding record keeps the queued id for a binding; the in-memory map
       // keeps it for a project steward, which has no binding.
-      retriedRequests.set(retriedId, { threadId: args.threadId, queuedMessageId: args.binding === null ? queuedMessageId : null });
-      if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: retriedId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId });
+      retriedRequests.set(retriedId, { threadId: args.threadId, rootRequestId: args.rootRequestId, queuedMessageId: args.binding === null ? queuedMessageId : null });
+      if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: retriedId, rootRequestId: args.rootRequestId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId });
       // A worker the earlier thread.failed marked failed is running again: the
       // retry stands in for the failure.
       if (args.worker !== null && args.worker.status === "failed") store.setWorker(args.threadId, "running", args.worker.result);
@@ -7260,7 +7289,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const project = store.projectByThread(e.threadId);
       const own = e.originPluginId === bb.pluginId;
       const retry = binding === null ? null : (binding.wakeRetries[e.threadId] ?? null);
-      const retried = e.originPluginId === null && ((retry !== null && retry.requestId === e.requestId) || retriedRequests.get(e.requestId)?.threadId === e.threadId);
+      // The chain this failure belongs to: the turn event's `retryOfRequestId`
+      // for a retry (whichever plugin queued it), or the request itself for an
+      // original. Matching the chain, not one request id, recognises a retry
+      // provider-retry won the race to queue.
+      const rootRequestId = own ? e.requestId : e.originPluginId === null ? await retryChainRoot(e.threadId, e.requestId) : null;
+      const knownRoot = chainRootFor(e.threadId);
+      const retried = e.originPluginId === null && rootRequestId !== null && knownRoot !== null && rootRequestId === knownRoot;
       // A foreign or unrecognised null origin is left alone.
       if (!own && !retried) return;
       // At most one pending retry per thread: a repeat of the original failure
@@ -7270,7 +7305,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (binding === null && project === null) return;
       wakeRetryInFlight.add(e.threadId);
       try {
-        const handled = await retryFailedWake({ threadId: e.threadId, requestId: e.requestId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, rateLimits: e.rateLimits, binding, worker });
+        const handled = await retryFailedWake({ threadId: e.threadId, requestId: e.requestId, rootRequestId: rootRequestId ?? e.requestId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, rateLimits: e.rateLimits, binding, worker });
         if (!handled) await giveUpFailedWake({ threadId: e.threadId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, binding, worker });
       } finally {
         wakeRetryInFlight.delete(e.threadId);

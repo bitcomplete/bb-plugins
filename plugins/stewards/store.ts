@@ -704,6 +704,8 @@ export type Observed = z.infer<typeof observedSchema>;
  */
 export const wakeRetrySchema = z.object({
   requestId: z.string(),
+  /** The chain's original request id, so a retry queued by provider-retry is still recognised; null reads as `requestId`. */
+  rootRequestId: z.string().nullable().default(null),
   attempt: z.number(),
   sendAt: z.number(),
   holdUntil: z.number(),
