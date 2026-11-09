@@ -5547,15 +5547,16 @@ describe("questions to the user", () => {
     });
 
     // BB-249: the user's approve-spec item files as today on a first approval,
-    // stores the approved text, and leads with a diff after an edit.
+    // stores the approved text, and leads with a diff after an edit. The link
+    // points at the comment that explains this edit, not an older one.
     it("files the first approval as today, stores the approved text, then diffs a re-approval", async () => {
       const t = await setup();
       t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
       t.entities.set("uuid-12", issue());
       await t.ring("linear", "uuid-12");
       const steward = t.spawns[1]!.id;
-      const specComment = comment({ id: "s1", body: "**Spec:** acceptance criteria", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s1", createdAt: "2026-10-14T15:00:00Z" });
-      t.entities.set("uuid-12", issue({ comments: [specComment] }));
+      const older = comment({ id: "s1", body: "**Spec:** acceptance criteria", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s1", createdAt: "2026-10-14T14:00:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [older] }));
       await t.ring("linear", "uuid-12");
       await t.tool("steward_report", { ...base, ready: met }, steward);
       const b = t.hooks.store.find("ENG-12")!;
@@ -5569,8 +5570,9 @@ describe("questions to the user", () => {
       expect(approved.ready.approval!.approvedText).toContain("Users cannot log in.");
       expect(approved.ready.approval!.approvedText).toContain("s1\n**Spec:** acceptance criteria");
 
-      // Edit only the description: the item is a re-approval with the diff.
-      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [specComment] }));
+      // Edit only the description: the item is a re-approval with the diff, and
+      // the older spec comment does not explain this edit.
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [older] }));
       await t.ring("linear", "uuid-12");
       await t.tool("steward_report", { ...base, ready: met }, steward);
       const reapproval = t.hooks.store.openNeeds(approved.id).find((n) => n.kind === "approve-spec")!;
@@ -5578,8 +5580,42 @@ describe("questions to the user", () => {
       expect(reapproval.data.specChangedLines).toBe(2);
       expect(reapproval.data.specDiff).toContain("-Users cannot log in.");
       expect(reapproval.data.specDiff).toContain("+Users cannot log in with SSO.");
-      expect(reapproval.data.specCommentUrl).toBe("https://linear.app/acme/issue/ENG-12#comment-s1");
+      expect(reapproval.data.specCommentUrl).toBeNull();
       expect(reapproval.data.specFullText).toContain("Users cannot log in with SSO.");
+
+      // A comment posted after the approval does explain the edit, and is linked.
+      const newer = comment({ id: "s2", body: "**Revision:** SSO changed", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s2", createdAt: "2026-10-14T16:00:00Z" });
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [older, newer] }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const relinked = t.hooks.store.openNeeds(approved.id).find((n) => n.kind === "approve-spec")!;
+      expect(relinked.data.specCommentUrl).toBe("https://linear.app/acme/issue/ENG-12#comment-s2");
+    });
+
+    // BB-249 review round 1, blocker 1: voiding the approval keeps its text, so
+    // a re-approval after a void still shows the diff.
+    it("still diffs a re-approval after the approval is voided", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const b = t.hooks.store.find("ENG-12")!;
+      const first = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+      await t.harness.callRpc("stewardsNeedAction", { needId: first.id, action: "approve" }, client);
+
+      await t.tool("steward_report", { ...base, ready: met, voidApproval: true }, steward);
+      const voided = t.hooks.store.find("ENG-12")!;
+      expect(voided.ready.approval).toBeNull();
+      expect(voided.ready.voidedApprovedText).toBe("Users cannot log in.");
+
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO." }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const reapproval = t.hooks.store.openNeeds(voided.id).find((n) => n.kind === "approve-spec")!;
+      expect(reapproval.what).toBe("Re-approve: 2 lines changed");
+      expect(reapproval.data.specDiff).toContain("+Users cannot log in with SSO.");
     });
   });
 

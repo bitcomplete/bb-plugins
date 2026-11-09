@@ -612,6 +612,8 @@ export const readyStateSchema = z.object({
   approval: z.object({ at: z.number(), specHash: z.string(), by: z.string(), approvedText: z.string().nullable().default(null) }).nullable().default(null),
   /** Set when an approval was voided, so the steward knows to ask again. */
   voidedAt: z.number().nullable().default(null),
+  /** BB-249: the text the voided approval pinned, so a re-approval after a void still shows the diff; cleared by the next approval. */
+  voidedApprovedText: z.string().nullable().default(null),
   /** The spec an approval request was declined for: not asked again until the spec changes. */
   declinedSpecHash: z.string().nullable().default(null),
 });
@@ -2007,7 +2009,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
           // listed, before the request closes. An assumption recorded after the
           // request was shown is not on the list and stays open.
           confirmApprovalAssumptionsFor(bindingId, by);
-          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
+          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, voidedApprovedText: null, declinedSpecHash: null }, declinedSpecObjections: [] });
           closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
           projectChanged(projectIdForBinding(bindingId));

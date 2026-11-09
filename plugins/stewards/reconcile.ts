@@ -205,14 +205,25 @@ export function specHash(entity: EntitySnapshot, stewardThreadId: string | null,
 }
 
 /**
- * The spec comment nearest the latest edit: the newest spec comment (by
- * `createdAt`) that carries a link, so a re-approval item can point at the
- * comment that explains what changed. Null when there is none.
+ * A comment that explains a spec edit: a signed comment that starts `Spec:`,
+ * `Criteria:` or `Revision:`. This is deliberately wider than `isSpecComment`
+ * (which only counts `Spec:` because it feeds the spec hash); the link on a
+ * re-approval may point at a criteria or revision comment, and widening the
+ * hash predicate would change every pinned hash.
  */
-export function newestSpecComment(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): SnapshotComment | null {
-  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread) && c.url !== null && c.url !== "");
+export const isEditComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): boolean =>
+  c.signedBy !== null && /^\s*(\*\*)?(?:spec|criteria|revision)\b/iu.test(c.body) && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
+
+/**
+ * The comment that explains the latest edit: the newest signed
+ * `Spec:`/`Criteria:`/`Revision:` comment with a link, created after `since`
+ * (the last approval's time), so a re-approval item points at the comment
+ * that explains this edit and not an older one. Null when there is none.
+ */
+export function newestEditComment(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread: ((threadId: string) => boolean) | undefined, since: number): SnapshotComment | null {
+  const comments = entity.comments.filter((c) => isEditComment(c, stewardThreadId, isUserThread) && c.url !== null && c.url !== "" && Date.parse(c.createdAt) > since);
   let newest: SnapshotComment | null = null;
-  for (const c of specs) if (newest === null || c.createdAt > newest.createdAt) newest = c;
+  for (const c of comments) if (newest === null || c.createdAt > newest.createdAt) newest = c;
   return newest;
 }
 

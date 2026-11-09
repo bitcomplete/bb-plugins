@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, newestSpecComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specDiff, specHash, specText, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specDiff, specHash, specText, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, ownerApproval, prGate, projectApprovalMarker, reviewWorkerThread, type ProjectApprovalRecord } from "./gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
@@ -436,12 +436,19 @@ describe("the spec text and its re-approval diff (BB-249)", () => {
     expect(diff).toContain(" line 2099");
   });
 
-  it("links the newest spec comment that carries a url", () => {
+  it("links the newest Spec/Criteria/Revision comment after the approval, and none older", () => {
+    const approvedAt = Date.parse("2026-10-02T00:00:00Z");
     const older = comment({ id: "s1", body: "Spec: old", signedBy: "thr_s", url: "https://x/1", createdAt: "2026-10-01T00:00:00Z" });
     const newer = comment({ id: "s2", body: "**Spec:** new", signedBy: "thr_s", url: "https://x/2", createdAt: "2026-10-03T00:00:00Z" });
-    const noUrl = comment({ id: "s3", body: "Criteria: no link", signedBy: "thr_s", url: null, createdAt: "2026-10-04T00:00:00Z" });
-    expect(newestSpecComment(issue({ comments: [older, newer, noUrl] }), "thr_s")).toMatchObject({ id: "s2" });
-    expect(newestSpecComment(issue({ comments: [comment({ body: "not a spec", url: "https://x" })] }), "thr_s")).toBeNull();
+    const criteria = comment({ id: "s3", body: "Criteria: a test", signedBy: "thr_s", url: "https://x/3", createdAt: "2026-10-04T00:00:00Z" });
+    const revision = comment({ id: "s4", body: "**Revision:** the signal", signedBy: "thr_s", url: "https://x/4", createdAt: "2026-10-05T00:00:00Z" });
+    // The newest matching comment after the approval wins, whatever its keyword.
+    expect(newestEditComment(issue({ comments: [older, newer, criteria, revision] }), "thr_s", undefined, approvedAt)).toMatchObject({ id: "s4" });
+    // A comment at or before the approval does not explain this edit.
+    expect(newestEditComment(issue({ comments: [older] }), "thr_s", undefined, approvedAt)).toBeNull();
+    // Unsigned, non-edit and linkless comments never match.
+    const ignored = [comment({ id: "u", body: "Spec: no signature", url: "https://x", createdAt: "2026-10-06T00:00:00Z" }), comment({ id: "n", body: "note", signedBy: "thr_s", url: "https://x", createdAt: "2026-10-06T00:00:00Z" }), comment({ id: "l", body: "Spec: no link", signedBy: "thr_s", url: null, createdAt: "2026-10-06T00:00:00Z" })];
+    expect(newestEditComment(issue({ comments: ignored }), "thr_s", undefined, approvedAt)).toBeNull();
   });
 });
 
