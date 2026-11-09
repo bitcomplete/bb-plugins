@@ -5592,9 +5592,9 @@ describe("questions to the user", () => {
       expect(relinked.data.specCommentUrl).toBe("https://linear.app/acme/issue/ENG-12#comment-s2");
     });
 
-    // BB-249 review round 1, blocker 1: voiding the approval keeps its text, so
-    // a re-approval after a void still shows the diff.
-    it("still diffs a re-approval after the approval is voided", async () => {
+    // BB-249 review round 2: the voided approval's own time is the link cutoff,
+    // so a Revision comment posted between the edit and the void is linked.
+    it("still diffs a re-approval after the approval is voided, and links the edit's Revision comment", async () => {
       const t = await setup();
       t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
       t.entities.set("uuid-12", issue());
@@ -5605,17 +5605,21 @@ describe("questions to the user", () => {
       const first = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
       await t.harness.callRpc("stewardsNeedAction", { needId: first.id, action: "approve" }, client);
 
+      // The steward edits, comments a Revision, then voids: the comment is
+      // after the approval but before the void, so it must still be linked.
+      const revision = comment({ id: "s2", body: "**Revision:** SSO changed", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s2", createdAt: "2026-10-14T16:00:00Z" });
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [revision] }));
+      await t.ring("linear", "uuid-12");
       await t.tool("steward_report", { ...base, ready: met, voidApproval: true }, steward);
       const voided = t.hooks.store.find("ENG-12")!;
       expect(voided.ready.approval).toBeNull();
       expect(voided.ready.voidedApprovedText).toBe("Users cannot log in.");
+      expect(voided.ready.voidedApprovedAt).toBe(Date.parse("2026-10-14T15:00:00Z"));
 
-      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO." }));
-      await t.ring("linear", "uuid-12");
-      await t.tool("steward_report", { ...base, ready: met }, steward);
       const reapproval = t.hooks.store.openNeeds(voided.id).find((n) => n.kind === "approve-spec")!;
       expect(reapproval.what).toBe("Re-approve: 2 lines changed");
       expect(reapproval.data.specDiff).toContain("+Users cannot log in with SSO.");
+      expect(reapproval.data.specCommentUrl).toBe("https://linear.app/acme/issue/ENG-12#comment-s2");
     });
   });
 

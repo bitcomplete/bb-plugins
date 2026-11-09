@@ -3445,7 +3445,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const approval = playbook.ready?.approval;
       const sourceLabel = entity.source === "github" ? "GitHub" : "Linear";
       if (typeof approval === "object" && lc(entity.state) === lc(approval.state) && ready.approval === null) {
-        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source, approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null };
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source, approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null };
         changes.push({ text: `Approved in ${sourceLabel} (now ${entity.state})`, actionable: true });
       }
       const workers = store.workers(b.id);
@@ -3523,7 +3523,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // pinned to the spec it just changed, whether or not an earlier
       // approval has gone stale.
       if (approval === "user" && (ready.approval === null || ready.approval.specHash !== currentSpec) && fresh.some((c) => c.byUser === true)) {
-        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user", approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, declinedSpecHash: null };
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user", approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null, declinedSpecHash: null };
         changes.push({ text: "The user's spec comment approves the spec (approval: user)", actionable: true });
       }
       // Only an entry into build from spec: review → build is the worker's
@@ -6195,7 +6195,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const currentText = specTextFor(b, entity);
       const prior = b.ready.approval;
       const approvedText = prior?.approvedText ?? b.ready.voidedApprovedText;
-      const approvedAt = prior?.at ?? b.ready.voidedAt;
+      const approvedAt = prior?.at ?? b.ready.voidedApprovedAt;
       const reapproval = approvedText !== null && approvedAt !== null ? specDiff(approvedText, currentText) : null;
       const specComment = reapproval === null || approvedAt === null ? null : newestEditComment(entity, b.threadId, isUserThread, approvedAt);
       const what =
@@ -8464,7 +8464,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               why: input.ready.why ?? ready.why,
             };
           }
-          if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now(), voidedApprovedText: ready.approval.approvedText };
+          if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now(), voidedApprovedText: ready.approval.approvedText, voidedApprovedAt: ready.approval.at };
           // BB-109: `blockedOn` is the old name for `waitingOn`. Accept it for
           // one release so a steward whose prompt predates the rename still
           // reports cleanly; `waitingOn` wins when both are given, and only the
@@ -9352,7 +9352,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // BB-251: the approval confirms exactly the assumptions the
             // request listed, before the request closes.
             const confirmedAssumptions = store.confirmApprovalAssumptions(target.id, threadId);
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId, approvedText: specTextFor(target, approval.entity) }, voidedAt: null, voidedApprovedText: null, declinedSpecHash: null }, declinedSpecObjections: [] });
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId, approvedText: specTextFor(target, approval.entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
             store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
