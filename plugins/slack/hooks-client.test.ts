@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createHooksLoop, HooksRequestError, SseParser, sessionEventSchema, subscribe } from "./hooks-client.js";
+import { createHooksLoop, HooksRequestError, SseParser, sessionEventSchema, startConversation, subscribe } from "./hooks-client.js";
 
 const BASE = "http://bb-gate-hooks.test:8081";
 
@@ -204,6 +204,43 @@ describe("subscribe", () => {
     const error = await subscribe(fetchImpl, BASE, "c_1", [{ kind: "session", id: "D1:1", capability: "cap-secret" }], new AbortController().signal).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(HooksRequestError);
     expect(String((error as Error).message)).not.toContain("cap-secret");
+  });
+});
+
+describe("startConversation", () => {
+  it("posts the connection, text and users target, and parses the session", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return Response.json({ session: "D1:1.2", capability: "cap", permalink: "https://team.slack.com/x", channel: "D1", participants: [{ id: "U1", name: "Alice" }] });
+    }) as unknown as typeof fetch;
+    const result = await startConversation(fetchImpl, BASE, { connection: "c_1", text: "hi", users: ["alice"] }, AbortSignal.timeout(1000));
+    expect(calls).toEqual([{ url: `${BASE}/v1/slack/conversations`, body: { connection: "c_1", text: "hi", users: ["alice"] } }]);
+    expect(result).toMatchObject({ session: "D1:1.2", capability: "cap", channel: "D1", participants: [{ id: "U1", name: "Alice" }] });
+  });
+
+  it("carries a channel target instead of users", async () => {
+    let body: unknown = null;
+    const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return Response.json({ session: "C1:1.2", capability: "cap", permalink: "", channel: "C1", participants: [] });
+    }) as unknown as typeof fetch;
+    await startConversation(fetchImpl, BASE, { connection: "c_1", text: "hi", channel: "C1" }, AbortSignal.timeout(1000));
+    expect(body).toEqual({ connection: "c_1", text: "hi", channel: "C1" });
+  });
+
+  it("reads a response missing the optional fields, and never logs the capability", async () => {
+    const fetchImpl = (async () => Response.json({ session: "D1:1.2" })) as unknown as typeof fetch;
+    const result = await startConversation(fetchImpl, BASE, { connection: "c_1", text: "hi", users: ["alice"] }, AbortSignal.timeout(1000));
+    expect(result).toEqual({ session: "D1:1.2", capability: "", permalink: "", channel: "", participants: [] });
+  });
+
+  it("surfaces a refusal as a HooksRequestError whose message names no capability", async () => {
+    const fetchImpl = (async () => new Response(JSON.stringify({ error: "ambiguous-user", name: "bob", candidates: [{ id: "U1", name: "Bob" }] }), { status: 400 })) as unknown as typeof fetch;
+    const error = await startConversation(fetchImpl, BASE, { connection: "c_1", text: "hi", users: ["bob"] }, AbortSignal.timeout(1000)).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HooksRequestError);
+    expect((error as HooksRequestError).code).toBe("ambiguous-user");
+    expect((error as HooksRequestError).body).toContain("Bob");
   });
 });
 

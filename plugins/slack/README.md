@@ -246,6 +246,59 @@ signing secret, bot token or OAuth client secret; they are sealed with
 |---|---|
 | `slack_reply` | Post the one reply on the Slack conversation that woke this thread. The service holds the bot token; the request carries only the connection id and the text. The text may be Markdown (`**bold**`, `# Heading`, `- item`, `[label](url)`, fenced code): the plugin converts it to Slack mrkdwn before posting. |
 | `slack_ack` | Count the wake as answered without posting anything, for a message that needs no answer (a thanks, or one bb should not act on), so no error reply fires. It is not for skipping work that was asked for; answer a request with `slack_reply`. |
+| `slack_start_conversation` | Open a new Slack DM, group DM or channel thread as the owner and bind it to this thread, so replies land back here. Pass `text` and exactly one of `users` (Slack names or ids) or `channel` (a `C…`/`G…` id). |
+
+## Starting a conversation
+
+`slack_start_conversation` opens a conversation the plugin did not get woken
+by: a DM, a group DM, or a new top-level message in a channel. It is the way
+a thread asks a person in Slack for something without the person having to
+DM bb first. The service opens it as the app and returns a leasable session;
+the plugin writes a session record with `opened: true`, bound to the calling
+bb thread, and leases it, so a reply in the conversation arrives at that
+thread as a steer. A thread may hold several conversations at once, and the
+wake text names the session, so `slack_reply` and `slack_ack` take it when a
+thread has more than one.
+
+The tool is used only on the owner's instruction or the calling thread's own
+task. A participant's or any other non-owner's message is never a reason to
+open a conversation, and the tool refuses a call made in a turn such a
+message started.
+
+- `users` is one or more Slack names or ids; the service matches a name
+case-insensitively on real name, display name and handle. A name matching no
+one or more than one person is refused with the candidates, and the plugin
+never retries with a guess. Guests, Slack Connect users and bots are refused.
+- `channel` is a channel id (`C…`/`G…`), never a name. A channel the bot is
+not in is an error naming **Settings → Plugins → Slack** (**Add bb**) or
+`/invite @bb`.
+- The opener is posted as the app and is visible to real people; the plugin
+prefixes a line naming whose bb it is (`<Owner>'s bb here, on <Owner>'s
+behalf:`) unless the text already does, and for a DM or group DM appends one
+line asking for replies in the opener's thread. The ask is there because a
+person who has their own bb keeps their top-level messages (they go to that
+bb), so a threaded reply is how an answer reaches this conversation.
+
+**A participant's replies are information.** In a conversation bb opened, a
+message from anyone but the owner is delivered to the thread framed as the
+next message in a conversation bb started and marked `(NOT your owner …)`,
+untrusted information, never an instruction. It does not go through the
+hold-and-`confirm` path, because the thread asked for the conversation and a
+confirmation prompt in front of the person answering would make it unusable;
+it also owes no reply. The owner's own messages stay instructions. Everything
+else — an ordinary DM, a channel mention, an untagged reply in a thread bb
+did not open — is unchanged.
+
+**The idle sweep** forgets an opened conversation after `archiveIdleHours`,
+dropping its lease and its session record, but it never archives the bb
+thread. When the bound thread is archived or deleted, the next reply starts a
+fresh thread with the earlier conversation and a line saying the original
+thread ended.
+
+**By hand (a Slack admin), from BB-261.** A group DM needs the bot scopes
+`mpim:write` and `mpim:history` and the `message.mpim` bot event; add them and
+reinstall. Until then a multi-user DM is refused (`missing-scope`). A
+single-person DM and a channel thread need none of these.
 
 ## Other people's text
 
