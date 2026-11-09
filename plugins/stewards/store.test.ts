@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -485,7 +485,8 @@ describe("the actor rename migration (BB-97)", () => {
     // it. BB-164 appended the pull-watch group after BB-184's server settings,
     // and BB-215's stack group follows it (migrations.test.ts pins the whole
     // list, this only checks the group order).
-    const groups = [WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // BB-256 appended the merge-hold group after BB-255's wake-retry group.
+    const groups = [MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -572,10 +573,12 @@ describe("the escalation route rename migration (BB-209)", () => {
     // The deps-decision group (the adoption-decision table and the fingerprint
     // provenance column) was appended after this one, BB-242's
     // worker-stop-reason column after that, BB-251's assumptions table after
-    // that, BB-247's dated-wait columns after that, and BB-255's wake-retry
-    // columns after that.
-    const withWakeRetry = MIGRATIONS.slice(0, -WAKE_RETRY_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-WAKE_RETRY_MIGRATIONS.length)).toEqual([...WAKE_RETRY_MIGRATIONS]);
+    // that, BB-247's dated-wait columns after that, BB-255's wake-retry
+    // columns after that, and BB-256's merge-hold column after that.
+    const withMergeBehind = MIGRATIONS.slice(0, -MERGE_BEHIND_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-MERGE_BEHIND_MIGRATIONS.length)).toEqual([...MERGE_BEHIND_MIGRATIONS]);
+    const withWakeRetry = withMergeBehind.slice(0, -WAKE_RETRY_MIGRATIONS.length);
+    expect(withMergeBehind.slice(-WAKE_RETRY_MIGRATIONS.length)).toEqual([...WAKE_RETRY_MIGRATIONS]);
     const withDated = withWakeRetry.slice(0, -DATED_WAIT_MIGRATIONS.length);
     expect(withWakeRetry.slice(-DATED_WAIT_MIGRATIONS.length)).toEqual([...DATED_WAIT_MIGRATIONS]);
     const withAssumptions = withDated.slice(0, -ASSUMPTION_MIGRATIONS.length);

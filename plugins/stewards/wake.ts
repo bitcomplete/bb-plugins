@@ -43,6 +43,7 @@ export const STANDING_RULES = [
   `- **What only the user can do is an escalation, not a need.** A credential, a step outside the repos, or a decision — ${ESCALATED_NEED_KINDS.map((k) => `\`${k}\``).join(", ")} — is raised with \`steward_report { escalate: { kind, question, context, meanwhile } }\`: the question is one line, as the sidebar row shows it, and the evidence and reasoning go in \`context\` (a longer question is refused). The project steward decides it or forwards it to the user. Since BB-30 \`steward_report { needs }\` refuses exactly those ("that is an escalation now"); it still takes the plugin's gate items (${STEWARD_NEED_KINDS.map((k) => `\`${k}\``).join(", ")}). A decision that is really a pick between fixed options carries \`choices\` (2-6 short labels, e.g. \`choices: ["Merge", "Close", "Verify first"]\`), and the page shows one button each; never write "reply with your choice" in prose.`,
   "- **A credential is a decision escalation the project steward forwards as a secret.** Raise it with `steward_report { escalate }`, naming the variable and purpose in `context`. Forward it with `resolution: \"secret\"` and either `writeEnv`/`worker` (the dotenv a worker reads) or `setting` (a plugin secret setting); the plugin spawns a requester thread that opens bb's secure form. `secret` is the only resolution even when the ticket or spec says the owner produces or seals it by hand, corrected at spec approval. Never paste a secret or route the user to a script.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
+  '- **A spec that says "do not merge before X is Done" is a merge hold.** Report it with `steward_report { mergeBehind: ["X"] }`, never as a `merge` need or as free text alone: while it stands the plugin files no Merge item (so the effort shows as held, not "needs you"), it is a live wake source, and it lifts itself, waking you, once every named binding has merged its pull requests or ended. Each report replaces the set, and `mergeBehind: []` clears it.',
 ];
 /**
  * The fixed first line of every brief, and of the per-turn system context the
@@ -465,6 +466,17 @@ const holdLine = (binding: Binding, then: string): string => {
 };
 
 /**
+ * The merge-hold line of a wake (BB-256): no Merge item is filed while it
+ * stands, and the plugin wakes the steward once every named binding has merged
+ * its pull requests or ended. A separate line from `holdLine`, because a
+ * binding may carry both holds.
+ */
+const mergeHoldLine = (binding: Binding): string => {
+  const keys = binding.mergeBehind;
+  return `- **MERGE HOLD: behind ${keys.join(", ")}** — the plugin files no Merge item while it stands, so the effort shows as held. It lifts itself, and you are woken, once ${keys.length === 1 ? "that binding has" : "each of them has"} merged its pull requests or ended.`;
+};
+
+/**
  * The sentence a no-wake-source paragraph carries when a `failed` watch is
  * holding the binding (BB-194): a settled watch will not wake the steward on
  * its own, and the playbook's `not-yet` report is the way back. One sentence,
@@ -490,7 +502,7 @@ function noWakeSourceLines(binding: Binding): string[] {
   const lines = [
     "**Waiting with no wake source.** Nothing the plugin tracks will deliver this wait" +
       (wait === null ? "" : ` (${JSON.stringify(wait)})`) +
-      ": no hold behind anything, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. Name what will — a binding to hold behind, a pull request, a deployment target, a worker — or, if nothing can, the condition is your own to re-examine.",
+      ": no hold behind anything, no merge hold, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. Name what will — a binding to hold behind, a pull request, a deployment target, a worker — or, if nothing can, the condition is your own to re-examine.",
   ];
   const failed = Object.values(binding.deployments)
     .filter((w) => w.state === "failed")
@@ -592,6 +604,7 @@ export function formatWake(input: WakeInput): string {
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
+  if (binding.mergeBehind.length > 0) out.push(mergeHoldLine(binding));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
   out.push(...trialLessonsLines(input.lessons ?? []));
   out.push(...assumptionLines(input.assumptions ?? []));

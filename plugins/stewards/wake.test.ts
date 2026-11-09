@@ -385,6 +385,17 @@ describe("the nightly prompt", () => {
     expect(STANDING_RULES.join("\n")).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
   });
 
+  it("carries the merge hold rule and its line (BB-256)", () => {
+    expect(STANDING_RULES.join("\n")).toMatch(/do not merge before X is Done/u);
+    expect(STANDING_RULES.join("\n")).toMatch(/mergeBehind/u);
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    s.patch(b.id, { mergeBehind: ["ENG-13"] });
+    const wake = formatWake(wakeInput({ binding: s.binding(b.id)! }));
+    expect(wake).toMatch(/MERGE HOLD: behind ENG-13/u);
+    expect(wake).toMatch(/files no Merge item while it stands/u);
+  });
+
   it("gives dates in the project's nightly time zone", () => {
     const { s } = world();
     const q = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });

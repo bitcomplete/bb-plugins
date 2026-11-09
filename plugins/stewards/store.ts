@@ -607,7 +607,17 @@ export const DATED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN requeue_u
 // old row reads as no retry and no failure.
 export const WAKE_RETRY_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wake_retry TEXT NOT NULL DEFAULT '{}'`, `ALTER TABLE bindings ADD COLUMN wake_failure TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS];
+// BB-256: a merge hold a steward reports with `steward_report { mergeBehind }`:
+// entity keys of open bindings whose work must finish before this binding's
+// pull request is merged. While it stands the plugin files no Merge item, so a
+// deliberate wait is not read as a stuck loop; it lifts itself, waking the
+// steward, once every named binding has merged its pull requests or ended. It
+// is a live wake source (BB-154), so removing the Merge item does not leave the
+// wait with nothing the plugin tracks. Additive and defaulted: an old row reads
+// as no merge hold and behaves exactly as before.
+export const MERGE_BEHIND_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN merge_behind TEXT NOT NULL DEFAULT '[]'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -763,6 +773,14 @@ export type Binding = {
   touches: string[];
   /** Entity keys of the bindings this hold waits behind: the hold lifts itself when every one has merged its pull requests or ended. */
   holdBehind: string[];
+  /**
+   * Entity keys of the bindings whose work must finish before this binding's
+   * pull request is merged (BB-256), reported with `steward_report
+   * { mergeBehind }`. While it stands the plugin files no Merge item; it lifts
+   * itself, waking the steward, once every named binding has merged its pull
+   * requests or ended.
+   */
+  mergeBehind: string[];
   /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
   holdStack: string[];
   /** The base pull request a stacked pull request landed in (owner/repo#N, BB-215): the deployment carries-check follows its merge on the default branch, since a squash rewrote the stacked merge. Null when the work did not stack. */
@@ -872,6 +890,7 @@ function rowToBinding(r: BindingRow): Binding {
     hold: str("hold"),
     touches: json(z.array(z.string()), str("touches"), []),
     holdBehind: json(z.array(z.string()), str("hold_behind"), []),
+    mergeBehind: json(z.array(z.string()), str("merge_behind"), []),
     holdStack: json(z.array(z.string()), str("hold_stack"), []),
     landedIn: str("landed_in"),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
@@ -941,6 +960,7 @@ const COLUMNS = {
   hold: "hold",
   touches: "touches",
   holdBehind: "hold_behind",
+  mergeBehind: "merge_behind",
   holdStack: "hold_stack",
   landedIn: "landed_in",
   scheduleAsked: "schedule_asked",
@@ -1007,6 +1027,7 @@ const VISIBLE_COLUMNS = [
   "phase",
   "hold",
   "hold_behind",
+  "merge_behind",
   "hold_stack",
   "status",
   "pending",
