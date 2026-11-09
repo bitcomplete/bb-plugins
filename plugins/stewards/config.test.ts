@@ -520,7 +520,10 @@ describe("the GitHub issue playbook (BB-234)", () => {
     // and the status:todo phase carries the attach commands.
     expect(parsed.value.may).toContain("create-sub-issue");
     expect(parsed.value.promote).toBe("A sub-issue that needs more than one pull request, its own approval, or work in a repo the parent does not touch.");
-    expect(phaseInstructions(parsed.value, "status:todo")).toContain("sub_issues");
+    const todo = phaseInstructions(parsed.value, "status:todo")!;
+    expect(todo).toContain("sub_issues");
+    // The child is assigned to this server's login, so a later `bb-managed` promotion can adopt it.
+    expect(todo).toContain("--assignee @me");
     expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/gh issue\s+close/u);
     expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
     expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");

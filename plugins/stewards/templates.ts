@@ -247,19 +247,20 @@ same way.
 
 A GitHub issue can have native sub-issues, so file a child as a real
 sub-issue of its parent in the same action, keeping a \`Part of #{parent}\`
-line in the body for a reader. Create the child and read back its numeric id,
-then attach it:
+line in the body for a reader. Create the child assigned to this server's
+login (so a later \`bb-managed\` promotion can adopt it), keep its number, and
+attach it:
 
 \`\`\`
-child=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
+n=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
 
-…" | grep -oE '[0-9]+$' | xargs -I{} gh api repos/{owner}/{repo}/issues/{} --jq .id)
-gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$child
+…" --assignee @me | grep -oE '[0-9]+$')
+gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/$n --jq .id)
 \`\`\`
 
 \`-F\` sends the numeric id as an integer. A child missing from the parent's
-next wake under Sub-issues is re-attached with the second command, not
-re-filed.
+next wake under Sub-issues is re-attached with the second command, using the
+child's number in place of \`$n\`, not re-filed.
 
 ## status:in-progress
 

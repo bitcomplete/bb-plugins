@@ -321,20 +321,21 @@ Two tools are yours; everything else you do with the tools every thread has.
 ### Filing a child on GitHub
 
 A GitHub child is attached as a native sub-issue of its parent in the same
-action, so the parent's snapshot lists it. Create the child and read back its
-numeric id, then attach it, keeping a `Part of #{parent}` line in the body
-for a reader:
+action, so the parent's snapshot lists it. Create the child assigned to this
+server's login (so a later `bb-managed` promotion can adopt it), keep its
+number, and attach it, keeping a `Part of #{parent}` line in the body for a
+reader:
 
 ```
-child=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
+n=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
 
-…" | grep -oE '[0-9]+$' | xargs -I{} gh api repos/{owner}/{repo}/issues/{} --jq .id)
-gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$child
+…" --assignee @me | grep -oE '[0-9]+$')
+gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/$n --jq .id)
 ```
 
 `-F` sends the numeric id as an integer. A child missing from the parent's
-next wake under Sub-issues is re-attached with the second command, not
-re-filed.
+next wake under Sub-issues is re-attached with the second command, using the
+child's number in place of `$n`, not re-filed.
 
 ## If you are an ops steward
 
