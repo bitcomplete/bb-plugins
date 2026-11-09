@@ -57,8 +57,12 @@ Two tools are yours; everything else you do with the tools every thread has.
   `steward` = you, including your own next step such as re-checking on the
   next deployment wake, `other` = someone else), what
   you are waiting on (`waitingOn`: the party or artifact the next action waits
-  on, such as checks, a review or a deploy), and `requeueAfter`. When the next
-  action waits on one of your own workers, name that worker in `waitingOn`
+  on, such as checks, a review or a deploy), `requeueAfter`, and, when the wait
+  has a known end, `until` (a date like `2026-12-01`, read as 00:00 UTC, or an
+  ISO datetime). `until` needs `waitingOn`, requeues you then instead of
+  `requeueAfter`, and stops the stall counter while the date is ahead; a date
+  in the past is ignored with a note. When the next action waits on one of your
+  own workers, name that worker in `waitingOn`
   (its thread id or its title): the plugin wakes you the moment it finishes,
   even while its pull request is still open, and a `waitingOn` you leave on a
   finished worker reads `hand-off lost: worker finished`. `cites` names the
@@ -249,6 +253,17 @@ Two tools are yours; everything else you do with the tools every thread has.
   first reported it and the wake count. A wake for another reason, a changed
   wait or a new source resets the count, and a stall already open is not
   raised again.
+- **A wait with a known end is a dated wait (BB-247).** When the wait has a
+  date — a tax year closing, a deployment window, a pilot cycle finishing, a
+  decision promised for Monday — report it as `steward_report { waitingOn,
+  until }`: the binding is requeued at the date rather than on
+  `requeue-default`, no stall is counted while the date is ahead (counting
+  resumes from zero after it passes), and the row and `bb stewards show` read
+  `waiting on <text> until <date>`. An actionable change on the entity still
+  wakes you early. Each report replaces the date: a report without `until`, or
+  with different wait text, clears it, so an old date never delays a requeue.
+  A date more than the playbook's `max-wait` (default 90d) out is accepted and
+  noted once to the project steward.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
