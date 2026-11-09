@@ -5,11 +5,11 @@
 // in prose. Pure: every read goes through the `CarriesReader` handed in, so a
 // test supplies a fake and the plugin never runs `gh` in the stewards server.
 import { parse as parseYaml } from "yaml";
-import type { CarriesRule, DeploymentTarget } from "./config.js";
-import { touchesAny } from "./decisions.js";
+import type { CarriesRule, CarriesStrategy, DeploymentTarget } from "./config.js";
+import { globMatches } from "./decisions.js";
 import type { CompareStatus, WorkflowRunInfo } from "./source-contract.js";
 
-/** The GitHub reads an `image-tag` or `ref-contains-merge` rule needs, through the github source. */
+/** The GitHub reads an `image-tag` or `ref-contains-merge` rule needs, through the github source. A `live-at-merge` rule needs none. */
 export type CarriesReader = {
   /** A file's text at a ref; content null when it is not there, error set when the read failed. */
   fileAtRef(repo: string, path: string, ref: string): Promise<{ content: string | null; error: string | null }>;
@@ -56,12 +56,68 @@ export const noRuleNoted = (note: string | null | undefined): boolean => (note ?
 export const containsStatus = (status: CompareStatus | null): boolean => status === "ahead" || status === "identical";
 
 /**
+ * Whether one changed path falls under one of a rule's `paths`. Both the
+ * carries `paths` and GitHub's changed files are repo-relative, so this is a
+ * direct glob match. The decide list's `touchesAny` is deliberately not used:
+ * its repo-prefix stripping turns a rule like `kploy/**` into `**` and so
+ * matches every path, which would make a rule swallow merges another rule
+ * owns (BB-260).
+ */
+const fileUnder = (file: string, paths: readonly string[]): boolean => paths.some((pattern) => globMatches(pattern, file));
+
+/**
+ * GitHub's changed-files page size: the source reads at most this many paths,
+ * so a list this long may be truncated and is not a complete "every file" set
+ * (BB-260).
+ */
+export const CARRIES_FILES_PAGE_LIMIT = 100;
+
+/**
+ * Whether a `live-at-merge` rule matches: its repo, and every changed file
+ * under one of its paths. An empty or unreadable file list matches nothing
+ * (an unknown change is never assumed live), nor does a list at GitHub's page
+ * limit, which may be truncated and so may hide a file outside the paths. A
+ * rule with no paths matches any non-empty list. A merge that also touches a
+ * path outside the rule does not match, so it can fall through to the rule
+ * that owns that path.
+ */
+export function liveAtMergeMatches(rule: CarriesRule, prRepo: string, files: readonly string[]): boolean {
+  if (rule.strategy.kind !== "live-at-merge") return false;
+  if (rule.when.repo.toLowerCase() !== prRepo.toLowerCase()) return false;
+  if (files.length === 0 || files.length >= CARRIES_FILES_PAGE_LIMIT) return false;
+  const paths = rule.when.paths;
+  if (paths === undefined || paths.length === 0) return true;
+  return files.every((file) => fileUnder(file, paths));
+}
+
+/**
  * The first rule whose `when` matches the merge: the pull request's repo,
  * ignoring case, and, when the rule lists paths, at least one changed path
- * under one of them. Null when none matches.
+ * under one of them. A `live-at-merge` rule is stricter: every changed file
+ * must be under its paths, so a merge that also touches a path another rule
+ * owns falls through to that rule (first match wins). Null when none matches.
  */
 export function matchCarriesRule(rules: readonly CarriesRule[], prRepo: string, files: readonly string[]): CarriesRule | null {
-  return rules.find((r) => r.when.repo.toLowerCase() === prRepo.toLowerCase() && (r.when.paths === undefined || touchesAny(files, r.when.paths))) ?? null;
+  return rules.find((r) => {
+    if (r.when.repo.toLowerCase() !== prRepo.toLowerCase()) return false;
+    if (r.strategy.kind === "live-at-merge") return liveAtMergeMatches(r, prRepo, files);
+    return r.when.paths === undefined || files.some((file) => fileUnder(file, r.when.paths!));
+  }) ?? null;
+}
+
+/**
+ * The verdict a `live-at-merge` rule gives without any deployment: `deployed`,
+ * because nothing builds or applies the paths the rule names, so the merge is
+ * live the moment it lands. Null for every other strategy, which needs a
+ * deployment read. The watch-recording path applies this helper the moment it
+ * records a merge, so the steward is woken with the verdict and no deployment
+ * is awaited (BB-260).
+ */
+export function liveAtMergeVerdict(rule: CarriesRule): CarriesVerdict | null {
+  if (rule.strategy.kind !== "live-at-merge") return null;
+  const paths = rule.when.paths ?? [];
+  const where = paths.length === 0 ? "the merge" : paths.join(", ");
+  return { kind: "deployed", note: `live-at-merge: nothing deploys ${where}` };
 }
 
 /**
@@ -104,11 +160,26 @@ export function pinFromDockerfile(content: string, pinArg: string): string | nul
  */
 export async function evaluateCarries(target: DeploymentTarget, context: CarriesContext, reader: CarriesReader): Promise<CarriesVerdict | null> {
   if (typeof target.carries === "string") return null;
+  const rule = matchCarriesRule(target.carries, context.prRepo, context.files);
   if (context.merge === null || context.merge === "") return { kind: "not-yet", note: "The merge commit is not known yet; the next read re-resolves it" };
   if (context.ref === null || context.ref === "") return { kind: "not-yet", note: "The deployment has no ref yet" };
   const merge = context.merge;
-  const rule = matchCarriesRule(target.carries, context.prRepo, context.files);
   if (rule === null) return { kind: "undecided", note: `${NO_RULE_PREFIX} ${context.prRepo}${context.files.length === 0 ? "" : ` (${context.files.slice(0, 5).join(", ")}${context.files.length > 5 ? ", …" : ""})`}` };
+
+  // BB-260: a live-at-merge rule needs no image read, but a deployment can
+  // only settle a watch whose merge is already on the default branch. Require
+  // the deployment's ref to contain the merge, exactly as ref-contains-merge
+  // does: a stacked pull request's squash merge is not on main, so it stays
+  // not-yet until the BB-215 override re-points the watch. The record path
+  // (`liveAtMergeVerdict`) settles a normal merge at merge time, so this read
+  // only runs for a watch left awaiting a deployment.
+  if (rule.strategy.kind === "live-at-merge") {
+    const { status, error } = await reader.compare(target.repo, merge, context.ref);
+    if (error !== null || status === null) return { kind: "undecided", note: `live-at-merge: could not compare ${short(merge)}...${context.ref} on ${target.repo}${error === null ? "" : `: ${error}`}` };
+    return containsStatus(status)
+      ? liveAtMergeVerdict(rule)!
+      : { kind: "not-yet", note: `live-at-merge: ${context.ref} does not contain merge ${short(merge)} (${status})` };
+  }
 
   if (rule.strategy.kind === "ref-contains-merge") {
     const { status, error } = await reader.compare(target.repo, merge, context.ref);
@@ -118,7 +189,10 @@ export async function evaluateCarries(target: DeploymentTarget, context: Carries
       : { kind: "not-yet", note: `ref-contains-merge: ${context.ref} does not contain merge ${short(merge)} (${status})` };
   }
 
-  const { manifest, image, workflow, job, consumer } = rule.strategy;
+  // The `live-at-merge` and `ref-contains-merge` kinds returned above; the
+  // reads in the block before this reset the compiler's narrowing of the
+  // property, so re-state it.
+  const { manifest, image, workflow, job, consumer } = rule.strategy as Extract<CarriesStrategy, { kind: "image-tag" }>;
   const manifestRead = await reader.fileAtRef(target.repo, manifest, context.ref);
   if (manifestRead.error !== null) return { kind: "undecided", note: `image-tag: could not read ${manifest} at ${context.ref} on ${target.repo}: ${manifestRead.error}` };
   if (manifestRead.content === null) return { kind: "not-yet", note: `image-tag: ${manifest} has no ${image} at ${context.ref}` };

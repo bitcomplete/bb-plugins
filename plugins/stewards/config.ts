@@ -1112,10 +1112,16 @@ export type CarriesWhen = z.infer<typeof carriesWhenSchema>;
  * whether the deployment's ref has the merge as an ancestor. `image-tag`
  * reads the image tag the manifest applies, finds the workflow run it names,
  * and compares the merge against what that run built: the run's head sha, or
- * the commit whose Dockerfile pinned a consumer (BB-132).
+ * the commit whose Dockerfile pinned a consumer (BB-132). `live-at-merge`
+ * names a merge nothing deploys: nothing builds or applies the paths the rule
+ * lists (`.bb`, docs, markdown), so the merge is live the moment it lands.
+ * Unlike the other kinds it matches only when every changed file is under its
+ * paths, so a merge that also touches a deployed path falls through to the
+ * rule that owns it (BB-260).
  */
 export const carriesStrategySchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ref-contains-merge") }).strict(),
+  z.object({ kind: z.literal("live-at-merge") }).strict(),
   z
     .object({
       kind: z.literal("image-tag"),

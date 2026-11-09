@@ -113,7 +113,7 @@ import {
   type Source,
   type WorkflowRun,
 } from "./source-contract.js";
-import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
+import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -3738,12 +3738,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             landedOverride = (p) => (p.unit === baseUnit && p.pull?.base === baseHead ? override : null);
           }
         }
-        deployments = recordMerged(deployments, observed, deployTargets, now(), landedOverride);
+        // BB-260: a live-at-merge rule is only live on the default branch, so
+        // the record needs to know each merged pull's default branch. Read it
+        // only when a target actually has a live rule, and once per repo. A
+        // read that fails names no default branch, so the merge is not live
+        // (the safe direction) and the watch keeps awaiting a deployment.
+        const wantsLive = deployTargets.some((t) => typeof t.carries !== "string" && t.carries.some((r) => r.strategy.kind === "live-at-merge"));
+        let isDefaultBase: ((prRepo: string, base: string | null) => boolean) | undefined;
+        if (wantsLive) {
+          const branches = new Map<string, string | null>();
+          for (const p of mergedPulls(observed)) {
+            if (branches.has(p.unit)) continue;
+            branches.set(p.unit, await github.defaultBranch(p.unit).catch(() => null));
+          }
+          isDefaultBase = (prRepo, base) => base !== null && branches.get(prRepo) === base;
+        }
+        deployments = recordMerged(deployments, observed, deployTargets, now(), landedOverride, isDefaultBase);
         if (deployments !== beforeDeploy) {
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
           // A reconcile can also only drop a not-applicable watch (BB-132
           // follow-up): there is nothing new to await, so do not announce it.
-          if (fresh.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
+          // A live-at-merge watch (BB-260) is already `deployed` when it is
+          // recorded: nothing builds or applies its paths, so it has no
+          // deployment to await and the steward is woken with the verdict now.
+          const liveNow = fresh.filter((k) => deployments[k]?.state === "deployed");
+          const awaiting = fresh.filter((k) => deployments[k]?.state !== "deployed");
+          if (awaiting.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${awaiting.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
+          if (liveNow.length > 0) deploymentChanges.push({ text: `Deployed at merge: ${liveNow.map((k) => `${k} — ${deployments[k]?.note ?? "live at merge"}`).join("; ")}`, actionable: true });
         }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
         // BB-59: a deployment that already exists confirms a merge whose

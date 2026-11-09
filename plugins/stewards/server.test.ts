@@ -11675,6 +11675,50 @@ describe("deployment watching (BB-53)", () => {
     expect(prompt).toMatch(/Awaiting deployment: acme\/web#7/u);
   });
 
+  // BB-260: a merge whose matching rule is live-at-merge is recorded
+  // `deployed` the moment it lands, and the steward is woken with the verdict
+  // and no deployment doorbell. The mixed case below still follows the kploy
+  // rule, which waits for its apply.
+  it("records a .bb-only merge as deployed at merge and wakes the steward with no deployment (BB-260)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook(
+      [
+        "    - when: { repo: acme/web, paths: [kploy/**, backend.json] }",
+        "      strategy: { kind: ref-contains-merge }",
+        '    - when: { repo: acme/web, paths: [.bb/**, docs/**, "**.md"] }',
+        "      strategy: { kind: live-at-merge }",
+      ].join("\n"),
+    );
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/playbooks/linear-tickets.md"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({
+      state: "deployed",
+      deadlineAt: null,
+      note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md",
+    });
+    const prompt = String(t.spawns[1]!.prompt);
+    expect(prompt).toMatch(/Deployed at merge: acme\/web#7/u);
+    expect(prompt).toMatch(/live-at-merge: nothing deploys/u);
+    expect(prompt).not.toMatch(/Awaiting deployment: acme\/web#7/u);
+  });
+
+  // BB-260: a stacked live watch is recorded merged, not deployed, because
+  // its merge is not on the default branch. A deployment whose ref (main)
+  // does not contain the stacked merge leaves it not-yet rather than settling
+  // it deployed with no read.
+  it("keeps a stacked live watch not-yet on a deployment that does not contain its merge (BB-260)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook(["    - when: { repo: acme/web, paths: [.bb/**] }", "      strategy: { kind: live-at-merge }"].join("\n"));
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", mergeSha: "stacked1" });
+    t.sourceCompares.set("acme/bb-gate stacked1 main", "behind");
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", note: expect.stringMatching(/live-at-merge: main does not contain merge stacked/u) });
+  });
+
   it("routes a deployment doorbell to the awaiting binding and shows the deployment in the wake", async () => {
     const t = await setup();
     merged(t);

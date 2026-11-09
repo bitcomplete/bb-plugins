@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DeploymentTarget } from "./config.js";
-import { evaluateCarries, imageTagFromManifest, matchCarriesRule, pinFromDockerfile, type CarriesReader } from "./carries.js";
+import { CARRIES_FILES_PAGE_LIMIT, evaluateCarries, imageTagFromManifest, liveAtMergeMatches, liveAtMergeVerdict, matchCarriesRule, pinFromDockerfile, type CarriesReader } from "./carries.js";
 import type { WorkflowRunInfo } from "./source-contract.js";
 
 const MERGE = "mergecommit0";
@@ -62,6 +62,64 @@ describe("matching a carries rule", () => {
     expect(matchCarriesRule(rules, "bitcomplete/bb-gate", ["kploy/production/kustomization.yaml"])).toBe(rules[1]);
     expect(matchCarriesRule(rules, "bitcomplete/bb-plugins", ["x"])).toBeNull();
     expect(matchCarriesRule(rules, "BitComplete/BB-Gate", [])).toBe(rules[1]);
+  });
+
+  // BB-260: carries paths are matched directly. `touchesAny` would strip the
+  // leading segment of a rule like `kploy/**`, turning it into `**`, so a
+  // single-segment rule matched every file and swallowed the rules after it.
+  it("does not let a single-segment rule swallow another rule's files", () => {
+    const kploy = { when: { repo: "bitcomplete/bb-gate", paths: ["kploy/**"] }, strategy: { kind: "ref-contains-merge" as const } };
+    const router = { when: { repo: "bitcomplete/bb-gate" }, strategy: { kind: "image-tag" as const, manifest: "m", image: "bb-gate", workflow: "image.yaml" } };
+    expect(matchCarriesRule([kploy, router], "bitcomplete/bb-gate", ["cmd/router/main.go"])).toBe(router);
+    expect(matchCarriesRule([kploy, router], "bitcomplete/bb-gate", ["kploy/production/kustomization.yaml"])).toBe(kploy);
+  });
+
+  // BB-260: a live-at-merge rule matches only when every changed file is
+  // under its paths, so a mixed merge falls through to the rule that owns the
+  // other path. The other kinds keep any-file matching.
+  describe("a live-at-merge rule", () => {
+    const live = { when: { repo: "bitcomplete/bb-gate", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" as const } };
+    const kploy = { when: { repo: "bitcomplete/bb-gate", paths: ["kploy/**", "backend.json"] }, strategy: { kind: "ref-contains-merge" as const } };
+    const router = { when: { repo: "bitcomplete/bb-gate" }, strategy: { kind: "image-tag" as const, manifest: "m", image: "bb-gate", workflow: "image.yaml" } };
+
+    it("matches every changed file under its paths, including '**.md'", () => {
+      const rules = [live, router];
+      expect(matchCarriesRule(rules, "bitcomplete/bb-gate", [".bb/stewards/project.json"])).toBe(live);
+      expect(matchCarriesRule(rules, "bitcomplete/bb-gate", ["docs/design.md"])).toBe(live);
+      expect(matchCarriesRule(rules, "bitcomplete/bb-gate", ["README.md"])).toBe(live);
+      expect(liveAtMergeMatches(live, "BitComplete/BB-Gate", ["docs/a.md"])).toBe(true);
+    });
+
+    it("falls through to an earlier rule on a mixed merge", () => {
+      // The kploy rule is first and matches any of its files.
+      expect(matchCarriesRule([kploy, live], "bitcomplete/bb-gate", ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"])).toBe(kploy);
+      // With the live rule first, the mixed merge does not match it and falls
+      // through to the kploy rule.
+      expect(matchCarriesRule([live, kploy], "bitcomplete/bb-gate", ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"])).toBe(kploy);
+    });
+
+    it("reaches the catch-all image-tag rule for .bb plus router code", () => {
+      expect(matchCarriesRule([kploy, live, router], "bitcomplete/bb-gate", [".bb/stewards/project.json", "cmd/router/main.go"])).toBe(router);
+      expect(matchCarriesRule([kploy, live, router], "bitcomplete/bb-gate", ["internal/gate/server.go"])).toBe(router);
+    });
+
+    it("never matches an empty or unreadable file list", () => {
+      expect(matchCarriesRule([live], "bitcomplete/bb-gate", [])).toBeNull();
+      expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", [])).toBe(false);
+    });
+
+    // BB-260: the source reads at most GitHub's first 100 changed paths, so a
+    // list that long may hide a file outside the paths and must not match.
+    it("never matches at GitHub's changed-files page limit", () => {
+      const atLimit = Array.from({ length: CARRIES_FILES_PAGE_LIMIT }, (_, i) => `docs/${i}.md`);
+      expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", atLimit)).toBe(false);
+      expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", atLimit.slice(0, CARRIES_FILES_PAGE_LIMIT - 1))).toBe(true);
+    });
+
+    it("gives a deployed verdict without any deployment read, and null for other kinds", () => {
+      expect(liveAtMergeVerdict(live)).toEqual({ kind: "deployed", note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
+      expect(liveAtMergeVerdict(kploy)).toBeNull();
+    });
   });
 });
 
@@ -151,6 +209,52 @@ describe("the carries strategies", () => {
     );
     expect(verdict).toMatchObject({ kind: "deployed" });
     expect(verdict?.note).toMatch(/head gatehea/u);
+  });
+
+  // BB-260: a live-at-merge rule needs no image read, but a deployment can
+  // only settle a watch whose merge is already on the default branch, so the
+  // evaluate path compares the ref. A stacked merge is not on main and stays
+  // not-yet until the BB-215 override re-points the watch.
+  it("a live-at-merge rule settles a deployment only when the ref contains the merge", async () => {
+    const rule = { when: { repo: "bitcomplete/bb-gate", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" as const } };
+    const calls: string[] = [];
+    const verdict = await evaluateCarries(
+      target({ carries: [rule] }),
+      context({ prRepo: "bitcomplete/bb-gate", files: [".bb/stewards/project.json"] }),
+      reader({
+        compare: async (_repo, base, head) => {
+          calls.push(`compare ${base} ${head}`);
+          return { status: "identical", error: null };
+        },
+        fileAtRef: async () => { calls.push("fileAtRef"); return { content: null, error: null }; },
+      }),
+    );
+    expect(verdict).toEqual({ kind: "deployed", note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
+    // Only the ref compare runs: no manifest, run or file read.
+    expect(calls).toEqual([`compare ${MERGE} ${REF}`]);
+
+    const behind = await evaluateCarries(
+      target({ carries: [rule] }),
+      context({ prRepo: "bitcomplete/bb-gate", files: [".bb/stewards/project.json"] }),
+      reader({ compare: async () => ({ status: "behind", error: null }) }),
+    );
+    expect(behind).toMatchObject({ kind: "not-yet", note: expect.stringMatching(/live-at-merge: gatehead0 does not contain merge/u) });
+  });
+
+  it("a mixed PR follows an earlier kploy rule rather than live-at-merge", async () => {
+    const calls: string[] = [];
+    const verdict = await evaluateCarries(
+      target({
+        carries: [
+          { when: { repo: "bitcomplete/bb-gate", paths: ["kploy/**", "backend.json"] }, strategy: { kind: "ref-contains-merge" } },
+          { when: { repo: "bitcomplete/bb-gate", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" } },
+        ],
+      }),
+      context({ prRepo: "bitcomplete/bb-gate", files: ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"] }),
+      reader({ compare: async () => { calls.push("compare"); return { status: "identical", error: null }; } }),
+    );
+    expect(verdict).toMatchObject({ kind: "deployed", note: expect.stringMatching(/ref-contains-merge/u) });
+    expect(calls).toEqual(["compare"]);
   });
 
   it("bb-gate no image: carried when the deployment ref contains the merge", async () => {
