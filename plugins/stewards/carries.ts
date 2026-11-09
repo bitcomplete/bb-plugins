@@ -161,16 +161,25 @@ export function pinFromDockerfile(content: string, pinArg: string): string | nul
 export async function evaluateCarries(target: DeploymentTarget, context: CarriesContext, reader: CarriesReader): Promise<CarriesVerdict | null> {
   if (typeof target.carries === "string") return null;
   const rule = matchCarriesRule(target.carries, context.prRepo, context.files);
-  // A live-at-merge rule settles the moment the rule matches: it names paths
-  // nothing deploys, so no merge sha or deployment ref is needed. This also
-  // covers a deployment doorbell that later evaluates the same rule (BB-260).
-  if (rule !== null) {
-    if (rule.strategy.kind === "live-at-merge") return liveAtMergeVerdict(rule)!;
-  }
   if (context.merge === null || context.merge === "") return { kind: "not-yet", note: "The merge commit is not known yet; the next read re-resolves it" };
   if (context.ref === null || context.ref === "") return { kind: "not-yet", note: "The deployment has no ref yet" };
   const merge = context.merge;
   if (rule === null) return { kind: "undecided", note: `${NO_RULE_PREFIX} ${context.prRepo}${context.files.length === 0 ? "" : ` (${context.files.slice(0, 5).join(", ")}${context.files.length > 5 ? ", …" : ""})`}` };
+
+  // BB-260: a live-at-merge rule needs no image read, but a deployment can
+  // only settle a watch whose merge is already on the default branch. Require
+  // the deployment's ref to contain the merge, exactly as ref-contains-merge
+  // does: a stacked pull request's squash merge is not on main, so it stays
+  // not-yet until the BB-215 override re-points the watch. The record path
+  // (`liveAtMergeVerdict`) settles a normal merge at merge time, so this read
+  // only runs for a watch left awaiting a deployment.
+  if (rule.strategy.kind === "live-at-merge") {
+    const { status, error } = await reader.compare(target.repo, merge, context.ref);
+    if (error !== null || status === null) return { kind: "undecided", note: `live-at-merge: could not compare ${short(merge)}...${context.ref} on ${target.repo}${error === null ? "" : `: ${error}`}` };
+    return containsStatus(status)
+      ? liveAtMergeVerdict(rule)!
+      : { kind: "not-yet", note: `live-at-merge: ${context.ref} does not contain merge ${short(merge)} (${status})` };
+  }
 
   if (rule.strategy.kind === "ref-contains-merge") {
     const { status, error } = await reader.compare(target.repo, merge, context.ref);
@@ -180,8 +189,9 @@ export async function evaluateCarries(target: DeploymentTarget, context: Carries
       : { kind: "not-yet", note: `ref-contains-merge: ${context.ref} does not contain merge ${short(merge)} (${status})` };
   }
 
-  // The `live-at-merge` kind returned above; the reads in the block before
-  // this reset the compiler's narrowing of the property, so re-state it.
+  // The `live-at-merge` and `ref-contains-merge` kinds returned above; the
+  // reads in the block before this reset the compiler's narrowing of the
+  // property, so re-state it.
   const { manifest, image, workflow, job, consumer } = rule.strategy as Extract<CarriesStrategy, { kind: "image-tag" }>;
   const manifestRead = await reader.fileAtRef(target.repo, manifest, context.ref);
   if (manifestRead.error !== null) return { kind: "undecided", note: `image-tag: could not read ${manifest} at ${context.ref} on ${target.repo}: ${manifestRead.error}` };

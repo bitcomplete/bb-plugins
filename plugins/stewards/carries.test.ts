@@ -211,25 +211,34 @@ describe("the carries strategies", () => {
     expect(verdict?.note).toMatch(/head gatehea/u);
   });
 
-  // BB-260: a live-at-merge rule settles the moment the rule matches; the
-  // reader is never called, and a deployment doorbell reaches the same verdict.
-  it("a live-at-merge rule is deployed without a deployment read", async () => {
-    const calls: string[] = [];
+  // BB-260: a live-at-merge rule needs no image read, but a deployment can
+  // only settle a watch whose merge is already on the default branch, so the
+  // evaluate path compares the ref. A stacked merge is not on main and stays
+  // not-yet until the BB-215 override re-points the watch.
+  it("a live-at-merge rule settles a deployment only when the ref contains the merge", async () => {
     const rule = { when: { repo: "bitcomplete/bb-gate", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" as const } };
+    const calls: string[] = [];
     const verdict = await evaluateCarries(
       target({ carries: [rule] }),
       context({ prRepo: "bitcomplete/bb-gate", files: [".bb/stewards/project.json"] }),
       reader({
-        compare: async () => { calls.push("compare"); return { status: null, error: null }; },
+        compare: async (_repo, base, head) => {
+          calls.push(`compare ${base} ${head}`);
+          return { status: "identical", error: null };
+        },
         fileAtRef: async () => { calls.push("fileAtRef"); return { content: null, error: null }; },
       }),
     );
     expect(verdict).toEqual({ kind: "deployed", note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
-    expect(calls).toEqual([]);
-    // The same rule on a later deployment doorbell (a ref is present) still
-    // returns deployed without reading the ref.
-    const doorbell = await evaluateCarries(target({ carries: [rule] }), context({ prRepo: "bitcomplete/bb-gate", files: ["docs/x.md"], ref: "gatehead0" }), reader());
-    expect(doorbell).toMatchObject({ kind: "deployed" });
+    // Only the ref compare runs: no manifest, run or file read.
+    expect(calls).toEqual([`compare ${MERGE} ${REF}`]);
+
+    const behind = await evaluateCarries(
+      target({ carries: [rule] }),
+      context({ prRepo: "bitcomplete/bb-gate", files: [".bb/stewards/project.json"] }),
+      reader({ compare: async () => ({ status: "behind", error: null }) }),
+    );
+    expect(behind).toMatchObject({ kind: "not-yet", note: expect.stringMatching(/live-at-merge: gatehead0 does not contain merge/u) });
   });
 
   it("a mixed PR follows an earlier kploy rule rather than live-at-merge", async () => {
