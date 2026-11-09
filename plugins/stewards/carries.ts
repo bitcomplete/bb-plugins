@@ -66,16 +66,25 @@ export const containsStatus = (status: CompareStatus | null): boolean => status 
 const fileUnder = (file: string, paths: readonly string[]): boolean => paths.some((pattern) => globMatches(pattern, file));
 
 /**
+ * GitHub's changed-files page size: the source reads at most this many paths,
+ * so a list this long may be truncated and is not a complete "every file" set
+ * (BB-260).
+ */
+export const CARRIES_FILES_PAGE_LIMIT = 100;
+
+/**
  * Whether a `live-at-merge` rule matches: its repo, and every changed file
  * under one of its paths. An empty or unreadable file list matches nothing
- * (an unknown change is never assumed live), and a rule with no paths matches
- * any non-empty list. A merge that also touches a path outside the rule does
- * not match, so it can fall through to the rule that owns that path.
+ * (an unknown change is never assumed live), nor does a list at GitHub's page
+ * limit, which may be truncated and so may hide a file outside the paths. A
+ * rule with no paths matches any non-empty list. A merge that also touches a
+ * path outside the rule does not match, so it can fall through to the rule
+ * that owns that path.
  */
 export function liveAtMergeMatches(rule: CarriesRule, prRepo: string, files: readonly string[]): boolean {
   if (rule.strategy.kind !== "live-at-merge") return false;
   if (rule.when.repo.toLowerCase() !== prRepo.toLowerCase()) return false;
-  if (files.length === 0) return false;
+  if (files.length === 0 || files.length >= CARRIES_FILES_PAGE_LIMIT) return false;
   const paths = rule.when.paths;
   if (paths === undefined || paths.length === 0) return true;
   return files.every((file) => fileUnder(file, paths));

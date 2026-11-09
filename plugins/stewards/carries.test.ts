@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DeploymentTarget } from "./config.js";
-import { evaluateCarries, imageTagFromManifest, liveAtMergeMatches, liveAtMergeVerdict, matchCarriesRule, pinFromDockerfile, type CarriesReader } from "./carries.js";
+import { CARRIES_FILES_PAGE_LIMIT, evaluateCarries, imageTagFromManifest, liveAtMergeMatches, liveAtMergeVerdict, matchCarriesRule, pinFromDockerfile, type CarriesReader } from "./carries.js";
 import type { WorkflowRunInfo } from "./source-contract.js";
 
 const MERGE = "mergecommit0";
@@ -106,6 +106,14 @@ describe("matching a carries rule", () => {
     it("never matches an empty or unreadable file list", () => {
       expect(matchCarriesRule([live], "bitcomplete/bb-gate", [])).toBeNull();
       expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", [])).toBe(false);
+    });
+
+    // BB-260: the source reads at most GitHub's first 100 changed paths, so a
+    // list that long may hide a file outside the paths and must not match.
+    it("never matches at GitHub's changed-files page limit", () => {
+      const atLimit = Array.from({ length: CARRIES_FILES_PAGE_LIMIT }, (_, i) => `docs/${i}.md`);
+      expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", atLimit)).toBe(false);
+      expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", atLimit.slice(0, CARRIES_FILES_PAGE_LIMIT - 1))).toBe(true);
     });
 
     it("gives a deployed verdict without any deployment read, and null for other kinds", () => {

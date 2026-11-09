@@ -257,6 +257,45 @@ describe("recording merged pull requests", () => {
     }
   });
 
+  // BB-260: GitHub's changed-files read is capped at 100, so a full page may
+  // hide a file outside the paths. It must not be treated as every-file.
+  it("does not deploy a merge at GitHub's changed-files page limit", () => {
+    const many = Array.from({ length: 100 }, (_, i) => `docs/${i}.md`);
+    const merged = pull({ key: "bitcomplete/bb-gate#9", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: many });
+    const recorded = recordMerged({}, { entity: merged, pulls: [] }, [liveAtMergeTarget], NOW);
+    expect(recorded["bitcomplete/bb-gate#9::bb-gate"]).toMatchObject({ state: "merged" });
+  });
+
+  // BB-260: a stacked pull request merged into its base branch is not on main,
+  // so it is not live at merge. The BB-215 override re-points it once the base
+  // lands, and the live check is re-run against the base's files.
+  it("does not mark a stacked .bb-only merge deployed before it reaches the default branch", () => {
+    const stacked = pull({ key: "bitcomplete/bb-gate#20", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] });
+    const isDefaultBase = (_repo: string, base: string | null) => base === "main";
+    const recorded = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, undefined, isDefaultBase);
+    expect(recorded["bitcomplete/bb-gate#20::bb-gate"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deadlineAt: NOW + liveAtMergeTarget.timeout });
+  });
+
+  it("keeps a stacked watch merged when the override's base is not live at merge", () => {
+    const stacked = pull({ key: "bitcomplete/bb-gate#21", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked2", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] });
+    const isDefaultBase = (_repo: string, base: string | null) => base === "main";
+    const first = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, undefined, isDefaultBase);
+    expect(first["bitcomplete/bb-gate#21::bb-gate"]).toMatchObject({ state: "merged" });
+    const base = { mergeSha: "base0001", prRepo: "bitcomplete/bb-gate", files: [".bb/AGENTS.md", "cmd/router/main.go"] };
+    const after = recordMerged(first, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW + 1000, () => base, isDefaultBase);
+    expect(after["bitcomplete/bb-gate#21::bb-gate"]).toMatchObject({ state: "merged", mergeSha: "base0001", files: [".bb/AGENTS.md", "cmd/router/main.go"] });
+  });
+
+  it("marks a stacked watch deployed when the override's base is live at merge", () => {
+    const stacked = pull({ key: "bitcomplete/bb-gate#22", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked3", base: "feature-base", head: "feature-stacked", files: ["cmd/router/main.go"] });
+    const isDefaultBase = (_repo: string, base: string | null) => base === "main";
+    const first = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, undefined, isDefaultBase);
+    expect(first["bitcomplete/bb-gate#22::bb-gate"]).toMatchObject({ state: "merged" });
+    const base = { mergeSha: "base0002", prRepo: "bitcomplete/bb-gate", files: [".bb/AGENTS.md"] };
+    const after = recordMerged(first, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW + 1000, () => base, isDefaultBase);
+    expect(after["bitcomplete/bb-gate#22::bb-gate"]).toMatchObject({ state: "deployed", mergeSha: "base0002", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
+  });
+
   it("does not record an open pull request, and reads a ticket's linked merged ones", () => {
     expect(recordMerged({}, observed({ entity: pull({ key: "acme/web#7" }, { merged: false }) }), [target], NOW)).toEqual({});
     const linked = recordMerged({}, observed({ entity: pull({ key: "acme/web#7", kind: "pull" }, { merged: false }), pulls: [pull({ key: "acme/web#8" }, { merged: true })] }), [target], NOW);

@@ -5,7 +5,7 @@
 // is evaluated by `carries.ts` (BB-132), and either way the steward reports a
 // verdict it disagrees with.
 import { z } from "zod";
-import { liveAtMergeVerdict, matchCarriesRule } from "./carries.js";
+import { liveAtMergeVerdict, matchCarriesRule, type CarriesVerdict } from "./carries.js";
 import type { DeploymentTarget } from "./config.js";
 import type { Deployment, EntitySnapshot, WorkflowRun } from "./source-contract.js";
 import type { Observed } from "./store.js";
@@ -95,6 +95,17 @@ export const targetAppliesToMerge = (target: DeploymentTarget, prRepo: string, f
   typeof target.carries === "string" || matchCarriesRule(target.carries, prRepo, files) !== null;
 
 /**
+ * The verdict a target's matching `live-at-merge` rule gives for a merge, or
+ * null when no live rule matches (BB-260). A free-text carries is the
+ * steward's and never matches here.
+ */
+function liveVerdict(target: DeploymentTarget, prRepo: string, files: readonly string[]): CarriesVerdict | null {
+  if (typeof target.carries === "string") return null;
+  const matched = matchCarriesRule(target.carries, prRepo, files);
+  return matched === null ? null : liveAtMergeVerdict(matched);
+}
+
+/**
  * Add a `merged` watch for every merged pull request the binding does not
  * already watch, for each of the playbook's deployment targets (BB-132). The
  * target's timeout is the deadline; a watch that already exists is left
@@ -108,7 +119,21 @@ export const targetAppliesToMerge = (target: DeploymentTarget, prRepo: string, f
  * target is watched, as before, so the merge still lands on the
  * steward-decided path rather than getting no watch (BB-132 follow-up).
  */
-export function recordMerged(deployments: Deployments, observed: Observed, targets: readonly DeploymentTarget[], now: number, overrideFor?: (p: EntitySnapshot) => { mergeSha: string | null; prRepo: string; files: string[] } | null): Deployments {
+export function recordMerged(
+  deployments: Deployments,
+  observed: Observed,
+  targets: readonly DeploymentTarget[],
+  now: number,
+  overrideFor?: (p: EntitySnapshot) => { mergeSha: string | null; prRepo: string; files: string[] } | null,
+  /**
+   * Whether a merged pull request's base is its repo's default branch, so its
+   * merge is already on `main`. A stacked pull request merged into its base
+   * branch is not live yet; the BB-215 override re-points it once the base
+   * lands. Omitted, every base is treated as the default (the pre-BB-260
+   * behaviour, for callers with no default-branch read).
+   */
+  isDefaultBase?: (prRepo: string, base: string | null) => boolean,
+): Deployments {
   const pulls = mergedPulls(observed);
   if (pulls.length === 0 || targets.length === 0) return deployments;
   const multiple = targets.length > 1;
@@ -123,6 +148,11 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
     const merge = over === null ? p.pull?.mergeCommit ?? null : over.mergeSha;
     const files = over === null ? p.pull?.files ?? [] : over.files;
     const prRepo = over === null ? p.unit : over.prRepo;
+    // BB-260: a live-at-merge merge is only live once it is on the default
+    // branch. A stacked pull request merged into its base branch is not live
+    // yet; the override, when it lands, re-points the watch to the base's
+    // merge on main. A base the read could not name is not treated as default.
+    const onDefault = over !== null || (isDefaultBase?.(p.unit, p.pull?.base ?? null) ?? true);
     // An existing watch's own recorded repo and files decide applicability
     // when it has them: a snapshot whose files read came back empty must not
     // drop an in-flight watch. The fresh snapshot is the fallback.
@@ -170,7 +200,25 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
           // never says a pin does not contain the sha it was re-resolved to.
           const reevaluate = existing.state === "merged" && existing.deploymentId !== null && existing.deploymentState === "success";
           const note = reevaluate ? resolved : existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})`;
-          next[id] = { ...existing, state: reevaluate ? "deploying" : existing.state, mergeSha: merge, ...(over === null ? {} : { prRepo, files }), note };
+          // BB-260: when the BB-215 override re-points the watch to the base
+          // merge on the default branch, re-run the live check against the
+          // base's files. A live rule marks it deployed; a watch live-marked
+          // on a stacked merge whose base is not live goes back to `merged`
+          // and awaits a deployment.
+          const live = over === null ? null : liveVerdict(target, prRepo, files);
+          let state = reevaluate ? "deploying" : existing.state;
+          let deadlineAt = existing.deadlineAt;
+          let finalNote = note;
+          if (live !== null) {
+            state = "deployed";
+            deadlineAt = null;
+            finalNote = live.note;
+          } else if (over !== null && existing.state === "deployed" && existing.deploymentId === null) {
+            state = "merged";
+            deadlineAt = now + target.timeout;
+            finalNote = resolved;
+          }
+          next[id] = { ...existing, state, mergeSha: merge, deadlineAt, ...(over === null ? {} : { prRepo, files }), note: finalNote };
           changed = true;
         }
         continue;
@@ -178,9 +226,10 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
       // BB-260: a `live-at-merge` rule names paths nothing builds or applies,
       // so the merge is already live when it is recorded. Mark the new watch
       // `deployed` on the spot and give it no deadline; the server announces
-      // the verdict so the steward is woken with no deployment to await.
-      const matched = typeof target.carries === "string" ? null : matchCarriesRule(target.carries, prRepo, files);
-      const live = matched === null ? null : liveAtMergeVerdict(matched);
+      // the verdict so the steward is woken with no deployment to await. A
+      // merge not on the default branch (a stacked pull request) is not live
+      // yet and keeps the normal awaiting-deployment watch.
+      const live = onDefault ? liveVerdict(target, prRepo, files) : null;
       next[id] = {
         key: p.key,
         state: live === null ? "merged" : "deployed",
