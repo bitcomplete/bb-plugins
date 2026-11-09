@@ -44,6 +44,7 @@ export const STANDING_RULES = [
   "- **A credential is a decision escalation the project steward forwards as a secret.** Raise it with `steward_report { escalate }`, naming the variable and purpose in `context`. Forward it with `resolution: \"secret\"` and either `writeEnv`/`worker` (the dotenv a worker reads) or `setting` (a plugin secret setting); the plugin spawns a requester thread that opens bb's secure form. `secret` is the only resolution even when the ticket or spec says the owner produces or seals it by hand, corrected at spec approval. Never paste a secret or route the user to a script.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
   '- **A spec that says "do not merge before X is Done" is a merge hold.** Report it with `steward_report { mergeBehind: ["X"] }`, never as a `merge` need or as free text alone: while it stands the plugin files no Merge item (so the effort shows as held, not "needs you"), it is a live wake source, and it lifts itself, waking you, once every named binding has merged its pull requests or ended. Each report replaces the set, and `mergeBehind: []` clears it.',
+  "- **The plugin merges once the lane gate is met.** When a pull request's gate is met and no worker is in flight, the plugin squash-merges it if the binding's playbook permits `merge` — a ticket binding always does, a `pr` binding when its `may` includes `merge` — and wakes you with the merge so you proceed to the deployment watch. Do not file a Merge item for such a pull request: the item on the page is for a playbook that does not permit `merge`, or for a merge the plugin attempted and GitHub refused (a conflict or branch protection), which is also raised to the project steward.",
 ];
 /**
  * The fixed first line of every brief, and of the per-turn system context the
@@ -87,10 +88,21 @@ const DESCRIPTION_CHARS = 4000;
 const WORKER_SKILLS =
   "Write the worker's task so it follows the `build-tickets` skill, which tells the worker to spawn its reviewer with the `pr-reviewer` skill; a `.bb/skills/<name>` copy overrides either.";
 
+/**
+ * Whether the plugin itself merges this binding's gate-met pull request
+ * (BB-257): a ticket binding always runs the full loop and so always merges;
+ * a `pr` binding only when its playbook's `may` includes `merge`; a `review`
+ * binding (a teammate's pull request) never does, because its author merges
+ * (BB-170). One function decides it, so the worker skill line and the
+ * gate-met branch of `syncNeeds` cannot disagree.
+ */
+export function bindingMayMerge(binding: Pick<Binding, "kind">, playbook: Pick<Playbook, "may">): boolean {
+  return binding.kind === "ticket" || (binding.kind === "pr" && playbook.may.includes("merge"));
+}
+
 /** The skill line for a binding, or empty when its playbook's worker does not merge. */
 function workerSkillsLine(binding: Binding, playbook: Playbook): string[] {
-  const runsTheLoop = binding.kind === "ticket" || (binding.kind === "pr" && playbook.may.includes("merge"));
-  return runsTheLoop ? ["", WORKER_SKILLS] : [];
+  return bindingMayMerge(binding, playbook) ? ["", WORKER_SKILLS] : [];
 }
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
