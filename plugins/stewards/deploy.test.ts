@@ -30,6 +30,21 @@ const devboxTarget: DeploymentTarget = {
   timeout: 3_600_000,
   workflows: [],
 };
+// The split bb-gate rule (BB-260): kploy and backend.json wait for the apply,
+// .bb/docs/markdown are live at merge, and anything else builds the router.
+const liveAtMergeTarget: DeploymentTarget = {
+  name: "bb-gate",
+  source: "github",
+  repo: "bitcomplete/bb-gate",
+  environment: "production",
+  carries: [
+    { when: { repo: "bitcomplete/bb-gate", paths: ["kploy/**", "backend.json"] }, strategy: { kind: "ref-contains-merge" } },
+    { when: { repo: "bitcomplete/bb-gate", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" } },
+    { when: { repo: "bitcomplete/bb-gate" }, strategy: { kind: "image-tag", manifest: "kploy/production/kustomization.yaml", image: "bb-gate", workflow: "image.yaml" } },
+  ],
+  timeout: 3_600_000,
+  workflows: [],
+};
 const NOW = Date.parse("2026-10-14T15:00:00Z");
 
 const observed = (over: { entity?: ReturnType<typeof pull>; pulls?: Array<ReturnType<typeof pull>> } = {}): Observed => ({
@@ -195,6 +210,51 @@ describe("recording merged pull requests", () => {
     const other = { entity: pull({ key: "bitcomplete/other#3", unit: "bitcomplete/other" }, { merged: true, mergeCommit: "ccccccc3", files: ["README.md"] }), pulls: [] };
     const deployments = recordMerged({}, other, [bbGateTarget, devboxTarget], NOW);
     expect(Object.keys(deployments).sort()).toEqual(["bitcomplete/other#3::bb-gate", "bitcomplete/other#3::devbox"]);
+  });
+
+  // BB-260: a merge nothing deploys is `deployed` the moment it is recorded,
+  // with no deadline, so the steward is woken without waiting for any
+  // deployment.
+  it("marks a .bb-only merge deployed at merge, with no deadline", () => {
+    const bbOnly = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }), pulls: [] };
+    const recorded = recordMerged({}, bbOnly, [liveAtMergeTarget], NOW);
+    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+    expect(recorded["bitcomplete/bb-gate#4::bb-gate"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
+    // Nothing times out and nothing awaits a deployment.
+    expect(timeoutsDue(recorded, NOW + liveAtMergeTarget.timeout)).toEqual([]);
+    expect(awaitingOnRepo(recorded, "bitcomplete/bb-gate")).toEqual([]);
+  });
+
+  it("treats a docs-only or markdown-only merge as live at merge too", () => {
+    for (const files of [["docs/design.md"], ["README.md"]]) {
+      const merged = { entity: pull({ key: "bitcomplete/bb-gate#8", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files }), pulls: [] };
+      const recorded = recordMerged({}, merged, [liveAtMergeTarget], NOW);
+      expect(recorded["bitcomplete/bb-gate#8::bb-gate"]).toMatchObject({ state: "deployed" });
+    }
+  });
+
+  it("follows an earlier kploy rule for a mixed PR rather than live-at-merge", () => {
+    const mixed = { entity: pull({ key: "bitcomplete/bb-gate#5", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"] }), pulls: [] };
+    const recorded = recordMerged({}, mixed, [liveAtMergeTarget], NOW);
+    expect(recorded["bitcomplete/bb-gate#5::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + liveAtMergeTarget.timeout, note: null });
+  });
+
+  it("reaches the bb-gate image-tag rule for .bb plus router code", () => {
+    for (const files of [[".bb/stewards/project.json", "cmd/router/main.go"], [".bb/stewards/project.json", "internal/gate/server.go"]]) {
+      const router = { entity: pull({ key: "bitcomplete/bb-gate#6", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files }), pulls: [] };
+      const recorded = recordMerged({}, router, [liveAtMergeTarget], NOW);
+      // Awaiting the router image build, not deployed at merge.
+      expect(recorded["bitcomplete/bb-gate#6::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + liveAtMergeTarget.timeout, note: null });
+    }
+  });
+
+  it("does not deploy an empty or unreadable file list at merge", () => {
+    const liveOnly: DeploymentTarget = { ...liveAtMergeTarget, carries: [{ when: { repo: "bitcomplete/bb-gate", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
+    for (const files of [[], undefined]) {
+      const merged = pull({ key: "bitcomplete/bb-gate#7", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files });
+      const recorded = recordMerged({}, { entity: merged, pulls: [] }, [liveOnly], NOW);
+      expect(recorded["bitcomplete/bb-gate#7::bb-gate"]).toMatchObject({ state: "merged" });
+    }
   });
 
   it("does not record an open pull request, and reads a ticket's linked merged ones", () => {

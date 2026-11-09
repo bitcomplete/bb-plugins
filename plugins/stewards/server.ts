@@ -3743,7 +3743,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
           // A reconcile can also only drop a not-applicable watch (BB-132
           // follow-up): there is nothing new to await, so do not announce it.
-          if (fresh.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
+          // A live-at-merge watch (BB-260) is already `deployed` when it is
+          // recorded: nothing builds or applies its paths, so it has no
+          // deployment to await and the steward is woken with the verdict now.
+          const liveNow = fresh.filter((k) => deployments[k]?.state === "deployed");
+          const awaiting = fresh.filter((k) => deployments[k]?.state !== "deployed");
+          if (awaiting.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${awaiting.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
+          if (liveNow.length > 0) deploymentChanges.push({ text: `Deployed at merge: ${liveNow.map((k) => `${k} — ${deployments[k]?.note ?? "live at merge"}`).join("; ")}`, actionable: true });
         }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
         // BB-59: a deployment that already exists confirms a merge whose

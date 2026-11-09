@@ -873,7 +873,19 @@ the workflow run it numbers, and compares the merge against what that run
 built: the run's head sha without `job`; with `job`, the default branch as of
 the job's `started_at`, or, with `consumer` (`dockerfile`, `pinArg`, `repo`),
 the pin in the Dockerfile at that time, compared in the consumer's repo. The
-plugin reports `deployed`/`not-yet` itself. A doorbell, and a deployment
+plugin reports `deployed`/`not-yet` itself.
+
+`ref-contains-merge` and `image-tag` match when at least one changed file is
+under one of the rule's `paths` (or the rule lists none).
+`strategy: { kind: live-at-merge }` names a merge nothing deploys: no build
+or apply runs for the paths it lists (`.bb`, docs, markdown), so the merge is
+live the moment it lands. It matches only when every changed file is under
+its `paths`, so a merge that also touches a path another rule owns falls
+through to that rule (first match wins), and an empty or unreadable file list
+never matches it. The plugin marks such a watch `deployed` as soon as it
+records the merge, with a note such as `live-at-merge: nothing deploys
+.bb/**, docs/**, **.md`, and the steward is woken with the verdict and no
+deployment to await. A doorbell, and a deployment
 discovered on the sweep, is applied mechanically: an `in_progress` or
 `created` deployment, and a `success` that does not carry the merge yet,
 change no watch and leave a quiet note rather than a steward turn. The steward is woken only when a verdict settles a watch

@@ -5,7 +5,7 @@
 // is evaluated by `carries.ts` (BB-132), and either way the steward reports a
 // verdict it disagrees with.
 import { z } from "zod";
-import { matchCarriesRule } from "./carries.js";
+import { liveAtMergeVerdict, matchCarriesRule } from "./carries.js";
 import type { DeploymentTarget } from "./config.js";
 import type { Deployment, EntitySnapshot, WorkflowRun } from "./source-contract.js";
 import type { Observed } from "./store.js";
@@ -175,9 +175,15 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
         }
         continue;
       }
+      // BB-260: a `live-at-merge` rule names paths nothing builds or applies,
+      // so the merge is already live when it is recorded. Mark the new watch
+      // `deployed` on the spot and give it no deadline; the server announces
+      // the verdict so the steward is woken with no deployment to await.
+      const matched = typeof target.carries === "string" ? null : matchCarriesRule(target.carries, prRepo, files);
+      const live = matched === null ? null : liveAtMergeVerdict(matched);
       next[id] = {
         key: p.key,
-        state: "merged",
+        state: live === null ? "merged" : "deployed",
         mergeSha: merge,
         target: multiple || target.name !== undefined ? targetKeyOf(target) : "",
         mergedAt: now,
@@ -191,8 +197,8 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
         sha: null,
         url: null,
         at: now,
-        deadlineAt: now + target.timeout,
-        note: merge === null ? "The merge commit is not known yet; the next read re-resolves it" : null,
+        deadlineAt: live === null ? now + target.timeout : null,
+        note: live === null ? (merge === null ? "The merge commit is not known yet; the next read re-resolves it" : null) : live.note,
         workflowRuns: [],
       };
       changed = true;

@@ -480,6 +480,31 @@ describe("playbooks", () => {
     if (!duplicate.ok) expect(duplicate.error).toMatch(/bb-gate is listed twice/u);
   });
 
+  // BB-260: the third strategy, for a merge nothing builds or applies.
+  it("takes a live-at-merge carries strategy and still refuses an unknown kind", () => {
+    const structured = LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      [
+        "requeue-default: 2d",
+        "deployment:",
+        "  source: github",
+        "  repo: bitcomplete/bb-gate",
+        "  environment: production",
+        "  carries:",
+        "    - when: { repo: bitcomplete/bb-gate, paths: [kploy/**, backend.json] }",
+        "      strategy: { kind: ref-contains-merge }",
+        "    - when: { repo: bitcomplete/bb-gate, paths: [.bb/**, docs/**, '**.md'] }",
+        "      strategy: { kind: live-at-merge }",
+        "  timeout: 90m",
+      ].join("\n"),
+    );
+    const parsed = parsePlaybook(structured, "linear-tickets");
+    if (!parsed.ok) throw new Error(parsed.error);
+    const rules = parsed.value.deployments[0]!.carries as Array<{ strategy: { kind: string } }>;
+    expect(rules.map((r) => r.strategy.kind)).toEqual(["ref-contains-merge", "live-at-merge"]);
+    expect(parsePlaybook(structured.replace("kind: live-at-merge", "kind: magic"), "linear-tickets")).toMatchObject({ ok: false });
+  });
+
   it("refuses what would misbehave", () => {
     expect(parsePlaybook("no front matter", "x")).toMatchObject({ ok: false });
     expect(parsePlaybook(LINEAR_TICKETS, "other-name")).toMatchObject({ ok: false });
