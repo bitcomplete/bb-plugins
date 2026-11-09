@@ -156,11 +156,21 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
       }
       if (existing !== undefined) {
         // Re-resolve a stored PR-head merge sha to the merge commit (BB-132).
-        // An unknown oid leaves the watch on the steward-decided path. The
-        // old note is kept: a settled watch's failure text must not vanish.
+        // An unknown oid leaves the watch on the steward-decided path. A
+        // settled watch's own note is kept and the re-resolution appended,
+        // except when the watch is re-evaluated (BB-259): then the stale
+        // not-yet note is replaced, so it cannot contradict the new sha.
         if (merge !== null && existing.mergeSha !== merge) {
           const resolved = `Merge commit re-resolved to ${merge.slice(0, 7)}`;
-          next[id] = { ...existing, mergeSha: merge, ...(over === null ? {} : { prRepo, files }), note: existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})` };
+          // A `merged` watch that already holds a success deployment was judged
+          // against the old sha (BB-215): moving it back to `deploying` lets the
+          // reconcile's carries re-evaluation loop settle it against the
+          // re-resolved sha in the same pass, rather than waiting for a new
+          // deployment or timing out. Its stale not-yet note is replaced, so it
+          // never says a pin does not contain the sha it was re-resolved to.
+          const reevaluate = existing.state === "merged" && existing.deploymentId !== null && existing.deploymentState === "success";
+          const note = reevaluate ? resolved : existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})`;
+          next[id] = { ...existing, state: reevaluate ? "deploying" : existing.state, mergeSha: merge, ...(over === null ? {} : { prRepo, files }), note };
           changed = true;
         }
         continue;
