@@ -3431,6 +3431,33 @@ describe("pull requests", () => {
     expect(t.hooks.store.binding(b.id)!.pending.some((n) => n.quiet === true && n.text.includes("Review:"))).toBe(true);
   });
 
+  it("BB-263: observes the newest linked pull request past the cap of five", async () => {
+    const t = await setup();
+    const link = (n: number) => ({ key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` });
+    // Six linked pull requests in timeline order (oldest first). The cap keeps
+    // five, so the newest is the one at risk of being displaced.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [link(1), link(2), link(3), link(4), link(5), link(6)] }));
+    for (const n of [1, 2, 3, 4, 5]) {
+      t.entities.set(`acme/web#${n}`, pull({ id: `acme/web#${n}`, key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}`, state: "merged" }, { merged: true }));
+    }
+    // The sixth is open, owner-reviewed and approved with green checks.
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#6", pull({ id: "acme/web#6", key: "acme/web#6", url: "https://github.com/acme/web/pull/6", author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    // The cap still holds (the oldest merged one is not read), but the sixth
+    // is observed and its approve-pr item is filed.
+    expect(b.lastSnapshot!.pulls.map((p) => p.key)).not.toContain("acme/web#1");
+    expect(b.lastSnapshot!.pulls.map((p) => p.key)).toContain("acme/web#6");
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toMatchObject({ url: "https://github.com/acme/web/pull/6" });
+    // A steward report filing approve-pr for it is accepted, not refused as
+    // unobserved.
+    const report = await t.tool("steward_report", { phase: "Review", summary: "Round 8 approved.", nextAction: "Wait for the owner.", actor: "user", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/6", what: "Approve acme/web#6" }] }, steward);
+    expect(report.error, report.text).toBe(false);
+    expect(report.text).not.toMatch(/not been observed/u);
+  });
+
   it("leaves out repos the project file excludes, and says so in check", async () => {
     const t = await setup();
     t.repos.push({ dir: "docs", url: "git@github.com:acme/docs.git" });
