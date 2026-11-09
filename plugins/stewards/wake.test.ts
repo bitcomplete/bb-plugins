@@ -6,8 +6,9 @@ import { explainDecision, formatDecisionListing } from "./decisions.js";
 import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
-import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS } from "./templates.js";
-import { STANDING_RULES, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, goalProgress, goalProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
+import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, goalProgress, goalProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { BRIEF_MAX_CHARS } from "./server.js";
 import type { OpsFinding } from "./ops.js";
 import type { DepsFinding } from "./deps.js";
 import { ESCALATED_NEED_KINDS, type Assumption } from "./store.js";
@@ -844,5 +845,65 @@ describe("recorded assumptions (BB-251)", () => {
     expect(projectWake).toContain("project: Assuming: SSO is out of scope");
     const projectDigest = formatRecords({ ...records, assumptions: projectRow }, []).join("\n");
     expect(projectDigest).toContain("project: Assuming: SSO is out of scope");
+  });
+});
+
+describe("the per-turn brief cap (BB-254)", () => {
+  /** A brief input for one shipped playbook, with three guidance entries and a hold. */
+  function briefInputFor(name: string, text: string, over: { guidance?: number; firstGuidance?: string; lastGuidance?: string } = {}) {
+    const { s } = world();
+    const parsed = parsePlaybook(text, name);
+    if (!parsed.ok) throw new Error(`${name}: ${parsed.error}`);
+    const playbook = parsed.value;
+    const source = playbook.kind === "ops" ? ("ops" as const) : playbook.source === "linear" ? ("linear" as const) : ("github" as const);
+    const base = s.create({
+      projectId: "p1",
+      source,
+      entityId: name,
+      entityKey: "ENG-1",
+      url: null,
+      title: "An entity",
+      kind: playbook.kind,
+      playbook: name,
+      playbookVersion: "v1",
+      parentBindingId: null,
+      phase: Object.keys(playbook.sections)[0] ?? null,
+      stage: null,
+    });
+    const count = over.guidance ?? 3;
+    const guidance = Array.from({ length: count }, (_, i) => ({
+      at: T,
+      by: "owner",
+      text: i === 0 && over.firstGuidance !== undefined ? over.firstGuidance : i === count - 1 && over.lastGuidance !== undefined ? over.lastGuidance : `Guidance entry ${i}: do the thing carefully and report.`,
+    }));
+    const binding = { ...base, guidance, hold: "waiting on a decision" };
+    return { playbook, input: { binding, playbook, gate: gateState(playbook, binding.ready, ""), workerFlags: "--provider claude-code --model claude-opus-5-5 --reasoning-level high" } };
+  }
+
+  it("carries the whole phase and general section of every shipped playbook at the cap", () => {
+    for (const [name, text] of Object.entries(PLAYBOOK_TEMPLATES)) {
+      const { playbook, input } = briefInputFor(name, text);
+      const brief = formatBrief(input, BRIEF_MAX_CHARS);
+      // No clipping: the capped and uncapped renders are identical.
+      expect(brief, name).toBe(formatBrief(input));
+      expect(brief, name).toContain(playbook.general);
+      const phase = input.binding.phase;
+      if (phase !== null) expect(brief, name).toContain(playbook.sections[phase]!);
+    }
+  });
+
+  it("clips the middle first when a brief is over the cap, keeping the prefix and the steward_report tail", () => {
+    const { input } = briefInputFor("linear-tickets", LINEAR_TICKETS, { firstGuidance: "x".repeat(40_000), lastGuidance: "SENTINEL_LAST_GUIDANCE" });
+    const full = formatBrief(input);
+    expect(full.length).toBeGreaterThan(BRIEF_MAX_CHARS);
+    expect(full).toContain("SENTINEL_LAST_GUIDANCE");
+    const brief = formatBrief(input, BRIEF_MAX_CHARS);
+    expect(brief.startsWith(BRIEF_PREFIX)).toBe(true);
+    const lines = brief.split("\n");
+    expect(lines[lines.length - 1]).toMatch(/^End your turn with steward_report; requeueAfter defaults to /u);
+    // The middle gave way, not the head or the tail.
+    expect(brief).toContain("… (");
+    expect(brief).not.toContain("SENTINEL_LAST_GUIDANCE");
+    expect(brief).toContain(STANDING_RULES[0]!);
   });
 });

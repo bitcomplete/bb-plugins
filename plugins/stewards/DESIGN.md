@@ -595,8 +595,11 @@ invariants reach it from two durable places, not from the transcript:
 
 - **Per-turn system context.** The SDK exposes a per-thread system-context
   hook (`bb.agents.contributeInstructions`, resolved at `thread.start` and
-  `turn.submit`, capped at 4096 characters), and the plugin injects the
-  brief there on every turn. It carries the thread id, the playbook's allowed
+  `turn.submit`, capped at 32768 characters on bb 0.49; it was 4096 through
+  0.48), and the plugin injects the
+  brief there on every turn, budgeted to `BRIEF_MAX_CHARS` (30000) so the
+  whole phase and general section of every shipped playbook fits under the
+  cap. It carries the thread id, the playbook's allowed
   actions, the ready gate's "start no implementation workers" line, the
   exact `bb thread spawn` command built from `models.worker` and the project
   environment, the standing rules, and "end with `steward_report`". It is
