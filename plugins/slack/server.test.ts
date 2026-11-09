@@ -2997,5 +2997,73 @@ describe("Slack plugin", () => {
       await service.done;
       await s.stop();
     });
+
+    it("keeps the participant mark when a queued participant message is edited", async () => {
+      const s = await live({
+        token: "xoxp-test",
+        queued: [{ id: "q1" }],
+        send: () => ({ delivery: "queued", queuedMessage: { id: "q1", updatedAt: 1 } }),
+        updateQueued: () => ({ id: "q1", updatedAt: 2 }),
+      });
+      await s.tool("slack_start_conversation", { text: "opener", users: ["Bob"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      await tick();
+      s.hooks.last().send(s.hooks.session({ opened: true, ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, owner: { id: "U0123", name: "Alice" }, comment: { text: "answer", untrusted: true } }));
+      await tick();
+      // The participant edits the still-queued message: the row is rewritten
+      // in place and keeps its queued state and participant mark.
+      s.hooks.last().send(s.hooks.session({ opened: true, action: "edited", ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, comment: { text: "better answer", untrusted: true } }));
+      await tick();
+      expect(s.harness.sdk.callsTo("threads.queuedMessages.update")).toHaveLength(1);
+      // An older turn's idle, then a tool call: still refused.
+      await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-owner" } as never, lastAssistantText: null });
+      await tick();
+      const refused = await s.tool("slack_start_conversation", { text: "hi Carol", users: ["Carol"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      expect(s.text(refused)).toContain("not a reason to open one");
+      await s.stop();
+    });
+
+    it("removes a deleted queued participant message so no turn starts", async () => {
+      const s = await live({
+        token: "xoxp-test",
+        queued: [{ id: "q1" }],
+        send: () => ({ delivery: "queued", queuedMessage: { id: "q1", updatedAt: 1 } }),
+      });
+      await s.tool("slack_start_conversation", { text: "opener", users: ["Bob"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      await tick();
+      s.hooks.last().send(s.hooks.session({ opened: true, ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, owner: { id: "U0123", name: "Alice" }, comment: { text: "answer", untrusted: true } }));
+      await tick();
+      s.hooks.last().send(s.hooks.session({ opened: true, action: "deleted", ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, comment: { text: "", untrusted: true } }));
+      await tick();
+      expect(s.harness.sdk.callsTo("threads.queuedMessages.delete")).toHaveLength(1);
+      // The row is gone and the wake forgotten, so an idle clears the mark and
+      // the tool is allowed again.
+      await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-owner" } as never, lastAssistantText: null });
+      await tick();
+      const allowed = await s.tool("slack_start_conversation", { text: "hi Carol", users: ["Carol"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      expect(s.text(allowed)).toContain("Opened a Slack conversation");
+      await s.stop();
+    });
+
+    it("marks the thread when a deleted queued participant row moved on", async () => {
+      const s = await live({
+        token: "xoxp-test",
+        queued: [{ id: "q1" }],
+        send: () => ({ delivery: "queued", queuedMessage: { id: "q1", updatedAt: 1 } }),
+        deleteQueued: () => {
+          throw Object.assign(new Error("moved on"), { status: 409 });
+        },
+      });
+      await s.tool("slack_start_conversation", { text: "opener", users: ["Bob"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      await tick();
+      s.hooks.last().send(s.hooks.session({ opened: true, ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, owner: { id: "U0123", name: "Alice" }, comment: { text: "answer", untrusted: true } }));
+      await tick();
+      // The row already dispatched, so the delete is refused; the thread stays
+      // marked because the participant's turn is the one running.
+      s.hooks.last().send(s.hooks.session({ opened: true, action: "deleted", ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, comment: { text: "", untrusted: true } }));
+      await tick();
+      const refused = await s.tool("slack_start_conversation", { text: "hi Carol", users: ["Carol"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      expect(s.text(refused)).toContain("not a reason to open one");
+      await s.stop();
+    });
   });
 });

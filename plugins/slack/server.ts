@@ -1571,6 +1571,30 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           return;
         }
         if (openedHere && isUntrusted(event)) {
+          // A still-queued participant row is rewritten in place with the same
+          // author and untrusted framing, keeping its `participant` mark so the
+          // turn it starts is refused (BB-262).
+          if (wake.state === "queued" && record.threadId !== null && wake.queuedMessageId !== "") {
+            try {
+              const prepared = await prepareAttachments(event.session, wake.files, record.projectId ?? "");
+              const text = withFiles(openedParticipantWake(event, `the message "${clipMention(wake.text, 200)}" was edited; it now reads: "${clipMention(event.comment.text, 200)}"`), prepared.notForwarded, prepared.failed);
+              const updated = await bb.sdk.threads.queuedMessages.update({
+                threadId: record.threadId,
+                queuedMessageId: wake.queuedMessageId,
+                expectedUpdatedAt: wake.queuedUpdatedAt,
+                input: [{ type: "text", text, mentions: [] }, ...prepared.parts],
+              });
+              updateWake(event.session, event.ts, { text: event.comment.text, queuedUpdatedAt: updated.updatedAt });
+              bb.log.info(`Slack session ${logSession}: rewrote a queued participant message after an edit`);
+              return;
+            } catch (error) {
+              if (!queuedRowMovedOn(error)) {
+                bb.log.warn(`Slack session ${logSession}: could not rewrite the queued participant message (${errorMessage(error)}); leaving it`);
+                return;
+              }
+              bb.log.info(`Slack session ${logSession}: the queued participant message moved on (${errorMessage(error)}); steering the thread`);
+            }
+          }
           // The original was delivered as information in a conversation bb
           // opened; the correction is too, so it steers with the same author
           // and untrusted framing, without a hold and owing no reply.
@@ -1600,8 +1624,21 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           return;
         }
         if (openedHere) {
-          // The participant's message was information the thread asked for;
-          // its deletion is simply forgotten, with no hold.
+          // The participant's message was information the thread asked for. If
+          // its row is still queued, remove it so no turn starts; otherwise
+          // just forget it, with no hold. A row that moved on still starts a
+          // turn, so mark the thread for the refusal (BB-262).
+          if (wake.state === "queued" && record.threadId !== null && wake.queuedMessageId !== "") {
+            try {
+              await bb.sdk.threads.queuedMessages.delete({ threadId: record.threadId, queuedMessageId: wake.queuedMessageId });
+            } catch (error) {
+              if (!queuedRowMovedOn(error)) {
+                bb.log.warn(`Slack session ${logSession}: could not remove the queued participant message (${errorMessage(error)}); leaving it`);
+                return;
+              }
+              if (wake.participant) markParticipantTurn(record.threadId);
+            }
+          }
           forgetWake(event.session, event.ts);
           bb.log.info(`Slack session ${logSession}: a participant's message in an opened conversation was deleted; ignored`);
           return;
@@ -1613,13 +1650,29 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       await handleDeletedWake(event, record, wake, logSession);
     }
 
+    /**
+     * The threads whose current turn a non-owner's Slack message started, so
+     * `slack_start_conversation` refuses to open a conversation on that turn
+     * (BB-262). Set when an opened-conversation participant's message starts
+     * or spawns a turn, and when a queued participant row dispatches; cleared
+     * when the thread goes idle.
+     */
+    const participantStartedTurns = new Set<string>();
+    function markParticipantTurn(threadId: string | null | undefined): void {
+      if (threadId !== null && threadId !== undefined && threadId !== "") participantStartedTurns.add(threadId);
+    }
+
     // A queued wake's row dispatched, so its turn has started: a later edit
     // steers instead of rewriting the queue. A cancelled row is dropped, so a
-    // later correction of it is ignored.
+    // later correction of it is ignored. A participant's row marks the thread
+    // here, at the moment its turn starts, so a tool call in it is refused
+    // even when the row outlived the idle that would have cleared the mark.
     bb.events.on("message.dispatched", ({ entry }) => {
       for (const [session, r] of sessions) {
-        const wake = r.wakes.find((w) => w.queuedMessageId === entry.id && w.state === "queued");
-        if (wake !== undefined) updateWake(session, wake.ts, { state: "started" });
+        const wake = r.wakes.find((w) => w.queuedMessageId === entry.id);
+        if (wake === undefined) continue;
+        if (wake.state === "queued") updateWake(session, wake.ts, { state: "started" });
+        if (wake.participant && r.threadId !== null) markParticipantTurn(r.threadId);
       }
     });
     bb.events.on("message.cancelled", ({ entry }) => {
@@ -1628,17 +1681,6 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (wake !== undefined) forgetWake(session, wake.ts);
       }
     });
-
-    /**
-     * The threads whose current turn a non-owner's Slack message started, so
-     * `slack_start_conversation` refuses to open a conversation on that turn
-     * (BB-262). Set when an opened-conversation participant's message starts
-     * or spawns a turn; cleared when the thread goes idle.
-     */
-    const participantStartedTurns = new Set<string>();
-    function markParticipantTurn(threadId: string | null | undefined): void {
-      if (threadId !== null && threadId !== undefined && threadId !== "") participantStartedTurns.add(threadId);
-    }
 
     /**
      * A Slack conversation woke this server. The first message spawns a bb
