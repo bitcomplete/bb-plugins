@@ -11145,8 +11145,8 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(before).toContain("--model claude-opus-5-5");
     expect(before).toContain("End your turn with steward_report");
     expect(before).toContain("bb stewards brief");
-    // The SDK truncates a contribution at 4096 characters; the brief must fit.
-    expect(before!.length).toBeLessThanOrEqual(4096);
+    // bb 0.49 truncates a contribution at 32768 characters; the brief must fit.
+    expect(before!.length).toBeLessThanOrEqual(32768);
     expect(before).toContain("--parent-self --parent-notifications off");
 
     // Compaction replaces the transcript, not the injected context.

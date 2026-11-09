@@ -133,11 +133,18 @@ import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Ava
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
 
 /**
- * The per-turn system context the SDK injects is truncated at 4096 characters;
- * build the brief to a little under that so its wrapper and the head and tail
- * the clip keeps always fit.
+ * The per-turn system context the SDK injects is truncated at 32768 characters
+ * on bb 0.49 (through 0.48 it was 4096); build the brief under that so its
+ * wrapper and the head and tail the clip keeps always fit.
+ *
+ * 30000 comes from the longest shipped playbook in templates.ts: github-reviews
+ * is ~9 KB with three guidance entries and a hold, and ~12 KB with twenty, so
+ * the whole phase and general section of every shipped playbook fits with a
+ * generous guidance list and room for a hand-written playbook. It leaves ~2700
+ * characters under the 32768 cap for the SDK's wrapper, and matches
+ * WAKE_MAX_CHARS, so a brief and a wake clip at the same point.
  */
-export const BRIEF_MAX_CHARS = 3800;
+export const BRIEF_MAX_CHARS = 30_000;
 
 /**
  * What thread-briefs is asked to leave alone, seeded into this plugin's
