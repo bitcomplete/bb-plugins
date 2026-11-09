@@ -2220,9 +2220,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { ...entity, parent: prev.parent, children: prev.children, childrenTotal: prev.childrenTotal };
     }
 
+    /**
+     * The linked pull request keys a look reads, at most five (the cap bounds
+     * GitHub reads per look, BB-263). The newest are kept: a ticket with more
+     * than five linked pull requests must still observe the one that still
+     * matters, so older merged ones never displace a newer open one. Today the
+     * snapshot contract carries only `url` and `key` (source-contract.ts), so
+     * the newest five in timeline order (the tail) are taken; if a source ever
+     * carries a per-link state, open and unmerged pull requests are preferred
+     * (newest first, then the newest of the rest).
+     */
+    function linkedPullKeys(entity: EntitySnapshot): string[] {
+      const seen = new Set<string>();
+      const linked: Array<{ key: string; state: string | null; index: number }> = [];
+      entity.linkedPulls.forEach((l, index) => {
+        if (l.key === null) return;
+        const key = lc(l.key);
+        if (seen.has(key)) return;
+        seen.add(key);
+        const state = (l as { state?: unknown }).state;
+        linked.push({ key: l.key, state: typeof state === "string" ? lc(state) : null, index });
+      });
+      // Timeline order is oldest first, so descending index is newest first.
+      const newestFirst = [...linked].sort((a, b) => b.index - a.index);
+      const isMerged = (l: { state: string | null }) => l.state !== null && ["merged", "closed"].includes(l.state);
+      const carriesState = linked.some((l) => l.state !== null);
+      const ordered = carriesState ? [...newestFirst.filter((l) => !isMerged(l)), ...newestFirst.filter(isMerged)] : newestFirst;
+      return ordered.slice(0, 5).map((l) => l.key);
+    }
+
     /** A ticket's linked pull requests, read from github. One that cannot be read is left out. */
     async function linkedPulls(entity: EntitySnapshot): Promise<EntitySnapshot[]> {
-      const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
+      const keys = linkedPullKeys(entity);
       const pulls: EntitySnapshot[] = [];
       for (const key of keys) {
         try {
@@ -2249,7 +2278,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (fresh === null) return { observed: b.lastSnapshot, complete: false };
       const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
       if (b.kind !== "ticket") return { observed: { entity, pulls: [] }, complete: true };
-      const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
+      const keys = linkedPullKeys(entity);
       const pulls = await linkedPulls(entity);
       return { observed: { entity, pulls }, complete: pulls.length >= keys.length };
     }
