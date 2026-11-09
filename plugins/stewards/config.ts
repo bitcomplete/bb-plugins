@@ -355,6 +355,11 @@ export const projectFileSchema = z
       .default({}),
     /** Reviews: on unless turned off. */
     reviews: z.object({ enabled: z.boolean().default(true) }).strict().default({ enabled: true }),
+    /**
+     * The stewards' needs-you pushes (BB-253): on unless turned off. Off
+     * disables the pushes only; the steward threads are still muted.
+     */
+    notifications: z.object({ enabled: z.boolean().default(true) }).strict().default({ enabled: true }),
     adoption: z.object({ perPass: z.number().int().min(1).max(100).default(10) }).strict().default({ perPass: 10 }),
     /**
      * Project-level ticket watches (BB-246): a labelled, assigned issue whose

@@ -1203,6 +1203,93 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> =>
       rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
 
+    // ---- push-notifications (BB-253) ----------------------------------------------------------------
+    //
+    // Steward trees are muted and needs-you items push, both through the
+    // push-notifications plugin's published RPCs. A missing plugin, or a
+    // loaded one whose contract predates a method, is "not available": the
+    // call is skipped, one line is logged, and nothing else changes. That
+    // keeps the plugin usable on a server that predates the RPC, exactly as
+    // the source contract treats a missing stewards plugin.
+
+    const PUSH_NOTIFICATIONS_PLUGIN_ID = "push-notifications";
+    const MUTE_OUTPUT = z
+      .object({
+        own: z.enum(["inherit", "all", "input-only", "muted"]),
+        ancestorCap: z.object({ level: z.enum(["all", "input-only", "muted"]), threadId: z.string().min(1) }).strict().nullable(),
+      })
+      .strict();
+    const SEND_OUTPUT = z.object({ ok: z.literal(true), channels: z.array(z.enum(["web", "desktop", "mobile"])) }).strict();
+
+    /** The one log line for a push-notifications plugin or method that is not there. */
+    let pushUnavailableNoted = false;
+    function notePushUnavailable(error: unknown): void {
+      if (pushUnavailableNoted) return;
+      pushUnavailableNoted = true;
+      bb.log.info(`stewards: push-notifications is not available (${errorMessage(error)}); steward mutes and needs-you pushes are skipped`);
+    }
+
+    /**
+     * Mute one thread the plugin spawned, so the steward, its workers and
+     * their reviewers are silent (BB-253). True when done, or when
+     * push-notifications is not available and there is nothing to do; false
+     * only on a real failure, so a sweep can leave its one-time marker unset
+     * and retry on the next start.
+     */
+    async function muteStewardThread(threadId: string): Promise<boolean> {
+      try {
+        await rpc(PUSH_NOTIFICATIONS_PLUGIN_ID, "threadNotifications.set", { threadId, level: "muted" }, MUTE_OUTPUT);
+        return true;
+      } catch (error) {
+        if (rpcUnavailable(error)) {
+          notePushUnavailable(error);
+          return true;
+        }
+        bb.log.warn(`stewards: could not mute ${threadId}: ${errorMessage(error)}`);
+        return false;
+      }
+    }
+
+    /**
+     * Push one needs-you item, cut by the plugin to its title and body limits
+     * (BB-253). The tap opens `threadId` when one is given. Off through the
+     * project file's `notifications.enabled` disables pushes only; a missing
+     * push-notifications plugin is skipped, logged once, never an error.
+     */
+    async function pushNeed(b: Binding, fields: { id: string; title: string; body: string; threadId: string | null }): Promise<void> {
+      const config = await loadConfig(b.projectId);
+      if (config !== null && !config.file.notifications.enabled) return;
+      try {
+        await rpc(PUSH_NOTIFICATIONS_PLUGIN_ID, "notifications.send", { title: fields.title, body: fields.body, ...(fields.threadId === null ? {} : { threadId: fields.threadId }) }, SEND_OUTPUT);
+      } catch (error) {
+        if (rpcUnavailable(error)) notePushUnavailable(error);
+        else bb.log.warn(`stewards: could not push ${fields.id}: ${errorMessage(error)}`);
+      }
+    }
+
+    /** The push title and body for a newly filed gate item, or null for a kind that never pushes. */
+    function gatePushText(b: Binding, item: Need): { title: string; body: string } | null {
+      const title = b.title ?? "";
+      if (item.kind === "approve-spec" || item.kind === "approve-pr") return { title: `${b.entityKey} needs your approval`, body: title };
+      if (item.kind === "merge") return { title: `${item.what.replace(/^Merge\s+/u, "")} ready to merge`, body: title };
+      return null;
+    }
+
+    /**
+     * Push every gate item filed since `before`, in order (BB-253). Used where
+     * a forward files an `approve-spec` or `approve-pr` item outside a
+     * reconcile, so it is pushed at filing exactly as `syncNeeds` pushes the
+     * items it files. `before` is the open ids read before the filing, so a
+     * refresh of an item that was already open stays quiet.
+     */
+    async function pushNewGateNeeds(b: Binding, before: Set<string>): Promise<void> {
+      for (const item of store.openNeeds(b.id)) {
+        if (before.has(item.id)) continue;
+        const text = gatePushText(b, item);
+        if (text !== null) await pushNeed(b, { id: item.id, ...text, threadId: b.threadId });
+      }
+    }
+
     /**
      * The login a source acts as: the gh login github-watcher reads, or the
      * connected Linear user's name. A source that is not connected, or cannot
@@ -2798,6 +2885,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!failed) await bb.storage.kv.set(AUTO_NEEDS_ONCE_KEY, String(now()));
     }
 
+    /**
+     * The one-time steward mute (BB-253). New threads are muted where they are
+     * spawned; this quiets the project steward and binding threads that already
+     * exist when the server first runs the change, so an existing tree goes
+     * quiet without being respawned. The marker lives in the plugin's kv store,
+     * so a later start does nothing. A real failure leaves it unset so the next
+     * start retries; a missing push-notifications plugin is "not available" and
+     * records the marker, since there is nothing to retry.
+     */
+    const MUTE_STEWARDS_ONCE_KEY = "migrations/mute-steward-threads";
+    async function muteStewardThreadsOnce(): Promise<void> {
+      if ((await bb.storage.kv.get<string>(MUTE_STEWARDS_ONCE_KEY)) != null) return;
+      const ids = new Set<string>();
+      for (const p of store.projects()) if (p.threadId !== null) ids.add(p.threadId);
+      for (const b of store.open()) if (b.threadId !== null) ids.add(b.threadId);
+      let failed = false;
+      for (const id of ids) if (!(await muteStewardThread(id))) failed = true;
+      if (!failed) await bb.storage.kv.set(MUTE_STEWARDS_ONCE_KEY, String(now()));
+    }
+
     /** Show a thread hidden in the sidebar; false when the update failed, so the caller can retry. */
     async function showIfHidden(threadId: string): Promise<boolean> {
       const info = await threadInfo(threadId).catch(() => null);
@@ -2874,6 +2981,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           pluginMetadata: { role: "project", threadBriefs: THREAD_BRIEFS_OFF },
         });
         tagged.add(thread.id);
+        // BB-253: the project steward and its whole tree are muted; workers and
+        // reviewers inherit the ancestor cap, so only the owner's own threads
+        // and needs-you pushes notify.
+        await muteStewardThread(thread.id);
         store.patchProject(config.projectId, { threadId: thread.id, title });
         bb.log.info(`stewards: started the project steward for ${config.projectId} (${thread.id})`);
         threadId = thread.id;
@@ -2976,6 +3087,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       tagged.add(thread.id);
       kept.add(thread.id);
+      // BB-253: mute the steward; the workers it starts with `--parent-self`
+      // and their reviewers inherit the cap with no skill change.
+      await muteStewardThread(thread.id);
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
       return thread.id;
@@ -6428,7 +6542,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-231: a gate item filed this look may cover an open route-`user`
       // escalation or question; ask the project steward once, per new item.
       for (const item of store.openNeeds(b.id)) {
-        if (!needsBefore.has(item.id) && (item.kind === "approve-spec" || item.kind === "approve-pr" || item.kind === "merge")) await noteGateItemCoverage(b, item);
+        if (needsBefore.has(item.id) || !(item.kind === "approve-spec" || item.kind === "approve-pr" || item.kind === "merge")) continue;
+        await noteGateItemCoverage(b, item);
+        // BB-253: the item is newly filed this look, so this is its first and
+        // only push; the next look has it in `needsBefore` and stays quiet.
+        const text = gatePushText(b, item);
+        if (text !== null) await pushNeed(b, { id: item.id, ...text, threadId: b.threadId });
       }
       return events;
     }
@@ -9392,12 +9511,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 store.setEscalationRationale(q.id, ROUTINE_RATIONALE_WHY);
               }
             }
-            if (approvalToUser && target.lastSnapshot !== null) fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
+            // BB-253: the forwarded decision, configuration or secret is the
+            // only live signal once the project steward's thread is muted, so
+            // push it once, with the question as the body and the project
+            // steward's thread (which holds it) as the tap target.
+            if (q !== null) {
+              const heading = resolutionKind === "secret" ? "needs a secret" : resolutionKind === "done" ? "needs configuration" : "needs a decision";
+              await pushNeed(target, { id: q.id, title: `${target.entityKey} ${heading}`, body: forwarding.question, threadId: store.project(target.projectId).threadId });
+            }
+            if (approvalToUser && target.lastSnapshot !== null) {
+              const before = new Set(store.openNeeds(target.id).map((n) => n.id));
+              fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
+              await pushNewGateNeeds(target, before);
+            }
             if (prToUser) {
               // The user's page item carries the same decide-list listing the
               // project steward was shown, so the approval route is legible
               // (BB-135).
+              const before = new Set(store.openNeeds(target.id).map((n) => n.id));
               await fileForwardedApprovePrNeed(approvalsCtx, target, forwarding);
+              await pushNewGateNeeds(target, before);
             }
             // BB-213: a forward that reaches the user files the real item, so
             // the auto-filed `nextAction` item closes rather than sit beside it.
@@ -9933,6 +10066,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-213: the first start after dropping the actor clause gives every
         // open actor-`user` binding the item its badge will now stand on.
         await backfillAutoNeedsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time auto-need backfill: ${errorMessage(e)}`));
+        // BB-253: mute the steward trees that already exist, once.
+        await muteStewardThreadsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time steward mute: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
         const sweeper = setInterval(() => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`)), timing.sweepMs);
         // The first sweep tells linear and github what to watch after a restart.
@@ -11196,12 +11331,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

@@ -62,6 +62,8 @@ function world() {
   const labelEnsureFailures = new Map<string, string>();
   /** When true, the fake source does not serve `sourceEnsureLabel` at all (BB-236). */
   let labelEnsureUnavailable = false;
+  /** When true, the fake push-notifications plugin does not serve its methods (BB-253). */
+  let pushUnavailable = false;
   /** A plain thrown failure for `sourceEnsureLabel`, to tell it from unavailable (BB-236). */
   let labelEnsureThrow: string | null = null;
   const rpcCalls: Call[] = [];
@@ -176,7 +178,15 @@ function world() {
     const input = (args.input ?? {}) as Record<string, unknown>;
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
     let out: unknown;
-    if (args.method === "readProjectFiles") {
+    if (args.pluginId === "push-notifications") {
+      // BB-253: the fake serves the two published RPCs the stewards plugin
+      // calls; `setPushUnavailable` makes them unknown-method, for the
+      // "not available" path.
+      if (pushUnavailable) throw Object.assign(new Error(`Unknown RPC method: ${args.method}`), { code: "unknown_method" });
+      if (args.method === "threadNotifications.set") out = { own: "muted", ancestorCap: null };
+      else if (args.method === "notifications.send") out = { ok: true, channels: ["web"] };
+      else throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
+    } else if (args.method === "readProjectFiles") {
       const paths = input.paths as string[];
       if (paths.some((path) => path.startsWith("/") || path.includes("\\") || path.split("/").includes(".."))) throw new Error(`bad project file path: ${paths.join(", ")}`);
       out = { projectSourcePath: "/p/.bb", head: "abc", files: paths.map((path) => ({ path, content: files[path] ?? null })), error: null };
@@ -457,7 +467,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -4640,6 +4650,140 @@ describe("the one-time unhide (BB-93)", () => {
     t.harness.sdk.stub("threads.update", t.sdk.threads.update);
     await t.hooks.unhideOnce();
     expect(t.threads.get(steward)!.visibility).toBe("visible");
+  });
+});
+
+describe("muting steward trees and pushing needs-you items (BB-253)", () => {
+  const muteCalls = (t: Awaited<ReturnType<typeof setup>>) => t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "threadNotifications.set");
+  const pushCalls = (t: Awaited<ReturnType<typeof setup>>) => t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "notifications.send");
+  /** File the owner's `approve-pr` item on a ticket whose linked pull has an approved reviewer marker. */
+  const approvedPull = async (t: Awaited<ReturnType<typeof setup>>, steward: string) => {
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the owner.", actor: "user" }, steward);
+  };
+
+  it("mutes the project steward and the steward it starts, and leaves other threads alone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const calls = muteCalls(t);
+    expect(calls.map((c) => c.input.threadId).sort()).toEqual([project, steward].sort());
+    for (const c of calls) expect(c.input.level).toBe("muted");
+  });
+
+  it("leaves a thread the owner starts alone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    // A top-level thread with no steward parent: the owner's own, so nothing
+    // mutes it and its default level stands.
+    await t.harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "thr_owner", parentThreadId: null, lifecycleOwnerThreadId: null, originPluginId: null, providerId: "claude-code" }) });
+    await t.flush();
+    await t.hooks.muteStewardThreadsOnce();
+    expect(muteCalls(t).some((c) => c.input.threadId === "thr_owner")).toBe(false);
+  });
+
+  it("mutes every live binding thread once on load, and does nothing on a second start", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const before = muteCalls(t).length;
+    await t.hooks.muteStewardThreadsOnce();
+    const after = muteCalls(t);
+    expect(after.slice(before).map((c) => c.input.threadId).sort()).toEqual([project, steward].sort());
+    // The marker is recorded: a later start mutes nothing.
+    await t.hooks.muteStewardThreadsOnce();
+    expect(muteCalls(t)).toHaveLength(after.length);
+  });
+
+  it("runs the one-time mute on the plugin's loop service start, not only from the test seam", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const before = muteCalls(t).length;
+    const service = t.harness.runService("loop");
+    try {
+      await t.flush();
+      expect(muteCalls(t).slice(before).map((c) => c.input.threadId).sort()).toEqual([project, steward].sort());
+    } finally {
+      service.controller.abort();
+    }
+  });
+
+  it("pushes an approve-pr item once, opening the binding's steward thread, and not again on a re-sync", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await approvedPull(t, steward);
+    const pushes = pushCalls(t);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.input).toMatchObject({ threadId: steward, title: "ENG-12 needs your approval", body: "Fix login" });
+    // The same item synced again stays quiet.
+    await t.ring("linear", "uuid-12");
+    expect(pushCalls(t)).toHaveLength(1);
+  });
+
+  it("pushes an approve-spec item a forwarded approval files", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met }, steward);
+    const approval = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approval")!;
+    const before = pushCalls(t).length;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: approval.id }, project);
+    expect(forwarded.error, forwarded.text).toBe(false);
+    const pushes = pushCalls(t);
+    expect(pushes).toHaveLength(before + 1);
+    expect(pushes.at(-1)!.input).toMatchObject({ title: "ENG-12 needs your approval", body: "Fix login", threadId: steward });
+  });
+
+  it("pushes a forwarded decision once, with the project steward's question and thread", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", context: "The auth doc lists both providers.", meanwhile: "Wait." } }, steward);
+    const esc = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.question === "Include SSO?")!;
+    const before = pushCalls(t).length;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, recommendation: "Leave SSO out." }, project);
+    expect(forwarded.error, forwarded.text).toBe(false);
+    const pushes = pushCalls(t);
+    expect(pushes).toHaveLength(before + 1);
+    expect(pushes.at(-1)!.input).toMatchObject({ title: "ENG-12 needs a decision", body: "Include SSO?", threadId: project });
+  });
+
+  it("turns the pushes off with the project file switch, while the mute still applies", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, notifications: { enabled: false } });
+    t.hooks.forgetConfigs();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    expect(muteCalls(t).some((c) => c.input.threadId === steward)).toBe(true);
+    await approvedPull(t, steward);
+    expect(t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).some((n) => n.kind === "approve-pr")).toBe(true);
+    expect(pushCalls(t)).toHaveLength(0);
+  });
+
+  it("skips a missing push-notifications plugin, logs once, and keeps working", async () => {
+    const t = await setup();
+    t.setPushUnavailable(true);
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await approvedPull(t, steward);
+    expect(t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).some((n) => n.kind === "approve-pr")).toBe(true);
+    expect(t.harness.logEntries.filter((e) => e.message.includes("push-notifications is not available"))).toHaveLength(1);
   });
 });
 

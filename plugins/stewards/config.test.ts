@@ -56,6 +56,16 @@ describe("the project file", () => {
     expect(usesKind(parsed.value, "ops")).toBe(false);
   });
 
+  it("fills the notifications switch on by default, and takes an explicit off (BB-253)", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.notifications).toEqual({ enabled: true });
+    const off = parseProjectFile(JSON.stringify({ version: 1, notifications: { enabled: false } }));
+    if (!off.ok) throw new Error(off.error);
+    expect(off.value.notifications.enabled).toBe(false);
+    expect(parseProjectFile(JSON.stringify({ version: 1, notifications: { unknown: true } }))).toMatchObject({ ok: false });
+  });
+
   it("names the file and the field in errors", () => {
     const bad = parseProjectFile(JSON.stringify({ version: 1, nightly: { timezone: "Mars/Olympus" } }));
     expect(bad).toMatchObject({ ok: false });
