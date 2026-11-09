@@ -2224,10 +2224,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The linked pull request keys a look reads, at most five (the cap bounds
      * GitHub reads per look, BB-263). The newest are kept: a ticket with more
      * than five linked pull requests must still observe the one that still
-     * matters, so older merged ones never displace a newer open one. When the
-     * linked-pull data carries a state, open and unmerged pull requests are
-     * preferred (newest first, then the newest of the rest); otherwise the
-     * newest five in timeline order (the tail) are taken.
+     * matters, so older merged ones never displace a newer open one. Today the
+     * snapshot contract carries only `url` and `key` (source-contract.ts), so
+     * the newest five in timeline order (the tail) are taken; if a source ever
+     * carries a per-link state, open and unmerged pull requests are preferred
+     * (newest first, then the newest of the rest).
      */
     function linkedPullKeys(entity: EntitySnapshot): string[] {
       const seen = new Set<string>();
