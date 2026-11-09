@@ -7242,6 +7242,11 @@ describe("needs you items", () => {
     expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["acme/web#8"]);
     expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Merge held: acme\/web#7 is stacked on acme\/web#8/u.test(s.text))).toBe(true);
     expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /MERGE HOLD: behind acme\/web#8/u.test(s.text))).toBe(true);
+    // Nothing changed: the derived hold is already recorded, so no new wake.
+    const wakes = t.sends.filter((s) => s.threadId === t.steward).length;
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).length).toBe(wakes);
   });
 
   it("wakes the steward to retarget a gate-met pull request whose base pull request has merged (BB-264)", async () => {
@@ -7258,6 +7263,12 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
     expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Retarget acme\/web#7: its base acme\/web#8 has merged/u.test(s.text))).toBe(true);
+    // The retarget wake is once per base pull request, not on every look.
+    expect(t.hooks.store.find("ENG-12")!.retargetPulls).toEqual(["acme/web#8"]);
+    const wakes = t.sends.filter((s) => s.threadId === t.steward).length;
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).length).toBe(wakes);
   });
 
   it("treats a gate-met pull request whose base pull request closed unmerged as an ordinary pull request (BB-264)", async () => {
@@ -8501,19 +8512,30 @@ describe("needs you items", () => {
       const t = await withPull([marker, owner]);
       t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Blocker" }));
       await t.ring("linear", "uuid-13");
-      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-99"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding in this project to hold the merge behind: ENG-99\./u) });
-      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-12"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding in this project to hold the merge behind: ENG-12\./u) });
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-99"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding or pull request in this project to hold the merge behind: ENG-99\./u) });
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-12"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding or pull request in this project to hold the merge behind: ENG-12\./u) });
       // A key in any case is stored canonically, like `behind`.
       const ok = await t.tool("steward_report", { ...base, mergeBehind: ["eng-13"] }, t.steward);
       expect(ok.error, ok.text).toBe(false);
       expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["ENG-13"]);
       // An ended key is refused with a reason.
       t.hooks.store.patch(t.hooks.store.find("ENG-13")!.id, { endedAt: 1, endReason: "terminal" });
-      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-13"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding in this project to hold the merge behind: ENG-13\./u) });
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["ENG-13"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding or pull request in this project to hold the merge behind: ENG-13\./u) });
       expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["ENG-13"]);
       // [] clears it.
       await t.tool("steward_report", { ...base, mergeBehind: [] }, t.steward);
       expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
+    });
+
+    it("accepts an open base pull request key for a stack, and refuses a closed one (BB-264)", async () => {
+      const t = await withPull([marker, owner]);
+      t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base" }, { head: "bb/bb-256-parent", base: "main" }));
+      const ok = await t.tool("steward_report", { ...base, mergeBehind: ["acme/web#8"] }, t.steward);
+      expect(ok.error, ok.text).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["acme/web#8"]);
+      // A closed base pull request is refused: there is nothing to hold behind.
+      t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "closed" }, { head: "bb/bb-256-parent", base: "main" }));
+      expect(await t.tool("steward_report", { ...base, mergeBehind: ["acme/web#8"] }, t.steward)).toMatchObject({ error: true, text: expect.stringMatching(/Not an open binding or pull request in this project to hold the merge behind: acme\/web#8\./u) });
     });
 
     it("files no plugin Merge item while it stands, closes an open one, and leaves a steward-filed one alone", async () => {

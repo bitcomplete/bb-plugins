@@ -104,12 +104,13 @@ the default branch:
   it is open the plugin files no Merge item for yours: it is held behind the
   base pull request, and the steward is woken with that hold. Do not merge
   yours into the base branch, and do not merge the base pull request.
-- When the base pull request merges, retarget yours to the default branch
-  (`gh pr edit <n> --base <default>`), rebase it onto the default branch with
-  `git rebase --onto origin/<default> <old base head>` (the squash rewrote the
-  base's commits), resolve any conflicts, and push. The plugin then merges
-  yours through the normal gate; your reviewer's verdict and the owner's
-  approval carry across the rebase.
+- When the base pull request merges, rebase yours onto the default branch
+  with `git rebase --onto origin/<default> <old base head>` (the squash
+  rewrote the base's commits), resolve any conflicts, and push; then retarget
+  it (`gh pr edit <n> --base <default>`). Rebase and push first, so the
+  plugin never merges the un-rebased head while the old head's checks are
+  still green. The plugin then merges yours through the normal gate; your
+  reviewer's verdict and the owner's approval carry across the rebase.
 - If the base pull request closes without merging, retarget yours to the
   default branch (`gh pr edit <n> --base <default>`, rebasing or merging the
   default branch as needed) and carry on as an ordinary pull request.

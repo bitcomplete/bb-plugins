@@ -6877,14 +6877,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // mention it and must not file gate items here.
       const ownPulls = b.kind === "ticket" ? await ownPullKeys(b, store.workers(b.id), observed) : null;
       // BB-264: the steward's own merge holds name open bindings in this
-      // project; the plugin's derived stacked-PR holds are recomputed from the
-      // base pull requests on every look and dropped once the base is no
-      // longer an open pull request.
-      const userMergeBehind = b.mergeBehind.filter((k) => {
+      // project, or a stacked base pull request by its key; the plugin's
+      // derived stacked-PR holds are recomputed from the base pull requests on
+      // every look. An entry that names neither an open binding nor an open
+      // pull request is dropped, so a stale hold lifts itself.
+      const userMergeBehind: string[] = [];
+      for (const k of b.mergeBehind) {
         const target = store.find(k, b.projectId);
-        return target !== null && target.endedAt === null && target.id !== b.id;
-      });
+        if (target !== null && target.endedAt === null && target.id !== b.id) {
+          userMergeBehind.push(k);
+          continue;
+        }
+        const ref = parsePullRef(k);
+        const pull = ref === null ? null : await snapshot("github", `${ref.repo}#${ref.number}`).catch(() => null);
+        if (pull !== null && pull.kind === "pull" && lc(pull.state) !== "closed" && pull.pull?.merged !== true) userMergeBehind.push(k);
+      }
       const derivedMergeBehind: string[] = [];
+      // A hold already on the binding is not news: the "Merge held" wake fires
+      // only on the look that first derives it, so an open base that stays open
+      // does not wake the steward on every doorbell and sweep.
+      const heldBefore = new Set(b.mergeBehind.map((k) => lc(k)));
+      // The base pull requests a retarget wake has already been sent for
+      // (BB-264), so the retarget wake is once per base pull request.
+      const retargetPulls = [...b.retargetPulls];
+      const retargetBefore = new Set(retargetPulls.map((k) => lc(k)));
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
@@ -6942,18 +6958,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const held = [...userMergeBehind, ...(openBase === null ? [] : [openBase.key])];
               store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : held).join(", ")}`);
             }
-            if (openBase !== null) {
+            if (openBase !== null && !heldBefore.has(lc(openBase.key))) {
               changes.push({ text: `Merge held: ${pull.key} is stacked on ${openBase.key}, which is still open. The plugin files no Merge item; it merges once the base lands and the pull request is retargeted to the default branch.`, actionable: true });
             }
           } else if (mergedBase !== null) {
             // BB-264: GitHub does not retarget a stacked pull request when its
             // base merges (the branch survives), so the base is the head of a
-            // merged pull request. File no Merge item and wake the steward to
-            // retarget it; the next look sees the default branch and merges.
+            // merged pull request. File no Merge item and wake the steward once
+            // per base pull request to retarget it; the next look sees the
+            // default branch and merges. The rebase and push come first so the
+            // plugin never merges an un-rebased head while the checks of the
+            // old one are still green.
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) store.closeNeed(open.id, `The base ${mergedBase.key} has merged; retarget to the default branch.`);
-            const prRef = ref === null ? pull.key : `${ref.repo}#${ref.number}`;
-            changes.push({ text: `Retarget ${pull.key}: its base ${mergedBase.key} has merged. Retarget it to the default branch (\`gh pr edit ${prRef} --base <default>\`), rebase it onto the default branch (\`git rebase --onto origin/<default> <old base head>\`), and push; the plugin merges it on the next look.`, actionable: true });
+            if (!retargetBefore.has(lc(mergedBase.key))) {
+              const prRef = ref === null ? pull.key : `${ref.repo}#${ref.number}`;
+              changes.push({ text: `Retarget ${pull.key}: its base ${mergedBase.key} has merged. Rebase it onto the default branch (\`git fetch origin && git rebase --onto origin/<default> <old base head>\`), push, then retarget it (\`gh pr edit ${prRef} --base <default>\`); the plugin merges it once the default branch is its base and the checks on the new head are green.`, actionable: true });
+              retargetPulls.push(mergedBase.key);
+              retargetBefore.add(lc(mergedBase.key));
+            }
           } else if (store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === url && n.filedBy !== "plugin")) {
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
@@ -7014,6 +7037,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const nextMergeBehind = [...new Set([...userMergeBehind, ...derivedMergeBehind])];
       if (nextMergeBehind.length !== b.mergeBehind.length || nextMergeBehind.some((k, i) => k !== b.mergeBehind[i])) {
         b = store.patch(b.id, { mergeBehind: nextMergeBehind });
+      }
+      const nextRetargetPulls = retargetPulls.slice(-20);
+      if (nextRetargetPulls.length !== b.retargetPulls.length || nextRetargetPulls.some((k, i) => k !== b.retargetPulls[i])) {
+        b = store.patch(b.id, { retargetPulls: nextRetargetPulls });
       }
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
       // BB-231: a gate item filed this look may cover an open route-`user`
@@ -9178,19 +9205,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           // BB-256: a merge hold names open bindings in this project, validated
           // the way steward_update's `behind` is: an unknown or ended key, or
-          // the binding itself, is refused whole. Each report replaces the set,
-          // and `mergeBehind: []` clears it.
+          // the binding itself, is refused whole. BB-264 also accepts the base
+          // pull request of a stack by its key (`owner/repo#N`), which may not
+          // be an adopted binding, when it is an open pull request. Each report
+          // replaces the set, and `mergeBehind: []` clears it.
           let mergeBehind: string[] | undefined;
           if (input.mergeBehind !== undefined) {
             const missing: string[] = [];
             const named: Binding[] = [];
+            const prKeys: string[] = [];
             for (const k of input.mergeBehind) {
               const other = store.find(k, b.projectId);
-              if (other === null || other.endedAt !== null || other.id === b.id) missing.push(k);
-              else if (!named.some((x) => x.id === other.id)) named.push(other);
+              if (other !== null && other.endedAt === null && other.id !== b.id) {
+                if (!named.some((x) => x.id === other.id)) named.push(other);
+                continue;
+              }
+              const ref = parsePullRef(k);
+              const pull = ref === null ? null : await snapshot("github", `${ref.repo}#${ref.number}`).catch(() => null);
+              if (pull !== null && pull.kind === "pull" && lc(pull.state) !== "closed" && pull.pull?.merged !== true) {
+                const key = `${ref!.repo}#${ref!.number}`;
+                if (!prKeys.some((x) => lc(x) === lc(key))) prKeys.push(key);
+                continue;
+              }
+              missing.push(k);
             }
-            if (missing.length > 0) return toolError(new Error(`Not an open binding in this project to hold the merge behind: ${missing.join(", ")}.`));
-            mergeBehind = named.map((x) => x.entityKey);
+            if (missing.length > 0) return toolError(new Error(`Not an open binding or pull request in this project to hold the merge behind: ${missing.join(", ")}.`));
+            mergeBehind = [...named.map((x) => x.entityKey), ...prKeys];
           }
           // BB-231: a free-form escalation must say how it differs from every
           // open user-facing item on the binding, or it can duplicate the

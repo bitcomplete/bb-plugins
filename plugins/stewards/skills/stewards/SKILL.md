@@ -231,11 +231,12 @@ Two tools are yours; everything else you do with the tools every thread has.
   recognises a gate-met pull request whose base is another open pull
   request's branch as held behind it, so it files no Merge item either way.
   When the base merges, GitHub does not retarget the stacked pull request in
-  these repos: have the worker retarget it to the default branch (`gh pr edit
-  <n> --base <default>`), rebase it onto the default branch (`git rebase
-  --onto origin/<default> <old base head>`), resolve conflicts and push. The
-  reviewer's verdict and the owner's approval carry across the rebase; the
-  plugin then merges it through the normal gate. If the base pull request
+  these repos: have the worker rebase it onto the default branch (`git rebase
+  --onto origin/<default> <old base head>`), resolve conflicts and push, then
+  retarget it (`gh pr edit <n> --base <default>`). Rebase and push first, so
+  the plugin never merges the un-rebased head while the old head's checks are
+  still green. The reviewer's verdict and the owner's approval carry across
+  the rebase; the plugin then merges it through the normal gate. If the base pull request
   closes without merging, retarget to the default branch and carry on as an
   ordinary pull request. Never merge the stacked pull request into the base
   branch.
