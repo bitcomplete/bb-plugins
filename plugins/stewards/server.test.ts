@@ -11884,6 +11884,32 @@ describe("a steward idle in an active stage (BB-83)", () => {
     expect(t.sends.at(-1)!.text).toMatch(idleLine);
   });
 
+  // BB-247: a dated wait is something to wait on, so a binding parked until a
+  // date is not woken with the "nothing is being waited on" idle line before it.
+  it("does not wake a binding idle past the grace while a dated wait is ahead", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the vendor.");
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's decision", until: "2026-12-01" }, steward);
+    const before = t.sends.length;
+
+    // Past the idle grace but before the date: no idle wake.
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before);
+    expect(t.sends.every((s) => !idleLine.test(s.text))).toBe(true);
+
+    // Past the date, the binding can be idle again.
+    t.advance(60 * 86_400_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends.some((s) => idleLine.test(s.text))).toBe(true);
+  });
+
   it("starts a new idle period when the steward starts a worker that finishes", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
@@ -13003,6 +13029,105 @@ describe("a wait with no wake source (BB-154)", () => {
     await t.ring("linear", "uuid-12");
     await t.tool("steward_report", waitReport("the vendor's reply"), steward);
     expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(0);
+  });
+});
+
+// BB-247: a dated wait (`steward_report { until }`) parks the binding at the
+// date, counts no stall while it is ahead, is visible on the row and
+// `bb stewards show`, and is listed in its own digest section.
+describe("a dated wait (BB-247)", () => {
+  const waitReport = (waitingOn: string, over: Record<string, unknown> = {}) => ({ phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const, waitingOn, ...over });
+
+  async function bound() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    return { t, steward: t.spawns[1]!.id };
+  }
+
+  it("parks the binding at the date, ignores requeueAfter, and is not marked no-wake-source", async () => {
+    const { t, steward } = await bound();
+    const at = Date.parse("2026-12-01T00:00:00Z");
+    const res = await t.tool("steward_report", waitReport("the vendor's reply", { until: "2026-12-01", requeueAfter: "1m" }), steward);
+    expect(res.error).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.requeueUntil).toBe(at);
+    expect(b.requeueAt).toBe(at);
+    expect(b.noWakeSource).toBe(false);
+    // The date is on `bb stewards show` (the row half is `effortPhrase`).
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain("waiting on the vendor's reply until 2026-12-01");
+    expect(res.text).toContain("at 2026-12-01T00:00:00Z");
+  });
+
+  it("accepts an ISO datetime as the date", async () => {
+    const { t, steward } = await bound();
+    await t.tool("steward_report", waitReport("the deployment window", { until: "2026-12-01T15:30:00Z" }), steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueUntil).toBe(Date.parse("2026-12-01T15:30:00Z"));
+  });
+
+  it("refuses an invalid date, and an until with no waitingOn", async () => {
+    const { t, steward } = await bound();
+    const noWait = await t.tool("steward_report", waitReport("", { until: "2026-12-01" }), steward);
+    expect(noWait.error).toBe(true);
+    expect(noWait.text).toMatch(/until needs waitingOn/u);
+    const bad = await t.tool("steward_report", waitReport("the vendor", { until: "next Tuesday" }), steward);
+    expect(bad.error).toBe(true);
+    expect(bad.text).toMatch(/until must be a date \(YYYY-MM-DD\) or an ISO datetime/u);
+    // A date that does not exist is refused rather than rolled into March.
+    const rollover = await t.tool("steward_report", waitReport("the vendor", { until: "2026-02-30" }), steward);
+    expect(rollover.error).toBe(true);
+    expect(t.hooks.store.find("ENG-12")!.requeueUntil).toBeNull();
+  });
+
+  it("ignores a past until with a note and requeues on the playbook default", async () => {
+    const { t, steward } = await bound();
+    const res = await t.tool("steward_report", waitReport("the vendor's reply", { until: "2026-01-01" }), steward);
+    expect(res.error).toBe(false);
+    expect(res.text).toMatch(/in the past, so it was ignored/u);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.requeueUntil).toBeNull();
+    expect(b.requeueAt).toBe(t.now() + 2 * 86_400_000);
+  });
+
+  it("replaces the dated wait on every report: a report without one clears it", async () => {
+    const { t, steward } = await bound();
+    await t.tool("steward_report", waitReport("the vendor's reply", { until: "2026-12-01" }), steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueUntil).toBe(Date.parse("2026-12-01T00:00:00Z"));
+    await t.tool("steward_report", waitReport("the vendor's reply", { requeueAfter: "1d" }), steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.requeueUntil).toBeNull();
+    expect(b.requeueAt).toBe(t.now() + 86_400_000);
+  });
+
+  it("does not count a stall while the date is ahead, and counting resumes after it passes", async () => {
+    const { t, steward } = await bound();
+    const b0 = t.hooks.store.find("ENG-12")!;
+    // A run is already under way from an earlier wait, and this report is a
+    // requeue wake; the future date must still reset the run.
+    t.hooks.store.patch(b0.id, { requeueWakeCount: 1, requeueWaitText: "the vendor's reply", requeueFirstAt: t.now(), lastWakeReason: "requeue" });
+    await t.tool("steward_report", waitReport("the vendor's reply", { until: "2026-12-01" }), steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(0);
+
+    // Past the date, a requeue-only report with the same wait counts from
+    // zero; the date no longer suppresses the run.
+    t.advance(50 * 86_400_000);
+    t.hooks.store.patch(t.hooks.store.find("ENG-12")!.id, { lastWakeReason: "requeue" });
+    await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    expect(t.hooks.store.find("ENG-12")!.requeueWakeCount).toBe(1);
+  });
+
+  it("notes a wait beyond max-wait once to the project steward, and not again for the same date", async () => {
+    const { t, steward } = await bound();
+    const res = await t.tool("steward_report", waitReport("the pilot cycle", { until: "2027-06-01" }), steward);
+    expect(res.error).toBe(false);
+    const notes = () => t.hooks.store.peekProjectNotes("p1");
+    expect(notes().filter((n) => n.includes("2027-06-01") && n.includes("max-wait"))).toHaveLength(1);
+    expect(t.hooks.store.find("ENG-12")!.requeueUntilNoted).toBe(Date.parse("2027-06-01T00:00:00Z"));
+    // The same date again adds nothing; a different long date is a new note.
+    await t.tool("steward_report", waitReport("the pilot cycle", { until: "2027-06-01" }), steward);
+    expect(notes().filter((n) => n.includes("2027-06-01") && n.includes("max-wait"))).toHaveLength(1);
+    await t.tool("steward_report", waitReport("the pilot cycle", { until: "2027-07-01" }), steward);
+    expect(notes().filter((n) => n.includes("2027-07-01") && n.includes("max-wait"))).toHaveLength(1);
   });
 });
 

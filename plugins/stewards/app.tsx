@@ -621,6 +621,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     stuck: s.stuck,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
+    waitingUntil: s.waitingUntil,
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
@@ -687,7 +688,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
           {s.summary} <span className="text-muted-foreground">Next: {s.nextAction}{s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}</span>
         </p>
       )}
-      {s.waitingOn !== null ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
+      {s.waitingOn !== null && (s.waitingUntil === null || s.waitingUntil === undefined) ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
       {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
         <p key={i} className={x.route === "user" ? "text-destructive" : "text-muted-foreground"}>
@@ -877,6 +878,7 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     stuck: s.stuck,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
+    waitingUntil: s.waitingUntil,
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
@@ -1127,7 +1129,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
             Next: {s.nextAction ?? "—"}
             {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
           </p>
-          {s.waitingOn !== null ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
+          {s.waitingOn !== null && (s.waitingUntil === null || s.waitingUntil === undefined) ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}

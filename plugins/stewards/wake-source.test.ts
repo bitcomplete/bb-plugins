@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
+import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, hasLiveWakeSource, parseUntil, type WakeSourceInput } from "./wake-source.js";
 
 const noSources: WakeSourceInput = {
   hold: null,
@@ -99,5 +99,30 @@ describe("the requeue-only stall counter (BB-154)", () => {
     const first = at({ now: 1_000 });
     const second = advanceStall(first.state, { reason: "requeue", waitingOn: "the vendor", liveSource: false, now: 9_000 });
     expect(second.state.firstAt).toBe(1_000);
+  });
+
+  it("skips and resets while a dated wait is ahead, and counts once it has passed (BB-247)", () => {
+    const first = at();
+    const future = advanceStall(first.state, { reason: "requeue", waitingOn: "the vendor", liveSource: false, now: 2_000, until: 5_000 });
+    expect(future.state).toEqual(NO_STALL);
+    expect(future.escalate).toBe(false);
+    // Past the date, the same wait starts a fresh run from zero.
+    const after = advanceStall(future.state, { reason: "requeue", waitingOn: "the vendor", liveSource: false, now: 6_000, until: 5_000 });
+    expect(after.state).toEqual({ count: 1, waitText: "the vendor", firstAt: 6_000 });
+    expect(after.escalate).toBe(false);
+  });
+});
+
+describe("a report's `until` date (BB-247)", () => {
+  it("reads a date as 00:00 UTC and an ISO datetime as itself", () => {
+    expect(parseUntil("2026-12-01")).toBe(Date.parse("2026-12-01T00:00:00Z"));
+    expect(parseUntil("2026-12-01T15:30:00Z")).toBe(Date.parse("2026-12-01T15:30:00Z"));
+  });
+
+  it("refuses a non-date and a date that does not exist", () => {
+    expect(parseUntil("next Tuesday")).toBeNull();
+    expect(parseUntil("2026-02-30")).toBeNull();
+    expect(parseUntil("2026-13-01")).toBeNull();
+    expect(parseUntil("")).toBeNull();
   });
 });

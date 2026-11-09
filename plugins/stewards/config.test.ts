@@ -344,6 +344,10 @@ describe("playbooks", () => {
     expect(p.followThroughMs).toBe(6 * 3_600_000);
     // BB-83: the idle grace defaults to 15m and a playbook may override it.
     expect(p.idleGraceMs).toBe(15 * 60_000);
+    // BB-247: the dated-wait cap defaults to 90d and a playbook may override it.
+    expect(p.maxWaitMs).toBe(90 * 86_400_000);
+    const maxWait = parsePlaybook(LINEAR_TICKETS.replace("requeue-default: 2d", "requeue-default: 2d\nmax-wait: 30d"), "linear-tickets");
+    expect(maxWait.ok && maxWait.value.maxWaitMs).toBe(30 * 86_400_000);
     const shorter = parsePlaybook(LINEAR_TICKETS.replace("requeue-default: 2d", "requeue-default: 2d\nfollow-through: 90m"), "linear-tickets");
     expect(shorter.ok && shorter.value.followThroughMs).toBe(90 * 60_000);
     const idleGrace = parsePlaybook(LINEAR_TICKETS.replace("requeue-default: 2d", "requeue-default: 2d\nidle-grace: 5m"), "linear-tickets");
