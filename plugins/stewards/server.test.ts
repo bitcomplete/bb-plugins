@@ -11844,6 +11844,32 @@ describe("a steward idle in an active stage (BB-83)", () => {
     expect(t.sends.at(-1)!.text).toMatch(idleLine);
   });
 
+  // BB-247: a dated wait is something to wait on, so a binding parked until a
+  // date is not woken with the "nothing is being waited on" idle line before it.
+  it("does not wake a binding idle past the grace while a dated wait is ahead", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the vendor.");
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's decision", until: "2026-12-01" }, steward);
+    const before = t.sends.length;
+
+    // Past the idle grace but before the date: no idle wake.
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before);
+    expect(t.sends.every((s) => !idleLine.test(s.text))).toBe(true);
+
+    // Past the date, the binding can be idle again.
+    t.advance(60 * 86_400_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends.some((s) => idleLine.test(s.text))).toBe(true);
+  });
+
   it("starts a new idle period when the steward starts a worker that finishes", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));

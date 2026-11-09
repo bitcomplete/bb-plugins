@@ -821,7 +821,7 @@ export function unheardWait(status: Binding["status"], open: readonly Escalation
  * pull requests its own workers opened (BB-52 rule 0), and what waits on the
  * user. `server.ts` assembles these from the store; nothing here reads one.
  */
-export type IdleBinding = Pick<Binding, "stage" | "ending" | "hold" | "deployments"> & {
+export type IdleBinding = Pick<Binding, "stage" | "ending" | "hold" | "deployments" | "requeueUntil"> & {
   workers: readonly Pick<Worker, "status">[];
   ownPulls: ReadonlySet<string>;
   escalations: readonly Pick<Escalation, "status" | "route">[];
@@ -837,15 +837,19 @@ const pullOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== 
 
 /**
  * Whether a binding in an active stage has nothing left to wait on (BB-83):
- * its playbook stage is `build` or `review`, it is not ending or held, no
- * worker is running, no own pull request (BB-52 rule 0) is open, no deployment
- * watch is merged or deploying, and no escalation or need waits on the user.
- * It says nothing about the grace or the once-per-idle-period guard; the
- * server measures those.
+ * its playbook stage is `build` or `review`, it is not ending or held, it has
+ * no dated wait still ahead (BB-247), no worker is running, no own pull
+ * request (BB-52 rule 0) is open, no deployment watch is merged or deploying,
+ * and no escalation or need waits on the user. It says nothing about the grace
+ * or the once-per-idle-period guard; the server measures those.
  */
-export function idleInActiveStage(b: IdleBinding, observed: Observed): boolean {
+export function idleInActiveStage(b: IdleBinding, observed: Observed, now: number = Date.now()): boolean {
   if (b.stage !== "build" && b.stage !== "review") return false;
   if (b.ending !== null || b.hold !== null) return false;
+  // BB-247: a dated wait is something the plugin waits on. The binding is
+  // parked until the date, so it is not idle and must not be woken with
+  // "nothing is being waited on" before then.
+  if (b.requeueUntil !== null && b.requeueUntil > now) return false;
   if (b.workers.some((w) => w.status === "running")) return false;
   if ([observed.entity, ...observed.pulls].some((e) => pullOpen(e) && ownPull(e.key, e.url, b.ownPulls))) return false;
   if (Object.values(b.deployments).some((w) => w.state === "merged" || w.state === "deploying")) return false;

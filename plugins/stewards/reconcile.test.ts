@@ -998,6 +998,7 @@ describe("idle in an active stage (BB-83)", () => {
     ending: null,
     hold: null,
     deployments: {},
+    requeueUntil: null,
     workers: [{ status: "finished" }],
     ownPulls: own,
     escalations: [],
@@ -1029,6 +1030,11 @@ describe("idle in an active stage (BB-83)", () => {
     // is nothing to wait on.
     expect(idleInActiveStage(binding({ stage: "spec" }), merged)).toBe(false);
     expect(idleInActiveStage(binding({ deployments: { "acme/web#7": { state: "deployed" } as never } }), merged)).toBe(true);
+    // BB-247: a dated wait still ahead is something to wait on, so the binding
+    // is not idle before its date; once the date passes it can be.
+    const at = Date.parse("2026-12-01T00:00:00Z");
+    expect(idleInActiveStage(binding({ requeueUntil: at }), merged, at - 1)).toBe(false);
+    expect(idleInActiveStage(binding({ requeueUntil: at }), merged, at + 1)).toBe(true);
   });
 
   it("starts a new idle period when an own pull request closes", () => {

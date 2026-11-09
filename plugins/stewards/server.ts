@@ -3482,8 +3482,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // the last wake; a worker finish asks for the look at once, without the
       // grace. An idle wake ends the period until one of those happens again.
       const idle = idleInActiveStage(
-        { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id) },
+        { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id), requeueUntil: b.requeueUntil },
         observed,
+        now(),
       );
       // Re-read the idle fields from the store: a worker finish may have set
       // `idleWakeNow` (or a deployment verdict reset the period) after this
