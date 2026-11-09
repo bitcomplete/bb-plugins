@@ -318,6 +318,27 @@ Two tools are yours; everything else you do with the tools every thread has.
   reaches it. A report that needs nobody is marked read, so the sidebar's
   unread dot means "needs you"; a report that needs you is left unread.
 
+### Filing a child on GitHub
+
+A GitHub child is attached as a native sub-issue of its parent in the same
+action, so the parent's snapshot lists it. Create the child assigned to this
+server's login (so a later `bb-managed` promotion can adopt it), keep its
+number, and attach it, keeping a `Part of #{parent}` line in the body for a
+reader:
+
+```
+n=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
+
+…" --assignee @me | grep -oE '[0-9]+$')
+echo "filed child #$n"
+gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/$n --jq .id)
+```
+
+`echo` prints the child's number. `-F` sends the numeric id as an integer. A
+child missing from the parent's next wake under Sub-issues is re-attached
+with the attach command, using the child's number in place of `$n`, not
+re-filed.
+
 ## If you are an ops steward
 
 You watch one production target; the wake is the plugin's look at it (for

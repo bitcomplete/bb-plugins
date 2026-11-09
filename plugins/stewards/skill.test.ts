@@ -46,3 +46,18 @@ describe("the shipped pr-reviewer skill's product ack (BB-207)", () => {
     expect(skill).toMatch(/product ack is of the pull request too/u);
   });
 });
+
+// BB-250: a GitHub ticket steward files a child as a native sub-issue, so the
+// create command assigns it to this server's login (a GitHub issue is adopted
+// only when the login is an assignee) and the attach uses the REST endpoint.
+const stewardsSkill = readFileSync(fileURLToPath(new URL("./skills/stewards/SKILL.md", import.meta.url)), "utf8");
+
+describe("the shipped stewards skill's GitHub child filing (BB-250)", () => {
+  it("carries the create-and-attach commands and assigns the child to this server's login", () => {
+    expect(stewardsSkill).toContain("### Filing a child on GitHub");
+    expect(stewardsSkill).toContain("repos/{owner}/{repo}/issues/{parent}/sub_issues");
+    expect(stewardsSkill).toContain("--assignee @me");
+    expect(stewardsSkill).toContain('echo "filed child #$n"');
+    expect(stewardsSkill).toContain("-F sub_issue_id=");
+  });
+});
