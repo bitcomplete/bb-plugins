@@ -255,12 +255,14 @@ attach it:
 n=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
 
 …" --assignee @me | grep -oE '[0-9]+$')
+echo "filed child #$n"
 gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/$n --jq .id)
 \`\`\`
 
-\`-F\` sends the numeric id as an integer. A child missing from the parent's
-next wake under Sub-issues is re-attached with the second command, using the
-child's number in place of \`$n\`, not re-filed.
+\`echo\` prints the child's number. \`-F\` sends the numeric id as an
+integer. A child missing from the parent's next wake under Sub-issues is
+re-attached with the attach command, using the child's number in place of
+\`$n\`, not re-filed.
 
 ## status:in-progress
 

@@ -522,8 +522,10 @@ describe("the GitHub issue playbook (BB-234)", () => {
     expect(parsed.value.promote).toBe("A sub-issue that needs more than one pull request, its own approval, or work in a repo the parent does not touch.");
     const todo = phaseInstructions(parsed.value, "status:todo")!;
     expect(todo).toContain("sub_issues");
-    // The child is assigned to this server's login, so a later `bb-managed` promotion can adopt it.
+    // The child is assigned to this server's login, so a later `bb-managed` promotion can adopt it,
+    // and its number is printed so the steward can name it and re-attach it later.
     expect(todo).toContain("--assignee @me");
+    expect(todo).toContain('echo "filed child #$n"');
     expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/gh issue\s+close/u);
     expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
     expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");

@@ -57,6 +57,7 @@ describe("the shipped stewards skill's GitHub child filing (BB-250)", () => {
     expect(stewardsSkill).toContain("### Filing a child on GitHub");
     expect(stewardsSkill).toContain("repos/{owner}/{repo}/issues/{parent}/sub_issues");
     expect(stewardsSkill).toContain("--assignee @me");
+    expect(stewardsSkill).toContain('echo "filed child #$n"');
     expect(stewardsSkill).toContain("-F sub_issue_id=");
   });
 });
