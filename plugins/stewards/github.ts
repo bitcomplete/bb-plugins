@@ -77,8 +77,14 @@ export interface GithubWriter {
    * changes-requested review, where the owner's own pull request cannot.
    */
   review(repo: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string): Promise<void>;
-  /** Squash-merge the pull request, with the given commit title and message; returns the merge commit sha when GitHub reports one. */
-  squashMerge(repo: string, number: number, title: string, body: string): Promise<{ sha: string | null }>;
+  /**
+   * Squash-merge the pull request, with the given commit title and message;
+   * returns the merge commit sha when GitHub reports one. `sha` is the head
+   * the caller judged: GitHub refuses with 409 "Head branch was modified"
+   * when the head moved, so an unattended merge never lands a push whose
+   * checks have not run (BB-257).
+   */
+  squashMerge(repo: string, number: number, title: string, body: string, sha?: string | null): Promise<{ sha: string | null }>;
   /**
    * A pull request's title and body, for the squash merge commit (BB-193).
    * Null when GitHub has no readable title, or when the read fails; the caller
@@ -156,8 +162,8 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
     async review(repo, number, event, body) {
       await request("POST", `/repos/${repo}/pulls/${number}/reviews`, { event, body });
     },
-    async squashMerge(repo, number, title, body) {
-      const response = await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body });
+    async squashMerge(repo, number, title, body, headSha) {
+      const response = await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body, ...(headSha === undefined || headSha === null || headSha === "" ? {} : { sha: headSha }) });
       const merged = (await response.json().catch(() => null)) as { sha?: unknown } | null;
       const sha = merged?.sha;
       return { sha: typeof sha === "string" && sha !== "" ? sha : null };

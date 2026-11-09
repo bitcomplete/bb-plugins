@@ -6798,7 +6798,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
           } else if (!workerInFlight) {
             const ref = parsePullRef(pull.url ?? pull.key) ?? parsePullRef(url);
-            if (bindingMayMerge(b, playbook) && ref !== null) {
+            // Pause stewards is the kill switch: while it is on, the plugin
+            // files the item a person can press but never merges (BB-257).
+            const paused = (await settings.get()).paused;
+            if (bindingMayMerge(b, playbook) && ref !== null && !paused) {
               // BB-257: the plugin takes the step the Merge item used to ask a
               // person for. A refusal for this exact gate is recorded on the
               // binding and not retried until the head or a gate input changes.
@@ -6813,6 +6816,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   store.note(b.id, note);
                   changes.push({ text: note, actionable: true });
                   scheduleReconcile(b.id);
+                } else if (isHeadMovedRefusal(result.message)) {
+                  // A push landed between the look and the merge. GitHub
+                  // refused it with 409; the next look judges the new head.
+                  bb.log.warn(`stewards: plugin merge of ${pull.key} raced a push; waiting for the next look`);
                 } else if (result.message.startsWith("GitHub refused the merge:")) {
                   await raiseMergeRefusal(b, pull, g, result.message, changes);
                 } else {
@@ -7708,6 +7715,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * GitHub's refusal when the head moved between the look and the merge
+     * (409 "Head branch was modified", BB-257): the next look judges the new
+     * head, so it is a wait, not a `stuck` refusal.
+     */
+    function isHeadMovedRefusal(message: string): boolean {
+      return /\b409\b/u.test(message) || /Head branch was modified/iu.test(message);
+    }
+
+    /**
      * The key a refused merge is recorded against (BB-257): the head sha and
      * the reviewer marker and lane that made the gate met. A refusal under the
      * same key is not retried, so a conflict or branch protection is one
@@ -7744,7 +7760,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bindingId: b.id,
         kind: "stuck",
         question: `Could not merge ${pull.key}: ${message}`,
-        context: `The lane gate was met, so the plugin attempted the merge itself (BB-257), and GitHub refused it. Resolve the conflict or the branch protection and push; the plugin retries when the head sha or a gate input changes. GitHub said: ${message}`,
+        context: `The lane gate was met, so the plugin attempted the merge itself (BB-257), and GitHub refused it. Resolve the conflict or the branch protection and push; the plugin retries when the head sha or a gate input changes, or retry once the cause is fixed with \`bb stewards merge ${pull.key}\`. GitHub said: ${message}`,
         meanwhile: "The plugin does not retry the same gate; the pull request stays open.",
         route: nextRoute(b, null),
         recommendation: null,
@@ -7800,7 +7816,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       let mergeSha: string | null = null;
       try {
-        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, commitTitle, commitBody));
+        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, commitTitle, commitBody, gate.headSha));
       } catch (error) {
         return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
       }

@@ -108,6 +108,8 @@ function world() {
   let pullNumber = 0;
   let createPullError: string | null = null;
   let mergePullError: string | null = null;
+  /** When set, the pull request's head moves during `pullDetails`, so the merge PUT sees a stale head and GitHub refuses with 409 (BB-257). */
+  let moveHeadOnMerge = false;
   /** A forced failure for `github.dispatchWorkflow`, to exercise the best-effort dispatch after a merge (BB-216). */
   let mergeDispatchError: string | null = null;
   /** A forced failure for `github.pullDetails`, to exercise the merge title fallback (BB-193). */
@@ -124,14 +126,19 @@ function world() {
     review: async (repo: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string) => {
       githubReviews.push({ repo, number, event, body });
     },
-    squashMerge: async (repo: string, number: number, title: string, body: string) => {
+    squashMerge: async (repo: string, number: number, title: string, body: string, sha?: string | null) => {
       if (mergePullError !== null) throw new Error(mergePullError);
+      const key = `${repo}#${number}`;
+      const e = entities.get(key);
+      // The real PUT names the head the caller judged; GitHub refuses with 409
+      // when the head moved (BB-257).
+      if (sha !== undefined && sha !== null && sha !== "" && e !== undefined && e.pull !== null && e.pull.headSha !== sha) {
+        throw new Error("409 Head branch was modified. Review and try the merge again.");
+      }
       githubMerges.push({ repo, number, title, body });
       // The real merge changes the pull request's state; the fake must too, or
       // the plugin's own gate-met merge (BB-257) and the reconcile it
       // schedules would merge the same open snapshot again in a loop.
-      const key = `${repo}#${number}`;
-      const e = entities.get(key);
       if (e !== undefined && e.pull !== null) entities.set(key, { ...e, state: "merged", pull: { ...e.pull, merged: true, mergeCommit: "c".repeat(40) } });
       return { sha: "c".repeat(40) };
     },
@@ -142,6 +149,9 @@ function world() {
       if (pullDetailsError !== null) throw new Error(pullDetailsError);
       const entity = entities.get(`${repo}#${number}`);
       if (entity === undefined || entity.title === null || entity.title.trim() === "") return null;
+      // A push between the look and the merge: the head the plugin judged is
+      // no longer the head, so the merge PUT must be refused (BB-257).
+      if (moveHeadOnMerge && entity.pull !== null) entities.set(`${repo}#${number}`, { ...entity, pull: { ...entity.pull, headSha: "ddddddd4" } });
       return { title: entity.title, body: entity.description ?? "" };
     },
     files: async (repo: string, number: number) => {
@@ -479,7 +489,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -7185,6 +7195,33 @@ describe("needs you items", () => {
     // A new head is a new attempt; with the refusal cleared, it merges.
     t.setMergePullError(null);
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("does not merge while stewards are paused; it files the plugin's Merge item instead", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    await (t.hooks.settings as unknown as { experimental_set(values: Record<string, unknown>): Promise<unknown> }).experimental_set({ paused: true });
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
+  });
+
+  it("waits for the next look when the head moves between the look and the merge", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    // A push lands after the gate is judged and before the merge PUT: GitHub
+    // refuses with 409, and the plugin waits for the next look rather than
+    // raising a stuck refusal (BB-257).
+    t.setMoveHeadOnMerge(true);
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "stuck")).toBe(false);
+    // The head is stable on the next look, so it merges.
+    t.setMoveHeadOnMerge(false);
     await t.ring("linear", "uuid-12");
     expect(t.githubMerges).toHaveLength(1);
   });
