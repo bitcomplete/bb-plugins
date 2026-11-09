@@ -127,6 +127,12 @@ function world() {
     squashMerge: async (repo: string, number: number, title: string, body: string) => {
       if (mergePullError !== null) throw new Error(mergePullError);
       githubMerges.push({ repo, number, title, body });
+      // The real merge changes the pull request's state; the fake must too, or
+      // the plugin's own gate-met merge (BB-257) and the reconcile it
+      // schedules would merge the same open snapshot again in a loop.
+      const key = `${repo}#${number}`;
+      const e = entities.get(key);
+      if (e !== undefined && e.pull !== null) entities.set(key, { ...e, state: "merged", pull: { ...e.pull, merged: true, mergeCommit: "c".repeat(40) } });
       return { sha: "c".repeat(40) };
     },
     // The real writer reads the pull request's title and body from GitHub; the
@@ -6723,7 +6729,7 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*approved ENG-12's spec on the Stewards page: Looks good/u);
   });
 
-  it("files approve-pr in the owner lane; Approve posts a review on a teammate's pull request and the merge item follows", async () => {
+  it("files approve-pr in the owner lane; Approve posts a review on a teammate's pull request and the plugin merges", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
     // The user's lane is filed on the page at once, with no project-steward
@@ -6745,12 +6751,12 @@ describe("needs you items", () => {
     expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "APPROVE", body: "" }]);
     expect(t.githubComments).toEqual([]);
     expect(t.hooks.store.need(need.id)!.status).toBe("done");
-    // The snapshot now shows the owner's approval, so the merge item is filed.
+    // The snapshot now shows the owner's approval, so the plugin merges it.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.flush();
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeUndefined();
-    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeDefined();
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ url: "https://github.com/acme/web/pull/7", entityUrl: "https://linear.app/acme/issue/ENG-12" });
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
   });
 
   it("keeps the comment convention when the pull request is the signed-in account's own (BB-118)", async () => {
@@ -6946,13 +6952,15 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
-  it("files the merge need for the owner's own pull request (BB-170)", async () => {
+  it("merges the owner's own pull request when its playbook permits merge (BB-170)", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane", comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     const b = t.hooks.store.find("acme/web#7")!;
     expect(b.kind).toBe("pr");
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+    // github-prs' `may` includes merge, so the plugin takes the step itself.
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    expect(t.githubMerges).toHaveLength(1);
   });
 
   it("files the merge need for a dependabot[bot] pull request (BB-170)", async () => {
@@ -7107,29 +7115,78 @@ describe("needs you items", () => {
     expect(closed.resolution).not.toMatch(/not waiting for an owner approval/u);
   });
 
-  it("files merge only when the gate is met and no worker runs, and the page action merges through gh", async () => {
-    const t = await withPull([marker, owner]);
+  it("merges a gate-met ticket binding itself and files no Merge item", async () => {
+    const t = await withPull([marker]);
     const b = t.binding();
-    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
-    expect(need).toMatchObject({ what: "Merge acme/web#7", filedBy: "plugin" });
-    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, client);
-    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Merged/u) });
+    expect(t.githubMerges).toEqual([]);
+    // The owner approves: the next look merges and wakes the steward with the
+    // merge note, and files no Merge item.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.githubMerges).toHaveLength(1);
     expect(t.githubMerges[0]).toMatchObject({ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." });
     expect(t.githubComments.at(-1)!.body).toMatch(/Merged: owner-reviewed lane, reviewer approved aaaaaaa, checks green, approved by the owner/u);
-    expect(t.hooks.store.need(need.id)!.status).toBe("done");
     await t.flush();
-    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/What changed[\s\S]*merged from the Stewards page/u);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /What changed[\s\S]*merged by the plugin/u.test(s.text))).toBe(true);
   });
 
-  it("refuses the merge when a worker is still running", async () => {
-    const t = await withPull([marker, owner]);
-    const b = t.binding();
-    await t.created("thr_w1", t.steward, "ENG-12: Implement");
-    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
-    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, client);
-    expect(res).toMatchObject({ ok: false, message: expect.stringMatching(/Worker thr_w1 is mid-turn/u) });
+  it("does not merge while a worker is still running", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({}, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    // The worker is in flight when the owner approves, so the plugin holds the
+    // merge for a later look rather than racing the worker.
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.githubMerges).toEqual([]);
+  });
+
+  it("merges a dependabot pull request under a deps-prs playbook that permits merge", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    // The updated `.bb` playbook adds `merge`; until it lands the shipped
+    // template omits it and the plugin keeps filing the Merge item.
+    t.files[playbookPath("deps-prs")] = DEPS_PRS.replace("may: [comment, request-review, escalate, spawn-worker]", "may: [comment, request-review, escalate, spawn-worker, merge]");
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]" }));
+    await t.hooks.sweep();
+    await t.flush();
+    const b = t.hooks.store.find("acme/web#9")!;
+    expect(b).toMatchObject({ kind: "pr", playbook: "deps-prs" });
+    const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [], comments: [noReview] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#9");
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("records a refused merge once, does not retry the same gate, and merges after the head moves", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.setMergePullError("Pull request is not mergeable: the merge conflict must be resolved");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    // One attempt, noted on the binding and raised once to the steward.
+    expect(t.githubMerges).toEqual([]);
+    const stuck = t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck");
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0]!.headSha).toBe("aaaaaaa1");
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /could not merge acme\/web#7/u.test(s.text))).toBe(true);
+    // A second look at the same gate does not retry or re-raise.
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(1);
+    // A new head is a new attempt; with the refusal cleared, it merges.
+    t.setMergePullError(null);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
   });
 
   it("records a project-steward approval bound to the head sha; ticket and worker threads are refused (BB-30)", async () => {
@@ -7623,7 +7680,12 @@ describe("needs you items", () => {
     await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     const first = await board();
     expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, why: null })]);
-    // Once the owner approves, a merge item appears; a running worker makes it not actionable.
+    // A steward-filed Merge item (a refused merge) is the owner's to press; a
+    // running worker makes it not actionable, a finished one does not.
+    const b = t.binding();
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "steward" });
+    // The gate is met on the next look; the steward's own item blocks the
+    // plugin's merge, so the item is actionable.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
@@ -7666,16 +7728,22 @@ describe("needs you items", () => {
   });
 
   it("a finished worker does not block a steward-filed merge item; a running one does (BB-175)", async () => {
-    const t = await withPull([marker, owner]);
-    const b = t.binding();
-    // The plugin filed its own item; make it the steward's, as it is when a
-    // worker could not merge and handed the item to a person.
-    t.hooks.store.closeNeedByKey(b.id, "merge", "https://github.com/acme/web/pull/7", "the worker handed it to the steward");
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    // A worker could not merge and handed the item to a person; the plugin
+    // leaves it alone. The owner then approves, which would otherwise merge.
     t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "steward" });
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    // The gate is met, but the steward's own item blocks the plugin's merge.
+    await t.ring("linear", "uuid-12");
     const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
     // A running worker's turn can race a push: the item is not actionable and
     // the shared merge path refuses.
-    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.created("thr_w1", steward, "ENG-12: Implement");
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false });
     const refused = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(refused.exitCode).toBe(1);
@@ -7691,8 +7759,12 @@ describe("needs you items", () => {
   });
 
   it("the not-actionable reason names the running worker (BB-175)", async () => {
-    const t = await withPull([marker, owner]);
+    const t = await withPull([marker]);
     const b = t.binding();
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "steward" });
+    // The gate is met, but the steward's own item blocks the plugin's merge.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
@@ -7761,12 +7833,13 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b().id).some((n) => n.kind === "approve-spec")).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.ready.approval!.specHash).not.toBe(firstHash);
 
-    // The user approves the pull request on the page; the merge item follows.
+    // The user approves the pull request on the page; the plugin merges it.
     const pr = t.hooks.store.openNeeds(b().id).find((n) => n.kind === "approve-pr")!;
     await t.harness.callRpc("stewardsNeedAction", { needId: pr.id, action: "approve" }, client);
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.flush();
-    expect(kinds()).toEqual(["configure", "configure", "configure", "merge", "provide-secret"]);
+    expect(kinds()).toEqual(["configure", "configure", "configure", "provide-secret"]);
+    expect(t.githubMerges).toHaveLength(1);
 
     // The user does the three external steps and provides the secret.
     for (const n of t.hooks.store.openNeeds(b().id).filter((x) => x.kind === "configure" || x.kind === "provide-secret")) {
@@ -7775,10 +7848,9 @@ describe("needs you items", () => {
     }
     await t.flush();
     const all = t.hooks.store.needs(b().id, true);
-    expect(all.map((n) => n.kind).sort()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "merge", "provide-secret"]);
+    expect(all.map((n) => n.kind).sort()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "provide-secret"]);
     expect(all.filter((n) => n.status === "done").map((n) => n.kind).sort()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "provide-secret"]);
-    expect(all.find((n) => n.kind === "merge")!.status).toBe("open");
-    expect(t.hooks.store.openNeeds(b().id).map((n) => n.kind)).toEqual(["merge"]);
+    expect(t.hooks.store.openNeeds(b().id)).toEqual([]);
     expect(project).toBeDefined();
   });
 
@@ -8049,26 +8121,26 @@ describe("needs you items", () => {
   });
 
   it("does not re-ask the coverage question when a closed item is refiled for the same escalation", async () => {
-    const t = await withPull([marker]);
+    const t = await withPull([]);
     const b = t.binding();
     t.advance(1000);
     const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     t.advance(1000);
-    // The owner approves and checks are green: the merge item is filed, and the
-    // pair is asked once.
-    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    // The reviewer approves: the owner's approve-pr item is filed, and the pair
+    // is asked once.
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     const asked = () => t.sends.filter((s) => s.threadId === t.project && /a gate item was filed on ENG-12/u.test(s.text));
     expect(asked()).toHaveLength(1);
-    // Checks go red: the merge item closes. Green again: it is refiled with a
+    // The reviewer round goes away: the item closes. Back: it is refiled with a
     // new id, but the pair was already asked for this escalation.
     t.advance(1000);
-    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "failure", failing: ["test"] } }));
+    t.entities.set("acme/web#7", pull({}, { checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     t.advance(1000);
-    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
     expect(asked()).toHaveLength(1);
     expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
   });
@@ -8121,7 +8193,10 @@ describe("needs you items", () => {
     t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Fix login", comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
-    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "merge").map((n) => n.url)).toEqual(["https://github.com/acme/web/pull/8"]);
+    // #8 belongs to ENG-12 and its gate is met, so the plugin merges it; #7 is
+    // only mentioned, so it files nothing and is not merged.
+    expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#8"]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === "https://github.com/acme/web/pull/7")).toBe(false);
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "approval" && x.url === "https://github.com/acme/web/pull/7")).toBe(false);
   });
@@ -8156,7 +8231,9 @@ describe("needs you items", () => {
     await t.ring("linear", "uuid-13");
     const a = t.hooks.store.find("ENG-12")!;
     const b = t.hooks.store.find("ENG-13")!;
-    expect(t.hooks.store.openNeeds(a.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    // ENG-12 owns #7 and merges it; ENG-13 only cross-references it.
+    expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#7"]);
+    expect(t.hooks.store.openNeeds(a.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "approval")).toBe(false);
@@ -8173,8 +8250,7 @@ describe("needs you items", () => {
     await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "retry" });
     t.hooks.store.setWorker("thr_w1", "stopped", null);
     await t.ring("linear", "uuid-12");
-    const b = t.hooks.store.find("ENG-12")!;
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#7"]);
   });
 
   it("BB-239: a worker's final message that names the pull request owns it on a foreign branch", async () => {
@@ -8186,8 +8262,7 @@ describe("needs you items", () => {
     await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "retry" });
     t.hooks.store.setWorker("thr_w1", "stopped", "Opened https://github.com/acme/web/pull/7 for review.");
     await t.ring("linear", "uuid-12");
-    const b = t.hooks.store.find("ENG-12")!;
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#7"]);
   });
 
   it("BB-239: a title that names the ticket owns the pull request on a foreign branch", async () => {
@@ -8195,8 +8270,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
-    const b = t.hooks.store.find("ENG-12")!;
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#7"]);
   });
 
   it("BB-239: a GitHub issue's title number owns only a pull request in the issue's repo", async () => {
@@ -8209,8 +8283,7 @@ describe("needs you items", () => {
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", unit: "acme/web", title: "Fix login (#14)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
     t.entities.set("acme/other#14", pull({ id: "acme/other#14", key: "acme/other#14", url: "https://github.com/acme/other/pull/14", unit: "acme/other", title: "Fix login (#14)", comments: [marker, owner] }, { head: "feature/other", checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#14");
-    const b = t.hooks.store.find("acme/web#14", "p1")!;
-    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "merge").map((n) => n.url)).toEqual(["https://github.com/acme/web/pull/7"]);
+    expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#7"]);
   });
 
   // BB-256: a steward can hold its own merge behind another binding. While the
@@ -8243,16 +8316,21 @@ describe("needs you items", () => {
     });
 
     it("files no plugin Merge item while it stands, closes an open one, and leaves a steward-filed one alone", async () => {
-      const t = await withPull([marker, owner]);
+      const t = await withPull([marker]);
       const b = t.binding();
-      const pluginNeed = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
-      expect(pluginNeed.filedBy).toBe("plugin");
+      // A plugin-filed Merge item from an earlier look, and the gate met.
+      const pluginNeed = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+      t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
       t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Blocker" }));
       await t.ring("linear", "uuid-13");
       const report = await t.tool("steward_report", waitReport("ENG-13 to be Done", ["ENG-13"]), t.steward);
       expect(report.error, report.text).toBe(false);
       expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["ENG-13"]);
       expect(t.hooks.store.need(pluginNeed.id)).toMatchObject({ status: "done", resolution: "held behind ENG-13" });
+      // The hold stands with the gate met: no merge and no plugin item.
+      await t.ring("linear", "uuid-12");
+      expect(t.githubMerges).toEqual([]);
+      expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(false);
       // The row shows as held, not "needs you", with the steward's wait text.
       const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; needsUser: boolean; hold: string | null; holdBehind: string[] }> };
       expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ needsUser: false, hold: "ENG-13 to be Done", holdBehind: ["ENG-13"] });
@@ -8268,14 +8346,18 @@ describe("needs you items", () => {
       expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(false);
     });
 
-    it("lifts when the target merges, notes it, wakes the steward, and files the Merge item on the next look", async () => {
-      const t = await withPull([marker, owner]);
+    it("lifts when the target merges, notes it, wakes the steward, and merges on the next look", async () => {
+      const t = await withPull([marker]);
       const b = t.binding();
       blockedPull(t);
       await t.ring("github", "acme/web#8");
       expect(t.hooks.store.find("acme/web#8")!.kind).toBe("pr");
       await t.tool("steward_report", waitReport("acme/web#8", ["acme/web#8"]), t.steward);
       expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["acme/web#8"]);
+      // The gate is met, but the hold stands: no merge.
+      t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      expect(t.githubMerges).toEqual([]);
       expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
       const wakes = t.sends.filter((s) => s.threadId === t.steward).length;
       // The target merges: the hold clears and the steward is woken with the note.
@@ -8283,9 +8365,10 @@ describe("needs you items", () => {
       await t.ring("github", "acme/web#8");
       expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
       expect(t.sends.filter((s) => s.threadId === t.steward).length).toBeGreaterThan(wakes);
-      expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/Merge hold lifted: acme\/web#8, which it waited behind, reached merged\./u);
-      // The next look files the Merge item again, so a stuck loop still surfaces.
-      expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
+      expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Merge hold lifted: acme\/web#8, which it waited behind, reached merged\./u.test(s.text))).toBe(true);
+      // The next look merges the pull request, so a stuck loop still surfaces.
+      await t.ring("linear", "uuid-12");
+      expect(t.githubMerges.map((m) => `${m.repo}#${m.number}`)).toEqual(["acme/web#7"]);
     });
   });
 });
@@ -12760,7 +12843,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   const reviewMarkerApprover = (lane: string, approver: string, id = "m1") => comment({ id, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=${lane} approver=${approver} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 
   /** A bound ticket with one linked pull request, observed. */
-  async function withPull(comments: ReturnType<typeof comment>[], over: { repo?: string; number?: number; pullOver?: Record<string, unknown>; entityOver?: Record<string, unknown>; files?: string[]; project?: Record<string, unknown> } = {}) {
+  async function withPull(comments: ReturnType<typeof comment>[], over: { repo?: string; number?: number; pullOver?: Record<string, unknown>; entityOver?: Record<string, unknown>; files?: string[]; project?: Record<string, unknown>; noReconcileGate?: boolean } = {}) {
     const repo = over.repo ?? "acme/web";
     const number = over.number ?? 7;
     const key = `${repo}#${number}`;
@@ -12769,9 +12852,14 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key, url: `https://github.com/${repo}/pull/${number}` }] }));
     // The worker branch convention names the ticket, so the linked pull
     // belongs to it rather than merely mentioning it (BB-239).
-    t.entities.set(key, pull({ id: key, key, url: `https://github.com/${repo}/pull/${number}`, unit: repo, comments, ...over.entityOver }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] }, ...over.pullOver }));
+    const buildPull = (cs: ReturnType<typeof comment>[]) => pull({ id: key, key, url: `https://github.com/${repo}/pull/${number}`, unit: repo, comments: cs, ...over.entityOver }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] }, ...over.pullOver });
+    // A test of the CLI or the page's own merge path needs a gate-met pull
+    // request the plugin has not already merged (BB-257): it rings with the
+    // gate unmet, then sets the marker without a reconcile.
+    t.entities.set(key, buildPull(over.noReconcileGate === true ? [] : comments));
     if (over.files !== undefined) t.githubFiles.set(key, over.files);
     await t.ring("linear", "uuid-12");
+    if (over.noReconcileGate === true) t.entities.set(key, buildPull(comments));
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     return { ...t, project, steward, key, binding: () => t.hooks.store.find("ENG-12")! };
   }
@@ -12890,11 +12978,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("merges through --project from a thread in another project (BB-214)", async () => {
-    const t = await withPull([reviewMarker("no-review")]);
+    const t = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     const own = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
     t.hooks.store.patch(own.id, { threadId: "thr_p2" });
     const b = t.binding();
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"], { threadId: "thr_p2", projectId: "p2" });
     expect(merged.exitCode).toBe(0);
     expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
@@ -13020,16 +13107,15 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(refused.stdout).toMatch(/The gate is not met: no reviewer round yet/u);
     expect(unmet.githubMerges).toEqual([]);
 
-    const busy = await withPull([reviewMarker("no-review")]);
+    const busy = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     await busy.created("thr_w1", busy.steward, "ENG-12: Implement");
     const running = await busy.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(running.exitCode).toBe(1);
     expect(running.stdout).toMatch(/Worker thr_w1 is mid-turn/u);
     expect(busy.githubMerges).toEqual([]);
 
-    const t = await withPull([reviewMarker("no-review")]);
+    const t = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     const b = t.binding();
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(merged.stdout).toMatch(/Merged: no-review lane, reviewer approved aaaaaaa, checks green/u);
@@ -13043,7 +13129,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("lets the owning worker merge through the CLI while it is still in flight (BB-134)", async () => {
-    const t = await withPull([reviewMarker("no-review")]);
+    const t = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"], { threadId: "thr_w1", projectId: "p1" });
     expect(merged.exitCode).toBe(0);
@@ -13052,7 +13138,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
   it("dispatches the configured workflow once after a merge, through the CLI and the page, and says so (BB-216)", async () => {
     const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] };
-    const t = await withPull([reviewMarker("no-review")], { project });
+    const t = await withPull([reviewMarker("no-review")], { project, noReconcileGate: true });
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(t.githubDispatches).toEqual([{ repo: "bitcomplete/bb-gate", workflow: "bb-server.yaml", ref: "main", inputs: { only_if_moved: "true" } }]);
@@ -13060,8 +13146,9 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(t.githubComments.at(-1)!.body).toMatch(/dispatched bb-server\.yaml on bitcomplete\/bb-gate@main/u);
 
     // The Stewards page's Merge item takes the same shared path.
-    const page = await withPull([reviewMarker("no-review")], { project });
+    const page = await withPull([reviewMarker("no-review")], { project, noReconcileGate: true });
     const b = page.binding();
+    page.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "plugin" });
     const need = page.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
     const res = await page.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, { experimental_caller: { kind: "client" } });
     expect(res).toMatchObject({ ok: true });
@@ -13070,7 +13157,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
   it("reads the ref from the workflow repo's default branch when the entry names none (BB-216)", async () => {
     const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "build.yaml", workflowRepo: "acme/infra", inputs: { only_if_moved: "true" } }] };
-    const t = await withPull([reviewMarker("no-review")], { project });
+    const t = await withPull([reviewMarker("no-review")], { project, noReconcileGate: true });
     t.githubDefaultBranches.set("acme/infra", "trunk");
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
@@ -13078,7 +13165,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("dispatches nothing when the project configures no mergeDispatch, so the merge path is unchanged (BB-216)", async () => {
-    const t = await withPull([reviewMarker("no-review")]);
+    const t = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(t.githubDispatches).toEqual([]);
@@ -13087,7 +13174,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
   it("reports a failed dispatch but still merges (BB-216)", async () => {
     const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] };
-    const t = await withPull([reviewMarker("no-review")], { project });
+    const t = await withPull([reviewMarker("no-review")], { project, noReconcileGate: true });
     t.setMergeDispatchError("workflow dispatch refused: 403");
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
@@ -13100,7 +13187,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   it("carries the pull request's title and body into the squash merge, and falls back to the key when they cannot be read (BB-193)", async () => {
     // The happy path: GitHub's own squash subject, with the PR body as the
     // message, and no "Merged:" summary in the commit.
-    const t = await withPull([reviewMarker("no-review")]);
+    const t = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
@@ -13108,14 +13195,14 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
     // A read that fails falls back to the old placeholder rather than refusing
     // a merge whose gate is met.
-    const failed = await withPull([reviewMarker("no-review")]);
+    const failed = await withPull([reviewMarker("no-review")], { noReconcileGate: true });
     failed.setPullDetailsError("GitHub rate limited the read");
     const failedMerge = await failed.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(failedMerge.exitCode).toBe(0);
     expect(failed.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
 
     // A pull request GitHub reports with no title falls back the same way.
-    const untitled = await withPull([reviewMarker("no-review")], { entityOver: { title: null } });
+    const untitled = await withPull([reviewMarker("no-review")], { entityOver: { title: null }, noReconcileGate: true });
     const untitledMerge = await untitled.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(untitledMerge.exitCode).toBe(0);
     expect(untitled.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
@@ -13136,7 +13223,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("carries the restart note only when one guidance paragraph names the repo, says restart and makes an every-merge claim", async () => {
-    const withNote = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-plugins" });
+    const withNote = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-plugins", noReconcileGate: true });
     // The real `.bb/AGENTS.md` shape ("Who merges"): all three in one paragraph.
     withNote.files["AGENTS.md"] = "The lane decides who approves, not what ships. **Any merge to `bb-plugins` `main`, docs included, moves the pin**, builds a new `bb-server` image and stages a restart for every developer.\n";
     const merged = await withNote.harness.behavior.runCli(["merge", "bitcomplete/bb-plugins#7", "--project", "p1"]);
@@ -13145,7 +13232,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
     // A devbox-shaped paragraph names the repo and says "restart" but makes no
     // every-merge claim, so no note: the false positive the reviewer found.
-    const devbox = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/devbox" });
+    const devbox = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/devbox", noReconcileGate: true });
     devbox.files["AGENTS.md"] = "## Change classification\n\nA change to `devbox/host/**` is production infrastructure. A merge rebuilds the `bb-server` image and restarts every developer's server.\n";
     const devboxMerged = await devbox.harness.behavior.runCli(["merge", "bitcomplete/devbox#7", "--project", "p1"]);
     expect(devboxMerged.exitCode).toBe(0);
@@ -13153,7 +13240,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
     // The repo named in one paragraph and "restart" in another, in the same
     // section, is not the project saying a merge to that repo restarts servers.
-    const split = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-gate" });
+    const split = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-gate", noReconcileGate: true });
     split.files["AGENTS.md"] = "## Shipping a plugin change\n\nLanding on `bb-gate` main is not instant; the pin is rewritten.\n\nEvery developer's server will restart when a staged image lands.\n";
     const splitMerged = await split.harness.behavior.runCli(["merge", "bitcomplete/bb-gate#7", "--project", "p1"]);
     expect(splitMerged.exitCode).toBe(0);

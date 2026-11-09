@@ -385,6 +385,14 @@ describe("the nightly prompt", () => {
     expect(STANDING_RULES.join("\n")).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
   });
 
+  it("carries the rule that the plugin merges a gate-met pull request (BB-257)", () => {
+    const rules = STANDING_RULES.join("\n");
+    expect(rules).toMatch(/The plugin merges once the lane gate is met/u);
+    expect(rules).toMatch(/a ticket binding always does/u);
+    expect(rules).toMatch(/`may` includes `merge`/u);
+    expect(rules).toMatch(/Do not file a Merge item/u);
+  });
+
   it("carries the merge hold rule and its line (BB-256)", () => {
     expect(STANDING_RULES.join("\n")).toMatch(/do not merge before X is Done/u);
     expect(STANDING_RULES.join("\n")).toMatch(/mergeBehind/u);
