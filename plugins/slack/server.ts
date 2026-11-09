@@ -1918,19 +1918,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       participantStartedTurns.delete(threadId);
       await pushTitle(threadId);
       const mine = [...sessions].filter(([, r]) => r.threadId === threadId);
-      // A participant's queued wake has not started its turn yet, so its mark
-      // must survive this older turn's idle (BB-262). A wake whose row
-      // dispatched has state "started" by now, so a "queued" participant wake
-      // is still waiting. This runs before the early return below, because a
-      // participant wake owes no reply and can leave `waiting` empty.
-      if (mine.some(([, r]) => r.wakes.some((w) => w.participant && w.state === "queued"))) {
-        participantStartedTurns.add(threadId);
-      }
       const waiting = mine.filter(([, r]) => !taggedAnswered(r));
       // An untagged wake does not owe a reply, so a silent turn is the expected
       // outcome; clear the thinking status for it once its turn has run, so an
       // older turn's idle does not clear the indicator of a queued wake.
       const untaggedWaiting = mine.filter(([, r]) => r.untagged > 0);
+      // A participant's queued wake owes no reply, so it can leave `waiting`
+      // and `untaggedWaiting` empty; read the queue for it rather than
+      // returning early (BB-262).
+      const queuedParticipant = mine.some(([, r]) => r.wakes.some((w) => w.participant && w.state === "queued"));
       // A parked late steer set the thinking indicator for the edit, but the
       // turn ending here cannot answer it and posts no backstop. Clear the
       // indicator so it does not outlive the turn; a following turn sets its
@@ -1941,7 +1937,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (r.wakes.some((w) => w.state === "queued" && w.queuedMessageId !== "")) continue;
         void hooks.status(session, "", checkSignal()).catch(() => undefined);
       }
-      if (waiting.length === 0 && untaggedWaiting.length === 0) {
+      if (waiting.length === 0 && untaggedWaiting.length === 0 && !queuedParticipant) {
         await clearSteered(threadId, idleAt);
         return;
       }
@@ -1958,6 +1954,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return;
       }
       const stillQueued = (r: SessionRecord) => r.wakes.some((w) => w.state === "queued" && w.queuedMessageId !== "" && queuedIds.has(w.queuedMessageId));
+      // A participant's queued wake has not started its turn yet, so its mark
+      // must survive this older turn's idle. Check the queue, so a missed
+      // dispatch that left the wake "queued" in storage does not mark a thread
+      // for good (BB-262).
+      if (mine.some(([, r]) => r.wakes.some((w) => w.participant && w.state === "queued" && w.queuedMessageId !== "" && queuedIds.has(w.queuedMessageId)))) {
+        participantStartedTurns.add(threadId);
+      }
       // A steer joined the turn that just ended, whichever turn that was;
       // `steeredAt` says so even when the turn's own input never named it. A
       // steer or wake newer than this idle belongs to the next one, so this

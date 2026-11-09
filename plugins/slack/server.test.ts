@@ -3089,5 +3089,26 @@ describe("Slack plugin", () => {
       expect(s.text(refused)).toContain("not a reason to open one");
       await s.stop();
     });
+
+    it("does not mark a thread for a stale queued participant wake", async () => {
+      const rows: Array<{ id: string }> = [{ id: "q1" }];
+      const s = await live({
+        token: "xoxp-test",
+        queued: rows,
+        send: () => ({ delivery: "queued", queuedMessage: { id: "q1", updatedAt: 1 } }),
+      });
+      await s.tool("slack_start_conversation", { text: "opener", users: ["Bob"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      await tick();
+      s.hooks.last().send(s.hooks.session({ opened: true, ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, owner: { id: "U0123", name: "Alice" }, comment: { text: "answer", untrusted: true } }));
+      await tick();
+      // A missed dispatch left the wake queued, but the row is no longer in the
+      // queue; an idle must not re-mark the thread for it.
+      rows.length = 0;
+      await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-owner" } as never, lastAssistantText: null });
+      await tick();
+      const allowed = await s.tool("slack_start_conversation", { text: "hi Carol", users: ["Carol"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      expect(s.text(allowed)).toContain("Opened a Slack conversation");
+      await s.stop();
+    });
   });
 });
