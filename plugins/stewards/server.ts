@@ -14,7 +14,11 @@
 // (project-source.ts): multi-repo's RPCs when it is installed, native git on
 // the project checkout when it is not. Nothing here reads a file.
 import { createHash, randomBytes } from "node:crypto";
-import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand } from "@get-bb/plugin-sdk";
+import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand, type PluginTurnFailedEvent } from "@get-bb/plugin-sdk";
+
+/** The structured failure and rate-limit types `turn.failed` carries (not re-exported by the 0.6.80 SDK). */
+type ProviderErrorInfo = NonNullable<PluginTurnFailedEvent["errorInfo"]>;
+type ProviderRateLimitState = NonNullable<PluginTurnFailedEvent["rateLimits"]>;
 import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
@@ -111,7 +115,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -179,6 +183,8 @@ export interface Timing {
   environmentPollMs: number;
   /** How long `spawnSteward` waits for that environment before giving the steward its own (BB-111). */
   environmentWaitMs: number;
+  /** BB-255: the base of the backoff before retrying a failed wake (doubles per attempt). */
+  wakeRetryBaseMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
@@ -192,7 +198,11 @@ export const DEFAULT_TIMING: Timing = {
   approvalLookbackMs: 24 * 60 * 60_000,
   environmentPollMs: 1000,
   environmentWaitMs: 60_000,
+  wakeRetryBaseMs: 15_000,
 };
+
+/** BB-255: the plugin retries its own failed wake up to this many attempts (the original is attempt 1). */
+export const WAKE_RETRY_MAX_ATTEMPTS = 3;
 
 /** BB-55: the backstop wake when a report passes the ready gate and the turn ends with no worker started. */
 export const START_WORKER_WAKE = "The ready gate passed on your last turn and nothing holds you: start the worker.";
@@ -620,6 +630,8 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
+              /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
+              wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
               hold: z.string().nullable(),
               /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
@@ -743,6 +755,8 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
+              /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
+              wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
               /** The hold reason, for the card's `On hold` line; null when not held. */
               hold: z.string().nullable(),
@@ -842,6 +856,8 @@ export const rpcContract = defineRpcContract({
           waitingUntil: z.number().nullable(),
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
+          /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
+          wakeFailure: z.string().nullable(),
           needsUser: z.boolean(),
           /** An open `stuck` escalation: the row is blocked (BB-76). */
           stuck: z.boolean(),
@@ -2460,6 +2476,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await recordPluginSend(text);
       try {
         await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
+        // BB-255: a newer wake the plugin sent supersedes any pending retry for
+        // that thread, so a stale retry's failure is not acted on.
+        clearWakeRetry(threadId);
         return "sent";
       } catch (error) {
         const e = error as { code?: string; status?: number };
@@ -3319,6 +3338,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         awaitingReport: true,
         wokeAt: now(),
         lastJudgmentAt: now(),
+        // BB-255: a wake that landed clears the failed-wake phrase.
+        wakeFailure: null,
         // BB-154: the reason this turn was woken, so the report that ends it
         // can count a requeue-only run. Cleared by that report.
         lastWakeReason: reason,
@@ -3331,6 +3352,182 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       noteRespawn(b, delivery.respawned);
       return true;
+    }
+
+    // ---- failed-wake retry (BB-255) ---------------------------------------------------------
+
+    /**
+     * The binding a thread belongs to, whether the thread is a steward's own
+     * or a worker's; null for a thread the store does not know (a project
+     * steward's).
+     */
+    function bindingForThread(threadId: string): Binding | null {
+      const direct = store.byThread(threadId);
+      if (direct !== null) return direct;
+      const worker = store.worker(threadId);
+      return worker === null ? null : store.binding(worker.bindingId);
+    }
+
+    /**
+     * Threads whose failed turn `turn.failed` is deciding on (BB-255). It is
+     * set synchronously before the retry RPC is awaited, so the `thread.failed`
+     * handler — dispatched just before it — yields and lets this decision win.
+     */
+    const wakeRetryInFlight = new Set<string>();
+
+    /** Replace the one pending retry for a thread, or drop it. */
+    function setWakeRetry(b: Binding, threadId: string, retry: WakeRetry | null): Binding {
+      const next = { ...b.wakeRetries };
+      if (retry === null) delete next[threadId];
+      else next[threadId] = retry;
+      return store.patch(b.id, { wakeRetries: next });
+    }
+
+    /**
+     * The retry request ids the plugin scheduled, keyed to their thread, for a
+     * thread the binding record does not cover: a project steward has no
+     * binding, and a retry's own failure arrives with a null origin. In memory:
+     * a restart loses it, which is the same as the retry being lost.
+     */
+    const retriedRequests = new Map<string, string>();
+
+    const hasRetriedRequest = (threadId: string): boolean => {
+      for (const id of retriedRequests.values()) if (id === threadId) return true;
+      return false;
+    };
+
+    /** Forget the in-memory retried ids for a thread. */
+    function forgetRetriedRequests(threadId: string): void {
+      for (const [requestId, id] of retriedRequests) if (id === threadId) retriedRequests.delete(requestId);
+    }
+
+    /** Drop a pending retry for a thread, wherever its binding is; a no-op when there is none. */
+    function clearWakeRetry(threadId: string): void {
+      forgetRetriedRequests(threadId);
+      const b = bindingForThread(threadId);
+      if (b === null || b.wakeRetries[threadId] === undefined) return;
+      setWakeRetry(b, threadId, null);
+    }
+
+    /**
+     * The provider error in words. `turn.failed` carries no message, only the
+     * structured classification, so the phrase is assembled from it.
+     */
+    function describeWakeError(errorInfo: ProviderErrorInfo | null): string {
+      if (errorInfo === null) return "the provider reported no detail";
+      const parts: string[] = [errorInfo.category];
+      if (errorInfo.providerCode !== null && errorInfo.providerCode !== "") parts.push(errorInfo.providerCode);
+      if (errorInfo.httpStatusCode !== null) parts.push(`HTTP ${errorInfo.httpStatusCode}`);
+      return parts.join(" ");
+    }
+
+    /** Categories a retry cannot fix: the same credentials, budget or request fail again. */
+    const NON_RETRYABLE_WAKE_CATEGORIES = new Set(["unauthorized", "billing", "policy", "bad-request"]);
+
+    /** Whether a retry could plausibly fix the failure. */
+    const retryableWakeFailure = (errorInfo: ProviderErrorInfo | null): boolean => errorInfo === null || !NON_RETRYABLE_WAKE_CATEGORIES.has(errorInfo.category);
+
+    /** The latest reset a rate-limit snapshot reports, or null when it reports none. */
+    function wakeRateLimitReset(rateLimits: ProviderRateLimitState | null): number | null {
+      if (rateLimits === null) return null;
+      const blocked = rateLimits.windows.filter((w) => w.status === "blocked");
+      const relevant = blocked.length > 0 ? blocked : rateLimits.windows;
+      const resets = relevant.flatMap((w) => (w.resetsAtMs === null ? [] : [w.resetsAtMs]));
+      return resets.length === 0 ? null : Math.max(...resets);
+    }
+
+    /** The `sendAt` for a retry: an exponential backoff, never before a reported rate-limit reset. */
+    function wakeRetrySendAt(rateLimits: ProviderRateLimitState | null, attemptNumber: number, at: number): number {
+      const backoff = at + timing.wakeRetryBaseMs * 2 ** Math.max(0, attemptNumber - 1);
+      const reset = wakeRateLimitReset(rateLimits);
+      return reset === null ? backoff : Math.max(backoff, reset);
+    }
+
+    /** The requeue interval a wake set, for the hold's upper bound; a fallback when there is none. */
+    function wakeRequeueMs(b: Binding | null): number {
+      if (b !== null && b.wokeAt !== null && b.requeueAt !== null && b.requeueAt > b.wokeAt) return b.requeueAt - b.wokeAt;
+      return timing.wakeRetryBaseMs * 8;
+    }
+
+    /**
+     * Retry a failed wake the plugin sent, if the failure is retryable and the
+     * attempt cap is not reached. Returns true when a retry was scheduled and
+     * recorded (the retry's own request id is what recognises its later
+     * null-origin failure); false when the caller must give up.
+     */
+    async function retryFailedWake(args: {
+      threadId: string;
+      requestId: string;
+      attemptNumber: number;
+      errorInfo: ProviderErrorInfo | null;
+      rateLimits: ProviderRateLimitState | null;
+      binding: Binding | null;
+      worker: Worker | null;
+    }): Promise<boolean> {
+      if (!retryableWakeFailure(args.errorInfo)) return false;
+      if (args.attemptNumber >= WAKE_RETRY_MAX_ATTEMPTS) return false;
+      const sendAt = wakeRetrySendAt(args.rateLimits, args.attemptNumber, now());
+      let result: { turnRequestId?: string } | null;
+      try {
+        result = (await bb.sdk.threads.retry({ threadId: args.threadId, turnRequestId: args.requestId, sendAt, reason: "Retrying a failed stewards wake" })) as { turnRequestId?: string };
+      } catch (error) {
+        bb.log.warn(`stewards: could not retry ${args.threadId}'s failed wake: ${errorMessage(error)}`);
+        return false;
+      }
+      const retriedId = result?.turnRequestId;
+      if (typeof retriedId !== "string" || retriedId === "") return false;
+      retriedRequests.set(retriedId, args.threadId);
+      if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: retriedId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding) });
+      // A worker the earlier thread.failed marked failed is running again: the
+      // retry stands in for the failure.
+      if (args.worker !== null && args.worker.status === "failed") store.setWorker(args.threadId, "running", args.worker.result);
+      bb.log.info(`stewards: retrying ${args.threadId}'s failed wake (attempt ${args.attemptNumber + 1}) at ${new Date(sendAt).toISOString()}`);
+      return true;
+    }
+
+    /**
+     * The terminal handling of a failed wake the plugin will not retry again.
+     * A steward's binding gets one note naming the failure and the attempts,
+     * the `wake failed:` phrase, and one `stuck` escalation whose text is the
+     * provider error; nothing is woken. A worker keeps the `thread.failed`
+     * path, which marks it failed and wakes the steward. A project steward has
+     * no binding to note or phrase, so the failure is logged.
+     */
+    async function giveUpFailedWake(args: { threadId: string; attemptNumber: number; errorInfo: ProviderErrorInfo | null; binding: Binding | null; worker: Worker | null }): Promise<void> {
+      const reason = describeWakeError(args.errorInfo);
+      clearWakeRetry(args.threadId);
+      if (args.worker !== null) {
+        // The `thread.failed` path, run here so the two handlers cannot race
+        // over the same worker.
+        const worker = store.worker(args.threadId) ?? args.worker;
+        if (!workerInFlight(worker)) return;
+        store.setWorker(args.threadId, "failed", reason);
+        await closeRequesterNeed(args.threadId);
+        store.note(worker.bindingId, `Worker "${worker.title}" failed: ${reason}`);
+        scheduleReconcile(worker.bindingId);
+        return;
+      }
+      if (args.binding === null) {
+        bb.log.warn(`stewards: ${args.threadId}'s wake failed after ${args.attemptNumber} attempt(s): ${reason}`);
+        return;
+      }
+      const b = store.binding(args.binding.id) ?? args.binding;
+      const attempts = `${args.attemptNumber} attempt${args.attemptNumber === 1 ? "" : "s"}`;
+      store.note(b.id, `Wake failed after ${attempts}: ${reason}.`);
+      store.patch(b.id, { wakeFailure: reason, awaitingReport: false });
+      if (!store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
+        store.escalate({
+          bindingId: b.id,
+          kind: "stuck",
+          question: `The steward's wake failed after ${attempts}: ${reason}.`,
+          context: "Every retry the plugin made failed the same way, so the steward could not be woken.",
+          meanwhile: "Waiting: the steward cannot be woken until the provider recovers; a later reconcile will try again.",
+          route: nextRoute(b, null),
+          recommendation: null,
+          projectId: b.projectId,
+          origin: { threadId: args.threadId, bindingId: b.id, chain: [] },
+        });
+      }
     }
 
     /**
@@ -6811,11 +7008,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (b.awaitingReport) {
-        const missed = b.missedReports + 1;
-        store.patch(b.id, { awaitingReport: false, missedReports: missed });
-        bb.log.warn(`stewards: ${b.entityKey}'s turn ended without steward_report (${missed} in a row)`);
-        if (missed >= timing.missedReportsForStuck && !store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
-          await raise(b, "stuck", `The steward ended ${missed} turns in a row without a status report. Look at the thread and say how to continue.`, "Waiting.");
+        // BB-255: while the plugin's own wake is being retried, a turn that
+        // ends without a report is the provider's failure, not the steward's.
+        // The hold lapses on its own (backoff plus one requeue), so a retry
+        // lost to a restart resumes today's counting.
+        const retry = b.wakeRetries[b.threadId ?? ""] ?? null;
+        if (retry !== null && retry.holdUntil > now()) {
+          bb.log.debug(`stewards: ${b.entityKey}'s wake is being retried; not counting a missed report`);
+        } else {
+          const missed = b.missedReports + 1;
+          store.patch(b.id, { awaitingReport: false, missedReports: missed });
+          if (retry !== null) clearWakeRetry(thread.id);
+          bb.log.warn(`stewards: ${b.entityKey}'s turn ended without steward_report (${missed} in a row)`);
+          if (missed >= timing.missedReportsForStuck && !store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
+            await raise(b, "stuck", `The steward ended ${missed} turns in a row without a status report. Look at the thread and say how to continue.`, "Waiting.");
+          }
         }
       }
       // Compaction makes the thread busy; a wake that finds it so waits as notes for the next idle.
@@ -6923,6 +7130,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // its next `thread.idle` records the result and wakes the steward, and
     // the sidebar does not read "hand-off lost" while it works.
     bb.events.on("thread.active", store.coalescingTool(async ({ thread }) => {
+      // BB-255: the retry's turn started, so its `awaitingReport` hold ends; a
+      // later idle counts a missed report as today if the steward still does
+      // not report. The retried request id stays recorded for the null-origin
+      // failure path.
+      const held = bindingForThread(thread.id);
+      const pendingRetry = held === null ? null : (held.wakeRetries[thread.id] ?? null);
+      if (held !== null && pendingRetry !== null && pendingRetry.holdUntil > 0) setWakeRetry(held, thread.id, { ...pendingRetry, holdUntil: 0 });
       const worker = store.worker(thread.id);
       if (worker === null) return;
       const owner = store.binding(worker.bindingId);
@@ -6943,10 +7157,59 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.failed", store.coalescingTool(async ({ thread, error }) => {
       const worker = store.worker(thread.id);
       if (worker === null || !workerInFlight(worker)) return;
+      // BB-255: turn.failed is dispatched right after this event and decides
+      // whether a plugin-sent spawn message is retried. One macrotask lets it
+      // record that decision before the worker is reported failed.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      // A retry being decided (the in-flight set) or already recorded (the
+      // binding's map) wins over this report; the retry's own failure at the
+      // cap marks the worker failed from `giveUpFailedWake`.
+      if (wakeRetryInFlight.has(thread.id)) return;
+      if (bindingForThread(thread.id)?.wakeRetries[thread.id] !== undefined) return;
+      const after = store.worker(thread.id);
+      if (after === null || !workerInFlight(after)) return;
       store.setWorker(thread.id, "failed", error);
       await closeRequesterNeed(thread.id);
-      store.note(worker.bindingId, `Worker "${worker.title}" failed: ${error ?? "no detail"}`);
-      scheduleReconcile(worker.bindingId);
+      store.note(after.bindingId, `Worker "${after.title}" failed: ${error ?? "no detail"}`);
+      scheduleReconcile(after.bindingId);
+    }));
+
+    /**
+     * BB-255: a turn failed. The plugin retries its own failed wake when the
+     * provider's failure is one a retry can fix, and surfaces the failure when
+     * it cannot. `originPluginId` (bb 0.49) names the sender; a retry's own
+     * failure arrives with a null origin, recognised by the request id the
+     * plugin recorded when it scheduled that retry.
+     */
+    bb.events.on("turn.failed", store.coalescingTool(async (event) => {
+      const e = event as {
+        threadId: string;
+        requestId: string;
+        errorInfo: ProviderErrorInfo | null;
+        rateLimits: ProviderRateLimitState | null;
+        attemptNumber: number;
+        originPluginId?: string | null;
+      };
+      const binding = bindingForThread(e.threadId);
+      const worker = store.worker(e.threadId);
+      const project = store.projectByThread(e.threadId);
+      const own = e.originPluginId === bb.pluginId;
+      const retry = binding === null ? null : (binding.wakeRetries[e.threadId] ?? null);
+      const retried = e.originPluginId === null && ((retry !== null && retry.requestId === e.requestId) || retriedRequests.get(e.requestId) === e.threadId);
+      // A foreign or unrecognised null origin is left alone.
+      if (!own && !retried) return;
+      // At most one pending retry per thread: a repeat of the original failure
+      // (or any event but the recorded retry's own) is ignored while one is
+      // pending. A newer wake the plugin sent clears the record (see `send`).
+      if (!retried && (retry !== null || hasRetriedRequest(e.threadId))) return;
+      if (binding === null && project === null) return;
+      wakeRetryInFlight.add(e.threadId);
+      try {
+        const handled = await retryFailedWake({ threadId: e.threadId, requestId: e.requestId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, rateLimits: e.rateLimits, binding, worker });
+        if (!handled) await giveUpFailedWake({ threadId: e.threadId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, binding, worker });
+      } finally {
+        wakeRetryInFlight.delete(e.threadId);
+      }
     }));
 
     // An archived steward is still bound: a wake brings it back, whoever
@@ -7506,6 +7769,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -7607,6 +7871,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -7718,6 +7983,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
@@ -8749,6 +9015,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
+            // BB-255: a report ends any wake failure and drops the steward's
+            // pending retry; a newer wake supersedes it too (see `send`).
+            wakeFailure: null,
+            ...(b.threadId !== null && b.wakeRetries[b.threadId] !== undefined ? { wakeRetries: Object.fromEntries(Object.entries(b.wakeRetries).filter(([id]) => id !== b.threadId)) } : {}),
             ready,
             deployments,
             // A deployment verdict changes a watch: the idle clock starts a new
@@ -8760,6 +9030,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(landedIn === undefined || landedIn === null ? {} : { landedIn: `${landedIn.repo}#${landedIn.number}` }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
+          // BB-255: the report supersedes any retry the plugin had pending.
+          if (b.threadId !== null) forgetRetriedRequests(b.threadId);
           if (noteBeyondMaxWait) {
             store.noteProject(b.projectId, `${b.entityKey} reported a dated wait beyond the playbook's max-wait (${formatDuration(maxWaitMs)}): waiting on ${JSON.stringify(waitingOn ?? "")} until ${iso(untilAt!)}.`);
           }

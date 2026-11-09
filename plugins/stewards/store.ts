@@ -598,7 +598,16 @@ export const ASSUMPTION_MIGRATIONS = [
 // dated wait and nothing noted.
 export const DATED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN requeue_until INTEGER`, `ALTER TABLE bindings ADD COLUMN requeue_until_noted INTEGER`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS];
+// BB-255: a failed wake the plugin is retrying. `wake_retry` is the one
+// pending retry per thread, keyed by thread id: the retry's own turn request
+// id (whose failure arrives with a null `originPluginId`), the attempt number
+// the retry runs as, its `sendAt`, and the moment the `awaitingReport` hold
+// lapses. `wake_failure` is the line-two phrase a wake that could not be
+// delivered leaves (`wake failed: <reason>`). Both additive and defaulted: an
+// old row reads as no retry and no failure.
+export const WAKE_RETRY_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wake_retry TEXT NOT NULL DEFAULT '{}'`, `ALTER TABLE bindings ADD COLUMN wake_failure TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -684,6 +693,24 @@ export const storedStatusRecordSchema = z
  */
 export const observedSchema = z.object({ entity: entitySnapshotSchema, pulls: z.array(entitySnapshotSchema).default([]) });
 export type Observed = z.infer<typeof observedSchema>;
+
+/**
+ * BB-255: the one pending retry for a thread, as `threads.retry` reported it.
+ * `requestId` is the retry's own turn request id, so a later `turn.failed`
+ * whose origin is null can be recognised as the retry's own failure. `holdUntil`
+ * bounds how long the retry suppresses missed-report counting: the retry's turn
+ * starting clears it, and it lapses on its own so a retry lost to a restart
+ * does not suppress counting forever.
+ */
+export const wakeRetrySchema = z.object({
+  requestId: z.string(),
+  attempt: z.number(),
+  sendAt: z.number(),
+  holdUntil: z.number(),
+});
+export type WakeRetry = z.infer<typeof wakeRetrySchema>;
+export const wakeRetriesSchema = z.record(z.string(), wakeRetrySchema);
+export type WakeRetries = z.infer<typeof wakeRetriesSchema>;
 
 /** Why a binding is due a judgment turn, queued until the next wake. */
 /** A reason for the next judgment turn. A quiet one is news for that turn but does not make it due. */
@@ -807,6 +834,10 @@ export type Binding = {
   requeueUntil: number | null;
   /** The `until` last noted to the project steward as beyond `max-wait`, or null (BB-247). */
   requeueUntilNoted: number | null;
+  /** The one pending retry per thread (BB-255), keyed by thread id; empty with none. */
+  wakeRetries: WakeRetries;
+  /** Line two's phrase after a wake could not be delivered: `wake failed: <reason>` (BB-255); null with none. */
+  wakeFailure: string | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -883,6 +914,8 @@ function rowToBinding(r: BindingRow): Binding {
     requeueFirstAt: num("requeue_first_at"),
     requeueUntil: num("requeue_until"),
     requeueUntilNoted: num("requeue_until_noted"),
+    wakeRetries: json(wakeRetriesSchema, str("wake_retry"), {}),
+    wakeFailure: str("wake_failure"),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -950,6 +983,8 @@ const COLUMNS = {
   requeueFirstAt: "requeue_first_at",
   requeueUntil: "requeue_until",
   requeueUntilNoted: "requeue_until_noted",
+  wakeRetries: "wake_retry",
+  wakeFailure: "wake_failure",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -986,6 +1021,8 @@ const VISIBLE_COLUMNS = [
   "no_wake_source",
   // BB-247: a dated wait changes line two's phrase too.
   "requeue_until",
+  // BB-255: a failed wake's phrase is the visible line two.
+  "wake_failure",
 ] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;
 
 function toColumn(value: unknown): unknown {
