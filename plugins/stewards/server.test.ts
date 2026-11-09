@@ -180,6 +180,18 @@ function world() {
       return m === null || path !== `.bb/${m[1]}` ? null : pr.body;
     },
     defaultBranch: async (repo: string) => githubDefaultBranches.get(repo) ?? "main",
+    // The real writer lists a repo's pull requests filtered by head branch
+    // (BB-264); the fake scans the entities the test registered.
+    pullByHead: async (repo: string, head: string) => {
+      for (const e of entities.values()) {
+        if (e.pull === null || e.pull.head !== head) continue;
+        if (e.unit.toLowerCase() !== repo.toLowerCase()) continue;
+        const number = Number(/(\d+)$/u.exec(e.key)?.[1] ?? "");
+        if (!Number.isInteger(number) || number <= 0) continue;
+        return { number, key: e.key, state: e.state, merged: e.pull.merged === true || e.state.toLowerCase() === "merged" };
+      }
+      return null;
+    },
     dispatchWorkflow: async (repo: string, workflow: string, ref: string, inputs: Record<string, string>) => {
       if (mergeDispatchError !== null) throw new Error(mergeDispatchError);
       githubDispatches.push({ repo, workflow, ref, inputs });
@@ -7189,12 +7201,12 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /What changed[\s\S]*merged by the plugin/u.test(s.text))).toBe(true);
   });
 
-  it("does not merge a gate-met stacked pull request; it files the Merge item for a person (BB-257)", async () => {
+  it("does not merge a gate-met pull request on an unknown base branch; it files the Merge item (BB-257)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    // The pull request's base is another pull request's branch, not the repo's
-    // default branch. A person or worker merges it into its parent; the plugin
-    // must not squash it into a branch that may already be merged and dead.
+    // The base is a branch no open or merged pull request is based on (BB-264),
+    // so the plugin cannot tell it is stacked: it must not squash-merge into a
+    // branch that may already be dead, and files the Merge item instead.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     expect(t.githubMerges).toEqual([]);
@@ -7204,14 +7216,77 @@ describe("needs you items", () => {
   it("merges a gate-met pull request once its base is the default branch again", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    // Stacked first: the plugin files the item. Retargeted to `main`: the next
-    // look merges and closes the item through the shared path.
+    // An unknown base first: the plugin files the item. Retargeted to `main`:
+    // the next look merges and closes the item through the shared path.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     expect(t.githubMerges).toEqual([]);
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "main", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     expect(t.githubMerges).toHaveLength(1);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
+  it("holds a gate-met pull request behind an open base pull request and files no Merge item (BB-264)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // The base pull request is open on the branch this pull request is based
+    // on. The plugin must not merge into it and must not file a Merge item;
+    // the effort shows as held behind the base.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base" }, { head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["acme/web#8"]);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Merge held: acme\/web#7 is stacked on acme\/web#8/u.test(s.text))).toBe(true);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /MERGE HOLD: behind acme\/web#8/u.test(s.text))).toBe(true);
+  });
+
+  it("wakes the steward to retarget a gate-met pull request whose base pull request has merged (BB-264)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // GitHub does not retarget the stacked pull request when its base merges
+    // (delete_branch_on_merge is off), so its base is still the merged branch.
+    // The plugin files no Merge item and wakes the steward to retarget.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Retarget acme\/web#7: its base acme\/web#8 has merged/u.test(s.text))).toBe(true);
+  });
+
+  it("treats a gate-met pull request whose base pull request closed unmerged as an ordinary pull request (BB-264)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "closed" }, { merged: false, head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
+    expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
+  });
+
+  it("merges a held stacked pull request once its base merges and it is retargeted (BB-264)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base" }, { head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual(["acme/web#8"]);
+    // The base merges; the stacked pull request is retargeted to main.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "main", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+    expect(t.hooks.store.find("ENG-12")!.mergeBehind).toEqual([]);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
@@ -11799,57 +11874,47 @@ describe("deployment watching (BB-53)", () => {
     expect(wake).toMatch(/evaluated by the plugin/);
   });
 
-  // BB-215: a stacked pull request's own merge is not on the default branch
-  // after a squash, so the ticket reports the base pull request it landed in
-  // and the carries check follows that merge instead.
-  it("follows a stacked pull request's base pull request for the carries check (BB-215)", async () => {
+  // BB-264: `landedIn` is retired. The `landed_in` column stays so an
+  // existing binding still loads; the tolerant reader ignores the stored value
+  // and the watch follows the pull request's own merge.
+  it("ignores a stored landed_in value on an existing binding (BB-264)", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
     t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
-    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked" }));
-    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", head: "feature-base" }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", head: "feature-stacked" }));
     await t.ring("linear", "uuid-12");
-    const steward = t.spawns[1]!.id;
-    // Before the report the watch carries the stacked merge.
-    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ mergeSha: "stacked1" });
-    await t.tool("steward_report", { phase: "In Review", summary: "Stacked PR merged into the base.", nextAction: "Await the base deployment.", actor: "other", landedIn: "acme/web#9" }, steward);
-    await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12")!.landedIn).toBe("acme/web#9");
-    // The watch now carries the base pull request's merge on main.
-    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ mergeSha: "aaaaaaa1" });
-    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
-    await doorbell(t, "acme/bb-gate#7", deployment());
-    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", note: expect.stringMatching(/contains merge aaaaaaa/u) });
+    const b = t.hooks.store.find("ENG-12")!;
+    // A binding written by an older build still carries the retired column.
+    t.hooks.db.prepare("UPDATE bindings SET landed_in = ? WHERE id = ?").run("acme/web#9", b.id);
+    const loaded = t.hooks.store.find("ENG-12")!;
+    expect(loaded).not.toHaveProperty("landedIn");
+    // The watch carries the pull request's own merge, not a base's.
+    expect(loaded.deployments["acme/web#7"]).toMatchObject({ mergeSha: "aaaaaaa1" });
   });
 
-  // BB-259: a `merged` watch judged not-yet against a stacked pull request's
-  // sha, then re-resolved to the base pull request's squash commit while it
-  // already holds the success deployment that pins that commit, must be
-  // re-evaluated in the same reconcile and settle deployed, not time out.
-  it("re-evaluates a re-resolved stacked watch against its existing success deployment (BB-259)", async () => {
+  // BB-259: a `merged` watch judged not-yet against one sha, then re-resolved
+  // to another while it already holds the success deployment that pins that
+  // commit, must be re-evaluated in the same reconcile and settle deployed,
+  // not time out.
+  it("re-evaluates a re-resolved watch against its existing success deployment (BB-259)", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
     t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
     t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked" }));
-    // The base pull request is not merged when the steward reports it, so the
-    // override does not apply and the watch keeps the stacked sha.
-    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: false, base: "main", head: "feature-base" }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { phase: "In Review", summary: "Stacked PR merged into the base.", nextAction: "Await the base deployment.", actor: "other", landedIn: "acme/web#9" }, steward);
-    await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ mergeSha: "stacked1" });
 
-    // A success deployment pins the stacked sha's absence: the carries check
-    // says not-yet and the watch goes back to `merged` holding deployment 7.
+    // A success deployment pins the sha's absence: the carries check says
+    // not-yet and the watch goes back to `merged` holding deployment 7.
     t.sourceCompares.set("acme/bb-gate stacked1 main", "behind");
     await doorbell(t, "acme/bb-gate#7", deployment());
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deploymentId: 7, deploymentState: "success", note: expect.stringMatching(/does not contain merge/u) });
 
-    // The base pull request is now observed merged with squash commit X, and
-    // the same success deployment pins X. The next reconcile re-resolves the
-    // watch and settles it deployed in the same pass.
-    t.entities.set("acme/web#9", pull({ key: "acme/web#9" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", head: "feature-base" }));
+    // A rebase rewrote the merge, so the source now reports a different merge
+    // commit; the same success deployment pins it. The next reconcile
+    // re-resolves the watch and settles it deployed in the same pass.
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", head: "feature-stacked" }));
     t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", mergeSha: "aaaaaaa1", deploymentId: 7, deploymentState: "success", note: expect.stringMatching(/contains merge aaaaaaa/u) });

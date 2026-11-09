@@ -3751,22 +3751,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let deployments = b.deployments;
       if (deployTargets.length > 0) {
         const beforeDeploy = deployments;
-        // BB-215: a stacked pull request whose ticket reported the base pull
-        // request it landed in is carried by the base's merge on the default
-        // branch, because a squash rewrote the stacked merge. Read the base
-        // fresh so the watch re-points as soon as the base merges, and apply
-        // the override only to the pull request that actually merged into the
-        // base branch, never to another merged pull request on the ticket.
-        let landedOverride: ((p: EntitySnapshot) => { mergeSha: string | null; prRepo: string; files: string[] } | null) | undefined;
-        if (b.landedIn !== null) {
-          const base = await snapshot("github", b.landedIn).catch(() => null);
-          if (base !== null && base.pull !== null && base.pull.merged && base.pull.head !== null && base.pull.head !== "") {
-            const baseUnit = base.unit;
-            const baseHead = base.pull.head;
-            const override = { mergeSha: base.pull.mergeCommit ?? null, prRepo: base.unit, files: base.pull.files ?? [] };
-            landedOverride = (p) => (p.unit === baseUnit && p.pull?.base === baseHead ? override : null);
-          }
-        }
         // BB-260: a live-at-merge rule is only live on the default branch, so
         // the record needs to know each merged pull's default branch. Read it
         // only when a target actually has a live rule, and once per repo. A
@@ -3782,7 +3766,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           isDefaultBase = (prRepo, base) => base !== null && branches.get(prRepo) === base;
         }
-        deployments = recordMerged(deployments, observed, deployTargets, now(), landedOverride, isDefaultBase);
+        deployments = recordMerged(deployments, observed, deployTargets, now(), isDefaultBase);
         if (deployments !== beforeDeploy) {
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
           // A reconcile can also only drop a not-applicable watch (BB-132
@@ -4052,6 +4036,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (Object.keys(clear).length > 0) b = store.patch(b.id, clear);
       }
       const approvalEvents = await syncNeeds(b, observed, playbook, workerInFlight, changes);
+      // BB-264: `syncNeeds` records a derived stacked-PR merge hold on the
+      // binding; re-read it so the status below and the wake see the hold.
+      b = store.binding(b.id) ?? b;
       // BB-203: write the status the plugin observed itself, without a steward
       // turn, before the wake, so the page and sidebar are current within one
       // refetch. Checks fold into the phrase; approved, merged and deployed
@@ -6889,6 +6876,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A ticket's other linked pull requests (GitHub cross-references) only
       // mention it and must not file gate items here.
       const ownPulls = b.kind === "ticket" ? await ownPullKeys(b, store.workers(b.id), observed) : null;
+      // BB-264: the steward's own merge holds name open bindings in this
+      // project; the plugin's derived stacked-PR holds are recomputed from the
+      // base pull requests on every look and dropped once the base is no
+      // longer an open pull request.
+      const userMergeBehind = b.mergeBehind.filter((k) => {
+        const target = store.find(k, b.projectId);
+        return target !== null && target.endedAt === null && target.id !== b.id;
+      });
+      const derivedMergeBehind: string[] = [];
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
@@ -6928,7 +6924,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // BB-256: a standing merge hold is not a stuck loop, so the plugin
           // files no Merge item and closes its own if one is open. A
           // steward-filed item (a refused merge) is always left alone.
-          const mergeHeld = b.mergeBehind.length > 0;
+          // BB-264: an open base pull request is the same hold, derived from
+          // the pull request's base rather than reported.
+          const ref = parsePullRef(pull.url ?? pull.key) ?? parsePullRef(url);
+          const base = bindingMayMerge(b, playbook) && ref !== null && !foreignOwner ? await pullBaseDisposition(ref, pull) : null;
+          const openBase = base !== null && base.kind === "open" ? base : null;
+          const mergedBase = base !== null && base.kind === "merged" ? base : null;
+          if (openBase !== null) derivedMergeBehind.push(openBase.key);
+          const mergeHeld = userMergeBehind.length > 0 || openBase !== null;
           if (foreignOwner) {
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) store.closeNeed(open.id, "A teammate's pull request: its author merges after the owner's approval.");
@@ -6936,24 +6939,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) {
               const keys = mergeHoldKeys(b);
-              store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : b.mergeBehind).join(", ")}`);
+              const held = [...userMergeBehind, ...(openBase === null ? [] : [openBase.key])];
+              store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : held).join(", ")}`);
             }
+            if (openBase !== null) {
+              changes.push({ text: `Merge held: ${pull.key} is stacked on ${openBase.key}, which is still open. The plugin files no Merge item; it merges once the base lands and the pull request is retargeted to the default branch.`, actionable: true });
+            }
+          } else if (mergedBase !== null) {
+            // BB-264: GitHub does not retarget a stacked pull request when its
+            // base merges (the branch survives), so the base is the head of a
+            // merged pull request. File no Merge item and wake the steward to
+            // retarget it; the next look sees the default branch and merges.
+            const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
+            if (open !== undefined) store.closeNeed(open.id, `The base ${mergedBase.key} has merged; retarget to the default branch.`);
+            const prRef = ref === null ? pull.key : `${ref.repo}#${ref.number}`;
+            changes.push({ text: `Retarget ${pull.key}: its base ${mergedBase.key} has merged. Retarget it to the default branch (\`gh pr edit ${prRef} --base <default>\`), rebase it onto the default branch (\`git rebase --onto origin/<default> <old base head>\`), and push; the plugin merges it on the next look.`, actionable: true });
           } else if (store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === url && n.filedBy !== "plugin")) {
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
           } else if (!workerInFlight) {
-            const ref = parsePullRef(pull.url ?? pull.key) ?? parsePullRef(url);
             // Pause stewards is the kill switch: while it is on, the plugin
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
-            // BB-257: only the repository's default branch. A stacked pull
-            // request's base is another pull request's branch, which may
-            // already be merged and left dead; the plugin must not squash-merge
-            // into it (that is how #290/#291/#293 were stranded). A stacked
-            // pull request keeps the plugin-filed Merge item and a person or
-            // worker merges it into its parent.
-            if (bindingMayMerge(b, playbook) && ref !== null && !paused && (await pullBaseIsDefault(ref, pull))) {
+            // BB-257: only the repository's default branch is merged by the
+            // plugin. A stacked pull request is held above, so it never
+            // squash-merges into a base branch that may be dead.
+            if (ref !== null && base !== null && base.kind === "default" && !paused) {
               // BB-257: the plugin takes the step the Merge item used to ask a
               // person for. A refusal for this exact gate is recorded on the
               // binding and not retried until the head or a gate input changes.
@@ -6995,6 +7007,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
         }
+      }
+      // BB-264: keep the derived stacked-PR holds in `mergeBehind` so the wake
+      // and the sidebar show them like a reported hold, and drop one the look
+      // no longer derives (the base landed, closed, or was retargeted).
+      const nextMergeBehind = [...new Set([...userMergeBehind, ...derivedMergeBehind])];
+      if (nextMergeBehind.length !== b.mergeBehind.length || nextMergeBehind.some((k, i) => k !== b.mergeBehind[i])) {
+        b = store.patch(b.id, { mergeBehind: nextMergeBehind });
       }
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
       // BB-231: a gate item filed this look may cover an open route-`user`
@@ -7884,21 +7903,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return /failed: 409\b/u.test(message) || /Head branch was modified/iu.test(message);
     }
 
+    /** Where a pull request's base branch points, for the stacked-PR hold (BB-264). */
+    type BaseDisposition =
+      | { kind: "default" }
+      | { kind: "open"; key: string }
+      | { kind: "merged"; key: string }
+      | { kind: "other" };
+
     /**
-     * Whether a pull request targets its repository's default branch
-     * (BB-257). A stacked pull request's base is another pull request's
-     * branch, which may already be merged and dead; the plugin must not
-     * auto-merge into it, because the change would be off the default branch
-     * with no one involved. A stacked pull request keeps the plugin-filed
-     * Merge item and a person or worker merges it into its parent. A read of
-     * the default branch that fails is not the default (fail closed), so the
-     * item is filed.
+     * Where a pull request's base branch points (BB-264). The default branch
+     * merges through BB-257; the head branch of another open pull request is a
+     * merge hold behind that pull request; the head branch of a merged pull
+     * request means the stacked pull request must be retargeted to the default
+     * branch (GitHub does not retarget it here); a closed or unknown branch is
+     * an ordinary pull request. A read of the default branch that fails is not
+     * the default (fail closed), so a Merge item is filed.
      */
-    async function pullBaseIsDefault(ref: { repo: string; number: number }, pull: EntitySnapshot): Promise<boolean> {
+    async function pullBaseDisposition(ref: { repo: string; number: number }, pull: EntitySnapshot): Promise<BaseDisposition> {
       const base = pull.pull?.base ?? null;
-      if (base === null || base === "") return false;
+      if (base === null || base === "") return { kind: "other" };
       const def = await github.defaultBranch(ref.repo).catch(() => null);
-      return def !== null && def === base;
+      if (def !== null && def === base) return { kind: "default" };
+      const basePull = await github.pullByHead(ref.repo, base).catch(() => null);
+      if (basePull === null) return { kind: "other" };
+      if (basePull.merged) return { kind: "merged", key: basePull.key };
+      if (lc(basePull.state) === "open") return { kind: "open", key: basePull.key };
+      return { kind: "other" };
     }
 
     /**
@@ -9036,13 +9066,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(500)
           .optional()
           .describe('Pull-request stewards: the open pull request that replaces this one (owner/repo#N or its URL), opened on its own branch when this one could not merge as is. The binding moves to it: the gate, the Merge item and every later wake are about the replacement, and this pull request is closed by whoever opened the replacement. Report it once, as soon as the replacement is open.'),
-        landedIn: z
-          .string()
-          .trim()
-          .min(1)
-          .max(500)
-          .optional()
-          .describe('Ticket stewards: the base pull request (owner/repo#N or its URL) a stacked pull request landed in, when its own merge went into that pull request\'s branch rather than the default branch. The deployment carries-check then follows the base pull request\'s merge on the default branch, because a squash rewrote the stacked merge. Report it once the stacked pull request has merged into the base branch.'),
         mergeBehind: z
           .array(z.string().trim().min(1).max(100))
           .max(20)
@@ -9153,10 +9176,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             replacedNote = ` ${moved.binding.entityKey} replaces ${b.entityKey}: the gate, the Merge item and your wakes now follow it.`;
             b = moved.binding;
           }
-          // A stacked pull request that landed in a base pull request names it
-          // so the deployment carries-check follows that merge (BB-215).
-          const landedIn = input.landedIn === undefined ? undefined : parsePullRef(input.landedIn);
-          if (input.landedIn !== undefined && landedIn === null) return toolError(new Error(`landedIn must name a pull request as owner/repo#N or its URL; ${JSON.stringify(input.landedIn)} does not.`));
           // BB-256: a merge hold names open bindings in this project, validated
           // the way steward_update's `behind` is: an unknown or ended key, or
           // the binding itself, is refused whole. Each report replaces the set,
@@ -9391,7 +9410,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
             ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
             ...(mergeBehind === undefined ? {} : { mergeBehind }),
-            ...(landedIn === undefined || landedIn === null ? {} : { landedIn: `${landedIn.repo}#${landedIn.number}` }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
           // BB-255: the report supersedes any retry the plugin had pending,

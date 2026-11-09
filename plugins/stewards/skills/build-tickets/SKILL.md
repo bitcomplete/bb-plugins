@@ -100,19 +100,19 @@ the default branch:
 - Keep your own lane gate. The reviewer's verdict and, on an owner-reviewed
   change, the owner's approval are for your pull request; the base pull
   request's approval is not yours and never counts for it.
-- When your own review approves and your checks are green, merge your pull
-  request into the base branch — not into the default branch — with
-  `bb stewards merge <owner/repo#N>` on your own gate. The base pull request
-  then lands on the default branch as one landing.
+- **Wait for the base pull request to merge into the default branch.** While
+  it is open the plugin files no Merge item for yours: it is held behind the
+  base pull request, and the steward is woken with that hold. Do not merge
+  yours into the base branch, and do not merge the base pull request.
+- When the base pull request merges, retarget yours to the default branch
+  (`gh pr edit <n> --base <default>`), rebase it onto the default branch with
+  `git rebase --onto origin/<default> <old base head>` (the squash rewrote the
+  base's commits), resolve any conflicts, and push. The plugin then merges
+  yours through the normal gate; your reviewer's verdict and the owner's
+  approval carry across the rebase.
 - If the base pull request closes without merging, retarget yours to the
   default branch (`gh pr edit <n> --base <default>`, rebasing or merging the
   default branch as needed) and carry on as an ordinary pull request.
-- When your stacked pull request merges into the base branch, say in your
-  final message that it landed in the base pull request
-  (`owner/repo#<base>`). A squash rewrote your merge, so it is not an ancestor
-  of the default branch; the steward reports it with
-  `steward_report { landedIn: "owner/repo#<base>" }` so the deployment
-  carries-check follows the base pull request's merge on the default branch.
 
 ## Test
 

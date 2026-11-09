@@ -504,9 +504,10 @@ export const SERVER_SETTINGS_MIGRATIONS = [
 export const PULL_WATCH_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN adopted_by TEXT`];
 
 // Stack scheduling (BB-215): the open bindings whose pull request this hold
-// waits for (a stack-wait; `hold_behind` waits for a merge or an end), and
-// the base pull request a stacked pull request landed in, so the deployment
-// carries-check follows that merge on the default branch.
+// waits for (a stack-wait; `hold_behind` waits for a merge or an end). The
+// `landed_in` column the same group adds is retired (BB-264) but kept: a
+// tolerant reader ignores a value an existing binding already recorded, so no
+// destructive migration is needed.
 //
 // The SDK records each migration's hash by index and refuses to start the
 // plugin when an index no longer matches, so a new group goes at the END of
@@ -787,8 +788,6 @@ export type Binding = {
   mergeBehind: string[];
   /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
   holdStack: string[];
-  /** The base pull request a stacked pull request landed in (owner/repo#N, BB-215): the deployment carries-check follows its merge on the default branch, since a squash rewrote the stacked merge. Null when the work did not stack. */
-  landedIn: string | null;
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
   scheduleAsked: string[];
   /** The gate has passed and nothing holds or schedules it: it is starting, whatever Linear still says, so others schedule against it. */
@@ -896,7 +895,6 @@ function rowToBinding(r: BindingRow): Binding {
     holdBehind: json(z.array(z.string()), str("hold_behind"), []),
     mergeBehind: json(z.array(z.string()), str("merge_behind"), []),
     holdStack: json(z.array(z.string()), str("hold_stack"), []),
-    landedIn: str("landed_in"),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
@@ -966,7 +964,6 @@ const COLUMNS = {
   holdBehind: "hold_behind",
   mergeBehind: "merge_behind",
   holdStack: "hold_stack",
-  landedIn: "landed_in",
   scheduleAsked: "schedule_asked",
   clearedToStart: "cleared_to_start",
   modelSteward: "model_steward",

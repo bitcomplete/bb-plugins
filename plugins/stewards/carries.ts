@@ -170,7 +170,7 @@ export async function evaluateCarries(target: DeploymentTarget, context: Carries
   // only settle a watch whose merge is already on the default branch. Require
   // the deployment's ref to contain the merge, exactly as ref-contains-merge
   // does: a stacked pull request's squash merge is not on main, so it stays
-  // not-yet until the BB-215 override re-points the watch. The record path
+  // not-yet until it reaches the default branch. The record path
   // (`liveAtMergeVerdict`) settles a normal merge at merge time, so this read
   // only runs for a watch left awaiting a deployment.
   if (rule.strategy.kind === "live-at-merge") {

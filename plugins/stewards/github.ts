@@ -105,6 +105,13 @@ export interface GithubWriter {
   dispatchWorkflow(repo: string, workflow: string, ref: string, inputs: Record<string, string>): Promise<void>;
   /** A repository's default branch, for the base of a lesson's pull request (BB-108). */
   defaultBranch(repo: string): Promise<string | null>;
+  /**
+   * The newest pull request in `repo` whose head branch is `head`, across
+   * every state, or null when none is visible. A stacked pull request's base
+   * names the branch of the pull request it is stacked on; the plugin reads
+   * this to tell an open base (a merge hold) from a merged one (a retarget).
+   */
+  pullByHead(repo: string, head: string): Promise<{ number: number; key: string; state: string; merged: boolean } | null>;
   /** Open a pull request and return its URL and number (BB-108). */
   createPull(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
   /** Close a pull request without merging it (BB-108 Drop). */
@@ -184,6 +191,24 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       const response = await request("GET", `/repos/${repo}`, undefined);
       const body = (await response.json().catch(() => null)) as { default_branch?: unknown } | null;
       return typeof body?.default_branch === "string" && body.default_branch !== "" ? body.default_branch : null;
+    },
+    async pullByHead(repo, head) {
+      // GitHub's `head` filter is `user:ref-name` and only matches same-repo
+      // pull requests when `user` is the repository owner. The list is newest
+      // first; the first match is the pull request the base branch belongs to.
+      const owner = repo.split("/")[0] ?? "";
+      const query = `head=${encodeURIComponent(`${owner}:${head}`)}&state=all&sort=created&direction=desc&per_page=100`;
+      const response = await request("GET", `/repos/${repo}/pulls?${query}`, undefined);
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (!Array.isArray(body)) return null;
+      for (const item of body) {
+        if (item === null || typeof item !== "object") continue;
+        const pr = item as { number?: unknown; state?: unknown; merged_at?: unknown; head?: { ref?: unknown } };
+        if (typeof pr.number !== "number") continue;
+        if (typeof pr.head?.ref === "string" && pr.head.ref !== head) continue;
+        return { number: pr.number, key: `${repo}#${pr.number}`, state: typeof pr.state === "string" ? pr.state : "", merged: pr.merged_at !== null && pr.merged_at !== undefined };
+      }
+      return null;
     },
     async dispatchWorkflow(repo, workflow, ref, inputs) {
       await request("POST", `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, { ref, inputs });

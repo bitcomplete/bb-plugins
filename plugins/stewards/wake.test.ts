@@ -391,7 +391,8 @@ describe("the nightly prompt", () => {
     expect(rules).toMatch(/targets the default branch/u);
     expect(rules).toMatch(/a ticket binding always does/u);
     expect(rules).toMatch(/`may` includes `merge`/u);
-    expect(rules).toMatch(/stacked pull request/u);
+    expect(rules).toMatch(/a stacked pull request is held behind its base pull request until that merges/u);
+    expect(rules).toMatch(/retargeted to the default branch and rebased/u);
     expect(rules).toMatch(/Do not file a Merge item/u);
   });
 

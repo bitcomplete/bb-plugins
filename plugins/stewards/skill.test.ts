@@ -61,3 +61,27 @@ describe("the shipped stewards skill's GitHub child filing (BB-250)", () => {
     expect(stewardsSkill).toContain("-F sub_issue_id=");
   });
 });
+
+// BB-264: a stack merges bottom-up, and the rule lives in the shipped skills
+// rather than in each project's `.bb`.
+const buildTicketsSkill = readFileSync(fileURLToPath(new URL("./skills/build-tickets/SKILL.md", import.meta.url)), "utf8");
+
+describe("the shipped skills' stacked-PR rule (BB-264)", () => {
+  it("build-tickets waits for the base, then retargets and rebases --onto before the normal gate", () => {
+    expect(buildTicketsSkill).toContain("Wait for the base pull request to merge into the default branch");
+    expect(buildTicketsSkill).toContain("gh pr edit <n> --base <default>");
+    expect(buildTicketsSkill).toContain("git rebase --onto origin/<default> <old base head>");
+    expect(buildTicketsSkill).toContain("approval carry across the rebase");
+    // The retired `landedIn` instruction is gone.
+    expect(buildTicketsSkill).not.toContain("landedIn");
+  });
+
+  it("stewards has the ticket steward report mergeBehind and the project steward's bottom-up note", () => {
+    expect(stewardsSkill).toContain("A stacked pull request merges bottom-up");
+    expect(stewardsSkill).toContain('steward_report { mergeBehind: ["owner/repo#<base>"] }');
+    expect(stewardsSkill).toContain("rebase it onto the default branch");
+    expect(stewardsSkill).toContain("--onto origin/<default> <old base head>");
+    expect(stewardsSkill).toContain("A stack resolves bottom-up");
+    expect(stewardsSkill).toContain("Never answer a schedule escalation by telling a stacked ticket");
+  });
+});
