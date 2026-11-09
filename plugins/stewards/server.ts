@@ -2299,6 +2299,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const sources: WakeSourceInput = {
         hold: b.hold,
         holdBehind: b.holdBehind,
+        mergeBehind: b.mergeBehind,
         holdStack: b.holdStack,
         deployments: b.deployments,
         runningWorkers: store.workers(b.id).filter((w) => w.status === "running").length,
@@ -2307,6 +2308,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         pullRequestWatch: pullWatch(b),
       };
       return hasLiveWakeSource(sources);
+    }
+
+    /**
+     * The entity keys a binding's merge hold still waits on (BB-256): every
+     * named binding that has not yet merged its pull requests or ended. Used
+     * for the "held behind" close text; the hold itself stands while
+     * `mergeBehind` is non-empty, and the reconcile pass clears it once every
+     * target is finished.
+     */
+    function mergeHoldKeys(b: Binding): string[] {
+      return b.mergeBehind.filter((k) => {
+        const target = store.find(k, b.projectId);
+        return target === null || target.lastSnapshot === null || !finished(target, target.lastSnapshot);
+      });
     }
 
     /**
@@ -3921,6 +3936,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const targets = b.holdBehind.map((k) => store.find(k, projectId)).filter((t): t is Binding => t !== null);
         if (targets.length === b.holdBehind.length && targets.every((t) => t.lastSnapshot !== null && finished(t, t.lastSnapshot))) {
           for (const t of targets) await releaseBehind(t, howFinished(t));
+          b = store.binding(b.id) ?? b;
+        }
+      }
+      // BB-256: a merge hold is level-triggered the same way, so a hold placed
+      // after its targets finished lifts on this look rather than waiting for
+      // an edge that has already passed. Every target must satisfy `finished`;
+      // the release goes through releaseMergeBehind, so the wake and the note
+      // are the same as any other lift.
+      if (b.mergeBehind.length > 0) {
+        const projectId = b.projectId;
+        const targets = b.mergeBehind.map((k) => store.find(k, projectId)).filter((t): t is Binding => t !== null);
+        if (targets.length === b.mergeBehind.length && targets.every((t) => t.lastSnapshot !== null && finished(t, t.lastSnapshot))) {
+          for (const t of targets) await releaseMergeBehind(t, howFinished(t));
           b = store.binding(b.id) ?? b;
         }
       }
@@ -6303,6 +6331,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The work a merge hold waits on has landed (BB-256): take `b`'s key off
+     * every merge hold that names it, and where nothing is left to wait for,
+     * clear the hold, note it on the held binding and wake its steward. The
+     * next look files the Merge item again if the pull request is still open
+     * with its gate met, so a stuck loop still surfaces.
+     */
+    async function releaseMergeBehind(b: Binding, how: string): Promise<void> {
+      const key = lc(b.entityKey);
+      const waiting = store.open(b.projectId).filter((h) => h.id !== b.id && h.mergeBehind.some((k) => lc(k) === key));
+      if (waiting.length === 0) return;
+      for (const h of waiting) {
+        const rest = h.mergeBehind.filter((k) => lc(k) !== key);
+        if (rest.length > 0) {
+          store.patch(h.id, { mergeBehind: rest });
+          store.note(h.id, `${b.entityKey} ${how}; your merge hold stays until ${rest.join(", ")} ${rest.length === 1 ? "does" : "do"} too.`, true);
+          continue;
+        }
+        store.patch(h.id, { mergeBehind: [] });
+        store.note(h.id, `Merge hold lifted: ${b.entityKey}, which it waited behind, ${how}. The plugin files the Merge item again on the next look if the pull request is still open with its gate met.`);
+        scheduleReconcile(h.id);
+      }
+      bb.log.info(`stewards: ${b.entityKey} ${how}; released the merge hold on ${waiting.map((h) => h.entityKey).join(", ")}`);
+    }
+
+    /**
      * The work `b` was holding others behind has landed (`how`: its pull
      * requests merged, or it ended): take it off every hold that waits behind
      * it, lift the holds with nothing left to wait for, wake those stewards,
@@ -6313,6 +6366,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A stack-wait on this binding lifts on the same endings: the work it
       // waited to stack on will not open a pull request now.
       await releaseStack(b, b.lastSnapshot, how);
+      // A merge hold on this binding lifts on the same endings (BB-256).
+      await releaseMergeBehind(b, how);
       const key = lc(b.entityKey);
       const waiting = store.open(b.projectId).filter((h) => h.id !== b.id && h.holdBehind.some((k) => lc(k) === key));
       if (waiting.length === 0) return;
@@ -6726,9 +6781,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (g.gateMet) {
           // A steward's own merge item (a refused merge) is left alone while a
           // worker still runs; the plugin files its own only when none does.
+          // BB-256: a standing merge hold is not a stuck loop, so the plugin
+          // files no Merge item and closes its own if one is open. A
+          // steward-filed item (a refused merge) is always left alone.
+          const mergeHeld = b.mergeBehind.length > 0;
           if (foreignOwner) {
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) store.closeNeed(open.id, "A teammate's pull request: its author merges after the owner's approval.");
+          } else if (mergeHeld) {
+            const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
+            if (open !== undefined) {
+              const keys = mergeHoldKeys(b);
+              store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : b.mergeBehind).join(", ")}`);
+            }
           } else if (!workerInFlight) {
             store.fileNeed({
               bindingId: b.id,
@@ -7780,8 +7845,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               noWakeSource: b.noWakeSource,
               wakeFailure: b.wakeFailure,
               priority: b.priority,
-              hold: b.hold,
-              holdBehind: b.holdBehind,
+              ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
@@ -7882,8 +7946,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               noWakeSource: b.noWakeSource,
               wakeFailure: b.wakeFailure,
               priority: b.priority,
-              hold: b.hold,
-              holdBehind: b.holdBehind,
+              ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
@@ -7987,8 +8050,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // child stays top-level (the client decides from the tab's own
               // list).
               parentKey: b.parentBindingId === null ? null : (store.binding(b.parentBindingId)?.entityKey ?? null),
-              hold: b.hold,
-              holdBehind: b.holdBehind,
+              ...presentationHold(b),
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
@@ -8709,6 +8771,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(500)
           .optional()
           .describe('Ticket stewards: the base pull request (owner/repo#N or its URL) a stacked pull request landed in, when its own merge went into that pull request\'s branch rather than the default branch. The deployment carries-check then follows the base pull request\'s merge on the default branch, because a squash rewrote the stacked merge. Report it once the stacked pull request has merged into the base branch.'),
+        mergeBehind: z
+          .array(z.string().trim().min(1).max(100))
+          .max(20)
+          .optional()
+          .describe('A merge hold: entity keys of open bindings in this project whose work must finish before this binding\'s pull request is merged, like steward_update\'s behind. While it stands the plugin files no Merge item (so the page does not read as "needs you"), the binding shows as held, and it is a live wake source. Report it when a spec says "do not merge before X is Done"; the hold lifts itself, and you are woken, once every named binding has merged its pull requests or ended. Each report replaces the set; `mergeBehind: []` clears it.'),
         needs: z
           .array(
             z.object({
@@ -8818,6 +8885,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // so the deployment carries-check follows that merge (BB-215).
           const landedIn = input.landedIn === undefined ? undefined : parsePullRef(input.landedIn);
           if (input.landedIn !== undefined && landedIn === null) return toolError(new Error(`landedIn must name a pull request as owner/repo#N or its URL; ${JSON.stringify(input.landedIn)} does not.`));
+          // BB-256: a merge hold names open bindings in this project, validated
+          // the way steward_update's `behind` is: an unknown or ended key, or
+          // the binding itself, is refused whole. Each report replaces the set,
+          // and `mergeBehind: []` clears it.
+          let mergeBehind: string[] | undefined;
+          if (input.mergeBehind !== undefined) {
+            const missing: string[] = [];
+            const named: Binding[] = [];
+            for (const k of input.mergeBehind) {
+              const other = store.find(k, b.projectId);
+              if (other === null || other.endedAt !== null || other.id === b.id) missing.push(k);
+              else if (!named.some((x) => x.id === other.id)) named.push(other);
+            }
+            if (missing.length > 0) return toolError(new Error(`Not an open binding in this project to hold the merge behind: ${missing.join(", ")}.`));
+            mergeBehind = named.map((x) => x.entityKey);
+          }
           // BB-231: a free-form escalation must say how it differs from every
           // open user-facing item on the binding, or it can duplicate the
           // plugin's gate item. The pairwise judgement is forced here; no
@@ -9036,6 +9119,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
             ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
+            ...(mergeBehind === undefined ? {} : { mergeBehind }),
             ...(landedIn === undefined || landedIn === null ? {} : { landedIn: `${landedIn.repo}#${landedIn.number}` }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
@@ -9147,7 +9231,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               bindingId: b.id,
               kind: "stall",
               question: `${b.entityKey} has woken by requeue ${count} time${count === 1 ? "" : "s"} with the same wait (${JSON.stringify(waitText)}), first reported ${iso(firstAt)}, and nothing the plugin tracks will deliver it.`,
-              context: `The steward's waitingOn is free text and no structured source is live on the binding: no open holdBehind, no deployment watch in merged/deploying, no running worker, no open escalation or need, no pull-request watch. It will keep waking by requeue alone.`,
+              context: `The steward's waitingOn is free text and no structured source is live on the binding: no open holdBehind, no merge hold, no deployment watch in merged/deploying, no running worker, no open escalation or need, no pull-request watch. It will keep waking by requeue alone.`,
               meanwhile: "Waiting: the steward keeps reporting the same wait and is woken only by another requeue.",
               route: "project",
               recommendation: null,
@@ -10030,6 +10114,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     const rolesForBinding = (roleMap: Map<string, string[]>, b: Binding): string[] => roleMap.get(b.entityId) ?? (b.adoptedBy === null ? [] : roleMap.get(b.adoptedBy)) ?? [];
 
+    /**
+     * The hold a row shows for a binding (BB-256): its start hold, or, when it
+     * has none but a merge hold stands, a merge hold behind the same keys. A
+     * merge hold ranks the effort as held (the existing hold tier) with the
+     * steward's `waitingOn` text rather than filing a Merge item, so the page
+     * does not read as "needs you". The stored field drives the plugin; this is
+     * presentation only.
+     */
+    function presentationHold(b: Binding): { hold: string | null; holdBehind: string[] } {
+      if (b.hold !== null) return { hold: b.hold, holdBehind: b.holdBehind };
+      if (b.mergeBehind.length > 0) return { hold: b.status?.waitingOn ?? "merge hold", holdBehind: b.mergeBehind };
+      return { hold: null, holdBehind: [] };
+    }
+
     /** `rolesFor` names the role(s) whose definition owns a binding's target, for `bb stewards list` (BB-163). */
     function formatBindings(rows: Binding[], rolesFor?: (b: Binding) => string[]): string {
       if (rows.length === 0) return "No bindings.";
@@ -10051,7 +10149,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   ? `cannot read the target: ${sentry.error}`
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
