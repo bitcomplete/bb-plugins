@@ -20,7 +20,7 @@ const reviews = (() => {
 const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerInFlight: false };
 const actionable = (cs: Array<{ text: string; actionable: boolean }>) => cs.filter((c) => c.actionable).map((c) => c.text);
 
-const LABEL_PHASE = '\n  "label:goal:awaiting-outcome": { stage: build, stuck: 120d }';
+const LABEL_PHASE = '\n  "label:initiative:awaiting-outcome": { stage: build, stuck: 120d }';
 const labelledTickets = (() => {
   const p = parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", `  In Progress: { stage: build, stuck: 2d }${LABEL_PHASE}`), "linear-tickets");
   if (!p.ok) throw new Error(p.error);
@@ -34,23 +34,23 @@ const labelledGithubIssues = (() => {
 
 describe("phaseAndStage keys a phase on a present label (BB-248)", () => {
   it("selects a matching label phase ahead of the state, on Linear", () => {
-    expect(phaseAndStage(labelledTickets, "In Progress", ["bb-managed", "goal:awaiting-outcome"])).toEqual({ phase: "label:goal:awaiting-outcome", stage: "build" });
+    expect(phaseAndStage(labelledTickets, "In Progress", ["bb-managed", "initiative:awaiting-outcome"])).toEqual({ phase: "label:initiative:awaiting-outcome", stage: "build" });
     // The label match ignores case.
-    expect(phaseAndStage(labelledTickets, "In Progress", ["Goal:Awaiting-Outcome"])).toEqual({ phase: "label:goal:awaiting-outcome", stage: "build" });
+    expect(phaseAndStage(labelledTickets, "In Progress", ["Initiative:Awaiting-Outcome"])).toEqual({ phase: "label:initiative:awaiting-outcome", stage: "build" });
     // No such label, or no labels at all: the state decides, as today.
     expect(phaseAndStage(labelledTickets, "In Progress", ["bb-managed"])).toEqual({ phase: "In Progress", stage: "build" });
     expect(phaseAndStage(labelledTickets, "In Progress")).toEqual({ phase: "In Progress", stage: "build" });
   });
 
   it("selects it on a GitHub entity too, over the synthesised status state", () => {
-    expect(phaseAndStage(labelledGithubIssues, "status:in-progress", ["bb-managed", "goal:awaiting-outcome"])).toEqual({ phase: "label:goal:awaiting-outcome", stage: "build" });
+    expect(phaseAndStage(labelledGithubIssues, "status:in-progress", ["bb-managed", "initiative:awaiting-outcome"])).toEqual({ phase: "label:initiative:awaiting-outcome", stage: "build" });
     // A present status label is still a state, and decides when no label phase matches.
     expect(phaseAndStage(labelledGithubIssues, "status:in-progress", ["bb-managed", "status:in-progress"])).toEqual({ phase: "status:in-progress", stage: "build" });
   });
 
   it("resolves the stored label phase for stuckDue", () => {
-    expect(phaseAndStage(labelledTickets, "In Progress", ["goal:awaiting-outcome"]).phase).toBe("label:goal:awaiting-outcome");
-    expect(stuckDue({ advancedAt: 1_000, createdAt: 0, phase: "label:goal:awaiting-outcome" }, labelledTickets, [], 1_000 + 120 * 86_400_000)).toBe(120 * 86_400_000);
+    expect(phaseAndStage(labelledTickets, "In Progress", ["initiative:awaiting-outcome"]).phase).toBe("label:initiative:awaiting-outcome");
+    expect(stuckDue({ advancedAt: 1_000, createdAt: 0, phase: "label:initiative:awaiting-outcome" }, labelledTickets, [], 1_000 + 120 * 86_400_000)).toBe(120 * 86_400_000);
   });
 });
 
@@ -503,29 +503,29 @@ describe("lifecycle", () => {
   });
 });
 
-// BB-243: a goal is a ticket routed to the `goal` playbook. All three endings
-// (reached, superseded, retired) are the goal closing; a child's merge is not
-// one, so the binding carries on. The fixture is a fake goal, never the pilot's.
-describe("goal endings (BB-243)", () => {
-  const goal = (() => {
-    const p = parsePlaybook(GITHUB_ISSUES.replace("name: github-issues", "name: goal").replace("approval: project", "approval: user"), "goal");
+// BB-243: an initiative is a ticket routed to the `initiative` playbook. All three endings
+// (reached, superseded, retired) are the initiative closing; a child's merge is not
+// one, so the binding carries on. The fixture is a fake initiative, never the pilot's.
+describe("initiative endings (BB-243)", () => {
+  const initiative = (() => {
+    const p = parsePlaybook(GITHUB_ISSUES.replace("name: github-issues", "name: initiative").replace("approval: project", "approval: user"), "initiative");
     if (!p.ok) throw new Error(p.error);
     return p.value;
   })();
   const open = { kind: "ticket" as const, endedAt: null, endReason: null, manualDetach: false, ending: null };
 
-  it("ends the binding when the goal is reached, superseded or retired, and never on a child merge", () => {
+  it("ends the binding when the initiative is reached, superseded or retired, and never on a child merge", () => {
     // Reached: every criterion met, the owner closes it as completed.
-    expect(lifecycle(open, goal, issue({ state: "closed (completed)" }), "bb-managed").kind).toBe("terminal");
+    expect(lifecycle(open, initiative, issue({ state: "closed (completed)" }), "bb-managed").kind).toBe("terminal");
     // Retired: the owner closes it as not planned.
-    expect(lifecycle(open, goal, issue({ state: "closed (not planned)" }), "bb-managed").kind).toBe("terminal");
-    // Superseded: a successor is filed and this goal is closed with a Revision comment.
-    const superseded = issue({ state: "closed", comments: [comment({ id: "r1", author: "Jane", body: "**Revision:** superseded by Goal: file the 2027 claim." })] });
-    expect(lifecycle(open, goal, superseded, "bb-managed").kind).toBe("terminal");
-    // A child merging does not close the goal, so the binding carries on.
-    expect(lifecycle(open, goal, issue({ state: "status:in-progress" }), "bb-managed").kind).toBe("continue");
-    // An ended goal stays ended while it is closed, whatever an earlier digest said.
-    expect(lifecycle({ ...open, endedAt: 1, endReason: "terminal" }, goal, issue({ state: "closed" }), "bb-managed").kind).toBe("stay-ended");
+    expect(lifecycle(open, initiative, issue({ state: "closed (not planned)" }), "bb-managed").kind).toBe("terminal");
+    // Superseded: a successor is filed and this initiative is closed with a Revision comment.
+    const superseded = issue({ state: "closed", comments: [comment({ id: "r1", author: "Jane", body: "**Revision:** superseded by Initiative: file the 2027 claim." })] });
+    expect(lifecycle(open, initiative, superseded, "bb-managed").kind).toBe("terminal");
+    // A child merging does not close the initiative, so the binding carries on.
+    expect(lifecycle(open, initiative, issue({ state: "status:in-progress" }), "bb-managed").kind).toBe("continue");
+    // An ended initiative stays ended while it is closed, whatever an earlier digest said.
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "terminal" }, initiative, issue({ state: "closed" }), "bb-managed").kind).toBe("stay-ended");
   });
 });
 
