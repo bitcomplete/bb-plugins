@@ -7162,6 +7162,32 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /What changed[\s\S]*merged by the plugin/u.test(s.text))).toBe(true);
   });
 
+  it("does not merge a gate-met stacked pull request; it files the Merge item for a person (BB-257)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // The pull request's base is another pull request's branch, not the repo's
+    // default branch. A person or worker merges it into its parent; the plugin
+    // must not squash it into a branch that may already be merged and dead.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
+  });
+
+  it("merges a gate-met pull request once its base is the default branch again", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // Stacked first: the plugin files the item. Retargeted to `main`: the next
+    // look merges and closes the item through the shared path.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { base: "main", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
   it("does not merge while a worker is still running", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));

@@ -6897,7 +6897,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // Pause stewards is the kill switch: while it is on, the plugin
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
-            if (bindingMayMerge(b, playbook) && ref !== null && !paused) {
+            // BB-257: only the repository's default branch. A stacked pull
+            // request's base is another pull request's branch, which may
+            // already be merged and left dead; the plugin must not squash-merge
+            // into it (that is how #290/#291/#293 were stranded). A stacked
+            // pull request keeps the plugin-filed Merge item and a person or
+            // worker merges it into its parent.
+            if (bindingMayMerge(b, playbook) && ref !== null && !paused && (await pullBaseIsDefault(ref, pull))) {
               // BB-257: the plugin takes the step the Merge item used to ask a
               // person for. A refusal for this exact gate is recorded on the
               // binding and not retried until the head or a gate input changes.
@@ -7826,6 +7832,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // URL path carries its number, so PR #409 would otherwise be read as a
       // head-moved refusal and silently retried on every look (BB-257).
       return /failed: 409\b/u.test(message) || /Head branch was modified/iu.test(message);
+    }
+
+    /**
+     * Whether a pull request targets its repository's default branch
+     * (BB-257). A stacked pull request's base is another pull request's
+     * branch, which may already be merged and dead; the plugin must not
+     * auto-merge into it, because the change would be off the default branch
+     * with no one involved. A stacked pull request keeps the plugin-filed
+     * Merge item and a person or worker merges it into its parent. A read of
+     * the default branch that fails is not the default (fail closed), so the
+     * item is filed.
+     */
+    async function pullBaseIsDefault(ref: { repo: string; number: number }, pull: EntitySnapshot): Promise<boolean> {
+      const base = pull.pull?.base ?? null;
+      if (base === null || base === "") return false;
+      const def = await github.defaultBranch(ref.repo).catch(() => null);
+      return def !== null && def === base;
     }
 
     /**
