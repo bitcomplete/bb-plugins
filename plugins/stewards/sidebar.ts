@@ -32,6 +32,8 @@ export interface SidebarBinding {
   waitingUntil: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
+  /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
+  wakeFailure: string | null;
   needsUser: boolean;
   /** An open `stuck` escalation (BB-76). */
   stuck: boolean;
@@ -128,6 +130,8 @@ export interface SidebarEffort {
   waitingUntil: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
+  /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
+  wakeFailure: string | null;
   /** The binding's worker records, so a wait on a finished one reads as a lost hand-off (BB-152). */
   workers: SidebarWorker[];
   needsUser: boolean;
@@ -254,6 +258,8 @@ export interface EffortStatus {
   waitingUntil?: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource?: boolean;
+  /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
+  wakeFailure?: string | null;
   /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
   workers?: readonly { threadId: string; title: string; status: string }[];
 }
@@ -369,6 +375,9 @@ export const waitingUntilDate = (at: number): string => new Date(at).toISOString
  */
 export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
   if (e.needsUser) return "needs you";
+  // BB-255: a wake that could not be delivered outranks the `stuck` escalation
+  // it filed, so the row says why it is stuck rather than just that it is.
+  if (e.wakeFailure !== null && e.wakeFailure !== undefined && e.wakeFailure !== "") return `wake failed: ${e.wakeFailure}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
   if (e.stuck) return "stuck";
   // A running worker or reviewer paints the blue ring, but the count is of
@@ -428,6 +437,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     waitingOn: null,
     waitingUntil: null,
     noWakeSource: false,
+    wakeFailure: null,
     workers: [],
     needsUser: false,
     stuck: false,
@@ -646,6 +656,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       waitingOn: b.waitingOn,
       waitingUntil: b.waitingUntil,
       noWakeSource: b.noWakeSource,
+      wakeFailure: b.wakeFailure,
       workers: b.workers,
       needsUser: b.needsUser,
       stuck: b.stuck,
@@ -743,6 +754,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       waitingOn: null,
       waitingUntil: null,
       noWakeSource: false,
+      wakeFailure: null,
       workers: [],
       needsUser: false,
       stuck: false,

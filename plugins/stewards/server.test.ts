@@ -62,6 +62,8 @@ function world() {
   const labelEnsureFailures = new Map<string, string>();
   /** When true, the fake source does not serve `sourceEnsureLabel` at all (BB-236). */
   let labelEnsureUnavailable = false;
+  /** When true, the fake push-notifications plugin does not serve its methods (BB-253). */
+  let pushUnavailable = false;
   /** A plain thrown failure for `sourceEnsureLabel`, to tell it from unavailable (BB-236). */
   let labelEnsureThrow: string | null = null;
   const rpcCalls: Call[] = [];
@@ -86,6 +88,16 @@ function world() {
   const uiPreferencesWrites: Array<{ key: string; value: unknown; expectedRevision: number }> = [];
   const spawns: Array<Record<string, unknown> & { id: string }> = [];
   const sends: Array<{ threadId: string; text: string; at?: number }> = [];
+  /** Every `threads.retry` the plugin made (BB-255). */
+  const retries: Array<{ threadId: string; turnRequestId: string; sendAt?: number; reason?: string }> = [];
+  /** The `client/turn/requested` events a retry leaves, for the chain-root read (BB-255). */
+  const retryEvents: Array<{ threadId: string; requestId: string; retryOfRequestId: string }> = [];
+  /** Whether `threads.retry` answers 409 `retry_already_queued` (BB-255). */
+  let retryConflict = false;
+  /** Whether `threads.retry` returns a queued row instead of a sent one (BB-255). */
+  let retryQueued = false;
+  /** Every queued retry row the plugin deleted (BB-255). */
+  const queuedDeletes: Array<{ threadId: string; queuedMessageId: string }> = [];
   const userTurns: Array<{ threadId: string; text: string; at?: number }> = [];
   /** What the page's GitHub actions did. */
   const githubComments: Array<{ repo: string; number: number; body: string }> = [];
@@ -176,7 +188,15 @@ function world() {
     const input = (args.input ?? {}) as Record<string, unknown>;
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
     let out: unknown;
-    if (args.method === "readProjectFiles") {
+    if (args.pluginId === "push-notifications") {
+      // BB-253: the fake serves the two published RPCs the stewards plugin
+      // calls; `setPushUnavailable` makes them unknown-method, for the
+      // "not available" path.
+      if (pushUnavailable) throw Object.assign(new Error(`Unknown RPC method: ${args.method}`), { code: "unknown_method" });
+      if (args.method === "threadNotifications.set") out = { own: "muted", ancestorCap: null };
+      else if (args.method === "notifications.send") out = { ok: true, channels: ["web"] };
+      else throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
+    } else if (args.method === "readProjectFiles") {
       const paths = input.paths as string[];
       if (paths.some((path) => path.startsWith("/") || path.includes("\\") || path.split("/").includes(".."))) throw new Error(`bad project file path: ${paths.join(", ")}`);
       out = { projectSourcePath: "/p/.bb", head: "abc", files: paths.map((path) => ({ path, content: files[path] ?? null })), error: null };
@@ -349,6 +369,24 @@ function world() {
         sends.push({ threadId: args.threadId, text: args.input.map((i) => i.text).join(""), at: now });
         return {};
       },
+      retry: async (args: { threadId: string; turnRequestId: string; sendAt?: number; reason?: string }) => {
+        if (retryConflict) throw Object.assign(new Error("retry already queued"), { code: "retry_already_queued", status: 409 });
+        retries.push({ ...args });
+        const attempt = retries.filter((r) => r.threadId === args.threadId).length + 1;
+        const turnRequestId = `retry_${retries.length}`;
+        // Core's `retryOfRequestId` is the chain's original, not the immediate
+        // parent, so a retry of a retry still names the original.
+        const root = retryEvents.find((e) => e.threadId === args.threadId && e.requestId === args.turnRequestId)?.retryOfRequestId ?? args.turnRequestId;
+        retryEvents.push({ threadId: args.threadId, requestId: turnRequestId, retryOfRequestId: root });
+        if (retryQueued) return { ok: true as const, delivery: "queued" as const, attempt, turnRequestId, queuedMessageId: `q_${retries.length}`, sendAt: args.sendAt ?? null, waitingOn: { kind: "time" as const } };
+        return { ok: true as const, delivery: "sent" as const, attempt, turnRequestId };
+      },
+      queuedMessages: {
+        delete: async (args: { threadId: string; queuedMessageId: string }) => {
+          queuedDeletes.push({ ...args });
+          return {};
+        },
+      },
       get: async ({ threadId }: { threadId: string }) => {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
@@ -419,27 +457,26 @@ function world() {
         return next;
       },
       events: {
-        list: async ({ threadId, types }: { threadId: string; types?: string[] }) =>
-          types?.includes("thread/contextWindowUsage/updated")
-            ? usage.has(threadId)
-              ? [{ id: "u", seq: 1, threadId, createdAt: now, scope: "thread", type: "thread/contextWindowUsage/updated", data: { contextWindowUsage: { usedTokens: usage.get(threadId), modelContextWindow: 1_000_000, estimated: true } } }]
-              : []
-            : types?.includes("client/turn/requested")
-              ? [
-                  // The spawn's execution as the server resolved it; absent while the thread is still pending its first turn.
-                  ...(threads.get(threadId)?.model === undefined
-                    ? []
-                    : [{ id: "t", seq: 1, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { execution: { model: threads.get(threadId)!.model, reasoningLevel: threads.get(threadId)!.reasoningLevel ?? "none", permissionMode: "auto", serviceTier: "default", source: "client/turn/requested" } } }]),
-                  // A spawn's prompt is the thread's first turn, recorded as the
-                  // user's by bb, so it is a plugin send too (BB-178).
-                  ...spawns.filter((s) => s.id === threadId && typeof s.prompt === "string").map((s, i) => ({ id: `p${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, input: [{ type: "text", text: s.prompt as string }] } })),
-                  // The plugin's own sends are turns too: bb records them with
-                  // `initiator: "user"` and no sender thread, so the text is the
-                  // only thing telling them from the owner's (BB-178).
-                  ...sends.filter((s) => s.threadId === threadId).map((s, i) => ({ id: `s${i}`, seq: i, threadId, createdAt: s.at ?? now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, input: [{ type: "text", text: s.text }] } })),
-                  ...userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: t.at ?? now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, input: [{ type: "text", text: t.text }] } })),
-                ]
-              : [],
+        list: async ({ threadId, types, order }: { threadId: string; types?: string[]; order?: string }) => {
+          if (types?.includes("thread/contextWindowUsage/updated")) return usage.has(threadId) ? [{ id: "u", seq: 1, threadId, createdAt: now, scope: "thread", type: "thread/contextWindowUsage/updated", data: { contextWindowUsage: { usedTokens: usage.get(threadId), modelContextWindow: 1_000_000, estimated: true } } }] : [];
+          if (!types?.includes("client/turn/requested")) return [];
+          const rows = [
+            // The spawn's execution as the server resolved it; absent while the thread is still pending its first turn.
+            ...(threads.get(threadId)?.model === undefined
+              ? []
+              : [{ id: "t", seq: 1, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { execution: { model: threads.get(threadId)!.model, reasoningLevel: threads.get(threadId)!.reasoningLevel ?? "none", permissionMode: "auto", serviceTier: "default", source: "client/turn/requested" } } }]),
+            // A spawn's prompt is the thread's first turn, recorded as the
+            // user's by bb, so it is a plugin send too (BB-178).
+            ...spawns.filter((s) => s.id === threadId && typeof s.prompt === "string").map((s, i) => ({ id: `p${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: "stewards", input: [{ type: "text", text: s.prompt as string }] } })),
+            // The plugin's own sends are turns too: bb records them with
+            // `initiator: "user"` and no sender thread, so the text is the
+            // only thing telling them from the owner's (BB-178).
+            ...sends.filter((s) => s.threadId === threadId).map((s, i) => ({ id: `s${i}`, seq: i, threadId, createdAt: s.at ?? now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: "stewards", input: [{ type: "text", text: s.text }] } })),
+            ...userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: t.at ?? now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: null, input: [{ type: "text", text: t.text }] } })),
+            ...retryEvents.filter((r) => r.threadId === threadId).map((r, i) => ({ id: `r${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { initiator: "user", senderThreadId: null, originPluginId: null, requestId: r.requestId, retryOfRequestId: r.retryOfRequestId, input: [] } })),
+          ];
+          return order === "desc" ? [...rows].reverse() : rows;
+        },
       },
     },
     system: {
@@ -457,7 +494,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -4643,6 +4680,140 @@ describe("the one-time unhide (BB-93)", () => {
   });
 });
 
+describe("muting steward trees and pushing needs-you items (BB-253)", () => {
+  const muteCalls = (t: Awaited<ReturnType<typeof setup>>) => t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "threadNotifications.set");
+  const pushCalls = (t: Awaited<ReturnType<typeof setup>>) => t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "notifications.send");
+  /** File the owner's `approve-pr` item on a ticket whose linked pull has an approved reviewer marker. */
+  const approvedPull = async (t: Awaited<ReturnType<typeof setup>>, steward: string) => {
+    const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.tool("steward_report", { phase: "Review", summary: "Posted round 8.", nextAction: "Wait for the owner.", actor: "user" }, steward);
+  };
+
+  it("mutes the project steward and the steward it starts, and leaves other threads alone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const calls = muteCalls(t);
+    expect(calls.map((c) => c.input.threadId).sort()).toEqual([project, steward].sort());
+    for (const c of calls) expect(c.input.level).toBe("muted");
+  });
+
+  it("leaves a thread the owner starts alone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    // A top-level thread with no steward parent: the owner's own, so nothing
+    // mutes it and its default level stands.
+    await t.harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "thr_owner", parentThreadId: null, lifecycleOwnerThreadId: null, originPluginId: null, providerId: "claude-code" }) });
+    await t.flush();
+    await t.hooks.muteStewardThreadsOnce();
+    expect(muteCalls(t).some((c) => c.input.threadId === "thr_owner")).toBe(false);
+  });
+
+  it("mutes every live binding thread once on load, and does nothing on a second start", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const before = muteCalls(t).length;
+    await t.hooks.muteStewardThreadsOnce();
+    const after = muteCalls(t);
+    expect(after.slice(before).map((c) => c.input.threadId).sort()).toEqual([project, steward].sort());
+    // The marker is recorded: a later start mutes nothing.
+    await t.hooks.muteStewardThreadsOnce();
+    expect(muteCalls(t)).toHaveLength(after.length);
+  });
+
+  it("runs the one-time mute on the plugin's loop service start, not only from the test seam", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const before = muteCalls(t).length;
+    const service = t.harness.runService("loop");
+    try {
+      await t.flush();
+      expect(muteCalls(t).slice(before).map((c) => c.input.threadId).sort()).toEqual([project, steward].sort());
+    } finally {
+      service.controller.abort();
+    }
+  });
+
+  it("pushes an approve-pr item once, opening the binding's steward thread, and not again on a re-sync", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await approvedPull(t, steward);
+    const pushes = pushCalls(t);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.input).toMatchObject({ threadId: steward, title: "ENG-12 needs your approval", body: "Fix login" });
+    // The same item synced again stays quiet.
+    await t.ring("linear", "uuid-12");
+    expect(pushCalls(t)).toHaveLength(1);
+  });
+
+  it("pushes an approve-spec item a forwarded approval files", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met }, steward);
+    const approval = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approval")!;
+    const before = pushCalls(t).length;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: approval.id }, project);
+    expect(forwarded.error, forwarded.text).toBe(false);
+    const pushes = pushCalls(t);
+    expect(pushes).toHaveLength(before + 1);
+    expect(pushes.at(-1)!.input).toMatchObject({ title: "ENG-12 needs your approval", body: "Fix login", threadId: steward });
+  });
+
+  it("pushes a forwarded decision once, with the project steward's question and thread", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", context: "The auth doc lists both providers.", meanwhile: "Wait." } }, steward);
+    const esc = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.question === "Include SSO?")!;
+    const before = pushCalls(t).length;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, recommendation: "Leave SSO out." }, project);
+    expect(forwarded.error, forwarded.text).toBe(false);
+    const pushes = pushCalls(t);
+    expect(pushes).toHaveLength(before + 1);
+    expect(pushes.at(-1)!.input).toMatchObject({ title: "ENG-12 needs a decision", body: "Include SSO?", threadId: project });
+  });
+
+  it("turns the pushes off with the project file switch, while the mute still applies", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, notifications: { enabled: false } });
+    t.hooks.forgetConfigs();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    expect(muteCalls(t).some((c) => c.input.threadId === steward)).toBe(true);
+    await approvedPull(t, steward);
+    expect(t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).some((n) => n.kind === "approve-pr")).toBe(true);
+    expect(pushCalls(t)).toHaveLength(0);
+  });
+
+  it("skips a missing push-notifications plugin, logs once, and keeps working", async () => {
+    const t = await setup();
+    t.setPushUnavailable(true);
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ author: "sam" }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await approvedPull(t, steward);
+    expect(t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).some((n) => n.kind === "approve-pr")).toBe(true);
+    expect(t.harness.logEntries.filter((e) => e.message.includes("push-notifications is not available"))).toHaveLength(1);
+  });
+});
+
 describe("archiving finished workers and reviewers (BB-47)", () => {
   it("archives a reviewer once its worker's next turn ends, and keeps the worker until the round is consumed", async () => {
     const t = await setup();
@@ -7508,6 +7679,11 @@ describe("needs you items", () => {
     const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ filedBy: "steward" });
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    // BB-253: the steward-filed Merge item is the owner's only signal on the
+    // HUB-218 shape, so it pushes once, to the binding's steward thread.
+    const mergePushes = t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "notifications.send" && (c.input as { title?: string }).title === "acme/web#7 ready to merge");
+    expect(mergePushes).toHaveLength(1);
+    expect(mergePushes[0]!.input).toMatchObject({ threadId: t.steward });
   });
 
   it("a finished worker does not block a steward-filed merge item; a running one does (BB-175)", async () => {
@@ -13479,5 +13655,265 @@ describe("recorded assumptions (BB-251)", () => {
     const refreshed = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
     expect(refreshed.data.assumptionIds).toEqual([first]);
     expect(refreshed.data.assumptionIds).not.toContain(second);
+  });
+});
+
+describe("retrying a failed wake (BB-255)", () => {
+  const failTurn = async (
+    t: Awaited<ReturnType<typeof setup>>,
+    over: { threadId: string; requestId?: string; attemptNumber?: number; category?: string; originPluginId?: string | null; rateLimits?: unknown },
+  ): Promise<void> => {
+    await t.harness.behavior.emitThreadEvent("turn.failed", {
+      threadId: over.threadId,
+      requestId: over.requestId ?? "req_1",
+      turnId: null,
+      errorInfo: { category: over.category ?? "internal", providerCode: null, httpStatusCode: null },
+      inputAccepted: false,
+      rateLimits: over.rateLimits ?? null,
+      attemptNumber: over.attemptNumber ?? 1,
+      originPluginId: over.originPluginId === undefined ? "stewards" : over.originPluginId,
+    } as never);
+    await t.flush();
+  };
+
+  const adopt = async (t: Awaited<ReturnType<typeof setup>>): Promise<string> => {
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    return t.spawns[1]!.id;
+  };
+
+  it("leaves a turn the owner typed alone", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    expect(t.hooks.store.find("ENG-12", "p1")!.awaitingReport).toBe(true);
+
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "owner_req" });
+    expect(t.retries).toHaveLength(0);
+    expect(t.hooks.store.find("ENG-12", "p1")!.missedReports).toBe(0);
+  });
+
+  it("retries a retryable failure and follows its null-origin retry to the cap", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    expect(t.retries[0]).toMatchObject({ threadId: steward, turnRequestId: "req_1" });
+    let b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.missedReports).toBe(0);
+    expect(b.awaitingReport).toBe(true);
+    expect(b.wakeRetries[steward]).toMatchObject({ requestId: "retry_1", attempt: 2 });
+
+    // The retry's own failure arrives with a null origin and the retry's id.
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
+    expect(t.retries).toHaveLength(2);
+    expect(t.retries[1]).toMatchObject({ turnRequestId: "retry_1" });
+    b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.wakeRetries[steward]).toMatchObject({ requestId: "retry_2", attempt: 3 });
+
+    // Third failure: the cap. One note, one stuck escalation, the provider
+    // error, and the escalation's route is delivered (the project steward).
+    const project = t.spawns[0]!.id;
+    const sendsBefore = t.sends.filter((s) => s.threadId === project).length;
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_2", attemptNumber: 3, category: "internal" });
+    expect(t.retries).toHaveLength(2);
+    b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.missedReports).toBe(0);
+    expect(b.awaitingReport).toBe(false);
+    expect(b.wakeFailure).toBe("internal");
+    expect(b.wakeRetries[steward]).toBeUndefined();
+    expect(b.pending.filter((n) => /^Wake failed after 3 attempts: internal\.$/u.test(n.text))).toHaveLength(1);
+    const stuck = t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck");
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0]!.question).toContain("internal");
+    expect(stuck[0]!.question).not.toContain("missed report");
+    expect(t.sends.filter((s) => s.threadId === project).length).toBeGreaterThan(sendsBefore);
+  });
+
+  it("answers provider-retry consent: decline its own wake, allow an owner turn", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    const caller = { experimental_caller: { kind: "plugin" as const, pluginId: "provider-retry" } };
+    const ask = (requestId: string) => t.harness.callRpc("provider-retry.v1.consent", { threadId: steward, requestId, reason: "Provider overloaded", sendAt: t.now() + 1000 }, caller);
+    // The steward's wake was the plugin's send.
+    expect(await ask("req_1")).toMatchObject({ kind: "decline" });
+    // An owner turn on the same thread is provider-retry's to handle.
+    t.userTurns.push({ threadId: steward, text: "please look", at: t.now() });
+    expect(await ask("req_2")).toMatchObject({ kind: "allow" });
+  });
+
+  it("treats a 409 retry_already_queued as pending, never giving up", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    t.setRetryConflict(true);
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.wakeFailure).toBeNull();
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(0);
+    expect(b.wakeRetries[steward]).toMatchObject({ requestId: "req_1" });
+  });
+
+  it("follows a retry chain provider-retry queued past a 409 to the cap", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    // Attempt 1: stewards queues its own retry (retry_1, root req_1).
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    // Attempt 2 fails; provider-retry already queued retry_2, so the call 409s.
+    t.setRetryConflict(true);
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
+    // provider-retry's own queued retry (retry_2) fails at the cap; stewards
+    // never recorded that id, but the chain root matches.
+    t.retryEvents.push({ threadId: steward, requestId: "retry_2", retryOfRequestId: "req_1" });
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_2", attemptNumber: 3, category: "internal" });
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.wakeFailure).toBe("internal");
+    expect(b.pending.filter((n) => /^Wake failed after 3 attempts: internal\.$/u.test(n.text))).toHaveLength(1);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(1);
+  });
+
+  it("deletes a queued retry row when a report drops it", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    t.setRetryQueued(true);
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "rate-limit" });
+    expect(t.hooks.store.find("ENG-12", "p1")!.wakeRetries[steward]).toMatchObject({ queuedMessageId: "q_1" });
+    await t.tool("steward_report", { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" }, steward);
+    expect(t.queuedDeletes).toEqual([{ threadId: steward, queuedMessageId: "q_1" }]);
+    expect(t.hooks.store.find("ENG-12", "p1")!.wakeRetries[steward]).toBeUndefined();
+  });
+
+  it("does not retry an auth failure, and surfaces it at once", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+
+    await failTurn(t, { threadId: steward, requestId: "req_auth", attemptNumber: 1, category: "unauthorized" });
+    expect(t.retries).toHaveLength(0);
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.wakeFailure).toBe("unauthorized");
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(1);
+    expect(b.missedReports).toBe(0);
+  });
+
+  it("places sendAt at or after a reported rate-limit reset", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    const reset = t.now() + 3_600_000;
+    await failTurn(t, {
+      threadId: steward,
+      requestId: "req_rl",
+      attemptNumber: 1,
+      category: "rate-limit",
+      rateLimits: {
+        providerId: "claude-code",
+        status: "blocked",
+        kind: "subscription-window",
+        overageReason: null,
+        overageStatus: null,
+        reachedReason: null,
+        windows: [{ label: null, providerKey: null, resetsAtMs: reset, status: "blocked" }],
+      },
+    });
+    expect(t.retries).toHaveLength(1);
+    expect(t.retries[0]!.sendAt).toBeGreaterThanOrEqual(reset);
+  });
+
+  it("holds awaitingReport while the retry is pending and lapses after the bound", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, wakeRetryBaseMs: 1000 } });
+    const steward = await adopt(t);
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    let b = t.hooks.store.find("ENG-12", "p1")!;
+    const hold = b.wakeRetries[steward]!.holdUntil;
+
+    // The hold suppresses the missed-report count.
+    await t.idle(steward);
+    b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.missedReports).toBe(0);
+    expect(b.awaitingReport).toBe(true);
+
+    // Past the bound, counting resumes and the stale retry is dropped.
+    t.advance(hold - t.now() + 1);
+    await t.idle(steward);
+    b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.missedReports).toBe(1);
+    expect(b.wakeRetries[steward]).toBeUndefined();
+  });
+
+  it("ends the hold when the retry's turn starts", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, wakeRetryBaseMs: 1000 } });
+    const steward = await adopt(t);
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: steward }) });
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.wakeRetries[steward]!.holdUntil).toBe(0);
+    await t.idle(steward);
+    expect(t.hooks.store.find("ENG-12", "p1")!.missedReports).toBe(1);
+  });
+
+  it("keeps one pending retry per thread, dropped by a report or a newer wake", async () => {
+    const t = await setup();
+    const steward = await adopt(t);
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    // A repeat of the original failure does not schedule a second retry.
+    await failTurn(t, { threadId: steward, requestId: "req_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+
+    // A report drops the pending retry, so the retry's later failure is ignored.
+    await t.tool("steward_report", { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" }, steward);
+    expect(t.hooks.store.find("ENG-12", "p1")!.wakeRetries[steward]).toBeUndefined();
+    await failTurn(t, { threadId: steward, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+
+    // A newer wake the plugin sent clears the record too.
+    await failTurn(t, { threadId: steward, requestId: "req_2", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(2);
+    t.entities.set("uuid-12", issue({ comments: [comment({ id: "c1", author: "lee", body: "a new comment" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")!.wakeRetries[steward]).toBeUndefined();
+  });
+
+  it("retries a worker's failed spawn message and revives the worker", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    // The thread.failed path marked it failed first; the plugin's own spawn
+    // message then retries, so the worker is running again.
+    t.hooks.store.setWorker("thr_w1", "failed", "provider error");
+
+    await failTurn(t, { threadId: "thr_w1", requestId: "spawn_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    expect(t.retries[0]).toMatchObject({ threadId: "thr_w1", turnRequestId: "spawn_1" });
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("running");
+  });
+
+  it("does not report a worker failed while its spawn retry is pending", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+
+    await failTurn(t, { threadId: "thr_w1", requestId: "spawn_1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    await t.harness.behavior.emitThreadEvent("thread.failed", { thread: makeThreadResponse({ id: "thr_w1" }), error: "provider error" });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("running");
+  });
+
+  it("retries a project steward's failed wake through its null-origin failure", async () => {
+    const t = await setup();
+    await adopt(t);
+    const project = t.spawns[0]!.id;
+
+    await failTurn(t, { threadId: project, requestId: "p1", attemptNumber: 1, category: "internal" });
+    expect(t.retries).toHaveLength(1);
+    expect(t.retries[0]).toMatchObject({ threadId: project, turnRequestId: "p1" });
+    await failTurn(t, { threadId: project, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
+    expect(t.retries).toHaveLength(2);
   });
 });

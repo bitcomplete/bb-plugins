@@ -14,7 +14,11 @@
 // (project-source.ts): multi-repo's RPCs when it is installed, native git on
 // the project checkout when it is not. Nothing here reads a file.
 import { createHash, randomBytes } from "node:crypto";
-import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand } from "@get-bb/plugin-sdk";
+import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand, type PluginTurnFailedEvent } from "@get-bb/plugin-sdk";
+
+/** The structured failure and rate-limit types `turn.failed` carries (not re-exported by the 0.6.80 SDK). */
+type ProviderErrorInfo = NonNullable<PluginTurnFailedEvent["errorInfo"]>;
+type ProviderRateLimitState = NonNullable<PluginTurnFailedEvent["rateLimits"]>;
 import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
@@ -111,7 +115,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -179,6 +183,8 @@ export interface Timing {
   environmentPollMs: number;
   /** How long `spawnSteward` waits for that environment before giving the steward its own (BB-111). */
   environmentWaitMs: number;
+  /** BB-255: the base of the backoff before retrying a failed wake (doubles per attempt). */
+  wakeRetryBaseMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
@@ -192,7 +198,11 @@ export const DEFAULT_TIMING: Timing = {
   approvalLookbackMs: 24 * 60 * 60_000,
   environmentPollMs: 1000,
   environmentWaitMs: 60_000,
+  wakeRetryBaseMs: 15_000,
 };
+
+/** BB-255: the plugin retries its own failed wake up to this many attempts (the original is attempt 1). */
+export const WAKE_RETRY_MAX_ATTEMPTS = 3;
 
 /** BB-55: the backstop wake when a report passes the ready gate and the turn ends with no worker started. */
 export const START_WORKER_WAKE = "The ready gate passed on your last turn and nothing holds you: start the worker.";
@@ -620,6 +630,8 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
+              /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
+              wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
               hold: z.string().nullable(),
               /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
@@ -743,6 +755,8 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
+              /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
+              wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
               /** The hold reason, for the card's `On hold` line; null when not held. */
               hold: z.string().nullable(),
@@ -842,6 +856,8 @@ export const rpcContract = defineRpcContract({
           waitingUntil: z.number().nullable(),
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
+          /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
+          wakeFailure: z.string().nullable(),
           needsUser: z.boolean(),
           /** An open `stuck` escalation: the row is blocked (BB-76). */
           stuck: z.boolean(),
@@ -892,6 +908,31 @@ export const rpcContract = defineRpcContract({
       choice: z.string().trim().min(1).max(100).nullable().optional(),
     }),
     output: z.object({ ok: z.boolean(), message: z.string(), threadId: z.string().nullable().optional() }),
+  },
+});
+
+/**
+ * BB-255: the consent provider-retry asks the plugin that sent a failed turn
+ * before it re-runs that turn. Core's `provider-retry` plugin defines the
+ * contract, not the SDK, so a plugin that wants to answer registers its own
+ * copy (core's automations plugin does). Stewards declines its own wakes: it
+ * re-runs them itself, and a double retry races (the second `threads.retry`
+ * gets 409 `retry_already_queued`). An owner-typed turn on a steward thread is
+ * left to provider retry.
+ */
+export const RETRY_CONSENT_METHOD = "provider-retry.v1.consent";
+export const retryConsentSchema = z.discriminatedUnion("kind", [z.object({ kind: z.literal("allow") }), z.object({ kind: z.literal("decline"), reason: z.string().min(1) })]);
+export type RetryConsent = z.infer<typeof retryConsentSchema>;
+export const retryConsentContract = defineRpcContract({
+  [RETRY_CONSENT_METHOD]: {
+    input: z.object({
+      threadId: z.string().min(1),
+      requestId: z.string().min(1),
+      reason: z.enum(["Rate limited", "Provider overloaded", "Provider unavailable"]),
+      sendAt: z.number().int().nonnegative(),
+    }),
+    output: retryConsentSchema,
+    experimental_description: "Asked of the plugin that sent a failed turn before provider retry re-runs it. Stewards declines its own wakes, which it re-runs itself; allow leaves the retry to provider retry.",
   },
 });
 
@@ -1202,6 +1243,93 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
     const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> =>
       rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
+
+    // ---- push-notifications (BB-253) ----------------------------------------------------------------
+    //
+    // Steward trees are muted and needs-you items push, both through the
+    // push-notifications plugin's published RPCs. A missing plugin, or a
+    // loaded one whose contract predates a method, is "not available": the
+    // call is skipped, one line is logged, and nothing else changes. That
+    // keeps the plugin usable on a server that predates the RPC, exactly as
+    // the source contract treats a missing stewards plugin.
+
+    const PUSH_NOTIFICATIONS_PLUGIN_ID = "push-notifications";
+    const MUTE_OUTPUT = z
+      .object({
+        own: z.enum(["inherit", "all", "input-only", "muted"]),
+        ancestorCap: z.object({ level: z.enum(["all", "input-only", "muted"]), threadId: z.string().min(1) }).strict().nullable(),
+      })
+      .strict();
+    const SEND_OUTPUT = z.object({ ok: z.literal(true), channels: z.array(z.enum(["web", "desktop", "mobile"])) }).strict();
+
+    /** The one log line for a push-notifications plugin or method that is not there. */
+    let pushUnavailableNoted = false;
+    function notePushUnavailable(error: unknown): void {
+      if (pushUnavailableNoted) return;
+      pushUnavailableNoted = true;
+      bb.log.info(`stewards: push-notifications is not available (${errorMessage(error)}); steward mutes and needs-you pushes are skipped`);
+    }
+
+    /**
+     * Mute one thread the plugin spawned, so the steward, its workers and
+     * their reviewers are silent (BB-253). True when done, or when
+     * push-notifications is not available and there is nothing to do; false
+     * only on a real failure, so a sweep can leave its one-time marker unset
+     * and retry on the next start.
+     */
+    async function muteStewardThread(threadId: string): Promise<boolean> {
+      try {
+        await rpc(PUSH_NOTIFICATIONS_PLUGIN_ID, "threadNotifications.set", { threadId, level: "muted" }, MUTE_OUTPUT);
+        return true;
+      } catch (error) {
+        if (rpcUnavailable(error)) {
+          notePushUnavailable(error);
+          return true;
+        }
+        bb.log.warn(`stewards: could not mute ${threadId}: ${errorMessage(error)}`);
+        return false;
+      }
+    }
+
+    /**
+     * Push one needs-you item, cut by the plugin to its title and body limits
+     * (BB-253). The tap opens `threadId` when one is given. Off through the
+     * project file's `notifications.enabled` disables pushes only; a missing
+     * push-notifications plugin is skipped, logged once, never an error.
+     */
+    async function pushNeed(b: Binding, fields: { id: string; title: string; body: string; threadId: string | null }): Promise<void> {
+      const config = await loadConfig(b.projectId);
+      if (config !== null && !config.file.notifications.enabled) return;
+      try {
+        await rpc(PUSH_NOTIFICATIONS_PLUGIN_ID, "notifications.send", { title: fields.title, body: fields.body, ...(fields.threadId === null ? {} : { threadId: fields.threadId }) }, SEND_OUTPUT);
+      } catch (error) {
+        if (rpcUnavailable(error)) notePushUnavailable(error);
+        else bb.log.warn(`stewards: could not push ${fields.id}: ${errorMessage(error)}`);
+      }
+    }
+
+    /** The push title and body for a newly filed gate item, or null for a kind that never pushes. */
+    function gatePushText(b: Binding, item: Need): { title: string; body: string } | null {
+      const title = b.title ?? "";
+      if (item.kind === "approve-spec" || item.kind === "approve-pr") return { title: `${b.entityKey} needs your approval`, body: title };
+      if (item.kind === "merge") return { title: `${item.what.replace(/^Merge\s+/u, "")} ready to merge`, body: title };
+      return null;
+    }
+
+    /**
+     * Push every gate item filed since `before`, in order (BB-253). Used where
+     * a forward files an `approve-spec` or `approve-pr` item outside a
+     * reconcile, so it is pushed at filing exactly as `syncNeeds` pushes the
+     * items it files. `before` is the open ids read before the filing, so a
+     * refresh of an item that was already open stays quiet.
+     */
+    async function pushNewGateNeeds(b: Binding, before: Set<string>): Promise<void> {
+      for (const item of store.openNeeds(b.id)) {
+        if (before.has(item.id)) continue;
+        const text = gatePushText(b, item);
+        if (text !== null) await pushNeed(b, { id: item.id, ...text, threadId: b.threadId });
+      }
+    }
 
     /**
      * The login a source acts as: the gh login github-watcher reads, or the
@@ -2373,6 +2501,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await recordPluginSend(text);
       try {
         await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
+        // BB-255: a newer wake the plugin sent supersedes any pending retry for
+        // that thread, so a stale retry's failure is not acted on and its
+        // queued row is dropped.
+        await clearWakeRetry(threadId);
         return "sent";
       } catch (error) {
         const e = error as { code?: string; status?: number };
@@ -2798,6 +2930,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!failed) await bb.storage.kv.set(AUTO_NEEDS_ONCE_KEY, String(now()));
     }
 
+    /**
+     * The one-time steward mute (BB-253). New threads are muted where they are
+     * spawned; this quiets the project steward and binding threads that already
+     * exist when the server first runs the change, so an existing tree goes
+     * quiet without being respawned. The marker lives in the plugin's kv store,
+     * so a later start does nothing. A real failure leaves it unset so the next
+     * start retries; a missing push-notifications plugin is "not available" and
+     * records the marker, since there is nothing to retry.
+     */
+    const MUTE_STEWARDS_ONCE_KEY = "migrations/mute-steward-threads";
+    async function muteStewardThreadsOnce(): Promise<void> {
+      if ((await bb.storage.kv.get<string>(MUTE_STEWARDS_ONCE_KEY)) != null) return;
+      const ids = new Set<string>();
+      for (const p of store.projects()) if (p.threadId !== null) ids.add(p.threadId);
+      for (const b of store.open()) if (b.threadId !== null) ids.add(b.threadId);
+      let failed = false;
+      for (const id of ids) if (!(await muteStewardThread(id))) failed = true;
+      if (!failed) await bb.storage.kv.set(MUTE_STEWARDS_ONCE_KEY, String(now()));
+    }
+
     /** Show a thread hidden in the sidebar; false when the update failed, so the caller can retry. */
     async function showIfHidden(threadId: string): Promise<boolean> {
       const info = await threadInfo(threadId).catch(() => null);
@@ -2874,6 +3026,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           pluginMetadata: { role: "project", threadBriefs: THREAD_BRIEFS_OFF },
         });
         tagged.add(thread.id);
+        // BB-253: the project steward and its whole tree are muted; workers and
+        // reviewers inherit the ancestor cap, so only the owner's own threads
+        // and needs-you pushes notify.
+        await muteStewardThread(thread.id);
         store.patchProject(config.projectId, { threadId: thread.id, title });
         bb.log.info(`stewards: started the project steward for ${config.projectId} (${thread.id})`);
         threadId = thread.id;
@@ -2976,6 +3132,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       tagged.add(thread.id);
       kept.add(thread.id);
+      // BB-253: mute the steward; the workers it starts with `--parent-self`
+      // and their reviewers inherit the cap with no skill change.
+      await muteStewardThread(thread.id);
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
       return thread.id;
@@ -3205,6 +3364,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         awaitingReport: true,
         wokeAt: now(),
         lastJudgmentAt: now(),
+        // BB-255: a wake that landed clears the failed-wake phrase.
+        wakeFailure: null,
         // BB-154: the reason this turn was woken, so the report that ends it
         // can count a requeue-only run. Cleared by that report.
         lastWakeReason: reason,
@@ -3217,6 +3378,250 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       noteRespawn(b, delivery.respawned);
       return true;
+    }
+
+    // ---- failed-wake retry (BB-255) ---------------------------------------------------------
+
+    /**
+     * The binding a thread belongs to, whether the thread is a steward's own
+     * or a worker's; null for a thread the store does not know (a project
+     * steward's).
+     */
+    function bindingForThread(threadId: string): Binding | null {
+      const direct = store.byThread(threadId);
+      if (direct !== null) return direct;
+      const worker = store.worker(threadId);
+      return worker === null ? null : store.binding(worker.bindingId);
+    }
+
+    /**
+     * BB-255: provider-retry asks whether it should re-run a failed turn.
+     * Decline a turn this plugin sent (its own wake), which it re-runs itself;
+     * allow everything else, including an owner-typed turn on a steward thread.
+     * A read that fails is an allow, the contract's fail-open default.
+     */
+    async function answerRetryConsent(input: { threadId: string; requestId: string }): Promise<RetryConsent> {
+      try {
+        const [latest] = await bb.sdk.threads.events.list({ threadId: input.threadId, types: ["client/turn/requested"], order: "desc", limit: "1" });
+        if ((latest?.data as { originPluginId?: unknown } | undefined)?.originPluginId === bb.pluginId) return { kind: "decline", reason: "stewards re-runs its own failed wake" };
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the failed turn for retry consent: ${errorMessage(error)}`);
+      }
+      return { kind: "allow" };
+    }
+
+    /**
+     * Threads whose failed turn `turn.failed` is deciding on (BB-255). It is
+     * set synchronously before the retry RPC is awaited, so the `thread.failed`
+     * handler — dispatched just before it — yields and lets this decision win.
+     */
+    const wakeRetryInFlight = new Set<string>();
+
+    /** Replace the one pending retry for a thread, or drop it. */
+    function setWakeRetry(b: Binding, threadId: string, retry: WakeRetry | null): Binding {
+      const next = { ...b.wakeRetries };
+      if (retry === null) delete next[threadId];
+      else next[threadId] = retry;
+      return store.patch(b.id, { wakeRetries: next });
+    }
+
+    /**
+     * The retry request ids the plugin scheduled, keyed to their thread, for a
+     * thread the binding record does not cover: a project steward has no
+     * binding, and a retry's own failure arrives with a null origin. In memory:
+     * a restart loses it, which is the same as the retry being lost.
+     */
+    type RetriedRequest = { threadId: string; rootRequestId: string; queuedMessageId: string | null };
+    const retriedRequests = new Map<string, RetriedRequest>();
+
+    const hasRetriedRequest = (threadId: string): boolean => {
+      for (const entry of retriedRequests.values()) if (entry.threadId === threadId) return true;
+      return false;
+    };
+
+    /** The original request id of the chain stewards is retrying on a thread, or null when none is pending. */
+    function chainRootFor(threadId: string): string | null {
+      const b = bindingForThread(threadId);
+      const retry = b === null ? undefined : b.wakeRetries[threadId];
+      if (retry !== undefined) return retry.rootRequestId ?? retry.requestId;
+      for (const entry of retriedRequests.values()) if (entry.threadId === threadId) return entry.rootRequestId;
+      return null;
+    }
+
+    /**
+     * The chain a failed turn belongs to: its `client/turn/requested` event's
+     * `retryOfRequestId` (the original request), or the request id itself for
+     * an original. Null when the event cannot be read.
+     */
+    async function retryChainRoot(threadId: string, requestId: string): Promise<string | null> {
+      try {
+        const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
+        for (const row of rows) {
+          const data = row.data as { requestId?: unknown; retryOfRequestId?: unknown };
+          if (data.requestId !== requestId) continue;
+          return typeof data.retryOfRequestId === "string" ? data.retryOfRequestId : requestId;
+        }
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the retry chain for ${threadId}: ${errorMessage(error)}`);
+      }
+      return null;
+    }
+
+    /** Delete a queued retry row, best-effort; a no-op when there is none. */
+    async function deleteQueuedRetry(threadId: string, queuedMessageId: string | null): Promise<void> {
+      if (queuedMessageId === null) return;
+      await quietly(`delete queued retry ${queuedMessageId}`, () => bb.sdk.threads.queuedMessages.delete({ threadId, queuedMessageId }));
+    }
+
+    /** Drop a pending retry for a thread, deleting its queued row; a no-op when there is none. */
+    async function clearWakeRetry(threadId: string): Promise<void> {
+      for (const [requestId, entry] of retriedRequests) {
+        if (entry.threadId !== threadId) continue;
+        await deleteQueuedRetry(threadId, entry.queuedMessageId);
+        retriedRequests.delete(requestId);
+      }
+      const b = bindingForThread(threadId);
+      const retry = b === null ? undefined : b.wakeRetries[threadId];
+      if (b !== null && retry !== undefined) {
+        await deleteQueuedRetry(threadId, retry.queuedMessageId);
+        setWakeRetry(b, threadId, null);
+      }
+    }
+
+    /**
+     * The provider error in words. `turn.failed` carries no message, only the
+     * structured classification, so the phrase is assembled from it.
+     */
+    function describeWakeError(errorInfo: ProviderErrorInfo | null): string {
+      if (errorInfo === null) return "the provider reported no detail";
+      const parts: string[] = [errorInfo.category];
+      if (errorInfo.providerCode !== null && errorInfo.providerCode !== "") parts.push(errorInfo.providerCode);
+      if (errorInfo.httpStatusCode !== null) parts.push(`HTTP ${errorInfo.httpStatusCode}`);
+      return parts.join(" ");
+    }
+
+    /** Categories a retry cannot fix: the same credentials, budget or request fail again. */
+    const NON_RETRYABLE_WAKE_CATEGORIES = new Set(["unauthorized", "billing", "policy", "bad-request"]);
+
+    /** Whether a retry could plausibly fix the failure. */
+    const retryableWakeFailure = (errorInfo: ProviderErrorInfo | null): boolean => errorInfo === null || !NON_RETRYABLE_WAKE_CATEGORIES.has(errorInfo.category);
+
+    /** The latest reset a rate-limit snapshot reports, or null when it reports none. */
+    function wakeRateLimitReset(rateLimits: ProviderRateLimitState | null): number | null {
+      if (rateLimits === null) return null;
+      const blocked = rateLimits.windows.filter((w) => w.status === "blocked");
+      const relevant = blocked.length > 0 ? blocked : rateLimits.windows;
+      const resets = relevant.flatMap((w) => (w.resetsAtMs === null ? [] : [w.resetsAtMs]));
+      return resets.length === 0 ? null : Math.max(...resets);
+    }
+
+    /** The `sendAt` for a retry: an exponential backoff, never before a reported rate-limit reset. */
+    function wakeRetrySendAt(rateLimits: ProviderRateLimitState | null, attemptNumber: number, at: number): number {
+      const backoff = at + timing.wakeRetryBaseMs * 2 ** Math.max(0, attemptNumber - 1);
+      const reset = wakeRateLimitReset(rateLimits);
+      return reset === null ? backoff : Math.max(backoff, reset);
+    }
+
+    /** The requeue interval a wake set, for the hold's upper bound; a fallback when there is none. */
+    function wakeRequeueMs(b: Binding | null): number {
+      if (b !== null && b.wokeAt !== null && b.requeueAt !== null && b.requeueAt > b.wokeAt) return b.requeueAt - b.wokeAt;
+      return timing.wakeRetryBaseMs * 8;
+    }
+
+    /**
+     * Retry a failed wake the plugin sent, if the failure is retryable and the
+     * attempt cap is not reached. Returns true when a retry was scheduled and
+     * recorded (the retry's own request id is what recognises its later
+     * null-origin failure); false when the caller must give up.
+     */
+    async function retryFailedWake(args: {
+      threadId: string;
+      requestId: string;
+      rootRequestId: string;
+      attemptNumber: number;
+      errorInfo: ProviderErrorInfo | null;
+      rateLimits: ProviderRateLimitState | null;
+      binding: Binding | null;
+      worker: Worker | null;
+    }): Promise<boolean> {
+      if (!retryableWakeFailure(args.errorInfo)) return false;
+      if (args.attemptNumber >= WAKE_RETRY_MAX_ATTEMPTS) return false;
+      const sendAt = wakeRetrySendAt(args.rateLimits, args.attemptNumber, now());
+      let result: Awaited<ReturnType<typeof bb.sdk.threads.retry>>;
+      try {
+        result = await bb.sdk.threads.retry({ threadId: args.threadId, turnRequestId: args.requestId, sendAt, reason: "Retrying a failed stewards wake" });
+      } catch (error) {
+        const e = error as { code?: string; status?: number };
+        if (e.code === "retry_already_queued") {
+          // provider-retry (or a concurrent call) already holds the one live
+          // retry for this turn. Treat it as pending so the failure is never
+          // given up on; that caller owns the queued row.
+          if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: args.requestId, rootRequestId: args.rootRequestId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId: null });
+          bb.log.info(`stewards: a retry for ${args.threadId} is already queued; leaving it to the other caller`);
+          return true;
+        }
+        bb.log.warn(`stewards: could not retry ${args.threadId}'s failed wake: ${errorMessage(error)}`);
+        return false;
+      }
+      const retriedId = result.turnRequestId;
+      const queuedMessageId = result.delivery === "queued" ? result.queuedMessageId : null;
+      // The binding record keeps the queued id for a binding; the in-memory map
+      // keeps it for a project steward, which has no binding.
+      retriedRequests.set(retriedId, { threadId: args.threadId, rootRequestId: args.rootRequestId, queuedMessageId: args.binding === null ? queuedMessageId : null });
+      if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: retriedId, rootRequestId: args.rootRequestId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId });
+      // A worker the earlier thread.failed marked failed is running again: the
+      // retry stands in for the failure.
+      if (args.worker !== null && args.worker.status === "failed") store.setWorker(args.threadId, "running", args.worker.result);
+      bb.log.info(`stewards: retrying ${args.threadId}'s failed wake (attempt ${args.attemptNumber + 1}) at ${new Date(sendAt).toISOString()}`);
+      return true;
+    }
+
+    /**
+     * The terminal handling of a failed wake the plugin will not retry again.
+     * A steward's binding gets one note naming the failure and the attempts,
+     * the `wake failed:` phrase, and one `stuck` escalation whose text is the
+     * provider error; nothing is woken. A worker keeps the `thread.failed`
+     * path, which marks it failed and wakes the steward. A project steward has
+     * no binding to note or phrase, so the failure is logged.
+     */
+    async function giveUpFailedWake(args: { threadId: string; attemptNumber: number; errorInfo: ProviderErrorInfo | null; binding: Binding | null; worker: Worker | null }): Promise<void> {
+      const reason = describeWakeError(args.errorInfo);
+      await clearWakeRetry(args.threadId);
+      if (args.worker !== null) {
+        // The `thread.failed` path, run here so the two handlers cannot race
+        // over the same worker.
+        const worker = store.worker(args.threadId) ?? args.worker;
+        if (!workerInFlight(worker)) return;
+        store.setWorker(args.threadId, "failed", reason);
+        await closeRequesterNeed(args.threadId);
+        store.note(worker.bindingId, `Worker "${worker.title}" failed: ${reason}`);
+        scheduleReconcile(worker.bindingId);
+        return;
+      }
+      if (args.binding === null) {
+        bb.log.warn(`stewards: ${args.threadId}'s wake failed after ${args.attemptNumber} attempt(s): ${reason}`);
+        return;
+      }
+      const b = store.binding(args.binding.id) ?? args.binding;
+      const attempts = `${args.attemptNumber} attempt${args.attemptNumber === 1 ? "" : "s"}`;
+      store.note(b.id, `Wake failed after ${attempts}: ${reason}.`);
+      store.patch(b.id, { wakeFailure: reason, awaitingReport: false });
+      if (!store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
+        const escalation = store.escalate({
+          bindingId: b.id,
+          kind: "stuck",
+          question: `The steward's wake failed after ${attempts}: ${reason}.`,
+          context: "Every retry the plugin made failed the same way, so the steward could not be woken.",
+          meanwhile: "Waiting: the steward cannot be woken until the provider recovers; a later reconcile will try again.",
+          route: nextRoute(b, null),
+          recommendation: null,
+          projectId: b.projectId,
+          origin: { threadId: args.threadId, bindingId: b.id, chain: [] },
+        });
+        // The failed steward is not re-woken, but the escalation's route
+        // (project steward, parent, or the user) is told.
+        await deliver(b, escalation);
+      }
     }
 
     /**
@@ -6428,7 +6833,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-231: a gate item filed this look may cover an open route-`user`
       // escalation or question; ask the project steward once, per new item.
       for (const item of store.openNeeds(b.id)) {
-        if (!needsBefore.has(item.id) && (item.kind === "approve-spec" || item.kind === "approve-pr" || item.kind === "merge")) await noteGateItemCoverage(b, item);
+        if (needsBefore.has(item.id) || !(item.kind === "approve-spec" || item.kind === "approve-pr" || item.kind === "merge")) continue;
+        await noteGateItemCoverage(b, item);
+        // BB-253: the item is newly filed this look, so this is its first and
+        // only push; the next look has it in `needsBefore` and stays quiet.
+        const text = gatePushText(b, item);
+        if (text !== null) await pushNeed(b, { id: item.id, ...text, threadId: b.threadId });
       }
       return events;
     }
@@ -6692,11 +7102,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (b.awaitingReport) {
-        const missed = b.missedReports + 1;
-        store.patch(b.id, { awaitingReport: false, missedReports: missed });
-        bb.log.warn(`stewards: ${b.entityKey}'s turn ended without steward_report (${missed} in a row)`);
-        if (missed >= timing.missedReportsForStuck && !store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
-          await raise(b, "stuck", `The steward ended ${missed} turns in a row without a status report. Look at the thread and say how to continue.`, "Waiting.");
+        // BB-255: while the plugin's own wake is being retried, a turn that
+        // ends without a report is the provider's failure, not the steward's.
+        // The hold lapses on its own (backoff plus one requeue), so a retry
+        // lost to a restart resumes today's counting.
+        const retry = b.wakeRetries[b.threadId ?? ""] ?? null;
+        if (retry !== null && retry.holdUntil > now()) {
+          bb.log.debug(`stewards: ${b.entityKey}'s wake is being retried; not counting a missed report`);
+        } else {
+          const missed = b.missedReports + 1;
+          store.patch(b.id, { awaitingReport: false, missedReports: missed });
+          if (retry !== null) await clearWakeRetry(thread.id);
+          bb.log.warn(`stewards: ${b.entityKey}'s turn ended without steward_report (${missed} in a row)`);
+          if (missed >= timing.missedReportsForStuck && !store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
+            await raise(b, "stuck", `The steward ended ${missed} turns in a row without a status report. Look at the thread and say how to continue.`, "Waiting.");
+          }
         }
       }
       // Compaction makes the thread busy; a wake that finds it so waits as notes for the next idle.
@@ -6804,6 +7224,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // its next `thread.idle` records the result and wakes the steward, and
     // the sidebar does not read "hand-off lost" while it works.
     bb.events.on("thread.active", store.coalescingTool(async ({ thread }) => {
+      // BB-255: the retry's turn started, so its `awaitingReport` hold ends; a
+      // later idle counts a missed report as today if the steward still does
+      // not report. The retried request id stays recorded for the null-origin
+      // failure path.
+      const held = bindingForThread(thread.id);
+      const pendingRetry = held === null ? null : (held.wakeRetries[thread.id] ?? null);
+      if (held !== null && pendingRetry !== null && pendingRetry.holdUntil > 0) setWakeRetry(held, thread.id, { ...pendingRetry, holdUntil: 0 });
       const worker = store.worker(thread.id);
       if (worker === null) return;
       const owner = store.binding(worker.bindingId);
@@ -6824,10 +7251,65 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.failed", store.coalescingTool(async ({ thread, error }) => {
       const worker = store.worker(thread.id);
       if (worker === null || !workerInFlight(worker)) return;
+      // BB-255: turn.failed is dispatched right after this event and decides
+      // whether a plugin-sent spawn message is retried. One macrotask lets it
+      // record that decision before the worker is reported failed.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      // A retry being decided (the in-flight set) or already recorded (the
+      // binding's map) wins over this report; the retry's own failure at the
+      // cap marks the worker failed from `giveUpFailedWake`.
+      if (wakeRetryInFlight.has(thread.id)) return;
+      if (bindingForThread(thread.id)?.wakeRetries[thread.id] !== undefined) return;
+      const after = store.worker(thread.id);
+      if (after === null || !workerInFlight(after)) return;
       store.setWorker(thread.id, "failed", error);
       await closeRequesterNeed(thread.id);
-      store.note(worker.bindingId, `Worker "${worker.title}" failed: ${error ?? "no detail"}`);
-      scheduleReconcile(worker.bindingId);
+      store.note(after.bindingId, `Worker "${after.title}" failed: ${error ?? "no detail"}`);
+      scheduleReconcile(after.bindingId);
+    }));
+
+    /**
+     * BB-255: a turn failed. The plugin retries its own failed wake when the
+     * provider's failure is one a retry can fix, and surfaces the failure when
+     * it cannot. `originPluginId` (bb 0.49) names the sender; a retry's own
+     * failure arrives with a null origin, recognised by the request id the
+     * plugin recorded when it scheduled that retry.
+     */
+    bb.events.on("turn.failed", store.coalescingTool(async (event) => {
+      const e = event as {
+        threadId: string;
+        requestId: string;
+        errorInfo: ProviderErrorInfo | null;
+        rateLimits: ProviderRateLimitState | null;
+        attemptNumber: number;
+        originPluginId?: string | null;
+      };
+      const binding = bindingForThread(e.threadId);
+      const worker = store.worker(e.threadId);
+      const project = store.projectByThread(e.threadId);
+      const own = e.originPluginId === bb.pluginId;
+      const retry = binding === null ? null : (binding.wakeRetries[e.threadId] ?? null);
+      // The chain this failure belongs to: the turn event's `retryOfRequestId`
+      // for a retry (whichever plugin queued it), or the request itself for an
+      // original. Matching the chain, not one request id, recognises a retry
+      // provider-retry won the race to queue.
+      const rootRequestId = own ? e.requestId : e.originPluginId === null ? await retryChainRoot(e.threadId, e.requestId) : null;
+      const knownRoot = chainRootFor(e.threadId);
+      const retried = e.originPluginId === null && rootRequestId !== null && knownRoot !== null && rootRequestId === knownRoot;
+      // A foreign or unrecognised null origin is left alone.
+      if (!own && !retried) return;
+      // At most one pending retry per thread: a repeat of the original failure
+      // (or any event but the recorded retry's own) is ignored while one is
+      // pending. A newer wake the plugin sent clears the record (see `send`).
+      if (!retried && (retry !== null || hasRetriedRequest(e.threadId))) return;
+      if (binding === null && project === null) return;
+      wakeRetryInFlight.add(e.threadId);
+      try {
+        const handled = await retryFailedWake({ threadId: e.threadId, requestId: e.requestId, rootRequestId: rootRequestId ?? e.requestId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, rateLimits: e.rateLimits, binding, worker });
+        if (!handled) await giveUpFailedWake({ threadId: e.threadId, attemptNumber: e.attemptNumber, errorInfo: e.errorInfo, binding, worker });
+      } finally {
+        wakeRetryInFlight.delete(e.threadId);
+      }
     }));
 
     // An archived steward is still bound: a wake brings it back, whoever
@@ -7387,6 +7869,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -7488,6 +7971,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -7599,6 +8083,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
@@ -7929,6 +8414,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
     };
     bb.rpc.register(rpcContract, measuredHandlers("rpc", rawRpcHandlers));
+    bb.rpc.register(retryConsentContract, { [RETRY_CONSENT_METHOD]: (input) => answerRetryConsent(input) }, { experimental_discoverable: true, experimental_description: "Declines provider retries of stewards' own wakes, which the plugin re-runs itself." });
 
     /** Stewarded projects, and those whose configuration went away but still have stewards. */
     function projectIds(configured: Iterable<string>): string[] {
@@ -8630,6 +9116,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
+            // BB-255: a report ends any wake failure and drops the steward's
+            // pending retry; a newer wake supersedes it too (see `send`).
+            wakeFailure: null,
             ready,
             deployments,
             // A deployment verdict changes a watch: the idle clock starts a new
@@ -8641,6 +9130,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(landedIn === undefined || landedIn === null ? {} : { landedIn: `${landedIn.repo}#${landedIn.number}` }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
+          // BB-255: the report supersedes any retry the plugin had pending,
+          // deleting its queued row too.
+          if (b.threadId !== null) await clearWakeRetry(b.threadId);
           if (noteBeyondMaxWait) {
             store.noteProject(b.projectId, `${b.entityKey} reported a dated wait beyond the playbook's max-wait (${formatDuration(maxWaitMs)}): waiting on ${JSON.stringify(waitingOn ?? "")} until ${iso(untilAt!)}.`);
           }
@@ -8652,6 +9144,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // closed again by syncNeeds in this same call, silently.
           const refused: string[] = [];
           let mergeFiled = false;
+          // BB-253: the gate items this report files itself (`approve-spec`,
+          // `approve-pr`, `merge`) are filed before `syncNeedsFresh` runs, so
+          // `syncNeeds`' own `needsBefore` already holds them and would never
+          // push them. Capture the open ids here and push the new ones right
+          // after the loop, before `syncNeedsFresh` (which pushes the items it
+          // files itself, so nothing is pushed twice).
+          const needsBeforeReport = new Set(store.openNeeds(b.id).map((n) => n.id));
           for (const n of input.needs ?? []) {
             // The plugin files the gate items (approve-spec, approve-pr, merge);
             // a credential, a step outside the repos or a decision is an
@@ -8691,6 +9190,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             });
             if (n.kind === "merge") mergeFiled = true;
           }
+          await pushNewGateNeeds(b, needsBeforeReport);
           // BB-175: filing a merge item hands the merge to a person, so the
           // binding's workers are done. Stop them now, keeping each result, so
           // a `finished` record cannot deadlock the item it was filed to
@@ -9392,12 +9892,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 store.setEscalationRationale(q.id, ROUTINE_RATIONALE_WHY);
               }
             }
-            if (approvalToUser && target.lastSnapshot !== null) fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
+            // BB-253: the forwarded decision, configuration or secret is the
+            // only live signal once the project steward's thread is muted, so
+            // push it once, with the question as the body and the project
+            // steward's thread (which holds it) as the tap target.
+            if (q !== null) {
+              const heading = resolutionKind === "secret" ? "needs a secret" : resolutionKind === "done" ? "needs configuration" : "needs a decision";
+              await pushNeed(target, { id: q.id, title: `${target.entityKey} ${heading}`, body: forwarding.question, threadId: store.project(target.projectId).threadId });
+            }
+            if (approvalToUser && target.lastSnapshot !== null) {
+              const before = new Set(store.openNeeds(target.id).map((n) => n.id));
+              fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
+              await pushNewGateNeeds(target, before);
+            }
             if (prToUser) {
               // The user's page item carries the same decide-list listing the
               // project steward was shown, so the approval route is legible
               // (BB-135).
+              const before = new Set(store.openNeeds(target.id).map((n) => n.id));
               await fileForwardedApprovePrNeed(approvalsCtx, target, forwarding);
+              await pushNewGateNeeds(target, before);
             }
             // BB-213: a forward that reaches the user files the real item, so
             // the auto-filed `nextAction` item closes rather than sit beside it.
@@ -9933,6 +10447,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-213: the first start after dropping the actor clause gives every
         // open actor-`user` binding the item its badge will now stand on.
         await backfillAutoNeedsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time auto-need backfill: ${errorMessage(e)}`));
+        // BB-253: mute the steward trees that already exist, once.
+        await muteStewardThreadsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time steward mute: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
         const sweeper = setInterval(() => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`)), timing.sweepMs);
         // The first sweep tells linear and github what to watch after a restart.
@@ -11196,12 +11712,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
