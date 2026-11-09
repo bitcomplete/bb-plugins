@@ -3065,5 +3065,29 @@ describe("Slack plugin", () => {
       expect(s.text(refused)).toContain("not a reason to open one");
       await s.stop();
     });
+
+    it("records a queued participant correction so its turn is still refused", async () => {
+      let sends = 0;
+      const s = await live({
+        token: "xoxp-test",
+        queued: [{ id: "q1" }],
+        send: () => (++sends === 1 ? { delivery: "sent" } : { delivery: "queued", queuedMessage: { id: "q1", updatedAt: 1 } }),
+      });
+      await s.tool("slack_start_conversation", { text: "opener", users: ["Bob"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      await tick();
+      // The participant's message is delivered (a started turn).
+      s.hooks.last().send(s.hooks.session({ opened: true, ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, owner: { id: "U0123", name: "Alice" }, comment: { text: "answer", untrusted: true } }));
+      await tick();
+      await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-owner" } as never, lastAssistantText: null });
+      await tick();
+      // The participant edits it; the correction comes back queued.
+      s.hooks.last().send(s.hooks.session({ opened: true, action: "edited", ts: "2.0", fromOwner: false, asker: { id: "U0456", name: "Bob" }, comment: { text: "better answer", untrusted: true } }));
+      await tick();
+      await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-owner" } as never, lastAssistantText: null });
+      await tick();
+      const refused = await s.tool("slack_start_conversation", { text: "hi Carol", users: ["Carol"] }, { threadId: "thr-owner", projectId: "prj-1" });
+      expect(s.text(refused)).toContain("not a reason to open one");
+      await s.stop();
+    });
   });
 });
