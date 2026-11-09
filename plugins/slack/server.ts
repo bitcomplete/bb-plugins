@@ -32,6 +32,7 @@ import {
   isForwardableFile,
   isFromOwner,
   isUntrusted,
+  openedParticipantWake,
   parseChannelMap,
   parseConfirm,
   parseLegacyChannelEntries,
@@ -1251,6 +1252,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       queuedUpdatedAt?: number;
       heldId?: string;
       confirmed?: boolean;
+      /** True when a participant in a conversation bb opened sent it (BB-262). */
+      participant?: boolean;
     };
 
     /** Remember a wake's delivery, keyed by `ts`; bounded to the last few. */
@@ -1267,6 +1270,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         text: wake.text,
         files: wake.files,
         confirmed: wake.confirmed ?? false,
+        participant: wake.participant ?? false,
         at: deps.now(),
       };
       const next = [...r.wakes.filter((w) => w.ts !== wake.ts), entry].slice(-WAKE_MAP_MAX);
@@ -1389,18 +1393,21 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * steer that joins a running turn shares that turn's reply, and one that
      * starts a turn keeps its own.
      */
-    async function steerCorrection(event: SessionEvent, record: SessionRecord, correction: string, options: { owesReply: boolean; noReplyNote?: string; dropOriginal?: boolean }): Promise<void> {
+    async function steerCorrection(event: SessionEvent, record: SessionRecord, correction: string, options: { owesReply: boolean; noReplyNote?: string; dropOriginal?: boolean; framed?: boolean }): Promise<SendOutcome | null> {
       const threadId = record.threadId;
       if (threadId === null) {
         bb.log.info(`Slack session ${sessionLogId(event.session)}: no bb thread to steer for a ${event.action}; ignored`);
-        return;
+        return null;
       }
       // Read before the send. A reply that lands while the send is in flight
       // makes an edit look not-late here, so it is not parked: the pre-existing
       // narrow window where the "already has its reply" failure can return.
       const before = sessions.get(event.session);
       if (options.owesReply && event.tagged) countWake(event);
-      const body = `[Slack — session ${event.session}]\n${correction}${options.owesReply ? `\n\nReply in Slack with the slack_reply tool (session ${event.session}). If the message needs no answer, use the slack_ack tool (session ${event.session}) instead.` : `\n\n${options.noReplyNote ?? "No reply is needed for this deletion."}`}`;
+      // `framed` means the caller already built the whole body (an opened
+      // conversation's participant framing); otherwise this wraps it with the
+      // session header and the reply/note line.
+      const body = options.framed === true ? correction : `[Slack — session ${event.session}]\n${correction}${options.owesReply ? `\n\nReply in Slack with the slack_reply tool (session ${event.session}). If the message needs no answer, use the slack_ack tool (session ${event.session}) instead.` : `\n\n${options.noReplyNote ?? "No reply is needed for this deletion."}`}`;
       // Only an edit owes a reply, so only an edit shows the thinking indicator.
       // A deletion that starts a turn is answered silently, and nothing would
       // clear an indicator it never owed a reply for.
@@ -1410,11 +1417,11 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       if (outcome.kind === "gone") {
         bb.log.info(`Slack session ${sessionLogId(event.session)}'s bb thread ${threadId} is gone; forgetting it`);
         forgetThread(threadId);
-        return;
+        return null;
       }
       if (outcome.kind === "failed") {
         await backstop(event.session, "Your bb could not deliver a correction to its thread. Try again in a moment.", event.tagged ? "tagged" : "untagged");
-        return;
+        return outcome;
       }
       if (options.owesReply && event.tagged) {
         if (outcome.kind === "steered") {
@@ -1434,6 +1441,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         const current = sessions.get(event.session);
         if (current !== undefined && current.answered < current.events) await uncountWake(event.session);
       }
+      return outcome;
     }
 
     /** An owner's edit of a delivered wake: rewrite the queued row, or steer. */
@@ -1564,11 +1572,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         }
         if (openedHere && isUntrusted(event)) {
           // The original was delivered as information in a conversation bb
-          // opened; the correction is too, so it steers without a hold and
-          // owes no reply.
+          // opened; the correction is too, so it steers with the same author
+          // and untrusted framing, without a hold and owing no reply.
           const quote = clipMention(wake.text, 200);
           const now = clipMention(event.comment.text, 200);
-          await steerCorrection(event, record, `the message "${quote}" was edited; it now reads: "${now}"`, { owesReply: false, noReplyNote: "No reply is needed for this correction." });
+          const correction = `the message "${quote}" was edited; it now reads: "${now}"`;
+          const outcome = await steerCorrection(event, record, openedParticipantWake(event, correction), { owesReply: false, framed: true });
+          if (outcome !== null && (outcome.kind === "started" || outcome.kind === "queued")) markParticipantTurn(record.threadId);
           updateWake(event.session, event.ts, { text: event.comment.text, state: "started" });
           return;
         }
@@ -1784,7 +1794,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           // The message is a queued row whose turn has not started. Record it so
           // a later edit rewrites the row and a later deletion removes it.
           await markHanded(event.session, handedAt);
-          recordWake(event.session, { ts: event.ts, state: "queued", queuedMessageId: outcome.queuedMessageId, queuedUpdatedAt: outcome.queuedUpdatedAt, text: event.comment.text, files: event.files, confirmed: confirmed !== null });
+          recordWake(event.session, { ts: event.ts, state: "queued", queuedMessageId: outcome.queuedMessageId, queuedUpdatedAt: outcome.queuedUpdatedAt, text: event.comment.text, files: event.files, confirmed: confirmed !== null, participant: openedParticipant });
           recordTranscript(event.session, { role: "asker", name: asker.name, text: asker.text, at: deps.now() });
           // The row starts a turn when it drains, so mark the thread now: the
           // tool cannot be called before that turn exists.
@@ -1890,6 +1900,11 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return;
       }
       const stillQueued = (r: SessionRecord) => r.wakes.some((w) => w.state === "queued" && w.queuedMessageId !== "" && queuedIds.has(w.queuedMessageId));
+      // A participant's queued wake has not started its turn yet, so its mark
+      // must survive this older turn's idle (BB-262).
+      if (mine.some(([, r]) => r.wakes.some((w) => w.participant && w.state === "queued" && w.queuedMessageId !== "" && queuedIds.has(w.queuedMessageId)))) {
+        participantStartedTurns.add(threadId);
+      }
       // A steer joined the turn that just ended, whichever turn that was;
       // `steeredAt` says so even when the turn's own input never named it. A
       // steer or wake newer than this idle belongs to the next one, so this
@@ -1952,6 +1967,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // 0 (or anything that is not a positive number) turns the sweep off.
       if (!(hours > 0)) return;
       const cutoff = deps.now() - hours * 60 * 60 * 1000;
+      // Threads that still hold an opened conversation newer than the cutoff:
+      // never archive one of them because a different session on it went idle
+      // (BB-262).
+      const openedLiveThreads = new Set<string>();
+      for (const [, r] of sessions) {
+        if (r.opened && r.threadId !== null && r.eventAt >= cutoff) openedLiveThreads.add(r.threadId);
+      }
       // Snapshot the map: archiving fires `thread.archived`, whose handler
       // mutates it as the sweep walks it.
       for (const [session, record] of [...sessions]) {
@@ -1971,6 +1993,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         }
         const threadId = record.threadId;
         if (threadId === null) continue;
+        // A thread that still holds a live opened conversation is that
+        // conversation's watcher; never archive it because another session on
+        // it went idle (BB-262).
+        if (openedLiveThreads.has(threadId)) continue;
         try {
           const thread = await bb.sdk.threads.get({ threadId });
           if (thread.archivedAt !== null || thread.deletedAt !== null || thread.pinnedAt !== null) continue;
