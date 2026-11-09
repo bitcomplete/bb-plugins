@@ -23,6 +23,8 @@ export type WakeSourceInput = {
   hold: string | null;
   /** Entity keys the hold waits behind; a hold with entries lifts itself when they land. */
   holdBehind: readonly string[];
+  /** Entity keys whose work must finish before this binding's pull request merges (BB-256); a merge hold with entries lifts itself when they land. */
+  mergeBehind: readonly string[];
   /** Entity keys whose open pull request the hold waits for (a stack-wait, BB-215); it lifts when one opens. */
   holdStack: readonly string[];
   /** Per-pull-request deployment watches; `merged` and `deploying` are the live ones. */
@@ -39,13 +41,15 @@ export type WakeSourceInput = {
 
 /**
  * Whether anything the plugin tracks will wake this binding. The list is the
- * one in the ticket's criterion 1: an open `holdBehind` entry, a deployment
- * watch in `merged`/`deploying`, a running worker, an open escalation or need,
- * or a pull-request watch. A free-text `waitingOn` is not on it.
+ * one in the ticket's criterion 1: an open `holdBehind` entry, an open
+ * `mergeBehind` entry (BB-256), a deployment watch in `merged`/`deploying`, a
+ * running worker, an open escalation or need, or a pull-request watch. A
+ * free-text `waitingOn` is not on it.
  */
 export function hasLiveWakeSource(s: WakeSourceInput): boolean {
   return (
     (s.hold !== null && (s.holdBehind.length > 0 || s.holdStack.length > 0)) ||
+    s.mergeBehind.length > 0 ||
     Object.values(s.deployments).some((d) => d.state === "merged" || d.state === "deploying") ||
     s.runningWorkers > 0 ||
     s.openEscalations > 0 ||
