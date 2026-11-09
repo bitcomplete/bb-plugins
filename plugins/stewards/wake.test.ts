@@ -388,8 +388,10 @@ describe("the nightly prompt", () => {
   it("carries the rule that the plugin merges a gate-met pull request (BB-257)", () => {
     const rules = STANDING_RULES.join("\n");
     expect(rules).toMatch(/The plugin merges once the lane gate is met/u);
+    expect(rules).toMatch(/targets the default branch/u);
     expect(rules).toMatch(/a ticket binding always does/u);
     expect(rules).toMatch(/`may` includes `merge`/u);
+    expect(rules).toMatch(/stacked pull request/u);
     expect(rules).toMatch(/Do not file a Merge item/u);
   });
 
