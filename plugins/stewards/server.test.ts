@@ -888,21 +888,21 @@ describe("a Linear ticket steward", () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace(
       "  In Progress: { stage: build, stuck: 2d }",
-      '  In Progress: { stage: build, stuck: 2d }\n  "label:goal:awaiting-outcome": { stage: spec, stuck: 120d }',
-    ).replace("## In Review", "## label:goal:awaiting-outcome\n\nWait for the outcome.\n\n## In Review");
+      '  In Progress: { stage: build, stuck: 2d }\n  "label:initiative:awaiting-outcome": { stage: spec, stuck: 120d }',
+    ).replace("## In Review", "## label:initiative:awaiting-outcome\n\nWait for the outcome.\n\n## In Review");
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("Todo");
     t.sends.length = 0;
     // The label moves the phase; the state stays `Todo`.
-    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal:awaiting-outcome"] }));
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "initiative:awaiting-outcome"] }));
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("label:goal:awaiting-outcome");
+    expect(t.hooks.store.find("ENG-12", "p1")!.phase).toBe("label:initiative:awaiting-outcome");
     const wakes = t.sends.filter((s) => s.threadId === steward);
     expect(wakes).toHaveLength(1);
-    expect(wakes[0]!.text).toMatch(/Phase: Todo → label:goal:awaiting-outcome/u);
-    expect(wakes[0]!.text).toContain("### label:goal:awaiting-outcome");
+    expect(wakes[0]!.text).toMatch(/Phase: Todo → label:initiative:awaiting-outcome/u);
+    expect(wakes[0]!.text).toContain("### label:initiative:awaiting-outcome");
     expect(wakes[0]!.text).toContain("Wait for the outcome.");
   });
 
@@ -2623,43 +2623,43 @@ describe("escalations delivered once, updates safe to retry", () => {
   });
 });
 
-// BB-243: a goal is a ticket under the `goal` playbook. All three endings
-// (reached, superseded, retired) are the goal closing; a child's merge is not
-// one, so the binding carries on. The fixture is a fake goal, never the pilot's.
-describe("goal endings end the binding (BB-243)", () => {
-  const GOAL = LINEAR_TICKETS.replace("name: linear-tickets", "name: goal");
-  async function goalBinding() {
+// BB-243: an initiative is a ticket under the `initiative` playbook. All three endings
+// (reached, superseded, retired) are the initiative closing; a child's merge is not
+// one, so the binding carries on. The fixture is a fake initiative, never the pilot's.
+describe("initiative endings end the binding (BB-243)", () => {
+  const INITIATIVE = LINEAR_TICKETS.replace("name: linear-tickets", "name: initiative");
+  async function initiativeBinding() {
     const t = await setup();
     const file = JSON.parse(t.files[PROJECT_FILE]!) as { playbooks?: Record<string, string> };
-    file.playbooks = { ticket: "goal" };
+    file.playbooks = { ticket: "initiative" };
     t.files[PROJECT_FILE] = JSON.stringify(file);
-    t.files[playbookPath("goal")] = GOAL;
-    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal"], state: "In Progress", stateType: "started" }));
+    t.files[playbookPath("initiative")] = INITIATIVE;
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "initiative"], state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     return { t, steward: t.spawns[1]!.id };
   }
-  const closeGoal = async (t: Awaited<ReturnType<typeof goalBinding>>["t"], steward: string, state: string, stateType: string) => {
-    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal"], state, stateType }));
+  const closeInitiative = async (t: Awaited<ReturnType<typeof initiativeBinding>>["t"], steward: string, state: string, stateType: string) => {
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "initiative"], state, stateType }));
     await t.ring("linear", "uuid-12");
     await t.tool("steward_report", { phase: state, summary: "Ending.", nextAction: "Nothing", actor: "steward" }, steward);
     await t.idle(steward);
   };
 
   it("ends on reached (Done), and not on a child merge", async () => {
-    const { t, steward } = await goalBinding();
-    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goal", endedAt: null });
-    // A child merging does not close the goal, so the binding carries on.
-    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "goal"], state: "In Progress", stateType: "started", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    const { t, steward } = await initiativeBinding();
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiative", endedAt: null });
+    // A child merging does not close the initiative, so the binding carries on.
+    t.entities.set("uuid-12", issue({ labels: ["bb-managed", "initiative"], state: "In Progress", stateType: "started", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: null });
     // Reached: Done ends the binding once the wrap-up turn is over.
-    await closeGoal(t, steward, "Done", "completed");
+    await closeInitiative(t, steward, "Done", "completed");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "terminal" });
   });
 
   it("ends on retired (Canceled)", async () => {
-    const { t, steward } = await goalBinding();
-    await closeGoal(t, steward, "Canceled", "canceled");
+    const { t, steward } = await initiativeBinding();
+    await closeInitiative(t, steward, "Canceled", "canceled");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "terminal" });
   });
 });
@@ -3544,29 +3544,29 @@ describe("check --create-labels (BB-236)", () => {
 // BB-248: a playbook phase keyed `label:<name>` is checked as a label, not as
 // a missing workflow state, on Linear and GitHub alike.
 describe("check on a `label:` phase key (BB-248)", () => {
-  const withLabel = (text: string, stateLine: string) => text.replace(stateLine, `${stateLine}\n  "label:goal:awaiting-outcome": { stage: build, stuck: 120d }`);
+  const withLabel = (text: string, stateLine: string) => text.replace(stateLine, `${stateLine}\n  "label:initiative:awaiting-outcome": { stage: build, stuck: 120d }`);
 
   it("checks a Linear label phase key as a label, not a missing workflow state", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = withLabel(LINEAR_TICKETS, "  In Progress: { stage: build, stuck: 2d }");
-    t.setMissingLabel("linear", "ENG", ["goal:awaiting-outcome"]);
+    t.setMissingLabel("linear", "ENG", ["initiative:awaiting-outcome"]);
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.exitCode).toBe(1);
-    expect(check.stdout).toMatch(/problem: linear: ENG has no label goal:awaiting-outcome/u);
-    expect(check.stdout).not.toMatch(/has no state (?:label:)?goal:awaiting-outcome/u);
+    expect(check.stdout).toMatch(/problem: linear: ENG has no label initiative:awaiting-outcome/u);
+    expect(check.stdout).not.toMatch(/has no state (?:label:)?initiative:awaiting-outcome/u);
     // The label is read through the source's single-label field, with no states.
     const calls = t.rpcCalls.filter((c) => c.method === "sourceValidate" && c.pluginId === "linear");
-    expect(calls.some((c) => c.input.label === "goal:awaiting-outcome" && (c.input.states as string[]).length === 0)).toBe(true);
+    expect(calls.some((c) => c.input.label === "initiative:awaiting-outcome" && (c.input.states as string[]).length === 0)).toBe(true);
   });
 
   it("checks a GitHub repo label phase key the same way", async () => {
     const t = await setup();
     t.files[playbookPath("github-issues")] = withLabel(GITHUB_ISSUES, "  status:in-progress: { stage: build, stuck: 2d }");
-    t.setMissingLabel("github", "acme/web", ["goal:awaiting-outcome"]);
+    t.setMissingLabel("github", "acme/web", ["initiative:awaiting-outcome"]);
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.exitCode).toBe(1);
-    expect(check.stdout).toMatch(/problem: github: acme\/web has no label goal:awaiting-outcome/u);
-    expect(check.stdout).not.toMatch(/has no state (?:label:)?goal:awaiting-outcome/u);
+    expect(check.stdout).toMatch(/problem: github: acme\/web has no label initiative:awaiting-outcome/u);
+    expect(check.stdout).not.toMatch(/has no state (?:label:)?initiative:awaiting-outcome/u);
   });
 
   it("is silent when the label exists, and existing playbooks are unchanged", async () => {
@@ -3574,7 +3574,7 @@ describe("check on a `label:` phase key (BB-248)", () => {
     t.files[playbookPath("linear-tickets")] = withLabel(LINEAR_TICKETS, "  In Progress: { stage: build, stuck: 2d }");
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.exitCode).toBe(0);
-    expect(check.stdout).not.toMatch(/goal:awaiting-outcome/u);
+    expect(check.stdout).not.toMatch(/initiative:awaiting-outcome/u);
   });
 });
 
@@ -4049,28 +4049,28 @@ describe("role-owned pull watches (BB-164)", () => {
 // issue's labels and title, before the kind's default. The first watch wins;
 // with none, adoption is unchanged. It is the mirror of the pull watches.
 describe("project-level ticket watches (BB-246)", () => {
-  const GOALS = LINEAR_TICKETS.replace("name: linear-tickets", "name: goals");
-  const GITHUB_GOALS = GITHUB_ISSUES.replace("name: github-issues", "name: goals");
+  const INITIATIVES = LINEAR_TICKETS.replace("name: linear-tickets", "name: initiatives");
+  const GITHUB_INITIATIVES = GITHUB_ISSUES.replace("name: github-issues", "name: initiatives");
   const project = (tickets: unknown) => JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, tickets });
 
   it("adopts a labelled, assigned Linear ticket matching a watch under its playbook, and records the watch", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"], title: "docs: *" }, playbook: "goals" }]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"], title: "docs: *" }, playbook: "initiatives" }]);
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     t.entities.set("uuid-12", issue({ labels: ["bb-managed", "docs"], title: "Docs: rewrite" }));
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12", "p1")!;
-    expect(b).toMatchObject({ kind: "ticket", playbook: "goals", adoptedBy: "goals@ticket", endedAt: null });
+    expect(b).toMatchObject({ kind: "ticket", playbook: "initiatives", adoptedBy: "initiatives@ticket", endedAt: null });
     expect(b.threadId).not.toBeNull();
     // The title glob matched ignoring case, and `list` names the watch.
     const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
-    expect(list.stdout).toMatch(/adopted by goals@ticket/u);
+    expect(list.stdout).toMatch(/adopted by initiatives@ticket/u);
   });
 
   it("adopts a ticket matching no watch under the kind's default playbook, as before", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "goals" }]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "initiatives" }]);
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     t.entities.set("uuid-12", issue({ labels: ["bb-managed"], title: "Fix login" }));
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "linear-tickets", adoptedBy: null });
@@ -4079,19 +4079,19 @@ describe("project-level ticket watches (BB-246)", () => {
   it("takes the first matching watch, so order decides", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[PROJECT_FILE] = project([
-      { match: { labels: ["docs"] }, playbook: "goals" },
+      { match: { labels: ["docs"] }, playbook: "initiatives" },
       { match: { title: "Docs: *" }, playbook: "linear-tickets" },
     ]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     t.entities.set("uuid-12", issue({ labels: ["bb-managed", "docs"], title: "Docs: rewrite" }));
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals", adoptedBy: "goals@ticket" });
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiatives", adoptedBy: "initiatives@ticket" });
   });
 
   it("matches every named label ignoring case, and falls through when one is missing", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    t.files[PROJECT_FILE] = project([{ match: { labels: ["Docs", "v2"] }, playbook: "goals" }]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["Docs", "v2"] }, playbook: "initiatives" }]);
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     // Missing `v2`: no match, so the default.
     t.entities.set("uuid-12", issue({ labels: ["bb-managed", "DOCS"] }));
     await t.ring("linear", "uuid-12");
@@ -4099,17 +4099,17 @@ describe("project-level ticket watches (BB-246)", () => {
     // Both present, ignoring case: the watch.
     t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", labels: ["bb-managed", "docs", "V2"] }));
     await t.ring("linear", "uuid-13");
-    expect(t.hooks.store.find("ENG-13", "p1")).toMatchObject({ playbook: "goals" });
+    expect(t.hooks.store.find("ENG-13", "p1")).toMatchObject({ playbook: "initiatives" });
   });
 
   it("adopts a labelled, assigned GitHub issue matching a watch under its playbook", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "goals" }]);
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "initiatives" }]);
     t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
-    t.files[playbookPath("goals")] = GITHUB_GOALS;
+    t.files[playbookPath("initiatives")] = GITHUB_INITIATIVES;
     t.entities.set("acme/web#14", githubIssue({ id: "acme/web#14", key: "acme/web#14", labels: ["bb-managed", "status:todo", "docs"] }));
     await t.ring("github", "acme/web#14");
-    expect(t.hooks.store.find("acme/web#14", "p1")).toMatchObject({ source: "github", playbook: "goals", adoptedBy: "goals@ticket" });
+    expect(t.hooks.store.find("acme/web#14", "p1")).toMatchObject({ source: "github", playbook: "initiatives", adoptedBy: "initiatives@ticket" });
   });
 
   it("adopts nothing when the matched watch's playbook is missing or not a ticket playbook", async () => {
@@ -4128,15 +4128,15 @@ describe("project-level ticket watches (BB-246)", () => {
 
   it("does not re-route an adopted binding when the watch's label changes", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "goals" }]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "initiatives" }]);
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     t.entities.set("uuid-12", issue({ labels: ["bb-managed", "docs"] }));
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals" });
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiatives" });
     // Removing the watch's label leaves the playbook alone; the label still holds it.
     t.entities.set("uuid-12", issue({ labels: ["bb-managed"] }));
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals", endedAt: null });
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiatives", endedAt: null });
     // A ticket adopted under the default does not switch when the label arrives.
     t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", labels: ["bb-managed"] }));
     await t.ring("linear", "uuid-13");
@@ -4148,22 +4148,22 @@ describe("project-level ticket watches (BB-246)", () => {
 
   it("keeps an adopted ticket's playbook after its watch is removed, until the playbook file itself goes", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "goals" }]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[PROJECT_FILE] = project([{ match: { labels: ["docs"] }, playbook: "initiatives" }]);
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     t.entities.set("uuid-12", issue({ labels: ["bb-managed", "docs"] }));
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals", adoptedBy: "goals@ticket" });
-    // The watch is removed, but `goals.md` remains: the binding keeps running
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiatives", adoptedBy: "initiatives@ticket" });
+    // The watch is removed, but `initiatives.md` remains: the binding keeps running
     // under it, and `check` reports no problem for the removed watch.
     t.files[PROJECT_FILE] = project([]);
     t.hooks.forgetConfigs();
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "goals", endedAt: null });
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiatives", endedAt: null });
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
-    expect(check.stdout).not.toMatch(/goals/u);
+    expect(check.stdout).not.toMatch(/initiatives/u);
     // With the playbook file gone too, and no last-good copy, it ends.
-    delete t.files[playbookPath("goals")];
-    await t.bb.storage.kv.delete("good/p1/playbook/goals");
+    delete t.files[playbookPath("initiatives")];
+    await t.bb.storage.kv.delete("good/p1/playbook/initiatives");
     t.hooks.forgetConfigs();
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "unconfigured" });
@@ -4177,12 +4177,12 @@ describe("project-level ticket watches (BB-246)", () => {
     expect(check.stdout).toMatch(/tickets\[0\].*"gone".*does not exist/);
     expect(check.stdout).toMatch(/tickets\[1\].*"github-prs" is a pr playbook, not a ticket playbook/);
     // A project with a valid ticket watch names it and passes.
-    t.files[PROJECT_FILE] = project([{ playbook: "goals" }]);
-    t.files[playbookPath("goals")] = GOALS;
+    t.files[PROJECT_FILE] = project([{ playbook: "initiatives" }]);
+    t.files[playbookPath("initiatives")] = INITIATIVES;
     t.hooks.forgetConfigs();
     const good = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(good.exitCode).toBe(0);
-    expect(good.stdout).toMatch(/tickets: goals@ticket/u);
+    expect(good.stdout).toMatch(/tickets: initiatives@ticket/u);
   });
 });
 

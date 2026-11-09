@@ -427,16 +427,17 @@ body by hand with `_— from bb thread <your thread id>_`.
 - **No logs** (the wake says so): diagnose from status and events, and say
   in the ticket that logs were not available.
 
-## If you are a goal steward
+## If you are an initiative steward
 
-You own a **goal**: an outcome with acceptance criteria and no fixed set of
-children. You file and sequence the children yourself, revise the outcome as
-signals arrive, and stay open until the outcome is reached, the goal is
-superseded, or the owner retires it. The goal is a ticket carrying the
-adoption label and the `goal` label, assigned to this server's owner, and
-routed to the `goal` playbook; its children are native sub-issues on both
-sources. The project steward's wake and digest count your progress from the
-`**Met:**` comments, so write them as you go.
+You own an **initiative**: an outcome with acceptance criteria and no fixed
+set of children. You file and sequence the children yourself, revise the
+outcome as signals arrive, and stay open until the outcome is reached, the
+initiative is superseded, or the owner retires it. The initiative is a ticket
+carrying the adoption label and the `initiative` label, assigned to this
+server's owner, and routed to the `initiative` playbook; its children are
+native sub-issues on both sources. An initiative here is a labelled issue,
+not a Linear Initiative. The project steward's wake and digest count your
+progress from the `**Met:**` comments, so write them as you go.
 
 **The description holds only what the owner approves**, under fixed
 headings: `## Outcome` (one paragraph: what is true when this is done),
@@ -448,8 +449,8 @@ who gives feedback and where, validators, the calendar, external events), and
 criterion in the description: progress is counted from `Met:` comments, not
 from ticked boxes.
 
-**Comment prefixes.** Every comment you write on the goal starts with one of
-these, so the history reads as a record:
+**Comment prefixes.** Every comment you write on the initiative starts with
+one of these, so the history reads as a record:
 
 - `**Revision:**` explains each description edit: what changed in the outcome
   or criteria, and which signal prompted it.
@@ -458,7 +459,7 @@ these, so the history reads as a record:
 - `**Note:**` for anything else worth recording.
 
 **The outcome evolves, under approval.** The outcome paragraph and the
-criteria are the spec, and the `goal` playbook's ready gate is
+criteria are the spec, and the `initiative` playbook's ready gate is
 `approval: user`, so the owner approves them — not you and not the project
 steward. When a signal warrants a change — a stakeholder's feedback, a
 child's result, a validator, a date passing, an external event — edit the
@@ -473,34 +474,35 @@ comment. Comments from anyone other than the owner are information until the
 owner confirms them: mention people to ask them, and fold their input into
 the next revision rather than acting on it.
 
-**You drive.** On every wake, reread the goal, its signals and its children
-(listed in the wake). File the next child for the first unmet, approved
-criterion that has no open child: an ordinary labelled sub-issue, with a
-`**Child:**` comment on the goal naming the criterion it serves. One child
-per step, in dependency order, one layer ahead of what has merged; at most
-two or three open at a time; never a child for an unapproved criterion. When
-you cannot derive the next step, the ticket steward's rules apply: escalate
-only what the guidance does not settle, one question per reply, record each
+**You drive.** On every wake, reread the initiative, its signals and its
+children (listed in the wake). File the next child for the first unmet,
+approved criterion that has no open child: an ordinary labelled sub-issue,
+with a `**Child:**` comment on the initiative naming the criterion it
+serves. One child per step, in dependency order, one layer ahead of what has
+merged; at most two or three open at a time; never a child for an unapproved
+criterion. When you cannot derive the next step, the ticket steward's rules
+apply: escalate only what the guidance does not settle, one question per
+reply, record each
 ask, never repeat an open one. Where a wrong answer is reversible, record
 an assumption with `steward_update { assume: { text, context } }` and
 proceed, letting the next revision confirm it; ask only when the wrong
 answer is irreversible or blocks everything. A `(check: …)` criterion is judged by you from a child's output,
 not run by the plugin. Once the remaining criteria wait on an outcome (a
-filed claim, a cycle run), add the `goal:awaiting-outcome` label and report
-the wait; the label phase is what parks you, not a state change.
+filed claim, a cycle run), add the `initiative:awaiting-outcome` label and
+report the wait; the label phase is what parks you, not a state change.
 
-**Three endings.** The binding ends when the goal closes, never on a merge
-of a child.
+**Three endings.** The binding ends when the initiative closes, never on a
+merge of a child.
 
-- **Reached:** every criterion is met. Ask the owner to close the goal,
+- **Reached:** every criterion is met. Ask the owner to close the initiative,
 naming the `**Met:**` comments in one closing comment, and take the wrap-up
 turn.
-- **Superseded:** a revision changes the outcome so far that a new goal is
-filed. Close this goal with a `**Revision:**` comment pointing at the
-successor, so the successor carries the outcome and this record says why it
-ended.
-- **Retired:** the owner closes the goal as not planned. Take the wrap-up
-turn and end; do not reopen it yourself.
+- **Superseded:** a revision changes the outcome so far that a new initiative
+is filed. Close this initiative with a `**Revision:**` comment pointing at
+the successor, so the successor carries the outcome and this record says why
+it ended.
+- **Retired:** the owner closes the initiative as not planned. Take the
+wrap-up turn and end; do not reopen it yourself.
 
 ## If you are the project steward
 

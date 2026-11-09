@@ -7,7 +7,7 @@ import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
-import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, goalProgress, goalProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, initiativeProgress, initiativeProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 import { BRIEF_MAX_CHARS } from "./server.js";
 import type { OpsFinding } from "./ops.js";
 import type { DepsFinding } from "./deps.js";
@@ -736,7 +736,7 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
   });
 });
 
-describe("goal progress (BB-243)", () => {
+describe("initiative progress (BB-243)", () => {
   const description = [
     "## Outcome",
     "",
@@ -752,21 +752,21 @@ describe("goal progress (BB-243)", () => {
     "",
     "The progress file.",
   ].join("\n");
-  const goal = (over: Partial<EntitySnapshot> = {}) => issue({ labels: ["bb-managed", "goal"], description, ...over });
+  const initiative = (over: Partial<EntitySnapshot> = {}) => issue({ labels: ["bb-managed", "initiative"], description, ...over });
   const met = (text: string, id = text) => comment({ id, body: `**Met:** ${text}` });
 
   it("counts distinct Met: comments against the description's criteria", () => {
     const { s, bind } = world();
-    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments: [met("Scope memo approved (owner)"), met("Expenses gathered (check: npm run expenses)")] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 2, criteria: 3, capped: false });
-    expect(goalProgressFlag(b)).toBe("goal met 2/3");
+    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: initiative({ comments: [met("Scope memo approved (owner)"), met("Expenses gathered (check: npm run expenses)")] }), pulls: [] } });
+    expect(initiativeProgress(b)).toEqual({ met: 2, criteria: 3, capped: false });
+    expect(initiativeProgressFlag(b)).toBe("criteria 2/3");
   });
 
   it("counts a criterion once when its Met: comment repeats", () => {
     const { s, bind } = world();
-    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments: [met("Scope memo approved (owner)", "c1"), met("scope   memo approved (owner)", "c2")] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 1, criteria: 3, capped: false });
-    expect(goalProgressFlag(b)).toBe("goal met 1/3");
+    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: initiative({ comments: [met("Scope memo approved (owner)", "c1"), met("scope   memo approved (owner)", "c2")] }), pulls: [] } });
+    expect(initiativeProgress(b)).toEqual({ met: 1, criteria: 3, capped: false });
+    expect(initiativeProgressFlag(b)).toBe("criteria 1/3");
   });
 
   it("counts the criteria a signed, evidenced Met: comment names, never above the checklist", () => {
@@ -774,62 +774,62 @@ describe("goal progress (BB-243)", () => {
     const signed = (id: string, text: string) => comment({ id, body: `**Met:** ${text}\n\n_— from bb thread thr_steward_` });
     const b = s.patch(bind("ENG-12").id, {
       lastSnapshot: {
-        entity: goal({
+        entity: initiative({
           comments: [signed("c1", "Scope memo approved (owner)"), signed("c2", "Scope memo approved — see docs/memo.md"), signed("c3", "Expenses gathered (check: npm run expenses)"), signed("c4", "Claim filed (owner)")],
         }),
         pulls: [],
       },
     });
-    expect(goalProgress(b)).toEqual({ met: 3, criteria: 3, capped: false });
-    expect(goalProgressFlag(b)).toBe("goal met 3/3");
+    expect(initiativeProgress(b)).toEqual({ met: 3, criteria: 3, capped: false });
+    expect(initiativeProgressFlag(b)).toBe("criteria 3/3");
   });
 
   it("shows unknown, never 0, when no Met: comment can be read", () => {
     const { s, bind } = world();
-    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments: [] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: null, criteria: 3, capped: false });
-    expect(goalProgressFlag(b)).toBe("goal met unknown");
+    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: initiative({ comments: [] }), pulls: [] } });
+    expect(initiativeProgress(b)).toEqual({ met: null, criteria: 3, capped: false });
+    expect(initiativeProgressFlag(b)).toBe("criteria unknown");
   });
 
   it("shows a lower bound when the snapshot held a full page of comments", () => {
     const { s, bind } = world();
     const comments = Array.from({ length: 50 }, (_, i) => (i < 2 ? comment({ id: `c${i}`, body: `**Met:** ${i === 0 ? "Scope memo approved" : "Expenses gathered"}` }) : comment({ id: `c${i}`, body: `**Note:** noise ${i}` })));
-    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ comments }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 2, criteria: 3, capped: true });
-    expect(goalProgressFlag(b)).toBe("goal met ≥2/3");
+    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: initiative({ comments }), pulls: [] } });
+    expect(initiativeProgress(b)).toEqual({ met: 2, criteria: 3, capped: true });
+    expect(initiativeProgressFlag(b)).toBe("criteria ≥2/3");
   });
 
   it("shows met without a criteria count when the description has no criteria section", () => {
     const { s, bind } = world();
-    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: goal({ description: "## Outcome\n\nJust an outcome.", comments: [met("Something")] }), pulls: [] } });
-    expect(goalProgress(b)).toEqual({ met: 1, criteria: null, capped: false });
-    expect(goalProgressFlag(b)).toBe("goal met 1");
+    const b = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: initiative({ description: "## Outcome\n\nJust an outcome.", comments: [met("Something")] }), pulls: [] } });
+    expect(initiativeProgress(b)).toEqual({ met: 1, criteria: null, capped: false });
+    expect(initiativeProgressFlag(b)).toBe("criteria 1");
   });
 
-  it("knows a goal by its playbook before the first snapshot, and shows unknown", () => {
+  it("knows an initiative by its playbook before the first snapshot, and shows unknown", () => {
     const { s, bind } = world();
-    const b = s.patch(bind("ENG-12").id, { playbook: "goal" });
-    expect(goalProgress(b)).toEqual({ met: null, criteria: null, capped: false });
-    expect(goalProgressFlag(b)).toBe("goal met unknown");
+    const b = s.patch(bind("ENG-12").id, { playbook: "initiative" });
+    expect(initiativeProgress(b)).toEqual({ met: null, criteria: null, capped: false });
+    expect(initiativeProgressFlag(b)).toBe("criteria unknown");
   });
 
-  it("is null for a ticket without the goal label, and for a non-ticket", () => {
+  it("is null for a ticket without the initiative label, and for a non-ticket", () => {
     const { s, bind } = world();
     const plain = s.patch(bind("ENG-12").id, { lastSnapshot: { entity: issue({ comments: [met("Something")] }), pulls: [] } });
-    expect(goalProgress(plain)).toBeNull();
-    expect(goalProgressFlag(plain)).toBeNull();
-    expect(goalProgress({ ...plain, kind: "pr" })).toBeNull();
+    expect(initiativeProgress(plain)).toBeNull();
+    expect(initiativeProgressFlag(plain)).toBeNull();
+    expect(initiativeProgress({ ...plain, kind: "pr" })).toBeNull();
   });
 
   it("rides on the project steward's binding list and digest lines", () => {
     const { s, bind } = world();
-    const b = s.patch(bind("ENG-12").id, { status: status("Driving the goal."), advancedAt: T - 3_600_000, lastSnapshot: { entity: goal({ comments: [met("Scope memo approved (owner)"), met("Claim filed (owner)")] }), pulls: [] } });
+    const b = s.patch(bind("ENG-12").id, { status: status("Driving the initiative."), advancedAt: T - 3_600_000, lastSnapshot: { entity: initiative({ comments: [met("Scope memo approved (owner)"), met("Claim filed (owner)")] }), pulls: [] } });
     const records: DigestRecords = { previous: null, since: T - DAY, moved: [b], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [b], stall: [], held: [b] };
     const wake = formatProjectWake({ reason: "nightly", bindings: [{ binding: b, openEscalations: [] }], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records });
-    expect(wake).toContain("- ENG-12 (ticket, In Progress): Driving the goal. Next: Open the PR (steward) [goal met 2/3]");
-    expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\), moved .*\[goal met 2\/3\]/u);
-    expect(wake).toMatch(/- ENG-12: on hold: .*\[goal met 2\/3\]/u);
-    expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): waiting with no wake source.*\[goal met 2\/3\]/u);
+    expect(wake).toContain("- ENG-12 (ticket, In Progress): Driving the initiative. Next: Open the PR (steward) [criteria 2/3]");
+    expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\), moved .*\[criteria 2\/3\]/u);
+    expect(wake).toMatch(/- ENG-12: on hold: .*\[criteria 2\/3\]/u);
+    expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): waiting with no wake source.*\[criteria 2\/3\]/u);
   });
 });
 

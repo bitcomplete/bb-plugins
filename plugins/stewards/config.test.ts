@@ -368,16 +368,16 @@ describe("playbooks", () => {
   });
 
   it("keys a phase on a label with `label:<name>`, keeping it out of the states (BB-248)", () => {
-    const withLabel = parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", '  In Progress: { stage: build, stuck: 2d }\n  "label:goal:awaiting-outcome": { stage: build, stuck: 120d }'), "linear-tickets");
+    const withLabel = parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", '  In Progress: { stage: build, stuck: 2d }\n  "label:initiative:awaiting-outcome": { stage: build, stuck: 120d }'), "linear-tickets");
     if (!withLabel.ok) throw new Error(withLabel.error);
     const p = withLabel.value;
-    expect(labelPhaseName("label:goal:awaiting-outcome")).toBe("goal:awaiting-outcome");
+    expect(labelPhaseName("label:initiative:awaiting-outcome")).toBe("initiative:awaiting-outcome");
     expect(labelPhaseName("In Progress")).toBeNull();
-    expect(playbookLabels(p)).toEqual(["goal:awaiting-outcome"]);
-    expect(playbookStates(p)).not.toContain("label:goal:awaiting-outcome");
+    expect(playbookLabels(p)).toEqual(["initiative:awaiting-outcome"]);
+    expect(playbookStates(p)).not.toContain("label:initiative:awaiting-outcome");
     expect(playbookStates(p)).toContain("In Progress");
     // phaseOf still resolves the label key itself, for a binding's stored phase.
-    expect(phaseOf(p, "label:goal:awaiting-outcome")).toMatchObject({ name: "label:goal:awaiting-outcome", stage: "build" });
+    expect(phaseOf(p, "label:initiative:awaiting-outcome")).toMatchObject({ name: "label:initiative:awaiting-outcome", stage: "build" });
     // A `label:` key with no name is refused; a state-only playbook has no label keys.
     expect(parsePlaybook(LINEAR_TICKETS.replace("  In Progress: { stage: build, stuck: 2d }", '  In Progress: { stage: build, stuck: 2d }\n  "label:": { stage: build }'), "linear-tickets")).toMatchObject({ ok: false });
     const plain = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -846,29 +846,29 @@ describe("project-level ticket watches (BB-246)", () => {
   const file = (tickets: unknown) => parseProjectFile(JSON.stringify({ version: 1, tickets }));
   const playbooks = () => {
     const tickets = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
-    const goals = parsePlaybook(LINEAR_TICKETS.replace("name: linear-tickets", "name: goals"), "goals");
+    const initiative = parsePlaybook(LINEAR_TICKETS.replace("name: linear-tickets", "name: initiative"), "initiative");
     const prs = parsePlaybook(GITHUB_PRS, "github-prs");
-    if (!tickets.ok || !goals.ok || !prs.ok) throw new Error("playbook parse failed");
+    if (!tickets.ok || !initiative.ok || !prs.ok) throw new Error("playbook parse failed");
     return new Map([
       ["linear-tickets", tickets.value],
-      ["goals", goals.value],
+      ["initiative", initiative.value],
       ["github-prs", prs.value],
     ]);
   };
 
   it("parses a tickets list, defaulting match, and refuses a bad shape", () => {
-    const parsed = file([{ match: { labels: ["docs"], title: "Docs: *" }, playbook: "goals" }, { playbook: "linear-tickets" }]);
+    const parsed = file([{ match: { labels: ["docs"], title: "Docs: *" }, playbook: "initiative" }, { playbook: "linear-tickets" }]);
     if (!parsed.ok) throw new Error(parsed.error);
     expect(parsed.value.tickets).toEqual([
-      { match: { labels: ["docs"], title: "Docs: *" }, playbook: "goals" },
+      { match: { labels: ["docs"], title: "Docs: *" }, playbook: "initiative" },
       { match: {}, playbook: "linear-tickets" },
     ]);
     const empty = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!empty.ok) throw new Error(empty.error);
     expect(empty.value.tickets).toEqual([]);
-    expect(file([{ match: { labels: [] }, playbook: "goals" }])).toMatchObject({ ok: false });
+    expect(file([{ match: { labels: [] }, playbook: "initiative" }])).toMatchObject({ ok: false });
     expect(file([{ match: { labels: ["docs"] } }])).toMatchObject({ ok: false });
-    expect(file([{ match: { bogus: true }, playbook: "goals" }])).toMatchObject({ ok: false });
+    expect(file([{ match: { bogus: true }, playbook: "initiative" }])).toMatchObject({ ok: false });
     // A near-miss key is still refused by the strict project file.
     expect(parseProjectFile(JSON.stringify({ version: 1, ticket: [] }))).toMatchObject({ ok: false });
   });
@@ -887,15 +887,15 @@ describe("project-level ticket watches (BB-246)", () => {
   });
 
   it("reports a ticket watch playbook that did not parse from the loader's error, once", () => {
-    const parsed = file([{ playbook: "goals" }]);
+    const parsed = file([{ playbook: "initiative" }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const problems = ticketWatchProblems(parsed.value, new Map(), new Map([["goals", "stewards/playbooks/goals.md: the front matter is not YAML"]]));
-    expect(problems).toEqual([expect.stringMatching(/tickets\[0\].*"goals".*not YAML/u)]);
+    const problems = ticketWatchProblems(parsed.value, new Map(), new Map([["initiative", "stewards/playbooks/initiative.md: the front matter is not YAML"]]));
+    expect(problems).toEqual([expect.stringMatching(/tickets\[0\].*"initiative".*not YAML/u)]);
   });
 
   it("names a ticket watch by its playbook", () => {
-    const parsed = file([{ playbook: "goals" }]);
+    const parsed = file([{ playbook: "initiative" }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    expect(parsed.value.tickets.map((w) => ticketWatchId(w))).toEqual(["goals@ticket"]);
+    expect(parsed.value.tickets.map((w) => ticketWatchId(w))).toEqual(["initiative@ticket"]);
   });
 });
