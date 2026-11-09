@@ -133,7 +133,7 @@ function world() {
       // The real PUT names the head the caller judged; GitHub refuses with 409
       // when the head moved (BB-257).
       if (sha !== undefined && sha !== null && sha !== "" && e !== undefined && e.pull !== null && e.pull.headSha !== sha) {
-        throw new Error("409 Head branch was modified. Review and try the merge again.");
+        throw new Error(`PUT /repos/${repo}/pulls/${number}/merge failed: 409 {"message":"Head branch was modified. Review and try the merge again."}`);
       }
       githubMerges.push({ repo, number, title, body });
       // The real merge changes the pull request's state; the fake must too, or
@@ -7224,6 +7224,21 @@ describe("needs you items", () => {
     t.setMoveHeadOnMerge(false);
     await t.ring("linear", "uuid-12");
     expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("does not read a 409 in the pull request's URL path as a head-moved refusal", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // A conflict refusal whose URL path happens to contain 409, but whose
+    // status is 405: it must be recorded and raised, not silently retried.
+    t.setMergePullError("PUT /repos/acme/web/pulls/409/merge failed: 405 Base branch was modified. Review and try the merge again.");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "stuck")).toBe(true);
   });
 
   it("records a project-steward approval bound to the head sha; ticket and worker threads are refused (BB-30)", async () => {

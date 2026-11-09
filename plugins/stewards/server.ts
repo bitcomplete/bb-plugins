@@ -7720,7 +7720,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * head, so it is a wait, not a `stuck` refusal.
      */
     function isHeadMovedRefusal(message: string): boolean {
-      return /\b409\b/u.test(message) || /Head branch was modified/iu.test(message);
+      // The status after "failed: ", never a bare "409": the pull request's
+      // URL path carries its number, so PR #409 would otherwise be read as a
+      // head-moved refusal and silently retried on every look (BB-257).
+      return /failed: 409\b/u.test(message) || /Head branch was modified/iu.test(message);
     }
 
     /**
