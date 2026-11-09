@@ -8771,6 +8771,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // closed again by syncNeeds in this same call, silently.
           const refused: string[] = [];
           let mergeFiled = false;
+          // BB-253: the gate items this report files itself (`approve-spec`,
+          // `approve-pr`, `merge`) are filed before `syncNeedsFresh` runs, so
+          // `syncNeeds`' own `needsBefore` already holds them and would never
+          // push them. Capture the open ids here and push the new ones right
+          // after the loop, before `syncNeedsFresh` (which pushes the items it
+          // files itself, so nothing is pushed twice).
+          const needsBeforeReport = new Set(store.openNeeds(b.id).map((n) => n.id));
           for (const n of input.needs ?? []) {
             // The plugin files the gate items (approve-spec, approve-pr, merge);
             // a credential, a step outside the repos or a decision is an
@@ -8810,6 +8817,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             });
             if (n.kind === "merge") mergeFiled = true;
           }
+          await pushNewGateNeeds(b, needsBeforeReport);
           // BB-175: filing a merge item hands the merge to a person, so the
           // binding's workers are done. Stop them now, keeping each result, so
           // a `finished` record cannot deadlock the item it was filed to

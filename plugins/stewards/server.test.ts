@@ -7652,6 +7652,11 @@ describe("needs you items", () => {
     const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ filedBy: "steward" });
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    // BB-253: the steward-filed Merge item is the owner's only signal on the
+    // HUB-218 shape, so it pushes once, to the binding's steward thread.
+    const mergePushes = t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "notifications.send" && (c.input as { title?: string }).title === "acme/web#7 ready to merge");
+    expect(mergePushes).toHaveLength(1);
+    expect(mergePushes[0]!.input).toMatchObject({ threadId: t.steward });
   });
 
   it("a finished worker does not block a steward-filed merge item; a running one does (BB-175)", async () => {
