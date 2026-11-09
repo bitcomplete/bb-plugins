@@ -22,6 +22,7 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   hold: null,
   holdBehind: [],
   waitingOn: null,
+  waitingUntil: null,
   noWakeSource: false,
   needsUser: false,
   stuck: false,
@@ -52,6 +53,7 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   hold: null,
   holdBehind: [],
   waitingOn: null,
+  waitingUntil: null,
   noWakeSource: false,
   workers: [],
   needsUser: false,
@@ -84,6 +86,17 @@ describe("stewards sidebar grouping", () => {
     });
     expect(tabs[0]!.efforts).toHaveLength(1);
     expect(tabs[0]!.efforts[0]!.children).toMatchObject([{ threadId: "thr_worker", role: "worker" }]);
+  });
+
+  it("carries a dated wait onto the effort (BB-247)", () => {
+    const at = Date.parse("2026-12-01T00:00:00Z");
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "the vendor", waitingUntil: at })] })],
+    });
+    expect(tabs[0]!.efforts[0]!.waitingUntil).toBe(at);
+    expect(tabs[0]!.efforts[0]!.phrase).toBe("waiting on the vendor until 2026-12-01");
   });
 
   it("puts a reviewer under its worker through the thread tree, with no reviewers field in the data (BB-100)", () => {
@@ -492,6 +505,17 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "w4", noWakeSource: true, waitingOn: "Implement", workers: finished }))).toBe("hand-off lost: worker finished");
     // Unmarked still reads the next action verbatim.
     expect(effortPhrase(effort({ key: "w5", waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("the vendor");
+  });
+
+  // BB-247: a dated wait reads its date on line two, so the row says when the
+  // plugin will wake the steward.
+  it("reads a dated wait as waiting on <text> until <date> (BB-247)", () => {
+    const at = Date.parse("2026-12-01T00:00:00Z");
+    expect(effortPhrase(effort({ key: "d1", waitingOn: "the vendor", waitingUntil: at }))).toBe("waiting on the vendor until 2026-12-01");
+    // An ISO datetime keeps its UTC date.
+    expect(effortPhrase(effort({ key: "d2", waitingOn: "the window", waitingUntil: Date.parse("2026-12-01T15:30:00Z") }))).toBe("waiting on the window until 2026-12-01");
+    // A running worker is a live source, so the count still wins.
+    expect(effortPhrase(effort({ key: "d3", waitingOn: "the vendor", waitingUntil: at, runningWorkers: 1 }))).toBe("1 worker running");
   });
 
   it("shows a quiet worker finish over a stale summary, before the external wait (BB-83)", () => {

@@ -589,7 +589,16 @@ export const ASSUMPTION_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS assumptions_project ON assumptions (project_id, state)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS];
+// BB-247: a dated wait. `requeue_until` is the moment a report's `until` parks
+// the binding; it is set only while the date is ahead, cleared by every report
+// that does not repeat it, and never pulled forward by `requeue-default`.
+// `requeue_until_noted` is the `until` the project steward was last told was
+// beyond the playbook's `max-wait`, so the one informational note is not
+// repeated for the same date. Additive and defaulted: an old row reads as no
+// dated wait and nothing noted.
+export const DATED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN requeue_until INTEGER`, `ALTER TABLE bindings ADD COLUMN requeue_until_noted INTEGER`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -790,6 +799,10 @@ export type Binding = {
   requeueWaitText: string | null;
   /** When the run's first wait was reported, or null (BB-154). */
   requeueFirstAt: number | null;
+  /** When a dated wait parks the binding, or null (BB-247). */
+  requeueUntil: number | null;
+  /** The `until` last noted to the project steward as beyond `max-wait`, or null (BB-247). */
+  requeueUntilNoted: number | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -864,6 +877,8 @@ function rowToBinding(r: BindingRow): Binding {
     requeueWakeCount: Number(r.requeue_wake_count ?? 0),
     requeueWaitText: str("requeue_wait_text"),
     requeueFirstAt: num("requeue_first_at"),
+    requeueUntil: num("requeue_until"),
+    requeueUntilNoted: num("requeue_until_noted"),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -929,6 +944,8 @@ const COLUMNS = {
   requeueWakeCount: "requeue_wake_count",
   requeueWaitText: "requeue_wait_text",
   requeueFirstAt: "requeue_first_at",
+  requeueUntil: "requeue_until",
+  requeueUntilNoted: "requeue_until_noted",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -963,6 +980,8 @@ const VISIBLE_COLUMNS = [
   "thread_id",
   // BB-154: the mark changes line two's phrase, so its write rings the channel.
   "no_wake_source",
+  // BB-247: a dated wait changes line two's phrase too.
+  "requeue_until",
 ] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;
 
 function toColumn(value: unknown): unknown {

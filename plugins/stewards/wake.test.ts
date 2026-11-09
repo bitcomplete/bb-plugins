@@ -427,6 +427,24 @@ describe("the nightly prompt", () => {
     expect(wake).toContain(`- ENG-12: stall escalation ${stall.id} with the project steward, since 2026-10-18: ENG-12 has woken by requeue 2 times with the same wait.`);
   });
 
+  // BB-247: a dated wait is listed in its own digest section, separate from
+  // the stalls and the no-wake-source marks.
+  it("lists dated waits in their own digest section (BB-247)", () => {
+    const { s, bind } = world();
+    const dated = bind("ENG-12");
+    s.patch(dated.id, {
+      requeueUntil: Date.parse("2026-12-01T00:00:00Z"),
+      status: { phase: "In Progress", summary: "Waiting.", nextAction: "the vendor", actor: "other", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T },
+    });
+    const current = s.binding(dated.id)!;
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], datedWaits: [current], held: [] };
+    const digest = formatRecords(records, []).join("\n");
+    expect(digest).toContain("### Dated waits");
+    expect(digest).toContain("- ENG-12 (ticket, In Progress): waiting on the vendor's reply until 2026-12-01");
+    // A dated wait is not also in the no-wake-source list.
+    expect(digest).toContain("### Waiting with no wake source\n\nNothing.");
+  });
+
   it("shows the project's standing-rules list in an approval wake, and works with none configured (BB-54)", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");
