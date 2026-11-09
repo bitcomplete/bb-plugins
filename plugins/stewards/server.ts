@@ -127,7 +127,7 @@ import { advanceStall, hasLiveWakeSource, parseUntil, type WakeSourceInput } fro
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -4001,7 +4001,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.scheduleAsked.length > 0) clear.scheduleAsked = [];
         if (Object.keys(clear).length > 0) b = store.patch(b.id, clear);
       }
-      const approvalEvents = await syncNeeds(b, observed, playbook, workerInFlight);
+      const approvalEvents = await syncNeeds(b, observed, playbook, workerInFlight, changes);
       // BB-203: write the status the plugin observed itself, without a steward
       // turn, before the wake, so the page and sidebar are current within one
       // refetch. Checks fold into the phrase; approved, merged and deployed
@@ -6804,7 +6804,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * every look, so the page only offers a button while it is true. The
      * `approve-pr` half lives in approvals.ts (BB-153).
      */
-    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean): Promise<MechanicalEvent[]> {
+    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean, changes: Change[] = []): Promise<MechanicalEvent[]> {
       // BB-203: an `approve-pr` item this call closes because an approval is
       // present is a mechanical status event. The page and project-steward
       // paths write it at once; this catches an approval observed on GitHub.
@@ -6888,16 +6888,53 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const keys = mergeHoldKeys(b);
               store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : b.mergeBehind).join(", ")}`);
             }
+          } else if (store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === url && n.filedBy !== "plugin")) {
+            // A steward-filed Merge item is a hand-off to a person (a worker
+            // whose permission system refused the merge, or a refused plugin
+            // merge): leave it alone and do not merge over it (BB-170/BB-257).
           } else if (!workerInFlight) {
-            store.fileNeed({
-              bindingId: b.id,
-              kind: "merge",
-              url,
-              what: `Merge ${pull.key}`,
-              how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}. Merge squash-merges through the server's gh login and posts the merge comment.`,
-              data: { sha: g.headSha },
-              filedBy: "plugin",
-            });
+            const ref = parsePullRef(pull.url ?? pull.key) ?? parsePullRef(url);
+            // Pause stewards is the kill switch: while it is on, the plugin
+            // files the item a person can press but never merges (BB-257).
+            const paused = (await settings.get()).paused;
+            if (bindingMayMerge(b, playbook) && ref !== null && !paused) {
+              // BB-257: the plugin takes the step the Merge item used to ask a
+              // person for. A refusal for this exact gate is recorded on the
+              // binding and not retried until the head or a gate input changes.
+              if (mergeRefusalFor(b, g) === null) {
+                const result = await mergePullRequest(b, ref, pull, "by the plugin");
+                if (result.ok) {
+                  // The note goes into this look's changes as well as the
+                  // binding, so the wake that clears `pending` still carries
+                  // it; a merge found by the next look reads the same as a
+                  // worker's merge (BB-257).
+                  const note = `${pull.key} was merged by the plugin. ${result.summary}`;
+                  store.note(b.id, note);
+                  changes.push({ text: note, actionable: true });
+                  scheduleReconcile(b.id);
+                } else if (isHeadMovedRefusal(result.message)) {
+                  // A push landed between the look and the merge. GitHub
+                  // refused it with 409; the next look judges the new head.
+                  bb.log.warn(`stewards: plugin merge of ${pull.key} raced a push; waiting for the next look`);
+                } else if (result.message.startsWith("GitHub refused the merge:")) {
+                  await raiseMergeRefusal(b, pull, g, result.message, changes);
+                } else {
+                  // The gate or a worker changed between the look and the
+                  // merge: file nothing and let the next look decide.
+                  bb.log.warn(`stewards: plugin merge of ${pull.key} not attempted: ${result.message}`);
+                }
+              }
+            } else {
+              store.fileNeed({
+                bindingId: b.id,
+                kind: "merge",
+                url,
+                what: `Merge ${pull.key}`,
+                how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}. Merge squash-merges through the server's gh login and posts the merge comment.`,
+                data: { sha: g.headSha },
+                filedBy: "plugin",
+              });
+            }
           }
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
@@ -7780,6 +7817,67 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * GitHub's refusal when the head moved between the look and the merge
+     * (409 "Head branch was modified", BB-257): the next look judges the new
+     * head, so it is a wait, not a `stuck` refusal.
+     */
+    function isHeadMovedRefusal(message: string): boolean {
+      // The status after "failed: ", never a bare "409": the pull request's
+      // URL path carries its number, so PR #409 would otherwise be read as a
+      // head-moved refusal and silently retried on every look (BB-257).
+      return /failed: 409\b/u.test(message) || /Head branch was modified/iu.test(message);
+    }
+
+    /**
+     * The key a refused merge is recorded against (BB-257): the head sha and
+     * the reviewer marker and lane that made the gate met. A refusal under the
+     * same key is not retried, so a conflict or branch protection is one
+     * escalation per refusal, not one per look; a push or a new review round
+     * changes the key and a fresh attempt follows.
+     */
+    function mergeAttemptKey(g: ReturnType<typeof prGate>): string {
+      return [g.headSha ?? "", markerKey(g.marker) ?? "", g.lane ?? ""].join("|");
+    }
+
+    /**
+     * The refusal already recorded for this gate, if any: a merge the plugin
+     * attempted and GitHub refused, kept as a `stuck` escalation on the
+     * binding. Its presence stops a retry loop; the head or a gate input
+     * changing makes a new key, so the next look attempts again.
+     */
+    function mergeRefusalFor(b: Binding, g: ReturnType<typeof prGate>): Escalation | null {
+      const key = mergeAttemptKey(g);
+      return store.escalations(b.id, 50).find((x) => x.kind === "stuck" && x.data.mergeRefusal === true && x.data.mergeKey === key) ?? null;
+    }
+
+    /**
+     * Record a merge the plugin attempted and GitHub refused (BB-257): one
+     * note on the binding and one `stuck` escalation to the steward, both
+     * carrying the head sha and the gate key, so a repeated look does not
+     * retry or re-raise.
+     */
+    async function raiseMergeRefusal(b: Binding, pull: EntitySnapshot, g: ReturnType<typeof prGate>, message: string, changes: Change[]): Promise<void> {
+      const key = mergeAttemptKey(g);
+      const note = `The plugin could not merge ${pull.key}: ${message}`;
+      store.note(b.id, note);
+      changes.push({ text: note, actionable: true });
+      const x = store.escalate({
+        bindingId: b.id,
+        kind: "stuck",
+        question: `Could not merge ${pull.key}: ${message}`,
+        context: `The lane gate was met, so the plugin attempted the merge itself (BB-257), and GitHub refused it. Resolve the conflict or the branch protection and push; the plugin retries when the head sha or a gate input changes, or retry once the cause is fixed with \`bb stewards merge ${pull.key}\`. GitHub said: ${message}`,
+        meanwhile: "The plugin does not retry the same gate; the pull request stays open.",
+        route: nextRoute(b, null),
+        recommendation: null,
+        url: pull.url ?? pull.key,
+        headSha: g.headSha,
+        data: { mergeRefusal: true, mergeKey: key },
+        projectId: b.projectId,
+      });
+      await deliver(b, x);
+    }
+
+    /**
      * The one merge path the Stewards page's Merge button and `bb stewards
      * merge` share: recompute the gate with the project's approval records
      * and the pull request's changed files, refuse with the gate's words when
@@ -7823,7 +7921,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       let mergeSha: string | null = null;
       try {
-        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, commitTitle, commitBody));
+        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, commitTitle, commitBody, gate.headSha));
       } catch (error) {
         return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
       }
