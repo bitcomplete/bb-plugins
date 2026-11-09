@@ -850,7 +850,7 @@ describe("recorded assumptions (BB-251)", () => {
 
 describe("the per-turn brief cap (BB-254)", () => {
   /** A brief input for one shipped playbook, with three guidance entries and a hold. */
-  function briefInputFor(name: string, text: string, over: { guidance?: number; firstGuidance?: string; lastGuidance?: string } = {}) {
+  function briefInputFor(name: string, text: string, over: { phase?: string | null; guidance?: number; firstGuidance?: string; lastGuidance?: string } = {}) {
     const { s } = world();
     const parsed = parsePlaybook(text, name);
     if (!parsed.ok) throw new Error(`${name}: ${parsed.error}`);
@@ -867,7 +867,7 @@ describe("the per-turn brief cap (BB-254)", () => {
       playbook: name,
       playbookVersion: "v1",
       parentBindingId: null,
-      phase: Object.keys(playbook.sections)[0] ?? null,
+      phase: over.phase !== undefined ? over.phase : (Object.keys(playbook.sections)[0] ?? null),
       stage: null,
     });
     const count = over.guidance ?? 3;
@@ -882,13 +882,18 @@ describe("the per-turn brief cap (BB-254)", () => {
 
   it("carries the whole phase and general section of every shipped playbook at the cap", () => {
     for (const [name, text] of Object.entries(PLAYBOOK_TEMPLATES)) {
-      const { playbook, input } = briefInputFor(name, text);
-      const brief = formatBrief(input, BRIEF_MAX_CHARS);
-      // No clipping: the capped and uncapped renders are identical.
-      expect(brief, name).toBe(formatBrief(input));
-      expect(brief, name).toContain(playbook.general);
-      const phase = input.binding.phase;
-      if (phase !== null) expect(brief, name).toContain(playbook.sections[phase]!);
+      const parsed = parsePlaybook(text, name);
+      if (!parsed.ok) throw new Error(`${name}: ${parsed.error}`);
+      const phases = Object.keys(parsed.value.sections);
+      // A playbook with no phase sections is tested once, with no phase.
+      for (const phase of phases.length === 0 ? [null] : phases) {
+        const { playbook, input } = briefInputFor(name, text, { phase });
+        const brief = formatBrief(input, BRIEF_MAX_CHARS);
+        // No clipping: the capped and uncapped renders are identical.
+        expect(brief, `${name}@${phase ?? "none"}`).toBe(formatBrief(input));
+        expect(brief, `${name}@${phase ?? "none"}`).toContain(playbook.general);
+        if (phase !== null) expect(brief, `${name}@${phase}`).toContain(playbook.sections[phase]!);
+      }
     }
   });
 
