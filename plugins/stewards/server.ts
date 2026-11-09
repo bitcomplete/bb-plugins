@@ -911,6 +911,31 @@ export const rpcContract = defineRpcContract({
   },
 });
 
+/**
+ * BB-255: the consent provider-retry asks the plugin that sent a failed turn
+ * before it re-runs that turn. Core's `provider-retry` plugin defines the
+ * contract, not the SDK, so a plugin that wants to answer registers its own
+ * copy (core's automations plugin does). Stewards declines its own wakes: it
+ * re-runs them itself, and a double retry races (the second `threads.retry`
+ * gets 409 `retry_already_queued`). An owner-typed turn on a steward thread is
+ * left to provider retry.
+ */
+export const RETRY_CONSENT_METHOD = "provider-retry.v1.consent";
+export const retryConsentSchema = z.discriminatedUnion("kind", [z.object({ kind: z.literal("allow") }), z.object({ kind: z.literal("decline"), reason: z.string().min(1) })]);
+export type RetryConsent = z.infer<typeof retryConsentSchema>;
+export const retryConsentContract = defineRpcContract({
+  [RETRY_CONSENT_METHOD]: {
+    input: z.object({
+      threadId: z.string().min(1),
+      requestId: z.string().min(1),
+      reason: z.enum(["Rate limited", "Provider overloaded", "Provider unavailable"]),
+      sendAt: z.number().int().nonnegative(),
+    }),
+    output: retryConsentSchema,
+    experimental_description: "Asked of the plugin that sent a failed turn before provider retry re-runs it. Stewards declines its own wakes, which it re-runs itself; allow leaves the retry to provider retry.",
+  },
+});
+
 /** How long an ended binding stays on the page. */
 const ENDED_ON_BOARD_MS = 14 * 86_400_000;
 
@@ -2477,8 +2502,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
         // BB-255: a newer wake the plugin sent supersedes any pending retry for
-        // that thread, so a stale retry's failure is not acted on.
-        clearWakeRetry(threadId);
+        // that thread, so a stale retry's failure is not acted on and its
+        // queued row is dropped.
+        await clearWakeRetry(threadId);
         return "sent";
       } catch (error) {
         const e = error as { code?: string; status?: number };
@@ -3369,6 +3395,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-255: provider-retry asks whether it should re-run a failed turn.
+     * Decline a turn this plugin sent (its own wake), which it re-runs itself;
+     * allow everything else, including an owner-typed turn on a steward thread.
+     * A read that fails is an allow, the contract's fail-open default.
+     */
+    async function answerRetryConsent(input: { threadId: string; requestId: string }): Promise<RetryConsent> {
+      try {
+        const [latest] = await bb.sdk.threads.events.list({ threadId: input.threadId, types: ["client/turn/requested"], order: "desc", limit: "1" });
+        if ((latest?.data as { originPluginId?: unknown } | undefined)?.originPluginId === bb.pluginId) return { kind: "decline", reason: "stewards re-runs its own failed wake" };
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the failed turn for retry consent: ${errorMessage(error)}`);
+      }
+      return { kind: "allow" };
+    }
+
+    /**
      * Threads whose failed turn `turn.failed` is deciding on (BB-255). It is
      * set synchronously before the retry RPC is awaited, so the `thread.failed`
      * handler — dispatched just before it — yields and lets this decision win.
@@ -3389,24 +3431,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * binding, and a retry's own failure arrives with a null origin. In memory:
      * a restart loses it, which is the same as the retry being lost.
      */
-    const retriedRequests = new Map<string, string>();
+    type RetriedRequest = { threadId: string; queuedMessageId: string | null };
+    const retriedRequests = new Map<string, RetriedRequest>();
 
     const hasRetriedRequest = (threadId: string): boolean => {
-      for (const id of retriedRequests.values()) if (id === threadId) return true;
+      for (const entry of retriedRequests.values()) if (entry.threadId === threadId) return true;
       return false;
     };
 
-    /** Forget the in-memory retried ids for a thread. */
-    function forgetRetriedRequests(threadId: string): void {
-      for (const [requestId, id] of retriedRequests) if (id === threadId) retriedRequests.delete(requestId);
+    /** Delete a queued retry row, best-effort; a no-op when there is none. */
+    async function deleteQueuedRetry(threadId: string, queuedMessageId: string | null): Promise<void> {
+      if (queuedMessageId === null) return;
+      await quietly(`delete queued retry ${queuedMessageId}`, () => bb.sdk.threads.queuedMessages.delete({ threadId, queuedMessageId }));
     }
 
-    /** Drop a pending retry for a thread, wherever its binding is; a no-op when there is none. */
-    function clearWakeRetry(threadId: string): void {
-      forgetRetriedRequests(threadId);
+    /** Drop a pending retry for a thread, deleting its queued row; a no-op when there is none. */
+    async function clearWakeRetry(threadId: string): Promise<void> {
+      for (const [requestId, entry] of retriedRequests) {
+        if (entry.threadId !== threadId) continue;
+        await deleteQueuedRetry(threadId, entry.queuedMessageId);
+        retriedRequests.delete(requestId);
+      }
       const b = bindingForThread(threadId);
-      if (b === null || b.wakeRetries[threadId] === undefined) return;
-      setWakeRetry(b, threadId, null);
+      const retry = b === null ? undefined : b.wakeRetries[threadId];
+      if (b !== null && retry !== undefined) {
+        await deleteQueuedRetry(threadId, retry.queuedMessageId);
+        setWakeRetry(b, threadId, null);
+      }
     }
 
     /**
@@ -3467,17 +3518,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!retryableWakeFailure(args.errorInfo)) return false;
       if (args.attemptNumber >= WAKE_RETRY_MAX_ATTEMPTS) return false;
       const sendAt = wakeRetrySendAt(args.rateLimits, args.attemptNumber, now());
-      let result: { turnRequestId?: string } | null;
+      let result: Awaited<ReturnType<typeof bb.sdk.threads.retry>>;
       try {
-        result = (await bb.sdk.threads.retry({ threadId: args.threadId, turnRequestId: args.requestId, sendAt, reason: "Retrying a failed stewards wake" })) as { turnRequestId?: string };
+        result = await bb.sdk.threads.retry({ threadId: args.threadId, turnRequestId: args.requestId, sendAt, reason: "Retrying a failed stewards wake" });
       } catch (error) {
+        const e = error as { code?: string; status?: number };
+        if (e.code === "retry_already_queued") {
+          // provider-retry (or a concurrent call) already holds the one live
+          // retry for this turn. Treat it as pending so the failure is never
+          // given up on; that caller owns the queued row.
+          if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: args.requestId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId: null });
+          bb.log.info(`stewards: a retry for ${args.threadId} is already queued; leaving it to the other caller`);
+          return true;
+        }
         bb.log.warn(`stewards: could not retry ${args.threadId}'s failed wake: ${errorMessage(error)}`);
         return false;
       }
-      const retriedId = result?.turnRequestId;
-      if (typeof retriedId !== "string" || retriedId === "") return false;
-      retriedRequests.set(retriedId, args.threadId);
-      if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: retriedId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding) });
+      const retriedId = result.turnRequestId;
+      const queuedMessageId = result.delivery === "queued" ? result.queuedMessageId : null;
+      // The binding record keeps the queued id for a binding; the in-memory map
+      // keeps it for a project steward, which has no binding.
+      retriedRequests.set(retriedId, { threadId: args.threadId, queuedMessageId: args.binding === null ? queuedMessageId : null });
+      if (args.binding !== null) setWakeRetry(args.binding, args.threadId, { requestId: retriedId, attempt: args.attemptNumber + 1, sendAt, holdUntil: sendAt + wakeRequeueMs(args.binding), queuedMessageId });
       // A worker the earlier thread.failed marked failed is running again: the
       // retry stands in for the failure.
       if (args.worker !== null && args.worker.status === "failed") store.setWorker(args.threadId, "running", args.worker.result);
@@ -3495,7 +3557,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function giveUpFailedWake(args: { threadId: string; attemptNumber: number; errorInfo: ProviderErrorInfo | null; binding: Binding | null; worker: Worker | null }): Promise<void> {
       const reason = describeWakeError(args.errorInfo);
-      clearWakeRetry(args.threadId);
+      await clearWakeRetry(args.threadId);
       if (args.worker !== null) {
         // The `thread.failed` path, run here so the two handlers cannot race
         // over the same worker.
@@ -3516,7 +3578,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.note(b.id, `Wake failed after ${attempts}: ${reason}.`);
       store.patch(b.id, { wakeFailure: reason, awaitingReport: false });
       if (!store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
-        store.escalate({
+        const escalation = store.escalate({
           bindingId: b.id,
           kind: "stuck",
           question: `The steward's wake failed after ${attempts}: ${reason}.`,
@@ -3527,6 +3589,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           projectId: b.projectId,
           origin: { threadId: args.threadId, bindingId: b.id, chain: [] },
         });
+        // The failed steward is not re-woken, but the escalation's route
+        // (project steward, parent, or the user) is told.
+        await deliver(b, escalation);
       }
     }
 
@@ -7018,7 +7083,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } else {
           const missed = b.missedReports + 1;
           store.patch(b.id, { awaitingReport: false, missedReports: missed });
-          if (retry !== null) clearWakeRetry(thread.id);
+          if (retry !== null) await clearWakeRetry(thread.id);
           bb.log.warn(`stewards: ${b.entityKey}'s turn ended without steward_report (${missed} in a row)`);
           if (missed >= timing.missedReportsForStuck && !store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
             await raise(b, "stuck", `The steward ended ${missed} turns in a row without a status report. Look at the thread and say how to continue.`, "Waiting.");
@@ -7195,7 +7260,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const project = store.projectByThread(e.threadId);
       const own = e.originPluginId === bb.pluginId;
       const retry = binding === null ? null : (binding.wakeRetries[e.threadId] ?? null);
-      const retried = e.originPluginId === null && ((retry !== null && retry.requestId === e.requestId) || retriedRequests.get(e.requestId) === e.threadId);
+      const retried = e.originPluginId === null && ((retry !== null && retry.requestId === e.requestId) || retriedRequests.get(e.requestId)?.threadId === e.threadId);
       // A foreign or unrecognised null origin is left alone.
       if (!own && !retried) return;
       // At most one pending retry per thread: a repeat of the original failure
@@ -8314,6 +8379,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
     };
     bb.rpc.register(rpcContract, measuredHandlers("rpc", rawRpcHandlers));
+    bb.rpc.register(retryConsentContract, { [RETRY_CONSENT_METHOD]: (input) => answerRetryConsent(input) }, { experimental_discoverable: true, experimental_description: "Declines provider retries of stewards' own wakes, which the plugin re-runs itself." });
 
     /** Stewarded projects, and those whose configuration went away but still have stewards. */
     function projectIds(configured: Iterable<string>): string[] {
@@ -9018,7 +9084,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // BB-255: a report ends any wake failure and drops the steward's
             // pending retry; a newer wake supersedes it too (see `send`).
             wakeFailure: null,
-            ...(b.threadId !== null && b.wakeRetries[b.threadId] !== undefined ? { wakeRetries: Object.fromEntries(Object.entries(b.wakeRetries).filter(([id]) => id !== b.threadId)) } : {}),
             ready,
             deployments,
             // A deployment verdict changes a watch: the idle clock starts a new
@@ -9030,8 +9095,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(landedIn === undefined || landedIn === null ? {} : { landedIn: `${landedIn.repo}#${landedIn.number}` }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
-          // BB-255: the report supersedes any retry the plugin had pending.
-          if (b.threadId !== null) forgetRetriedRequests(b.threadId);
+          // BB-255: the report supersedes any retry the plugin had pending,
+          // deleting its queued row too.
+          if (b.threadId !== null) await clearWakeRetry(b.threadId);
           if (noteBeyondMaxWait) {
             store.noteProject(b.projectId, `${b.entityKey} reported a dated wait beyond the playbook's max-wait (${formatDuration(maxWaitMs)}): waiting on ${JSON.stringify(waitingOn ?? "")} until ${iso(untilAt!)}.`);
           }

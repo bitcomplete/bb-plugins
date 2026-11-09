@@ -707,6 +707,8 @@ export const wakeRetrySchema = z.object({
   attempt: z.number(),
   sendAt: z.number(),
   holdUntil: z.number(),
+  /** The queued row a future-`sendAt` retry left, so dropping the retry can delete it; null for a sent retry. */
+  queuedMessageId: z.string().nullable().default(null),
 });
 export type WakeRetry = z.infer<typeof wakeRetrySchema>;
 export const wakeRetriesSchema = z.record(z.string(), wakeRetrySchema);
