@@ -54,6 +54,27 @@ export function hasLiveWakeSource(s: WakeSourceInput): boolean {
   );
 }
 
+/**
+ * Parse a report's `until` (BB-247): a `YYYY-MM-DD` date read as 00:00 UTC,
+ * or an ISO datetime. Returns the epoch ms, or null when the value is not a
+ * valid date. A date-only value is checked against the calendar, so
+ * `2026-02-30` is refused rather than rolled over into March.
+ */
+export function parseUntil(value: string): number | null {
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (dateOnly !== null) {
+    const year = Number(dateOnly[1]);
+    const month = Number(dateOnly[2]);
+    const day = Number(dateOnly[3]);
+    const at = Date.UTC(year, month - 1, day);
+    const d = new Date(at);
+    if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+    return at;
+  }
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : at;
+}
+
 /** The stored requeue-only counter for one binding. */
 export type StallState = {
   /** Consecutive requeue-only wakes with the same wait. */
@@ -70,15 +91,18 @@ export const NO_STALL: StallState = { count: 0, waitText: null, firstAt: null };
  * What a report does to the requeue-only counter. It advances only when the
  * wake that preceded the report was a `requeue`, the report ended with a
  * non-empty `waitingOn`, and no structured source is live; any other wake
- * reason, a changed wait, or a source resets it. `escalate` is true once the
- * run reaches the threshold; the caller suppresses a second escalation while
- * one is already open, which the live-source test also does (an open `stall`
- * is an open escalation).
+ * reason, a changed wait, or a source resets it. A future `until` (BB-247)
+ * skips and resets the run while it is ahead, so a dated wait is never counted
+ * as stalled; once it passes, the next same-text report starts from zero.
+ * `escalate` is true once the run reaches the threshold; the caller suppresses
+ * a second escalation while one is already open, which the live-source test
+ * also does (an open `stall` is an open escalation).
  */
 export function advanceStall(
   prev: StallState,
-  opts: { reason: string | null; waitingOn: string | null; liveSource: boolean; now: number },
+  opts: { reason: string | null; waitingOn: string | null; liveSource: boolean; now: number; until?: number | null },
 ): { state: StallState; escalate: boolean } {
+  if (opts.until !== null && opts.until !== undefined && opts.until > opts.now) return { state: NO_STALL, escalate: false };
   const text = opts.waitingOn === null ? null : opts.waitingOn.trim();
   if (text === null || text === "" || opts.reason !== "requeue" || opts.liveSource) {
     return { state: NO_STALL, escalate: false };

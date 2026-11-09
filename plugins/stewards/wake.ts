@@ -1451,7 +1451,7 @@ export function formatProjectWake(input: {
     const s = b.status;
     const conflicts = conflictsOf(b, allOpen);
     const flags = [goalProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
-    out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
+    out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${day(b.requeueUntil)}`}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   const bindings = out.splice(0);
   if (input.digestDue) {
@@ -1581,6 +1581,8 @@ export type DigestRecords = {
   noWakeSource: Binding[];
   /** Open `stall` escalations: repeated requeue-only wakes with the same wait (BB-154). */
   stall: Array<{ escalation: Escalation; from: Binding }>;
+  /** Dated waits still ahead, listed separately from stalls (BB-247). */
+  datedWaits?: Binding[];
   /** Open bindings on hold. */
   held: Binding[];
   /** Silent notes queued for this digest (a hold that lifted on finished work), one line each. */
@@ -1654,6 +1656,12 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}${goalFlag(b)}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
+
+  // BB-247: a dated wait is not a quiet stall: the plugin will wake the steward
+  // at the date, so it is listed in its own section rather than under "waiting
+  // with no wake source".
+  const dated = (r.datedWaits ?? []).map((b) => `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): waiting on ${oneLine(b.status?.waitingOn ?? "")} until ${day(b.requeueUntil!)}${goalFlag(b)}`);
+  out.push("### Dated waits", "", ...capped(dated, "Nothing."), "");
 
   // BB-154: the quiet stall, visible once a day even before the requeue
   // threshold. A binding can be marked without a stall (the first report), and

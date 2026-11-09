@@ -62,6 +62,12 @@ export function formatDuration(ms: number): string {
   return `${Math.round(ms / UNIT_MS.m!)}m`;
 }
 
+/**
+ * BB-247: how far out a dated wait may be before the project steward is told
+ * once. The playbook's `max-wait` overrides it; the default is 90 days.
+ */
+export const DEFAULT_MAX_WAIT_MS = 90 * 86_400_000;
+
 // ---- models ---------------------------------------------------------------------
 
 /** "claude" is how people write the Claude Code provider; bb calls it claude-code. */
@@ -1223,6 +1229,12 @@ export const frontMatterSchema = z
     models: z.object({ steward: modelSpecSchema.optional(), worker: modelSpecSchema.optional(), reviewer: modelSpecSchema.optional() }).strict().default({}),
     "requeue-default": durationSchema.default(2 * 86_400_000),
     /**
+     * BB-247: the longest dated wait (`steward_report { until }`) a steward may
+     * park a binding for without the project steward being told once. The wait
+     * is still accepted; the note is informational, not a refusal. Default 90d.
+     */
+    "max-wait": durationSchema.default(DEFAULT_MAX_WAIT_MS),
+    /**
      * How long a binding in a build or review stage may sit with nothing to
      * wait on before the plugin wakes its steward (BB-83). The idle wake fires
      * once per idle period, so this is a grace, not a poll interval.
@@ -1261,6 +1273,8 @@ export type Playbook = {
   may: string[];
   models: { steward: ModelSpec | null; worker: ModelSpec | null; reviewer: ModelSpec | null };
   requeueDefaultMs: number;
+  /** BB-247: the longest dated wait accepted without one note to the project steward. */
+  maxWaitMs: number;
   /** How long a binding may sit idle in an active stage before its steward is woken (BB-83). */
   idleGraceMs: number;
   followThroughMs: number;
@@ -1347,6 +1361,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       may: fm.may,
       models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null, reviewer: fm.models.reviewer ?? null },
       requeueDefaultMs: fm["requeue-default"],
+      maxWaitMs: fm["max-wait"],
       idleGraceMs: fm["idle-grace"],
       followThroughMs: fm["follow-through"],
       maxAssumptions: fm["max-assumptions"],

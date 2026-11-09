@@ -28,6 +28,8 @@ export interface SidebarBinding {
   holdBehind: string[];
   /** The party or artifact the next action waits on; it never marks the effort blocked (BB-109). */
   waitingOn: string | null;
+  /** When a dated wait parks the binding, for `waiting on <text> until <date>` (BB-247). */
+  waitingUntil: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
   needsUser: boolean;
@@ -122,6 +124,8 @@ export interface SidebarEffort {
   holdBehind: string[];
   /** The party or artifact the next action waits on; shown as a plain line, never as a block (BB-109). */
   waitingOn: string | null;
+  /** When a dated wait parks the binding (BB-247). */
+  waitingUntil: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
   /** The binding's worker records, so a wait on a finished one reads as a lost hand-off (BB-152). */
@@ -246,6 +250,8 @@ export interface EffortStatus {
   requeueAt: number | null;
   /** The party or artifact the next action waits on (BB-109). */
   waitingOn?: string | null;
+  /** When a dated wait parks the binding (BB-247). */
+  waitingUntil?: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource?: boolean;
   /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
@@ -341,6 +347,9 @@ export function untilPhrase(at: number, now: number): string {
   return `${Math.round(ms / 86_400_000)}d`;
 }
 
+/** The UTC date of a dated wait, as `YYYY-MM-DD`, for line two's `until <date>` (BB-247). */
+export const waitingUntilDate = (at: number): string => new Date(at).toISOString().slice(0, 10);
+
 /**
  * Line two's status phrase, first match wins (BB-76, BB-86, BB-83, BB-152):
  * needs you › hold › stuck › running › lost hand-off › quiet worker finish ›
@@ -379,6 +388,11 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   // ahead of the deployment phrase and the next action, which can look live
   // when nothing the plugin tracks will deliver the wait.
   if (e.noWakeSource) return "waiting, no wake source";
+  // BB-247: a dated wait reads its date, so the row says when the plugin will
+  // wake the steward even though nothing else is live on the binding.
+  if (e.waitingUntil !== null && e.waitingUntil !== undefined && e.waitingOn !== null && e.waitingOn !== undefined && e.waitingOn !== "") {
+    return `waiting on ${e.waitingOn} until ${waitingUntilDate(e.waitingUntil)}`;
+  }
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
   if (e.statusActor === "other") return "the other party";
@@ -412,6 +426,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     hold: null,
     holdBehind: [],
     waitingOn: null,
+    waitingUntil: null,
     noWakeSource: false,
     workers: [],
     needsUser: false,
@@ -629,6 +644,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       hold: b.hold,
       holdBehind: b.holdBehind,
       waitingOn: b.waitingOn,
+      waitingUntil: b.waitingUntil,
       noWakeSource: b.noWakeSource,
       workers: b.workers,
       needsUser: b.needsUser,
@@ -725,6 +741,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       hold: null,
       holdBehind: [],
       waitingOn: null,
+      waitingUntil: null,
       noWakeSource: false,
       workers: [],
       needsUser: false,
