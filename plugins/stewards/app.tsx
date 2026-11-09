@@ -1286,6 +1286,39 @@ function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId }: {
   );
 }
 
+/**
+ * BB-249: a re-approval item leads with the diff from the text the owner
+ * approved, and keeps the full current text behind a toggle so the change
+ * reads first. A whitespace-only edit has an empty diff and says so.
+ */
+function ReapprovalDiff({ diff, changedLines, fullText, commentUrl }: { diff: string; changedLines: number; fullText: string | null; commentUrl: string | null }) {
+  const navigate = useBbNavigate();
+  const [full, setFull] = useState(false);
+  const text = fullText === null ? null : fullText.replace(/\u0000/gu, "");
+  return (
+    <>
+      {changedLines === 0 ? (
+        <p className="text-muted-foreground">The spec changed only in whitespace; no visible change.</p>
+      ) : (
+        <pre className="overflow-x-auto rounded-md border border-input bg-state-hover p-2 text-xs">{diff}</pre>
+      )}
+      {text !== null && text.trim() !== "" ? (
+        <>
+          <button type="button" className="self-start rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover" onClick={() => setFull((v) => !v)}>
+            {full ? "Hide full text" : "Show full text"}
+          </button>
+          {full ? <pre className="overflow-x-auto whitespace-pre-wrap rounded-md border border-input bg-state-hover p-2 text-xs">{text}</pre> : null}
+        </>
+      ) : null}
+      {commentUrl !== null ? (
+        <button type="button" className="self-start text-xs underline underline-offset-2 hover:text-foreground" onClick={() => navigate.openUrl(commentUrl)}>
+          The comment explaining the edit
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 /** The prompt half of one needs-you item: what it asks, and why it is not actionable yet. */
 function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
   if (entry.type === "question") {
@@ -1323,6 +1356,7 @@ function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
         <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
       </p>
       <p>{n.what}</p>
+      {n.specChangedLines !== null ? <ReapprovalDiff diff={n.specDiff ?? ""} changedLines={n.specChangedLines} fullText={n.specFullText} commentUrl={n.specCommentUrl} /> : null}
       {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
       {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
       {!n.actionable ? <p className="text-xs text-attention">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}

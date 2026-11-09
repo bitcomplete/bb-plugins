@@ -88,7 +88,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate, PRODUCT_APPROVAL_REFUSAL } from "./gate.js";
 import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import {
@@ -424,6 +424,14 @@ const needViewSchema = z.object({
   prUrl: z.string().nullable(),
   what: z.string(),
   how: z.string().nullable(),
+  /** BB-249: for a re-approval after an edit, the unified diff from the approved text; null on a first approval. Empty with `specChangedLines` 0 when the change was whitespace only. */
+  specDiff: z.string().nullable().default(null),
+  /** BB-249: the diff's changed-line count, 0 for a whitespace-only change; null on a first approval. */
+  specChangedLines: z.number().nullable().default(null),
+  /** BB-249: the nearest `Spec:`/`Criteria:` comment's link, when one explains the edit. */
+  specCommentUrl: z.string().nullable().default(null),
+  /** BB-249: the current spec text, for the item's full-text toggle. */
+  specFullText: z.string().nullable().default(null),
   /** For a provide-secret item: where the value goes, in words. */
   destination: z.string().nullable(),
   threadId: z.string().nullable(),
@@ -3052,6 +3060,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
     const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, isUserThread);
 
+    /** The text a binding's approval pins, stored as `approvedText` so BB-249 can diff a later edit against it. */
+    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, isUserThread);
+
     /**
      * The ready gate for a brief: the live spec hash when the binding has a
      * snapshot, so an approval whose spec changed reads as not passed. The
@@ -3434,7 +3445,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const approval = playbook.ready?.approval;
       const sourceLabel = entity.source === "github" ? "GitHub" : "Linear";
       if (typeof approval === "object" && lc(entity.state) === lc(approval.state) && ready.approval === null) {
-        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source }, voidedAt: null };
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source, approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null };
         changes.push({ text: `Approved in ${sourceLabel} (now ${entity.state})`, actionable: true });
       }
       const workers = store.workers(b.id);
@@ -3512,7 +3523,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // pinned to the spec it just changed, whether or not an earlier
       // approval has gone stale.
       if (approval === "user" && (ready.approval === null || ready.approval.specHash !== currentSpec) && fresh.some((c) => c.byUser === true)) {
-        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user" }, voidedAt: null, declinedSpecHash: null };
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user", approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null, declinedSpecHash: null };
         changes.push({ text: "The user's spec comment approves the spec (approval: user)", actionable: true });
       }
       // Only an entry into build from spec: review → build is the worker's
@@ -5857,6 +5868,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const coveredAssumptions = store.openAssumptions(b.id);
       const assumptionListing =
         coveredAssumptions.length === 0 ? "" : ` It covers ${coveredAssumptions.length} open assumption${coveredAssumptions.length === 1 ? "" : "s"}: ${coveredAssumptions.map((a) => `${a.id} — ${a.text}`).join("; ")}.`;
+      // BB-249: a re-approval after an edit carries the same diff the user's
+      // item does, so the project steward reads a change rather than a document.
+      const prior = b.ready.approval;
+      const approvedText = prior?.approvedText ?? b.ready.voidedApprovedText;
+      const reapproval = approvedText !== null ? specDiff(approvedText, specTextFor(b, b.lastSnapshot.entity)) : null;
       const x = store.escalate({
         bindingId: b.id,
         kind: "approval",
@@ -5867,7 +5883,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         meanwhile: "Waiting: no implementation workers start until it is approved.",
         route: "project",
         recommendation: null,
-        data: { assumptionIds: coveredAssumptions.map((a) => a.id) },
+        data: {
+          assumptionIds: coveredAssumptions.map((a) => a.id),
+          ...(reapproval === null ? {} : { specDiff: reapproval.diff, specChangedLines: reapproval.changedLines }),
+        },
       });
       bb.log.info(`stewards: ${b.entityKey}'s ready gate waits on the project steward; asked for approval (${x.id})`);
       return x;
@@ -6170,13 +6189,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const how =
         "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes." +
         (covered.length === 0 ? "" : ` It covers ${covered.length} open assumption${covered.length === 1 ? "" : "s"}: ${covered.map((a) => `${a.id} — ${a.text}`).join("; ")}.`);
+      // BB-249: a re-approval after an edit leads with a diff from the text the
+      // last approval pinned. A prior approval with no `approvedText` (recorded
+      // before the field existed) files the item as a first approval.
+      const currentText = specTextFor(b, entity);
+      const prior = b.ready.approval;
+      const approvedText = prior?.approvedText ?? b.ready.voidedApprovedText;
+      const approvedAt = prior?.at ?? b.ready.voidedApprovedAt;
+      const reapproval = approvedText !== null && approvedAt !== null ? specDiff(approvedText, currentText) : null;
+      const specComment = reapproval === null || approvedAt === null ? null : newestEditComment(entity, b.threadId, isUserThread, approvedAt);
+      const what =
+        reapproval === null
+          ? `Approve ${b.entityKey}'s spec`
+          : reapproval.changedLines === 0
+            ? "Re-approve: no visible change"
+            : `Re-approve: ${reapproval.changedLines} line${reapproval.changedLines === 1 ? "" : "s"} changed`;
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-spec",
         url: b.url ?? "",
-        what: `Approve ${b.entityKey}'s spec`,
+        what,
         how,
-        data: { specHash, ...(escalationId === null ? {} : { escalationId }), assumptionIds },
+        data: {
+          specHash,
+          ...(escalationId === null ? {} : { escalationId }),
+          assumptionIds,
+          ...(reapproval === null ? {} : { specDiff: reapproval.diff, specChangedLines: reapproval.changedLines, specCommentUrl: specComment?.url ?? null, specFullText: currentText }),
+        },
         filedBy: "plugin",
       });
     }
@@ -6194,7 +6233,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const hash = specHashFor(b, entity);
       const said = text === null ? "" : `: "${text}"`;
       if (action === "approve") {
-        store.approve(b.id, { at: now(), specHash: hash, by: "user" }, `Approved by the user ${where}${said}`, "user");
+        store.approve(b.id, { at: now(), specHash: hash, by: "user", approvedText: specTextFor(b, entity) }, `Approved by the user ${where}${said}`, "user");
         return { closure: `The user approved ${b.entityKey}'s spec ${where}${text === null ? "" : `: ${text}`}.`, forwarded };
       }
       store.decline(b.id, hash, `Declined by the user ${where}${said}`, "user");
@@ -7642,7 +7681,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
           const verdict = classifyApproval(text);
           if (verdict === "approve" && entity !== null) {
-            store.approve(b.id, { at: now(), specHash: specHashFor(b, entity), by: "user" }, `Approved by the user on the stewards page: "${text}"`, "user");
+            store.approve(b.id, { at: now(), specHash: specHashFor(b, entity), by: "user", approvedText: specTextFor(b, entity) }, `Approved by the user on the stewards page: "${text}"`, "user");
             store.addGuidance(b.id, text, "user");
             store.note(b.id, `Approval ${x.id} was answered by the user on the stewards page: ${text}`);
             scheduleReconcile(b.id);
@@ -8425,7 +8464,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               why: input.ready.why ?? ready.why,
             };
           }
-          if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now() };
+          if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now(), voidedApprovedText: ready.approval.approvedText, voidedApprovedAt: ready.approval.at };
           // BB-109: `blockedOn` is the old name for `waitingOn`. Accept it for
           // one release so a steward whose prompt predates the rename still
           // reports cleanly; `waitingOn` wins when both are given, and only the
@@ -9313,7 +9352,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // BB-251: the approval confirms exactly the assumptions the
             // request listed, before the request closes.
             const confirmedAssumptions = store.confirmApprovalAssumptions(target.id, threadId);
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId, approvedText: specTextFor(target, approval.entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
             store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
@@ -9415,7 +9454,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null; actions: NeedAction[]; freeText: boolean } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; specDiff: string | null; specChangedLines: number | null; specCommentUrl: string | null; specFullText: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null; actions: NeedAction[]; freeText: boolean } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -9440,7 +9479,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
       const { actions, freeText } = needActions(n, b);
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why, actions, freeText };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, specDiff: typeof n.data.specDiff === "string" ? n.data.specDiff : null, specChangedLines: typeof n.data.specChangedLines === "number" ? n.data.specChangedLines : null, specCommentUrl: typeof n.data.specCommentUrl === "string" ? n.data.specCommentUrl : null, specFullText: typeof n.data.specFullText === "string" ? n.data.specFullText : null, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why, actions, freeText };
     }
 
     /**

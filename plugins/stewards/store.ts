@@ -606,9 +606,16 @@ export const readyStateSchema = z.object({
   checklist: z.array(z.object({ item: z.string(), met: z.boolean(), note: z.string().nullable().default(null) })).default([]),
   substantial: z.boolean().nullable().default(null),
   why: z.string().nullable().default(null),
-  approval: z.object({ at: z.number(), specHash: z.string(), by: z.string() }).nullable().default(null),
+  // BB-249: the approved text itself, so a re-approval after an edit can show
+  // a diff. Null on an approval recorded before this field existed, which
+  // renders as "no previous version" rather than a diff against nothing.
+  approval: z.object({ at: z.number(), specHash: z.string(), by: z.string(), approvedText: z.string().nullable().default(null) }).nullable().default(null),
   /** Set when an approval was voided, so the steward knows to ask again. */
   voidedAt: z.number().nullable().default(null),
+  /** BB-249: the text the voided approval pinned, so a re-approval after a void still shows the diff; cleared by the next approval. */
+  voidedApprovedText: z.string().nullable().default(null),
+  /** BB-249: when the voided approval was recorded, so a comment between the approval and the void still explains the edit; cleared by the next approval. */
+  voidedApprovedAt: z.number().nullable().default(null),
   /** The spec an approval request was declined for: not asked again until the spec changes. */
   declinedSpecHash: z.string().nullable().default(null),
 });
@@ -2004,7 +2011,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
           // listed, before the request closes. An assumption recorded after the
           // request was shown is not on the list and stays open.
           confirmApprovalAssumptionsFor(bindingId, by);
-          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
+          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
           closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
           projectChanged(projectIdForBinding(bindingId));

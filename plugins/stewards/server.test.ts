@@ -1287,6 +1287,31 @@ describe("a Linear ticket steward", () => {
     expect(toProject()).toHaveLength(3);
   });
 
+  // BB-249: after an edit, the project steward's approval wake leads with the
+  // diff from the text the last approval pinned, as the user's item does.
+  it("carries the re-approval diff into the project steward's approval wake", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    const toProject = () => t.sends.filter((s) => s.threadId === project);
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" };
+
+    await t.tool("steward_report", { ...base, ready: met }, steward!);
+    expect(toProject()[0]!.text).not.toContain("Re-approval:");
+    await t.tool("steward_update", { binding: "ENG-12", approve: true }, project!);
+
+    // Edit the description: the next request carries the diff, as the wake.
+    t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO." }));
+    await t.ring("linear", "uuid-12");
+    await t.tool("steward_report", { ...base, ready: met }, steward!);
+    const reapproval = toProject().at(-1)!.text;
+    expect(reapproval).toContain("Re-approval: 2 lines changed from the approved spec:");
+    expect(reapproval).toContain("-Users cannot log in.");
+    expect(reapproval).toContain("+Users cannot log in with SSO.");
+  });
+
   it("wakes the project steward once when the steward escalates in the same report that asks for approval", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
@@ -5520,6 +5545,82 @@ describe("questions to the user", () => {
       expect(b.ready.declinedSpecHash).toBeNull();
       expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "approval")).toEqual([]);
     });
+
+    // BB-249: the user's approve-spec item files as today on a first approval,
+    // stores the approved text, and leads with a diff after an edit. The link
+    // points at the comment that explains this edit, not an older one.
+    it("files the first approval as today, stores the approved text, then diffs a re-approval", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      const older = comment({ id: "s1", body: "**Spec:** acceptance criteria", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s1", createdAt: "2026-10-14T14:00:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [older] }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const b = t.hooks.store.find("ENG-12")!;
+      const first = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+      expect(first.what).toBe("Approve ENG-12's spec");
+      expect(first.data.specDiff).toBeUndefined();
+      expect(first.data.specChangedLines).toBeUndefined();
+
+      await t.harness.callRpc("stewardsNeedAction", { needId: first.id, action: "approve" }, client);
+      const approved = t.hooks.store.find("ENG-12")!;
+      expect(approved.ready.approval!.approvedText).toContain("Users cannot log in.");
+      expect(approved.ready.approval!.approvedText).toContain("s1\n**Spec:** acceptance criteria");
+
+      // Edit only the description: the item is a re-approval with the diff, and
+      // the older spec comment does not explain this edit.
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [older] }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const reapproval = t.hooks.store.openNeeds(approved.id).find((n) => n.kind === "approve-spec")!;
+      expect(reapproval.what).toBe("Re-approve: 2 lines changed");
+      expect(reapproval.data.specChangedLines).toBe(2);
+      expect(reapproval.data.specDiff).toContain("-Users cannot log in.");
+      expect(reapproval.data.specDiff).toContain("+Users cannot log in with SSO.");
+      expect(reapproval.data.specCommentUrl).toBeNull();
+      expect(reapproval.data.specFullText).toContain("Users cannot log in with SSO.");
+
+      // A comment posted after the approval does explain the edit, and is linked.
+      const newer = comment({ id: "s2", body: "**Revision:** SSO changed", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s2", createdAt: "2026-10-14T16:00:00Z" });
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [older, newer] }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const relinked = t.hooks.store.openNeeds(approved.id).find((n) => n.kind === "approve-spec")!;
+      expect(relinked.data.specCommentUrl).toBe("https://linear.app/acme/issue/ENG-12#comment-s2");
+    });
+
+    // BB-249 review round 2: the voided approval's own time is the link cutoff,
+    // so a Revision comment posted between the edit and the void is linked.
+    it("still diffs a re-approval after the approval is voided, and links the edit's Revision comment", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: user");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const b = t.hooks.store.find("ENG-12")!;
+      const first = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+      await t.harness.callRpc("stewardsNeedAction", { needId: first.id, action: "approve" }, client);
+
+      // The steward edits, comments a Revision, then voids: the comment is
+      // after the approval but before the void, so it must still be linked.
+      const revision = comment({ id: "s2", body: "**Revision:** SSO changed", signedBy: steward, url: "https://linear.app/acme/issue/ENG-12#comment-s2", createdAt: "2026-10-14T16:00:00Z" });
+      t.entities.set("uuid-12", issue({ description: "Users cannot log in with SSO.", comments: [revision] }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met, voidApproval: true }, steward);
+      const voided = t.hooks.store.find("ENG-12")!;
+      expect(voided.ready.approval).toBeNull();
+      expect(voided.ready.voidedApprovedText).toBe("Users cannot log in.");
+      expect(voided.ready.voidedApprovedAt).toBe(Date.parse("2026-10-14T15:00:00Z"));
+
+      const reapproval = t.hooks.store.openNeeds(voided.id).find((n) => n.kind === "approve-spec")!;
+      expect(reapproval.what).toBe("Re-approve: 2 lines changed");
+      expect(reapproval.data.specDiff).toContain("+Users cannot log in with SSO.");
+      expect(reapproval.data.specCommentUrl).toBe("https://linear.app/acme/issue/ENG-12#comment-s2");
+    });
   });
 
   it("the page shows a project's board: waiting on you, in flight by stage with workers, stuck or held, ended, and the digest", async () => {
@@ -6230,7 +6331,7 @@ describe("the sidebar's needs you block (BB-46)", () => {
 
     // The spec approval the reconcile writes in the same patch clears the
     // product reason, so the item flips not actionable.
-    const approved = { ...ready, approval: { at: t.now(), specHash: "spec", by: "user" } };
+    const approved = { ...ready, approval: { at: t.now(), specHash: "spec", by: "user", approvedText: null } };
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.signalNeedActionability(b.id, snapshot, approved);
     expect(t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED)).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
@@ -6661,7 +6762,7 @@ describe("needs you items", () => {
     expect(refused.error, refused.text).toBe(true);
     expect(refused.text).toMatch(/substantial and references no ticket with an approved spec/u);
     // The ticket's own approved spec is the ack, so the project steward may approve.
-    t.hooks.store.patch(b.id, { ready: { ...b.ready, approval: { at: 1, specHash: "h", by: "user" } } });
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, approval: { at: 1, specHash: "h", by: "user", approvedText: null } } });
     const ok = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
     expect(ok.error, ok.text).toBe(false);
     expect(t.githubComments.some((c) => c.body.startsWith("<!-- bb-approval"))).toBe(true);
