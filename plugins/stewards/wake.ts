@@ -272,7 +272,7 @@ function deploymentInstructions(input: WakeInput): string | undefined {
   if (settled) {
     return (
       `Every pull request is merged and deployed (${where}). This is the last turn of the work: post one closing comment saying it is live and move the ticket to its terminal state, then end with steward_report without followThrough. ` +
-      `A by-hand step outside the repos that the feature needs to work — an app scope, a webhook, a registry entry, a tailnet rule — is not folded into the closing comment: report it with \`steward_report { escalate: { kind: "configure", question, context, meanwhile } }\` and keep the binding open with followThrough until it is done. A provide-secret whose form answer is "unchanged" has not provided the value, so reopen that step rather than settling it. ` +
+      `A by-hand step outside the repos that the feature needs to work — an app scope, a webhook, a registry entry, a tailnet rule — is not folded into the closing comment: raise it with \`steward_report { escalate }\` as a \`configure\` escalation (the project steward forwards it with \`resolution: "done"\`) and keep the binding open with followThrough until it is done. A provide-secret whose form answer is "unchanged" has not provided the value, so reopen that step rather than settling it. ` +
       `If a playbook says otherwise, keep it open with followThrough as usual.`
     );
   }

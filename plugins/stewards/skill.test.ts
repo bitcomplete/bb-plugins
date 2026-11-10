@@ -95,7 +95,7 @@ describe("the shipped stewards skill's by-hand configure step (BB-267)", () => {
     expect(stewardsSkill).toContain("A by-hand step outside the repos the feature needs to work");
     expect(stewardsSkill).toMatch(/an app scope, a webhook, a registry entry, a tailnet rule/u);
     expect(stewardsSkill).toMatch(/a `configure`\s+escalation raised in the spec turn/u);
-    expect(stewardsSkill).toMatch(/never a README line or a\s+closing-comment follow-up/u);
+    expect(stewardsSkill).toMatch(/never a README\s+line or a closing-comment follow-up/u);
     expect(stewardsSkill).toMatch(/reopens the step rather than settling\s+it/u);
     expect(stewardsSkill).toMatch(/Fail checklist item 5/u);
     expect(stewardsSkill).toMatch(/reopens rather than\s+settling/u);

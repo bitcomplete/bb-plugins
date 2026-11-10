@@ -264,7 +264,8 @@ describe("playbooks", () => {
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/changes what the ticket needs/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/escalated as a `decision`/u);
     // BB-267: a by-hand configure step outside the repos is an escalation too.
-    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/kind: "configure"/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/a `configure` escalation raised in the spec turn/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/resolution: "done"/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/never a README line or a closing-comment follow-up/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/reopen the step rather than settling it/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/followThrough/u);

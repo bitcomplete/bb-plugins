@@ -138,8 +138,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   it by hand; such spec wording is corrected at spec approval, never
   followed. A by-hand step outside the repos the feature needs to work — an
   app scope, a webhook, a registry entry, a tailnet rule — is a `configure`
-  escalation raised in the spec turn, never a README line or a
-  closing-comment follow-up; at wrap-up it is reported as an escalation with
+  escalation raised in the spec turn (`steward_report { escalate }`, which
+  the project steward forwards with `resolution: "done"`), never a README
+  line or a closing-comment follow-up; at wrap-up it is reported as an
+  escalation with
   `followThrough`, and a provide-secret whose form answer is "unchanged"
   has not provided the value, so it reopens the step rather than settling
   it. Never paste a secret, and never route the user to a script to
