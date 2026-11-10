@@ -179,10 +179,15 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
   // DIVERGENCE: the gate answers `gateMet: true` for this pull request, while
   // the page's own refusal says "the pull request has not been observed yet".
   it("DIVERGENCE: pins the page action's prGate caller: a met no-review gate refuses with the not-observed message", async () => {
-    const { ctx, githubComment, githubReview, sendTo } = deliveryContext();
+    const { ctx, worker, githubComment, githubReview, sendTo } = deliveryContext();
     const noReview = comment({ id: "m-nr", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
     const entity = pull({ comments: [noReview] }, green);
-    const b = { id: "b1", source: "ops", kind: "pr", entityId: "acme/web#7", entityKey: "acme/web#7", lastSnapshot: { entity, pulls: [] } } as unknown as Binding;
+    // The gate-met fixture carries a parked `finished` worker (in the context's
+    // store) and a second open own pull request, the BB-291 working rule.
+    const second = pull({ key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }, { headSha: "bbbbbbb2" });
+    expect(worker.status).toBe("finished");
+    expect(ctx.store.workers("b1")).toEqual([worker]);
+    const b = { id: "b1", source: "ops", kind: "pr", entityId: "acme/web#7", entityKey: "acme/web#7", workers: [worker], lastSnapshot: { entity, pulls: [second] } } as unknown as Binding;
     const need = { id: "n1", bindingId: "b1", kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7", how: null, data: {}, filedBy: "plugin", status: "open", resolution: null, createdAt: 0, resolvedAt: null } as unknown as Need;
     // The gate the caller reads is met; `needsOwnerApproval` is false.
     await expect(approvePrPageAction(ctx, b, need, "approve", null)).resolves.toEqual({ ok: false, message: "Not now: the pull request has not been observed yet." });
