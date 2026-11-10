@@ -1,5 +1,6 @@
 // Test fixtures shared by the stewards tests. Not loaded by the plugin.
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
+import type { Worker } from "./store.js";
 
 export const issue = (over: Partial<EntitySnapshot> = {}): EntitySnapshot => ({
   source: "linear",
@@ -91,6 +92,24 @@ export const comment = (over: Partial<SnapshotComment> = {}): SnapshotComment =>
   createdAt: "2026-10-02T00:00:00Z",
   url: null,
   signedBy: null,
+  ...over,
+});
+
+/**
+ * A worker that has parked at the end of its turn, waiting on something that
+ * will wake it (the build-tickets merge gate, a review round). `finished` is
+ * the parked status, so it is still in flight for delivery (BB-279).
+ */
+export const parkedWorker = (over: Partial<Worker> = {}): Worker => ({
+  threadId: "thr_worker",
+  bindingId: "b1",
+  title: "BB-12: implement",
+  status: "finished",
+  result: "Watching acme/web#7 for the review.",
+  startedAt: 1,
+  endedAt: 2,
+  modelCheckPending: false,
+  stopReason: null,
   ...over,
 });
 
