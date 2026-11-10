@@ -6,6 +6,8 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { landLessonInstruction } from "./lessons.js";
+import type { GuidanceUnit } from "./guidance.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
@@ -326,6 +328,8 @@ export type WakeInput = {
   conflicts?: Conflict[];
   /** Trial lessons of the project, already capped to `lessons.trial.max`; candidates never appear. */
   lessons?: Lesson[];
+  /** The hand-written guidance units this wake renders, each with the `gu_` id a steward cites (BB-288). */
+  guidance?: GuidanceUnit[];
   now: number;
 };
 
@@ -631,6 +635,7 @@ export function formatWake(input: WakeInput): string {
   if (binding.mergeBehind.length > 0) out.push(mergeHoldLine(binding));
   if (binding.stackedPulls.length > 0) out.push(stackedPullsLine(binding));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
+  out.push(...guidanceUnitLines(input.guidance ?? []));
   out.push(...trialLessonsLines(input.lessons ?? []));
   out.push(...assumptionLines(input.assumptions ?? []));
   // BB-154: a wait with no structured source gets one paragraph, before the
@@ -697,6 +702,8 @@ export type BriefInput = {
   escalations?: Escalation[];
   /** Open bindings at work on the same paths, for the scheduling line. */
   conflicts?: Conflict[];
+  /** The hand-written guidance units this brief renders, each with the `gu_` id a steward cites (BB-288). */
+  guidance?: GuidanceUnit[];
 };
 
 /** One line for the head of a brief: the gate's state, and the one action it forbids while unmet. */
@@ -753,6 +760,7 @@ export function formatBrief(input: BriefInput, maxChars?: number): string {
   middle.push(`- Priority: ${b.priority ?? "normal"}`);
   middle.push(holdLine(b, "take no new actions and start no workers until it is lifted."));
   middle.push(...schedulingLines(b, input.conflicts ?? [], escalations));
+  middle.push(...guidanceUnitLines(input.guidance ?? []));
 
   const tail: string[] = [
     "",
@@ -1214,6 +1222,23 @@ function trialLessonsLines(lessons: Lesson[]): string[] {
 }
 
 /**
+ * The hand-written guidance units a wake or brief renders, each beside its
+ * `gu_` id (BB-288). Without the id a steward can only cite a unit by running
+ * `bb stewards lessons --efficacy`, so every unit the wake shows carries the
+ * id it must cite.
+ */
+function guidanceUnitLines(units: readonly GuidanceUnit[]): string[] {
+  if (units.length === 0) return [];
+  return [
+    "",
+    "## Guidance units",
+    "",
+    "Each hand-written paragraph of `AGENTS.md` and the playbooks carries its `gu_` id. Cite the id of the paragraph a decision or turn rested on in `steward_update { resolve, cites: [...] }` (or `{ forward, cites }`) or `steward_report { cites: [...] }`.",
+    ...units.map((u) => `- ${u.id} (${u.file}${u.heading === null ? "" : ` §${u.heading}`}): ${oneLine(u.text)}`),
+  ];
+}
+
+/**
  * The project steward's lesson blocks (BB-35 step 3): the trial lessons to
  * decide from, the promoted ones the nightly pass queued for landing, and the
  * retired ones whose anchored text must come out. Trial is capped at
@@ -1224,8 +1249,13 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
   const out: string[] = [];
   const trial = lessons.filter((l) => l.tier === "trial").slice(0, cap);
   if (trial.length > 0) {
-    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `steward_update { resolve, cites: [lesson ids] }` (or `{ forward, cites }`), or the ones a turn acted on in `steward_report { cites: [lesson ids] }`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.");
-    for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`);
+    out.push(
+      "",
+      "## Lessons (trial)",
+      "",
+      "Project rules not yet in `.bb`. These are yours to land early or leave in trial; they are not owner to-dos and never belong under the digest's \"today's priorities\". Decide from them, and cite the ones a decision rested on with `steward_update { resolve, cites: [lesson ids] }` (or `{ forward, cites }`), or the ones a turn acted on in `steward_report { cites: [lesson ids] }`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.",
+    );
+    for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}\n  ${landLessonInstruction(l)}`);
   }
   const toLand = lessons.filter((l) => l.tier === "promoted" && l.status === "pending");
   if (toLand.length > 0) {
@@ -1233,7 +1263,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
       "",
       "## Lessons to land",
       "",
-      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. The plugin opens one pull request on the primary repo per lesson (or per publish when several touch the same file): a `procedure` one is squash-merged by the project steward, and a `boundary` one is filed for the owner as a Review PR/Drop item that waits for the owner to merge it. If the pull request was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
+      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. The plugin opens one pull request on the primary repo per lesson (or per publish when several touch the same file). The decide list places it like any other pull request: a `project` file (a playbook) is squash-merged by the project steward, while a `user` file (`AGENTS.md`) or a `boundary` lesson is filed for the owner as a Review PR/Drop item that waits for the owner to merge it. If the pull request was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
     );
     for (const l of toLand) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}\n  Anchor: \`<!-- lesson:${l.id} -->\`${l.note === null ? "" : `\n  Last attempt: ${oneLine(l.note)}`}`);
   }
@@ -1243,7 +1273,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
       "",
       "## Lessons to retire",
       "",
-      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. A retire is a pull request too: a `procedure` one is merged by the project steward, a `boundary` one waits for the owner. The row is kept.',
+      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. A retire is a pull request too: the decide list places it the same way — a `project` playbook is merged by the project steward, a `user` file or a `boundary` lesson waits for the owner. The row is kept.',
     );
     for (const l of toRetire) out.push(`- ${l.id} (${l.file}): ${oneLine(l.text)}`);
   }
@@ -1382,6 +1412,8 @@ export function formatProjectWake(input: {
   assumptions?: Array<{ assumption: Assumption; binding: Binding | null }>;
   /** Pending lessons: general rules waiting to be landed in `.bb`. */
   lessons?: Lesson[];
+  /** The hand-written guidance units this wake renders, each with the `gu_` id a steward cites (BB-288). */
+  guidance?: GuidanceUnit[];
   /** The project's lesson rules, for the trial cap and the wake headings. */
   lessonRules?: LessonRules;
   /** With digestDue: the records the digest is written from. */
@@ -1487,6 +1519,7 @@ export function formatProjectWake(input: {
     out.push("", "Recorded, not asked: the owner sees these here and can correct one; a confirmation is the steward's own. Do not ask the user about one in prose.", "");
   }
   const lessons = input.lessons ?? [];
+  out.push(...guidanceUnitLines(input.guidance ?? []));
   out.push(...projectLessonsLines(lessons, input.lessonRules));
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");

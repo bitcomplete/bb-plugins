@@ -673,9 +673,11 @@ Because `.bb` is a directory on the primary repo's default branch, a lesson
 lands as a pull request, never a fast-forward: the plugin opens one PR per
 lesson (or per publish when several lessons touch the same file) on the
 primary repo, naming the lesson id, the anchor and you as the proposing
-steward. A `procedure` lesson's PR is squash-merged by the project steward at
-once, with no person asked; a `boundary` lesson's PR waits for the owner to
-merge it, and a project-steward approval never counts for it. A lesson may
+steward. The decide list places that pull request like any other: a
+`procedure` lesson in a `project` file (a playbook) is squash-merged by the
+project steward at once, with no person asked; a lesson in a `user` file
+(`AGENTS.md`) or a `boundary` lesson waits for the owner as a Review PR/Drop
+item, and a project-steward approval never counts for it. A lesson may
 never target `stewards/project.json` or `stewards/roles.json`, so it cannot
 widen the decide list, loosen the pull-request gate, relax an approval or
 change who is a steward; a boundary lesson still goes to the owner as

@@ -97,7 +97,7 @@ import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTarget
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, recordProjectDecision, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -120,7 +120,7 @@ import {
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
-import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
+import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
@@ -1944,6 +1944,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return value;
     }
 
+    /** The `server_settings` key that records when `gu_` ids were first rendered for a project (BB-288). */
+    const guidanceRenderedKey = (projectId: string): string => `stewards.guidanceFirstRenderedAt.${projectId}`;
+
+    /** When the plugin first rendered `gu_` ids for a project, or null when it has not (BB-288). */
+    function guidanceFirstRenderedAt(projectId: string): number | null {
+      const raw = store.serverSetting(guidanceRenderedKey(projectId));
+      if (raw === null) return null;
+      const at = Number(raw);
+      return Number.isFinite(at) ? at : null;
+    }
+
+    /** Record the first `gu_` render, once, so the efficacy "uncited" list waits 90 days from it (BB-288). */
+    function noteGuidanceRendered(projectId: string): void {
+      if (guidanceFirstRenderedAt(projectId) !== null) return;
+      store.setServerSetting(guidanceRenderedKey(projectId), String(now()));
+    }
+
+    /** The AGENTS.md and playbook units a wake renders: `AGENTS.md` always, plus the binding's playbook (BB-288). */
+    function guidanceFor(units: readonly GuidanceUnit[], playbookName: string | null): GuidanceUnit[] {
+      const file = playbookName === null ? null : playbookPath(playbookName);
+      return units.filter((u) => u.file === "AGENTS.md" || (file !== null && u.file === file));
+    }
+
+    /** The guidance units for a wake, read (and cached) from `.bb` HEAD, recording the first render (BB-288). */
+    async function wakeGuidance(projectId: string, playbookName: string | null): Promise<GuidanceUnit[]> {
+      const units = await guidanceUnits(projectId);
+      noteGuidanceRendered(projectId);
+      return guidanceFor(units, playbookName);
+    }
+
+    /** The last loaded guidance units for a brief's synchronous context, without a read (BB-288). */
+    function cachedWakeGuidance(projectId: string, playbookName: string | null): GuidanceUnit[] {
+      return guidanceFor(guidanceIndexes.get(projectId)?.value ?? [], playbookName);
+    }
+
     /**
      * Count the lessons and hand-written guidance units one decision or report
      * rested on (BB-35 steps 2 and 6). A lesson's `hits` counts distinct
@@ -3433,6 +3468,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         deployments: b.deployments,
         assumptions: store.openAssumptions(b.id),
         lessons: store.lessonsByTier(b.projectId, "trial").slice(0, config.file.lessons.trial.max),
+        guidance: await wakeGuidance(b.projectId, playbook.name),
         now: now(),
       });
       const delivery = await deliverWake(b, config, playbook, text);
@@ -5753,7 +5789,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
       const assumptions = store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -5955,7 +5991,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return null;
     }
 
-    /** Squash-merge a lesson's pull request as the project steward, and mark the lesson merged. The narrow guard is checked first, and a refusal is recorded as a note, like a refused open, so the nightly wake shows it. */
+    /** Squash-merge a lesson's pull request as the project steward, and mark the lesson merged. The narrow guard is checked first, and a refusal is recorded as a note, like a refused open, so the nightly wake shows it. BB-288: the ordinary decide list places the landing; a `user` file is the owner's, not the project steward's. */
     async function mergeLessonPr(lesson: Lesson, result: LessonPrResult, note: string, opts: { retire?: boolean; verb?: string } = {}): Promise<{ ok: boolean; message: string }> {
       if (result.repo === null || result.number === null) return { ok: true, message: `pull request opened at ${result.url ?? "?"}` };
       const retire = opts.retire === true;
@@ -5963,6 +5999,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (problem !== null) {
         store.noteLesson(lesson.id, problem);
         return { ok: false, message: `pull request refused: ${problem}` };
+      }
+      // BB-288: the decide list decides who lands the lesson, exactly as it
+      // decides any other pull request. A `user` file (AGENTS.md, the project
+      // file, roles.json) files the owner's Review PR/Drop item; a `project`
+      // file (a playbook) is the project steward's, and the ordinary project
+      // approval is recorded before the merge.
+      const decisions = (await loadConfig(lesson.projectId))?.file.bigDecisions ?? [];
+      if (lessonLandingMark(lesson, decisions) === "user") {
+        const filed = fileLessonOwnerNeed(lesson, result.branch, result.url, retire);
+        const message = filed
+          ? "the decide list makes this the user's to approve; Review PR/Drop filed for the owner"
+          : "the decide list makes this the user's to approve, and the lesson has no binding to file it on";
+        store.noteLesson(lesson.id, message);
+        return { ok: false, message };
+      }
+      const binding = lesson.bindingId === null ? null : store.binding(lesson.bindingId);
+      const projectThreadId = store.project(lesson.projectId).threadId;
+      const pull = await snapshot("github", `${result.repo}#${result.number}`).catch(() => null);
+      if (binding !== null && projectThreadId !== null && pull !== null && (pull.pull?.headSha ?? "") !== "") {
+        const files = github.files === undefined ? null : await github.files(result.repo, result.number).catch(() => null);
+        const entry = files === null ? null : (explainDecision(files, decisions).winner?.text ?? null);
+        await recordProjectDecision(approvalsCtx, binding, pull, projectThreadId, { headSha: pull.pull?.headSha ?? "", entry, verdict: "approved", reasoning: note }).catch((error: unknown) => {
+          bb.log.warn(`stewards: could not record the project approval for lesson ${lesson.id}: ${errorMessage(error)}`);
+        });
       }
       try {
         const { sha } = await github.squashMerge(result.repo, result.number, `Lesson ${lesson.id}`, note);
@@ -6153,22 +6213,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * File the boundary lesson's Review PR/Drop item (BB-35 steps 3/5, BB-108).
-     * It is the existing validation escalation: only the owner merging the pull
-     * request makes a boundary lesson permanent, and an unanswered item leaves
-     * the lesson in trial.
+     * File the owner's Review PR/Drop item for a lesson the decide list or a
+     * boundary scope makes the user's (BB-35 steps 3/5, BB-108; BB-288). The
+     * project steward publishes the branch and opens the pull request; the
+     * owner approves it on GitHub, and the plugin observes the merge. It is the
+     * existing validation escalation: only the owner merging the pull request
+     * makes a boundary lesson permanent, and an unanswered item leaves the
+     * lesson in trial.
      */
-    function fileBoundaryLessonNeed(lesson: Lesson, branch: string | null, prUrl: string | null, retire = false): boolean {
+    function fileLessonOwnerNeed(lesson: Lesson, branch: string | null, prUrl: string | null, retire = false, boundary = false): boolean {
       if (lesson.bindingId === null) return false;
+      const kind = boundary ? "boundary lesson" : "lesson";
       store.fileNeed({
         bindingId: lesson.bindingId,
         kind: "decide",
         url: lesson.id,
-        what: `Review or drop the ${retire ? "retirement of the " : ""}boundary lesson for ${lesson.file}`,
+        what: `Review or drop the ${retire ? "retirement of the " : ""}${kind} for ${lesson.file}`,
         how: [
           retire
-            ? "The nightly pass retired this boundary lesson, so removing its anchored text also changes the boundary and only you may make it permanent."
-            : "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
+            ? `The nightly pass retired this ${kind}, so removing its anchored text ${boundary ? "also changes the boundary and " : ""}only you may make it permanent.`
+            : boundary
+              ? "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent."
+              : "The project steward recorded a general rule for a file the decide list makes the user's, so only you may make it permanent.",
           "",
           `> ${lesson.text}`,
           "",
@@ -6181,7 +6247,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return true;
     }
 
-    /** File the mixed-evidence Keep/Retire question (BB-35 step 5). Silence retires the lesson. */
+    /** File the boundary lesson's Review PR/Drop item (BB-35 steps 3/5, BB-108). */
+    const fileBoundaryLessonNeed = (lesson: Lesson, branch: string | null, prUrl: string | null, retire = false): boolean => fileLessonOwnerNeed(lesson, branch, prUrl, retire, true);
+
     function fileMixedEvidenceNeed(lesson: Lesson): boolean {
       if (lesson.bindingId === null) return false;
       store.fileNeed({
@@ -9009,7 +9077,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const hostId = cachedProjectHost(b.projectId);
       const flags = hostId === undefined ? null : [environmentFlags(config?.source ?? null, hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
       return formatBrief(
-        { binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) },
+        { binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)), guidance: cachedWakeGuidance(b.projectId, playbook.name) },
         BRIEF_MAX_CHARS,
       );
     });
@@ -10022,7 +10090,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const cluster = lessonClusterFor(bindingId, escalationId);
             const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch, ...(cluster === null ? {} : { clusterKey: cluster }), ...(input.lesson!.supersedes === undefined ? {} : { supersedes: input.lesson!.supersedes }) });
             if (cluster !== null) store.settleClusterRationale(projectOf!, cluster);
-            return `lesson ${lesson.id} recorded (${lesson.scope}, ${lesson.tier}); it is injected into wakes and the nightly pass promotes it when it earns it. To land it now, add \`${withLessonAnchor(lesson.text, lesson.id)}\` to ${lesson.file}, commit, publish it with workspace_publish_guidance on a multi-repo project (on a native project, commit and open the pull request yourself), then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
+            return `lesson ${lesson.id} recorded (${lesson.scope}, ${lesson.tier}); it is injected into wakes and the nightly pass promotes it when it earns it. ${landLessonInstruction(lesson)}`;
           };
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
             const q = store.question(resolve);
@@ -11490,7 +11558,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
               return {
                 exitCode: 0,
-                stdout: formatBrief({ binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: await workerFlagsFor(b, playbook, config.source), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) }),
+                stdout: formatBrief({ binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: await workerFlagsFor(b, playbook, config.source), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)), guidance: await wakeGuidance(b.projectId, playbook.name) }),
               };
             },
           }),
@@ -11637,7 +11705,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 // guidance nothing has cited in 90 days. Read-only: it names a
                 // suggestion, it never removes a unit.
                 const units = await guidanceUnits(projectId);
-                const uncited = uncitedGuidanceUnits(units, store.guidanceCitations(projectId), now());
+                // BB-288: the "uncited for 90 days" list is suppressed until
+                // `gu_` ids have actually been rendered for 90 days. A unit
+                // reads "never cited" because no wake ever showed its id, not
+                // because nobody followed it; the stored first-render date is
+                // when that stopped being true. Read-only: this command never
+                // sets the date.
+                const firstRenderedAt = guidanceFirstRenderedAt(projectId);
+                const uncitedReadyAt = firstRenderedAt === null ? null : firstRenderedAt + GUIDANCE_UNCITED_DAYS * 86_400_000;
+                const uncitedReady = uncitedReadyAt !== null && now() >= uncitedReadyAt;
+                const uncited = uncitedReady ? uncitedGuidanceUnits(units, store.guidanceCitations(projectId), now()) : [];
                 // One count per user-facing item: a forwarded escalation is
                 // represented by the question the user saw, not both. The
                 // question's creation is when it reached them.
@@ -11647,8 +11724,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const weeks = escalationWeeks(reaching.map((x) => x.createdAt), now());
                 if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ weeks, uncited: uncited.map((u) => ({ id: u.unit.id, file: u.unit.file, heading: u.unit.heading, text: u.unit.text, lastCitedAt: u.lastCitedAt })) }) };
                 const lines = ["Escalations reaching the user, per week (oldest first):", ...weeks.map((w) => `  ${iso(w.start).slice(0, 10)}  ${w.count}`)];
-                lines.push("", `Hand-written guidance units uncited for ${GUIDANCE_UNCITED_DAYS} days (consider removing):`);
-                if (uncited.length === 0) lines.push("  none");
+                if (uncitedReady) lines.push("", `Hand-written guidance units uncited for ${GUIDANCE_UNCITED_DAYS} days (consider removing):`);
+                else
+                  lines.push(
+                    "",
+                    `Hand-written guidance units uncited for ${GUIDANCE_UNCITED_DAYS} days: suppressed ${
+                      uncitedReadyAt === null ? "until the ids have been rendered in a wake" : `until ${iso(uncitedReadyAt).slice(0, 10)}`
+                    }, because \`gu_\` ids have not been rendering for ${GUIDANCE_UNCITED_DAYS} days yet.`,
+                  );
+                if (uncitedReady && uncited.length === 0) lines.push("  none");
                 for (const u of uncited) {
                   const snippet = u.unit.text.replace(/\s+/gu, " ").slice(0, 120);
                   lines.push(`  ${u.unit.id}  ${u.unit.file}${u.unit.heading === null ? "" : ` §${u.unit.heading}`}  ${u.lastCitedAt === null ? "(never cited)" : `(last cited ${iso(u.lastCitedAt).slice(0, 10)})`}\n    ${snippet}`);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hasLessonAnchor, lessonAnchor, lessonScore, planLessonTransitions, planValidations, removeLessonAnchor, retireLessonAnchor, retiredLessonAnchor, withLessonAnchor, type ScoreableLesson } from "./lessons.js";
+import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, lessonScore, planLessonTransitions, planValidations, removeLessonAnchor, retireLessonAnchor, retiredLessonAnchor, withLessonAnchor, type ScoreableLesson } from "./lessons.js";
 import type { LessonRules } from "./config.js";
 
 const DAY = 86_400_000;
@@ -135,5 +135,36 @@ describe("the validation queue (BB-35 step 5)", () => {
     const strong = lesson({ id: "lsn_strong", scope: "boundary", hits: 6, lastCitedAt: T - 1 * DAY, tierAt: T - 20 * DAY });
     const weak = lesson({ id: "lsn_weak", scope: "boundary", hits: 3, lastCitedAt: T - 20 * DAY, tierAt: T - 20 * DAY });
     expect(planValidations([weak, strong], rules, T).map((r) => r.id)).toEqual(["lsn_strong", "lsn_weak"]);
+  });
+});
+
+describe("the landing decision (BB-288)", () => {
+  // The decide-list entries bb-gate `main` carries (BB-280): the `user` entry
+  // for AGENTS.md and the `project` entry for the playbooks. A lesson is placed
+  // by these, not by its scope, except that a boundary lesson stays the user's.
+  const decisions = [
+    { text: "Who stewards are and what the project tells them (steward roles, the decide list, the project's guidance)", decide: "user" as const, paths: [".bb/stewards/roles.json", ".bb/stewards/project.json", ".bb/AGENTS.md"] },
+    { text: "What every steward is told (the playbooks and the project's skills)", decide: "project" as const, paths: [".bb/stewards/playbooks/**", ".bb/skills/**"] },
+  ];
+
+  it("places a procedure lesson by the ordinary decide list", () => {
+    expect(lessonLandingMark({ file: "stewards/playbooks/linear-tickets.md", scope: "procedure" }, decisions)).toBe("project");
+    expect(lessonLandingMark({ file: "AGENTS.md", scope: "procedure" }, decisions)).toBe("user");
+  });
+
+  it("keeps a boundary lesson the user's whatever file it targets", () => {
+    expect(lessonLandingMark({ file: "stewards/playbooks/linear-tickets.md", scope: "boundary" }, decisions)).toBe("user");
+  });
+
+  it("fails closed on no match or an unreadable decide list", () => {
+    expect(lessonLandingMark({ file: "stewards/playbooks/linear-tickets.md", scope: "procedure" }, [])).toBe("user");
+    expect(lessonLandingMark({ file: "docs/whatever.md", scope: "procedure" }, decisions)).toBe("user");
+  });
+
+  it("names the anchor, file and completion call for an early landing", () => {
+    const instruction = landLessonInstruction({ id: "lsn_1", file: "stewards/playbooks/linear-tickets.md" });
+    expect(instruction).toContain("<!-- lesson:lsn_1 -->");
+    expect(instruction).toContain("stewards/playbooks/linear-tickets.md");
+    expect(instruction).toContain('steward_update { lessonAction: { id: "lsn_1", action: "complete" } }');
   });
 });

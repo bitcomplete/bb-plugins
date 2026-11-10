@@ -367,6 +367,40 @@ describe("the nightly prompt", () => {
     expect(wake).not.toContain(`- ${lessons[2]!.id} `);
   });
 
+  it("tells the project steward it may land a trial lesson early, and that it is not an owner priority (BB-288)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const trial = s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: "Auth is the plugin's.", scope: "procedure", branch: null });
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], lessons: s.allLessons("p1") });
+    expect(wake).toContain("## Lessons (trial)");
+    expect(wake).toContain("not owner to-dos");
+    expect(wake).toContain("workspace_publish_guidance");
+    expect(wake).toContain(`steward_update { lessonAction: { id: "${trial.id}", action: "complete" } }`);
+    // The digest is built from the records, which never carry trial lessons,
+    // so a trial rule cannot be listed as an owner priority (BB-288).
+    const records: DigestRecords = { previous: null, since: T, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
+    const digest = formatRecords(records, []).join("\n");
+    expect(digest).not.toContain(trial.id);
+    expect(digest).not.toContain("Auth is the plugin's.");
+  });
+
+  it("renders each AGENTS.md and playbook guidance unit beside its gu_ id in the wake and the brief (BB-288)", () => {
+    const units = [
+      { id: "gu_0123456789abcdef", file: "AGENTS.md", heading: "Reviews", text: "A merge to bb-plugins main restarts every server.", lessonId: null },
+      { id: "gu_fedcba9876543210", file: "stewards/playbooks/linear-tickets.md", heading: "In Progress", text: "Start the worker in the same turn.", lessonId: null },
+    ];
+    const input = wakeInput({ guidance: units });
+    const wake = formatWake(input);
+    expect(wake).toContain("## Guidance units");
+    expect(wake).toContain("- gu_0123456789abcdef (AGENTS.md §Reviews): A merge to bb-plugins main restarts every server.");
+    expect(wake).toContain("- gu_fedcba9876543210 (stewards/playbooks/linear-tickets.md §In Progress): Start the worker in the same turn.");
+    const brief = formatBrief({ binding: input.binding, playbook: input.playbook, gate: input.gate, workerFlags: null, guidance: units });
+    expect(brief).toContain("gu_0123456789abcdef");
+    expect(brief).toContain("gu_fedcba9876543210");
+    // With no units the block is absent, so a wake that renders none says nothing.
+    expect(formatWake(wakeInput())).not.toContain("## Guidance units");
+  });
+
   it("names the five resolution kinds and how a credential is forwarded (BB-51, BB-176)", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");
