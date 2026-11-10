@@ -205,6 +205,32 @@ describe("the Stewards page's decide items and questions (BB-20)", () => {
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Merge" } }));
     slot.lifecycle.unmount();
   });
+
+  it("requires text for a decide item's free-text Answer, while Done and a fixed choice stay optional (BB-268)", async () => {
+    const slot = await renderBoard(
+      [
+        need({ id: "need_decide", kind: "decide", choices: [], what: "Which way?" }),
+        need({ id: "need_configure", kind: "configure", url: "https://example.test", what: "Enable the event" }),
+        need({ id: "need_choices", kind: "decide", choices: ["Merge", "Close"], what: "Merge or close?" }),
+      ],
+      [],
+    );
+    await waitFor(() => expect(slot.getByText("Which way?")).toBeTruthy());
+    const box = slot.getByLabelText("Note for: Which way?") as HTMLTextAreaElement;
+    expect(box.placeholder).toBe("Your answer");
+    const answer = () => slot.getByRole("button", { name: "Answer" }) as HTMLButtonElement;
+    expect(answer().disabled).toBe(true);
+    fireEvent.change(box, { target: { value: "   " } });
+    expect(answer().disabled).toBe(true);
+    fireEvent.change(box, { target: { value: "The second way" } });
+    expect(answer().disabled).toBe(false);
+    fireEvent.click(answer());
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_decide", action: "done", note: "The second way" } }));
+    // A configure Done and a decide item's fixed choice stay enabled with an empty box.
+    expect((slot.getByRole("button", { name: "Done" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((slot.getByRole("button", { name: "Merge" }) as HTMLButtonElement).disabled).toBe(false);
+    slot.lifecycle.unmount();
+  });
 });
 
 // BB-249: a re-approval item leads with the diff from the text the owner
@@ -331,18 +357,18 @@ describe("the rationale box and lessons block (BB-35 step 4)", () => {
     boxed.lifecycle.unmount();
   });
 
-  it("sends the rationale with the answer, and an empty box is accepted", async () => {
+  it("sends the rationale with the answer, and disables Answer while the box is empty", async () => {
     const slot = await renderBoardWith({ questions: [question({ rationaleWanted: "Why?" })] });
-    const box = await waitFor(() => slot.getByLabelText(/^Why:/u));
+    const answer = (await waitFor(() => slot.getByLabelText(/^Answer to:/u))) as HTMLTextAreaElement;
+    expect(answer.placeholder).toBe("Your answer");
+    const box = slot.getByLabelText(/^Why:/u);
     fireEvent.change(box, { target: { value: "Because the plugin owns auth." } });
+    // The rationale alone does not answer: the empty answer box keeps Answer disabled.
+    expect((slot.getByRole("button", { name: "Answer" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(answer, { target: { value: "Leave SSO out." } });
     fireEvent.click(slot.getByRole("button", { name: "Answer" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, rationale: "Because the plugin owns auth." } }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: "Leave SSO out.", rationale: "Because the plugin owns auth." } }));
     slot.lifecycle.unmount();
-
-    const empty = await renderBoardWith({ questions: [question({ rationaleWanted: "Why?" })] });
-    fireEvent.click(await waitFor(() => empty.getByRole("button", { name: "Answer" })));
-    await waitFor(() => expect(empty.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null } }));
-    empty.lifecycle.unmount();
   });
 
   it("is a collapsed details block with the tier counts and no action buttons", async () => {

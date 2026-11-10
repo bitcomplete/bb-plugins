@@ -1544,6 +1544,9 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
   // The text box is the free-text answer when there are no choices, or after
   // Other… turned it into one; otherwise it is a note on the chosen button.
   const freeMode = !n.actions.some((a) => !isLinkAction(a) && a.choice !== null) || other;
+  // A `decide` item's free-text Answer needs text; the note on a fixed choice,
+  // Approve, Decline and Done stays optional (BB-268).
+  const freeAnswer = n.kind === "decide" && n.actions.some((a) => !isLinkAction(a) && a.action === "done" && a.choice === null && a.note);
   return (
     <>
       {takesNote ? (
@@ -1551,13 +1554,13 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
           value={note}
           onChange={(e) => setNote(e.target.value)}
           rows={1}
-          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "approve-pr" ? "Note (optional; used when you decline)" : freeMode ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "approve-pr" ? "Note (optional; used when you decline)" : freeMode && freeAnswer ? "Your answer" : "Note (optional, saved as guidance)"}
           aria-label={`Note for: ${n.what}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
       ) : null}
       <div className="flex flex-wrap items-center gap-2">
-        <ActionButtons actions={n.actions} freeText={n.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={!n.actionable || state === "running"} onAction={act} onOpenLink={(url) => navigate.openUrl(url)} button={secondary} primary={primary} />
+        <ActionButtons actions={n.actions} freeText={n.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={!n.actionable || state === "running" || (freeMode && freeAnswer && note.trim() === "")} onAction={act} onOpenLink={(url) => navigate.openUrl(url)} button={secondary} primary={primary} />
         {n.threadId !== null ? <ThreadLink threadId={n.threadId}>{n.kind === "provide-secret" ? "Open the requester" : "Open the worker"}</ThreadLink> : null}
         {n.kind === "decide" && n.lessonId !== null && n.prUrl === null && n.choices.includes("Review PR") ? <span className="text-muted-foreground">The pull request is not open yet.</span> : null}
         {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
@@ -1596,6 +1599,10 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
       );
   };
   const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  // The free-text answer when there are no choices or Other… revealed it; a
+  // fixed choice's note box otherwise. Only the free-text Answer needs text
+  // (BB-268).
+  const freeMode = !q.freeText || other;
   return (
     <>
       {q.rationaleWanted !== null ? (
@@ -1613,11 +1620,11 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
           value={answer}
           onChange={(e) => setAnswer(e.target.value)}
           rows={1}
-          placeholder={q.freeText && !other ? "Note (optional)" : "Your answer (optional)"}
+          placeholder={freeMode ? "Your answer" : "Note (optional)"}
           aria-label={`Answer to: ${q.question}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
-        <ActionButtons actions={q.actions} freeText={q.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={state === "closing"} onAction={close} onOpenLink={() => {}} button={button} primary={button} busyLabel={state === "closing" ? "Closing…" : undefined} />
+        <ActionButtons actions={q.actions} freeText={q.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={state === "closing" || (freeMode && answer.trim() === "")} onAction={close} onOpenLink={() => {}} button={button} primary={button} busyLabel={state === "closing" ? "Closing…" : undefined} />
       </div>
       {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
     </>
@@ -2052,6 +2059,13 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
     );
   };
   const act = (a: BoardActionButton) => {
+    // A free-text Answer has no text box in the sidebar: open the effort's
+    // detail view where the box is, rather than closing the item empty
+    // (BB-268). Fixed choices stay one click.
+    if (a.choice === null && a.note && (item.type === "question" || (item.type === "need" && item.kind === "decide" && item.choices.length === 0))) {
+      navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, effortKey) });
+      return;
+    }
     if (item.type === "question") return run(rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice: a.choice }));
     return run(rpc.call("stewardsNeedAction", { needId: item.id, action: a.action as "approve" | "decline" | "done" | "merge" | "provide" | "choose", note: null, choice: a.choice }));
   };

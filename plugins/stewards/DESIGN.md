@@ -1424,7 +1424,10 @@ The rules that hold:
   shows one button per choice, a note field and **Other…** (which reveals the
   text box with **Answer**); a `decide` item or question without choices
   shows the text box and **Answer**, never **Done** (`configure` keeps
-  **Done**, since its "what" names the step being confirmed). Pressing a
+  **Done**, since its "what" names the step being confirmed). The free-text
+  **Answer** requires text: the page disables it while the box is empty, and
+  the sidebar opens the effort's detail view instead of closing the item
+  empty. Pressing a
   choice closes with `Chose: <label>` plus the note, saves the choice (and
   note) as guidance on the binding, and wakes the steward with "The user
   chose <label> for <what>" under What changed. A forwarded escalation
