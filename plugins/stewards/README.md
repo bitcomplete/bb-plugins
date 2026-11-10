@@ -978,6 +978,13 @@ npm test
 bb plugin build
 ```
 
+Test conventions: the gate-met tests in `server.test.ts` — the ones that
+exercise the plugin's auto-merge — run a parked-worker variant as well as
+the no-worker and running-worker ones. `parkWorker` inserts the shared
+`parkedWorker` fixture from `fixtures.ts` (`finished`, which is still in
+flight for delivery), so a gate-met pull request whose worker has parked is
+exercised; a change to the merge path keeps that variant passing.
+
 Deployment needs this directory added to bb-gate's
 `docker/bb-server/Dockerfile` (the sparse checkout, the `mv`, and
 `BB_PLUGIN_DIRS`), and multi-repo, linear and github-watcher at versions that serve

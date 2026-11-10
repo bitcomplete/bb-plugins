@@ -97,7 +97,7 @@ import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTarget
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -7037,14 +7037,49 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
-          } else if (runningWorkerReason(store.workers(b.id)) === null && !parkedWorkerOwnsAnother) {
+          } else if (runningWorkerReason(store.workers(b.id)) !== null) {
+            // A worker's turn is in progress: it merges or handles the pull
+            // request, so the plugin files nothing and merges nothing. A
+            // `finished` (parked) worker is not running (BB-266).
+          } else {
             // Pause stewards is the kill switch: while it is on, the plugin
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
-            // BB-257: only the repository's default branch is merged by the
-            // plugin. A stacked pull request is held above, so it never
-            // squash-merges into a base branch that may be dead.
-            if (ref !== null && base !== null && base.kind === "default" && !paused) {
+            if (parkedWorkerOwnsAnother) {
+              // BB-279: a gate-met pull request with a parked worker is never
+              // deferred silently. The plugin files the Merge item so "Needs
+              // you" shows it, and wakes the parked worker with the approval
+              // through the same delivery path the page and the project
+              // steward use. It does not merge: the worker owns the order of
+              // its open pull requests (BB-266), and the plugin adds no
+              // automatic multi-PR merge order.
+              const existing = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
+              const told = existing !== undefined && existing.data.workerTold === true && existing.data.sha === g.headSha;
+              store.fileNeed({
+                bindingId: b.id,
+                kind: "merge",
+                url,
+                what: `Merge ${pull.key}`,
+                how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}, but a parked worker owns another open pull request of this ticket, so the plugin does not merge out of order. Merge squash-merges through the server's gh login and posts the merge comment.`,
+                data: { sha: g.headSha, workerTold: true },
+                filedBy: "plugin",
+              });
+              if (!told) {
+                // A `no-review` pull request is gate-met with no approval from
+                // anyone, so the wake names the gate, not an approver (BB-279).
+                const approver = g.projectApproved ? "project steward" : g.ownerApproved ? "owner" : null;
+                await deliverApproval(
+                  approvalsCtx,
+                  b,
+                  pull,
+                  { verdict: "approved", sha: g.headSha ?? "", entry: null, reasoning: "a parked worker owns another open pull request of this ticket, so the plugin does not merge out of order" },
+                  approver,
+                );
+              }
+            } else if (ref !== null && base !== null && base.kind === "default" && !paused) {
+              // BB-257: only the repository's default branch is merged by the
+              // plugin. A stacked pull request is held above, so it never
+              // squash-merges into a base branch that may be dead.
               // BB-257: the plugin takes the step the Merge item used to ask a
               // person for. A refusal for this exact gate is recorded on the
               // binding and not retried until the head or a gate input changes.
@@ -8193,11 +8228,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The one "may merge" predicate (BB-279): the lane gate is met, no worker's
+     * turn is in progress, and the pull request's base is the repository's
+     * default branch. The plugin's auto-merge, `bb stewards merge` and the
+     * Stewards page's Merge button all go through `mergePullRequest`, which
+     * asks this first, so no path merges into a branch that may already be
+     * dead. The refusal names the base, and a refusal runs no `mergeDispatch`.
+     */
+    async function mayMergePullRequest(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot, opts: { exceptThreadId?: string } = {}): Promise<{ ok: true; gate: ReturnType<typeof prGate> } | { ok: false; message: string }> {
+      // The same `prGate` with the project's approvals the page's Merge item
+      // and the wake use, so the page, `bb stewards gate` and `bb stewards
+      // merge` cannot disagree.
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
+      if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
+      const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
+      if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
+      // BB-257/BB-279: only the repository's default branch is merged. A read of
+      // the default branch that fails is not the default (fail closed), so the
+      // pull request is refused rather than merged into a branch that may be
+      // dead. The refusal is before the merge and the dispatch, so it runs no
+      // `mergeDispatch`.
+      const base = pull.pull?.base ?? null;
+      const def = await github.defaultBranch(ref.repo).catch(() => null);
+      if (def === null) return { ok: false, message: `The default branch of ${ref.repo} could not be read, so ${pull.key}'s base ${base === null || base === "" ? "is not known" : `is ${JSON.stringify(base)}`}; the plugin merges only into the default branch.` };
+      if (base === null || base === "") return { ok: false, message: `${pull.key}'s base is not known; the plugin merges only into the default branch ${JSON.stringify(def)}.` };
+      if (base !== def) return { ok: false, message: `${pull.key}'s base is ${JSON.stringify(base)}, not the default branch ${JSON.stringify(def)}; the plugin merges only into the default branch.` };
+      return { ok: true, gate };
+    }
+
+    /**
      * The one merge path the Stewards page's Merge button and `bb stewards
-     * merge` share: recompute the gate with the project's approval records
-     * and the pull request's changed files, refuse with the gate's words when
-     * it is unmet or a worker's turn is in progress, squash-merge, post the
-     * "Merged:" comment, and close the binding's Merge need. The caller reads
+     * merge` share: it asks `mayMergePullRequest`, squash-merges, posts the
+     * "Merged:" comment, and closes the binding's Merge need. The caller reads
      * the pull request fresh and passes it in; `where` names the surface in
      * the need's closure. `exceptThreadId` is the worker that is doing the
      * merging: it is not "another worker running", so a worker may merge its
@@ -8207,13 +8269,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * does not block (BB-175).
      */
     async function mergePullRequest(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot, where: string, opts: { exceptThreadId?: string } = {}): Promise<{ ok: true; summary: string; mergeSha: string | null } | { ok: false; message: string }> {
-      // The same `prGate` with the project's approvals the page's Merge item
-      // and the wake use, so the page, `bb stewards gate` and `bb stewards
-      // merge` cannot disagree.
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
-      if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
-      const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
-      if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
+      // One predicate decides whether the pull request may merge; every caller
+      // reaches it here (BB-279).
+      const verdict = await mayMergePullRequest(b, ref, pull, opts);
+      if (!verdict.ok) return { ok: false, message: verdict.message };
+      const gate = verdict.gate;
       const summary = mergeSummary(gate);
       const since = sinceApproval(gate);
       const restart = await restartNoteFor(b.projectId, ref.repo);

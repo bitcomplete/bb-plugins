@@ -147,13 +147,14 @@ const COMMON_FIELDS = `number title body url createdAt updatedAt author ${ACTOR}
 const ISSUE_RELATION_FIELDS = `parent { id number title repository { nameWithOwner } }
     subIssues(first: 50) { totalCount nodes { id number title state labels(first: 20) { nodes { name } } repository { nameWithOwner } } }`;
 
-const targetDocument = (issueRelations: string) => `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner issueOrPullRequest(number: $number) { __typename
+const targetDocument = (issueRelations: string) => `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner defaultBranchRef { name } issueOrPullRequest(number: $number) { __typename
   ... on Issue { ${COMMON_FIELDS} state stateReason ${issueRelations}
     closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { number url repository { nameWithOwner } } }
     timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) { nodes { ... on CrossReferencedEvent { source { ... on PullRequest { number url repository { nameWithOwner } } } } } } }
   ... on PullRequest { ${COMMON_FIELDS} state isDraft merged reviewDecision headRefName headRefOid baseRefName
     mergeCommit { oid }
     files(first: 100) { nodes { path } }
+    timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
     reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { name } ... on Bot { login } ... on Mannequin { login } } } }
     latestReviews(first: 50) { nodes { author ${ACTOR} state } }
     reviews(last: 50) { nodes { id author ${ACTOR} state body createdAt submittedAt url commit { oid } comments(first: 50) { nodes { ${COMMENT_FIELDS} path } } } }
@@ -232,6 +233,7 @@ const pullNode = z.object({
   merged: z.boolean().nullish(),
   mergeCommit: z.object({ oid: z.string() }).nullish(),
   files: z.object({ nodes: z.array(z.object({ path: z.string() })) }).nullish(),
+  timelineItems: z.object({ nodes: z.array(z.object({ createdAt: z.string().nullish() })).nullish() }).nullish(),
   reviewDecision: z.string().nullish(),
   headRefName: z.string().nullish(),
   headRefOid: z.string().nullish(),
@@ -242,7 +244,7 @@ const pullNode = z.object({
   commits: z.object({ nodes: z.array(z.object({ commit: z.object({ oid: z.string(), author: z.object({ user: actor }).nullish(), statusCheckRollup: z.object({ state: z.string(), contexts: z.object({ nodes: z.array(contextNode) }).nullish() }).nullish() }) })) }).nullish(),
 });
 const targetPayload = z.object({
-  data: z.object({ viewer: actor, repository: z.object({ nameWithOwner: z.string(), issueOrPullRequest: z.discriminatedUnion("__typename", [issueNode, pullNode]).nullable() }).nullable() }).nullable(),
+  data: z.object({ viewer: actor, repository: z.object({ nameWithOwner: z.string(), defaultBranchRef: z.object({ name: z.string() }).nullish(), issueOrPullRequest: z.discriminatedUnion("__typename", [issueNode, pullNode]).nullable() }).nullable() }).nullable(),
 });
 
 // ---- what comes back ---------------------------------------------------------------
@@ -466,6 +468,22 @@ function relationsOf(node: z.infer<typeof issueNode>, repo: string): Pick<Entity
 }
 
 /**
+ * When the pull request's base ref last changed (BB-279), from the read's
+ * `BaseRefChangedEvent` timeline, or null when it never has. A read that did
+ * not carry the timeline is the same as no change: the retarget rule then does
+ * not apply, and a pull request based on the default branch throughout that is
+ * merely behind keeps its approval.
+ */
+function latestBaseRefChange(node: z.infer<typeof pullNode>): string | null {
+  let at: string | null = null;
+  for (const e of node.timelineItems?.nodes ?? []) {
+    if (e.createdAt === null || e.createdAt === undefined) continue;
+    if (at === null || e.createdAt > at) at = e.createdAt;
+  }
+  return at;
+}
+
+/**
  * The same read as stewards' contract wants it (source-contract.ts): the
  * state a playbook keys its phases on (open, draft, merged, closed), the
  * description, the newest comments with ids and the thread whose signature
@@ -529,6 +547,12 @@ export function parseSnapshot(payload: unknown, relationsUnread = false): Entity
       draft,
       merged,
       base: p.base,
+      // BB-279: when the base ref last changed (GitHub's BaseRefChangedEvent),
+      // or null when it never has. The merge gate's retarget rule reads this
+      // with the head's merge-base, which the server fills in from the compare
+      // API only when the base did change.
+      baseChangedAt: latestBaseRefChange(node),
+      headMergeBaseIsDefaultTip: null,
       head: p.head,
       headSha: p.headSha,
       headAuthor: commit?.author?.user?.login ?? null,
@@ -978,4 +1002,31 @@ export function parseCompare(payload: unknown): CompareStatus | null {
   const parsed = comparePayload.safeParse(payload);
   if (!parsed.success) return null;
   return (["ahead", "behind", "diverged", "identical"] as const).includes(parsed.data.status as CompareStatus) ? (parsed.data.status as CompareStatus) : null;
+}
+
+/** The repository's default branch name from a target read, or null when the read did not carry it. */
+export function parseDefaultBranch(payload: unknown): string | null {
+  const parsed = targetPayload.safeParse(payload);
+  return parsed.success ? parsed.data.data?.repository?.defaultBranchRef?.name ?? null : null;
+}
+
+const compareMergeBasePayload = z.object({
+  base_commit: z.object({ sha: z.string().nullish() }).nullish(),
+  merge_base_commit: z.object({ sha: z.string().nullish() }).nullish(),
+});
+
+/**
+ * Whether a compare of the default branch against the head has the default
+ * branch's tip as the merge base (BB-279): the head is based on the default
+ * branch, so a retargeted head that was rebased passes. Null when the answer
+ * does not carry both commits, which the gate reads as "cannot tell" and fails
+ * closed only when the base changed after the approval.
+ */
+export function parseMergeBaseIsDefaultTip(payload: unknown): boolean | null {
+  const parsed = compareMergeBasePayload.safeParse(payload);
+  if (!parsed.success) return null;
+  const base = parsed.data.base_commit?.sha ?? null;
+  const merge = parsed.data.merge_base_commit?.sha ?? null;
+  if (base === null || merge === null) return null;
+  return base === merge;
 }

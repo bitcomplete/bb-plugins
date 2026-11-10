@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -61,7 +61,12 @@ function fakeGitHub() {
     const compare = /\/repos\/([^/]+)\/([^/]+)\/compare\/([^/?]+)(?:\?|$)/u.exec(u);
     if (compare !== null) {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
-      const status = state.compares[decodeURIComponent(compare[3]!)];
+      const key = decodeURIComponent(compare[3]!);
+      // The merge-base read (BB-279) answers base_commit/merge_base_commit; a
+      // deployment rule's compare only needs the status.
+      const mergeBase = state.compareBases[key];
+      if (mergeBase !== undefined) return Response.json({ status: "ahead", base_commit: { sha: mergeBase.base }, merge_base_commit: { sha: mergeBase.mergeBase } });
+      const status = state.compares[key];
       if (status === undefined) return Response.json({ message: "Not Found" }, { status: 404 });
       return Response.json({ status });
     }
@@ -135,7 +140,7 @@ function fakeGitHub() {
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
     const number = typeof state.node?.number === "number" ? state.node.number : 12;
     if (v.number !== number || state.node === null) return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: null } }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] });
-    return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: state.node } } });
+    return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", defaultBranchRef: { name: state.defaultBranch }, issueOrPullRequest: state.node } } });
   }) as unknown as typeof fetch;
   return { fetchImpl, calls, state };
 }
@@ -555,6 +560,37 @@ describe("stewards' source contract", () => {
     expect(snapshot.pull).toMatchObject({ draft: true, merged: false, headSha: "0123456789abcdef", reviews: [{ author: "carol", state: "changes requested", submittedAt: "2026-10-09T08:00:01Z", commit: "aaaa" }] });
     expect(await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#13" }, STEWARDS)).toEqual({ snapshot: null });
     expect(await w.harness.callRpc("sourceSnapshot", { id: "nonsense" }, STEWARDS)).toEqual({ snapshot: null });
+  });
+
+  it("fills the head's merge base with the default branch when the base changed, and skips the read when it did not (BB-279)", async () => {
+    const w = await setup();
+    const plain = (await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#12" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    const plainPull = plain.snapshot.pull as Record<string, unknown>;
+    // The base never changed: no BaseRefChangedEvent, so no compare read and
+    // the field stays null. The gate then applies no retarget rule.
+    expect(plainPull.baseChangedAt).toBeNull();
+    expect(plainPull.headMergeBaseIsDefaultTip).toBeNull();
+
+    // The base ref changed: the server reads the compare and fills the field.
+    // Here the head is not based on the default tip (a retargeted, un-rebased
+    // head), so the gate fails closed on it.
+    w.github.state.node = pullNode({ timelineItems: { nodes: [{ createdAt: "2026-10-09T11:00:00Z" }] } });
+    w.github.state.compareBases["main...0123456789abcdef"] = { base: "tipsha", mergeBase: "oldersha" };
+    const retargeted = (await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#12" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    const retargetedPull = retargeted.snapshot.pull as Record<string, unknown>;
+    expect(retargetedPull.baseChangedAt).toBe("2026-10-09T11:00:00Z");
+    expect(retargetedPull.headMergeBaseIsDefaultTip).toBe(false);
+
+    // The head was rebased onto the default tip: true, so it merges.
+    w.github.state.compareBases["main...0123456789abcdef"] = { base: "tipsha", mergeBase: "tipsha" };
+    const rebased = (await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#12" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    expect((rebased.snapshot.pull as Record<string, unknown>).headMergeBaseIsDefaultTip).toBe(true);
+
+    // A compare read that fails leaves the field unknown, which the gate reads
+    // as "cannot tell" and fails closed only when the base changed.
+    w.github.state.compareBases = {};
+    const failed = (await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#12" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    expect((failed.snapshot.pull as Record<string, unknown>).headMergeBaseIsDefaultTip).toBeNull();
   });
 
   it("reads an issue's parent and children, and marks the relation unread when GitHub rejects the fields (BB-244)", async () => {

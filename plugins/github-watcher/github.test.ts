@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { labelAlreadyExists, labelPath, parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY, TARGET_QUERY_BASE } from "./github.js";
+import { labelAlreadyExists, labelPath, parseCompare, parseDefaultBranch, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseMergeBaseIsDefaultTip, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY, TARGET_QUERY_BASE } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -195,6 +195,8 @@ describe("parseSnapshot", () => {
       draft: false,
       merged: false,
       base: "main",
+      baseChangedAt: null,
+      headMergeBaseIsDefaultTip: null,
       head: "feature/widgets",
       headSha: "0123456789abcdef",
       headAuthor: "jane",
@@ -209,6 +211,16 @@ describe("parseSnapshot", () => {
       files: ["src/a.ts", "src/b.ts"],
     });
     expect(TARGET_QUERY).toContain("viewer { login }");
+  });
+
+  it("reads when the base ref last changed, and leaves it null when the read carries no timeline (BB-279)", () => {
+    const changed = parseSnapshot(pull({ timelineItems: { nodes: [{ createdAt: "2026-10-09T09:00:00Z" }] } }))!;
+    expect(changed.pull!.baseChangedAt).toBe("2026-10-09T09:00:00Z");
+    // The merge base is a second read the server makes only when the base
+    // changed; the pure parse leaves it unknown.
+    expect(changed.pull!.headMergeBaseIsDefaultTip).toBeNull();
+    // A read that did not carry the timeline is the same as no change.
+    expect(parseSnapshot(pull())!.pull!.baseChangedAt).toBeNull();
   });
 
   it("words the state as a playbook keys on it: draft, merged, closed; an issue is open or closed", () => {
@@ -554,5 +566,23 @@ describe("deployment rule reads", () => {
     expect(parseCompare({ status: "diverged" })).toBe("diverged");
     expect(parseCompare({ status: "weird" })).toBeNull();
     expect(parseCompare({ message: "Not Found" })).toBeNull();
+  });
+
+  it("reads the repository's default branch, and null when the read did not carry it", () => {
+    expect(parseDefaultBranch(pull())).toBeNull();
+    const withBranch = pull();
+    (withBranch.data.repository as Record<string, unknown>).defaultBranchRef = { name: "trunk" };
+    expect(parseDefaultBranch(withBranch)).toBe("trunk");
+    expect(parseDefaultBranch(null)).toBeNull();
+  });
+
+  it("says whether the default branch's tip is the head's merge base, and null when it cannot tell", () => {
+    expect(parseMergeBaseIsDefaultTip({ base_commit: { sha: "tip" }, merge_base_commit: { sha: "tip" } })).toBe(true);
+    expect(parseMergeBaseIsDefaultTip({ base_commit: { sha: "tip" }, merge_base_commit: { sha: "older" } })).toBe(false);
+    // A compare that does not name both commits is "cannot tell": the gate
+    // fails closed only when the base changed after the approval.
+    expect(parseMergeBaseIsDefaultTip({ base_commit: { sha: "tip" } })).toBeNull();
+    expect(parseMergeBaseIsDefaultTip({ status: "identical" })).toBeNull();
+    expect(parseMergeBaseIsDefaultTip(null)).toBeNull();
   });
 });
