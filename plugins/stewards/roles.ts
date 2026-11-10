@@ -4,14 +4,14 @@
 // seam, kept in its own module so a change to it is always the owner's.
 //
 // It reads nothing on its own: the project file's schema primitives and its
-// own `check` problems come from config.ts, and the store is passed to the
-// functions that need it.
+// own `check` problems come from config.ts.
 import { z } from "zod";
 import { globError } from "./decisions.js";
 import { opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { REPO_NAME } from "./source-contract.js";
 import { DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, sentrySlug, sentryTargets, STEWARDS_DIR, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
 
+/** The per-person roles: which watches and the project stewardship a GitHub login's server runs. */
 export const ROLES_FILE = `${STEWARDS_DIR}/roles.json`;
 
 // ---- roles: per-person watches, keyed by GitHub login ------------------------------
@@ -97,6 +97,7 @@ export type Role = z.infer<typeof roleSchema>;
 /** The built-in role name for the project steward. It has no `roles` definition. */
 export const PROJECT_STEWARD_ROLE = "projectSteward";
 
+/** A named role in a version 2 file. */
 const roleNameSchema = z.string().min(1).max(63).regex(/^[A-Za-z][A-Za-z0-9_-]*$/u, "a role name such as ops");
 
 /**
