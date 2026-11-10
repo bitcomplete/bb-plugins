@@ -113,7 +113,7 @@ export async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity:
       return "worker";
     }
   }
-  ctx.store.note(b.id, `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}: ${decision.reasoning} Start a worker at the build-tickets merge gate ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
+  ctx.store.note(b.id, `${what}: ${decision.reasoning} Start a worker at the build-tickets merge gate ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
   ctx.scheduleReconcile(b.id);
   return "steward";
 }

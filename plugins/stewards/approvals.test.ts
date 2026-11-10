@@ -125,6 +125,21 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(message).not.toContain("approved");
   });
 
+  it("records the no-review gate wording, not a null approver, when the worker cannot be reached (BB-279)", async () => {
+    const { ctx, sendTo, note, scheduleReconcile } = deliveryContext();
+    // The parked worker's send fails, so the fallback note is what the
+    // steward reads; it must carry the no-review wording too.
+    sendTo.mockResolvedValue("failed");
+    const entity = pull({ comments: [] }, green);
+    await expect(deliverApproval(ctx, { id: "b1" } as never, entity, { verdict: "approved", sha: head, entry: null, reasoning: "a parked worker owns another open pull request." }, null)).resolves.toBe("steward");
+    expect(scheduleReconcile).toHaveBeenCalledTimes(1);
+    expect(note).toHaveBeenCalledTimes(1);
+    const [, text, actionable] = note.mock.calls[0]!;
+    expect(text).toContain("The lane gate is met (no-review)");
+    expect(text).not.toContain("null");
+    expect(actionable).toBe(false);
+  });
+
   it("delivers an owner page approval to the parked worker by the same path", async () => {
     const { ctx, worker, sendTo, closeNeedByKey, mechanicalStatus, githubComment } = deliveryContext();
     // The owner is the pull request's author here, so the page posts an
