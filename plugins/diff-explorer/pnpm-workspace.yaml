@@ -8,4 +8,4 @@ strictDepBuilds: true
 onlyBuiltDependencies:
   - esbuild@0.28.2
 overrides:
-  dompurify: 3.4.16
+  dompurify: 3.4.17

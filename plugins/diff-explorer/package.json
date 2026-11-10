@@ -40,6 +40,6 @@
   },
   "packageManager": "pnpm@10.34.6",
   "overrides": {
-    "dompurify": "3.4.16"
+    "dompurify": "3.4.17"
   }
 }
