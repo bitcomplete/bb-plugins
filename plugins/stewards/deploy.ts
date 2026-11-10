@@ -113,6 +113,13 @@ function liveVerdict(target: DeploymentTarget, prRepo: string, files: readonly s
  * the source now knows one and the stored one differs (a watch recorded
  * before BB-132 holds the pull request head, which a squash merge rewrites).
  *
+ * An existing watch is also re-matched against the playbook's current rule
+ * on every read (BB-286): a watch recorded under an older playbook keeps the
+ * old rule otherwise. When the rule that now matches its stored `prRepo` and
+ * `files` is `live-at-merge` and the merge is on the default branch, the
+ * watch settles `deployed` with the live note and no deadline, so no
+ * deployment is read for it. A stacked merge stays awaiting.
+ *
  * A target whose structured `carries` has no rule for the merge is not
  * applicable and is skipped; a watch already stored for it is dropped, so it
  * cannot block closing the ticket. When no target applies at all, every
@@ -194,6 +201,22 @@ export function recordMerged(
           const note = reevaluate ? resolved : existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})`;
           next[id] = { ...existing, state: reevaluate ? "deploying" : existing.state, mergeSha: merge, note };
           changed = true;
+        }
+        // BB-286: re-match the watch against the playbook's current rule.
+        // The stored `prRepo` and `files` decide applicability, as they do
+        // above. When the matching rule is now `live-at-merge` and the merge
+        // is on the default branch, it is live and settles with the live note
+        // and no deadline, without any deployment read. A stacked merge
+        // (`onDefault` false) keeps awaiting its own merge to reach `main`.
+        const current = next[id] ?? existing;
+        if (onDefault && current.state !== "deployed" && current.state !== "failed" && typeof target.carries !== "string") {
+          const context = contextFor(target);
+          const matched = matchCarriesRule(target.carries, context.prRepo, context.files);
+          const live = matched === null ? null : liveAtMergeVerdict(matched);
+          if (live !== null) {
+            next[id] = { ...current, state: "deployed", at: now, deadlineAt: null, note: live.note };
+            changed = true;
+          }
         }
         continue;
       }

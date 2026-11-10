@@ -3810,7 +3810,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // A live-at-merge watch (BB-260) is already `deployed` when it is
           // recorded: nothing builds or applies its paths, so it has no
           // deployment to await and the steward is woken with the verdict now.
-          const liveNow = fresh.filter((k) => deployments[k]?.state === "deployed");
+          // BB-286: an existing watch re-matched to a live rule settles in
+          // `recordMerged` and is announced the same way.
+          const liveNow = Object.keys(deployments).filter((k) => deployments[k]?.state === "deployed" && beforeDeploy[k]?.state !== "deployed");
           const awaiting = fresh.filter((k) => deployments[k]?.state !== "deployed");
           if (awaiting.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${awaiting.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
           if (liveNow.length > 0) deploymentChanges.push({ text: `Deployed at merge: ${liveNow.map((k) => `${k} — ${deployments[k]?.note ?? "live at merge"}`).join("; ")}`, actionable: true });
@@ -3839,6 +3841,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             deployments = applied.deployments;
             b = store.patch(b.id, { deployments });
             b = store.note(b.id, line, true);
+            // BB-286: a non-final status may be the last doorbell delivered;
+            // re-read within the debounce so a dropped final one is caught.
+            scheduleReconcile(b.id);
             continue;
           }
           if (failed) {
@@ -5523,9 +5528,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const line = `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}${typeof target.carries === "string" ? `; the playbook's rule: ${target.carries}` : ""}`;
               // A deployment that has not reached a final status has not
               // applied the image yet, so no watch can move: a quiet note
-              // records it and no reconcile is scheduled (BB-204).
+              // records it. A re-read is still scheduled (BB-286), so a
+              // dropped final doorbell costs a debounce, not the sweep.
               if (!final) {
                 b = store.note(b.id, line, true);
+                scheduleReconcile(b.id);
                 continue;
               }
               const before = b.deployments;
@@ -5612,6 +5619,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bound = store.byEntity(source, id);
       if (bound !== null) scheduleReconcile(bound.id);
       if (source === "github") {
+        // BB-286: a repository ring (no `#`) comes from github-watcher's
+        // reconnect sweep. Re-read every open binding whose playbook names a
+        // deployment target for the repo, so a deployment doorbell dropped
+        // while the subscriber was away is caught by the reconnect (BB-59)
+        // rather than only by the half-hourly sweep.
+        if (bound === null && !id.includes("#")) {
+          for (const config of await stewardedProjects()) {
+            for (const b of store.open(config.projectId)) {
+              const playbook = bindingPlaybook(config, b);
+              if (playbook === null || playbook === undefined) continue;
+              if (playbook.deployments.some((t) => lc(t.repo) === lc(id))) scheduleReconcile(b.id);
+            }
+          }
+          return;
+        }
         // A Dependabot alert doorbell names the alert, not the repository's
         // ops binding; wake that repository's dependency watch. An id with a
         // github binding is an issue or pull request, not an alert.
@@ -8167,7 +8189,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         if (deployment !== undefined) {
           if (source !== "github") throw new Error("only the github-watcher plugin sends deployment doorbells");
-          debounce(`deploy:${lc(id)}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));
+          // BB-286: key the debounce on the deployment's state too, so an
+          // in_progress followed by a success inside the window does not
+          // discard the newer closure (first-wins kept only the first).
+          debounce(`deploy:${lc(id)}:${deployment.state}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));
           return { ok: true };
         }
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));

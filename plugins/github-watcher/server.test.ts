@@ -870,6 +870,46 @@ describe("stewards' source contract", () => {
       await service.done;
     });
 
+    // BB-286: a reconnect re-check rings stewards for every repo whose
+    // deployment doorbells it holds, so a deployment doorbell dropped while
+    // the subscriber was away is re-read rather than waiting for the sweep.
+    it("rings stewards for each deployment interest repo on the connected sweep (BB-286)", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      // A new connection re-checks; the deployment interest is rung once.
+      w.hooks.last().send(w.hooks.hello("c_2"));
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "acme/bb-gate" } }]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    // BB-286: the deployment queue holds the latest object per deployment id,
+    // so two statuses inside the debounce hand stewards the newest, not the
+    // first.
+    it("hands stewards the newest of two deployment statuses inside the debounce (BB-286)", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      const inProgress = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "in_progress", url: "https://github.com/acme/bb-gate/actions/runs/9" };
+      const success = { ...inProgress, state: "success" };
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment: inProgress })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment: success })}\n\n`);
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#7", deployment: success } }]);
+      service.controller.abort();
+      await service.done;
+    });
+
     it("leases what stewards asked for after a restart, beside the watches", async () => {
       const w = await setup({ ...WITH_HOOKS, kv: { "stewards/interest": { units: ["acme/gadgets"], entities: ["acme/widgets#12"] } } });
       await w.tool({ ref: "Acme/Widgets#12" });
