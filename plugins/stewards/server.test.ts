@@ -6498,6 +6498,65 @@ describe("the stewards sidebar call", () => {
     expect(after.rpc.stewardsSidebar!.count).toBe((before.rpc.stewardsSidebar?.count ?? 0) + 1);
     expect(after.signals.p1).toBe((before.signals.p1 ?? 0) + 1);
   });
+
+  it("derives claimedThreadIds from the narrow store read, identical to the old full parse (BB-294)", async () => {
+    const t = await setup();
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Beta" }]);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.created("thr_w1", steward, "Implement retry");
+    const other = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(other.id, { threadId: "thr_other_steward" });
+    t.hooks.store.addWorker("thr_other_worker", other.id, "Work");
+    const ended = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-21", entityKey: "ENG-21", url: null, title: "Ended", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(ended.id, { threadId: "thr_ended_steward", endedAt: t.now() });
+    t.hooks.store.addWorker("thr_ended_worker", ended.id, "Work");
+
+    // The old derivation: every binding's steward thread and every worker's.
+    const expected = new Map<string, Set<string>>();
+    const add = (projectId: string, threadId: string | null) => {
+      if (threadId === null) return;
+      const set = expected.get(projectId) ?? new Set<string>();
+      set.add(threadId);
+      expected.set(projectId, set);
+    };
+    for (const p of t.hooks.store.projects()) add(p.projectId, p.threadId);
+    for (const b of t.hooks.store.all()) {
+      add(b.projectId, b.threadId);
+      for (const w of t.hooks.store.workers(b.id)) add(b.projectId, w.threadId);
+    }
+
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    for (const p of result.projects) expect([...(p.claimedThreadIds ?? [])].sort()).toEqual([...(expected.get(p.projectId) ?? new Set<string>())].sort());
+  });
+
+  it("parses only the open bindings and a bounded ended tail, so a long history stays fast (BB-294)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    // A few thousand ended bindings, each with a 40 KB snapshot. The old handler
+    // parsed every one with `rowToBinding` on every poll; the new one reads a
+    // bounded ended list and never touches the tail's snapshots.
+    const bigSnapshot = JSON.stringify({ entity: issue({ description: "x".repeat(40_000) }), pulls: [] });
+    const insert = t.hooks.db.prepare("INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at, ended_at, last_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const at = t.now();
+    // One transaction: the fixture is thousands of rows and is not the code under test.
+    t.hooks.db.prepare("BEGIN").run();
+    for (let i = 0; i < 3000; i++) insert.run(`bnd_seed_${i}`, "p1", "linear", `uuid_seed_${i}`, `ENG-9${i}`, "ticket", "linear-tickets", "v1", at - 30 * 86_400_000 - i, at - 86_400_000 - i, bigSnapshot);
+    t.hooks.db.prepare("COMMIT").run();
+    // Warm the config read so the measured call is the parse cost.
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
+
+    const started = Date.now();
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    const elapsed = Date.now() - started;
+    // The bounded ended list holds the newest 30 within the window, not 3000.
+    expect(result.ended).toHaveLength(30);
+    expect(elapsed).toBeLessThan(100);
+    expect(t.harness.logEntries.some((entry) => /stewards: stewardsSidebar took \d+ms/u.test(entry.message))).toBe(true);
+  }, 30_000);
 });
 
 // BB-46: the sidebar's "needs you" count and items, and the realtime signal

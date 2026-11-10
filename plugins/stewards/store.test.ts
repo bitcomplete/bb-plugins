@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -195,6 +195,75 @@ describe("countNeedsUser (BB-104)", () => {
     expect(s.countNeedsUser("p1")).toBe(expected);
     expect(s.countNeedsUser("p1")).not.toBe(s.countNeedsUser("p2"));
     expect(s.countNeedsUser("p2")).toBe(1);
+  });
+});
+
+describe("the sidebar's narrow binding reads (BB-294)", () => {
+  const add = (s: ReturnType<typeof store>["s"], projectId: string, n: number) =>
+    s.create({ projectId, source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+
+  it("claimedThreads matches the old full parse, three columns and worker ids, ended bindings included", () => {
+    const { s, binding } = store();
+    s.patch(binding.id, { threadId: "thr_steward" });
+    s.addWorker("thr_w1", binding.id, "Work");
+    s.addWorker("thr_w2", binding.id, "More");
+    const other = add(s, "p2", 20);
+    s.patch(other.id, { threadId: "thr_other_steward" });
+    s.addWorker("thr_other_worker", other.id, "Work");
+    // An ended binding is included too: its worker can outlive its steward.
+    const ended = add(s, "p1", 21);
+    s.patch(ended.id, { threadId: "thr_ended_steward", endedAt: 2_000 });
+    s.addWorker("thr_ended_worker", ended.id, "Work");
+
+    // The old derivation, over every fully parsed binding.
+    const old = new Map<string, { projectId: string; threadId: string | null; workerThreadIds: string[] }>();
+    for (const b of s.all()) old.set(b.id, { projectId: b.projectId, threadId: b.threadId, workerThreadIds: s.workers(b.id).map((w) => w.threadId) });
+    const rows = s.claimedThreads();
+    expect(rows).toHaveLength(old.size);
+    for (const row of rows) {
+      const expected = old.get(row.id)!;
+      expect({ projectId: row.projectId, threadId: row.threadId, workerThreadIds: [...row.workerThreadIds].sort() }).toEqual({ ...expected, workerThreadIds: [...expected.workerThreadIds].sort() });
+    }
+  });
+
+  it("endedSince returns only the window, newest first, at most the limit, this project only", () => {
+    const { s } = store();
+    const ended = (n: number, at: number) => {
+      const b = add(s, "p1", n);
+      s.patch(b.id, { endedAt: at });
+      return b;
+    };
+    ended(30, 3_000); // before a since of 4_000
+    const newest = ended(31, 9_000);
+    const older = ended(32, 7_000);
+    const oldest = ended(33, 6_000);
+    const other = add(s, "p2", 99);
+    s.patch(other.id, { endedAt: 9_500 });
+
+    expect(s.endedSince("p1", 4_000, 30).map((b) => b.key)).toEqual([newest.entityKey, older.entityKey, oldest.entityKey]);
+    expect(s.endedSince("p1", 8_000, 30).map((b) => b.key)).toEqual([newest.entityKey]);
+    expect(s.endedSince("p1", 0, 2).map((b) => b.key)).toEqual([newest.entityKey, older.entityKey]);
+    expect(s.endedSince("p1", 10_000, 30)).toEqual([]);
+  });
+
+  it("bindingProjectIds names every project with a binding, without parsing one", () => {
+    const { s } = store();
+    add(s, "p2", 20);
+    const ended = add(s, "p3", 21);
+    s.patch(ended.id, { endedAt: 2_000 });
+    // A project with only a steward row is not a binding project.
+    s.patchProject("p4", { threadId: "thr_p4" });
+    expect([...s.bindingProjectIds()].sort()).toEqual(["p1", "p2", "p3"]);
+    expect(s.projectIds().sort()).toEqual(["p1", "p2", "p3", "p4"]);
+  });
+
+  it("openBindingIds lists only the project's open binding ids", () => {
+    const { s, binding } = store();
+    const ended = add(s, "p1", 21);
+    s.patch(ended.id, { endedAt: 2_000 });
+    add(s, "p2", 20);
+    expect(s.openBindingIds("p1")).toEqual([binding.id]);
+    expect(s.openBindingIds("p2")).toHaveLength(1);
   });
 });
 
@@ -487,9 +556,10 @@ describe("the actor rename migration (BB-97)", () => {
     // list, this only checks the group order).
     // BB-256 appended the merge-hold group after BB-255's wake-retry group,
     // BB-264 appended the retarget-pulls column after that, BB-287 appended the
-    // stacked-pull columns after that, and BB-293 appended the shadow
-    // assessment and divergence-log tables after that.
-    const groups = [ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // stacked-pull columns after that, BB-293 appended the shadow
+    // assessment and divergence-log tables after that, and BB-294 appended the
+    // ended-read index after that.
+    const groups = [ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -579,9 +649,12 @@ describe("the escalation route rename migration (BB-209)", () => {
     // that, BB-247's dated-wait columns after that, BB-255's wake-retry
     // columns after that, BB-256's merge-hold column after that, BB-264's
     // retarget-pulls column after that, BB-287's stacked-pull columns after
-    // that, and BB-293's shadow-assessment tables after that.
-    const withAssessment = MIGRATIONS.slice(0, -ASSESSMENT_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-ASSESSMENT_MIGRATIONS.length)).toEqual([...ASSESSMENT_MIGRATIONS]);
+    // that, BB-293's shadow-assessment tables after that, and BB-294's
+    // ended-read index after that.
+    const withEnded = MIGRATIONS.slice(0, -ENDED_READ_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-ENDED_READ_MIGRATIONS.length)).toEqual([...ENDED_READ_MIGRATIONS]);
+    const withAssessment = withEnded.slice(0, -ASSESSMENT_MIGRATIONS.length);
+    expect(withEnded.slice(-ASSESSMENT_MIGRATIONS.length)).toEqual([...ASSESSMENT_MIGRATIONS]);
     const withStacked = withAssessment.slice(0, -STACKED_PULLS_MIGRATIONS.length);
     expect(withAssessment.slice(-STACKED_PULLS_MIGRATIONS.length)).toEqual([...STACKED_PULLS_MIGRATIONS]);
     const withRetarget = withStacked.slice(0, -RETARGET_PULLS_MIGRATIONS.length);
