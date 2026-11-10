@@ -124,13 +124,11 @@ export function recordMerged(
   observed: Observed,
   targets: readonly DeploymentTarget[],
   now: number,
-  overrideFor?: (p: EntitySnapshot) => { mergeSha: string | null; prRepo: string; files: string[] } | null,
   /**
    * Whether a merged pull request's base is its repo's default branch, so its
    * merge is already on `main`. A stacked pull request merged into its base
-   * branch is not live yet; the BB-215 override re-points it once the base
-   * lands. Omitted, every base is treated as the default (the pre-BB-260
-   * behaviour, for callers with no default-branch read).
+   * branch is not live yet. Omitted, every base is treated as the default
+   * (the pre-BB-260 behaviour, for callers with no default-branch read).
    */
   isDefaultBase?: (prRepo: string, base: string | null) => boolean,
 ): Deployments {
@@ -140,26 +138,20 @@ export function recordMerged(
   const next = { ...deployments };
   let changed = false;
   for (const p of pulls) {
-    // A stacked pull request that landed in a base pull request (BB-215) is
-    // carried by the base's merge on the default branch, not by the stacked
-    // merge a squash rewrote: the override supplies that merge's commit and
-    // the base's repo and files, so the carries rule matches what is on main.
-    const over = overrideFor?.(p) ?? null;
-    const merge = over === null ? p.pull?.mergeCommit ?? null : over.mergeSha;
-    const files = over === null ? p.pull?.files ?? [] : over.files;
-    const prRepo = over === null ? p.unit : over.prRepo;
+    const merge = p.pull?.mergeCommit ?? null;
+    const files = p.pull?.files ?? [];
+    const prRepo = p.unit;
     // BB-260: a live-at-merge merge is only live once it is on the default
     // branch. A stacked pull request merged into its base branch is not live
-    // yet; the override, when it lands, re-points the watch to the base's
-    // merge on main. A base the read could not name is not treated as default.
-    const onDefault = over !== null || (isDefaultBase?.(p.unit, p.pull?.base ?? null) ?? true);
+    // yet. A base the read could not name is not treated as default.
+    const onDefault = isDefaultBase?.(p.unit, p.pull?.base ?? null) ?? true;
     // An existing watch's own recorded repo and files decide applicability
     // when it has them: a snapshot whose files read came back empty must not
     // drop an in-flight watch. The fresh snapshot is the fallback.
     const contextFor = (target: DeploymentTarget): { prRepo: string; files: readonly string[] } => {
       const id = watchId(p.key, target, multiple);
       const existing = next[id] ?? (id === p.key ? undefined : next[p.key]);
-      if (over === null && existing !== undefined && existing.prRepo !== "" && matchesTarget(target, existing.repo, existing.environment)) return { prRepo: existing.prRepo, files: existing.files };
+      if (existing !== undefined && existing.prRepo !== "" && matchesTarget(target, existing.repo, existing.environment)) return { prRepo: existing.prRepo, files: existing.files };
       return { prRepo, files };
     };
     const applicable = targets.filter((t) => {
@@ -193,32 +185,14 @@ export function recordMerged(
         if (merge !== null && existing.mergeSha !== merge) {
           const resolved = `Merge commit re-resolved to ${merge.slice(0, 7)}`;
           // A `merged` watch that already holds a success deployment was judged
-          // against the old sha (BB-215): moving it back to `deploying` lets the
+          // against the old sha (BB-259): moving it back to `deploying` lets the
           // reconcile's carries re-evaluation loop settle it against the
           // re-resolved sha in the same pass, rather than waiting for a new
           // deployment or timing out. Its stale not-yet note is replaced, so it
           // never says a pin does not contain the sha it was re-resolved to.
           const reevaluate = existing.state === "merged" && existing.deploymentId !== null && existing.deploymentState === "success";
           const note = reevaluate ? resolved : existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})`;
-          // BB-260: when the BB-215 override re-points the watch to the base
-          // merge on the default branch, re-run the live check against the
-          // base's files. A live rule marks it deployed; a watch live-marked
-          // on a stacked merge whose base is not live goes back to `merged`
-          // and awaits a deployment.
-          const live = over === null ? null : liveVerdict(target, prRepo, files);
-          let state = reevaluate ? "deploying" : existing.state;
-          let deadlineAt = existing.deadlineAt;
-          let finalNote = note;
-          if (live !== null) {
-            state = "deployed";
-            deadlineAt = null;
-            finalNote = live.note;
-          } else if (over !== null && existing.state === "deployed" && existing.deploymentId === null) {
-            state = "merged";
-            deadlineAt = now + target.timeout;
-            finalNote = resolved;
-          }
-          next[id] = { ...existing, state, mergeSha: merge, deadlineAt, ...(over === null ? {} : { prRepo, files }), note: finalNote };
+          next[id] = { ...existing, state: reevaluate ? "deploying" : existing.state, mergeSha: merge, note };
           changed = true;
         }
         continue;

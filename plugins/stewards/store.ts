@@ -504,9 +504,10 @@ export const SERVER_SETTINGS_MIGRATIONS = [
 export const PULL_WATCH_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN adopted_by TEXT`];
 
 // Stack scheduling (BB-215): the open bindings whose pull request this hold
-// waits for (a stack-wait; `hold_behind` waits for a merge or an end), and
-// the base pull request a stacked pull request landed in, so the deployment
-// carries-check follows that merge on the default branch.
+// waits for (a stack-wait; `hold_behind` waits for a merge or an end). The
+// `landed_in` column the same group adds is retired (BB-264) but kept: a
+// tolerant reader ignores a value an existing binding already recorded, so no
+// destructive migration is needed.
 //
 // The SDK records each migration's hash by index and refuses to start the
 // plugin when an index no longer matches, so a new group goes at the END of
@@ -617,7 +618,14 @@ export const WAKE_RETRY_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wake_retr
 // as no merge hold and behaves exactly as before.
 export const MERGE_BEHIND_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN merge_behind TEXT NOT NULL DEFAULT '[]'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS];
+// BB-264: a stacked pull request whose base pull request has merged is woken
+// once to retarget and rebase it onto the default branch. `retarget_pulls`
+// holds the base pull request keys already woken about, so a base that stays
+// merged until the worker acts does not wake the steward on every look.
+// Additive and defaulted: an old row reads as nothing woken yet.
+export const RETARGET_PULLS_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN retarget_pulls TEXT NOT NULL DEFAULT '[]'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -785,10 +793,10 @@ export type Binding = {
    * requests or ended.
    */
   mergeBehind: string[];
+  /** Base pull request keys this binding has already been woken to retarget (BB-264), so a stacked pull request whose base has merged is retargeted once. */
+  retargetPulls: string[];
   /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
   holdStack: string[];
-  /** The base pull request a stacked pull request landed in (owner/repo#N, BB-215): the deployment carries-check follows its merge on the default branch, since a squash rewrote the stacked merge. Null when the work did not stack. */
-  landedIn: string | null;
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
   scheduleAsked: string[];
   /** The gate has passed and nothing holds or schedules it: it is starting, whatever Linear still says, so others schedule against it. */
@@ -895,8 +903,8 @@ function rowToBinding(r: BindingRow): Binding {
     touches: json(z.array(z.string()), str("touches"), []),
     holdBehind: json(z.array(z.string()), str("hold_behind"), []),
     mergeBehind: json(z.array(z.string()), str("merge_behind"), []),
+    retargetPulls: json(z.array(z.string()), str("retarget_pulls"), []),
     holdStack: json(z.array(z.string()), str("hold_stack"), []),
-    landedIn: str("landed_in"),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
@@ -965,8 +973,8 @@ const COLUMNS = {
   touches: "touches",
   holdBehind: "hold_behind",
   mergeBehind: "merge_behind",
+  retargetPulls: "retarget_pulls",
   holdStack: "hold_stack",
-  landedIn: "landed_in",
   scheduleAsked: "schedule_asked",
   clearedToStart: "cleared_to_start",
   modelSteward: "model_steward",

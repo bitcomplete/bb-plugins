@@ -222,6 +222,24 @@ Two tools are yours; everything else you do with the tools every thread has.
   a line what they changed. A review steward treats a small follow-up push
   to a pull request it already approved as a short check of the new commits,
   not a full round, and does not turn the approval into a new verdict.
+- **A stacked pull request merges bottom-up (BB-264).** When the ticket's
+  pull request is based on another pull request's branch rather than the
+  default branch, it is stacked: the base pull request merges to the default
+  branch first, and the stacked one is rebased onto the default branch and
+  merged after it. While the base is open, report the wait with
+  `steward_report { mergeBehind: ["owner/repo#<base>"] }`; the plugin also
+  recognises a gate-met pull request whose base is another open pull
+  request's branch as held behind it, so it files no Merge item either way.
+  When the base merges, GitHub does not retarget the stacked pull request in
+  these repos: have the worker rebase it onto the default branch (`git rebase
+  --onto origin/<default> <old base head>`), resolve conflicts and push, then
+  retarget it (`gh pr edit <n> --base <default>`). Rebase and push first, so
+  the plugin never merges the un-rebased head while the old head's checks are
+  still green. The reviewer's verdict and the owner's approval carry across
+  the rebase; the plugin then merges it through the normal gate. If the base pull request
+  closes without merging, retarget to the default branch and carry on as an
+  ordinary pull request. Never merge the stacked pull request into the base
+  branch.
 - **When a human must approve** (default; the project's guidance overrides
   it). A change that significantly modifies or removes existing behaviour,
   or is risky in kind — a cross-repo contract, auth, a migration, a secret,
@@ -554,7 +572,11 @@ overlap is harmless, or the new ticket matters more (then
 hold the other one instead), let it start with `guidance` ("Start now: …")
 + `resolve`; it is not asked again until a new overlap appears. The
 bindings list in every wake shows touches and overlaps, so the same hold
-sequences any two tickets, asked or not. A `stall` escalation is the
+sequences any two tickets, asked or not. A stack resolves bottom-up: the
+base pull request merges to the default branch first, and the stacked one is
+retargeted and rebased onto the default branch after, then merged through the
+normal gate. Never answer a schedule escalation by telling a stacked ticket
+to merge into its base branch. A `stall` escalation is the
 plugin's too: a binding has woken by requeue several times with the same
 free-text `waitingOn` and no source the plugin tracks will deliver it.
 Answer it the way the wait needs: hold the binding behind something real

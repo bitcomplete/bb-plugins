@@ -83,28 +83,6 @@ describe("recording merged pull requests", () => {
     expect(recordMerged(first, observed(), [target], NOW + 1000)).toBe(first);
   });
 
-  it("carries a stacked pull request by the base pull request's merge on the default branch (BB-215)", () => {
-    const stacked = pull({ key: "acme/web#20" }, { merged: true, mergeCommit: "stacked1", files: ["plugins/stewards/a.ts"] });
-    const first = recordMerged({}, { entity: stacked, pulls: [] }, [target], NOW);
-    expect(first["acme/web#20"]).toMatchObject({ mergeSha: "stacked1", prRepo: "acme/web", files: ["plugins/stewards/a.ts"] });
-    // The base pull request's merge lands on the default branch: the override
-    // re-points the watch to it, so a carries check finds it on main.
-    const base = { mergeSha: "base0001", prRepo: "acme/web", files: ["plugins/stewards/a.ts", "plugins/stewards/b.ts"] };
-    const after = recordMerged(first, { entity: stacked, pulls: [] }, [target], NOW + 1000, () => base);
-    expect(after["acme/web#20"]).toMatchObject({ mergeSha: "base0001", prRepo: "acme/web", files: ["plugins/stewards/a.ts", "plugins/stewards/b.ts"] });
-  });
-
-  it("applies the landedIn override only to the pull request that merged into the base (BB-215)", () => {
-    const stacked = pull({ key: "acme/web#20" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked" });
-    const direct = pull({ key: "acme/web#21" }, { merged: true, mergeCommit: "direct1", base: "main", head: "feature-direct" });
-    const first = recordMerged({}, { entity: stacked, pulls: [direct] }, [target], NOW);
-    const base = { mergeSha: "base0001", prRepo: "acme/web", files: ["plugins/stewards/a.ts"] };
-    const after = recordMerged(first, { entity: stacked, pulls: [direct] }, [target], NOW + 1000, (p) => (p.pull?.base === "feature-base" ? base : null));
-    // The stacked pull request follows the base; the direct one keeps its own merge.
-    expect(after["acme/web#20"]).toMatchObject({ mergeSha: "base0001" });
-    expect(after["acme/web#21"]).toMatchObject({ mergeSha: "direct1" });
-  });
-
   it("stores the merge commit, not the head, and notes an unknown oid", () => {
     const merged = pull({ key: "acme/web#9" }, { merged: true, headSha: "headsha1", mergeCommit: "mergesha" });
     const deployments = recordMerged({}, { entity: merged, pulls: [] }, [target], NOW);
@@ -267,33 +245,14 @@ describe("recording merged pull requests", () => {
   });
 
   // BB-260: a stacked pull request merged into its base branch is not on main,
-  // so it is not live at merge. The BB-215 override re-points it once the base
-  // lands, and the live check is re-run against the base's files.
+  // so it is not live at merge. Under bottom-up (BB-264) it is retargeted and
+  // merged to main rather than carried by the base's merge, so the live check
+  // reads its own base.
   it("does not mark a stacked .bb-only merge deployed before it reaches the default branch", () => {
     const stacked = pull({ key: "bitcomplete/bb-gate#20", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] });
     const isDefaultBase = (_repo: string, base: string | null) => base === "main";
-    const recorded = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, undefined, isDefaultBase);
+    const recorded = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, isDefaultBase);
     expect(recorded["bitcomplete/bb-gate#20::bb-gate"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deadlineAt: NOW + liveAtMergeTarget.timeout });
-  });
-
-  it("keeps a stacked watch merged when the override's base is not live at merge", () => {
-    const stacked = pull({ key: "bitcomplete/bb-gate#21", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked2", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] });
-    const isDefaultBase = (_repo: string, base: string | null) => base === "main";
-    const first = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, undefined, isDefaultBase);
-    expect(first["bitcomplete/bb-gate#21::bb-gate"]).toMatchObject({ state: "merged" });
-    const base = { mergeSha: "base0001", prRepo: "bitcomplete/bb-gate", files: [".bb/AGENTS.md", "cmd/router/main.go"] };
-    const after = recordMerged(first, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW + 1000, () => base, isDefaultBase);
-    expect(after["bitcomplete/bb-gate#21::bb-gate"]).toMatchObject({ state: "merged", mergeSha: "base0001", files: [".bb/AGENTS.md", "cmd/router/main.go"] });
-  });
-
-  it("marks a stacked watch deployed when the override's base is live at merge", () => {
-    const stacked = pull({ key: "bitcomplete/bb-gate#22", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked3", base: "feature-base", head: "feature-stacked", files: ["cmd/router/main.go"] });
-    const isDefaultBase = (_repo: string, base: string | null) => base === "main";
-    const first = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, undefined, isDefaultBase);
-    expect(first["bitcomplete/bb-gate#22::bb-gate"]).toMatchObject({ state: "merged" });
-    const base = { mergeSha: "base0002", prRepo: "bitcomplete/bb-gate", files: [".bb/AGENTS.md"] };
-    const after = recordMerged(first, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW + 1000, () => base, isDefaultBase);
-    expect(after["bitcomplete/bb-gate#22::bb-gate"]).toMatchObject({ state: "deployed", mergeSha: "base0002", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
   });
 
   it("does not record an open pull request, and reads a ticket's linked merged ones", () => {
