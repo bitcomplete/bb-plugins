@@ -90,6 +90,17 @@ describe("matching a carries rule", () => {
       expect(liveAtMergeMatches(live, "BitComplete/BB-Gate", ["docs/a.md"])).toBe(true);
     });
 
+    // BB-292: the bb-gate#106 file list (a `.bb`-only guidance change) matches
+    // the live-at-merge rule and gives a deployed verdict with no deployment
+    // read.
+    it("pins bb-gate#106: a .bb/AGENTS.md plus playbook merge is live at merge", () => {
+      const rules = [kploy, live, router];
+      const files = [".bb/AGENTS.md", ".bb/stewards/playbooks/linear-tickets.md"];
+      expect(matchCarriesRule(rules, "bitcomplete/bb-gate", files)).toBe(live);
+      expect(liveAtMergeMatches(live, "bitcomplete/bb-gate", files)).toBe(true);
+      expect(liveAtMergeVerdict(live)).toEqual({ kind: "deployed", note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
+    });
+
     it("falls through to an earlier rule on a mixed merge", () => {
       // The kploy rule is first and matches any of its files.
       expect(matchCarriesRule([kploy, live], "bitcomplete/bb-gate", ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"])).toBe(kploy);

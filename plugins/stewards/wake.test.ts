@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { DepsDecision } from "./store.js";
 import { parsePlaybook } from "./config.js";
 import { explainDecision, formatDecisionListing } from "./decisions.js";
-import { comment, issue, pull } from "./fixtures.js";
+import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { gateState } from "./ready-gate.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
@@ -213,6 +213,23 @@ describe("a steward's wake", () => {
     const entity = pull({ comments: [marker] }, { headSha: "aaaaaaa1", checks: { state: "success", failing: [] } });
     const wake = formatWake(wakeInput({ observed: { entity, pulls: [] } }));
     expect(wake).toContain("- Lane gate: met (reviewer approved bbbbbbb, head aaaaaaa, checks green, lane no-review)");
+  });
+
+  // BB-292: the wake is a prGate caller. Pin both branches of its "Lane gate"
+  // line: the met wording and each `missing` reason the gate produces. The
+  // gate-met fixture carries a parked `finished` worker and a second open own
+  // pull request, the BB-291 working rule (the test is not about their absence).
+  it("pins the wake's prGate caller: the Lane gate line's met and not-met branches", () => {
+    const marker = (body: string) => comment({ id: `m-${body.length}`, author: "trotterdylan", body, signedBy: "thr_reviewer", createdAt: "2026-10-18T04:00:00Z" });
+    const green = { state: "success", failing: [] };
+    const second = pull({ key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }, { headSha: "bbbbbbb2" });
+    const parked = parkedWorker({ result: "Waiting on the owner's approval of acme/web#7." });
+    const met = pull({ comments: [marker("<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->")] }, { checks: green });
+    expect(formatWake(wakeInput({ observed: { entity: met, pulls: [second] }, workers: [parked], own: new Set(["acme/web#8", "https://github.com/acme/web/pull/8"]) }))).toContain("- Lane gate: met (reviewer approved aaaaaaa, checks green, lane no-review)");
+    const ownerWaiting = pull({ comments: [marker("<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=project -->")] }, { checks: green });
+    expect(formatWake(wakeInput({ observed: { entity: ownerWaiting, pulls: [] } }))).toContain("- Lane gate: not met — owner approval needed (lane owner-reviewed)");
+    const noRound = pull({ comments: [] }, { checks: green });
+    expect(formatWake(wakeInput({ observed: { entity: noRound, pulls: [] } }))).toContain("- Lane gate: not met — no reviewer round yet");
   });
 
   it("takes a worker's closing question, but not one it resolved later in the message", () => {
