@@ -8,12 +8,11 @@ import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { decideEntrySchema, defaultDecideList, globError } from "./decisions.js";
-import { SENTRY_SLUG, opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
+import { SENTRY_SLUG, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
 export const PROJECT_FILE = `${STEWARDS_DIR}/project.json`;
-/** The per-person roles: which watches and the project stewardship a GitHub login's server runs. */
 export const playbookPath = (name: string) => `${STEWARDS_DIR}/playbooks/${name}.md`;
 
 export const DEFAULT_LABEL = "bb-managed";
