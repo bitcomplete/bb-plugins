@@ -215,6 +215,19 @@ describe("a steward's wake", () => {
     expect(wake).toContain("- Lane gate: met (reviewer approved bbbbbbb, head aaaaaaa, checks green, lane no-review)");
   });
 
+  // BB-292: the wake is a prGate caller. Pin both branches of its "Lane gate"
+  // line: the met wording and each `missing` reason the gate produces.
+  it("pins the wake's prGate caller: the Lane gate line's met and not-met branches", () => {
+    const marker = (body: string) => comment({ id: `m-${body.length}`, author: "trotterdylan", body, signedBy: "thr_reviewer", createdAt: "2026-10-18T04:00:00Z" });
+    const green = { state: "success", failing: [] };
+    const met = pull({ comments: [marker("<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->")] }, { checks: green });
+    expect(formatWake(wakeInput({ observed: { entity: met, pulls: [] } }))).toContain("- Lane gate: met (reviewer approved aaaaaaa, checks green, lane no-review)");
+    const ownerWaiting = pull({ comments: [marker("<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=project -->")] }, { checks: green });
+    expect(formatWake(wakeInput({ observed: { entity: ownerWaiting, pulls: [] } }))).toContain("- Lane gate: not met — owner approval needed (lane owner-reviewed)");
+    const noRound = pull({ comments: [] }, { checks: green });
+    expect(formatWake(wakeInput({ observed: { entity: noRound, pulls: [] } }))).toContain("- Lane gate: not met — no reviewer round yet");
+  });
+
   it("takes a worker's closing question, but not one it resolved later in the message", () => {
     expect(workerQuestion("Pushed the fix.\nShould I bring the reviewer back?")).toBe("Should I bring the reviewer back?");
     // A question buried above the last few lines is not what the message ended with.

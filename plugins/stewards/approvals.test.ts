@@ -170,6 +170,26 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(githubReview).toHaveBeenCalledTimes(1);
     expect(sendTo).not.toHaveBeenCalled();
   });
+
+  // BB-292: approvals.ts is a prGate caller. The page's Approve/Decline acts
+  // only while the gate's `needsOwnerApproval` is true. A no-review marker's
+  // met gate refuses the page action, and the refusal text falls through to
+  // the `??` fallback: the gate's `missing` is null when met.
+  //
+  // DIVERGENCE: the gate answers `gateMet: true` for this pull request, while
+  // the page's own refusal says "the pull request has not been observed yet".
+  it("DIVERGENCE: pins the page action's prGate caller: a met no-review gate refuses with the not-observed message", async () => {
+    const { ctx, githubComment, githubReview, sendTo } = deliveryContext();
+    const noReview = comment({ id: "m-nr", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    const entity = pull({ comments: [noReview] }, green);
+    const b = { id: "b1", source: "ops", kind: "pr", entityId: "acme/web#7", entityKey: "acme/web#7", lastSnapshot: { entity, pulls: [] } } as unknown as Binding;
+    const need = { id: "n1", bindingId: "b1", kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7", how: null, data: {}, filedBy: "plugin", status: "open", resolution: null, createdAt: 0, resolvedAt: null } as unknown as Need;
+    // The gate the caller reads is met; `needsOwnerApproval` is false.
+    await expect(approvePrPageAction(ctx, b, need, "approve", null)).resolves.toEqual({ ok: false, message: "Not now: the pull request has not been observed yet." });
+    expect(githubComment).not.toHaveBeenCalled();
+    expect(githubReview).not.toHaveBeenCalled();
+    expect(sendTo).not.toHaveBeenCalled();
+  });
 });
 
 // BB-280: the approve/decline recording path lives in this module, so a change

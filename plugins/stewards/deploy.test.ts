@@ -211,6 +211,28 @@ describe("recording merged pull requests", () => {
     }
   });
 
+  // BB-292: the bb-gate#106 deployment scenario. #106 changed only
+  // `.bb/AGENTS.md` and `.bb/stewards/playbooks/linear-tickets.md`, both under
+  // the split rule's live-at-merge paths, so the watch settles `deployed` the
+  // moment the merge is recorded: no deadline, no deployment read, and the wake
+  // that follows names it deployed rather than awaiting.
+  it("pins the bb-gate#106 scenario: a .bb-only merge is deployed at merge with the wake following it", () => {
+    const bb106 = { entity: pull({ key: "bitcomplete/bb-gate#106", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "dc8fb02", files: [".bb/AGENTS.md", ".bb/stewards/playbooks/linear-tickets.md"] }), pulls: [] };
+    const recorded = recordMerged({}, bb106, [liveAtMergeTarget], NOW);
+    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#106::bb-gate"]);
+    expect(recorded["bitcomplete/bb-gate#106::bb-gate"]).toMatchObject({
+      state: "deployed",
+      deadlineAt: null,
+      note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md",
+    });
+    // No deployment read is needed: nothing times out and nothing awaits.
+    expect(timeoutsDue(recorded, NOW + liveAtMergeTarget.timeout)).toEqual([]);
+    expect(awaitingOnRepo(recorded, "bitcomplete/bb-gate")).toEqual([]);
+    expect(allDeployed(recorded)).toBe(true);
+    // The wake that follows prints the watch deployed, not awaiting.
+    expect(deploymentLines(recorded)).toEqual(["bitcomplete/bb-gate#106 [bb-gate]: deployed → bitcomplete/bb-gate production — live-at-merge: nothing deploys .bb/**, docs/**, **.md"]);
+  });
+
   it("follows an earlier kploy rule for a mixed PR rather than live-at-merge", () => {
     const mixed = { entity: pull({ key: "bitcomplete/bb-gate#5", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"] }), pulls: [] };
     const recorded = recordMerged({}, mixed, [liveAtMergeTarget], NOW);
