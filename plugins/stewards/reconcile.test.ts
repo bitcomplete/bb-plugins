@@ -1044,6 +1044,14 @@ describe("idle in an active stage (BB-83)", () => {
     expect(idleInActiveStage(binding({ requeueUntil: at }), merged, at + 1)).toBe(true);
   });
 
+  // BB-285: a gate-met own pull request is the plugin's to act on, so it does
+  // not suppress the idle wake the way an open one does.
+  it("does not suppress the idle wake for a gate-met own pull request", () => {
+    const open = { entity: issue({ state: "In Review" }), pulls: [pull({ state: "open" })] };
+    expect(idleInActiveStage(binding(), open)).toBe(false);
+    expect(idleInActiveStage(binding({ gateMetPulls: new Set(["acme/web#7"]) }), open)).toBe(true);
+  });
+
   it("starts a new idle period when an own pull request closes", () => {
     const before = { entity: issue({ state: "In Review" }), pulls: [pull({ state: "open" })] };
     expect(ownPullClosed(before, merged, own)).toBe(true);

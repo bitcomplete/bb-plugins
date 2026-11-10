@@ -835,6 +835,12 @@ export function unheardWait(status: Binding["status"], open: readonly Escalation
 export type IdleBinding = Pick<Binding, "stage" | "ending" | "hold" | "deployments" | "requeueUntil"> & {
   workers: readonly Pick<Worker, "status">[];
   ownPulls: ReadonlySet<string>;
+  /**
+   * Lowercased keys of the binding's own pull requests whose gate is met
+   * (BB-285). A gate-met own pull request is not something to wait on: the
+   * plugin acts on it, so it does not suppress the idle wake.
+   */
+  gateMetPulls?: ReadonlySet<string>;
   escalations: readonly Pick<Escalation, "status" | "route">[];
   needs: readonly unknown[];
 };
@@ -862,7 +868,7 @@ export function idleInActiveStage(b: IdleBinding, observed: Observed, now: numbe
   // "nothing is being waited on" before then.
   if (b.requeueUntil !== null && b.requeueUntil > now) return false;
   if (b.workers.some((w) => w.status === "running")) return false;
-  if ([observed.entity, ...observed.pulls].some((e) => pullOpen(e) && ownPull(e.key, e.url, b.ownPulls))) return false;
+  if ([observed.entity, ...observed.pulls].some((e) => pullOpen(e) && ownPull(e.key, e.url, b.ownPulls) && !(b.gateMetPulls?.has(e.key.toLowerCase()) ?? false))) return false;
   if (Object.values(b.deployments).some((w) => w.state === "merged" || w.state === "deploying")) return false;
   if (b.escalations.some((x) => x.status === "open" && x.route === "user")) return false;
   if (b.needs.length > 0) return false;

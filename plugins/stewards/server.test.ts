@@ -14536,3 +14536,84 @@ describe("retrying a failed wake (BB-255)", () => {
     expect(t.retries).toHaveLength(2);
   });
 });
+
+// BB-285: an open pull request is not a wake source (a `pr`/`review` binding's
+// own, or a ticket's once its gate is met), and a gate-met pull request nobody
+// acts on, or a retarget wake nobody answers, raises one `stuck` per episode.
+describe("a gate-met pull request nobody acts on (BB-285)", () => {
+  const head = "aaaaaaa1";
+  const projectMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const owner = comment({ id: "oa", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T15:00:00Z" });
+
+  it("marks a pr binding's free-text wait no-wake-source while its own pull request is open (#294)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    const report = await t.tool("steward_report", { phase: "open", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the dompurify fix on main", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("acme/web#7")!.noWakeSource).toBe(true);
+  });
+
+  it("marks a ticket's free-text wait no-wake-source when its own pull request is gate-met", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+  });
+
+  it("raises one stuck for a gate-met pull request nobody acts on after the window, and clears it when the gate moves", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    expect(stuckOf()[0]!.question).toContain("acme/web#7");
+    // The same state on another sweep re-raises nothing.
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    // A new round requests changes: the gate is no longer met, so it clears.
+    const changed = comment({ id: "r2", author: "jane", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [noReview, changed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(0);
+  });
+
+  it("raises one stuck for a retarget nobody answers after the window, and clears it when retargeted", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.retargetPulls).toEqual(["acme/web#8"]);
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "retarget");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(5 * 60 * 60_000);
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(1);
+    expect(stuckOf()[0]!.question).toContain("acme/web#7");
+    // The same state on another sweep re-raises nothing.
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(1);
+    // Retargeted to the default branch: the state ends and it clears.
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "main", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(0);
+  });
+});
