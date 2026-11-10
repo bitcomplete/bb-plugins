@@ -202,11 +202,13 @@ describe("the sidebar's narrow binding reads (BB-294)", () => {
   const add = (s: ReturnType<typeof store>["s"], projectId: string, n: number) =>
     s.create({ projectId, source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
 
-  it("claimedThreads matches the old full parse, three columns and worker ids, ended bindings included", () => {
+  it("claimedThreadIdsByProject is one grouped query matching the old full parse, ended bindings included", () => {
     const { s, binding } = store();
     s.patch(binding.id, { threadId: "thr_steward" });
     s.addWorker("thr_w1", binding.id, "Work");
     s.addWorker("thr_w2", binding.id, "More");
+    // The project steward's own thread is claimed too.
+    s.patchProject("p1", { threadId: "thr_project" });
     const other = add(s, "p2", 20);
     s.patch(other.id, { threadId: "thr_other_steward" });
     s.addWorker("thr_other_worker", other.id, "Work");
@@ -215,15 +217,46 @@ describe("the sidebar's narrow binding reads (BB-294)", () => {
     s.patch(ended.id, { threadId: "thr_ended_steward", endedAt: 2_000 });
     s.addWorker("thr_ended_worker", ended.id, "Work");
 
-    // The old derivation, over every fully parsed binding.
-    const old = new Map<string, { projectId: string; threadId: string | null; workerThreadIds: string[] }>();
-    for (const b of s.all()) old.set(b.id, { projectId: b.projectId, threadId: b.threadId, workerThreadIds: s.workers(b.id).map((w) => w.threadId) });
-    const rows = s.claimedThreads();
-    expect(rows).toHaveLength(old.size);
-    for (const row of rows) {
-      const expected = old.get(row.id)!;
-      expect({ projectId: row.projectId, threadId: row.threadId, workerThreadIds: [...row.workerThreadIds].sort() }).toEqual({ ...expected, workerThreadIds: [...expected.workerThreadIds].sort() });
+    // The old derivation, over every fully parsed binding plus the project rows.
+    const expected = new Map<string, Set<string>>();
+    const claim = (projectId: string, threadId: string | null) => {
+      if (threadId === null) return;
+      const set = expected.get(projectId) ?? new Set<string>();
+      set.add(threadId);
+      expected.set(projectId, set);
+    };
+    for (const p of s.projects()) claim(p.projectId, p.threadId);
+    for (const b of s.all()) {
+      claim(b.projectId, b.threadId);
+      for (const w of s.workers(b.id)) claim(b.projectId, w.threadId);
     }
+    const actual = s.claimedThreadIdsByProject();
+    expect([...actual.keys()].sort()).toEqual([...expected.keys()].sort());
+    for (const [projectId, threads] of expected) expect([...actual.get(projectId)!].sort()).toEqual([...threads].sort());
+  });
+
+  it("reads a project's open escalations, workers and parent keys in one query each", () => {
+    const { s, binding } = store();
+    // A parent in another project, an ended child, and a worker on each.
+    const parent = add(s, "p1", 30);
+    const child = s.create({ projectId: "p1", source: "linear", entityId: "uuid-31", entityKey: "ENG-31", url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: parent.id, phase: "Todo", stage: "spec" });
+    s.patch(parent.id, { threadId: "thr_parent" });
+    s.addWorker("thr_parent_worker", parent.id, "Parent work");
+    s.addWorker("thr_child_worker", child.id, "Child work");
+    const ended = add(s, "p1", 32);
+    s.patch(ended.id, { endedAt: 2_000 });
+    s.addWorker("thr_ended_worker", ended.id, "Ended work");
+    const other = add(s, "p2", 33);
+    s.addWorker("thr_other_worker", other.id, "Other work");
+    s.escalate({ bindingId: binding.id, kind: "stuck", question: "Stuck", meanwhile: "Wait", route: "project", recommendation: null, projectId: "p1" });
+    s.escalate({ bindingId: other.id, kind: "stuck", question: "Other stuck", meanwhile: "Wait", route: "project", recommendation: null, projectId: "p2" });
+
+    expect(s.openEscalationsForProject("p1").map((x) => x.bindingId)).toEqual([binding.id]);
+    expect(s.workersForProject("p1").map((w) => w.threadId).sort()).toEqual(["thr_child_worker", "thr_parent_worker"]);
+    expect(s.parentKeysForProject("p1").get(child.id)).toBe("ENG-30");
+    expect(s.parentKeysForProject("p1").get(parent.id)).toBeNull();
+    // An ended binding is not in the open parent-key map.
+    expect(s.parentKeysForProject("p1").has(ended.id)).toBe(false);
   });
 
   it("endedSince returns only the window, newest first, at most the limit, this project only", () => {

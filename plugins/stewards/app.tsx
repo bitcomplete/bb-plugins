@@ -219,6 +219,21 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
   // The retry timer and the consecutive failure count, for the backoff (BB-205).
   const retry = useRef<number | null>(null);
   const failures = useRef(0);
+  // BB-296: whether a load is in flight, and whether a realtime signal asked
+  // for one more once it settles. A burst of signals during a slow call makes
+  // one follow-up fetch, not one per signal; the server cache then makes that
+  // fetch cheap. A signal is never dropped, so the sidebar still follows the
+  // reconcile.
+  const inflight = useRef(false);
+  const queued = useRef(false);
+  const runRef = useRef<() => void>(() => {});
+  const schedule = useCallback(() => {
+    if (pending.current !== null) window.clearTimeout(pending.current);
+    pending.current = window.setTimeout(() => {
+      pending.current = null;
+      runRef.current();
+    }, REFETCH_DEBOUNCE_MS);
+  }, []);
   const run = useCallback(() => {
     pending.current = null;
     // A manual refetch or poll supersedes a pending backoff retry.
@@ -227,8 +242,19 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
       retry.current = null;
     }
     const call = ++latest.current;
+    inflight.current = true;
+    const settle = () => {
+      inflight.current = false;
+      // A signal that arrived while this fetch was in flight asks for one
+      // follow-up, not one per signal (BB-296).
+      if (queued.current && mounted.current) {
+        queued.current = false;
+        schedule();
+      }
+    };
     load().then(
       (o) => {
+        settle();
         if (!mounted.current || call !== latest.current) return;
         failures.current = 0;
         if (retry.current !== null) {
@@ -246,6 +272,7 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
         setError(null);
       },
       (e: unknown) => {
+        settle();
         if (!mounted.current || call !== latest.current) return;
         setError(message(e));
         setFailing(true);
@@ -259,14 +286,18 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
         }, delay);
       },
     );
-  }, [load]);
+  }, [load, schedule]);
+  runRef.current = run;
   const refetch = useCallback(() => {
-    if (pending.current !== null) window.clearTimeout(pending.current);
-    pending.current = window.setTimeout(() => {
-      pending.current = null;
-      run();
-    }, REFETCH_DEBOUNCE_MS);
-  }, [run]);
+    // A realtime signal no longer queues a fetch while one is in flight: it
+    // leaves one follow-up for when the call settles, so a slow sidebar call is
+    // not compounded by every signal that arrives during it (BB-296).
+    if (inflight.current) {
+      queued.current = true;
+      return;
+    }
+    schedule();
+  }, [schedule]);
   // A paint after the first successful load, so rows that mount later animate.
   useEffect(() => {
     if (data !== null) setLoaded(true);
@@ -2739,7 +2770,10 @@ function StewardsSidebarCore({
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs.find((t) => t.projectId === data?.projectId) ?? tabs[0] ?? null;
   // A steward's visible change updates the badge and block within seconds; the
   // half-minute poll stays the fallback. Only a signal that names the shown
-  // project triggers a refetch, not one for another listed project (BB-100).
+  // project triggers a refetch, not one for another listed project (BB-100),
+  // and a signal during an in-flight call leaves one follow-up rather than one
+  // fetch each (BB-296). The server caches the project's section between
+  // reconciles, so the follow-up is cheap.
   const shownProjectId = active?.projectId ?? data?.projectId ?? wanted;
   useRealtime(
     PROJECT_CHANGED,

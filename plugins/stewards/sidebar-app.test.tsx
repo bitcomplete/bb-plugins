@@ -2273,6 +2273,40 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("holds signals while a call is in flight and makes one follow-up (BB-296)", async () => {
+    const resolvers: Array<() => void> = [];
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          const call = calls;
+          return new Promise((resolve) => {
+            resolvers.push(() => resolve(sidebarData({ bindings: [binding({ phase: call === 1 ? "In Progress" : "In Review" })] })));
+          });
+        },
+      } as never,
+    });
+    // The first call is in flight. Several signals arrive while it is pending:
+    // they must leave one follow-up, not one fetch each.
+    await waitFor(() => expect(calls).toBe(1));
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls).toBe(1);
+    // The in-flight call settles: exactly one follow-up, not one per signal.
+    resolvers[0]!();
+    await waitFor(() => expect(calls).toBe(2));
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls).toBe(2);
+    // The follow-up's payload renders.
+    resolvers[1]!();
+    await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
+    slot.lifecycle.unmount();
+  });
+
   it("does not re-render rows when the refetched payload is identical", async () => {
     let calls = 0;
     const slot = await renderSidebar({
