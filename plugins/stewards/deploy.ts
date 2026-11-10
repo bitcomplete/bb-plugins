@@ -19,6 +19,13 @@ import type { Observed } from "./store.js";
 export const DEPLOY_STATES = ["merged", "deploying", "deployed", "failed"] as const;
 export type DeployState = (typeof DEPLOY_STATES)[number];
 
+/**
+ * Whether a deployment's own last status is final (BB-286). A non-final
+ * status (`in_progress`, `created`, `queued`, the empty state) has not
+ * applied the image yet, so a watch that last read one keeps being polled.
+ */
+export const isFinalDeploymentState = (state: string | null | undefined): boolean => state === "success" || state === "failure" || state === "error";
+
 export const deploymentWatchSchema = z.object({
   /** The pull request's key, e.g. "acme/web#12"; the map's key as well. */
   key: z.string(),

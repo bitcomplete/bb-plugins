@@ -12137,6 +12137,25 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
   });
 
+  // BB-286: the re-read repeats while the last read was non-final. The first
+  // re-read still sees in_progress; the poll settles it when it turns success
+  // later, rather than waiting for the half-hourly sweep.
+  it("keeps polling while the deployment is non-final and settles when it turns final (BB-286)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, deploymentPollMs: 20 } });
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The source is still in_progress for the doorbell and the first re-read.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentState: "in_progress" });
+    // The final status lands later; the poll re-reads and settles it.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "success" })]);
+    await new Promise((r) => setTimeout(r, 30));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
   // BB-286: the same re-read on the sweep read path.
   it("re-reads after a non-final deployment status found on the sweep (BB-286)", async () => {
     const t = await setup();

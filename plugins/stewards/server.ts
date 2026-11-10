@@ -117,7 +117,7 @@ import {
   type Source,
   type WorkflowRun,
 } from "./source-contract.js";
-import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
+import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -178,6 +178,12 @@ export const ONBOARDING_INTRO = `Set up stewards for this project. Follow the on
 export interface Timing {
   /** Rings for one entity within this long are one look. */
   debounceMs: number;
+  /**
+   * While an awaiting watch's last deployment read is non-final, re-read it
+   * this often (BB-286), bounded by the watch's deadline. Within the five
+   * minutes AC1 names for the re-read after a non-final status.
+   */
+  deploymentPollMs: number;
   /** How long a project's configuration is reused before `.bb` is read again. */
   configTtlMs: number;
   /** The mechanical sweep: adoption backstop, stuck backstop, a look at every binding. */
@@ -202,6 +208,7 @@ export interface Timing {
 
 export const DEFAULT_TIMING: Timing = {
   debounceMs: 3000,
+  deploymentPollMs: 4 * 60_000,
   configTtlMs: 5 * 60_000,
   sweepMs: 30 * 60_000,
   requeueTickMs: 60_000,
@@ -1397,19 +1404,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return next;
     }
 
-    function debounce(key: string, fn: () => Promise<void>): void {
+    function debounce(key: string, fn: () => Promise<void>, delayMs = timing.debounceMs): void {
       if (disposed || timers.has(key)) return;
       timers.set(
         key,
         setTimeout(() => {
           timers.delete(key);
           void fn();
-        }, timing.debounceMs),
+        }, delayMs),
       );
     }
 
     /** Look at a binding again, soon, once however often this is called meanwhile. */
     const scheduleReconcile = (bindingId: string) => debounce(`b:${bindingId}`, () => serial(`b:${bindingId}`, () => reconcileBinding(bindingId, null)));
+
+    /**
+     * Re-read a binding whose last deployment read was non-final, at the
+     * minutes-scale poll interval (BB-286), so a dropped final doorbell is
+     * caught within minutes rather than waiting for the half-hourly sweep.
+     * The watch's deadline ends the retries: the reconcile times it out. The
+     * poll is silent; only a settled or failed watch wakes the steward.
+     */
+    const scheduleDeploymentPoll = (bindingId: string) => debounce(`deploypoll:${bindingId}`, () => serial(`b:${bindingId}`, () => reconcileBinding(bindingId, null)), timing.deploymentPollMs);
 
     // ---- configuration ----------------------------------------------------------------
 
@@ -3873,6 +3889,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           deployments = timeOut(deployments, late, now());
           deploymentChanges.push({ text: `No matching deployment for ${labels.join(", ")}${within}${first === undefined ? "" : `; check the run: https://github.com/${first.repo}/actions`}`, actionable: true });
         }
+        // BB-286: while an awaiting watch's last deployment read was
+        // non-final, keep re-reading at the poll interval, so a dropped final
+        // doorbell is caught within minutes. A settled or failed watch ends
+        // the retries; the watch's deadline times out the wait.
+        if (Object.values(deployments).some((w) => (w.state === "merged" || w.state === "deploying") && !isFinalDeploymentState(w.deploymentState))) scheduleDeploymentPoll(b.id);
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
       }
       const awaitingDeploy = deployTargets.length > 0 && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
@@ -5507,6 +5528,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (!final) {
                 b = store.note(b.id, line, true);
                 scheduleReconcile(b.id);
+                scheduleDeploymentPoll(b.id);
                 continue;
               }
               const before = b.deployments;
@@ -5603,7 +5625,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             for (const b of store.open(config.projectId)) {
               const playbook = bindingPlaybook(config, b);
               if (playbook === null || playbook === undefined) continue;
-              if (playbook.deployments.some((t) => lc(t.repo) === lc(id))) scheduleReconcile(b.id);
+              if (playbook.deployments.some((t) => lc(t.repo) === lc(id)) && awaitingOnRepo(b.deployments, id).length > 0) scheduleReconcile(b.id);
             }
           }
           return;
