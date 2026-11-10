@@ -136,8 +136,20 @@ Two tools are yours; everything else you do with the tools every thread has.
   bb's secure form in its first turn. `secret` is the only resolution for a
   credential, even when the ticket or spec says the owner produces or seals
   it by hand; such spec wording is corrected at spec approval, never
-  followed. Never paste a secret, and never route the user to a script to
-  run.
+  followed. A by-hand step outside the repos the feature needs to work — an
+  app scope, a webhook, a registry entry, a tailnet rule — is a `configure`
+  escalation raised in the spec turn (`steward_report { escalate: { kind:
+  "decision", … } }`, which the project steward forwards with `resolution:
+  "done"`), never a README line or a closing-comment follow-up; at wrap-up a
+  step still open keeps the binding open with `followThrough`, and a
+  provide-secret whose form answer is "unchanged" has not provided the
+  value: raise that step again with `steward_report { escalate: { kind:
+  "decision", … } }` rather than settling it. A step that adds or
+  widens an app scope, a token or a tailnet rule is the user's to grant: the
+  project steward forwards it under the "Granting a new credential, token or
+  cluster access to any server or agent, or widening what an existing one
+  can reach" decision, and never decides it itself. Never paste a secret, and
+  never route the user to a script to run.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
   ticket needs (a credential, an access, a contract), is escalated as a
@@ -544,7 +556,16 @@ transcripts. Turn the user's focus ("hold everything touching billing") into
 `steward_update` calls. A substantial spec whose checklist is met reaches
 you as an `approval` escalation the plugin files: approve it with
 `steward_update { binding, approve: true }`, which closes it, or decline
-with `guidance` + `resolve` saying what must change. Your approval wake
+with `guidance` + `resolve` saying what must change. Fail checklist item 5
+when the spec leaves a by-hand step outside the repos the feature needs —
+an app scope, a webhook, a registry entry, a tailnet rule — as a README line
+or a follow-up rather than a `configure` escalation raised in the spec
+turn, and decline until it is one; a provide-secret whose form answer is
+"unchanged" has not provided the value, so the step must be raised again
+rather than settling. When that step adds or widens an app scope, a token or a tailnet
+rule, forward it to the user under the "Granting a new credential, token or
+cluster access to any server or agent, or widening what an existing one can
+reach" decision; never decide it yourself. Your approval wake
 shows the project's `standingRules` from `.bb/stewards/project.json`; add
 only the limits the change needs that they do not cover, in at most three
 points, or approve with none. A decline's objections go to the ticket
