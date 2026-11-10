@@ -323,6 +323,13 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       const keys = watches.keys();
       if (keys.length > 0) bb.log.info(`checking ${keys.length} watched GitHub pull request${keys.length === 1 ? "" : "s"} or issue${keys.length === 1 ? "" : "s"} (${reason})`);
       await checks.sweep(keys);
+      // BB-286: a reconnect re-check must also ring stewards for every repo
+      // whose deployment doorbells it holds. A deployment doorbell dropped
+      // while this server was away is otherwise only found by the half-hourly
+      // sweep; the ring makes stewards re-read that repo's deployments now.
+      if (reason === "connected") {
+        for (const repo of interest.deployment) rings.ring(repo);
+      }
     }
 
     // ---- what stewards wants to hear about ------------------------------------
