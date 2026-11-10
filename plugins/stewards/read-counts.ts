@@ -47,7 +47,11 @@ export function createReadCounts(): ReadCounts {
   // same way the store's turn coalescing does (BB-95).
   const reconcileScope = new AsyncLocalStorage<CallCounts>();
   const wakeScope = new AsyncLocalStorage<CallCounts>();
-  let pass: ReconcilePassCounts = { storeReads: 0, sourceCalls: 0, reconciles: 0, bindings: 0 };
+  let current: ReconcilePassCounts = { storeReads: 0, sourceCalls: 0, reconciles: 0, bindings: 0 };
+  // The pass before the running one. A `stats` read in the moment between a
+  // sweep starting a fresh pass and its debounced reconciles finishing shows
+  // this instead of a nearly empty pass.
+  let completed: ReconcilePassCounts | null = null;
   let wake: WakeCounts = { storeReads: 0, sourceCalls: 0, wakes: 0 };
 
   return {
@@ -64,16 +68,17 @@ export function createReadCounts(): ReadCounts {
       if (w !== undefined) w.sourceCalls += 1;
     },
     beginReconcilePass(bindings: number): void {
-      pass = { storeReads: 0, sourceCalls: 0, reconciles: 0, bindings };
+      if (current.reconciles > 0) completed = current;
+      current = { storeReads: 0, sourceCalls: 0, reconciles: 0, bindings };
     },
     async runReconcile<T>(fn: () => Promise<T>): Promise<T> {
       const scope: CallCounts = { storeReads: 0, sourceCalls: 0 };
       try {
         return await reconcileScope.run(scope, fn);
       } finally {
-        pass.storeReads += scope.storeReads;
-        pass.sourceCalls += scope.sourceCalls;
-        pass.reconciles += 1;
+        current.storeReads += scope.storeReads;
+        current.sourceCalls += scope.sourceCalls;
+        current.reconciles += 1;
       }
     },
     async runWake<T>(fn: () => Promise<T>): Promise<T> {
@@ -87,7 +92,8 @@ export function createReadCounts(): ReadCounts {
       }
     },
     snapshot(): ReadCountSnapshot {
-      return { reconcile: { ...pass }, wake: { ...wake } };
+      const reconcile = current.reconciles > 0 ? current : (completed ?? current);
+      return { reconcile: { ...reconcile }, wake: { ...wake } };
     },
   };
 }
@@ -135,4 +141,25 @@ export function countingDatabase<D extends { prepare(sql: string): ReadableState
       return typeof value === "function" ? value.bind(target) : value;
     },
   }) as D;
+}
+
+/**
+ * Wrap a GitHub writer so every method call counts as one source call. The
+ * writer is how the plugin reads GitHub outside the source contract (a changed
+ * file, a default branch, the pull requests stacked on a base, a branch's
+ * existence), so counting only `sourceRpc` would undercount GitHub load
+ * (BB-297). Writes (a comment, a merge, a workflow dispatch) count too: the
+ * measure is every GitHub API call the plugin makes, read or write.
+ */
+export function countingGithub<W extends object>(writer: W, onCall: () => void): W {
+  return new Proxy(writer, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]): unknown => {
+        onCall();
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  }) as W;
 }

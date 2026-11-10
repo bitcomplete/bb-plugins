@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { playbookPath } from "./config.js";
 import { issue, pull } from "./fixtures.js";
 import { countingDatabase, createReadCounts } from "./read-counts.js";
+import { SOURCE_PLUGIN_IDS } from "./source-contract.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import { setup } from "./test-world.js";
 
@@ -18,13 +19,14 @@ describe("the read counters (BB-297)", () => {
     db.exec("CREATE TABLE t (n INTEGER)");
     db.prepare("INSERT INTO t (n) VALUES (1), (2)").run();
     const counts = createReadCounts();
-    // The independent spy counts every row read the database serves, whatever
-    // the counter does. Counting on, the two must agree.
+    // The spy counts every row read the database serves, through its own
+    // wrapper and callback, so it is independent of the counter under test.
+    // Counting on, the counter must report the same number of reads.
     let rawReads = 0;
-    const counted = countingDatabase(db, () => {
+    const spy = countingDatabase(db, () => {
       rawReads += 1;
-      counts.storeRead();
     });
+    const counted = countingDatabase(spy, () => counts.storeRead());
     await counts.runReconcile(async () => {
       const statement = counted.prepare("SELECT n FROM t");
       expect(statement.get()).toEqual({ n: 1 });
@@ -40,11 +42,8 @@ describe("the read counters (BB-297)", () => {
     // Counting off (the spy only), the same reads happen: the wrapper added
     // none, so a measured reconcile reads exactly as much as an unmeasured one.
     const before = rawReads;
-    const uncounted = countingDatabase(db, () => {
-      rawReads += 1;
-    });
     await counts.runReconcile(async () => {
-      const statement = uncounted.prepare("SELECT n FROM t");
+      const statement = spy.prepare("SELECT n FROM t");
       statement.get();
       statement.all();
     });
@@ -83,9 +82,24 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = deploymentPlaybook;
     t.hooks.forgetConfigs();
+    // Warm the config so the pass measures steady-state reconcile load, not a
+    // cold config load (which reads Linear/GitHub logins through sourceValidate).
+    await t.hooks.loadConfig("p1");
     // A steward thread the looks already point at, so no binding is adopted
     // mid-pass and no wake spawns a thread.
     t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+
+    // Count the GitHub writer's calls independently of the plugin's counter, so
+    // the fixture's source-call assertion cannot be circular (BB-297 review 1).
+    const githubCalls: string[] = [];
+    for (const [name, fn] of Object.entries(t.github)) {
+      if (typeof fn !== "function") continue;
+      (t.github as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => {
+        githubCalls.push(name);
+        return (fn as (...a: unknown[]) => unknown).apply(t.github, args);
+      };
+    }
+    const sourceRpcCalls = () => t.rpcCalls.filter((c) => c.pluginId === SOURCE_PLUGIN_IDS.linear || c.pluginId === SOURCE_PLUGIN_IDS.github).length;
 
     const bind = (key: string, entityId: string) => {
       const b = t.hooks.store.create({
@@ -136,11 +150,17 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     });
 
     // One reconcile pass over the fixed set, measured as the sweep measures one.
+    const beforeSourceRpc = sourceRpcCalls();
+    githubCalls.length = 0;
     await t.hooks.reconcilePass("p1");
     const { reconcile, wake } = t.hooks.readCounts.snapshot();
+    // The source count is checked against the world's own call log: the source
+    // plugin RPCs plus the GitHub writer calls the pass actually made. This is
+    // what caught the uncounted writer (BB-297 review 1).
+    expect(reconcile.sourceCalls).toBe(sourceRpcCalls() - beforeSourceRpc + githubCalls.length);
     // The pinned baseline. Update these numbers only in a child that explains
     // the change in its pull request body; never loosen them to inequalities.
-    expect(reconcile).toEqual({ storeReads: 191, sourceCalls: 10, reconciles: 4, bindings: 4 });
+    expect(reconcile).toEqual({ storeReads: 190, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 16, sourceCalls: 0, wakes: 1 });
   });
 

@@ -123,7 +123,7 @@ import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } fr
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
-import { countingDatabase, createReadCounts, type ReadCounts } from "./read-counts.js";
+import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
@@ -1201,7 +1201,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
   return async (bb) => {
     const timing: Timing = { ...DEFAULT_TIMING, ...deps.timing };
     const now = deps.now;
-    const github = deps.github ?? createGhWriter();
+    // BB-297: the in-memory read counters. `readCounts` wraps the store's own
+    // statements (through `countingDatabase`) and every source call — the
+    // GitHub/Linear source RPCs and the `github` writer — so a reconcile or a
+    // wake is measured without adding a read of its own.
+    const readCounts = createReadCounts();
+    const github = countingGithub(deps.github ?? createGhWriter(), () => readCounts.sourceCall());
     const settings = bb.settings.define(STEWARDS_SETTINGS);
     const fetchImpl = deps.fetch ?? globalThis.fetch;
     const env = deps.env ?? process.env;
@@ -1290,10 +1295,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
-    // BB-297: the in-memory read counters. `readCounts` wraps the store's own
-    // statements (through `countingDatabase`) and every source RPC, so a
-    // reconcile or a wake is measured without adding a read of its own.
-    const readCounts = createReadCounts();
     // BB-296: the sidebar's per-project section is the expensive half of the
     // RPC (one pass over the project's bindings and their needs, escalations,
     // workers and parent keys). It is cached per project and dropped when the
@@ -11108,12 +11109,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await reconcileLessons(config);
       applyLessonTransitions(config);
       applyRationaleClustering(config);
-      const open = store.open(config.projectId);
-      // BB-297: a sweep is one reconcile pass. The totals the pass reports are
-      // every reconcile that runs until the next sweep, so the owner can read
-      // the load against the binding count the pass was taken at.
-      readCounts.beginReconcilePass(open.length);
-      for (const b of open) {
+      for (const b of store.open(config.projectId)) {
         if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
         const deadline = endingDeadline(b, timing.endingTimeoutMs);
         if (deadline !== null && now() > deadline) {
@@ -11173,6 +11169,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await quietly(`switch off the disabled project ${config.projectId}`, () => endProject(config.projectId, "disabled", { purge: false, config }));
       }
       pushInterest();
+      // BB-297: a sweep is one reconcile pass over every project it sweeps.
+      // The debounced reconciles run after this returns, so the pass totals
+      // cover them and any doorbell reconcile until the next sweep, and the
+      // binding count is the summed open bindings at the sweep — not one
+      // project's, which would mislabel the other projects' reconciles.
+      readCounts.beginReconcilePass(projects.reduce((n, c) => n + store.open(c.projectId).length, 0));
       for (const config of projects) await sweepProject(config);
     }
 
