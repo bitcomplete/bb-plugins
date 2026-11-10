@@ -268,7 +268,7 @@ describe("playbooks", () => {
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/kind: "decision"/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/resolution: "done"/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/never a README line or a closing-comment follow-up/u);
-    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/reopen the step rather than settling it/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/raise that step again/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/the user's to grant/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/followThrough/u);
     expect(phaseInstructions(linear.value, "In Review")).toMatch(/escalated as a `decision`/u);

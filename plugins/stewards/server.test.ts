@@ -12235,7 +12235,7 @@ describe("deployment watching (BB-53)", () => {
     expect(wrap).toMatch(/kind: "decision"/u);
     expect(wrap).toMatch(/resolution: "done"/u);
     expect(wrap).toMatch(/keep the binding open with followThrough until its `configure` escalation is done/u);
-    expect(wrap).toMatch(/"unchanged" has not provided the value, so reopen that step/u);
+    expect(wrap).toMatch(/"unchanged" has not provided the value: raise that step again/u);
   });
 
   it("keeps the pull request awaiting when the steward reports the deployment does not carry the merge", async () => {
