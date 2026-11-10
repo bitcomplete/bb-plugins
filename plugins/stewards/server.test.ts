@@ -122,6 +122,8 @@ function world() {
   const userTurns: Array<{ threadId: string; text: string; at?: number }> = [];
   /** What the page's GitHub actions did. */
   const githubComments: Array<{ repo: string; number: number; body: string }> = [];
+  /** The order of the github writer's comment/merge calls, so a test can assert a marker preceded a merge (BB-288). */
+  const githubCallOrder: string[] = [];
   const githubReviews: Array<{ repo: string; number: number; event: string; body: string }> = [];
   const githubMerges: Array<{ repo: string; number: number; title: string; body: string }> = [];
   /** Workflow dispatches the fake github serves, in order (BB-216). */
@@ -152,6 +154,7 @@ function world() {
   const github = {
     comment: async (repo: string, number: number, body: string) => {
       githubComments.push({ repo, number, body });
+      githubCallOrder.push("comment");
       return `IC_${githubComments.length}`;
     },
     review: async (repo: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string) => {
@@ -167,6 +170,7 @@ function world() {
         throw new Error(`PUT /repos/${repo}/pulls/${number}/merge failed: 409 {"message":"Head branch was modified. Review and try the merge again."}`);
       }
       githubMerges.push({ repo, number, title, body });
+      githubCallOrder.push("merge");
       // The real merge changes the pull request's state; the fake must too, or
       // the plugin's own gate-met merge (BB-257) and the reconcile it
       // schedules would merge the same open snapshot again in a loop.
@@ -563,7 +567,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubCallOrder, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -10603,6 +10607,9 @@ describe("lessons", () => {
     const t = await adopted();
     const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    // The lesson's pull request is observable, so the ordinary project
+    // approval is recorded before the merge (BB-288).
+    t.entities.set("acme/bb#1", pull({ id: "acme/bb#1", key: "acme/bb#1", url: "https://github.com/acme/bb/pull/1" }, { headSha: "a".repeat(40), base: "main" }));
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done).toMatchObject({ error: false, text: expect.stringMatching(new RegExp(`${id}: merged at c{8}`, "u")) });
     // Exactly one PR, on the primary repo, against its default branch, from the
@@ -10612,6 +10619,13 @@ describe("lessons", () => {
     expect(pr).toMatchObject({ repo: "acme/bb", head: `guidance-${t.project}`, base: "main", title: expect.stringContaining(id) });
     expect(pr.body).toContain(withLessonAnchor(lesson, id));
     expect(pr.body).toContain(`_— from bb thread ${t.project}_`);
+    // The ordinary project approval names the BB-280 playbook entry and is
+    // posted before the merge.
+    const marker = t.githubComments.find((c) => c.body.includes("bb-approval"));
+    expect(marker?.body).toContain('entry="What every steward is told (the playbooks and the project\'s skills)"');
+    const mergeAt = t.githubCallOrder.indexOf("merge");
+    expect(mergeAt).toBeGreaterThan(-1);
+    expect(t.githubCallOrder.slice(0, mergeAt)).toContain("comment");
     // No person is asked: the project steward squash-merges it.
     expect(t.githubMerges).toHaveLength(1);
     expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged", tier: "promoted", mergeSha: "c".repeat(40), branch: `refs/heads/guidance-${t.project}`, pr: pr.url });

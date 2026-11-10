@@ -25,6 +25,11 @@ import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
 
+/** How many guidance units a wake or brief lists before it says how many it left out (BB-288). */
+export const GUIDANCE_UNITS_MAX = 60;
+/** The characters of a unit's own text a wake or brief shows; the `gu_` id is what is cited (BB-288). */
+const GUIDANCE_UNIT_CHARS = 120;
+
 /**
  * What a steward must never ask for: an open escalation or approval request is
  * already on the user's Stewards page, and repeating it in a reply is noise.
@@ -635,7 +640,6 @@ export function formatWake(input: WakeInput): string {
   if (binding.mergeBehind.length > 0) out.push(mergeHoldLine(binding));
   if (binding.stackedPulls.length > 0) out.push(stackedPullsLine(binding));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
-  out.push(...guidanceUnitLines(input.guidance ?? []));
   out.push(...trialLessonsLines(input.lessons ?? []));
   out.push(...assumptionLines(input.assumptions ?? []));
   // BB-154: a wait with no structured source gets one paragraph, before the
@@ -676,6 +680,9 @@ export function formatWake(input: WakeInput): string {
     }
     out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
+  // BB-288: the guidance index sits at the end of the snapshot, so `fit` can
+  // clip it and never the snapshot or "What changed".
+  out.push(...guidanceUnitLines(input.guidance ?? []));
 
   const snapshot = out.splice(0);
   out.push("", "## 5. What changed since your last turn", "");
@@ -1225,16 +1232,21 @@ function trialLessonsLines(lessons: Lesson[]): string[] {
  * The hand-written guidance units a wake or brief renders, each beside its
  * `gu_` id (BB-288). Without the id a steward can only cite a unit by running
  * `bb stewards lessons --efficacy`, so every unit the wake shows carries the
- * id it must cite.
+ * id it must cite. The text is a short snippet, not the paragraph: the whole
+ * of `AGENTS.md` is already loaded natively, and a full-text index overflows
+ * the wake's cap. The block is placed where `fit` can clip it, so it can never
+ * cost the snapshot or "What changed".
  */
 function guidanceUnitLines(units: readonly GuidanceUnit[]): string[] {
   if (units.length === 0) return [];
+  const shown = units.slice(0, GUIDANCE_UNITS_MAX);
   return [
     "",
     "## Guidance units",
     "",
     "Each hand-written paragraph of `AGENTS.md` and the playbooks carries its `gu_` id. Cite the id of the paragraph a decision or turn rested on in `steward_update { resolve, cites: [...] }` (or `{ forward, cites }`) or `steward_report { cites: [...] }`.",
-    ...units.map((u) => `- ${u.id} (${u.file}${u.heading === null ? "" : ` §${u.heading}`}): ${oneLine(u.text)}`),
+    ...shown.map((u) => `- ${u.id} (${u.file}${u.heading === null ? "" : ` §${u.heading}`}): ${oneLine(u.text, GUIDANCE_UNIT_CHARS)}`),
+    ...(units.length > shown.length ? [`- … and ${units.length - shown.length} more; run \`bb stewards lessons --efficacy\` for the rest.`] : []),
   ];
 }
 
@@ -1519,7 +1531,6 @@ export function formatProjectWake(input: {
     out.push("", "Recorded, not asked: the owner sees these here and can correct one; a confirmation is the steward's own. Do not ask the user about one in prose.", "");
   }
   const lessons = input.lessons ?? [];
-  out.push(...guidanceUnitLines(input.guidance ?? []));
   out.push(...projectLessonsLines(lessons, input.lessonRules));
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
@@ -1530,6 +1541,9 @@ export function formatProjectWake(input: {
     const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${day(b.requeueUntil)}`}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
+  // BB-288: the guidance index sits at the end of the bindings list, so `fit`
+  // can clip it and never the bindings or the digest.
+  out.push(...guidanceUnitLines(input.guidance ?? []));
   const bindings = out.splice(0);
   if (input.digestDue) {
     if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions, input.timeZone));
