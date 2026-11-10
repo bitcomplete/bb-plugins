@@ -37,8 +37,11 @@ describe("the merge gate's base-ref retarget rule (BB-279)", () => {
   it("is not met when the base changed after the approval and the head is not based on the default branch", () => {
     const g = prGate(ownerPull({ baseChangedAt: afterApproval, headMergeBaseIsDefaultTip: false }));
     expect(g.gateMet).toBe(false);
-    expect(g.missing).toMatch(/the base branch changed since it was given/u);
-    expect(g.needsOwnerApproval).toBe(true);
+    expect(g.missing).toMatch(/rebase the head onto the default branch/u);
+    // A stale approval is not a request for another approval: the head must be
+    // rebased first, or a fresh approval would let the un-rebased head merge.
+    expect(g.baseStale).toBe(true);
+    expect(g.needsOwnerApproval).toBe(false);
   });
 
   it("stays met when the base never changed, even though the head is merely behind", () => {
@@ -76,7 +79,8 @@ describe("the merge gate's base-ref retarget rule (BB-279)", () => {
     const entity = pull({ comments: [marker("project"), projectMarker(approvalAt)] }, { ...green, baseChangedAt: afterApproval, headMergeBaseIsDefaultTip: false });
     const g = prGate(entity, { decision: "project", projectApprovals });
     expect(g.gateMet).toBe(false);
-    expect(g.needsProjectApproval).toBe(true);
+    expect(g.baseStale).toBe(true);
+    expect(g.needsProjectApproval).toBe(false);
   });
 
   it("leaves a project approval that predates the base change met", () => {

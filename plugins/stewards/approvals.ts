@@ -281,6 +281,14 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
       if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
       ctx.store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
+    } else if (g.baseStale) {
+      // The approval is present but stale: the base ref changed after it was
+      // given and the head is not based on the default branch tip. The remedy
+      // is a rebase, not another approval, so close the request with the
+      // gate's words rather than resolving it as approved (BB-279).
+      const why = g.missing ?? "Rebase the head onto the default branch.";
+      ctx.store.closeNeedByKey(b.id, "approve-pr", url, why);
+      ctx.store.resolve(approvalEsc.id, why);
     } else if (g.ownerApproved || g.projectApproved) {
       // The resolution names what approved, so a closed item can always
       // be traced to the comment or review that closed it (BB-151).
@@ -351,10 +359,9 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
     ctx.store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
     ctx.mechanicalStatus(b, { kind: "approved", pull: pull.key });
     after(`The user approved ${pull.key} from the Stewards page.`);
-    // BB-279: an owner page approval reaches a parked worker by the same path
-    // the project steward's decision does, so a worker parked on the gate is
-    // told to merge instead of waiting for a reconcile or a `github_watch`.
-    await deliverApproval(ctx, b, pull, { verdict: "approved", sha: gate.headSha ?? "", entry: null, reasoning: text ?? "Approved from the Stewards page." }, "owner");
+    // A teammate's pull request is the author's to merge after the owner's
+    // approval, so no worker is told to merge it: the review worker follows
+    // pr-reviewer's "Never merge", and there is no build worker here to reach.
     return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
   }
   const body = `Approved ${gate.headSha ?? "?"} from the Stewards page`;
@@ -367,7 +374,9 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
   ctx.mechanicalStatus(b, { kind: "approved", pull: pull.key });
   after(`The user approved ${pull.key} from the Stewards page: "${body}".`);
   // BB-279: the owner's page approval is delivered to the parked worker by the
-  // same path the project steward's decision is.
+  // same path the project steward's decision is. Only the pull request's own
+  // (non-foreign) worker is reached: a teammate's pull request is the author's
+  // to merge.
   await deliverApproval(ctx, b, pull, { verdict: "approved", sha: gate.headSha ?? "", entry: null, reasoning: text ?? "Approved from the Stewards page." }, "owner");
   return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
 }

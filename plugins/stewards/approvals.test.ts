@@ -130,17 +130,16 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(message).toContain("merge it now");
   });
 
-  it("delivers the owner's page approval on a teammate's pull request too", async () => {
-    const { ctx, worker, sendTo, githubReview } = deliveryContext();
+  it("does not tell a teammate's review worker to merge", async () => {
+    const { ctx, sendTo, githubReview } = deliveryContext();
     // A teammate's pull request (the author is not the viewer) approves with a
-    // real GitHub review, then delivers by the same path.
+    // real GitHub review. Its worker is a review worker that follows
+    // pr-reviewer's "Never merge", and the author merges, so it is not told to.
     const entity = pull({ author: "sam", viewer: "jane", comments: [marker("owner")] }, green);
     const b = { id: "b1", source: "ops", kind: "pr", entityId: "acme/web#7", entityKey: "acme/web#7", lastSnapshot: { entity, pulls: [] } } as unknown as Binding;
     const need = { id: "n1", bindingId: "b1", kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7", how: null, data: {}, filedBy: "plugin", status: "open", resolution: null, createdAt: 0, resolvedAt: null } as unknown as Need;
     await expect(approvePrPageAction(ctx, b, need, "approve", null)).resolves.toMatchObject({ ok: true });
     expect(githubReview).toHaveBeenCalledTimes(1);
-    expect(sendTo).toHaveBeenCalledTimes(1);
-    expect(sendTo.mock.calls[0]![0]).toBe(worker.threadId);
-    expect(sendTo.mock.calls[0]![1]).toContain("The owner approved");
+    expect(sendTo).not.toHaveBeenCalled();
   });
 });
