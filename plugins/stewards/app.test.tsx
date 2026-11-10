@@ -331,18 +331,18 @@ describe("the rationale box and lessons block (BB-35 step 4)", () => {
     boxed.lifecycle.unmount();
   });
 
-  it("sends the rationale with the answer, and an empty box is accepted", async () => {
+  it("sends the rationale with the answer, and disables Answer while the box is empty", async () => {
     const slot = await renderBoardWith({ questions: [question({ rationaleWanted: "Why?" })] });
-    const box = await waitFor(() => slot.getByLabelText(/^Why:/u));
+    const answer = (await waitFor(() => slot.getByLabelText(/^Answer to:/u))) as HTMLTextAreaElement;
+    expect(answer.placeholder).toBe("Your answer");
+    const box = slot.getByLabelText(/^Why:/u);
     fireEvent.change(box, { target: { value: "Because the plugin owns auth." } });
+    // The rationale alone does not answer: the empty answer box keeps Answer disabled.
+    expect((slot.getByRole("button", { name: "Answer" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(answer, { target: { value: "Leave SSO out." } });
     fireEvent.click(slot.getByRole("button", { name: "Answer" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, rationale: "Because the plugin owns auth." } }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: "Leave SSO out.", rationale: "Because the plugin owns auth." } }));
     slot.lifecycle.unmount();
-
-    const empty = await renderBoardWith({ questions: [question({ rationaleWanted: "Why?" })] });
-    fireEvent.click(await waitFor(() => empty.getByRole("button", { name: "Answer" })));
-    await waitFor(() => expect(empty.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null } }));
-    empty.lifecycle.unmount();
   });
 
   it("is a collapsed details block with the tier counts and no action buttons", async () => {

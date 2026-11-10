@@ -126,7 +126,7 @@ const needItem = (over: Record<string, unknown> = {}) => {
     why: null,
     ...over,
   };
-  const { actions, freeText } = needActions({ kind: base.kind as string, url: (base.url as string | null) ?? "", data: { choices: base.choices, lessonId: base.lessonId, prUrl: base.prUrl } }, { url: (base.entityUrl as string | null) ?? null });
+  const { actions, freeText } = needActions({ kind: base.kind as string, url: (base.url as string | null) ?? "", data: { choices: base.choices, lessonId: base.lessonId, prUrl: base.prUrl, ...(over.autoFiled === true ? { autoFiled: true } : {}) } }, { url: (base.entityUrl as string | null) ?? null });
   return { ...base, actions: (over.actions as unknown[]) ?? actions, freeText: (over.freeText as boolean) ?? freeText };
 };
 
@@ -1346,8 +1346,29 @@ describe("the inline needs-you actions (BB-76)", () => {
     expect(prompt.className).toContain("line-clamp-3");
     expect(prompt.getAttribute("title")).toBe(long);
     expect(slot.queryByText(/The evidence and reasoning the sidebar must never show/u)).toBeNull();
+    // A free-text Answer has no box in the sidebar: open the detail view, do
+    // not close the question empty (BB-268).
     fireEvent.click(slot.getByRole("button", { name: "Answer" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: null } }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } }));
+    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsAnswerQuestion")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the effort's detail view for a decide need without choices, and keeps an auto-filed Done one click (BB-268)", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 2, items: [needItem({ kind: "decide", choices: [], what: "Merge or close?" }), needItem({ id: "need_2", kind: "decide", choices: [], autoFiled: true, what: "Approve the pull request" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Merge or close?")).toBeTruthy());
+    fireEvent.click(slot.getAllByRole("button", { name: "Answer" })[0]!);
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } }));
+    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsNeedAction")).toBe(false);
+    // The auto-filed item's Done is a plain one-click close, not the free-text Answer.
+    fireEvent.click(slot.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_2", action: "done", note: null, choice: null } }));
     slot.lifecycle.unmount();
   });
 

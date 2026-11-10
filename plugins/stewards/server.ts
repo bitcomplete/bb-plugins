@@ -893,8 +893,8 @@ export const rpcContract = defineRpcContract({
       ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), phase: z.string().nullable(), endReason: z.string().nullable(), endedAt: z.number() })),
     }),
   },
-  // The user closes a question from the page, with or without an answer, or
-  // picks one of its fixed choices.
+  // The user answers a question from the page with text, or picks one of its
+  // fixed choices.
   stewardsAnswerQuestion: {
     input: z.object({
       questionId: z.string().min(1).max(100),
@@ -8501,11 +8501,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await wakePlainRationale();
           return { ok: true, message: "Closed." };
         }
+        // A free-text answer must carry text: the page disables Answer while
+        // the box is empty, and the sidebar opens the detail view instead of
+        // closing the question empty (BB-268).
+        if (text === null) return { ok: false, message: "Type an answer first." };
         // Criterion 1: an approval request answered on the page approves or
         // declines the current spec and closes the request in one
         // transaction. Ambiguous words are not a decline: the project steward
         // decides, so the request goes back to it with the answer.
-        if (x !== null && b !== null && b.endedAt === null && x.kind === "approval" && text !== null) {
+        if (x !== null && b !== null && b.endedAt === null && x.kind === "approval") {
           const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
           const verdict = classifyApproval(text);
           if (verdict === "approve" && entity !== null) {
@@ -8538,18 +8542,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // Closes the escalation it was forwarded for, too. The project
         // steward forwarded it, so it is told too: the user's answer is a
         // lesson candidate for its next wake (BB-35 step 1).
-        store.answer(q.id, text ?? "Closed by the user on the stewards page, without an answer.", "user");
+        store.answer(q.id, text, "user");
         if (x !== null && b !== null && b.endedAt === null) {
-          const closure = withRationale(
-            text === null
-              ? `The user closed ${b.entityKey}'s forwarded escalation on the Stewards page without an answer.`
-              : `The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`,
-          );
-          if (text !== null) store.addGuidance(b.id, text, "user");
-          if (text !== null) countCorrections(x, text);
-          store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
+          const closure = withRationale(`The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`);
+          store.addGuidance(b.id, text, "user");
+          countCorrections(x, text);
+          store.note(b.id, `Escalation ${x.id} decided by the user: ${text}`);
           scheduleReconcile(b.id);
-          await wakeProjectOnForwardedAnswer(b, closure, [x], text !== null);
+          await wakeProjectOnForwardedAnswer(b, closure, [x]);
           return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
         }
         await wakePlainRationale();
@@ -8735,6 +8735,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
         }
 
+        // A `decide` item's free-text Answer must carry text, or the item
+        // stays open: the sidebar opens the detail view instead of calling
+        // this with an empty answer (BB-268). An auto-filed item (BB-213) is a
+        // plain Done item with no text box, so its Done still closes it.
+        if (need.kind === "decide" && action === "done" && need.data.autoFiled !== true && needChoices(need).length === 0 && text === null) {
+          return { ok: false, message: "Type an answer first." };
+        }
         // `decide` is the question mechanism; a raw item of that kind just closes.
         const closure = `${need.kind} item ${need.id} was closed on the Stewards page${text === null ? "" : `: ${text}`}.`;
         store.closeNeed(need.id, text === null ? "Closed on the Stewards page." : `Closed on the Stewards page: ${text}`, "user");

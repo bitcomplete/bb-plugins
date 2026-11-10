@@ -5344,9 +5344,13 @@ describe("questions to the user", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided by the user: Leave SSO out\./u);
     expect((await t.list())[0]!.escalations).toBe(0);
 
-    // A plain question closes without an answer too.
+    // A free-text answer must carry text: an empty or whitespace-only one is
+    // refused and the question stays open (BB-268).
     const plain = t.qid((await t.tool("steward_update", { ask: { question: "Freeze on Friday?" } }, t.project)).text);
-    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: plain, answer: null }, client)).toMatchObject({ ok: true, message: "Closed." });
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: plain, answer: null }, client)).toMatchObject({ ok: false, message: "Type an answer first." });
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: plain, answer: "   " }, client)).toMatchObject({ ok: false, message: "Type an answer first." });
+    expect(t.hooks.store.question(plain)!.status).toBe("open");
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: plain, answer: "Yes." }, client)).toMatchObject({ ok: true, message: "Closed." });
     expect((await t.board()).questions).toEqual([]);
   });
 
@@ -5425,16 +5429,15 @@ describe("questions to the user", () => {
       expect(closed.text).toMatch(/record it with steward_update \{ lesson/u);
     });
 
-    it("tells the project steward about an answerless close without the lesson nudge", async () => {
+    it("refuses an answerless close on a forwarded question, leaving it open and the escalation untouched (BB-268)", async () => {
       const t = await forwarded();
       const before = t.projectWakes().length;
-      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: null }, client)).toMatchObject({ ok: true });
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: null }, client)).toMatchObject({ ok: false, message: "Type an answer first." });
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "   " }, client)).toMatchObject({ ok: false, message: "Type an answer first." });
       await t.flush();
-      const wakes = t.projectWakes();
-      expect(wakes.length).toBeGreaterThan(before);
-      const wake = wakes.at(-1)!.text;
-      expect(wake).toMatch(/forwarded escalation on the Stewards page without an answer/u);
-      expect(wake).not.toMatch(/general judgement the playbook should carry/u);
+      expect(t.hooks.store.question(t.qst)!.status).toBe("open");
+      expect(t.hooks.store.escalation(t.esc)!.status).toBe("open");
+      expect(t.projectWakes().length).toBe(before);
     });
   });
 
@@ -8927,6 +8930,19 @@ describe("fixed choices on decide items and questions", () => {
     const out = await t.harness.behavior.runCli(["done", need.id, "--note", "The second way", "--project", "p1"]);
     expect(out).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Closed/u) });
     expect(t.hooks.store.need(need.id)!.resolution).toBe("Answered from a thread: The second way");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("The second way");
+  });
+
+  it("refuses an empty free-text Answer on a decide item without choices and leaves it open (BB-268)", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", what: "Which way?" }] }, t.steward);
+    const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "decide")!;
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "done", note: null }, client)).toMatchObject({ ok: false, message: "Type an answer first." });
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "done", note: "   " }, client)).toMatchObject({ ok: false, message: "Type an answer first." });
+    expect(t.hooks.store.need(need.id)!.status).toBe("open");
+    // A real answer closes it and records the guidance.
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "done", note: "The second way" }, client)).toMatchObject({ ok: true });
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
     expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("The second way");
   });
 });
