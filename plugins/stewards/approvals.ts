@@ -54,6 +54,41 @@ export async function postApprovalMarker(ctx: ApprovalsContext, entity: EntitySn
 }
 
 /**
+ * The thread the pull request's worker is in, or null. The build-tickets
+ * "Independent review running" comment names it; when that thread has ended,
+ * the newest worker still in flight (a parked `finished` worker included) is
+ * used instead.
+ */
+function workerThreadFor(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot): string | null {
+  const signed = reviewWorkerThread(entity.comments);
+  return (signed !== null && ctx.store.worker(signed)?.bindingId === b.id ? signed : null) ?? [...ctx.store.workers(b.id)].reverse().find((w) => workerInFlight(w))?.threadId ?? null;
+}
+
+/**
+ * Tell the pull request's parked worker that a decision landed, so it merges
+ * (or reworks) without a `github_watch` on the owner. The project steward's
+ * decision and the owner's page approval both deliver by this one path
+ * (BB-279). Returns `worker` when it was told, `steward` when it had ended and
+ * the ticket steward must be woken instead.
+ */
+async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }, actor: "project steward" | "owner"): Promise<"worker" | "steward"> {
+  const thread = workerThreadFor(ctx, b, entity);
+  const info = thread === null ? null : await ctx.threadInfo(thread).catch(() => null);
+  const label = decision.verdict === "approved" ? "approved" : "declined";
+  const entry = decision.entry === null ? "" : ` (entry ${JSON.stringify(decision.entry)})`;
+  const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets, The merge gate), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
+  if (info !== null && info.deletedAt === null && info.archivedAt === null) {
+    if ((await ctx.sendTo(thread!, `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}: ${decision.reasoning}\n\n${next}.`)) === "sent") {
+      ctx.store.note(b.id, `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}; its worker was told.`, true);
+      return "worker";
+    }
+  }
+  ctx.store.note(b.id, `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}: ${decision.reasoning} Start a worker at the build-tickets merge gate ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
+  ctx.scheduleReconcile(b.id);
+  return "steward";
+}
+
+/**
  * Tell the pull request's worker the project steward's decision landed, so it
  * merges (or reworks) without a `github_watch` on the owner. The worker is the
  * thread that posted build-tickets' "Independent review running" comment, or
@@ -62,24 +97,10 @@ export async function postApprovalMarker(ctx: ApprovalsContext, entity: EntitySn
  * starts a fresh worker at the build-tickets merge step.
  */
 export async function deliverProjectApproval(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }): Promise<"worker" | "steward"> {
-  const signed = reviewWorkerThread(entity.comments);
-  const thread = (signed !== null && ctx.store.worker(signed)?.bindingId === b.id ? signed : null) ?? [...ctx.store.workers(b.id)].reverse().find((w) => workerInFlight(w))?.threadId ?? null;
-  const info = thread === null ? null : await ctx.threadInfo(thread).catch(() => null);
-  const label = decision.verdict === "approved" ? "approved" : "declined";
   // The project steward's approval is a mechanical status event: the page and
   // sidebar are current before the ticket steward's next turn (BB-203).
   if (decision.verdict === "approved") ctx.mechanicalStatus(b, { kind: "approved", pull: entity.key });
-  const entry = decision.entry === null ? "" : ` (entry ${JSON.stringify(decision.entry)})`;
-  const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets, The merge gate), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
-  if (info !== null && info.deletedAt === null && info.archivedAt === null) {
-    if ((await ctx.sendTo(thread!, `The project steward ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}: ${decision.reasoning}\n\n${next}.`)) === "sent") {
-      ctx.store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}; its worker was told.`, true);
-      return "worker";
-    }
-  }
-  ctx.store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}: ${decision.reasoning} Start a worker at the build-tickets merge gate ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
-  ctx.scheduleReconcile(b.id);
-  return "steward";
+  return deliverApproval(ctx, b, entity, decision, "project steward");
 }
 
 /**
@@ -260,6 +281,14 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
       if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
       ctx.store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
+    } else if (g.baseStale) {
+      // The approval is present but stale: the base ref changed after it was
+      // given and the head is not based on the default branch tip. The remedy
+      // is a rebase, not another approval, so close the request with the
+      // gate's words rather than resolving it as approved (BB-279).
+      const why = g.missing ?? "Rebase the head onto the default branch.";
+      ctx.store.closeNeedByKey(b.id, "approve-pr", url, why);
+      ctx.store.resolve(approvalEsc.id, why);
     } else if (g.ownerApproved || g.projectApproved) {
       // The resolution names what approved, so a closed item can always
       // be traced to the comment or review that closed it (BB-151).
@@ -330,6 +359,9 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
     ctx.store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
     ctx.mechanicalStatus(b, { kind: "approved", pull: pull.key });
     after(`The user approved ${pull.key} from the Stewards page.`);
+    // A teammate's pull request is the author's to merge after the owner's
+    // approval, so no worker is told to merge it: the review worker follows
+    // pr-reviewer's "Never merge", and there is no build worker here to reach.
     return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
   }
   const body = `Approved ${gate.headSha ?? "?"} from the Stewards page`;
@@ -341,5 +373,10 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
   ctx.store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
   ctx.mechanicalStatus(b, { kind: "approved", pull: pull.key });
   after(`The user approved ${pull.key} from the Stewards page: "${body}".`);
+  // BB-279: the owner's page approval is delivered to the parked worker by the
+  // same path the project steward's decision is. Only the pull request's own
+  // (non-foreign) worker is reached: a teammate's pull request is the author's
+  // to merge.
+  await deliverApproval(ctx, b, pull, { verdict: "approved", sha: gate.headSha ?? "", entry: null, reasoning: text ?? "Approved from the Stewards page." }, "owner");
   return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
 }

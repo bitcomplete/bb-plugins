@@ -162,6 +162,21 @@ export const snapshotPullSchema = z.object({
   draft: z.boolean(),
   merged: z.boolean(),
   base: z.string().nullable(),
+  /**
+   * When the pull request's base ref last changed (GitHub's
+   * `BaseRefChangedEvent`), or null when it never has. Optional: a source that
+   * does not read the timeline omits it, and the merge gate then applies no
+   * retarget rule (BB-279).
+   */
+  baseChangedAt: z.string().nullable().optional(),
+  /**
+   * Whether the head's merge-base with the default branch is the default
+   * branch's tip, so a retargeted head is based on the default branch. True
+   * when it is, false when it is not, and null when the source cannot tell.
+   * Optional, so a source that does not report it still parses, and the merge
+   * gate fails closed only when the base changed after the approval (BB-279).
+   */
+  headMergeBaseIsDefaultTip: z.boolean().nullable().optional(),
   head: z.string().nullable(),
   headSha: z.string().nullable(),
   /** Login of the head commit's author, to tell a teammate's push from the viewer's own. */

@@ -234,6 +234,13 @@ export type PrGate = {
   needsOwnerApproval: boolean;
   /** The project steward's side: a `decide: project` entry, marker approved, checks green, no project approval yet. */
   needsProjectApproval: boolean;
+  /**
+   * Whether the approval present is stale because the base ref changed after it
+   * was given and the head is not based on the default branch tip (BB-279). The
+   * remedy is a rebase, not a fresh approval, so neither approval is requested
+   * while it holds; `missing` names the rebase.
+   */
+  baseStale: boolean;
   /** The decide mark applied to this pull request; `user` unless the project steward classified it under a `project` entry. */
   decision: "project" | "user";
   /** Whether the plugin posted a project-steward approval marker on this pull request. */
@@ -278,6 +285,21 @@ export type PrGateOptions = {
   substantial?: boolean | null;
   /** Whether a ticket the pull request references has an approved spec (BB-207); that is the ack, so the owner is not asked again. */
   ticketApprovedSpec?: boolean;
+  /**
+   * Whether the pull request's base ref changed after the approval being
+   * considered (BB-279). Omitted reads the pull snapshot's `baseChangedAt`
+   * against the approval time; a base that never changed applies no retarget
+   * rule, so a pull request based on the default branch throughout that is
+   * merely behind keeps its approval.
+   */
+  baseChangedSinceApproval?: boolean;
+  /**
+   * Whether the head's merge-base with the default branch is the default
+   * branch's tip (BB-279). True means a retargeted head is based on the
+   * default branch; false, null or omitted when the source cannot tell, which
+   * fails closed only when the base changed after the approval.
+   */
+  headMergeBaseIsDefaultTip?: boolean | null;
 };
 
 export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate {
@@ -328,8 +350,23 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // everything else is the user's (fail closed).
   const decision: "project" | "user" = escalated ? "user" : opts.decision === "project" || (opts.decision === undefined && projectApprovedRaw) ? "project" : "user";
   const projectApproved = projectApprovedRaw && decision === "project";
-  const approved = decision === "project" ? projectApproved : owner.approved;
-  const approvalNeeded = ownerLane && markerApproved && checksGreen && !approved;
+  // BB-279: an approval given before the pull request's base ref changed
+  // counts only when the head is based on the default branch tip. The rule
+  // fires only when the base ref changed after the approval: a pull request
+  // based on the default branch throughout that is merely behind keeps its
+  // approval, because the base never changed. The approval time is the one the
+  // gate is using: the project steward's marker or the owner's approval.
+  const approvalAt = decision === "project" ? (approval?.comment.createdAt ?? null) : owner.at;
+  const baseChangedAt = pull?.baseChangedAt ?? null;
+  const baseChangedSinceApproval = opts.baseChangedSinceApproval ?? (baseChangedAt !== null && approvalAt !== null && baseChangedAt > approvalAt);
+  const headOnDefaultTip = opts.headMergeBaseIsDefaultTip ?? pull?.headMergeBaseIsDefaultTip ?? null;
+  const baseStale = baseChangedSinceApproval && headOnDefaultTip !== true;
+  const approved = (decision === "project" ? projectApproved : owner.approved) && !baseStale;
+  // A stale approval is not a request for another approval: the head must be
+  // rebased onto the default branch first, and a fresh approval would only let
+  // the un-rebased head merge. So neither approval is asked for while
+  // `baseStale`, and `missing` names the rebase.
+  const approvalNeeded = ownerLane && markerApproved && checksGreen && !approved && !baseStale;
   const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || approved);
   const missing = gateMet
     ? null
@@ -342,13 +379,15 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
           : !checksGreen
             ? `checks ${checksState ?? "not run"}`
             : ownerLane && !approved
-              ? product
-                ? "owner approval needed (product)"
-                : escalated
-                  ? "owner approval needed (the reviewer escalated it)"
-                  : decision === "project"
-                    ? "project steward approval needed"
-                    : "owner approval needed"
+              ? baseStale
+                ? "rebase the head onto the default branch: the base changed since the approval"
+                : product
+                  ? "owner approval needed (product)"
+                  : escalated
+                    ? "owner approval needed (the reviewer escalated it)"
+                    : decision === "project"
+                      ? "project steward approval needed"
+                      : "owner approval needed"
               : "not met";
   return {
     headSha,
@@ -367,6 +406,7 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     missing,
     needsOwnerApproval: approvalNeeded && decision === "user",
     needsProjectApproval: approvalNeeded && decision === "project",
+    baseStale,
     decision,
     projectApproved,
     escalated,
