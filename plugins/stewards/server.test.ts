@@ -6056,6 +6056,23 @@ describe("stale-while-revalidate project configuration (BB-104)", () => {
     await Promise.all([first, second]);
   });
 
+  it("reads every project's configuration concurrently, so a cold start is not serial (BB-295)", async () => {
+    const t = await setup();
+    await t.flush();
+    t.hooks.forgetConfigs();
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Beta" }]);
+    const gate = gated(t);
+    gate.hold();
+    // Both projects' reads are issued before either can settle; the old serial
+    // `for … await loadConfig` would have only one in flight.
+    const overview = t.harness.callRpc("stewardsOverview", null);
+    for (let i = 0; i < 20 && gate.reads.filter((paths) => paths.includes(PROJECT_FILE)).length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(gate.reads.filter((paths) => paths.includes(PROJECT_FILE)).length).toBe(2);
+    gate.release();
+    await overview;
+  });
+
   it("keeps the last good entry and logs when the refresh fails", async () => {
     const t = await setup();
     await t.flush();
@@ -6499,6 +6516,23 @@ describe("the stewards sidebar call", () => {
     expect(after.signals.p1).toBe((before.signals.p1 ?? 0) + 1);
   });
 
+  it("reports the sidebar call's client-reported queue time beside the handler time (BB-295)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const before = JSON.parse((await t.harness.behavior.runCli(["stats", "--json"])).stdout) as { rpc: Record<string, { queueCount?: number; queueTotalMs?: number }> };
+    // The client's stamp says the call waited 40 ms before the handler ran; the
+    // handler's own duration cannot see that wait.
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1", clientSentAt: t.now() - 40 });
+    const after = JSON.parse((await t.harness.behavior.runCli(["stats", "--json"])).stdout) as { rpc: Record<string, { queueCount: number; queueTotalMs: number; queueMaxMs: number; queueLastMs: number }> };
+    const stat = after.rpc.stewardsSidebar!;
+    expect(stat.queueCount).toBe((before.rpc.stewardsSidebar?.queueCount ?? 0) + 1);
+    expect(stat.queueLastMs).toBe(40);
+    expect(stat.queueMaxMs).toBeGreaterThanOrEqual(40);
+    const text = (await t.harness.behavior.runCli(["stats"])).stdout;
+    expect(text).toMatch(/stewardsSidebar: .*queue \d+ call.*last 40ms/u);
+  });
+
   it("derives claimedThreadIds from the narrow store read, identical to the old full parse (BB-294)", async () => {
     const t = await setup();
     const originalProjects = t.sdk.projects.list;
@@ -6532,7 +6566,7 @@ describe("the stewards sidebar call", () => {
     for (const p of result.projects) expect([...(p.claimedThreadIds ?? [])].sort()).toEqual([...(expected.get(p.projectId) ?? new Set<string>())].sort());
   });
 
-  it("parses only the open bindings and a bounded ended tail, so a long history stays fast (BB-294)", async () => {
+  it("parses only the open bindings and a bounded ended tail, so a long history stays fast (BB-294, BB-295)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -6546,7 +6580,7 @@ describe("the stewards sidebar call", () => {
     t.hooks.db.prepare("BEGIN").run();
     for (let i = 0; i < 3000; i++) insert.run(`bnd_seed_${i}`, "p1", "linear", `uuid_seed_${i}`, `ENG-9${i}`, "ticket", "linear-tickets", "v1", at - 30 * 86_400_000 - i, at - 86_400_000 - i, bigSnapshot);
     t.hooks.db.prepare("COMMIT").run();
-    // Warm the config read so the measured call is the parse cost.
+    // Warm the config read so the measured calls are the parse cost.
     await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
 
     const started = Date.now();
@@ -6556,6 +6590,20 @@ describe("the stewards sidebar call", () => {
     expect(result.ended).toHaveLength(30);
     expect(elapsed).toBeLessThan(100);
     expect(t.harness.logEntries.some((entry) => /stewards: stewardsSidebar took \d+ms/u.test(entry.message))).toBe(true);
+
+    // BB-295: the board and the overview read the same narrow rows, so the
+    // 3000-row history must not slow either one.
+    const boardStarted = Date.now();
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { ended: Array<{ key: string }> } };
+    const boardElapsed = Date.now() - boardStarted;
+    expect(board.board.ended).toHaveLength(30);
+    expect(boardElapsed).toBeLessThan(100);
+
+    const overviewStarted = Date.now();
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; endedCount: number }> };
+    const overviewElapsed = Date.now() - overviewStarted;
+    expect(overview.projects.find((p) => p.projectId === "p1")!.endedCount).toBe(3000);
+    expect(overviewElapsed).toBeLessThan(100);
   }, 30_000);
 
   it("caches the per-project section until the reconcile invalidates it (BB-296)", async () => {
@@ -6609,6 +6657,45 @@ describe("the stewards sidebar call", () => {
     t.advance(26_000);
     const after = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
     expect(after.bindings.find((x) => x.key === "ENG-12")!.stuck).toBe(true);
+  });
+});
+
+// BB-295: the board and the overview read narrow rows instead of every parsed
+// binding; on a mixed seed their results are the old `store.all` derivation.
+describe("the board and overview narrow reads (BB-295)", () => {
+  it("match the old store.all derivation on a mixed seed", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const store = t.hooks.store;
+    const at = t.now();
+    // The board's ended window is 14 days; one ended binding is inside it, one outside.
+    const endedOld = store.create({ projectId: "p1", source: "linear", entityId: "uuid-old", entityKey: "ENG-101", url: "https://x/101", title: "Old", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    store.patch(endedOld.id, { endedAt: at - 40 * 86_400_000, endReason: "terminal" });
+    const endedNew = store.create({ projectId: "p1", source: "linear", entityId: "uuid-new", entityKey: "ENG-102", url: "https://x/102", title: "New", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    store.patch(endedNew.id, { endedAt: at - 60_000, endReason: "terminal" });
+    const open = store.create({ projectId: "p1", source: "linear", entityId: "uuid-open", entityKey: "ENG-103", url: null, title: "Open", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+
+    // The old derivation over every parsed binding.
+    const oldAll = store.all("p1");
+    const oldOpen = oldAll.filter((b) => b.endedAt === null).map((b) => b.entityKey).sort();
+    const oldEnded = oldAll
+      .filter((b) => b.endedAt !== null && b.endedAt >= at - 14 * 86_400_000)
+      .sort((a, b) => b.endedAt! - a.endedAt!)
+      .slice(0, 30)
+      .map((b) => b.entityKey);
+    expect(oldOpen).toEqual(["ENG-12", open.entityKey].sort());
+    expect(oldEnded).toEqual([endedNew.entityKey]);
+
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string }>; ended: Array<{ key: string; url: string | null }> } };
+    expect(board.board.stewards.map((s) => s.key).sort()).toEqual(oldOpen);
+    expect(board.board.ended.map((e) => e.key)).toEqual(oldEnded);
+    expect(board.board.ended[0]!.url).toBe(endedNew.url);
+
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; endedCount: number; stewards: Array<{ key: string }> }> };
+    const p1 = overview.projects.find((p) => p.projectId === "p1")!;
+    expect(p1.stewards.map((s) => s.key).sort()).toEqual(oldOpen);
+    expect(p1.endedCount).toBe(oldAll.length - oldOpen.length);
   });
 });
 

@@ -396,8 +396,8 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 
 // ---- Status ---------------------------------------------------------------------------------------
 
-/** The plugin's in-memory per-method stat (BB-100), shown in the Status section. */
-function MethodStats({ title, rows, now }: { title: string; rows: Record<string, { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null }>; now: number }) {
+/** The plugin's in-memory per-method stat (BB-100), shown in the Status section. `queue*` is the client-reported wait before the handler (BB-295). */
+function MethodStats({ title, rows, now }: { title: string; rows: Record<string, { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null; queueCount: number; queueTotalMs: number; queueMaxMs: number; queueLastMs: number }>; now: number }) {
   const entries = Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0]));
   return (
     <div>
@@ -410,6 +410,7 @@ function MethodStats({ title, rows, now }: { title: string; rows: Record<string,
             <li key={name}>
               {name}: {s.count} call{s.count === 1 ? "" : "s"}, total {s.totalMs}ms, max {s.maxMs}ms, last {s.lastMs}ms
               {s.lastAt === null ? "" : ` (${ago(s.lastAt, now)})`}
+              {s.queueCount === 0 ? "" : `; queue total ${s.queueTotalMs}ms, max ${s.queueMaxMs}ms, last ${s.queueLastMs}ms`}
             </li>
           ))}
         </ul>
@@ -2689,7 +2690,7 @@ function StewardsSidebarCore({
   // A route that names a project wins over the remembered one, and a pick wins
   // until the next route change (BB-117).
   const wanted = picked ?? routeProject ?? lastProject.current;
-  const { data, error, fetchedAt, failing, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
+  const { data, error, fetchedAt, failing, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted, clientSentAt: Date.now() }), [rpc, wanted]));
   // BB-127: the body is pending until the RPC has data for the project on
   // screen. A null `data.projectId` is a landed answer for a project with no
   // stewards config (`server.ts` returns it for an unconfigured or absent
