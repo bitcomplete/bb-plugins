@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -255,6 +255,15 @@ describe("the sidebar's narrow binding reads (BB-294)", () => {
     s.patchProject("p4", { threadId: "thr_p4" });
     expect([...s.bindingProjectIds()].sort()).toEqual(["p1", "p2", "p3"]);
     expect(s.projectIds().sort()).toEqual(["p1", "p2", "p3", "p4"]);
+  });
+
+  it("openBindingIds lists only the project's open binding ids", () => {
+    const { s, binding } = store();
+    const ended = add(s, "p1", 21);
+    s.patch(ended.id, { endedAt: 2_000 });
+    add(s, "p2", 20);
+    expect(s.openBindingIds("p1")).toEqual([binding.id]);
+    expect(s.openBindingIds("p2")).toHaveLength(1);
   });
 });
 
@@ -547,9 +556,10 @@ describe("the actor rename migration (BB-97)", () => {
     // list, this only checks the group order).
     // BB-256 appended the merge-hold group after BB-255's wake-retry group,
     // BB-264 appended the retarget-pulls column after that, BB-287 appended the
-    // stacked-pull columns after that, and BB-293 appended the shadow
-    // assessment and divergence-log tables after that.
-    const groups = [ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // stacked-pull columns after that, BB-293 appended the shadow
+    // assessment and divergence-log tables after that, and BB-294 appended the
+    // ended-read index after that.
+    const groups = [ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -639,9 +649,12 @@ describe("the escalation route rename migration (BB-209)", () => {
     // that, BB-247's dated-wait columns after that, BB-255's wake-retry
     // columns after that, BB-256's merge-hold column after that, BB-264's
     // retarget-pulls column after that, BB-287's stacked-pull columns after
-    // that, and BB-293's shadow-assessment tables after that.
-    const withAssessment = MIGRATIONS.slice(0, -ASSESSMENT_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-ASSESSMENT_MIGRATIONS.length)).toEqual([...ASSESSMENT_MIGRATIONS]);
+    // that, BB-293's shadow-assessment tables after that, and BB-294's
+    // ended-read index after that.
+    const withEnded = MIGRATIONS.slice(0, -ENDED_READ_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-ENDED_READ_MIGRATIONS.length)).toEqual([...ENDED_READ_MIGRATIONS]);
+    const withAssessment = withEnded.slice(0, -ASSESSMENT_MIGRATIONS.length);
+    expect(withEnded.slice(-ASSESSMENT_MIGRATIONS.length)).toEqual([...ASSESSMENT_MIGRATIONS]);
     const withStacked = withAssessment.slice(0, -STACKED_PULLS_MIGRATIONS.length);
     expect(withAssessment.slice(-STACKED_PULLS_MIGRATIONS.length)).toEqual([...STACKED_PULLS_MIGRATIONS]);
     const withRetarget = withStacked.slice(0, -RETARGET_PULLS_MIGRATIONS.length);

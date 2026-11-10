@@ -664,7 +664,13 @@ export const ASSESSMENT_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS assessment_divergences_seen ON assessment_divergences (last_seen_at)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS];
+// BB-294: the sidebar's bounded ended read filters and orders on `ended_at`,
+// which sits after `last_snapshot` in the row. Without this index SQLite reads
+// every ended binding's snapshot to sort the tail, so the read does not scale
+// with the live work. A new index, so nothing existing is altered.
+export const ENDED_READ_MIGRATIONS = [`CREATE INDEX IF NOT EXISTS bindings_project_ended ON bindings (project_id, ended_at DESC)`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1446,12 +1452,6 @@ export interface StoreOptions {
 }
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
-  // BB-294: `endedSince` filters and orders on `ended_at`, which sits after
-  // `last_snapshot` in the row, so without this index SQLite reads every ended
-  // binding's snapshot to sort the tail. It is a performance aid, not schema the
-  // data depends on, so it is created idempotently here rather than as a
-  // migration: the previous build ignores it and it is safe on a live store.
-  db.exec("CREATE INDEX IF NOT EXISTS bindings_project_ended ON bindings (project_id, ended_at DESC)");
   const getBinding = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE id = ?");
   const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at LIMIT 1");
   const byKey = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
@@ -1466,6 +1466,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // `rowToBinding`.
   const claimedBindingRows = db.prepare<[], { id: string; project_id: string; thread_id: string | null }>("SELECT id, project_id, thread_id FROM bindings");
   const claimedWorkerRows = db.prepare<[], { binding_id: string; thread_id: string }>("SELECT binding_id, thread_id FROM workers");
+  // BB-294: a project's open binding ids, for `needsUser`'s caller when it does
+  // not already hold the open list. Narrow, so a single-binding caller does not
+  // parse every open binding's `lastSnapshot`.
+  const openBindingIdsStmt = db.prepare<[string], { id: string }>("SELECT id FROM bindings WHERE project_id = ? AND ended_at IS NULL");
   // BB-294: the project list the sidebar, board and overview build, without
   // parsing a binding.
   const bindingProjectIdsStmt = db.prepare<[], { project_id: string }>("SELECT DISTINCT project_id FROM bindings");
@@ -2162,6 +2166,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     open(projectId?: string): Binding[] {
       return (projectId === undefined ? allOpen.all() : openForProject.all(projectId)).map(rowToBinding);
+    },
+    /** The ids of a project's open bindings, without parsing a binding (BB-294). */
+    openBindingIds(projectId: string): string[] {
+      return openBindingIdsStmt.all(projectId).map((r) => r.id);
     },
     all(projectId?: string): Binding[] {
       return (projectId === undefined ? all.all() : allForProject.all(projectId)).map(rowToBinding);

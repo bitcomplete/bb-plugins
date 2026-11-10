@@ -2858,8 +2858,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * project; a single-binding caller uses this.
      */
     function needsUserInputs(projectId: string, open?: Binding[]): { questions: Question[]; openIds: Set<string> } {
-      const openBindings = open ?? store.open(projectId);
-      return { questions: store.openQuestions(projectId), openIds: new Set(openBindings.map((b) => b.id)) };
+      const openIds = open === undefined ? new Set(store.openBindingIds(projectId)) : new Set(open.map((b) => b.id));
+      return { questions: store.openQuestions(projectId), openIds };
     }
 
     /**
