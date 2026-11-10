@@ -123,6 +123,7 @@ import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } fr
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
+import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
@@ -577,6 +578,11 @@ const statsSchema = z.object({
   cli: z.record(z.string(), methodStatSchema),
   /** Signals published per project in the last hour. */
   signals: z.record(z.string(), z.number()),
+  /** Store reads and GitHub/Linear source calls, counted in memory per reconcile pass and per wake (BB-297). */
+  reads: z.object({
+    reconcile: z.object({ storeReads: z.number(), sourceCalls: z.number(), reconciles: z.number(), bindings: z.number() }),
+    wake: z.object({ storeReads: z.number(), sourceCalls: z.number(), wakes: z.number() }),
+  }),
 });
 export type StewardStats = z.infer<typeof statsSchema>;
 
@@ -1195,7 +1201,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
   return async (bb) => {
     const timing: Timing = { ...DEFAULT_TIMING, ...deps.timing };
     const now = deps.now;
-    const github = deps.github ?? createGhWriter();
+    // BB-297: the in-memory read counters. `readCounts` wraps the store's own
+    // statements (through `countingDatabase`) and every source call — the
+    // GitHub/Linear source RPCs and the `github` writer — so a reconcile or a
+    // wake is measured without adding a read of its own.
+    const readCounts = createReadCounts();
+    const github = countingGithub(deps.github ?? createGhWriter(), () => readCounts.sourceCall());
     const settings = bb.settings.define(STEWARDS_SETTINGS);
     const fetchImpl = deps.fetch ?? globalThis.fetch;
     const env = deps.env ?? process.env;
@@ -1262,7 +1273,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const cutoff = now() - 3_600_000;
       const signals: Record<string, number> = {};
       for (const s of signalLog) if (s.at >= cutoff) signals[s.projectId] = (signals[s.projectId] ?? 0) + 1;
-      return { rpc: table(methodStats.rpc), cli: table(methodStats.cli), signals };
+      return { rpc: table(methodStats.rpc), cli: table(methodStats.cli), signals, reads: readCounts.snapshot() };
     }
     /** Wrap every RPC handler with `measured`, so the table covers every method, not a hand-picked list. */
     function measuredHandlers<T extends Record<string, (...args: never[]) => unknown>>(kind: "rpc" | "cli", handlers: T): T {
@@ -1304,7 +1315,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // changed; the sidebar, the board page and the overview refetch on the
     // channel. Keeping it a callback keeps store.ts free of bb, so
     // steward-side mutations publish too.
-    const store = createStore(db, now, {
+    const store = createStore(countingDatabase(db, () => readCounts.storeRead()), now, {
       log: (message) => bb.log.info(message),
       onProjectChange: (projectId, columns) => {
         // The project's cached sidebar section is stale the moment the store
@@ -1323,8 +1334,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
-    const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> =>
-      rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
+    const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> => {
+      // One GitHub/Linear source call, counted while a reconcile or wake is
+      // measured (BB-297). `snapshot` and `linkedPulls` go through here, so a
+      // ticket's look counts each entity it reads.
+      readCounts.sourceCall();
+      return rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
+    };
 
     // ---- push-notifications (BB-253) ----------------------------------------------------------------
     //
@@ -3529,6 +3545,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** Wake the steward, spawning its thread on the first wake. */
     async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<boolean> {
+      // BB-297: the wake's own store reads and source calls are counted
+      // separately from the reconcile that may have triggered it.
+      return readCounts.runWake(() => wakeInner(b, config, playbook, observed, changes, reason));
+    }
+
+    async function wakeInner(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<boolean> {
       const gate = gateState(playbook, b.ready, specHashFor(b, observed.entity));
       const workerQuestions = await collectWorkerQuestions(b);
       const text = formatWake({
@@ -3872,14 +3894,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * is pushed again.
      */
     async function reconcileBinding(bindingId: string, force: WakeReason | null): Promise<void> {
-      const before = store.binding(bindingId);
-      const leased = before === null ? "" : leasedPulls(before).join(" ");
-      try {
-        await reconcileOnce(bindingId, force);
-      } finally {
-        const after = store.binding(bindingId);
-        if (after !== null && leasedPulls(after).join(" ") !== leased) pushInterest();
-      }
+      // BB-297: the whole look, including its snapshot reads, is one measured
+      // reconcile. Its totals land in the current pass `bb stewards stats`
+      // reports.
+      await readCounts.runReconcile(async () => {
+        const before = store.binding(bindingId);
+        const leased = before === null ? "" : leasedPulls(before).join(" ");
+        try {
+          await reconcileOnce(bindingId, force);
+        } finally {
+          const after = store.binding(bindingId);
+          if (after !== null && leasedPulls(after).join(" ") !== leased) pushInterest();
+        }
+      });
     }
 
     async function reconcileOnce(bindingId: string, force: WakeReason | null): Promise<void> {
@@ -4375,6 +4402,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // for it, and the line under What changed is the whole wake (BB-83).
       const idleDue = lines.includes(IDLE_WAKE_TEXT);
       if (await wake(b, config, playbook, observed, lines, reason ?? (idleDue ? "changed" : followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"))) await archiveFinishedWorkers(store.binding(b.id) ?? b);
+    }
+
+    /**
+     * Test seam: run one reconcile pass over a project's open bindings, the
+     * way the sweep measures one (BB-297). The fixture uses it to pin the store
+     * reads and source calls a reconcile performs over a fixed binding set.
+     */
+    async function reconcilePass(projectId: string): Promise<void> {
+      const open = store.open(projectId);
+      readCounts.beginReconcilePass(open.length);
+      for (const b of open) await serial(`b:${b.id}`, () => reconcileBinding(b.id, null));
     }
 
     // ---- ops bindings ----------------------------------------------------------------------------
@@ -11131,6 +11169,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await quietly(`switch off the disabled project ${config.projectId}`, () => endProject(config.projectId, "disabled", { purge: false, config }));
       }
       pushInterest();
+      // BB-297: a sweep is one reconcile pass over every project it sweeps.
+      // The debounced reconciles run after this returns, so the pass totals
+      // cover them and any doorbell reconcile until the next sweep, and the
+      // binding count is the summed open bindings at the sweep — not one
+      // project's, which would mislabel the other projects' reconciles.
+      readCounts.beginReconcilePass(projects.reduce((n, c) => n + store.open(c.projectId).length, 0));
       for (const config of projects) await sweepProject(config);
     }
 
@@ -12501,7 +12545,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           stats: cliCommand({
             summary: "Per-method RPC and CLI call counts and timings, and published signals in the last hour",
             description:
-              "The in-memory table bb core's own handler stat cannot show: one row per RPC method and CLI command, plus the signals each project published in the last hour (BB-100). The `queue` half of a `stewardsSidebar` row is the client-reported wait from the call's stamp to the handler, so a slowdown can be told from event-loop contention (BB-295). Reset by a restart.",
+              "The in-memory table bb core's own handler stat cannot show: one row per RPC method and CLI command, plus the signals each project published in the last hour (BB-100). The `queue` half of a `stewardsSidebar` row is the client-reported wait from the call's stamp to the handler, so a slowdown can be told from event-loop contention (BB-295). The reads line counts store reads and GitHub/Linear source calls per reconcile pass and per wake (BB-297). Reset by a restart.",
             options: { json: JSON_OPTION },
             async run(input) {
               const stats = statsSnapshot();
@@ -12524,6 +12568,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const signals = Object.entries(stats.signals).sort((a, b) => a[0].localeCompare(b[0]));
               if (signals.length === 0) lines.push("  (none)");
               else for (const [projectId, count] of signals) lines.push(`  ${projectId}: ${count}`);
+              // BB-297: the reads and source calls the owner compares against the
+              // baseline, with the binding count the reconcile pass was taken at.
+              const per = (total: number, count: number): string => (count === 0 ? "0.0" : (total / count).toFixed(1));
+              const reconcile = stats.reads.reconcile;
+              const wake = stats.reads.wake;
+              lines.push("Reads and source calls (BB-297):");
+              lines.push(`  reconcile pass: ${reconcile.storeReads} store reads, ${reconcile.sourceCalls} source calls over ${reconcile.reconciles} reconcile${reconcile.reconciles === 1 ? "" : "s"} at ${reconcile.bindings} binding${reconcile.bindings === 1 ? "" : "s"} (${per(reconcile.storeReads, reconcile.reconciles)} reads, ${per(reconcile.sourceCalls, reconcile.reconciles)} calls per reconcile)`);
+              lines.push(`  wake: ${wake.storeReads} store reads, ${wake.sourceCalls} source calls over ${wake.wakes} wake${wake.wakes === 1 ? "" : "s"} (${per(wake.storeReads, wake.wakes)} reads, ${per(wake.sourceCalls, wake.wakes)} calls per wake)`);
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
@@ -12543,12 +12595,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, readCounts, reconcilePass });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void> }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
