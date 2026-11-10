@@ -12232,9 +12232,9 @@ describe("deployment watching (BB-53)", () => {
     // BB-267: a by-hand configure step is an escalation with followThrough, not
     // folded into the closing comment; an "unchanged" provide-secret reopens it.
     expect(wrap).toMatch(/A by-hand step outside the repos that the feature needs to work/u);
-    expect(wrap).toMatch(/as a `configure` escalation/u);
+    expect(wrap).toMatch(/kind: "decision"/u);
     expect(wrap).toMatch(/resolution: "done"/u);
-    expect(wrap).toMatch(/keep the binding open with followThrough until it is done/u);
+    expect(wrap).toMatch(/keep the binding open with followThrough until its `configure` escalation is done/u);
     expect(wrap).toMatch(/"unchanged" has not provided the value, so reopen that step/u);
   });
 
