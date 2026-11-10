@@ -6,6 +6,8 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { landLessonInstruction } from "./lessons.js";
+import type { GuidanceUnit } from "./guidance.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
@@ -22,6 +24,9 @@ import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
+
+/** The characters of a unit's own text a wake or brief shows; the `gu_` id is what is cited (BB-288). */
+const GUIDANCE_UNIT_CHARS = 120;
 
 /**
  * What a steward must never ask for: an open escalation or approval request is
@@ -326,6 +331,8 @@ export type WakeInput = {
   conflicts?: Conflict[];
   /** Trial lessons of the project, already capped to `lessons.trial.max`; candidates never appear. */
   lessons?: Lesson[];
+  /** The hand-written guidance units this wake renders, each with the `gu_` id a steward cites (BB-288). */
+  guidance?: GuidanceUnit[];
   now: number;
 };
 
@@ -671,6 +678,9 @@ export function formatWake(input: WakeInput): string {
     }
     out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
+  // BB-288: the guidance index sits at the end of the snapshot, so `fit` can
+  // clip it and never the snapshot or "What changed".
+  out.push(...guidanceUnitLines(input.guidance ?? []));
 
   const snapshot = out.splice(0);
   out.push("", "## 5. What changed since your last turn", "");
@@ -697,6 +707,8 @@ export type BriefInput = {
   escalations?: Escalation[];
   /** Open bindings at work on the same paths, for the scheduling line. */
   conflicts?: Conflict[];
+  /** The hand-written guidance units this brief renders, each with the `gu_` id a steward cites (BB-288). */
+  guidance?: GuidanceUnit[];
 };
 
 /** One line for the head of a brief: the gate's state, and the one action it forbids while unmet. */
@@ -753,6 +765,7 @@ export function formatBrief(input: BriefInput, maxChars?: number): string {
   middle.push(`- Priority: ${b.priority ?? "normal"}`);
   middle.push(holdLine(b, "take no new actions and start no workers until it is lifted."));
   middle.push(...schedulingLines(b, input.conflicts ?? [], escalations));
+  middle.push(...guidanceUnitLines(input.guidance ?? []));
 
   const tail: string[] = [
     "",
@@ -1214,6 +1227,26 @@ function trialLessonsLines(lessons: Lesson[]): string[] {
 }
 
 /**
+ * The hand-written guidance units a wake or brief renders, each beside its
+ * `gu_` id (BB-288). Without the id a steward can only cite a unit by running
+ * `bb stewards lessons --efficacy`, so every unit the wake shows carries the
+ * id it must cite. The text is a short snippet, not the paragraph: the whole
+ * of `AGENTS.md` is already loaded natively, and a full-text index overflows
+ * the wake's cap. The block is placed where `fit` can clip it, so it can never
+ * cost the snapshot or "What changed".
+ */
+function guidanceUnitLines(units: readonly GuidanceUnit[]): string[] {
+  if (units.length === 0) return [];
+  return [
+    "",
+    "## Guidance units",
+    "",
+    "Each hand-written paragraph of `AGENTS.md` and the playbooks carries its `gu_` id. Cite the id of the paragraph a decision or turn rested on in `steward_update { resolve, cites: [...] }` (or `{ forward, cites }`) or `steward_report { cites: [...] }`.",
+    ...units.map((u) => `- ${u.id} (${u.file}${u.heading === null ? "" : ` §${u.heading}`}): ${oneLine(u.text, GUIDANCE_UNIT_CHARS)}`),
+  ];
+}
+
+/**
  * The project steward's lesson blocks (BB-35 step 3): the trial lessons to
  * decide from, the promoted ones the nightly pass queued for landing, and the
  * retired ones whose anchored text must come out. Trial is capped at
@@ -1224,8 +1257,13 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
   const out: string[] = [];
   const trial = lessons.filter((l) => l.tier === "trial").slice(0, cap);
   if (trial.length > 0) {
-    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `steward_update { resolve, cites: [lesson ids] }` (or `{ forward, cites }`), or the ones a turn acted on in `steward_report { cites: [lesson ids] }`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.");
-    for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`);
+    out.push(
+      "",
+      "## Lessons (trial)",
+      "",
+      "Project rules not yet in `.bb`. These are yours to land early or leave in trial; they are not owner to-dos and never belong under the digest's \"today's priorities\". Decide from them, and cite the ones a decision rested on with `steward_update { resolve, cites: [lesson ids] }` (or `{ forward, cites }`), or the ones a turn acted on in `steward_report { cites: [lesson ids] }`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.",
+    );
+    for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}\n  ${landLessonInstruction(l)}`);
   }
   const toLand = lessons.filter((l) => l.tier === "promoted" && l.status === "pending");
   if (toLand.length > 0) {
@@ -1233,7 +1271,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
       "",
       "## Lessons to land",
       "",
-      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. The plugin opens one pull request on the primary repo per lesson (or per publish when several touch the same file): a `procedure` one is squash-merged by the project steward, and a `boundary` one is filed for the owner as a Review PR/Drop item that waits for the owner to merge it. If the pull request was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
+      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. The plugin opens one pull request on the primary repo per lesson (or per publish when several touch the same file). The decide list places it like any other pull request: a `project` file (a playbook) is squash-merged by the project steward, while a `user` file (`AGENTS.md`) or a `boundary` lesson is filed for the owner as a Review PR/Drop item that waits for the owner to merge it. If the pull request was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
     );
     for (const l of toLand) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}\n  Anchor: \`<!-- lesson:${l.id} -->\`${l.note === null ? "" : `\n  Last attempt: ${oneLine(l.note)}`}`);
   }
@@ -1243,7 +1281,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
       "",
       "## Lessons to retire",
       "",
-      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. A retire is a pull request too: a `procedure` one is merged by the project steward, a `boundary` one waits for the owner. The row is kept.',
+      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. A retire is a pull request too: the decide list places it the same way — a `project` playbook is merged by the project steward, a `user` file or a `boundary` lesson waits for the owner. The row is kept.',
     );
     for (const l of toRetire) out.push(`- ${l.id} (${l.file}): ${oneLine(l.text)}`);
   }
@@ -1382,6 +1420,8 @@ export function formatProjectWake(input: {
   assumptions?: Array<{ assumption: Assumption; binding: Binding | null }>;
   /** Pending lessons: general rules waiting to be landed in `.bb`. */
   lessons?: Lesson[];
+  /** The hand-written guidance units this wake renders, each with the `gu_` id a steward cites (BB-288). */
+  guidance?: GuidanceUnit[];
   /** The project's lesson rules, for the trial cap and the wake headings. */
   lessonRules?: LessonRules;
   /** With digestDue: the records the digest is written from. */
@@ -1497,6 +1537,9 @@ export function formatProjectWake(input: {
     const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${day(b.requeueUntil)}`}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
+  // BB-288: the guidance index sits at the end of the bindings list, so `fit`
+  // can clip it and never the bindings or the digest.
+  out.push(...guidanceUnitLines(input.guidance ?? []));
   const bindings = out.splice(0);
   if (input.digestDue) {
     if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions, input.timeZone));

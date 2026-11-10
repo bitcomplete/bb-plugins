@@ -3,8 +3,9 @@
 // lessons, and the thresholds and caps that decide which tier a lesson moves
 // to. Nothing here touches the store or a plugin; server.ts applies what this
 // returns. Keeping it pure is what makes every transition a unit test.
-import type { LessonScope, LessonTier } from "./store.js";
+import type { Lesson, LessonScope, LessonTier } from "./store.js";
 import type { LessonRules } from "./config.js";
+import { decideForPull, type BigDecision, type DecideMark } from "./decisions.js";
 
 const DAY_MS = 86_400_000;
 
@@ -164,6 +165,29 @@ export function planLessonTransitions(lessons: readonly ScoreableLesson[], rules
     out.push({ id: lesson.id, action: "promote", reason: `${lesson.hits} bindings over ${days(now - (lesson.tierAt ?? lesson.createdAt))}d`, ...(displacedId === undefined ? {} : { displacedId }) });
   }
   return out;
+}
+
+/**
+ * How a lesson's pull request is placed (BB-288): the ordinary decide list
+ * applied to the lesson's own `.bb` file, never a lesson-specific rule. A
+ * `boundary` lesson is always the user's, because it changes the escalation
+ * boundary. A `procedure` lesson in a file the decide list marks `project` (a
+ * playbook) is the project steward's; one in a `user` file (`AGENTS.md`, the
+ * project file, `roles.json`) is the owner's. The files are fail-closed: an
+ * unreadable list or no match is the user's, exactly as `decideForPull`.
+ */
+export function lessonLandingMark(lesson: Pick<Lesson, "file" | "scope">, decisions: readonly BigDecision[]): DecideMark {
+  if (lesson.scope === "boundary") return "user";
+  return decideForPull([lesson.file], decisions);
+}
+
+/**
+ * The sentence a wake and the record-time reply use to land a trial lesson
+ * early, before the nightly pass promotes it (BB-288). It names the anchor, the
+ * file and the completion call, so both surfaces say the same thing.
+ */
+export function landLessonInstruction(lesson: Pick<Lesson, "id" | "file">): string {
+  return `To land it early: add \`${lessonAnchor(lesson.id)}\` and the wording to \`${lesson.file}\`, publish with \`workspace_publish_guidance\` (on a native project, commit and open the pull request yourself), then complete it with \`steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }\`.`;
 }
 
 /** The two rare conditions a validation escalation asks the user about (BB-35 step 5). */

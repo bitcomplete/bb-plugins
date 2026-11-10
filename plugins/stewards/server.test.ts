@@ -14,6 +14,24 @@ import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { STANDING_RULES } from "./wake.js";
 
+/**
+ * The decide-list entry BB-280 landed on bb-gate `main` for playbooks (read
+ * from `.bb/stewards/project.json`), so a lesson in a playbook is the project
+ * steward's to land (BB-288). The end-to-end test uses the entry that is
+ * actually there, not an assumed one.
+ */
+const BB280_PLAYBOOK_ENTRY = { text: "What every steward is told (the playbooks and the project's skills)", decide: "project", paths: [".bb/stewards/playbooks/**", ".bb/skills/**"] } as const;
+/** The `user` entry the same real project file carries for `AGENTS.md`, so the test proves the `user` entry wins (BB-288). */
+const AGENTS_USER_ENTRY = { text: "Who stewards are and what the project tells them (steward roles, the decide list, the project's guidance)", decide: "user", paths: [".bb/stewards/roles.json", ".bb/stewards/project.json", ".bb/AGENTS.md"] } as const;
+/** A `.bb`-relative playbook file a lesson can target: the `project` entry's path (BB-288). */
+const LESSON_PLAYBOOK_FILE = playbookPath("linear-tickets");
+/** Add the real decide-list entries a lesson is placed by to a world's project file (BB-288). */
+function withBb280PlaybookEntry(t: { files: Record<string, string | null> }): void {
+  const parsed = JSON.parse(t.files[PROJECT_FILE] ?? "{}") as { bigDecisions?: unknown[] };
+  parsed.bigDecisions = [...(parsed.bigDecisions ?? []), AGENTS_USER_ENTRY, BB280_PLAYBOOK_ENTRY];
+  t.files[PROJECT_FILE] = JSON.stringify(parsed);
+}
+
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
 
 // A world of fake neighbours: multi-repo serving `.bb`, linear and github
@@ -10623,6 +10641,7 @@ describe("GitHub filing targets (BB-235)", () => {
 describe("lessons", () => {
   async function adopted() {
     const t = await setup();
+    withBb280PlaybookEntry(t);
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
@@ -10666,7 +10685,7 @@ describe("lessons", () => {
 
   it("a procedure lesson opens one pull request on the primary repo and the project steward merges it", async () => {
     const t = await adopted();
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done).toMatchObject({ error: false, text: expect.stringMatching(new RegExp(`${id}: merged at c{8}`, "u")) });
@@ -10677,15 +10696,34 @@ describe("lessons", () => {
     expect(pr).toMatchObject({ repo: "acme/bb", head: `guidance-${t.project}`, base: "main", title: expect.stringContaining(id) });
     expect(pr.body).toContain(withLessonAnchor(lesson, id));
     expect(pr.body).toContain(`_— from bb thread ${t.project}_`);
+    // The project steward's own `complete` is the approval. No `bb-approval`
+    // marker is posted on a lesson pull request: recording a project-steward
+    // approval is the user's code, so this PR adds none (BB-288).
+    expect(t.githubComments.filter((c) => c.body.includes("bb-approval"))).toEqual([]);
     // No person is asked: the project steward squash-merges it.
     expect(t.githubMerges).toHaveLength(1);
     expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged", tier: "promoted", mergeSha: "c".repeat(40), branch: `refs/heads/guidance-${t.project}`, pr: pr.url });
   });
 
+  it("a procedure lesson in a user-decided file is the owner's, not the project steward's (BB-288)", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(done.text).toMatch(/decide list makes this the user's/u);
+    // The pull request is open, but the project steward never merges it: the
+    // owner's Review PR/Drop item is filed instead.
+    expect(t.githubPulls).toHaveLength(1);
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "pending" });
+    const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "decide" && n.data.lessonId === id)!;
+    expect(need).toMatchObject({ data: { choices: ["Review PR", "Drop"] } });
+  });
+
   it("a refused pull request leaves the lesson pending with the reason", async () => {
     const t = await adopted();
     t.setCreatePullError("No commits between main and guidance-x.");
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done.text).toMatch(/pull request refused: No commits between main and guidance-x\./u);
@@ -10695,7 +10733,7 @@ describe("lessons", () => {
   it("a refused merge leaves the lesson pending with the reason", async () => {
     const t = await adopted();
     t.setMergePullError("Pull request is not mergeable: required status check is expected.");
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done.text).toMatch(/pull request refused: Pull request is not mergeable/u);
@@ -10704,10 +10742,10 @@ describe("lessons", () => {
 
   it("refuses to merge a procedure lesson's pull request that carries a second file", async () => {
     const t = await adopted();
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     // The published branch smuggled an edit to the project file alongside the lesson.
-    t.githubFiles.set("acme/bb#1", [".bb/AGENTS.md", ".bb/stewards/project.json"]);
+    t.githubFiles.set("acme/bb#1", [`.bb/${LESSON_PLAYBOOK_FILE}`, ".bb/stewards/project.json"]);
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done.text).toMatch(/pull request refused: .*other than the lesson's own/u);
     expect(t.githubMerges).toEqual([]);
@@ -10716,9 +10754,9 @@ describe("lessons", () => {
 
   it("refuses to merge a procedure lesson's pull request whose file lacks the anchor", async () => {
     const t = await adopted();
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
-    t.githubFileContents.set(`acme/bb#guidance-${t.project}:.bb/AGENTS.md`, "# Guidance\n\nNo anchor here.\n");
+    t.githubFileContents.set(`acme/bb#guidance-${t.project}:.bb/${LESSON_PLAYBOOK_FILE}`, "# Guidance\n\nNo anchor here.\n");
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done.text).toMatch(/pull request refused: .*does not carry the lesson's anchor/u);
     expect(t.githubMerges).toEqual([]);
@@ -10941,7 +10979,7 @@ describe("lessons", () => {
 
   it("promotes a trial lesson the nightly pass finds ready, and lands its anchored block", async () => {
     const t = await adopted();
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     // Three distinct bindings cite it, which is the promotion's hit threshold.
     for (const key of ["ENG-13", "ENG-14", "ENG-15"]) {
@@ -10961,7 +10999,7 @@ describe("lessons", () => {
 
   it("retires an aged promoted lesson, and removes its anchored text through the same path", async () => {
     const t = await adopted();
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "promoted", status: "merged" });
@@ -11047,6 +11085,7 @@ describe("validation escalations (BB-35 step 5)", () => {
   const text = "Only the user may grant a credential.";
   async function adopted() {
     const t = await setup();
+    withBb280PlaybookEntry(t);
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
@@ -11061,7 +11100,7 @@ describe("validation escalations (BB-35 step 5)", () => {
   }
   /** A procedure lesson landed in `.bb`, promoted, then given mixed evidence. */
   async function promoted(t: Awaited<ReturnType<typeof adopted>>, hits = 4, corrections = 1) {
-    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text, file: LESSON_PLAYBOOK_FILE, scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     for (let i = 0; i < hits; i++) t.hooks.store.recordCitations("p1", [id], `bnd_${i}`);
@@ -11369,6 +11408,9 @@ describe("guidance units and the efficacy view (BB-35 step 6)", () => {
     const t = await adopted();
     const text = "A new column read with SELECT * breaks the previous image.";
     t.files["AGENTS.md"] = `# Guidance\n\n${text}\n`;
+    // The guidance index is cached with the config's TTL; the wake at adoption
+    // read the old file, so expire it before the citation re-reads (BB-288).
+    t.advance(6 * 60_000);
     const unitId = guidanceUnitId(text);
     await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
     const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
@@ -11378,11 +11420,36 @@ describe("guidance units and the efficacy view (BB-35 step 6)", () => {
     expect(t.hooks.store.guidanceCitations("p1")).toEqual([{ unitId, lastCitedAt: expect.any(Number) }]);
   });
 
+  it("lists the binding's playbook units before AGENTS.md, so a clipped wake keeps the playbook ids (BB-288)", async () => {
+    const t = await adopted();
+    const agentsText = "An AGENTS.md rule.";
+    const playbookText = "A playbook rule added for the test.";
+    t.files["AGENTS.md"] = `# Guidance\n\n${agentsText}\n`;
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("You steward one Linear ticket", `${playbookText}\n\nYou steward one Linear ticket`);
+    t.advance(6 * 60_000);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    t.sends.length = 0;
+    await t.ring("linear", "uuid-12");
+    const wake = t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text;
+    const playbookAt = wake.indexOf(guidanceUnitId(playbookText));
+    const agentsAt = wake.indexOf(guidanceUnitId(agentsText));
+    expect(playbookAt).toBeGreaterThan(-1);
+    expect(agentsAt).toBeGreaterThan(-1);
+    expect(playbookAt).toBeLessThan(agentsAt);
+  });
+
   it("prints the escalation trend and the uncited guidance units", async () => {
     const t = await adopted();
     const cited = "Cited recently.";
     const uncited = "Nothing cites this yet.";
     t.files["AGENTS.md"] = `# Guidance\n\n${cited}\n\n${uncited}\n`;
+    // BB-288: a fresh world has just rendered `gu_` ids, so the "uncited for 90
+    // days" list is suppressed and says so rather than naming every unit.
+    const suppressed = await t.harness.behavior.runCli(["lessons", "--efficacy", "--project", "p1"]);
+    expect(suppressed.stdout).toMatch(/suppressed/u);
+    expect(suppressed.stdout).not.toContain(guidanceUnitId(uncited));
+    // After the ids have rendered for 90 days, the list appears.
+    t.advance(91 * 86_400_000);
     // One forwarded decision (its escalation and the page's question are one
     // item), and one unit cited so it is not uncited.
     await forward(t);
@@ -13982,6 +14049,8 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const withNote = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-plugins", noReconcileGate: true });
     // The real `.bb/AGENTS.md` shape ("Who merges"): all three in one paragraph.
     withNote.files["AGENTS.md"] = "The lane decides who approves, not what ships. **Any merge to `bb-plugins` `main`, docs included, moves the pin**, builds a new `bb-server` image and stages a restart for every developer.\n";
+    // The wake at setup cached the old guidance; expire it before the merge reads (BB-288).
+    withNote.advance(6 * 60_000);
     const merged = await withNote.harness.behavior.runCli(["merge", "bitcomplete/bb-plugins#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(withNote.githubComments.at(-1)!.body).toMatch(/moves the pin and stages a restart/u);
@@ -13990,6 +14059,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     // every-merge claim, so no note: the false positive the reviewer found.
     const devbox = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/devbox", noReconcileGate: true });
     devbox.files["AGENTS.md"] = "## Change classification\n\nA change to `devbox/host/**` is production infrastructure. A merge rebuilds the `bb-server` image and restarts every developer's server.\n";
+    devbox.advance(6 * 60_000);
     const devboxMerged = await devbox.harness.behavior.runCli(["merge", "bitcomplete/devbox#7", "--project", "p1"]);
     expect(devboxMerged.exitCode).toBe(0);
     expect(devbox.githubComments.at(-1)!.body).not.toMatch(/moves the pin/u);
@@ -13998,6 +14068,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     // section, is not the project saying a merge to that repo restarts servers.
     const split = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-gate", noReconcileGate: true });
     split.files["AGENTS.md"] = "## Shipping a plugin change\n\nLanding on `bb-gate` main is not instant; the pin is rewritten.\n\nEvery developer's server will restart when a staged image lands.\n";
+    split.advance(6 * 60_000);
     const splitMerged = await split.harness.behavior.runCli(["merge", "bitcomplete/bb-gate#7", "--project", "p1"]);
     expect(splitMerged.exitCode).toBe(0);
     expect(split.githubComments.at(-1)!.body).not.toMatch(/moves the pin/u);
