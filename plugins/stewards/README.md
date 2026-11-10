@@ -328,7 +328,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   exiting 0 when met and 1 when not. `bb stewards merge <owner/repo#N>` runs
   the page's Merge action through one shared function: it re-reads the pull
   request, re-checks the gate, refuses with the gate's reason when it is
-  unmet or another worker is in flight, and otherwise squash-merges, posts
+  unmet or another worker is mid-turn, and otherwise squash-merges, posts
   the "Merged:" comment (lane, approved sha, a "since then" line when the
   head moved past it, an escalation line when the reviewer escalated it to
   the owner, the merge commit, and a restart note when the project's
