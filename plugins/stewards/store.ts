@@ -1366,6 +1366,12 @@ export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | "misspawn";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null };
 
+/** A binding's claim row for the sidebar picker (BB-294): the three columns it needs, plus its workers' thread ids. */
+export type ClaimedThreadRow = { id: string; projectId: string; threadId: string | null; workerThreadIds: string[] };
+
+/** The sidebar's ended-list row (BB-294): the columns it renders, never `lastSnapshot`. */
+export type EndedBindingRow = { key: string; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number };
+
 /**
  * BB-293: the latest shadow assessment stored for a binding. The three answers
  * are kept as JSON so the shape can grow without another migration; nothing
@@ -1440,6 +1446,12 @@ export interface StoreOptions {
 }
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
+  // BB-294: `endedSince` filters and orders on `ended_at`, which sits after
+  // `last_snapshot` in the row, so without this index SQLite reads every ended
+  // binding's snapshot to sort the tail. It is a performance aid, not schema the
+  // data depends on, so it is created idempotently here rather than as a
+  // migration: the previous build ignores it and it is safe on a live store.
+  db.exec("CREATE INDEX IF NOT EXISTS bindings_project_ended ON bindings (project_id, ended_at DESC)");
   const getBinding = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE id = ?");
   const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at LIMIT 1");
   const byKey = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
@@ -1448,6 +1460,24 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const allForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? ORDER BY created_at");
   const allOpen = db.prepare<[], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL ORDER BY created_at");
   const all = db.prepare<[], BindingRow>("SELECT * FROM bindings ORDER BY created_at");
+  // BB-294: the picker's claimed-thread set spans every binding ever held, so it
+  // reads the three columns it needs and the workers' thread ids, joined in
+  // memory, rather than parsing each row (and its `lastSnapshot`) through
+  // `rowToBinding`.
+  const claimedBindingRows = db.prepare<[], { id: string; project_id: string; thread_id: string | null }>("SELECT id, project_id, thread_id FROM bindings");
+  const claimedWorkerRows = db.prepare<[], { binding_id: string; thread_id: string }>("SELECT binding_id, thread_id FROM workers");
+  // BB-294: the project list the sidebar, board and overview build, without
+  // parsing a binding.
+  const bindingProjectIdsStmt = db.prepare<[], { project_id: string }>("SELECT DISTINCT project_id FROM bindings");
+  // BB-294: the sidebar's ended tail, bounded in SQL by the caller's window and
+  // row count, so a project's whole history is never read. It selects only the
+  // columns the ended list shows: a `SELECT *` would load every matching row's
+  // `last_snapshot` before the sort and limit apply. The columns are named for
+  // the row type directly. `created_at ASC` breaks ties as the old in-memory
+  // stable sort did.
+  const endedSinceForProject = db.prepare<[string, number, number], { entity_key: string; kind: string; thread_id: string | null; title: string | null; phase: string | null; end_reason: string | null; ended_at: number }>(
+    "SELECT entity_key, kind, thread_id, title, phase, end_reason, ended_at FROM bindings WHERE project_id = ? AND ended_at IS NOT NULL AND ended_at >= ? ORDER BY ended_at DESC, created_at ASC LIMIT ?",
+  );
   /**
    * The picker's needs count (BB-104): one statement per project, so the
    * sidebar does not parse every binding and run three more queries each. It
@@ -2135,6 +2165,30 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     all(projectId?: string): Binding[] {
       return (projectId === undefined ? all.all() : allForProject.all(projectId)).map(rowToBinding);
+    },
+    /**
+     * Every binding's id, project and steward thread, with its workers' thread
+     * ids (BB-294), for the picker's claimed-thread set. Two narrow statements
+     * joined in memory: the set spans every binding ever held, so it must not go
+     * through `rowToBinding` and parse every `lastSnapshot`.
+     */
+    claimedThreads(): ClaimedThreadRow[] {
+      const workersByBinding = new Map<string, string[]>();
+      for (const w of claimedWorkerRows.all()) {
+        const list = workersByBinding.get(w.binding_id);
+        if (list === undefined) workersByBinding.set(w.binding_id, [w.thread_id]);
+        else list.push(w.thread_id);
+      }
+      return claimedBindingRows.all().map((r) => ({ id: r.id, projectId: r.project_id, threadId: r.thread_id, workerThreadIds: workersByBinding.get(r.id) ?? [] }));
+    },
+    /**
+     * A project's bindings ended at or after `since`, newest first, at most
+     * `limit` rows (BB-294). The sidebar's ended list: the columns it shows only,
+     * bounded in SQL, so an old ended tail is neither returned nor its
+     * `lastSnapshot` read.
+     */
+    endedSince(projectId: string, since: number, limit: number): EndedBindingRow[] {
+      return endedSinceForProject.all(projectId, since, limit).map((r) => ({ key: r.entity_key, kind: r.kind as BindingKind, threadId: r.thread_id, title: r.title, phase: r.phase, endReason: r.end_reason, endedAt: r.ended_at }));
     },
     /** The open bindings of a project that `needsUser` would flag, counted in SQL (BB-104). */
     countNeedsUser(projectId: string): number {
@@ -2930,6 +2984,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
         .prepare<[], { project_id: string }>("SELECT project_id FROM project_stewards UNION SELECT project_id FROM bindings")
         .all()
         .map((r) => r.project_id);
+    },
+    /** Every project with a binding, without parsing a binding (BB-294). */
+    bindingProjectIds(): string[] {
+      return bindingProjectIdsStmt.all().map((r) => r.project_id);
     },
 
     // the server's own string settings (BB-184): the footer toggle remembers
