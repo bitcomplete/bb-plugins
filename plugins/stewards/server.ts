@@ -95,8 +95,8 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, reviewMarker, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
-import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate } from "./gate.js";
+import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
@@ -2340,24 +2340,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * (merge it, file the Merge item, or raise its own `stuck`), so waiting on
      * it would mask every stall backstop (BB-154) and the idle wake (BB-83).
      */
-    function pullWatch(b: Binding): boolean {
+    function pullWatch(b: Binding, ownPulls: ReadonlySet<string>): boolean {
       if (b.kind !== "ticket") return false;
       const observed = b.lastSnapshot;
       if (observed === null) return false;
       const pulls = observedPulls(b, observed);
       // Only the ticket's own open pull requests (BB-239): a linked pull
-      // request that merely mentions the ticket is context, not a wait.
+      // request that merely mentions the ticket is context, not a wait. The
+      // own set is the report path's, the same one the gate/merge loop uses.
       const open = leasedPulls(b)
         .map((key) => pulls.find((p) => lc(p.key) === lc(key)))
         .filter((p): p is EntitySnapshot => p !== undefined && p.pull !== null && p.pull.merged !== true && lc(p.state) !== "closed")
-        .filter((p) => pullBelongsToTicket(b, p, new Set()));
+        .filter((p) => pullBelongsToTicket(b, p, ownPulls));
       if (open.length === 0) return false;
       const gateMet = open.every((p) => prGate(p, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, p) }).gateMet);
       return pullWatchCounts(b.kind, open.length, gateMet);
     }
 
     /** The structured sources that will wake a binding, as the report path reads them (BB-154). */
-    function liveWakeSourceFor(b: Binding): boolean {
+    function liveWakeSourceFor(b: Binding, ownPulls: ReadonlySet<string>): boolean {
       const sources: WakeSourceInput = {
         hold: b.hold,
         holdBehind: b.holdBehind,
@@ -2367,7 +2368,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         runningWorkers: store.workers(b.id).filter((w) => w.status === "running").length,
         openEscalations: store.openEscalations(b.id).length,
         openNeeds: store.openNeeds(b.id).length,
-        pullRequestWatch: pullWatch(b),
+        pullRequestWatch: pullWatch(b, ownPulls),
       };
       return hasLiveWakeSource(sources);
     }
@@ -6855,6 +6856,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // (BB-264), so the retarget wake is once per base pull request.
       const retargetPulls = [...b.retargetPulls];
       const retargetBefore = new Set(retargetPulls.map((k) => lc(k)));
+      // The retarget wake sent before this look (BB-285): the retarget `stuck`
+      // is judged on this set, never on the one the loop mutates, so the look
+      // that first sends the wake cannot also raise the stall.
+      const retargetSentBefore = new Set(retargetBefore);
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
@@ -6943,7 +6948,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // the steward, which moves `wokeAt`, and resolving on a moved
               // anchor would clear it in a loop. The post-loop sweep clears it
               // once the pull request is retargeted or the state otherwise ends.
-              if (retargetBefore.has(lc(mergedBase.key)) && pullStuckEscalation(b, pull, "retarget") === null) {
+              if (retargetSentBefore.has(lc(mergedBase.key)) && pullStuckEscalation(b, pull, "retarget") === null) {
                 const since = store.binding(b.id)?.wokeAt ?? b.wokeAt;
                 if (since !== null && now() - since >= retargetStuckMs) await raisePullStuck(b, pull, "retarget", `its base ${mergedBase.key} merged and it is still based on that branch after ${formatDuration(retargetStuckMs)}`, changes, null);
               }
@@ -9565,7 +9570,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // set of sources (an escalation this turn raised, a need it filed, a
           // gate item syncNeeds filed, a worker it started).
           const current = store.binding(b.id) ?? b;
-          const liveSource = liveWakeSourceFor(current);
+          // The same own-pull set the gate/merge loop uses (BB-52 rule 0), so a
+          // ticket's own pull request counts as a source or not by one rule.
+          const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
+          const liveSource = liveWakeSourceFor(current, currentOwnPulls);
           // BB-247: a dated wait is the plugin's own wake source while the date
           // is ahead, so it is not marked waiting with no source (and is listed
           // as a dated wait in the digest instead).
