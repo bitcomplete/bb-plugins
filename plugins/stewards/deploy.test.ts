@@ -255,6 +255,23 @@ describe("recording merged pull requests", () => {
     expect(recorded["bitcomplete/bb-gate#20::bb-gate"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deadlineAt: NOW + liveAtMergeTarget.timeout });
   });
 
+  // BB-286: a watch recorded under an older playbook is re-matched against
+  // the current one on every read, so a rule that is now live-at-merge
+  // settles it with no deployment read. The first-record contract above still
+  // holds when the rule has not changed.
+  it("re-matches a pre-existing merged watch when the playbook's rule becomes live-at-merge (BB-286)", () => {
+    const refTarget: DeploymentTarget = { name: "bb-gate", source: "github", repo: "bitcomplete/bb-gate", environment: "production", carries: [{ when: { repo: "acme/web" }, strategy: { kind: "ref-contains-merge" } }], timeout: 3_600_000, workflows: [] };
+    const liveTarget: DeploymentTarget = { ...refTarget, carries: [{ when: { repo: "acme/web", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
+    const mergedPull = { entity: pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }), pulls: [] };
+    const before = recordMerged({}, mergedPull, [refTarget], NOW);
+    expect(before["acme/web#7::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + refTarget.timeout });
+    const after = recordMerged(before, mergedPull, [liveTarget], NOW + 1000);
+    expect(after["acme/web#7::bb-gate"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    // No deployment read is needed: nothing times out and nothing awaits.
+    expect(timeoutsDue(after, NOW + liveTarget.timeout)).toEqual([]);
+    expect(awaitingOnRepo(after, "bitcomplete/bb-gate")).toEqual([]);
+  });
+
   it("does not record an open pull request, and reads a ticket's linked merged ones", () => {
     expect(recordMerged({}, observed({ entity: pull({ key: "acme/web#7" }, { merged: false }) }), [target], NOW)).toEqual({});
     const linked = recordMerged({}, observed({ entity: pull({ key: "acme/web#7", kind: "pull" }, { merged: false }), pulls: [pull({ key: "acme/web#8" }, { merged: true })] }), [target], NOW);

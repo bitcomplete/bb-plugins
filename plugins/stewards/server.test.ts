@@ -32,6 +32,8 @@ function world() {
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
+  /** Repos whose dependency graph parsed no manifests, lowercased, for the graph-empty wake (BB-289). */
+  const dependabotGraphEmpty = new Set<string>();
   /** Entity ids whose snapshot read throws, for the failed-read test (BB-115). */
   const snapshotErrors = new Set<string>();
   /** The fake linear dedup search: unsupported (github-style decline) or an error, for BB-136. */
@@ -110,6 +112,8 @@ function world() {
   const githubPulls: Array<{ repo: string; head: string; base: string; title: string; body: string; url: string; number: number }> = [];
   const githubClosedPulls: Array<{ repo: string; number: number }> = [];
   const githubDefaultBranches = new Map<string, string>();
+  /** Branches the test registered as existing, for the BB-287 recovery read. */
+  const githubBranches = new Set<string>();
   /** The survey's GitHub reads: a recursive tree, branch protection, labels and file text. */
   const githubTrees = new Map<string, Array<{ path: string; type: string }>>();
   const githubBranchProtection = new Map<string, { protected: boolean; requiredApprovingReviewCount: number | null; requiresStatusChecks: boolean }>();
@@ -189,10 +193,28 @@ function world() {
         if (e.unit.toLowerCase() !== repo.toLowerCase()) continue;
         const number = Number(/(\d+)$/u.exec(e.key)?.[1] ?? "");
         if (!Number.isInteger(number) || number <= 0) continue;
-        return { number, key: e.key, state: e.state, merged: e.pull.merged === true || e.state.toLowerCase() === "merged" };
+        return { number, key: e.key, state: e.state, merged: e.pull.merged === true || e.state.toLowerCase() === "merged", headSha: e.pull.headSha };
       }
       return null;
     },
+    // BB-287: the open pull requests whose base is `base`, the stacked-on-me
+    // check. The fake scans the entities the test registered.
+    openPullsByBase: async (repo: string, base: string) => {
+      const pulls: Array<{ number: number; key: string; state: string }> = [];
+      for (const e of entities.values()) {
+        if (e.pull === null || e.pull.base !== base) continue;
+        if (e.unit.toLowerCase() !== repo.toLowerCase()) continue;
+        if (e.pull.merged === true || e.state.toLowerCase() === "merged" || e.state.toLowerCase() === "closed") continue;
+        const number = Number(/(\d+)$/u.exec(e.key)?.[1] ?? "");
+        if (!Number.isInteger(number) || number <= 0) continue;
+        pulls.push({ number, key: e.key, state: e.state });
+      }
+      return pulls;
+    },
+    // BB-287: a branch the test registered as existing; a base branch absent
+    // from the set is gone, which fires the recovery wake for a closed stacked
+    // pull request.
+    branchExists: async (repo: string, branch: string) => githubBranches.has(`${repo.toLowerCase()} ${branch}`),
     dispatchWorkflow: async (repo: string, workflow: string, ref: string, inputs: Record<string, string>) => {
       if (mergeDispatchError !== null) throw new Error(mergeDispatchError);
       githubDispatches.push({ repo, workflow, ref, inputs });
@@ -298,7 +320,7 @@ function world() {
     }
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
-      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
+      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [], graphEmpty: units.filter((u) => dependabotGraphEmpty.has(u.toLowerCase())) };
     }
     else if (args.method === "sourceDeployments") {
       const key = `${String(input.repo).toLowerCase()} ${String(input.environment).toLowerCase()}`;
@@ -523,7 +545,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -7502,6 +7524,54 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
+  it("wakes the steward to retarget a stacked pull request whose base merged before its gate is met (BB-287)", async () => {
+    const t = await withPull([]);
+    // No reviewer marker: the gate is not met. The base pull request merges
+    // anyway, and the retarget wake must fire all the same (BB-287).
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({}, { base: "bb/bb-256-parent" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.find("ENG-12")!.retargetPulls).toEqual(["acme/web#8"]);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Retarget acme\/web#7: its base acme\/web#8 has merged/u.test(s.text))).toBe(true);
+  });
+
+  it("tells a binding its pull request is the base of an open pull request, in the wake and in show (BB-287)", async () => {
+    const t = await withPull([]);
+    // #9 is stacked on #7's branch. The binding must know not to delete it.
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "Stacked" }, { head: "bb/eng-12-stacked", base: "bb/eng-12-retry" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.stackedPulls).toEqual(["acme/web#9"]);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Base of open pull request: acme\/web#9 is stacked on acme\/web#7/u.test(s.text))).toBe(true);
+    // The standing section of the wake names it too, so every later wake carries it.
+    const wake = t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text;
+    expect(wake).toMatch(/BASE OF: acme\/web#9/u);
+    // `bb stewards show` renders the same fact.
+    const shown = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(shown).toContain("BASE OF: acme/web#9");
+  });
+
+  it("wakes the steward to restore the base branch when a stacked pull request closes unmerged with its base branch gone (BB-287)", async () => {
+    const t = await withPull([]);
+    // The base pull request merged and its branch was deleted; GitHub closed
+    // the stacked pull request unmerged. The wake names the sha to restore the
+    // branch at and says the approvals carry.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main", headSha: "deadbeef1" }));
+    t.entities.set("acme/web#7", pull({ state: "closed" }, { merged: false, base: "bb/bb-256-parent" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text;
+    expect(wake).toMatch(/restore the branch at .*deadbeef1.*reopen or replace.*approvals carry/u);
+    expect(t.hooks.store.find("ENG-12")!.stackedRecovered).toEqual(["acme/web#7"]);
+    // The recovery wake is once per pull request, not on every look.
+    const wakes = t.sends.filter((s) => s.threadId === t.steward).length;
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).length).toBe(wakes);
+  });
+
   it("does not merge while a worker is still running", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
@@ -9831,13 +9901,14 @@ describe("dependency stewards", () => {
     ...over,
   });
 
-  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = []) {
+  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = [], graphEmpty = false) {
     const t = await setup();
     // The fixture's primary (acme/bb) is a stewarded repo too; these tests watch one repo.
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb"] }, ...project });
     t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
     t.files[playbookPath("deps-prs")] = DEPS_PRS;
     t.dependabotAlerts.set("acme/web", alerts);
+    if (graphEmpty) t.dependabotGraphEmpty.add("acme/web");
     for (const [id, entity] of entities) t.entities.set(id, entity);
     await t.hooks.sweep();
     await t.flush();
@@ -9963,6 +10034,20 @@ describe("dependency stewards", () => {
     expect(wakes().at(-1)).toContain("#### acme/web#7");
     expect(wakes().at(-1)).toMatch(/\*\*critical\*\* priority urgent/u);
     expect(wakes().at(-1)).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+  });
+
+  it("says the dependency graph is empty, naming the toggle, instead of 'no open alerts' when the graph parsed nothing (BB-289)", async () => {
+    const { wakes } = await watching([], {}, [], true);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/\*\*Dependency graph empty\.\*\*/u);
+    expect(first).toMatch(/Dependabot cannot see any manifest/u);
+    expect(first).toMatch(/Settings → Advanced Security → Dependency graph/u);
+    expect(first).not.toMatch(/\*\*No open alerts\.\*\*/u);
+
+    // A repo whose graph is readable still says "no open alerts" when there are none.
+    const { wakes: readable } = await watching([]);
+    expect(readable()[0]).toMatch(/\*\*No open alerts\.\*\*/u);
+    expect(readable()[0]).not.toMatch(/Dependency graph empty/u);
   });
 
   it("replays SC-111: the adoption decision is durable plugin state, the SLA clock is the alert's, and reminders land in needs and the digest", async () => {
@@ -10320,6 +10405,13 @@ describe("dependency stewards", () => {
     expect(check.stdout).toMatch(/deps-alerts: deps-alerts@/u);
     expect(check.stdout).toMatch(/deps-prs: deps-prs@/u);
     expect(check.stdout).toMatch(/deps: watching 1 repo for alerts: acme\/web/u);
+  });
+
+  it("check says a repo's dependency graph is empty, naming the toggle (BB-289)", async () => {
+    const { t } = await watching([], {}, [], true);
+    const check = await t.harness.behavior.runCli(["check"], { projectId: "p1" });
+    expect(check.stdout).toMatch(/deps: acme\/web: dependency graph empty/u);
+    expect(check.stdout).toMatch(/Settings → Advanced Security → Dependency graph/u);
   });
 });
 
@@ -12203,6 +12295,105 @@ describe("deployment watching (BB-53)", () => {
     }
     expect(t.hooks.store.find("ENG-12")!.pending.some((n) => n.quiet === true && /in_progress/.test(n.text))).toBe(true);
     expect(t.hooks.store.find("ENG-12")!.pending.some((n) => n.quiet === true && /created/.test(n.text))).toBe(true);
+  });
+
+  // BB-286: a non-final doorbell used to note quietly and stop; a dropped
+  // final doorbell then waited for the half-hourly sweep. The doorbell path
+  // now schedules a re-read, so the final status is caught within the
+  // debounce.
+  it("re-reads after a non-final deployment doorbell and settles on the final status (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The doorbell is in_progress, but the deployment source already has the
+    // success: the scheduled re-read settles the watch with no second doorbell.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the re-read repeats while the last read was non-final. The first
+  // re-read still sees in_progress; the poll settles it when it turns success
+  // later, rather than waiting for the half-hourly sweep.
+  it("keeps polling while the deployment is non-final and settles when it turns final (BB-286)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, deploymentPollMs: 20 } });
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The source is still in_progress for the doorbell and the first re-read.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentState: "in_progress" });
+    // The final status lands later; the poll re-reads and settles it.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "success" })]);
+    await new Promise((r) => setTimeout(r, 30));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the same re-read on the sweep read path.
+  it("re-reads after a non-final deployment status found on the sweep (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await t.hooks.sweep();
+    // The sweep noted in_progress and scheduled a re-read; the source has the
+    // final status by the time it runs.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the deploy debounce keys on the deployment id and state, so two
+  // statuses inside the window both run and the newest wins. A first-wins
+  // debounce kept only the in_progress closure and dropped the success.
+  it("keeps the newest of two deployment statuses inside the debounce (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const send = (state: string) =>
+      t.harness.callRpc("stewardsRing", { source: "github", id: "acme/bb-gate#7", deployment: deployment({ state }) }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    // Both inside the same debounce window, before either timer fires.
+    await Promise.all([send("in_progress"), send("success")]);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: a watch recorded under an older rule is re-matched against the
+  // playbook on every read. When the rule is now live-at-merge it settles with
+  // the live note and no deadline, and the steward hears "Deployed at merge".
+  it("settles a pre-existing merged watch when the playbook's rule becomes live-at-merge (BB-286)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook("    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }");
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    const steward = t.spawns[1]!.id;
+    // The rule becomes live-at-merge; the next read settles it without any
+    // deployment read. Forget the cached config so the new playbook is read.
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Deployed at merge: acme\/web#7/u);
+  });
+
+  // BB-286: github-watcher's reconnect sweep rings stewards once per repo with
+  // a deployment interest, and the repo ring re-reads that repo's deployments
+  // (BB-59) rather than waiting for the half-hourly sweep.
+  it("re-reads deployments for a repo when github-watcher rings it on reconnect (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    // The final deployment already exists at the source when the ring arrives.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.ring("github", "acme/bb-gate");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success" });
   });
 
   // BB-204: a success whose image is behind the merge leaves the watch where
@@ -14639,5 +14830,120 @@ describe("retrying a failed wake (BB-255)", () => {
     expect(t.retries[0]).toMatchObject({ threadId: project, turnRequestId: "p1" });
     await failTurn(t, { threadId: project, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
     expect(t.retries).toHaveLength(2);
+  });
+});
+
+// BB-285: an open pull request is not a wake source (a `pr`/`review` binding's
+// own, or a ticket's once its gate is met), and a gate-met pull request nobody
+// acts on, or a retarget wake nobody answers, raises one `stuck` per episode.
+describe("a gate-met pull request nobody acts on (BB-285)", () => {
+  const head = "aaaaaaa1";
+  const projectMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const owner = comment({ id: "oa", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T15:00:00Z" });
+
+  it("marks a pr binding's free-text wait no-wake-source while its own pull request is open (#294)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    const report = await t.tool("steward_report", { phase: "open", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the dompurify fix on main", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("acme/web#7")!.noWakeSource).toBe(true);
+  });
+
+  it("marks a ticket's free-text wait no-wake-source when its own pull request is gate-met", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+  });
+
+  it("raises one stuck for a gate-met pull request nobody acts on after the window, and clears it when the gate moves", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    expect(stuckOf()[0]!.question).toContain("acme/web#7");
+    // The same state on another sweep re-raises nothing.
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    // A new round requests changes: the gate is no longer met, so it clears.
+    const changed = comment({ id: "r2", author: "jane", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [noReview, changed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(0);
+  });
+
+  it("raises one stuck for a retarget nobody answers after the window, and clears it when retargeted", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.retargetPulls).toEqual(["acme/web#8"]);
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "retarget");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(5 * 60 * 60_000);
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(1);
+    expect(stuckOf()[0]!.question).toContain("acme/web#7");
+    // The same state on another sweep re-raises nothing.
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(1);
+    // Retargeted to the default branch: the state ends and it clears.
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "main", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(0);
+  });
+
+  it("does not raise the retarget stuck on the look that first sends the wake", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    // The base is open, so the binding is held and quiet for hours.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base" }, { head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12")!;
+    t.advance(5 * 60 * 60_000);
+    // The base merges: this look sends the retarget wake and must not also
+    // raise a stall for the wake it just sent.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.retargetPulls).toEqual(["acme/web#8"]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "retarget")).toHaveLength(0);
+  });
+
+  it("counts a worker-reported own pull request as a wake source when its branch does not name the ticket", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ title: "A fix", comments: [] }, { head: "feature/unrelated", checks: { state: "pending", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // A finished worker's result names the pull request, so it is the ticket's
+    // own even though neither its branch nor its title names the ticket.
+    await t.created("thr_w1", b.threadId!, "ENG-12: Implement", { branchName: "feature/other" });
+    t.hooks.store.setWorker("thr_w1", "finished", "Opened https://github.com/acme/web/pull/7 for ENG-12.");
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the reviewer's reply", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 });

@@ -114,6 +114,12 @@ the default branch:
 - If the base pull request closes without merging, retarget yours to the
   default branch (`gh pr edit <n> --base <default>`, rebasing or merging the
   default branch as needed) and carry on as an ordinary pull request.
+- **Never delete a branch that is the base of an open pull request.** A base
+  branch deleted by `delete_branch_on_merge` or by hand closes the stacked
+  pull request unmerged. Before deleting any branch, run
+  `gh pr list --base <branch> --state open`; if it lists an open pull request,
+  leave the branch. The steward's wake says when another open pull request is
+  stacked on yours.
 
 ## Test
 

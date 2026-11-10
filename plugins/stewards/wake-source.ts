@@ -8,6 +8,7 @@
 // Pure, so the report path, the store's derived phrase and the tests all read
 // the same rules. The threshold is one plugin constant, never a project.json
 // key.
+import type { BindingKind } from "./config.js";
 import type { Deployments } from "./deploy.js";
 
 /**
@@ -56,6 +57,22 @@ export function hasLiveWakeSource(s: WakeSourceInput): boolean {
     s.openNeeds > 0 ||
     s.pullRequestWatch
   );
+}
+
+/**
+ * Whether an open pull request is a wake source for a binding (BB-285). A
+ * `pr` or `review` binding's own pull request is not: the binding is the pull
+ * request, so its open state masks every stall backstop (BB-154) and the
+ * BB-83 idle wake. A ticket binding's open own pull request counts only while
+ * the gate is not met: once the gate is met the plugin acts on the pull
+ * request (merges it, files the Merge item, or raises its own `stuck`), so the
+ * open pull request is not a wait. `openOwnPulls` is the number of the
+ * binding's open pull requests and `gateMet` whether every one of them is
+ * gate-met.
+ */
+export function pullWatchCounts(kind: BindingKind, openOwnPulls: number, gateMet: boolean): boolean {
+  if (kind !== "ticket") return false;
+  return openOwnPulls > 0 && !gateMet;
 }
 
 /**

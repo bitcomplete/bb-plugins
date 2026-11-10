@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -114,6 +114,10 @@ function fakeGitHub() {
     const v = body.variables as { owner: string; name: string; number: number; label?: string };
     if (!body.query.includes("repository(")) return Response.json({ data: { viewer: { login: "dev" } } });
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
+    if (body.query.includes("dependencyGraphManifests")) {
+      if (state.dependencyGraphFail) return Response.json({ data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
+      return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", dependencyGraphManifests: state.dependencyGraph === null ? null : { totalCount: state.dependencyGraph } } } });
+    }
     if (body.query.includes("label(name:")) {
       const has = (state.labels[`${v.owner}/${v.name}`.toLowerCase()] ?? []).some((n) => n.toLowerCase() === String(v.label).toLowerCase());
       return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: has ? { name: String(v.label) } : null } } });
@@ -714,8 +718,21 @@ describe("stewards' source contract", () => {
         },
       ],
       errors: [],
+      graphEmpty: [],
     });
     expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["acme/gone", "widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], errors: ["acme/gone: GitHub answered HTTP 404: Not Found", "widgets: not owner/repo"] });
+  });
+
+  it("names a repository whose dependency graph parsed no manifests, and leaves a failed graph read unflagged (BB-289)", async () => {
+    const w = await setup();
+    w.github.state.dependencyGraph = 0;
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], graphEmpty: ["Acme/Widgets"], errors: [] });
+    // A non-empty graph is not flagged: an empty alert list then means nothing is open.
+    w.github.state.dependencyGraph = 37;
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ graphEmpty: [] });
+    // A graph read the token was refused is not an empty graph: it stays unflagged and adds no error.
+    w.github.state.dependencyGraphFail = true;
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ graphEmpty: [], errors: [] });
   });
 
   it("names a repository whose alerts the token cannot read (403) without failing the whole call", async () => {
@@ -902,6 +919,46 @@ describe("stewards' source contract", () => {
       w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/Other#42", unit: "Acme/Other", workflow_run })}\n\n`);
       await tick(3000);
       expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#42", workflow_run: { ...workflow_run, startedAt: null } } }]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    // BB-286: a reconnect re-check rings stewards for every repo whose
+    // deployment doorbells it holds, so a deployment doorbell dropped while
+    // the subscriber was away is re-read rather than waiting for the sweep.
+    it("rings stewards for each deployment interest repo on the connected sweep (BB-286)", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      // A new connection re-checks; the deployment interest is rung once.
+      w.hooks.last().send(w.hooks.hello("c_2"));
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "acme/bb-gate" } }]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    // BB-286: the deployment queue holds the latest object per deployment id,
+    // so two statuses inside the debounce hand stewards the newest, not the
+    // first.
+    it("hands stewards the newest of two deployment statuses inside the debounce (BB-286)", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      const inProgress = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "in_progress", url: "https://github.com/acme/bb-gate/actions/runs/9" };
+      const success = { ...inProgress, state: "success" };
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment: inProgress })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment: success })}\n\n`);
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#7", deployment: success } }]);
       service.controller.abort();
       await service.done;
     });

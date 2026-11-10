@@ -491,6 +491,16 @@ const mergeHoldLine = (binding: Binding): string => {
 };
 
 /**
+ * The stacked-pull-request line of a wake (BB-287): one or more open pull
+ * requests are based on this binding's own, so its worker must not delete the
+ * branch that is their base — the deletion closes them unmerged.
+ */
+const stackedPullsLine = (binding: Binding): string => {
+  const keys = binding.stackedPulls;
+  return `- **BASE OF: ${keys.join(", ")}** — ${keys.length === 1 ? "another open pull request is" : "other open pull requests are"} stacked on this binding's own. Do not delete the branch that is their base: before deleting any branch run \`gh pr list --base <branch> --state open\` and leave a branch that is the base of an open pull request.`;
+};
+
+/**
  * The sentence a no-wake-source paragraph carries when a `failed` watch is
  * holding the binding (BB-194): a settled watch will not wake the steward on
  * its own, and the playbook's `not-yet` report is the way back. One sentence,
@@ -619,6 +629,7 @@ export function formatWake(input: WakeInput): string {
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   if (binding.mergeBehind.length > 0) out.push(mergeHoldLine(binding));
+  if (binding.stackedPulls.length > 0) out.push(stackedPullsLine(binding));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
   out.push(...trialLessonsLines(input.lessons ?? []));
   out.push(...assumptionLines(input.assumptions ?? []));
@@ -1023,6 +1034,10 @@ export function formatDepsWake(input: DepsWakeInput): string {
   const head = out.splice(0);
   out.push("", "## 3. The alerts", "");
   if (look.error !== null) out.push(`The repository could not be read: ${look.error}. Nothing to do until it can; \`bb stewards check\` says why.`);
+  else if (look.alerts.length === 0 && look.graphEmpty === true)
+    out.push(
+      "**Dependency graph empty.** Dependabot cannot see any manifest for this repository, so an empty alert list is not evidence that there is nothing to fix. Turn the dependency graph on by hand in the repository's Settings → Advanced Security → Dependency graph; the next look will then read real alerts. Nothing to file, comment on or close: report that with steward_report (actor other) and end the turn.",
+    );
   else if (look.alerts.length === 0) out.push("**No open alerts.** Nothing to file, comment on or close: report that with steward_report (actor other) and end the turn.");
   for (const c of present) {
     out.push("", `### ${DEPS_CLASS_TITLES[c]}`, "");
