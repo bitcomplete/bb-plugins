@@ -9983,7 +9983,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (!covered && approval === null && resolving.kind === "approval" && resolving.resolutionKind !== "approve-decline" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
                 const config = await loadConfig(target.projectId);
                 const playbook = config === null ? null : bindingPlaybook(config, target);
-                if (playbook?.ready?.approval === "project" && isProjectSteward(approvalsCtx, threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
+                if (specApprovedByProject(approvalsCtx, threadId, target, playbook?.ready?.approval)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
               }
             }
             if (input.stewardModel !== undefined && target.threadId !== null) {
