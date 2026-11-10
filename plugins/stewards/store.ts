@@ -1372,9 +1372,6 @@ export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | "misspawn";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null };
 
-/** A binding's claim row for the sidebar picker (BB-294): the three columns it needs, plus its workers' thread ids. */
-export type ClaimedThreadRow = { id: string; projectId: string; threadId: string | null; workerThreadIds: string[] };
-
 /** The sidebar's ended-list row (BB-294): the columns it renders, never `lastSnapshot`. */
 export type EndedBindingRow = { key: string; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number };
 
@@ -1460,12 +1457,35 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const allForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? ORDER BY created_at");
   const allOpen = db.prepare<[], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL ORDER BY created_at");
   const all = db.prepare<[], BindingRow>("SELECT * FROM bindings ORDER BY created_at");
-  // BB-294: the picker's claimed-thread set spans every binding ever held, so it
-  // reads the three columns it needs and the workers' thread ids, joined in
-  // memory, rather than parsing each row (and its `lastSnapshot`) through
-  // `rowToBinding`.
-  const claimedBindingRows = db.prepare<[], { id: string; project_id: string; thread_id: string | null }>("SELECT id, project_id, thread_id FROM bindings");
-  const claimedWorkerRows = db.prepare<[], { binding_id: string; thread_id: string }>("SELECT binding_id, thread_id FROM workers");
+  // BB-296: the picker's claimed-thread set, grouped by project in one query:
+  // each project steward, each binding's steward thread, and every worker's
+  // thread. The set spans every binding ever held, so it must not parse a
+  // binding row (and its `lastSnapshot`) through `rowToBinding`.
+  const claimedThreadRowsStmt = db.prepare<[], { project_id: string; thread_id: string }>(
+    `SELECT project_id, thread_id FROM (
+       SELECT project_id, thread_id FROM project_stewards WHERE thread_id IS NOT NULL
+       UNION ALL
+       SELECT project_id, thread_id FROM bindings WHERE thread_id IS NOT NULL
+       UNION ALL
+       SELECT b.project_id AS project_id, w.thread_id AS thread_id FROM workers w JOIN bindings b ON b.id = w.binding_id
+     ) GROUP BY project_id, thread_id`,
+  );
+  // BB-296: a project's open escalations in one query, grouped by binding in the
+  // caller, so `needsYou` and `needsUser` do not run `openEscalations(b.id)` per
+  // binding.
+  const openEscalationsForProjectStmt = db.prepare<[string], Record<string, unknown>>(
+    "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND b.ended_at IS NULL AND e.status = 'open' ORDER BY e.created_at",
+  );
+  // BB-296: a project's open bindings' workers in one query, grouped by binding
+  // in the caller.
+  const workersForProjectStmt = db.prepare<[string], Record<string, unknown>>(
+    "SELECT w.* FROM workers w JOIN bindings b ON b.id = w.binding_id WHERE b.project_id = ? AND b.ended_at IS NULL ORDER BY w.started_at",
+  );
+  // BB-296: each open binding's parent entity key in one query, so the sidebar
+  // does not `store.binding(parentBindingId)` per row.
+  const parentKeysForProjectStmt = db.prepare<[string], { id: string; parent_key: string | null }>(
+    "SELECT c.id AS id, p.entity_key AS parent_key FROM bindings c LEFT JOIN bindings p ON p.id = c.parent_binding_id WHERE c.project_id = ? AND c.ended_at IS NULL",
+  );
   // BB-294: a project's open binding ids, for `needsUser`'s caller when it does
   // not already hold the open list. Narrow, so a single-binding caller does not
   // parse every open binding's `lastSnapshot`.
@@ -2175,19 +2195,31 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return (projectId === undefined ? all.all() : allForProject.all(projectId)).map(rowToBinding);
     },
     /**
-     * Every binding's id, project and steward thread, with its workers' thread
-     * ids (BB-294), for the picker's claimed-thread set. Two narrow statements
-     * joined in memory: the set spans every binding ever held, so it must not go
-     * through `rowToBinding` and parse every `lastSnapshot`.
+     * Every project's claimed thread ids (BB-296): its project steward, each
+     * binding's steward thread, and every worker's thread. One grouped query,
+     * so the picker's set spans every binding ever held without parsing a
+     * binding row or its `lastSnapshot`.
      */
-    claimedThreads(): ClaimedThreadRow[] {
-      const workersByBinding = new Map<string, string[]>();
-      for (const w of claimedWorkerRows.all()) {
-        const list = workersByBinding.get(w.binding_id);
-        if (list === undefined) workersByBinding.set(w.binding_id, [w.thread_id]);
-        else list.push(w.thread_id);
+    claimedThreadIdsByProject(): Map<string, string[]> {
+      const out = new Map<string, string[]>();
+      for (const row of claimedThreadRowsStmt.all()) {
+        const list = out.get(row.project_id);
+        if (list === undefined) out.set(row.project_id, [row.thread_id]);
+        else list.push(row.thread_id);
       }
-      return claimedBindingRows.all().map((r) => ({ id: r.id, projectId: r.project_id, threadId: r.thread_id, workerThreadIds: workersByBinding.get(r.id) ?? [] }));
+      return out;
+    },
+    /** A project's open escalations, one query (BB-296). */
+    openEscalationsForProject(projectId: string): Escalation[] {
+      return openEscalationsForProjectStmt.all(projectId).map(toEscalation);
+    },
+    /** A project's open bindings' workers, one query (BB-296). */
+    workersForProject(projectId: string): Worker[] {
+      return workersForProjectStmt.all(projectId).map(toWorker);
+    },
+    /** Each open binding's parent entity key, one query (BB-296). */
+    parentKeysForProject(projectId: string): Map<string, string | null> {
+      return new Map(parentKeysForProjectStmt.all(projectId).map((r) => [r.id, r.parent_key] as const));
     },
     /**
      * A project's bindings ended at or after `since`, newest first, at most

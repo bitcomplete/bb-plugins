@@ -951,6 +951,10 @@ export const retryConsentContract = defineRpcContract({
   },
 });
 
+/** The sidebar's full payload, and the per-project section cached across calls (BB-296). */
+type SidebarOutput = z.infer<typeof rpcContract.stewardsSidebar.output>;
+type SidebarSection = Omit<SidebarOutput, "projects" | "roleProblem" | "projectStewardThreadId">;
+
 /** How long an ended binding stays on the page. */
 const ENDED_ON_BOARD_MS = 14 * 86_400_000;
 
@@ -1248,6 +1252,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
+    // BB-296: the sidebar's per-project section is the expensive half of the
+    // RPC (one pass over the project's bindings and their needs, escalations,
+    // workers and parent keys). It is cached per project and dropped when the
+    // store publishes that project's reconcile signal, so a burst of signals
+    // and several connected clients share one recompute. The picker and
+    // `roleProblem` are recomputed each call: both are one query (a per-project
+    // count and the grouped claimed set) plus the config cache.
+    const sidebarCache = new Map<string, SidebarSection>();
     // The store reports a project whose sidebar- or board-visible state
     // changed; the sidebar, the board page and the overview refetch on the
     // channel. Keeping it a callback keeps store.ts free of bb, so
@@ -1255,6 +1267,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const store = createStore(db, now, {
       log: (message) => bb.log.info(message),
       onProjectChange: (projectId, columns) => {
+        // The project's cached sidebar section is stale the moment the store
+        // changes; the next call recomputes it once for every waiting client.
+        sidebarCache.delete(projectId);
         // One debug line per published signal, with the project and the
         // coalesced columns, so the next slowdown has numbers (BB-95).
         bb.log.debug(`stewards: signal for project ${projectId} (${columns.length === 0 ? "no columns" : columns.join(", ")})`);
@@ -8698,25 +8713,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const projects = projectIds(configs.map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
-        // The threads each project's stewards and workers own, so the picker's
-        // unread sum does not count them as one-off roots when this call carries
-        // another project's bindings (BB-160). The store already holds them: the
-        // project steward, each binding's steward thread, and every worker. One
-        // narrow read of every binding's three columns and its workers' thread
-        // ids (BB-294), so a project whose bindings this call does not carry still
-        // gets its set and no `lastSnapshot` is parsed.
-        const claimed = new Map<string, Set<string>>();
-        const claim = (projectId: string, threadId: string | null): void => {
-          if (threadId === null) return;
-          const set = claimed.get(projectId) ?? new Set<string>();
-          set.add(threadId);
-          claimed.set(projectId, set);
-        };
-        for (const p of store.projects()) claim(p.projectId, p.threadId);
-        for (const b of store.claimedThreads()) {
-          claim(b.projectId, b.threadId);
-          for (const w of b.workerThreadIds) claim(b.projectId, w);
-        }
+        // BB-296: the picker's claimed-thread set is one grouped SQL query
+        // (project stewards, binding threads, worker threads), no binding row
+        // parsed. The set spans every binding ever held, so a project whose
+        // bindings this call does not carry still gets its set (BB-160).
+        const claimed = store.claimedThreadIdsByProject();
         // The picker's count is the server's own: every open binding with an
         // open need, question or route-`user` escalation. It is broader than
         // `needsUser` since BB-237 (a need the server cannot act on yet is not
@@ -8729,7 +8730,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // The threads this project's stewards and workers own, for every
           // project, so the picker's unread sum does not count them as one-off
           // roots when this call carries another project's bindings (BB-160).
-          claimedThreadIds: [...(claimed.get(p.projectId) ?? [])],
+          claimedThreadIds: claimed.get(p.projectId) ?? [],
         }));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
         if (picked === undefined) {
@@ -8737,69 +8738,87 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         const { projectId } = picked;
         const roleProblem = configs.find((c) => c.projectId === projectId)?.problems.find((p) => p.startsWith("No role for ")) ?? null;
-        const open = store.open(projectId);
-        const ended = store.endedSince(projectId, started - ENDED_ON_BOARD_MS, 30);
-        const { questions: projectQuestions, openIds } = needsUserInputs(projectId, open);
-        const { questions, withUser, needs } = needsYou(projectId, open, projectQuestions, { actionableOnly: true });
-        // Only the workers the row can show: running or finished, plus any
-        // other worker that ended within the last hour (BB-100).
-        const liveSince = started - 3_600_000;
-        const bindings = open.map((b) => {
-          const workers = store
-            .workers(b.id)
-            .filter((w) => w.status === "running" || w.status === "finished" || (w.endedAt !== null && w.endedAt >= liveSince))
-            .map((w) => ({ threadId: w.threadId, title: w.title, status: w.status }));
-          // The newest deployment watch, whatever its state (BB-76); the row shows `merged` as deploying too.
-          const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
-          return {
-            key: b.entityKey,
-            kind: b.kind,
-            stage: b.stage,
-            phase: b.phase,
-            threadId: b.threadId,
-            // BB-245: the parent binding's key, so the sidebar nests the
-            // effort under its parent; null when it has none. A parent in
-            // another project, or an ended one, names no effort and the
-            // child stays top-level (the client decides from the tab's own
-            // list).
-            parentKey: b.parentBindingId === null ? null : (store.binding(b.parentBindingId)?.entityKey ?? null),
-            ...presentationHold(b),
-            holdStack: b.holdStack,
-            waitingOn: b.status?.waitingOn ?? null,
-            noWakeSource: b.noWakeSource,
-            wakeFailure: b.wakeFailure,
-            needsUser: needsUser(b, projectQuestions, openIds),
-            stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
-            status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
-            deployment: newestDeployment === null ? null : newestDeployment.state,
-            pending: b.pending,
-            requeueAt: b.requeueAt,
-            advancedAt: b.advancedAt,
-            waitingUntil: b.requeueUntil,
-            workers,
+        // BB-296: the per-project section is the expensive half. Serve it from
+        // the cache when the reconcile has not changed the project, so several
+        // connected clients and a burst of signals share one recompute.
+        const cached = sidebarCache.get(projectId);
+        const section = cached ?? (() => {
+          const open = store.open(projectId);
+          const ended = store.endedSince(projectId, started - ENDED_ON_BOARD_MS, 30);
+          const projectQuestions = store.openQuestions(projectId);
+          // `needsYou` reads the project's open needs and escalations once and
+          // returns the per-binding `needsUser` and `stuck` sets (BB-296).
+          const { questions, withUser, needs, needsUser, stuck } = needsYou(projectId, open, projectQuestions, { actionableOnly: true });
+          // Only the workers the row can show: running or finished, plus any
+          // other worker that ended within the last hour (BB-100).
+          const liveSince = started - 3_600_000;
+          // BB-296: the project's workers and parent keys are read once and
+          // grouped by binding, instead of `workers(b.id)` and
+          // `binding(parentBindingId)` per row.
+          const workersByBinding = new Map<string, Worker[]>();
+          for (const w of store.workersForProject(projectId)) {
+            const list = workersByBinding.get(w.bindingId);
+            if (list === undefined) workersByBinding.set(w.bindingId, [w]);
+            else list.push(w);
+          }
+          const parentKeys = store.parentKeysForProject(projectId);
+          const bindings = open.map((b) => {
+            const workers = (workersByBinding.get(b.id) ?? [])
+              .filter((w) => w.status === "running" || w.status === "finished" || (w.endedAt !== null && w.endedAt >= liveSince))
+              .map((w) => ({ threadId: w.threadId, title: w.title, status: w.status }));
+            // The newest deployment watch, whatever its state (BB-76); the row shows `merged` as deploying too.
+            const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
+            return {
+              key: b.entityKey,
+              kind: b.kind,
+              stage: b.stage,
+              phase: b.phase,
+              threadId: b.threadId,
+              // BB-245: the parent binding's key, so the sidebar nests the
+              // effort under its parent; null when it has none. A parent in
+              // another project, or an ended one, names no effort and the
+              // child stays top-level (the client decides from the tab's own
+              // list).
+              parentKey: parentKeys.get(b.id) ?? null,
+              ...presentationHold(b),
+              holdStack: b.holdStack,
+              waitingOn: b.status?.waitingOn ?? null,
+              noWakeSource: b.noWakeSource,
+              wakeFailure: b.wakeFailure,
+              needsUser: needsUser.has(b.id),
+              stuck: stuck.has(b.id),
+              status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
+              deployment: newestDeployment === null ? null : newestDeployment.state,
+              pending: b.pending,
+              requeueAt: b.requeueAt,
+              advancedAt: b.advancedAt,
+              waitingUntil: b.requeueUntil,
+              workers,
+            };
+          });
+          const computed: SidebarSection = {
+            projectId,
+            needs: {
+              count: questions.length + withUser.length + needs.length,
+              items: [
+                ...questions.map((q) => ({ type: "question" as const, ...q, bindingKey: q.key })),
+                ...withUser.map((w) => ({ type: "withUser" as const, ...w, bindingKey: w.key })),
+                ...needs.map((n) => ({ type: "need" as const, ...n, bindingKey: n.key })),
+              ],
+            },
+            bindings,
+            ended: ended.map((b) => ({ key: b.key, kind: b.kind, threadId: b.threadId, title: b.title, phase: b.phase, endReason: b.endReason, endedAt: b.endedAt })),
           };
-        });
-        const result = {
-          projects: picker,
-          projectId,
-          projectStewardThreadId: store.project(projectId).threadId,
-          roleProblem,
-          needs: {
-            count: questions.length + withUser.length + needs.length,
-            items: [
-              ...questions.map((q) => ({ type: "question" as const, ...q, bindingKey: q.key })),
-              ...withUser.map((w) => ({ type: "withUser" as const, ...w, bindingKey: w.key })),
-              ...needs.map((n) => ({ type: "need" as const, ...n, bindingKey: n.key })),
-            ],
-          },
-          bindings,
-          ended: ended.map((b) => ({ key: b.key, kind: b.kind, threadId: b.threadId, title: b.title, phase: b.phase, endReason: b.endReason, endedAt: b.endedAt })),
-        };
+          sidebarCache.set(projectId, computed);
+          return computed;
+        })();
         // One debug line per call, with its duration and binding/worker counts,
         // so the next slowdown has numbers (BB-95).
-        const workerCount = bindings.reduce((n, b) => n + b.workers.length, 0);
-        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms (${projectId}: ${bindings.length} bindings, ${workerCount} workers)`);
-        return result;
+        const workerCount = section.bindings.reduce((n, b) => n + b.workers.length, 0);
+        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms (${projectId}: ${section.bindings.length} bindings, ${workerCount} workers, ${cached === undefined ? "recomputed" : "cached"})`);
+        // `projectStewardThreadId` is read fresh: `patchProject` does not publish
+        // a store change, so it is not part of the cached section.
+        return { projects: picker, roleProblem, projectStewardThreadId: store.project(projectId).threadId, ...section };
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
@@ -10736,14 +10755,76 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * drops needs the server cannot act on now, which the sidebar's badge and
      * block do not show; the board keeps them and says why.
      */
-    function needsYou(projectId: string, open: Binding[], questions: Question[], opts: { actionableOnly?: boolean } = {}): { questions: ReturnType<typeof questionView>[]; withUser: ReturnType<typeof withUserView>[]; needs: ReturnType<typeof needView>[] } {
+    function needsYou(projectId: string, open: Binding[], questions: Question[], opts: { actionableOnly?: boolean } = {}): { questions: ReturnType<typeof questionView>[]; withUser: ReturnType<typeof withUserView>[]; needs: ReturnType<typeof needView>[]; needsUser: Set<string>; stuck: Set<string> } {
       const questionViews = questions.map(questionView);
-      const allNeeds = open.flatMap((b) => store.openNeeds(b.id).map((n) => needView(n, b)));
+      const openIds = new Set(open.map((b) => b.id));
+      // BB-296: the project's open needs and escalations are read once and
+      // grouped by binding, rather than `openNeeds(b.id)` and
+      // `openEscalations(b.id)` per binding. The sidebar shares these rows and
+      // the covered set with its per-binding `needsUser`.
+      const needsByBinding = groupOpenNeedsByBinding(store.openNeedsForProject(projectId), openIds);
+      const escalationsByBinding = groupOpenEscalationsByBinding(store.openEscalationsForProject(projectId), openIds);
+      const allNeeds = open.flatMap((b) => (needsByBinding.get(b.id) ?? []).map((n) => needView(n, b)));
       // A question or a need covers the escalation it was made for: the page's
       // row is the question or the item, never the raw escalation.
       const covered = new Set([...questionViews.map((q) => q.escalationId), ...allNeeds.map((n) => n.escalationId), ...store.openQuestionEscalationIds(projectId)].filter((id): id is string => id !== null));
-      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "user" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => withUserView(x, b)));
-      return { questions: questionViews, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds };
+      const withUser = open.flatMap((b) => (escalationsByBinding.get(b.id) ?? []).filter((x) => x.route === "user" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => withUserView(x, b)));
+      // BB-296: the same predicate `needsUser(b)` computes, for every open
+      // binding, from the rows and covered set above.
+      const needsUser = needsUserIds(open, questions, allNeeds, covered, escalationsByBinding);
+      // BB-296: the `stuck` flag shares the same grouped escalations, so the
+      // sidebar and board do not re-query them per binding.
+      const stuck = new Set<string>();
+      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck")) stuck.add(bindingId);
+      return { questions: questionViews, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds, needsUser, stuck };
+    }
+
+    /** A project's open needs grouped by binding, dropping ended bindings (BB-296). */
+    function groupOpenNeedsByBinding(needs: Need[], openIds: ReadonlySet<string>): Map<string, Need[]> {
+      const out = new Map<string, Need[]>();
+      for (const n of needs) {
+        if (!openIds.has(n.bindingId)) continue;
+        const list = out.get(n.bindingId);
+        if (list === undefined) out.set(n.bindingId, [n]);
+        else list.push(n);
+      }
+      return out;
+    }
+
+    /** A project's open escalations grouped by binding, dropping ended bindings (BB-296). */
+    function groupOpenEscalationsByBinding(escalations: Escalation[], openIds: ReadonlySet<string>): Map<string, Escalation[]> {
+      const out = new Map<string, Escalation[]>();
+      for (const x of escalations) {
+        if (!openIds.has(x.bindingId)) continue;
+        const list = out.get(x.bindingId);
+        if (list === undefined) out.set(x.bindingId, [x]);
+        else list.push(x);
+      }
+      return out;
+    }
+
+    /**
+     * BB-296: `needsUser` for every open binding of a project in one pass,
+     * from the rows and covered set `needsYou` already built. A binding needs
+     * the user when it has an actionable open need, an open question, or an
+     * open route-`user` escalation no question or item covers. The per-binding
+     * `needsUser(b)` stays for a single-row caller (the board).
+     */
+    function needsUserIds(open: Binding[], questions: Question[], allNeeds: ReturnType<typeof needView>[], covered: ReadonlySet<string>, escalationsByBinding: ReadonlyMap<string, Escalation[]>): Set<string> {
+      const actionable = new Set<string>();
+      for (const n of allNeeds) if (n.actionable) actionable.add(n.bindingId);
+      const asked = new Set<string>();
+      for (const q of questions) if (q.bindingId !== null) asked.add(q.bindingId);
+      const out = new Set<string>();
+      for (const b of open) {
+        if (actionable.has(b.id) || asked.has(b.id)) {
+          out.add(b.id);
+          continue;
+        }
+        const escalations = (escalationsByBinding.get(b.id) ?? []).filter((x) => x.route === "user" && !x.isQuestion && x.resolutionKind === null);
+        if (escalations.some((x) => !covered.has(x.id))) out.add(b.id);
+      }
+      return out;
     }
 
     /** The board's question row; the sidebar reuses it, tagged. */

@@ -6557,6 +6557,40 @@ describe("the stewards sidebar call", () => {
     expect(elapsed).toBeLessThan(100);
     expect(t.harness.logEntries.some((entry) => /stewards: stewardsSidebar took \d+ms/u.test(entry.message))).toBe(true);
   }, 30_000);
+
+  it("caches the per-project section until the reconcile invalidates it (BB-296)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    // One recompute reads the project's open needs once; a cache hit reads them
+    // zero times. Counting that read counts recomputes.
+    let recomputes = 0;
+    const original = t.hooks.store.openNeedsForProject;
+    t.hooks.store.openNeedsForProject = ((projectId: string) => {
+      recomputes += 1;
+      return original.call(t.hooks.store, projectId);
+    }) as typeof t.hooks.store.openNeedsForProject;
+
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
+    expect(recomputes).toBe(1);
+    // A second call for the same project serves the cache: several connected
+    // clients and the poll share one recompute.
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
+    expect(recomputes).toBe(1);
+    // A store change (the reconcile's signal) drops the project's cache; the
+    // next call recomputes it once.
+    t.hooks.store.patch(b.id, { phase: "In Review" });
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
+    expect(recomputes).toBe(2);
+    // The picker half is not cached: a change to another project still reaches
+    // this project's picker on the next call.
+    const other = t.hooks.store.create({ projectId: "p2", source: "linear", entityId: "uuid-20", entityKey: "ENG-20", url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.fileNeed({ bindingId: other.id, kind: "configure", url: "", what: "Enable it", how: null });
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(recomputes).toBe(2);
+    expect(result.projects.find((p) => p.projectId === "p2")!.needsCount).toBe(1);
+  });
 });
 
 // BB-46: the sidebar's "needs you" count and items, and the realtime signal
@@ -6566,6 +6600,7 @@ describe("the sidebar's needs you block (BB-46)", () => {
     questions: Array<{ id: string }>;
     withUser: Array<{ id: string }>;
     needs: Array<{ id: string; kind: string; actionable: boolean }>;
+    stewards: Array<{ key: string; needsUser: boolean }>;
   };
   type SidebarView = { projectId: string | null; needs: { count: number; items: Array<{ type: string; id: string }> }; bindings: Array<{ key: string; needsUser: boolean }> };
   const boardView = async (t: Awaited<ReturnType<typeof setup>>): Promise<BoardView> => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: BoardView }).board;
@@ -6622,6 +6657,40 @@ describe("the sidebar's needs you block (BB-46)", () => {
     expect(sidebar.bindings.find((x) => x.key === "ENG-12")!.needsUser).toBe(false);
     expect(sidebar.needs.items.some((i) => i.id === need.id)).toBe(false);
     expect(sidebar.needs.count).toBe(0);
+  });
+
+  it("agrees with the per-binding needsUser on every row (BB-296)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const first = t.hooks.store.find("ENG-12", "p1")!;
+    // Needs the user through an actionable need.
+    t.hooks.store.fileNeed({ bindingId: first.id, kind: "configure", url: "", what: "Enable it", how: null });
+    const other = (n: number) => t.hooks.store.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    // An escalation a question covers: the question needs the user, not the raw row.
+    const covered = other(13);
+    const coveredEscalation = t.hooks.store.escalate({ bindingId: covered.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    t.hooks.store.ask({ projectId: "p1", bindingId: covered.id, escalationId: coveredEscalation.id, question: "Which option?", context: null });
+    // A route-`user` escalation no question or item covers: needs the user.
+    const direct = other(14);
+    t.hooks.store.escalate({ bindingId: direct.id, kind: "decision", question: "Forwarded?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    // A non-actionable need says needs you nowhere.
+    const unobserved = other(15);
+    t.hooks.store.fileNeed({ bindingId: unobserved.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/999", what: "Unobserved", how: null });
+    // A plain binding that needs nobody.
+    other(16);
+
+    const board = await boardView(t);
+    const sidebar = await sidebarView(t);
+    const byKey = new Map(board.stewards.map((s) => [s.key, s.needsUser] as const));
+    // The board's per-binding `needsUser(b)` and the sidebar's one-pass set
+    // must agree on every row.
+    for (const row of sidebar.bindings) expect(row.needsUser, row.key).toBe(byKey.get(row.key));
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")!.needsUser).toBe(true);
+    expect(sidebar.bindings.find((x) => x.key === "ENG-13")!.needsUser).toBe(true);
+    expect(sidebar.bindings.find((x) => x.key === "ENG-14")!.needsUser).toBe(true);
+    expect(sidebar.bindings.find((x) => x.key === "ENG-15")!.needsUser).toBe(false);
+    expect(sidebar.bindings.find((x) => x.key === "ENG-16")!.needsUser).toBe(false);
   });
 
   it("rings the refetch channel when a snapshot flips an open need's actionability, and stays silent when it flips nothing (BB-237)", async () => {
