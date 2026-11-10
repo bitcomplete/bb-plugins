@@ -2905,15 +2905,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function archiveFinishedWorkers(b: Binding): Promise<void> {
       if (needsUser(b)) return;
-      const candidates = store.workers(b.id).filter((w) => w.status === "finished" && workerQuestion(w.result) === null && !workerWaiting(w.result));
+      await archiveWorkers(store.workers(b.id).filter((w) => w.status === "finished" && workerQuestion(w.result) === null && !workerWaiting(w.result)));
+    }
+
+    /**
+     * Retire the binding's parked `finished` workers (BB-266). The plugin's
+     * own merge consumed the approval they were waiting on, so they are done,
+     * not parked; only one that asked the steward a question stays visible.
+     * Unlike `archiveFinishedWorkers` this does not wait for the binding to
+     * need nobody: the merge has settled their reason to stay.
+     */
+    async function archiveParkedWorkers(b: Binding): Promise<void> {
+      await archiveWorkers(store.workers(b.id).filter((w) => w.status === "finished" && workerQuestion(w.result) === null));
+    }
+
+    /**
+     * Archive the given finished workers unless one still has an unarchived
+     * child. A worker whose reviewer is still unarchived must stay: bb core
+     * releases a thread's unarchived children from it when it is archived,
+     * so archiving the worker would clear the reviewer's parent: it could
+     * no longer wake the worker, and no later pass could find it to archive
+     * it. One batched descendant lookup covers every candidate (BB-100); a
+     * listing that failed is "unknown", so all the workers wait rather than
+     * risking an orphan (BB-47).
+     */
+    async function archiveWorkers(candidates: readonly Worker[]): Promise<void> {
       if (candidates.length === 0) return;
-      // A worker whose reviewer is still unarchived must stay. bb core
-      // releases a thread's unarchived children from it when it is archived,
-      // so archiving the worker would clear the reviewer's parent: it could
-      // no longer wake the worker, and no later pass could find it to archive
-      // it. One batched descendant lookup covers every candidate (BB-100); a
-      // listing that failed is "unknown", so all the workers wait rather than
-      // risking an orphan (BB-47).
       const descendants = await descendantsOfMany(candidates.map((w) => w.threadId));
       if (descendants === null) return;
       for (const w of candidates) {
@@ -4035,7 +4052,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.scheduleAsked.length > 0) clear.scheduleAsked = [];
         if (Object.keys(clear).length > 0) b = store.patch(b.id, clear);
       }
-      const approvalEvents = await syncNeeds(b, observed, playbook, workerInFlight, changes);
+      const approvalEvents = await syncNeeds(b, observed, playbook, changes);
       // BB-264: `syncNeeds` records a derived stacked-PR merge hold on the
       // binding; re-read it so the status below and the wake see the hold.
       b = store.binding(b.id) ?? b;
@@ -6841,7 +6858,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * every look, so the page only offers a button while it is true. The
      * `approve-pr` half lives in approvals.ts (BB-153).
      */
-    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean, changes: Change[] = []): Promise<MechanicalEvent[]> {
+    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, changes: Change[] = []): Promise<MechanicalEvent[]> {
       // BB-203: an `approve-pr` item this call closes because an approval is
       // present is a mechanical status event. The page and project-steward
       // paths write it at once; this catches an approval observed on GitHub.
@@ -6981,7 +6998,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
-          } else if (!workerInFlight) {
+          } else if (runningWorkerReason(store.workers(b.id)) === null) {
             // Pause stewards is the kill switch: while it is on, the plugin
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
@@ -7003,6 +7020,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   store.note(b.id, note);
                   changes.push({ text: note, actionable: true });
                   scheduleReconcile(b.id);
+                  // BB-266: the approval this merge consumed was what the
+                  // binding's parked workers waited on, so retire them the way
+                  // a consumed finish is retired; one that asked the steward a
+                  // question stays visible.
+                  await archiveParkedWorkers(b);
                 } else if (isHeadMovedRefusal(result.message)) {
                   // A push landed between the look and the merge. GitHub
                   // refused it with 409; the next look judges the new head.
@@ -7071,7 +7093,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // falling back to the stored snapshot when the read fails (BB-54).
       const fresh = await freshObserved(b);
       const observed = fresh?.observed ?? b.lastSnapshot;
-      if (observed !== null) await syncNeeds(b, observed, playbook, anyWorkerInFlight(store.workers(b.id)));
+      if (observed !== null) await syncNeeds(b, observed, playbook);
     }
 
     /**

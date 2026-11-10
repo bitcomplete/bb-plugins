@@ -1671,23 +1671,30 @@ describe("a Linear ticket steward", () => {
     await t.idle("thr_w1", "Opened acme/web#7; waiting on the reviewer.");
     expect(toSteward()).toHaveLength(before);
 
-    // The reviewer posts its marker as the developer (unsigned), checks
-    // finish, and the worker pushes: all the worker's, none of it wakes.
-    const marker = "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->";
-    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: marker, createdAt: "2026-10-14T16:00:00Z" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
-    await t.ring("github", "acme/web#7");
-    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: marker, createdAt: "2026-10-14T16:00:00Z" })] }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    // Its own push is quiet too: the reviewer has not approved, so the gate is
+    // not met and nothing merges (BB-266 changed only the gate-met branch).
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "pending", failing: [] } }));
     await t.ring("github", "acme/web#7");
     expect(toSteward()).toHaveLength(before);
 
-    // A teammate's comment is the wake, and it carries the quiet notes kept:
-    // the worker's finish and its own PR activity.
+    // The reviewer posts its marker as the developer (unsigned) and checks
+    // finish: the worker's own activity stays quiet, but the gate is now met,
+    // so the plugin merges (BB-266) and wakes the steward with the merge,
+    // carrying the quiet notes kept: the worker's finish and its own activity.
+    const marker = "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->";
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: marker, createdAt: "2026-10-14T16:00:00Z" })] }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.githubMerges).toHaveLength(1);
+    const afterMerge = toSteward().slice(before);
+    const mergeWake = afterMerge.find((s) => /acme\/web#7 was merged by the plugin/u.test(s.text));
+    expect(mergeWake).toBeDefined();
+    expect(mergeWake!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+    expect(mergeWake!.text).toMatch(/Opened acme\/web#7; waiting on the reviewer\./u);
+
+    // A teammate's comment is the next wake.
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked, comments: [comment({ createdAt: "2026-10-14T17:00:00Z" })] }));
     await t.ring("linear", "uuid-12");
-    expect(toSteward()).toHaveLength(before + 1);
-    const wake = toSteward().at(-1)!.text;
-    expect(wake).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
-    expect(wake).toMatch(/Opened acme\/web#7; waiting on the reviewer\./u);
+    expect(toSteward().length).toBeGreaterThan(before + afterMerge.length);
   });
 
   it("wakes for a reviewer round that changes the lane while a worker is in flight", async () => {
@@ -7199,6 +7206,81 @@ describe("needs you items", () => {
     expect(t.githubComments.at(-1)!.body).toMatch(/Merged: owner-reviewed lane, reviewer approved aaaaaaa, checks green, approved by the owner/u);
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /What changed[\s\S]*merged by the plugin/u.test(s.text))).toBe(true);
+  });
+
+  it("a finished worker does not defer the plugin merge; a running one does (BB-266)", async () => {
+    // The reconcile pass: a worker parked "waiting on the owner's approval"
+    // (finished) cannot race a push, so the plugin merges.
+    const parked = await withPull([marker]);
+    await parked.created("thr_w1", parked.steward, "ENG-12: Implement");
+    parked.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    parked.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await parked.ring("linear", "uuid-12");
+    expect(parked.githubMerges).toHaveLength(1);
+
+    // The re-report path (syncNeedsFresh): the same parked worker does not
+    // hold the merge either.
+    const rereport = await withPull([marker]);
+    await rereport.created("thr_w1", rereport.steward, "ENG-12: Implement");
+    rereport.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    rereport.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await rereport.tool("steward_report", { phase: "In Progress", summary: "Watching the pull request.", nextAction: "Wait", actor: "steward" }, rereport.steward);
+    expect(rereport.githubMerges).toHaveLength(1);
+
+    // A running worker still defers it, at both call sites, and files no item.
+    const running = await withPull([marker]);
+    await running.created("thr_w1", running.steward, "ENG-12: Implement");
+    running.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await running.ring("linear", "uuid-12");
+    expect(running.githubMerges).toEqual([]);
+    expect(running.hooks.store.openNeeds(running.binding().id).some((n) => n.kind === "merge")).toBe(false);
+    await running.tool("steward_report", { phase: "In Progress", summary: "Watching the pull request.", nextAction: "Wait", actor: "steward" }, running.steward);
+    expect(running.githubMerges).toEqual([]);
+  });
+
+  it("the plugin merge archives the binding's parked workers (BB-266)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    await t.created("thr_parked", t.steward, "ENG-12: Implement");
+    t.hooks.store.setWorker("thr_parked", "finished", "Waiting on the owner's approval.");
+    // A finished worker's turn is over: its thread is idle, not active.
+    t.threads.get("thr_parked")!.status = "idle";
+    // A finished worker with an open question for the steward is left alone.
+    await t.created("thr_question", t.steward, "ENG-12: Ask");
+    t.hooks.store.setWorker("thr_question", "finished", "Should I open the follow-up ticket?");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+    // The parked worker is archived; the thread.archived event flips it stopped.
+    expect(t.threads.get("thr_parked")!.archivedAt).not.toBeNull();
+    await t.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_parked" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_parked")).toMatchObject({ status: "stopped", stopReason: "archived" });
+    // The one that asked a question stays for the steward to answer.
+    expect(t.threads.get("thr_question")!.archivedAt).toBeNull();
+    expect(t.hooks.store.worker("thr_question")).toMatchObject({ status: "finished", result: "Should I open the follow-up ticket?" });
+    // The merge filed no item for the parked worker to have been waiting on.
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
+  it("a finished worker does not suppress the fallback Merge item when the playbook omits merge (BB-266)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]" }));
+    await t.hooks.sweep();
+    await t.flush();
+    const b = t.hooks.store.find("acme/web#9")!;
+    expect(b).toMatchObject({ kind: "pr", playbook: "deps-prs" });
+    // A parked worker, waiting on the owner's approval, must not suppress the
+    // fallback Merge item: the playbook omits merge, so a person merges.
+    t.hooks.store.addWorker("thr_parked", b.id, "Watch the dependency bump");
+    t.hooks.store.setWorker("thr_parked", "finished", "Waiting on the owner's approval.");
+    const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [], comments: [noReview] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#9");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
   });
 
   it("does not merge a gate-met pull request on an unknown base branch; it files the Merge item (BB-257)", async () => {
