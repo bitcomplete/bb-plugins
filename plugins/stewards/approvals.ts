@@ -8,6 +8,7 @@
 // The functions take an `ApprovalsContext` rather than the server's whole
 // closure, so nothing here reads the plugin's config or snapshots on its own.
 import { type BigDecision, decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type DecideMark } from "./decisions.js";
+import type { ApprovalMode } from "./config.js";
 import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
 import { productGateOptions, productReason, workerInFlight, type MechanicalEvent } from "./reconcile.js";
@@ -129,9 +130,10 @@ export const isProjectSteward = (ctx: ApprovalsContext, threadId: string, b: Bin
  * Whether the project steward's thread may approve `b`'s spec under the
  * playbook's `mode`: `project` and the project steward's own thread. `user` is
  * the user's, recorded by quoting their words (BB-280; this acceptance was in
- * server.ts before).
+ * server.ts before). The raw `ready.approval` value is accepted so both spec
+ * acceptance paths route through here.
  */
-export const specApprovedByProject = (ctx: ApprovalsContext, threadId: string, b: Binding, mode: "project" | "user"): boolean => mode === "project" && isProjectSteward(ctx, threadId, b);
+export const specApprovedByProject = (ctx: ApprovalsContext, threadId: string, b: Binding, mode: ApprovalMode | null | undefined): boolean => mode === "project" && isProjectSteward(ctx, threadId, b);
 
 /**
  * The decide-list placement of a pull request a steward is reporting:
