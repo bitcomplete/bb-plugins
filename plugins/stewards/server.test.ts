@@ -15018,3 +15018,66 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 });
+
+// BB-293: the shadow assessment is stored on every reconcile, and its
+// divergence log is readable from `bb stewards divergences` (read-only). The
+// pure derivations and the fixtures are in assessment.test.ts; this is the
+// plugin path that writes and reads them.
+describe("bb stewards divergences (BB-293)", () => {
+  it("stores an assessment on reconcile and prints the divergence log, with filters and --json", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // The reconcile stored an assessment for the binding. It is shadow only:
+    // nothing reads it to decide or render.
+    expect(t.hooks.store.assessment(b.id)).not.toBeNull();
+    expect(t.hooks.store.assessment(b.id)!.gate).toBeTruthy();
+    // Seed the log the way the reconcile's compare would.
+    t.hooks.store.recordDivergences(
+      [
+        { bindingId: b.id, surface: "workerInFlight", old: "in-flight", new: "parked", inputs: { binding: b.id, workers: 1, states: "finished" } },
+        { bindingId: b.id, surface: "approvals.gate", old: "owner approval needed", new: "met", inputs: { binding: b.id } },
+        { bindingId: "bnd_other", surface: "noWakeSource", old: "no-wake-source", new: "source-or-no-wait", inputs: {} },
+      ],
+      5_000,
+    );
+
+    const all = await t.harness.behavior.runCli(["divergences"]);
+    expect(all.exitCode).toBe(0);
+    expect(all.stdout).toContain("workerInFlight");
+    expect(all.stdout).toContain("approvals.gate");
+    expect(all.stdout).toContain("noWakeSource");
+
+    // --binding resolves an entity key to the binding and keeps only its rows.
+    const one = await t.harness.behavior.runCli(["divergences", "--binding", "ENG-12"]);
+    expect(one.stdout).toContain("workerInFlight");
+    expect(one.stdout).toContain("approvals.gate");
+    expect(one.stdout).not.toContain("noWakeSource");
+
+    // --surface keeps only that surface.
+    const surface = await t.harness.behavior.runCli(["divergences", "--surface", "approvals.gate"]);
+    expect(surface.stdout).toContain("approvals.gate");
+    expect(surface.stdout).not.toContain("workerInFlight");
+
+    // --json emits the rows.
+    const json = await t.harness.behavior.runCli(["divergences", "--binding", "ENG-12", "--json"]);
+    const rows = JSON.parse(json.stdout) as Array<{ surface: string; old: string; new: string; count: number }>;
+    expect(rows.map((r) => r.surface).sort()).toEqual(["approvals.gate", "workerInFlight"]);
+    expect(rows.find((r) => r.surface === "workerInFlight")).toMatchObject({ old: "in-flight", new: "parked", count: 1 });
+  });
+
+  it("swallows a failure inside the shadow assessment and keeps reconciling", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    // Force the assessment write to fail: the lazy prepared statement throws
+    // "no such table: assessments", which the reconcile must swallow and log.
+    t.hooks.db.prepare("DROP TABLE assessments").run();
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    // The reconcile completed past the failure: the binding's snapshot was
+    // stored and the warning names the shadow assessment.
+    expect(t.hooks.store.find("ENG-12")!.lastSnapshot).not.toBeNull();
+    expect(t.harness.logEntries.some((e) => e.level === "warn" && e.message.includes("shadow assessment failed"))).toBe(true);
+  });
+});

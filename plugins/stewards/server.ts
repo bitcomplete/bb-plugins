@@ -86,7 +86,8 @@ import {
   type Role as StewardRole,
   type RolesFile,
 } from "./roles.js";
-import { explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
+import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, type AssessmentInput } from "./assessment.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
@@ -119,7 +120,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -334,6 +335,18 @@ const checkoutDirName = (path: string): string => path.replace(/[\\/]+$/u, "").s
  * and a lesson records it before the merge so the page can name it.
  */
 export const lessonBranchFor = (threadId: string): string => `refs/heads/guidance-${threadId.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 60)}`;
+
+/**
+ * BB-293: the human-readable shadow-assessment divergence log, one block per
+ * distinct row (binding, surface, old, new, inputs, count, first/last seen).
+ */
+export function formatDivergences(rows: ReadonlyArray<Pick<DivergenceRow, "bindingId" | "surface" | "old" | "new" | "inputs" | "firstSeenAt" | "lastSeenAt" | "count">>): string {
+  if (rows.length === 0) return "No divergences recorded.";
+  const at = (ms: number): string => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+  return rows
+    .map((d) => `${d.bindingId}  ${d.surface}  x${d.count}  ${at(d.firstSeenAt)} -> ${at(d.lastSeenAt)}\n  old: ${d.old}\n  new: ${d.new}\n  inputs: ${JSON.stringify(d.inputs)}`)
+    .join("\n");
+}
 
 /** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
 const normalizeLessonText = (text: string) => text.replace(/\s+/gu, " ").trim();
@@ -2411,8 +2424,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** The structured sources that will wake a binding, as the report path reads them (BB-154). */
-    function liveWakeSourceFor(b: Binding, ownPulls: ReadonlySet<string>): boolean {
-      const sources: WakeSourceInput = {
+    function wakeSourcesFor(b: Binding, ownPulls: ReadonlySet<string>): WakeSourceInput {
+      return {
         hold: b.hold,
         holdBehind: b.holdBehind,
         mergeBehind: b.mergeBehind,
@@ -2423,7 +2436,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         openNeeds: store.openNeeds(b.id).length,
         pullRequestWatch: pullWatch(b, ownPulls),
       };
-      return hasLiveWakeSource(sources);
+    }
+
+    function liveWakeSourceFor(b: Binding, ownPulls: ReadonlySet<string>): boolean {
+      return hasLiveWakeSource(wakeSourcesFor(b, ownPulls));
     }
 
     /**
@@ -3742,6 +3758,47 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-293: the shadow assessment. Computed from the rows this reconcile has
+     * already read, stored beside the predicates it will replace, and compared
+     * with them. It decides nothing; the caller wraps the call in a try/catch,
+     * so a failure here can never change the reconcile's own result.
+     */
+    function recordShadowAssessment(
+      b: Binding,
+      observed: Observed,
+      workers: readonly Worker[],
+      ownPulls: ReadonlySet<string>,
+      gateMetPulls: ReadonlySet<string>,
+      playbook: Playbook,
+      currentSpecHash: string,
+      config: ProjectConfig,
+    ): void {
+      // The decide-list mark comes from the files the snapshot already carries;
+      // no extra GitHub read. Everything else is a row already in hand.
+      const decisions = new Map<string, "project" | "user">();
+      for (const e of ownPullEntities(observed, ownPulls)) decisions.set(lc(e.key), decideForPull(e.pull?.files ?? null, config.file.bigDecisions));
+      const input: AssessmentInput = {
+        binding: b,
+        observed,
+        ownPulls,
+        gateMetPulls,
+        decisions,
+        projectApprovals: projectApprovalsFor(b),
+        workers,
+        escalations: store.openEscalations(b.id),
+        needs: store.openNeeds(b.id),
+        sources: wakeSourcesFor(b, ownPulls),
+        playbook,
+        currentSpecHash,
+        now: now(),
+      };
+      const assessment = assess(input);
+      store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
+      store.recordDivergences(compare(input, assessment));
+      store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
+    }
+
+    /**
      * One reconcile of one binding: snapshot, lifecycle, compare, and wake
      * when something actionable changed (or `force` says this is a turn
      * regardless: adoption, the nightly pass). A linked pull request that
@@ -4008,6 +4065,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const own = ownPulls.has(lc(e.key)) || (e.url !== null && e.url !== "" && ownPulls.has(lc(e.url)));
         if (!own) continue;
         if (prGate(e, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, e) }).gateMet) gateMetPulls.add(e.key.toLowerCase());
+      }
+      // BB-293: the shadow assessment, computed from the rows above. It decides
+      // nothing; a failure is logged and swallowed so the reconcile's own
+      // result never changes.
+      try {
+        recordShadowAssessment(b, observed, workers, ownPulls, gateMetPulls, playbook, currentSpec, config);
+      } catch (error) {
+        bb.log.warn(`stewards: shadow assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
       }
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
@@ -11655,6 +11720,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
               const report = await gateReport(b, ref, pull);
               return { exitCode: report.gateMet ? 0 : 1, stdout: input.options.json === true ? JSON.stringify(report) : formatGateReport(report) };
+            },
+          }),
+
+          divergences: cliCommand({
+            summary: "The shadow assessment's divergence log (BB-293), read-only",
+            description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
+            options: {
+              binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, hasLiveWakeSource, approvals.gate, approvals.pageRefusal, noWakeSource)" },
+              project: PROJECT_OPTION,
+              json: JSON_OPTION,
+            },
+            async run(input, ctx) {
+              const projectId = input.options.project ?? ctx.projectId;
+              const raw = input.options.binding;
+              const bindingId = raw === undefined ? undefined : (store.find(raw, projectId)?.id ?? raw);
+              const rows = store.divergences({ bindingId, surface: input.options.surface });
+              return { exitCode: 0, stdout: input.options.json === true ? JSON.stringify(rows) : formatDivergences(rows) };
             },
           }),
 
