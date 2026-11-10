@@ -7,6 +7,7 @@
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
 import { approvePrPageAction, deliverProjectApproval, recordProjectDecision, type ApprovalsContext } from "./approvals.js";
+import { isSelfWidening } from "./decisions.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
 import type { Binding, Need } from "./store.js";
 
@@ -141,5 +142,15 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     await expect(approvePrPageAction(ctx, b, need, "approve", null)).resolves.toMatchObject({ ok: true });
     expect(githubReview).toHaveBeenCalledTimes(1);
     expect(sendTo).not.toHaveBeenCalled();
+  });
+});
+
+// BB-280: the approve/decline recording path lives in this module, so a change
+// to it must always be the user's, whatever the decide list matched.
+describe("the approval-recording files are self-widening (BB-280)", () => {
+  it("classifies approvals.ts and approvals-store.ts as self-widening", () => {
+    for (const file of ["bb-plugins/plugins/stewards/approvals.ts", "plugins/stewards/approvals.ts", "bb-plugins/plugins/stewards/approvals-store.ts", "plugins/stewards/approvals-store.ts"]) {
+      expect(isSelfWidening([file]), file).toBe(true);
+    }
   });
 });

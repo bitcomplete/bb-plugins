@@ -86,7 +86,7 @@ import {
   type Role as StewardRole,
   type RolesFile,
 } from "./roles.js";
-import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
+import { explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
@@ -96,8 +96,8 @@ import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
-import { ESCALATED_APPROVAL_REFUSAL, latestProjectApprovalMarker, prGate, PRODUCT_APPROVAL_REFUSAL } from "./gate.js";
-import { approvePrPageAction, deliverProjectApproval, fileForwardedApprovePrNeed, markerKey, recordProjectDecision, syncPullApproval, type ApprovalsContext } from "./approvals.js";
+import { latestProjectApprovalMarker, prGate } from "./gate.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, markerKey, placeReportedPull, specApprovedByProject, syncPullApproval, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { briefGate, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -6550,6 +6550,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       wakeProject,
       pullChangedFiles,
       loadDecisions: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? [],
+      loadDecisionsOrNull: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? null,
       observedPulls,
       mechanicalStatus: patchMechanicalStatus,
     };
@@ -8829,11 +8830,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return b;
     }
 
-    const isProjectSteward = (threadId: string, b: Binding) => store.project(b.projectId).threadId === threadId;
-
     /** Whether `threadId` may steer `target`: its own steward, a steward above it, or its project steward. */
     function mayDirect(threadId: string, target: Binding): boolean {
-      if (target.threadId === threadId || isProjectSteward(threadId, target)) return true;
+      if (target.threadId === threadId || isProjectSteward(approvalsCtx, threadId, target)) return true;
       let up = target.parentBindingId === null ? null : store.binding(target.parentBindingId);
       for (let depth = 0; up !== null && depth < 10; depth++) {
         if (up.threadId === threadId) return true;
@@ -9439,7 +9438,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
-              const decision = pull === undefined ? "user" : decideForPull(await pullChangedFiles(pull), config?.file.bigDecisions ?? []);
+              const decision = pull === undefined ? "user" : await placeReportedPull(approvalsCtx, pull, config?.file.bigDecisions ?? []);
               const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
@@ -9935,36 +9934,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // missing, unknown, `user`, or the change widens the list itself.
             const prApproval = store.openEscalations(target.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline") ?? null;
             if (input.approve === true && prApproval !== null && input.entry !== undefined) {
-              if (!isProjectSteward(threadId, target)) return toolError(new Error("An owner-reviewed pull request is the project steward's to approve; a steward escalates it and waits."));
-              const config = await loadConfig(target.projectId);
-              if (config === null) return toolError(new Error("The project file could not be read, so no project-steward approval can be recorded."));
-              const observed = target.lastSnapshot;
-              const pull = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === prApproval.url) ?? null;
-              // A reviewer's owner call in the marker is binding: the project
-              // steward does not decide it, whatever entry the decide list
-              // matched, and never posts a `bb-approval` on it (BB-192). The
-              // product reason (BB-207) binds it the same way.
-              const approvalGate = pull === null ? null : prGate(pull, { projectApprovals: projectApprovalsFor(target), ...productGateOptions(target, pull) });
-              if (approvalGate !== null && approvalGate.escalated) {
-                return toolError(new Error(approvalGate.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL));
-              }
-              const files = pull === null ? null : await pullChangedFiles(pull);
-              const decision = decideFor(files, input.entry ?? null, config.file.bigDecisions);
-              if (decision !== "project") {
-                const why = decideForRefusal(files, input.entry ?? null, config.file.bigDecisions) ?? "the change is not the project steward's to approve";
-                return toolError(new Error(`That pull request is the user's to approve: ${why}. Forward it with steward_update { binding: "${target.entityKey}", forward: "${prApproval.id}", resolution: "approve-decline", recommendation } instead.`));
-              }
-              const answer = guidance ?? `Approved as ${JSON.stringify(input.entry)}.`;
-              if (pull === null) return toolError(new Error("The pull request could not be read, so the approval marker cannot be posted."));
-              try {
-                await recordProjectDecision(approvalsCtx, target, pull, threadId, { headSha: prApproval.headSha ?? "", entry: input.entry ?? null, verdict: "approved", reasoning: answer });
-              } catch (error) {
-                return toolError(error);
-              }
-              store.addGuidance(target.id, answer, threadId);
-              store.answerEscalation(prApproval.id, answer, threadId);
-              const reached = await deliverProjectApproval(approvalsCtx, target, pull, { verdict: "approved", sha: prApproval.headSha ?? "", entry: input.entry ?? null, reasoning: answer });
-              done.push(`posted the project steward's approval marker on ${prApproval.url} at ${shortSha(prApproval.headSha)} and ${reached === "worker" ? "told its worker" : "woke the steward"}`);
+              const result = await approveOwnerReviewedPull(approvalsCtx, target, prApproval, threadId, { entry: input.entry, guidance });
+              if (!result.ok) return toolError(new Error(result.error));
+              done.push(result.done);
               return `${target.entityKey}: ${done.join("; ")}.`;
             }
             if (input.approve === true) {
@@ -9975,7 +9947,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode.state} in ${target.source === "github" ? "GitHub" : "Linear"}.`));
               if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
               const entity = (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
-              const byProject = mode === "project" && isProjectSteward(threadId, target);
+              const byProject = specApprovedByProject(approvalsCtx, threadId, target, mode);
               // Criterion 3: the user's words may be an unsigned comment on the entity itself, not only a message in this thread.
               const byUser = input.quote !== undefined && ((await userSaid(threadId, input.quote)) || userApprovedOnEntity(entity, target.threadId, input.quote));
               if (!byProject && !byUser) {
@@ -10011,7 +9983,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (!covered && approval === null && resolving.kind === "approval" && resolving.resolutionKind !== "approve-decline" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
                 const config = await loadConfig(target.projectId);
                 const playbook = config === null ? null : bindingPlaybook(config, target);
-                if (playbook?.ready?.approval === "project" && isProjectSteward(threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
+                if (playbook?.ready?.approval === "project" && isProjectSteward(approvalsCtx, threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
               }
             }
             if (input.stewardModel !== undefined && target.threadId !== null) {
@@ -10224,13 +10196,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const declinePull = isDecline && target.lastSnapshot !== null ? observedPulls(target, target.lastSnapshot).find((p) => (p.url ?? p.key) === resolving.url) ?? null : null;
             const declineSha = resolving.headSha ?? declinePull?.pull?.headSha ?? null;
             if (isDecline && declinePull !== null) {
-              const entry = input.entry ?? null;
               try {
-                await recordProjectDecision(approvalsCtx, target, declinePull, threadId, { headSha: declineSha ?? "", entry, verdict: "declined", reasoning: guidance ?? "" });
+                await declineOwnerReviewedPull(approvalsCtx, target, declinePull, threadId, { headSha: declineSha, entry: input.entry ?? null, reasoning: guidance ?? "" });
               } catch (error) {
                 return toolError(error);
               }
-              await deliverProjectApproval(approvalsCtx, target, declinePull, { verdict: "declined", sha: declineSha ?? "", entry, reasoning: guidance ?? "" });
             }
             // Already resolved (the binding ended, a retry) is no error: the answer is added to the record.
             const outcome = store.answerEscalation(resolving.id, guidance!, threadId);
@@ -10265,7 +10235,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 done.push(`recorded the decline's ${objections.length} objection(s) for the steward's checklist`);
               }
             }
-            if (resolving.status === "open") done.push(`resolved ${resolving.id}${isProjectSteward(threadId, target) ? "; if this is a general judgement the playbook should carry, record it with steward_update { lesson: { text, file, scope } }" : ""}`);
+            if (resolving.status === "open") done.push(`resolved ${resolving.id}${isProjectSteward(approvalsCtx, threadId, target) ? "; if this is a general judgement the playbook should carry, record it with steward_update { lesson: { text, file, scope } }" : ""}`);
             else if (outcome === "appended") done.push(`recorded the answer on ${resolving.id}, which was already resolved (${resolving.resolution ?? "no answer"})`);
             else done.push(`${resolving.id} already has this answer`);
             if (outcome !== "unchanged") notes.push(`Escalation ${resolving.id} decided: ${guidance}`);
@@ -10281,7 +10251,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const stackNote = stackKeys.length === 0 ? "" : ` (stacked on ${stackKeys.join(", ")}: lifts itself once ${stackKeys.length === 1 ? "its pull request opens" : "their pull requests open"})`;
             const what = [input.priority === undefined ? null : `priority ${input.priority}`, input.hold === undefined ? null : input.hold === "" ? "hold lifted" : `on hold: ${input.hold}${behindNote}${stackNote}`].filter((s) => s !== null).join("; ");
             done.push(what);
-            notes.push(`Set by your ${isProjectSteward(threadId, target) ? "project" : "parent"} steward: ${what}`);
+            notes.push(`Set by your ${isProjectSteward(approvalsCtx, threadId, target) ? "project" : "parent"} steward: ${what}`);
             // A hold answers an open scheduling request. A hold lifted by hand closes it too; the next look asks again if it must.
             if (input.hold !== undefined) {
               for (const x of store.openEscalations(target.id).filter((e) => e.kind === "schedule")) store.resolve(x.id, input.hold === "" ? "Hold lifted." : stackKeys.length > 0 ? `Stacked on ${stackKeys.join(", ")}.` : behindKeys.length === 0 ? `Held: ${input.hold}` : `Held behind ${behindKeys.join(", ")}.`);

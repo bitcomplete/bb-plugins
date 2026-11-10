@@ -7,12 +7,12 @@
 //
 // The functions take an `ApprovalsContext` rather than the server's whole
 // closure, so nothing here reads the plugin's config or snapshots on its own.
-import { type BigDecision, explainDecision, formatDecisionListing } from "./decisions.js";
+import { type BigDecision, decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type DecideMark } from "./decisions.js";
 import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
 import { productGateOptions, productReason, workerInFlight, type MechanicalEvent } from "./reconcile.js";
 import { signatureLine, type EntitySnapshot, type Source } from "./source-contract.js";
-import type { Binding, Need, Observed, Store } from "./store.js";
+import type { Binding, Escalation, Need, Observed, Store } from "./store.js";
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -34,6 +34,8 @@ export type ApprovalsContext = {
   wakeProject: (projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[] }) => Promise<void>;
   pullChangedFiles: (entity: EntitySnapshot) => Promise<string[] | null>;
   loadDecisions: (projectId: string) => Promise<readonly BigDecision[]>;
+  /** The project's decide list, or null when the project file could not be read (BB-280). */
+  loadDecisionsOrNull: (projectId: string) => Promise<readonly BigDecision[] | null>;
   observedPulls: (b: Binding, observed: Observed) => EntitySnapshot[];
   /** Write the status the plugin observed itself, without a steward turn (BB-203). */
   mechanicalStatus: (b: Binding, event: MechanicalEvent) => void;
@@ -118,6 +120,75 @@ export async function recordProjectDecision(ctx: ApprovalsContext, b: Binding, p
   const commentId = await postApprovalMarker(ctx, pull, threadId, fields);
   ctx.store.recordProjectApproval({ bindingId: b.id, headSha: fields.headSha, entry: fields.entry, byThread: threadId, commentId, verdict: fields.verdict });
   return { commentId };
+}
+
+/** Whether `threadId` is the thread of `b`'s project steward (BB-280). */
+export const isProjectSteward = (ctx: ApprovalsContext, threadId: string, b: Binding): boolean => ctx.store.project(b.projectId).threadId === threadId;
+
+/**
+ * Whether the project steward's thread may approve `b`'s spec under the
+ * playbook's `mode`: `project` and the project steward's own thread. `user` is
+ * the user's, recorded by quoting their words (BB-280; this acceptance was in
+ * server.ts before).
+ */
+export const specApprovedByProject = (ctx: ApprovalsContext, threadId: string, b: Binding, mode: "project" | "user"): boolean => mode === "project" && isProjectSteward(ctx, threadId, b);
+
+/**
+ * The decide-list placement of a pull request a steward is reporting:
+ * `decideForPull` on its changed files, so a steward cannot file the user's
+ * item for the project steward's lane (BB-51, BB-280).
+ */
+export const placeReportedPull = async (ctx: ApprovalsContext, pull: EntitySnapshot, decisions: readonly BigDecision[]): Promise<DecideMark> => decideForPull(await ctx.pullChangedFiles(pull), decisions);
+
+/** The outcome of the project steward's decision on an owner-reviewed pull request from `steward_update`. */
+export type ProjectPullDecision = { ok: true; done: string } | { ok: false; error: string };
+
+/**
+ * Record the project steward's approval of an owner-reviewed pull request
+ * (`steward_update { approve: true, entry }`): the isProjectSteward check, the
+ * reviewer's owner call refusal, the decide-list placement, the marker and the
+ * delivery. The decide list comes from the context, null when the project file
+ * could not be read. The whole path was in server.ts before (BB-280).
+ */
+export async function approveOwnerReviewedPull(ctx: ApprovalsContext, b: Binding, prApproval: Escalation, threadId: string, fields: { entry: string | null; guidance: string | undefined }): Promise<ProjectPullDecision> {
+  if (!isProjectSteward(ctx, threadId, b)) return { ok: false, error: "An owner-reviewed pull request is the project steward's to approve; a steward escalates it and waits." };
+  const decisions = await ctx.loadDecisionsOrNull(b.projectId);
+  if (decisions === null) return { ok: false, error: "The project file could not be read, so no project-steward approval can be recorded." };
+  const observed = b.lastSnapshot;
+  const pull = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === prApproval.url) ?? null;
+  // A reviewer's owner call in the marker is binding: the project steward does
+  // not decide it, whatever entry the decide list matched, and never posts a
+  // `bb-approval` on it (BB-192). The product reason (BB-207) binds it the same way.
+  const approvalGate = pull === null ? null : prGate(pull, { projectApprovals: ctx.store.projectApprovals(b.id), ...productGateOptions(b, pull) });
+  if (approvalGate !== null && approvalGate.escalated) return { ok: false, error: approvalGate.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL };
+  const files = pull === null ? null : await ctx.pullChangedFiles(pull);
+  const decision = decideFor(files, fields.entry, decisions);
+  if (decision !== "project") {
+    const why = decideForRefusal(files, fields.entry, decisions) ?? "the change is not the project steward's to approve";
+    return { ok: false, error: `That pull request is the user's to approve: ${why}. Forward it with steward_update { binding: "${b.entityKey}", forward: "${prApproval.id}", resolution: "approve-decline", recommendation } instead.` };
+  }
+  const answer = fields.guidance ?? `Approved as ${JSON.stringify(fields.entry)}.`;
+  if (pull === null) return { ok: false, error: "The pull request could not be read, so the approval marker cannot be posted." };
+  try {
+    await recordProjectDecision(ctx, b, pull, threadId, { headSha: prApproval.headSha ?? "", entry: fields.entry, verdict: "approved", reasoning: answer });
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  ctx.store.addGuidance(b.id, answer, threadId);
+  ctx.store.answerEscalation(prApproval.id, answer, threadId);
+  const reached = await deliverProjectApproval(ctx, b, pull, { verdict: "approved", sha: prApproval.headSha ?? "", entry: fields.entry, reasoning: answer });
+  return { ok: true, done: `posted the project steward's approval marker on ${prApproval.url} at ${ctx.shortSha(prApproval.headSha)} and ${reached === "worker" ? "told its worker" : "woke the steward"}` };
+}
+
+/**
+ * Record the project steward's decline of an owner-reviewed pull request that
+ * resolves an `approve-decline` escalation: the marker first, then the
+ * delivery, so a GitHub failure leaves the request open to retry rather than
+ * recording a decision nobody can see. The path was in server.ts before (BB-280).
+ */
+export async function declineOwnerReviewedPull(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, threadId: string, fields: { headSha: string | null; entry: string | null; reasoning: string }): Promise<void> {
+  await recordProjectDecision(ctx, b, pull, threadId, { headSha: fields.headSha ?? "", entry: fields.entry, verdict: "declined", reasoning: fields.reasoning });
+  await deliverProjectApproval(ctx, b, pull, { verdict: "declined", sha: fields.headSha ?? "", entry: fields.entry, reasoning: fields.reasoning });
 }
 
 /**
