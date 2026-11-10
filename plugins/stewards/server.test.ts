@@ -14616,4 +14616,38 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     await t.flush();
     expect(stuckOf()).toHaveLength(0);
   });
+
+  it("does not raise the retarget stuck on the look that first sends the wake", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    // The base is open, so the binding is held and quiet for hours.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base" }, { head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12")!;
+    t.advance(5 * 60 * 60_000);
+    // The base merges: this look sends the retarget wake and must not also
+    // raise a stall for the wake it just sent.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.retargetPulls).toEqual(["acme/web#8"]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "retarget")).toHaveLength(0);
+  });
+
+  it("counts a worker-reported own pull request as a wake source when its branch does not name the ticket", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ title: "A fix", comments: [] }, { head: "feature/unrelated", checks: { state: "pending", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // A finished worker's result names the pull request, so it is the ticket's
+    // own even though neither its branch nor its title names the ticket.
+    await t.created("thr_w1", b.threadId!, "ENG-12: Implement", { branchName: "feature/other" });
+    t.hooks.store.setWorker("thr_w1", "finished", "Opened https://github.com/acme/web/pull/7 for ENG-12.");
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the reviewer's reply", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+  });
 });
