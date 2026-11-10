@@ -95,7 +95,7 @@ function workerThreadFor(ctx: ApprovalsContext, b: Binding, entity: EntitySnapsh
  * (BB-279). Returns `worker` when it was told, `steward` when it had ended and
  * the ticket steward must be woken instead.
  */
-async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }, actor: "project steward" | "owner"): Promise<"worker" | "steward"> {
+export async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }, actor: "project steward" | "owner"): Promise<"worker" | "steward"> {
   const thread = workerThreadFor(ctx, b, entity);
   const info = thread === null ? null : await ctx.threadInfo(thread).catch(() => null);
   const label = decision.verdict === "approved" ? "approved" : "declined";

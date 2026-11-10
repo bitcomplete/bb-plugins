@@ -42,11 +42,13 @@ import {
   labelAlreadyExists,
   labelPath,
   parseCompare,
+  parseDefaultBranch,
   parseDependabotAlerts,
   parseDeploymentStatus,
   parseDeployments,
   parseFileAtRef,
   parseLatestCommit,
+  parseMergeBaseIsDefaultTip,
   parseOpenIssues,
   parseOpenPulls,
   parseRef,
@@ -180,14 +182,36 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
      * its other fields survive (BB-244).
      */
     async function readSnapshot(ref: { repo: string; number: number }, signal: AbortSignal): Promise<EntitySnapshot | null> {
+      let payload: unknown;
+      let snapshot: EntitySnapshot | null;
       try {
-        return parseSnapshot(await readTargetDocument(TARGET_QUERY, ref, signal));
+        payload = await readTargetDocument(TARGET_QUERY, ref, signal);
+        snapshot = parseSnapshot(payload);
       } catch (error) {
         try {
-          return parseSnapshot(await readTargetDocument(TARGET_QUERY_BASE, ref, signal), true);
+          payload = await readTargetDocument(TARGET_QUERY_BASE, ref, signal);
+          snapshot = parseSnapshot(payload, true);
         } catch {
           throw error;
         }
+      }
+      if (snapshot === null || snapshot.pull === null || snapshot.pull === undefined) return snapshot;
+      // BB-279: the retarget rule fires only when the base ref changed after
+      // the approval, so the merge-base is read only then. A read that fails,
+      // or a read that does not name the default branch, leaves the field null,
+      // which the gate reads as "cannot tell" and fails closed. A pull request
+      // based on the default branch throughout that is merely behind never
+      // triggers the read, and stays gate-met.
+      if ((snapshot.pull.baseChangedAt ?? null) === null) return snapshot;
+      const defaultBranch = parseDefaultBranch(payload);
+      const headSha = snapshot.pull.headSha;
+      if (defaultBranch === null || headSha === null) return snapshot;
+      try {
+        const body = (await restPage(comparePath(snapshot.unit, defaultBranch, headSha), signal)).body;
+        return { ...snapshot, pull: { ...snapshot.pull, headMergeBaseIsDefaultTip: parseMergeBaseIsDefaultTip(body) } };
+      } catch (error) {
+        bb.log.warn(`github-watcher: could not read the merge base of ${snapshot.key} with ${defaultBranch} (${errorMessage(error)}); the gate fails closed`);
+        return snapshot;
       }
     }
 

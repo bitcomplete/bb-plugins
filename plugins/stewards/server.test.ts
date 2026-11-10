@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { PROJECT_CHANGED } from "./channels.js";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { ROLES_FILE } from "./roles.js";
-import { comment, crashingPod, githubIssue, issue, pull, warningEvent } from "./fixtures.js";
+import { comment, crashingPod, githubIssue, issue, parkedWorker, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
@@ -6791,6 +6791,18 @@ describe("needs you items", () => {
     return { ...t, project, steward, binding: () => t.hooks.store.find("ENG-12")! };
   }
 
+  /**
+   * Park a worker in the store with the shared `parkedWorker` fixture (BB-279):
+   * `finished` is the parked status, still in flight for delivery. The
+   * gate-met tests run this variant so a parked worker is exercised, not only
+   * a running one.
+   */
+  function parkWorker(t: { hooks: { store: { setWorker: (threadId: string, status: "finished", result: string | null) => void } } }, threadId: string, over: Partial<ReturnType<typeof parkedWorker>> = {}): ReturnType<typeof parkedWorker> {
+    const w = parkedWorker({ threadId, ...over });
+    t.hooks.store.setWorker(w.threadId, "finished", w.result);
+    return w;
+  }
+
   it("files approve-spec for approval: me; the page action records the approval, closes it and wakes the steward", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
@@ -7267,7 +7279,7 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
-  it("a finished worker keeps deferring the plugin merge while another own pull request is open (BB-266)", async () => {
+  it("a finished worker keeps deferring the plugin merge while another own pull request is open, and is woken instead of deferring silently (BB-266, BB-279)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [
       { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
@@ -7277,17 +7289,29 @@ describe("needs you items", () => {
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     t.entities.set("acme/api#8", pull({ id: "acme/api#8", key: "acme/api#8", url: "https://github.com/acme/api/pull/8", title: "Add api retry (ENG-12)" }, { head: "bb/eng-12-api", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement both");
-    t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval of acme/web#7 and acme/api#8.");
+    parkWorker(t, "thr_w1", { result: "Waiting on the owner's approval of acme/web#7 and acme/api#8." });
     t.threads.get("thr_w1")!.status = "idle";
     // The owner approves #7. The plugin must not merge it while #8 is still
     // open, and must not retire the worker that owns the landing order.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
+    await t.flush();
     expect(t.githubMerges).toEqual([]);
     expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "finished" });
     expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    // BB-279: it never defers silently. The Merge item is filed for the worker
+    // to press if it will not merge itself, and the parked worker is woken
+    // with the approval through the delivery path the page uses.
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    expect(t.sends.filter((s) => s.threadId === "thr_w1").some((s) => /The owner approved acme\/web#7/u.test(s.text) && /merge it now/u.test(s.text))).toBe(true);
+    // A second look at the same gate does not wake the worker again.
+    const wakes = t.sends.filter((s) => s.threadId === "thr_w1").length;
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === "thr_w1").length).toBe(wakes);
     // #7 has landed; #8 is now the only open own pull request, so the plugin
     // merges it and retires the parked worker.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner], state: "merged" }, { head: "bb/eng-12-retry", merged: true, checks: { state: "success", failing: [] } }));
@@ -7296,6 +7320,36 @@ describe("needs you items", () => {
     expect(t.githubMerges).toHaveLength(1);
     expect(t.githubMerges[0]).toMatchObject({ repo: "acme/api", number: 8 });
     expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+  });
+
+  it("delivers an owner page approval to the parked worker through the same path (BB-279)", async () => {
+    // The pull request is the signed-in account's own, so the page posts the
+    // unsigned approval comment and then delivers it, exactly as the project
+    // steward's decision is delivered.
+    const t = await withPull([marker], {}, { author: "jane" });
+    const b = t.binding();
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    parkWorker(t, "thr_w1", { result: "Waiting on the owner's approval." });
+    t.threads.get("thr_w1")!.status = "idle";
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
+    expect(res).toMatchObject({ ok: true });
+    expect(t.githubComments.some((c) => /Approved aaaaaaa1 from the Stewards page/u.test(c.body))).toBe(true);
+    expect(t.sends.filter((s) => s.threadId === "thr_w1").some((s) => /The owner approved acme\/web#7/u.test(s.text) && /merge it now/u.test(s.text))).toBe(true);
+  });
+
+  it("refuses a retargeted, un-rebased head whose base changed after approval, and merges a merely-behind one (BB-279)", async () => {
+    // The base ref changed after the approval and the head is not based on the
+    // default branch tip: the approval is stale, so the gate is not met and
+    // the plugin does not merge.
+    const stale = await withPull([marker, owner], { baseChangedAt: "2026-10-15T00:00:00Z", headMergeBaseIsDefaultTip: false, checks: { state: "success", failing: [] } });
+    expect(stale.githubMerges).toEqual([]);
+    expect(stale.hooks.store.openNeeds(stale.binding().id).find((n) => n.kind === "merge")).toBeUndefined();
+    // A pull request based on the default branch throughout that is merely
+    // behind never had its base change, so it keeps its approval and merges.
+    const behind = await withPull([marker, owner], { baseChangedAt: null, headMergeBaseIsDefaultTip: false, checks: { state: "success", failing: [] } });
+    expect(behind.githubMerges).toHaveLength(1);
   });
 
   it("a finished worker does not suppress the fallback Merge item when the playbook omits merge (BB-266)", async () => {
@@ -13613,6 +13667,27 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const res = await page.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, { experimental_caller: { kind: "client" } });
     expect(res).toMatchObject({ ok: true });
     expect(page.githubDispatches).toEqual([{ repo: "bitcomplete/bb-gate", workflow: "bb-server.yaml", ref: "main", inputs: { only_if_moved: "true" } }]);
+  });
+
+  it("refuses to merge a pull request whose base is not the default branch, naming the base and running no mergeDispatch (BB-279)", async () => {
+    const project = { version: 1, linear: { teams: ["ENG"] }, mergeDispatch: [{ repo: "acme/web", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] };
+    // The CLI path: the shared predicate refuses, so no merge and no dispatch.
+    const t = await withPull([reviewMarker("no-review")], { project, noReconcileGate: true, pullOver: { base: "bb/bb-256-parent" } });
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(1);
+    expect(merged.stdout).toMatch(/base is "bb\/bb-256-parent", not the default branch "main"/u);
+    expect(t.githubMerges).toEqual([]);
+    expect(t.githubDispatches).toEqual([]);
+
+    // The Stewards page's Merge item takes the same predicate.
+    const page = await withPull([reviewMarker("no-review")], { project, noReconcileGate: true, pullOver: { base: "bb/bb-256-parent" } });
+    const b = page.binding();
+    page.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+    const need = page.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
+    const res = await page.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: false, message: expect.stringMatching(/base is "bb\/bb-256-parent", not the default branch "main"/u) });
+    expect(page.githubMerges).toEqual([]);
+    expect(page.githubDispatches).toEqual([]);
   });
 
   it("reads the ref from the workflow repo's default branch when the entry names none (BB-216)", async () => {
