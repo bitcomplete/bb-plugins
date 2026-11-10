@@ -6904,6 +6904,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // is judged on this set, never on the one the loop mutates, so the look
       // that first sends the wake cannot also raise the stall.
       const retargetSentBefore = new Set(retargetBefore);
+      // BB-287: the open pull requests stacked on this binding's own pull
+      // requests, and the stacked pull requests already woken about after
+      // closing with their base branch gone.
+      const stackedOnMe: string[] = [];
+      const recoveredPulls = [...b.stackedRecovered];
+      const recoveredBefore = new Set(recoveredPulls.map((k) => lc(k)));
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
@@ -6921,10 +6927,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (hadApprove && !closed && (g.ownerApproved || g.projectApproved) && !store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url)) {
           events.push({ kind: "approved", pull: pull.key });
         }
-        if (closed) {
-          store.closeNeedByKey(b.id, "merge", url, "The pull request is closed.");
-          continue;
-        }
+        const ref = parsePullRef(pull.url ?? pull.key) ?? parsePullRef(url);
         // BB-170: on a teammate's pull request (a review steward), the owner's
         // approval is their last step and the author merges, so the plugin
         // files no Merge item. A review binding is a teammate's pull request by
@@ -6937,6 +6940,50 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           !dependencyBot &&
           !playbook.ownerMerges &&
           (b.kind === "review" || (b.kind === "pr" && pull.author !== null && ownerLogin !== null && lc(pull.author) !== lc(ownerLogin)));
+        if (closed) {
+          store.closeNeedByKey(b.id, "merge", url, "The pull request is closed.");
+          // BB-287: a stacked pull request GitHub closed because its base
+          // branch was deleted gets a recovery wake, once per pull request.
+          if (!foreignOwner && pull.pull?.merged !== true && lc(pull.state) === "closed" && !recoveredBefore.has(lc(pull.key))) {
+            const recovery = await stackedCloseRecovery(pull, ref);
+            if (recovery !== null) {
+              changes.push({ text: recovery, actionable: true });
+              recoveredPulls.push(pull.key);
+              recoveredBefore.add(lc(pull.key));
+            }
+          }
+          continue;
+        }
+        // BB-287: what is stacked on this open pull request. The binding whose
+        // pull request is the base of another open one is told, so its worker
+        // does not delete the branch and close the stacked pull request.
+        if (!foreignOwner && ref !== null && typeof pull.pull?.head === "string" && pull.pull.head !== "") {
+          const stacked = await github.openPullsByBase(ref.repo, pull.pull.head).catch(() => []);
+          for (const s of stacked) {
+            if (lc(s.key) === lc(pull.key)) continue;
+            stackedOnMe.push(s.key);
+            if (!b.stackedPulls.some((x) => lc(x) === lc(s.key))) {
+              changes.push({ text: `Base of open pull request: ${s.key} is stacked on ${pull.key}. Do not delete ${pull.key}'s branch until ${s.key} is retargeted or closed: before deleting any branch run \`gh pr list --base <branch> --state open\` and leave a branch that is the base of an open pull request.`, actionable: true });
+            }
+          }
+        }
+        // BB-287: the stacked-PR disposition is read for every open own pull
+        // request, not only a gate-met one, so a base merge (and the retarget
+        // it needs) reaches the steward whatever the gate state.
+        const base = bindingMayMerge(b, playbook) && ref !== null && !foreignOwner ? await pullBaseDisposition(ref, pull) : null;
+        const openBase = base !== null && base.kind === "open" ? base : null;
+        const mergedBase = base !== null && base.kind === "merged" ? base : null;
+        if (openBase !== null) derivedMergeBehind.push(openBase.key);
+        // BB-264/BB-287: the stacked-PR wakes fire whatever the gate state.
+        if (openBase !== null && !heldBefore.has(lc(openBase.key))) {
+          changes.push({ text: `Merge held: ${pull.key} is stacked on ${openBase.key}, which is still open. The plugin files no Merge item; it merges once the base lands and the pull request is retargeted to the default branch.`, actionable: true });
+        }
+        if (mergedBase !== null && !retargetBefore.has(lc(mergedBase.key))) {
+          const prRef = ref === null ? pull.key : `${ref.repo}#${ref.number}`;
+          changes.push({ text: `Retarget ${pull.key}: its base ${mergedBase.key} has merged. Rebase it onto the default branch (\`git fetch origin && git rebase --onto origin/<default> <old base head>\`), push, then retarget it (\`gh pr edit ${prRef} --base <default>\`); the plugin merges it once the default branch is its base and the checks on the new head are green.`, actionable: true });
+          retargetPulls.push(mergedBase.key);
+          retargetBefore.add(lc(mergedBase.key));
+        }
         if (g.gateMet) {
           // BB-285: whether this look merged the pull request, so the
           // gate-met-with-nobody-acting check below does not race its own merge.
@@ -6948,11 +6995,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // steward-filed item (a refused merge) is always left alone.
           // BB-264: an open base pull request is the same hold, derived from
           // the pull request's base rather than reported.
-          const ref = parsePullRef(pull.url ?? pull.key) ?? parsePullRef(url);
-          const base = bindingMayMerge(b, playbook) && ref !== null && !foreignOwner ? await pullBaseDisposition(ref, pull) : null;
-          const openBase = base !== null && base.kind === "open" ? base : null;
-          const mergedBase = base !== null && base.kind === "merged" ? base : null;
-          if (openBase !== null) derivedMergeBehind.push(openBase.key);
           const mergeHeld = userMergeBehind.length > 0 || openBase !== null;
           if (foreignOwner) {
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
@@ -6964,9 +7006,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const held = [...userMergeBehind, ...(openBase === null ? [] : [openBase.key])];
               store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : held).join(", ")}`);
             }
-            if (openBase !== null && !heldBefore.has(lc(openBase.key))) {
-              changes.push({ text: `Merge held: ${pull.key} is stacked on ${openBase.key}, which is still open. The plugin files no Merge item; it merges once the base lands and the pull request is retargeted to the default branch.`, actionable: true });
-            }
           } else if (mergedBase !== null) {
             // BB-264: GitHub does not retarget a stacked pull request when its
             // base merges (the branch survives), so the base is the head of a
@@ -6977,12 +7016,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // old one are still green.
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) store.closeNeed(open.id, `The base ${mergedBase.key} has merged; retarget to the default branch.`);
-            if (!retargetBefore.has(lc(mergedBase.key))) {
-              const prRef = ref === null ? pull.key : `${ref.repo}#${ref.number}`;
-              changes.push({ text: `Retarget ${pull.key}: its base ${mergedBase.key} has merged. Rebase it onto the default branch (\`git fetch origin && git rebase --onto origin/<default> <old base head>\`), push, then retarget it (\`gh pr edit ${prRef} --base <default>\`); the plugin merges it once the default branch is its base and the checks on the new head are green.`, actionable: true });
-              retargetPulls.push(mergedBase.key);
-              retargetBefore.add(lc(mergedBase.key));
-            }
             // BB-285: a retarget wake nobody answered. Once the wake has been
             // sent (recorded in retargetPulls) and the pull request is still
             // based on the merged branch after the window, escalate `stuck`.
@@ -7086,6 +7119,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const nextRetargetPulls = retargetPulls.slice(-20);
       if (nextRetargetPulls.length !== b.retargetPulls.length || nextRetargetPulls.some((k, i) => k !== b.retargetPulls[i])) {
         b = store.patch(b.id, { retargetPulls: nextRetargetPulls });
+      }
+      // BB-287: what is stacked on this binding's pull requests, so `bb
+      // stewards show` and the sidebar carry it; and the stacked pull requests
+      // already given a recovery wake.
+      const nextStackedPulls = [...new Set(stackedOnMe)].slice(-20);
+      if (nextStackedPulls.length !== b.stackedPulls.length || nextStackedPulls.some((k, i) => k !== b.stackedPulls[i])) {
+        b = store.patch(b.id, { stackedPulls: nextStackedPulls });
+      }
+      const nextRecoveredPulls = recoveredPulls.slice(-20);
+      if (nextRecoveredPulls.length !== b.stackedRecovered.length || nextRecoveredPulls.some((k, i) => k !== b.stackedRecovered[i])) {
+        b = store.patch(b.id, { stackedRecovered: nextRecoveredPulls });
       }
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
       // BB-231: a gate item filed this look may cover an open route-`user`
@@ -8009,6 +8053,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (basePull.merged) return { kind: "merged", key: basePull.key };
       if (lc(basePull.state) === "open") return { kind: "open", key: basePull.key };
       return { kind: "other" };
+    }
+
+    /**
+     * BB-287: the recovery wake for a stacked pull request GitHub closed
+     * because its base branch was deleted (`delete_branch_on_merge`, or a hand
+     * deletion). Null when the pull request is not closed unmerged, is not
+     * stacked, or its base branch still exists. The text names the base branch
+     * and the sha to restore it at, and says the approvals carry. A read that
+     * fails is treated as the branch existing, so a transient error never
+     * fires the recovery.
+     */
+    async function stackedCloseRecovery(pull: EntitySnapshot, ref: { repo: string; number: number } | null): Promise<string | null> {
+      if (ref === null) return null;
+      const base = pull.pull?.base ?? null;
+      if (base === null || base === "") return null;
+      const def = await github.defaultBranch(ref.repo).catch(() => null);
+      if (def !== null && def === base) return null;
+      const exists = await github.branchExists(ref.repo, base).catch(() => true);
+      if (exists) return null;
+      const basePull = await github.pullByHead(ref.repo, base).catch(() => null);
+      const sha = basePull?.headSha ?? null;
+      const at = sha === null ? "the base branch's last commit" : `\`${sha}\``;
+      const command = sha === null ? `git push origin <sha>:refs/heads/${base}` : `git push origin ${sha}:refs/heads/${base}`;
+      return `Stacked pull request closed: restore the branch at ${at}, reopen or replace, approvals carry. ${pull.key} closed unmerged and its base branch ${base} is gone; restore it with \`${command}\`, then reopen ${pull.key} (or open a replacement) and retarget it to the default branch.`;
     }
 
     /**
@@ -10533,7 +10601,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   ? `cannot read the target: ${sentry.error}`
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");

@@ -625,7 +625,15 @@ export const MERGE_BEHIND_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN merge_b
 // Additive and defaulted: an old row reads as nothing woken yet.
 export const RETARGET_PULLS_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN retarget_pulls TEXT NOT NULL DEFAULT '[]'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS];
+// BB-287: stacked pull requests visible for their whole life. `stacked_pulls`
+// is the open pull requests stacked on this binding's own pull request, so the
+// binding is told its branch is a base and must not be deleted;
+// `stacked_recovered` is the stacked pull requests already woken about after
+// closing unmerged with their base branch gone, so the recovery wake is once
+// per pull request. Additive and defaulted: an old row reads as neither.
+export const STACKED_PULLS_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN stacked_pulls TEXT NOT NULL DEFAULT '[]'`, `ALTER TABLE bindings ADD COLUMN stacked_recovered TEXT NOT NULL DEFAULT '[]'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -795,6 +803,10 @@ export type Binding = {
   mergeBehind: string[];
   /** Base pull request keys this binding has already been woken to retarget (BB-264), so a stacked pull request whose base has merged is retargeted once. */
   retargetPulls: string[];
+  /** Open pull requests stacked on this binding's own pull request (BB-287), so its worker is told not to delete the branch that is their base. */
+  stackedPulls: string[];
+  /** Stacked pull requests already woken about after closing unmerged with their base branch gone (BB-287), so the recovery wake is once per pull request. */
+  stackedRecovered: string[];
   /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
   holdStack: string[];
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
@@ -904,6 +916,8 @@ function rowToBinding(r: BindingRow): Binding {
     holdBehind: json(z.array(z.string()), str("hold_behind"), []),
     mergeBehind: json(z.array(z.string()), str("merge_behind"), []),
     retargetPulls: json(z.array(z.string()), str("retarget_pulls"), []),
+    stackedPulls: json(z.array(z.string()), str("stacked_pulls"), []),
+    stackedRecovered: json(z.array(z.string()), str("stacked_recovered"), []),
     holdStack: json(z.array(z.string()), str("hold_stack"), []),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
@@ -974,6 +988,8 @@ const COLUMNS = {
   holdBehind: "hold_behind",
   mergeBehind: "merge_behind",
   retargetPulls: "retarget_pulls",
+  stackedPulls: "stacked_pulls",
+  stackedRecovered: "stacked_recovered",
   holdStack: "hold_stack",
   scheduleAsked: "schedule_asked",
   clearedToStart: "cleared_to_start",
@@ -1040,6 +1056,7 @@ const VISIBLE_COLUMNS = [
   "hold",
   "hold_behind",
   "merge_behind",
+  "stacked_pulls",
   "hold_stack",
   "status",
   "pending",
