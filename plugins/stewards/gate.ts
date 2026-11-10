@@ -3,11 +3,123 @@
 // `bb-approval` marker and its plugin-recorded comment id, all read from one
 // snapshot. Pure, and kept in its own module because this is the code a change
 // may not widen by itself: a pull request that touches this file is always the
-// owner's, whatever the decide list says (BB-153). It reads the reviewer marker
-// and the approval words from reconcile.ts; reconcile.ts reads `isMarkerComment`
-// back, the one cycle, which ESM function hoisting makes safe.
-import { classifyApproval, latestReviewMarker, productReason, reviewMarker, type ReviewMarker } from "./reconcile.js";
+// owner's, whatever the decide list says (BB-153). It owns the reviewer's
+// marker and the approval words, so it reads nothing back from reconcile.ts
+// (BB-280).
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
+
+// ---- the reviewer's marker and the approval words -----------------------------------
+
+/**
+ * A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the
+ * first line of a comment. `lane` is null when the marker did not name one
+ * (the gate then treats the pull request as the owner's). `approver` is the
+ * optional `approver=owner|project` attribute; it is undefined when the marker
+ * did not name one, and the gate then reads it as `owner` (fail closed,
+ * BB-192). `substantial` is the reviewer's diff judgment (BB-207), null when
+ * the marker did not name one; `ticketApprovedSpec` is whether a ticket the
+ * pull request references has an approved spec, the ack that spares the owner
+ * the product ask, false when the marker did not say so (fail closed).
+ */
+export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null; approver?: string; substantial: boolean | null; ticketApprovedSpec: boolean };
+
+const REVIEW_MARKER = /^<!--\s*bb-review\b([^>]*?)-->/u;
+
+/** The verdict a marker without `verdict=` is read as: never `approved`. */
+export const UNREADABLE_VERDICT = "unreadable";
+/**
+ * The reviewer's marker on a comment, or null for any other comment. Any
+ * first line that opens a `bb-review` comment is a marker, however it is
+ * spelled: a round whose keys are missing or misspelled still closes the
+ * gate, because the alternative is to read the previous round's `approved`
+ * as the latest word. A missing `verdict=` is read from a bare word in the
+ * marker (`changes-requested`) and otherwise is `unreadable`; neither is
+ * `approved`.
+ */
+export function reviewMarker(body: string): ReviewMarker | null {
+  const first = body.split("\n", 1)[0]!.trim();
+  const m = REVIEW_MARKER.exec(first);
+  if (m === null) return null;
+  const keyed = new Map<string, string>();
+  const bare: string[] = [];
+  for (const token of m[1]!.trim().split(/\s+/u).filter((t) => t !== "")) {
+    const eq = token.indexOf("=");
+    if (eq > 0) keyed.set(token.slice(0, eq).toLowerCase(), token.slice(eq + 1));
+    else bare.push(token);
+  }
+  const round = Number(keyed.get("round") ?? "");
+  // BB-207: `substantial=yes|no` is the reviewer's diff judgment, absent is
+  // unjudged; `spec=yes` says a referenced ticket has an approved spec.
+  const substantial = keyed.get("substantial");
+  return {
+    round: Number.isInteger(round) && round > 0 ? round : 0,
+    sha: keyed.get("sha") ?? "",
+    verdict: keyed.get("verdict") ?? bare[0] ?? UNREADABLE_VERDICT,
+    lane: keyed.get("lane") ?? null,
+    approver: keyed.get("approver"),
+    substantial: substantial === "yes" ? true : substantial === "no" ? false : null,
+    ticketApprovedSpec: keyed.get("spec") === "yes",
+  };
+}
+
+/** The newest reviewer marker in a comment list, by comment time. */
+export function latestReviewMarker(comments: readonly SnapshotComment[]): ReviewMarker | null {
+  let at = "";
+  let latest: ReviewMarker | null = null;
+  for (const c of comments) {
+    const m = reviewMarker(c.body);
+    if (m !== null && c.createdAt >= at) {
+      at = c.createdAt;
+      latest = m;
+    }
+  }
+  return latest;
+}
+
+/**
+ * The product reason a pull request's owner lane carries (BB-207): the review
+ * binding was judged `substantial` from the diff, and no ticket it references
+ * has an approved spec. `substantial` is the binding's ready-gate judgment;
+ * null (unjudged) and false leave every lane exactly as today, which is what
+ * keeps the change inert until a reviewer reports a verdict. A referenced
+ * ticket with an approved spec is the existing ack, so the owner is not asked
+ * again. The reason is a property of the pull request, never of a commit: a
+ * later push only re-asks when it changed scope or behaviour.
+ */
+export function productReason(substantial: boolean | null, ticketApprovedSpec: boolean): "product" | null {
+  return substantial === true && !ticketApprovedSpec ? "product" : null;
+}
+
+// ---- approval words -------------------------------------------------------------------
+
+/**
+ * How a piece of text answers an approval request. Explicit approval words
+ * approve; explicit refusal words decline; anything else is ambiguous and is
+ * the project steward's to interpret. The page answer uses all three; a
+ * project steward's own guidance + resolve is a decision, so anything that
+ * does not approve declines (as before).
+ */
+export type ApprovalVerdict = "approve" | "decline" | "ambiguous";
+
+const NEGATED_APPROVE = /(?:^|[^\p{L}\p{N}])(?:not|never|cannot|do\s+not|[a-z]+n['’]t)\s+(?:\w+\s+){0,2}?(?:approv\w*|ship|lgtm|go\s+ahead|looks?\s+good|sign\s*off|yes)(?:[^\p{L}\p{N}]|$)/iu;
+const REFUSAL = /(?:^|[^\p{L}\p{N}])(?:reject(?:ed)?|declin(?:e|ed)|hold\s+off)(?:[^\p{L}\p{N}]|$)/iu;
+const APPROVE_WORDS = /(?:^|[^\p{L}\p{N}])(?:lgtm|approv(?:e|es|ed|al)|ship\s*it|go\s*ahead|looks?\s+good|sign(?:ed)?\s*off|:shipit:|yes|yep|yeah)(?:[^\p{L}\p{N}]|$)/iu;
+const DECLINE_WORDS = /(?:^|[^\p{L}\p{N}])(?:no|nope|don'?t|do\s+not|not\s+yet|changes?\s+(?:are\s+)?(?:needed|requested)|needs?\s+changes?)(?:[^\p{L}\p{N}]|$)/iu;
+
+/**
+ * A clear refusal first, so "not approved" and "don't ship it" decline rather
+ * than matching the approval word inside them; then approval words, so
+ * "LGTM, no concerns" and "ship it, no further changes needed" approve; then
+ * a bare no or a request for changes declines; anything else is ambiguous.
+ */
+export function classifyApproval(text: string | null | undefined): ApprovalVerdict {
+  const flat = (text ?? "").replace(/\s+/gu, " ").trim();
+  if (flat === "") return "ambiguous";
+  if (NEGATED_APPROVE.test(flat) || REFUSAL.test(flat)) return "decline";
+  if (APPROVE_WORDS.test(flat)) return "approve";
+  if (DECLINE_WORDS.test(flat)) return "decline";
+  return "ambiguous";
+}
 
 // ---- the merge gate -------------------------------------------------------------------
 
