@@ -9,9 +9,9 @@
 // closure, so nothing here reads the plugin's config or snapshots on its own.
 import { type BigDecision, decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type DecideMark } from "./decisions.js";
 import type { ApprovalMode } from "./config.js";
-import { approvalMarkerLine, ESCALATED_APPROVAL_REFUSAL, prGate, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
+import { approvalMarkerLine, classifyApproval, ESCALATED_APPROVAL_REFUSAL, prGate, productReason, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
-import { productGateOptions, productReason, workerInFlight, type MechanicalEvent } from "./reconcile.js";
+import { isSpecComment, productGateOptions, workerInFlight, type MechanicalEvent } from "./reconcile.js";
 import { signatureLine, type EntitySnapshot, type Source } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Store } from "./store.js";
 
@@ -34,6 +34,10 @@ export type ApprovalsContext = {
   sendTo: (threadId: string, text: string) => Promise<"sent" | "gone" | "failed" | "unavailable">;
   wakeProject: (projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[] }) => Promise<void>;
   pullChangedFiles: (entity: EntitySnapshot) => Promise<string[] | null>;
+  /** The user's own recent turn texts in a thread, normalized, newest first, excluding the plugin's own wakes (BB-178). */
+  recentUserTurnTexts: (threadId: string) => Promise<string[]>;
+  /** Whether a thread is the user's own rather than a steward's, a worker's or the project steward's. */
+  isUserThread: (threadId: string) => boolean;
   loadDecisions: (projectId: string) => Promise<readonly BigDecision[]>;
   /** The project's decide list, or null when the project file could not be read (BB-280). */
   loadDecisionsOrNull: (projectId: string) => Promise<readonly BigDecision[] | null>;
@@ -134,6 +138,38 @@ export const isProjectSteward = (ctx: ApprovalsContext, threadId: string, b: Bin
  * acceptance paths route through here.
  */
 export const specApprovedByProject = (ctx: ApprovalsContext, threadId: string, b: Binding, mode: ApprovalMode | null | undefined): boolean => mode === "project" && isProjectSteward(ctx, threadId, b);
+
+/**
+ * Whether the user said these words in this thread lately, in their own turn
+ * rather than the plugin's own wake (BB-178). The context supplies the user's
+ * own recent turns, already filtered to the user and the lookback and
+ * normalized. The path was in server.ts before (BB-280).
+ */
+export async function userSaid(ctx: ApprovalsContext, threadId: string, quote: string): Promise<boolean> {
+  const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
+  return (await ctx.recentUserTurnTexts(threadId)).some((text) => text.includes(want));
+}
+
+/**
+ * Whether the connected user approved in an unsigned comment on the entity,
+ * after the latest spec comment (criterion 3). `quote` is matched against the
+ * comment's text, so the steward can quote it back. The path was in server.ts
+ * before (BB-280).
+ */
+export function userApprovedOnEntity(ctx: ApprovalsContext, entity: EntitySnapshot | null, stewardThreadId: string | null, quote: string): boolean {
+  if (entity === null || entity.viewer === null) return false;
+  const viewer = entity.viewer.toLowerCase();
+  const latestSpec = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, ctx.isUserThread)).reduce((max, c) => (c.createdAt > max ? c.createdAt : max), "");
+  const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
+  return entity.comments.some(
+    (c) =>
+      c.signedBy === null &&
+      c.author.toLowerCase() === viewer &&
+      c.createdAt > latestSpec &&
+      classifyApproval(c.body) === "approve" &&
+      c.body.replace(/\s+/gu, " ").toLowerCase().includes(want),
+  );
+}
 
 /**
  * The decide-list placement of a pull request a steward is reporting:

@@ -1,10 +1,34 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, productReason, resolveChecklistItem, reviewMarker, specDiff, specHash, specText, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
-import { approvalMarkerLine, ownerApproval, prGate, projectApprovalMarker, reviewWorkerThread, type ProjectApprovalRecord } from "./gate.js";
+import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalMarkerLine, classifyApproval, ownerApproval, prGate, productReason, projectApprovalMarker, reviewMarker, reviewWorkerThread, UNREADABLE_VERDICT, type ProjectApprovalRecord } from "./gate.js";
+import { approvalWanted, gateState, resolveChecklistItem } from "./ready-gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
+import * as gateModule from "./gate.js";
+import * as readyGateModule from "./ready-gate.js";
+import * as reconcileModule from "./reconcile.js";
+
+// BB-280: each function moved out of reconcile.ts is pinned to its new module.
+// A change that moves one back (or drops the export) fails these, so the
+// owner-reviewed gate.ts and ready-gate.ts keep the code the decide list's
+// self-widening and narrowed entries name.
+describe("the moved functions stay in their modules (BB-280)", () => {
+  it("keeps the reviewer marker and approval words in gate.ts, not reconcile.ts", () => {
+    for (const name of ["reviewMarker", "latestReviewMarker", "classifyApproval", "productReason"]) {
+      expect(typeof (gateModule as Record<string, unknown>)[name], name).toBe("function");
+      expect((reconcileModule as Record<string, unknown>)[name], name).toBeUndefined();
+    }
+  });
+
+  it("keeps the ready gate in ready-gate.ts, not reconcile.ts", () => {
+    for (const name of ["gateState", "approvalWanted", "reportedItem", "resolveChecklistItem"]) {
+      expect(typeof (readyGateModule as Record<string, unknown>)[name], name).toBe("function");
+      expect((reconcileModule as Record<string, unknown>)[name], name).toBeUndefined();
+    }
+  });
+});
 
 const tickets = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");

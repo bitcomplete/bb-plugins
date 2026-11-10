@@ -95,11 +95,11 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, isSpecComment, latestReviewMarker, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, resolveChecklistItem, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
-import { latestProjectApprovalMarker, prGate } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, markerKey, placeReportedPull, specApprovedByProject, syncPullApproval, type ApprovalsContext } from "./approvals.js";
+import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate } from "./gate.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, markerKey, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
-import { briefGate, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
+import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -3307,7 +3307,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const escalationsCtx: EscalationsContext = { store, scheduleReconcile, wakeProject };
 
     /** The ready-gate helpers bound to this server's store and spec readers (ready-gate.ts). */
-    const readyGateCtx: ReadyGateContext = { store, specHashFor, specTextFor, log: (message) => bb.log.info(message) };
+    const readyGateCtx: ReadyGateContext = { store, specHashFor, specTextFor, specDiff, log: (message) => bb.log.info(message) };
 
     const ownThreads = (b: Binding) => new Set([b.threadId, ...store.workers(b.id).map((w) => w.threadId)].filter((t): t is string => t !== null));
 
@@ -6549,6 +6549,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       sendTo,
       wakeProject,
       pullChangedFiles,
+      recentUserTurnTexts: async (threadId) => {
+        const out: string[] = [];
+        const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
+        for (const row of rows) {
+          if (now() - row.createdAt > timing.approvalLookbackMs) break;
+          // A turn from before this plugin started recording its sends cannot be
+          // told from the plugin's own wakes, so it is never the owner's (BB-178).
+          if (row.createdAt < sentSince) continue;
+          const data = row.data as { initiator?: string; input?: unknown };
+          if (data.initiator !== "user") continue;
+          const text = turnText(data.input);
+          if (text === null) continue;
+          // A wake the plugin sent is recorded under its text's hash; it quotes
+          // the entity verbatim and must never count as the owner's approval.
+          if ((await bb.storage.kv.get(`sent/${sentHash(text)}`)) !== undefined) continue;
+          out.push(normalizeText(text));
+        }
+        return out;
+      },
+      isUserThread,
       loadDecisions: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? [],
       loadDecisionsOrNull: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? null,
       observedPulls,
@@ -8940,48 +8960,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
     }
 
-    /** Whether the user said these words in this thread lately, in their own turn rather than the plugin's own wake (BB-178). */
-    async function userSaid(threadId: string, quote: string): Promise<boolean> {
-      const want = normalizeText(quote);
-      const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
-      for (const row of rows) {
-        if (now() - row.createdAt > timing.approvalLookbackMs) break;
-        // A turn from before this plugin started recording its sends cannot be
-        // told from the plugin's own wakes, so it is never the owner's (BB-178).
-        if (row.createdAt < sentSince) continue;
-        const data = row.data as { initiator?: string; input?: unknown };
-        if (data.initiator !== "user") continue;
-        const text = turnText(data.input);
-        if (text === null) continue;
-        if (!normalizeText(text).includes(want)) continue;
-        // A wake the plugin sent is recorded under its text's hash; it quotes
-        // the entity verbatim and must never count as the owner's approval.
-        if ((await bb.storage.kv.get(`sent/${sentHash(text)}`)) !== undefined) continue;
-        return true;
-      }
-      return false;
-    }
-
-    /**
-     * Whether the connected user approved in an unsigned comment on the
-     * entity, after the latest spec comment (criterion 3). `quote` is matched
-     * against the comment's text, so the steward can quote it back.
-     */
-    function userApprovedOnEntity(entity: EntitySnapshot | null, stewardThreadId: string | null, quote: string): boolean {
-      if (entity === null || entity.viewer === null) return false;
-      const viewer = entity.viewer.toLowerCase();
-      const latestSpec = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).reduce((max, c) => (c.createdAt > max ? c.createdAt : max), "");
-      const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
-      return entity.comments.some(
-        (c) =>
-          c.signedBy === null &&
-          c.author.toLowerCase() === viewer &&
-          c.createdAt > latestSpec &&
-          classifyApproval(c.body) === "approve" &&
-          c.body.replace(/\s+/gu, " ").toLowerCase().includes(want),
-      );
-    }
-
     bb.agents.registerTool({
       name: "steward_report",
       description:
@@ -9949,7 +9927,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const entity = (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
               const byProject = specApprovedByProject(approvalsCtx, threadId, target, mode);
               // Criterion 3: the user's words may be an unsigned comment on the entity itself, not only a message in this thread.
-              const byUser = input.quote !== undefined && ((await userSaid(threadId, input.quote)) || userApprovedOnEntity(entity, target.threadId, input.quote));
+              const byUser = input.quote !== undefined && ((await userSaid(approvalsCtx, threadId, input.quote)) || userApprovedOnEntity(approvalsCtx, entity, target.threadId, input.quote));
               if (!byProject && !byUser) {
                 return toolError(
                   new Error(

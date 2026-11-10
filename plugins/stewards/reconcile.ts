@@ -8,7 +8,8 @@
 import { createHash } from "node:crypto";
 import { isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
 import type { Deployments } from "./deploy.js";
-import { isMarkerComment } from "./gate.js";
+import { isMarkerComment, latestReviewMarker, reviewMarker } from "./gate.js";
+import { gateState, reportedItem } from "./ready-gate.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, ReadyState, StatusRecord, Worker } from "./store.js";
 
@@ -47,72 +48,7 @@ export function runningWorkerReason(workers: readonly Pick<Worker, "threadId" | 
   return names.length === 1 ? `worker ${names[0]} is mid-turn` : `workers ${names.join(", ")} are mid-turn`;
 }
 
-/**
- * A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the
- * first line of a comment. `lane` is null when the marker did not name one
- * (the gate then treats the pull request as the owner's). `approver` is the
- * optional `approver=owner|project` attribute; it is undefined when the marker
- * did not name one, and the gate then reads it as `owner` (fail closed,
- * BB-192). `substantial` is the reviewer's diff judgment (BB-207), null when
- * the marker did not name one; `ticketApprovedSpec` is whether a ticket the
- * pull request references has an approved spec, the ack that spares the owner
- * the product ask, false when the marker did not say so (fail closed).
- */
-export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null; approver?: string; substantial: boolean | null; ticketApprovedSpec: boolean };
 
-const REVIEW_MARKER = /^<!--\s*bb-review\b([^>]*?)-->/u;
-
-/** The verdict a marker without `verdict=` is read as: never `approved`. */
-export const UNREADABLE_VERDICT = "unreadable";
-
-/**
- * The reviewer's marker on a comment, or null for any other comment. Any
- * first line that opens a `bb-review` comment is a marker, however it is
- * spelled: a round whose keys are missing or misspelled still closes the
- * gate, because the alternative is to read the previous round's `approved`
- * as the latest word. A missing `verdict=` is read from a bare word in the
- * marker (`changes-requested`) and otherwise is `unreadable`; neither is
- * `approved`.
- */
-export function reviewMarker(body: string): ReviewMarker | null {
-  const first = body.split("\n", 1)[0]!.trim();
-  const m = REVIEW_MARKER.exec(first);
-  if (m === null) return null;
-  const keyed = new Map<string, string>();
-  const bare: string[] = [];
-  for (const token of m[1]!.trim().split(/\s+/u).filter((t) => t !== "")) {
-    const eq = token.indexOf("=");
-    if (eq > 0) keyed.set(token.slice(0, eq).toLowerCase(), token.slice(eq + 1));
-    else bare.push(token);
-  }
-  const round = Number(keyed.get("round") ?? "");
-  // BB-207: `substantial=yes|no` is the reviewer's diff judgment, absent is
-  // unjudged; `spec=yes` says a referenced ticket has an approved spec.
-  const substantial = keyed.get("substantial");
-  return {
-    round: Number.isInteger(round) && round > 0 ? round : 0,
-    sha: keyed.get("sha") ?? "",
-    verdict: keyed.get("verdict") ?? bare[0] ?? UNREADABLE_VERDICT,
-    lane: keyed.get("lane") ?? null,
-    approver: keyed.get("approver"),
-    substantial: substantial === "yes" ? true : substantial === "no" ? false : null,
-    ticketApprovedSpec: keyed.get("spec") === "yes",
-  };
-}
-
-/** The newest reviewer marker in a comment list, by comment time. */
-export function latestReviewMarker(comments: readonly SnapshotComment[]): ReviewMarker | null {
-  let at = "";
-  let latest: ReviewMarker | null = null;
-  for (const c of comments) {
-    const m = reviewMarker(c.body);
-    if (m !== null && c.createdAt >= at) {
-      at = c.createdAt;
-      latest = m;
-    }
-  }
-  return latest;
-}
 
 /**
  * A change in the lane a reviewer's rounds are in: the one thing about a
@@ -125,19 +61,6 @@ export function markerLaneChange(before: readonly SnapshotComment[], after: read
   return { from: b.lane, to: a.lane };
 }
 
-/**
- * The product reason a pull request's owner lane carries (BB-207): the review
- * binding was judged `substantial` from the diff, and no ticket it references
- * has an approved spec. `substantial` is the binding's ready-gate judgment;
- * null (unjudged) and false leave every lane exactly as today, which is what
- * keeps the change inert until a reviewer reports a verdict. A referenced
- * ticket with an approved spec is the existing ack, so the owner is not asked
- * again. The reason is a property of the pull request, never of a commit: a
- * later push only re-asks when it changed scope or behaviour.
- */
-export function productReason(substantial: boolean | null, ticketApprovedSpec: boolean): "product" | null {
-  return substantial === true && !ticketApprovedSpec ? "product" : null;
-}
 
 /**
  * The product inputs `prGate` reads from a binding (BB-207). A review or PR
@@ -645,36 +568,6 @@ export function namesUserAsBlocker(text: string): boolean {
   return /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(text);
 }
 
-// ---- approval words -------------------------------------------------------------------
-
-/**
- * How a piece of text answers an approval request. Explicit approval words
- * approve; explicit refusal words decline; anything else is ambiguous and is
- * the project steward's to interpret. The page answer uses all three; a
- * project steward's own guidance + resolve is a decision, so anything that
- * does not approve declines (as before).
- */
-export type ApprovalVerdict = "approve" | "decline" | "ambiguous";
-
-const NEGATED_APPROVE = /(?:^|[^\p{L}\p{N}])(?:not|never|cannot|do\s+not|[a-z]+n['’]t)\s+(?:\w+\s+){0,2}?(?:approv\w*|ship|lgtm|go\s+ahead|looks?\s+good|sign\s*off|yes)(?:[^\p{L}\p{N}]|$)/iu;
-const REFUSAL = /(?:^|[^\p{L}\p{N}])(?:reject(?:ed)?|declin(?:e|ed)|hold\s+off)(?:[^\p{L}\p{N}]|$)/iu;
-const APPROVE_WORDS = /(?:^|[^\p{L}\p{N}])(?:lgtm|approv(?:e|es|ed|al)|ship\s*it|go\s*ahead|looks?\s+good|sign(?:ed)?\s*off|:shipit:|yes|yep|yeah)(?:[^\p{L}\p{N}]|$)/iu;
-const DECLINE_WORDS = /(?:^|[^\p{L}\p{N}])(?:no|nope|don'?t|do\s+not|not\s+yet|changes?\s+(?:are\s+)?(?:needed|requested)|needs?\s+changes?)(?:[^\p{L}\p{N}]|$)/iu;
-
-/**
- * A clear refusal first, so "not approved" and "don't ship it" decline rather
- * than matching the approval word inside them; then approval words, so
- * "LGTM, no concerns" and "ship it, no further changes needed" approve; then
- * a bare no or a request for changes declines; anything else is ambiguous.
- */
-export function classifyApproval(text: string | null | undefined): ApprovalVerdict {
-  const flat = (text ?? "").replace(/\s+/gu, " ").trim();
-  if (flat === "") return "ambiguous";
-  if (NEGATED_APPROVE.test(flat) || REFUSAL.test(flat)) return "decline";
-  if (APPROVE_WORDS.test(flat)) return "approve";
-  if (DECLINE_WORDS.test(flat)) return "decline";
-  return "ambiguous";
-}
 
 /**
  * A steward that asks for an approval that is already open. The plugin files
@@ -742,56 +635,6 @@ export function compactDue(usedTokens: number | null, limit: number, incomingCha
   return usedTokens > limit || usedTokens + Math.ceil(incomingChars / CHARS_PER_TOKEN) > limit;
 }
 
-// ---- the ready gate ------------------------------------------------------------------
-
-export type GateState = {
-  /** No ready gate in the playbook: nothing to pass. */
-  none: boolean;
-  checklistMet: boolean;
-  unmet: string[];
-  /** Null until the steward has judged it. */
-  substantial: boolean | null;
-  approvalNeeded: boolean;
-  approved: boolean;
-  /** An approval exists but the spec has changed since. */
-  approvalStale: boolean;
-  passed: boolean;
-};
-
-/** Checklist wording as compared: case, runs of spaces and trailing punctuation do not count. */
-const checklistKey = (s: string) => s.toLowerCase().replace(/\s+/gu, " ").replace(/[\s.:;,]+$/u, "").trim();
-
-/** What the steward last reported for one of the playbook's checklist items. */
-export const reportedItem = (ready: ReadyState, item: string): ReadyState["checklist"][number] | undefined =>
-  ready.checklist.find((c) => checklistKey(c.item) === checklistKey(item));
-
-/**
- * The playbook's own wording for a reported checklist entry: by its number
- * in the wake (1-based), or by its text as the playbook writes it. Null for
- * anything else. Stewards paraphrase long items, so a paraphrase is refused
- * rather than guessed at: a guess that misses leaves the gate shut in
- * silence, which is how it never passed.
- */
-export function resolveChecklistItem(items: readonly string[], reported: string | number): string | null {
-  const text = String(reported);
-  const number = /^\s*#?(\d+)\.?\s*$/u.exec(text);
-  if (number !== null) return items[Number(number[1]) - 1] ?? null;
-  return items.find((item) => checklistKey(item) === checklistKey(text)) ?? null;
-}
-
-export function gateState(playbook: Playbook, ready: ReadyState, currentSpecHash: string): GateState {
-  if (playbook.ready === null) return { none: true, checklistMet: true, unmet: [], substantial: null, approvalNeeded: false, approved: false, approvalStale: false, passed: true };
-  const items = playbook.ready.checklist;
-  const unmet = items.filter((item) => reportedItem(ready, item)?.met !== true);
-  const checklistMet = unmet.length === 0;
-  // Unjudged counts as substantial: the safe side of the gate.
-  const approvalNeeded = ready.substantial !== false;
-  const approved = ready.approval !== null;
-  const approvalStale = approved && ready.approval!.specHash !== currentSpecHash;
-  const passed = checklistMet && (!approvalNeeded || (approved && !approvalStale));
-  return { none: false, checklistMet, unmet, substantial: ready.substantial, approvalNeeded, approved, approvalStale, passed };
-}
-
 /**
  * Whether the gate is shut on something known rather than merely not yet
  * reported: approval is needed and the current spec has none (missing,
@@ -805,14 +648,6 @@ export function gateKnownUnmet(playbook: Playbook, ready: ReadyState, currentSpe
   if (gate.approvalNeeded && (!gate.approved || gate.approvalStale)) return true;
   return gate.unmet.some((item) => reportedItem(ready, item)?.met === false);
 }
-
-/**
- * Whether the gate waits on its approver: the checklist is met, the ticket
- * is (or may be) substantial, and the current spec has no approval. The
- * plugin asks the approver itself then, so the gate does not depend on the
- * steward remembering to.
- */
-export const approvalWanted = (gate: GateState): boolean => !gate.none && gate.checklistMet && gate.approvalNeeded && !gate.passed;
 
 /**
  * A status that says it waits on the project steward or the user while

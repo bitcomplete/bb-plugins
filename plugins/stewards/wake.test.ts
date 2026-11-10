@@ -4,7 +4,7 @@ import type { DepsDecision } from "./store.js";
 import { parsePlaybook } from "./config.js";
 import { explainDecision, formatDecisionListing } from "./decisions.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { gateState } from "./reconcile.js";
+import { gateState } from "./ready-gate.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
 import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, initiativeProgress, initiativeProgressFlag, spawnCommand, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";

@@ -6,7 +6,7 @@
 // BB-279: an owner's page approval and the project steward's decision deliver
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
-import { approvePrPageAction, deliverProjectApproval, recordProjectDecision, type ApprovalsContext } from "./approvals.js";
+import { approvePrPageAction, deliverProjectApproval, recordProjectDecision, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { isSelfWidening } from "./decisions.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
 import type { Binding, Need } from "./store.js";
@@ -152,5 +152,10 @@ describe("the approval-recording files are self-widening (BB-280)", () => {
     for (const file of ["bb-plugins/plugins/stewards/approvals.ts", "plugins/stewards/approvals.ts", "bb-plugins/plugins/stewards/approvals-store.ts", "plugins/stewards/approvals-store.ts"]) {
       expect(isSelfWidening([file]), file).toBe(true);
     }
+  });
+
+  it("keeps the user's approval detection in approvals.ts", () => {
+    expect(typeof userSaid).toBe("function");
+    expect(typeof userApprovedOnEntity).toBe("function");
   });
 });

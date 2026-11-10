@@ -13,7 +13,8 @@ import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } fro
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { ADOPTION_CHOICES, adoptionHow, dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
-import { newHumanComments, productGateOptions, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { newHumanComments, productGateOptions, unheardWait } from "./reconcile.js";
+import { reportedItem, type GateState } from "./ready-gate.js";
 import { prGate, type ProjectApprovalRecord } from "./gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
