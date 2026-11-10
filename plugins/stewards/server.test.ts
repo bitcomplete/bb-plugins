@@ -12121,6 +12121,105 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.pending.some((n) => n.quiet === true && /created/.test(n.text))).toBe(true);
   });
 
+  // BB-286: a non-final doorbell used to note quietly and stop; a dropped
+  // final doorbell then waited for the half-hourly sweep. The doorbell path
+  // now schedules a re-read, so the final status is caught within the
+  // debounce.
+  it("re-reads after a non-final deployment doorbell and settles on the final status (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The doorbell is in_progress, but the deployment source already has the
+    // success: the scheduled re-read settles the watch with no second doorbell.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the re-read repeats while the last read was non-final. The first
+  // re-read still sees in_progress; the poll settles it when it turns success
+  // later, rather than waiting for the half-hourly sweep.
+  it("keeps polling while the deployment is non-final and settles when it turns final (BB-286)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, deploymentPollMs: 20 } });
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The source is still in_progress for the doorbell and the first re-read.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentState: "in_progress" });
+    // The final status lands later; the poll re-reads and settles it.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "success" })]);
+    await new Promise((r) => setTimeout(r, 30));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the same re-read on the sweep read path.
+  it("re-reads after a non-final deployment status found on the sweep (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await t.hooks.sweep();
+    // The sweep noted in_progress and scheduled a re-read; the source has the
+    // final status by the time it runs.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the deploy debounce keys on the deployment id and state, so two
+  // statuses inside the window both run and the newest wins. A first-wins
+  // debounce kept only the in_progress closure and dropped the success.
+  it("keeps the newest of two deployment statuses inside the debounce (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const send = (state: string) =>
+      t.harness.callRpc("stewardsRing", { source: "github", id: "acme/bb-gate#7", deployment: deployment({ state }) }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    // Both inside the same debounce window, before either timer fires.
+    await Promise.all([send("in_progress"), send("success")]);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: a watch recorded under an older rule is re-matched against the
+  // playbook on every read. When the rule is now live-at-merge it settles with
+  // the live note and no deadline, and the steward hears "Deployed at merge".
+  it("settles a pre-existing merged watch when the playbook's rule becomes live-at-merge (BB-286)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook("    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }");
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    const steward = t.spawns[1]!.id;
+    // The rule becomes live-at-merge; the next read settles it without any
+    // deployment read. Forget the cached config so the new playbook is read.
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Deployed at merge: acme\/web#7/u);
+  });
+
+  // BB-286: github-watcher's reconnect sweep rings stewards once per repo with
+  // a deployment interest, and the repo ring re-reads that repo's deployments
+  // (BB-59) rather than waiting for the half-hourly sweep.
+  it("re-reads deployments for a repo when github-watcher rings it on reconnect (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    // The final deployment already exists at the source when the ring arrives.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.ring("github", "acme/bb-gate");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success" });
+  });
+
   // BB-204: a success whose image is behind the merge leaves the watch where
   // it was and does not wake the steward.
   it("keeps a success whose image is behind the merge quiet (BB-204)", async () => {
@@ -14534,5 +14633,120 @@ describe("retrying a failed wake (BB-255)", () => {
     expect(t.retries[0]).toMatchObject({ threadId: project, turnRequestId: "p1" });
     await failTurn(t, { threadId: project, originPluginId: null, requestId: "retry_1", attemptNumber: 2, category: "internal" });
     expect(t.retries).toHaveLength(2);
+  });
+});
+
+// BB-285: an open pull request is not a wake source (a `pr`/`review` binding's
+// own, or a ticket's once its gate is met), and a gate-met pull request nobody
+// acts on, or a retarget wake nobody answers, raises one `stuck` per episode.
+describe("a gate-met pull request nobody acts on (BB-285)", () => {
+  const head = "aaaaaaa1";
+  const projectMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const owner = comment({ id: "oa", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T15:00:00Z" });
+
+  it("marks a pr binding's free-text wait no-wake-source while its own pull request is open (#294)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    const report = await t.tool("steward_report", { phase: "open", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the dompurify fix on main", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("acme/web#7")!.noWakeSource).toBe(true);
+  });
+
+  it("marks a ticket's free-text wait no-wake-source when its own pull request is gate-met", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+  });
+
+  it("raises one stuck for a gate-met pull request nobody acts on after the window, and clears it when the gate moves", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    expect(stuckOf()[0]!.question).toContain("acme/web#7");
+    // The same state on another sweep re-raises nothing.
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    // A new round requests changes: the gate is no longer met, so it clears.
+    const changed = comment({ id: "r2", author: "jane", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [noReview, changed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(0);
+  });
+
+  it("raises one stuck for a retarget nobody answers after the window, and clears it when retargeted", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.retargetPulls).toEqual(["acme/web#8"]);
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "retarget");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(5 * 60 * 60_000);
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(1);
+    expect(stuckOf()[0]!.question).toContain("acme/web#7");
+    // The same state on another sweep re-raises nothing.
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(1);
+    // Retargeted to the default branch: the state ends and it clears.
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "main", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(stuckOf()).toHaveLength(0);
+  });
+
+  it("does not raise the retarget stuck on the look that first sends the wake", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    // The base is open, so the binding is held and quiet for hours.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base" }, { head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({ comments: [projectMarker, owner] }, { head: "bb/eng-12-retry", base: "bb/bb-256-parent", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const b = t.hooks.store.find("ENG-12")!;
+    t.advance(5 * 60 * 60_000);
+    // The base merges: this look sends the retarget wake and must not also
+    // raise a stall for the wake it just sent.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.retargetPulls).toEqual(["acme/web#8"]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "retarget")).toHaveLength(0);
+  });
+
+  it("counts a worker-reported own pull request as a wake source when its branch does not name the ticket", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ title: "A fix", comments: [] }, { head: "feature/unrelated", checks: { state: "pending", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // A finished worker's result names the pull request, so it is the ticket's
+    // own even though neither its branch nor its title names the ticket.
+    await t.created("thr_w1", b.threadId!, "ENG-12: Implement", { branchName: "feature/other" });
+    t.hooks.store.setWorker("thr_w1", "finished", "Opened https://github.com/acme/web/pull/7 for ENG-12.");
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the reviewer's reply", requeueAfter: "1m" }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 });

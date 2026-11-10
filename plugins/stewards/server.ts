@@ -96,7 +96,7 @@ import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
-import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate } from "./gate.js";
+import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
@@ -117,7 +117,7 @@ import {
   type Source,
   type WorkflowRun,
 } from "./source-contract.js";
-import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
+import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -127,7 +127,7 @@ import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter,
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
-import { advanceStall, hasLiveWakeSource, parseUntil, type WakeSourceInput } from "./wake-source.js";
+import { advanceStall, hasLiveWakeSource, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
@@ -178,6 +178,12 @@ export const ONBOARDING_INTRO = `Set up stewards for this project. Follow the on
 export interface Timing {
   /** Rings for one entity within this long are one look. */
   debounceMs: number;
+  /**
+   * While an awaiting watch's last deployment read is non-final, re-read it
+   * this often (BB-286), bounded by the watch's deadline. Within the five
+   * minutes AC1 names for the re-read after a non-final status.
+   */
+  deploymentPollMs: number;
   /** How long a project's configuration is reused before `.bb` is read again. */
   configTtlMs: number;
   /** The mechanical sweep: adoption backstop, stuck backstop, a look at every binding. */
@@ -202,6 +208,7 @@ export interface Timing {
 
 export const DEFAULT_TIMING: Timing = {
   debounceMs: 3000,
+  deploymentPollMs: 4 * 60_000,
   configTtlMs: 5 * 60_000,
   sweepMs: 30 * 60_000,
   requeueTickMs: 60_000,
@@ -1124,6 +1131,18 @@ export const STEWARDS_SETTINGS = {
     description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
     default: 120_000,
   },
+  gateMetStuckMinutes: {
+    type: "number",
+    label: "Gate-met, nobody acting (minutes)",
+    description: "A pull request whose lane gate is met, with no worker running and no open item, raises a `stuck` escalation once it has sat this long (BB-285). 0 turns the check off.",
+    default: 60,
+  },
+  retargetStuckMinutes: {
+    type: "number",
+    label: "Retarget unanswered (minutes)",
+    description: "A pull request still based on a merged branch this long after the plugin woke its steward to retarget it raises a `stuck` escalation (BB-285). 0 turns the check off.",
+    default: 240,
+  },
   sentryToken: {
     type: "string",
     secret: true,
@@ -1385,19 +1404,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return next;
     }
 
-    function debounce(key: string, fn: () => Promise<void>): void {
+    function debounce(key: string, fn: () => Promise<void>, delayMs = timing.debounceMs): void {
       if (disposed || timers.has(key)) return;
       timers.set(
         key,
         setTimeout(() => {
           timers.delete(key);
           void fn();
-        }, timing.debounceMs),
+        }, delayMs),
       );
     }
 
     /** Look at a binding again, soon, once however often this is called meanwhile. */
     const scheduleReconcile = (bindingId: string) => debounce(`b:${bindingId}`, () => serial(`b:${bindingId}`, () => reconcileBinding(bindingId, null)));
+
+    /**
+     * Re-read a binding whose last deployment read was non-final, at the
+     * minutes-scale poll interval (BB-286), so a dropped final doorbell is
+     * caught within minutes rather than waiting for the half-hourly sweep.
+     * The watch's deadline ends the retries: the reconcile times it out. The
+     * poll is silent; only a settled or failed watch wakes the steward.
+     */
+    const scheduleDeploymentPoll = (bindingId: string) => debounce(`deploypoll:${bindingId}`, () => serial(`b:${bindingId}`, () => reconcileBinding(bindingId, null)), timing.deploymentPollMs);
 
     // ---- configuration ----------------------------------------------------------------
 
@@ -2320,22 +2348,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Whether the plugin watches a pull request for this binding (BB-154): a
-     * ticket with an open linked one, or an open `pr`/`review` binding whose
-     * entity is the pull request. A closed or merged pull request is not a
-     * source; github will not ring for it again.
+     * Whether the plugin watches a pull request for this binding (BB-154,
+     * BB-285): a `pr`/`review` binding's own pull request is never a wake
+     * source, and a ticket's open own pull request counts only while its gate
+     * is not met. A closed or merged pull request is not a source; github will
+     * not ring for it again. A gate-met pull request is the plugin's to act on
+     * (merge it, file the Merge item, or raise its own `stuck`), so waiting on
+     * it would mask every stall backstop (BB-154) and the idle wake (BB-83).
      */
-    function pullWatch(b: Binding): boolean {
-      if (b.kind === "ticket") return leasedPulls(b).length > 0;
-      if (b.kind === "pr" || b.kind === "review") {
-        const entity = b.lastSnapshot?.entity ?? null;
-        return entity !== null && !["closed", "merged"].includes(lc(entity.state));
-      }
-      return false;
+    function pullWatch(b: Binding, ownPulls: ReadonlySet<string>): boolean {
+      if (b.kind !== "ticket") return false;
+      const observed = b.lastSnapshot;
+      if (observed === null) return false;
+      const pulls = observedPulls(b, observed);
+      // Only the ticket's own open pull requests (BB-239): a linked pull
+      // request that merely mentions the ticket is context, not a wait. The
+      // own set is the report path's, the same one the gate/merge loop uses.
+      const open = leasedPulls(b)
+        .map((key) => pulls.find((p) => lc(p.key) === lc(key)))
+        .filter((p): p is EntitySnapshot => p !== undefined && p.pull !== null && p.pull.merged !== true && lc(p.state) !== "closed")
+        .filter((p) => pullBelongsToTicket(b, p, ownPulls));
+      if (open.length === 0) return false;
+      const gateMet = open.every((p) => prGate(p, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, p) }).gateMet);
+      return pullWatchCounts(b.kind, open.length, gateMet);
     }
 
     /** The structured sources that will wake a binding, as the report path reads them (BB-154). */
-    function liveWakeSourceFor(b: Binding): boolean {
+    function liveWakeSourceFor(b: Binding, ownPulls: ReadonlySet<string>): boolean {
       const sources: WakeSourceInput = {
         hold: b.hold,
         holdBehind: b.holdBehind,
@@ -2345,7 +2384,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         runningWorkers: store.workers(b.id).filter((w) => w.status === "running").length,
         openEscalations: store.openEscalations(b.id).length,
         openNeeds: store.openNeeds(b.id).length,
-        pullRequestWatch: pullWatch(b),
+        pullRequestWatch: pullWatch(b, ownPulls),
       };
       return hasLiveWakeSource(sources);
     }
@@ -3761,7 +3800,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // A live-at-merge watch (BB-260) is already `deployed` when it is
           // recorded: nothing builds or applies its paths, so it has no
           // deployment to await and the steward is woken with the verdict now.
-          const liveNow = fresh.filter((k) => deployments[k]?.state === "deployed");
+          // BB-286: an existing watch re-matched to a live rule settles in
+          // `recordMerged` and is announced the same way.
+          const liveNow = Object.keys(deployments).filter((k) => deployments[k]?.state === "deployed" && beforeDeploy[k]?.state !== "deployed");
           const awaiting = fresh.filter((k) => deployments[k]?.state !== "deployed");
           if (awaiting.length > 0) deploymentChanges.push({ text: `Awaiting deployment: ${awaiting.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
           if (liveNow.length > 0) deploymentChanges.push({ text: `Deployed at merge: ${liveNow.map((k) => `${k} — ${deployments[k]?.note ?? "live at merge"}`).join("; ")}`, actionable: true });
@@ -3790,6 +3831,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             deployments = applied.deployments;
             b = store.patch(b.id, { deployments });
             b = store.note(b.id, line, true);
+            // BB-286: a non-final status may be the last doorbell delivered;
+            // re-read within the debounce so a dropped final one is caught.
+            scheduleReconcile(b.id);
             continue;
           }
           if (failed) {
@@ -3845,6 +3889,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           deployments = timeOut(deployments, late, now());
           deploymentChanges.push({ text: `No matching deployment for ${labels.join(", ")}${within}${first === undefined ? "" : `; check the run: https://github.com/${first.repo}/actions`}`, actionable: true });
         }
+        // BB-286: while an awaiting watch's last deployment read was
+        // non-final, keep re-reading at the poll interval, so a dropped final
+        // doorbell is caught within minutes. A settled or failed watch ends
+        // the retries; the watch's deadline times out the wait.
+        if (Object.values(deployments).some((w) => (w.state === "merged" || w.state === "deploying") && !isFinalDeploymentState(w.deploymentState))) scheduleDeploymentPoll(b.id);
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
       }
       const awaitingDeploy = deployTargets.length > 0 && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
@@ -3912,6 +3961,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // diff only quiets them while one is, and the idle rule (BB-83) needs the
       // set for a binding whose worker has finished its turn.
       const ownPulls = await ownPullKeys(b, workers, observed);
+      // BB-285: which of the binding's own pull requests are gate-met. A
+      // gate-met own pull request is the plugin's to act on, so it does not
+      // suppress the idle wake (BB-83) the way an open one otherwise does.
+      const gateMetPulls = new Set<string>();
+      for (const e of [observed.entity, ...observed.pulls]) {
+        if (e.pull === null) continue;
+        const own = ownPulls.has(lc(e.key)) || (e.url !== null && e.url !== "" && ownPulls.has(lc(e.url)));
+        if (!own) continue;
+        if (prGate(e, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, e) }).gateMet) gateMetPulls.add(e.key.toLowerCase());
+      }
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
@@ -3932,7 +3991,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // the last wake; a worker finish asks for the look at once, without the
       // grace. An idle wake ends the period until one of those happens again.
       const idle = idleInActiveStage(
-        { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id), requeueUntil: b.requeueUntil },
+        { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, gateMetPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id), requeueUntil: b.requeueUntil },
         observed,
         now(),
       );
@@ -5464,9 +5523,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const line = `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}${typeof target.carries === "string" ? `; the playbook's rule: ${target.carries}` : ""}`;
               // A deployment that has not reached a final status has not
               // applied the image yet, so no watch can move: a quiet note
-              // records it and no reconcile is scheduled (BB-204).
+              // records it. A re-read is still scheduled (BB-286), so a
+              // dropped final doorbell costs a debounce, not the sweep.
               if (!final) {
                 b = store.note(b.id, line, true);
+                scheduleReconcile(b.id);
+                scheduleDeploymentPoll(b.id);
                 continue;
               }
               const before = b.deployments;
@@ -5553,6 +5615,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bound = store.byEntity(source, id);
       if (bound !== null) scheduleReconcile(bound.id);
       if (source === "github") {
+        // BB-286: a repository ring (no `#`) comes from github-watcher's
+        // reconnect sweep. Re-read every open binding whose playbook names a
+        // deployment target for the repo, so a deployment doorbell dropped
+        // while the subscriber was away is caught by the reconnect (BB-59)
+        // rather than only by the half-hourly sweep.
+        if (bound === null && !id.includes("#")) {
+          for (const config of await stewardedProjects()) {
+            for (const b of store.open(config.projectId)) {
+              const playbook = bindingPlaybook(config, b);
+              if (playbook === null || playbook === undefined) continue;
+              if (playbook.deployments.some((t) => lc(t.repo) === lc(id)) && awaitingOnRepo(b.deployments, id).length > 0) scheduleReconcile(b.id);
+            }
+          }
+          return;
+        }
         // A Dependabot alert doorbell names the alert, not the repository's
         // ops binding; wake that repository's dependency watch. An id with a
         // github binding is an issue or pull request, not an alert.
@@ -6779,6 +6856,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const config = await loadConfig(b.projectId);
       const decisions = config?.file.bigDecisions ?? [];
       const ownerLogin = config?.githubLogin ?? null;
+      // BB-285: the two stall windows, in milliseconds. 0 turns a check off.
+      const stuckSettings = await settings.get();
+      const gateMetStuckMs = Math.max(0, stuckSettings.gateMetStuckMinutes) * 60_000;
+      const retargetStuckMs = Math.max(0, stuckSettings.retargetStuckMinutes) * 60_000;
+      // BB-285: the pull requests in a stuck-eligible state this look, so a
+      // `stuck` episode that has ended is cleared after the loop and a later
+      // recurrence raises afresh.
+      const pullStuckState = new Map<string, "gate-met" | "retarget">();
       // BB-239: the pull requests a worker of this binding opened or reported.
       // A ticket's other linked pull requests (GitHub cross-references) only
       // mention it and must not file gate items here.
@@ -6815,6 +6900,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // (BB-264), so the retarget wake is once per base pull request.
       const retargetPulls = [...b.retargetPulls];
       const retargetBefore = new Set(retargetPulls.map((k) => lc(k)));
+      // The retarget wake sent before this look (BB-285): the retarget `stuck`
+      // is judged on this set, never on the one the loop mutates, so the look
+      // that first sends the wake cannot also raise the stall.
+      const retargetSentBefore = new Set(retargetBefore);
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
@@ -6849,6 +6938,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           !playbook.ownerMerges &&
           (b.kind === "review" || (b.kind === "pr" && pull.author !== null && ownerLogin !== null && lc(pull.author) !== lc(ownerLogin)));
         if (g.gateMet) {
+          // BB-285: whether this look merged the pull request, so the
+          // gate-met-with-nobody-acting check below does not race its own merge.
+          let mergedThisLook = false;
           // A steward's own merge item (a refused merge) is left alone while a
           // worker still runs; the plugin files its own only when none does.
           // BB-256: a standing merge hold is not a stuck loop, so the plugin
@@ -6891,6 +6983,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               retargetPulls.push(mergedBase.key);
               retargetBefore.add(lc(mergedBase.key));
             }
+            // BB-285: a retarget wake nobody answered. Once the wake has been
+            // sent (recorded in retargetPulls) and the pull request is still
+            // based on the merged branch after the window, escalate `stuck`.
+            if (retargetStuckMs > 0) {
+              pullStuckState.set(lc(pull.key), "retarget");
+              // Only raise, never resolve here: raising the escalation wakes
+              // the steward, which moves `wokeAt`, and resolving on a moved
+              // anchor would clear it in a loop. The post-loop sweep clears it
+              // once the pull request is retargeted or the state otherwise ends.
+              if (retargetSentBefore.has(lc(mergedBase.key)) && pullStuckEscalation(b, pull, "retarget") === null) {
+                const since = store.binding(b.id)?.wokeAt ?? b.wokeAt;
+                if (since !== null && now() - since >= retargetStuckMs) await raisePullStuck(b, pull, "retarget", `its base ${mergedBase.key} merged and it is still based on that branch after ${formatDuration(retargetStuckMs)}`, changes, null);
+              }
+            }
           } else if (store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === url && n.filedBy !== "plugin")) {
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
@@ -6909,6 +7015,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (mergeRefusalFor(b, g) === null) {
                 const result = await mergePullRequest(b, ref, pull, "by the plugin");
                 if (result.ok) {
+                  mergedThisLook = true;
                   // The note goes into this look's changes as well as the
                   // binding, so the wake that clears `pending` still carries
                   // it; a merge found by the next look reads the same as a
@@ -6948,6 +7055,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               });
             }
           }
+          // BB-285: a gate-met pull request nobody acts on. No worker is
+          // running and no item is open, so the plugin is neither merging it
+          // nor waiting on a person; after the window it is stuck. A retarget
+          // episode is criterion 4's, not this one.
+          if (mergedBase === null && !mergeHeld && !mergedThisLook && gateMetStuckMs > 0) {
+            const unattended = runningWorkerReason(store.workers(b.id)) === null && store.openNeeds(b.id).length === 0;
+            if (unattended) {
+              pullStuckState.set(lc(pull.key), "gate-met");
+              const since = gateMetSince(pull, g);
+              const open = pullStuckEscalation(b, pull, "gate-met");
+              if (since !== null && now() - since >= gateMetStuckMs) {
+                if (open === null) await raisePullStuck(b, pull, "gate-met", `the gate is met (${g.lane ?? "lane unknown"}), no worker is running and no item is open after ${formatDuration(gateMetStuckMs)}`, changes, g);
+              } else if (open !== null) {
+                store.resolve(open.id, "The pull request is no longer gate-met with nobody acting.");
+              }
+            }
+          }
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
         }
@@ -6973,6 +7097,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // only push; the next look has it in `needsBefore` and stays quiet.
         const text = gatePushText(b, item);
         if (text !== null) await pushNeed(b, { id: item.id, ...text, threadId: b.threadId });
+      }
+      // BB-285: a `stuck` episode that has ended is cleared, so a later
+      // recurrence is a new episode and raises afresh.
+      for (const x of store.openEscalations(b.id)) {
+        const kind = x.data.pullStuck;
+        if (kind !== "gate-met" && kind !== "retarget") continue;
+        if (pullStuckState.get(lc(String(x.data.pull ?? ""))) === kind) continue;
+        store.resolve(x.id, kind === "retarget" ? "The pull request is no longer based on a merged branch." : "The pull request is no longer gate-met with nobody acting.");
       }
       return events;
     }
@@ -7928,6 +8060,67 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await deliverEscalation(escalationsCtx, b, x);
     }
 
+    /** The open `stuck` escalation the plugin raised for a pull request episode (BB-285), if any. */
+    function pullStuckEscalation(b: Binding, pull: EntitySnapshot, kind: "gate-met" | "retarget"): Escalation | null {
+      return store.openEscalations(b.id).find((x) => x.kind === "stuck" && x.data.pullStuck === kind && lc(String(x.data.pull ?? "")) === lc(pull.key)) ?? null;
+    }
+
+    /**
+     * When a pull request's gate became met (BB-285): the newest of the
+     * reviewer's approving marker and the effective approval (the owner's
+     * comment or review, or the project steward's recorded marker). Null when
+     * neither time can be read. Checks are not timed, so a gate that became
+     * met only when checks finished is dated from the approval; the window is
+     * a backstop, not an exact clock.
+     */
+    function gateMetSince(pull: EntitySnapshot, g: ReturnType<typeof prGate>): number | null {
+      let at = 0;
+      for (const c of pull.comments) {
+        if (reviewMarker(c.body) === null) continue;
+        const t = Date.parse(c.createdAt);
+        if (!Number.isNaN(t)) at = Math.max(at, t);
+      }
+      const approvalAt = g.decision === "project" ? (g.projectApprovalId === null ? null : (pull.comments.find((c) => c.id === g.projectApprovalId)?.createdAt ?? null)) : g.ownerApprovalAt;
+      if (approvalAt !== null) {
+        const t = Date.parse(approvalAt);
+        if (!Number.isNaN(t)) at = Math.max(at, t);
+      }
+      return at === 0 ? null : at;
+    }
+
+    /**
+     * Raise one `stuck` escalation for a pull request episode (BB-285): a
+     * gate-met pull request nobody acts on, or a retarget wake nobody answers.
+     * The episode marker (`data.pullStuck` and `data.pull`) keeps it to one
+     * per episode: a sweep that finds the same state again sees the open
+     * escalation and raises nothing, and the sweep that finds the state gone
+     * resolves it, so a later recurrence is a new episode.
+     */
+    async function raisePullStuck(b: Binding, pull: EntitySnapshot, kind: "gate-met" | "retarget", why: string, changes: Change[], g: ReturnType<typeof prGate> | null): Promise<void> {
+      const note = kind === "retarget" ? `Stuck: ${pull.key} is still based on a merged branch after the retarget window.` : `Stuck: ${pull.key} is gate-met with nobody acting.`;
+      const question = kind === "retarget" ? `Retarget ${pull.key} went unanswered: ${why}.` : `${pull.key} is gate-met with nobody acting: ${why}.`;
+      const context =
+        kind === "retarget"
+          ? "The plugin woke the steward to rebase the pull request onto the default branch and retarget it, and it is still based on a merged branch. Nothing the plugin tracks will retarget it."
+          : `The lane gate is met (${g?.lane ?? "lane unknown"}), no worker is running and no item is open, so the plugin is neither merging it nor waiting on a person.`;
+      store.note(b.id, note);
+      changes.push({ text: note, actionable: true });
+      const x = store.escalate({
+        bindingId: b.id,
+        kind: "stuck",
+        question,
+        context,
+        meanwhile: "Waiting: nothing the plugin tracks will move it.",
+        route: nextRoute(escalationsCtx, b, null),
+        recommendation: null,
+        url: pull.url ?? pull.key,
+        headSha: g?.headSha ?? null,
+        data: { pullStuck: kind, pull: lc(pull.key) },
+        projectId: b.projectId,
+      });
+      await deliverEscalation(escalationsCtx, b, x);
+    }
+
     /**
      * The one merge path the Stewards page's Merge button and `bb stewards
      * merge` share: recompute the gate with the project's approval records
@@ -8000,7 +8193,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         if (deployment !== undefined) {
           if (source !== "github") throw new Error("only the github-watcher plugin sends deployment doorbells");
-          debounce(`deploy:${lc(id)}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));
+          // BB-286: key the debounce on the deployment's state too, so an
+          // in_progress followed by a success inside the window does not
+          // discard the newer closure (first-wins kept only the first).
+          debounce(`deploy:${lc(id)}:${deployment.state}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));
           return { ok: true };
         }
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));
@@ -9421,7 +9617,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // set of sources (an escalation this turn raised, a need it filed, a
           // gate item syncNeeds filed, a worker it started).
           const current = store.binding(b.id) ?? b;
-          const liveSource = liveWakeSourceFor(current);
+          // The same own-pull set the gate/merge loop uses (BB-52 rule 0), so a
+          // ticket's own pull request counts as a source or not by one rule.
+          const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
+          const liveSource = liveWakeSourceFor(current, currentOwnPulls);
           // BB-247: a dated wait is the plugin's own wake source while the date
           // is ahead, so it is not marked waiting with no source (and is listed
           // as a dated wait in the digest instead).

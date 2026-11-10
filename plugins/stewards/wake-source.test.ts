@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, hasLiveWakeSource, parseUntil, type WakeSourceInput } from "./wake-source.js";
+import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, hasLiveWakeSource, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 
 const noSources: WakeSourceInput = {
   hold: null,
@@ -51,6 +51,20 @@ describe("a binding's live wake sources (BB-154)", () => {
     expect(hasLiveWakeSource(watch({ openEscalations: 1 }))).toBe(true);
     expect(hasLiveWakeSource(watch({ openNeeds: 1 }))).toBe(true);
     expect(hasLiveWakeSource(watch({ pullRequestWatch: true }))).toBe(true);
+  });
+
+  // BB-285: an open pull request is not a wake source for a `pr`/`review`
+  // binding, and a ticket's open own pull request counts only while its gate
+  // is not met.
+  it("does not count a pr or review binding's own open pull request", () => {
+    expect(pullWatchCounts("pr", 1, false)).toBe(false);
+    expect(pullWatchCounts("review", 1, false)).toBe(false);
+  });
+
+  it("counts a ticket's open own pull request only while its gate is not met", () => {
+    expect(pullWatchCounts("ticket", 1, false)).toBe(true);
+    expect(pullWatchCounts("ticket", 1, true)).toBe(false);
+    expect(pullWatchCounts("ticket", 0, false)).toBe(false);
   });
 });
 
