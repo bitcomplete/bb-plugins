@@ -32,6 +32,8 @@ function world() {
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
+  /** Repos whose dependency graph parsed no manifests, lowercased, for the graph-empty wake (BB-289). */
+  const dependabotGraphEmpty = new Set<string>();
   /** Entity ids whose snapshot read throws, for the failed-read test (BB-115). */
   const snapshotErrors = new Set<string>();
   /** The fake linear dedup search: unsupported (github-style decline) or an error, for BB-136. */
@@ -110,6 +112,8 @@ function world() {
   const githubPulls: Array<{ repo: string; head: string; base: string; title: string; body: string; url: string; number: number }> = [];
   const githubClosedPulls: Array<{ repo: string; number: number }> = [];
   const githubDefaultBranches = new Map<string, string>();
+  /** Branches the test registered as existing, for the BB-287 recovery read. */
+  const githubBranches = new Set<string>();
   /** The survey's GitHub reads: a recursive tree, branch protection, labels and file text. */
   const githubTrees = new Map<string, Array<{ path: string; type: string }>>();
   const githubBranchProtection = new Map<string, { protected: boolean; requiredApprovingReviewCount: number | null; requiresStatusChecks: boolean }>();
@@ -189,10 +193,28 @@ function world() {
         if (e.unit.toLowerCase() !== repo.toLowerCase()) continue;
         const number = Number(/(\d+)$/u.exec(e.key)?.[1] ?? "");
         if (!Number.isInteger(number) || number <= 0) continue;
-        return { number, key: e.key, state: e.state, merged: e.pull.merged === true || e.state.toLowerCase() === "merged" };
+        return { number, key: e.key, state: e.state, merged: e.pull.merged === true || e.state.toLowerCase() === "merged", headSha: e.pull.headSha };
       }
       return null;
     },
+    // BB-287: the open pull requests whose base is `base`, the stacked-on-me
+    // check. The fake scans the entities the test registered.
+    openPullsByBase: async (repo: string, base: string) => {
+      const pulls: Array<{ number: number; key: string; state: string }> = [];
+      for (const e of entities.values()) {
+        if (e.pull === null || e.pull.base !== base) continue;
+        if (e.unit.toLowerCase() !== repo.toLowerCase()) continue;
+        if (e.pull.merged === true || e.state.toLowerCase() === "merged" || e.state.toLowerCase() === "closed") continue;
+        const number = Number(/(\d+)$/u.exec(e.key)?.[1] ?? "");
+        if (!Number.isInteger(number) || number <= 0) continue;
+        pulls.push({ number, key: e.key, state: e.state });
+      }
+      return pulls;
+    },
+    // BB-287: a branch the test registered as existing; a base branch absent
+    // from the set is gone, which fires the recovery wake for a closed stacked
+    // pull request.
+    branchExists: async (repo: string, branch: string) => githubBranches.has(`${repo.toLowerCase()} ${branch}`),
     dispatchWorkflow: async (repo: string, workflow: string, ref: string, inputs: Record<string, string>) => {
       if (mergeDispatchError !== null) throw new Error(mergeDispatchError);
       githubDispatches.push({ repo, workflow, ref, inputs });
@@ -298,7 +320,7 @@ function world() {
     }
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
-      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
+      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [], graphEmpty: units.filter((u) => dependabotGraphEmpty.has(u.toLowerCase())) };
     }
     else if (args.method === "sourceDeployments") {
       const key = `${String(input.repo).toLowerCase()} ${String(input.environment).toLowerCase()}`;
@@ -523,7 +545,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -7418,6 +7440,54 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
+  it("wakes the steward to retarget a stacked pull request whose base merged before its gate is met (BB-287)", async () => {
+    const t = await withPull([]);
+    // No reviewer marker: the gate is not met. The base pull request merges
+    // anyway, and the retarget wake must fire all the same (BB-287).
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main" }));
+    t.entities.set("acme/web#7", pull({}, { base: "bb/bb-256-parent" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.find("ENG-12")!.retargetPulls).toEqual(["acme/web#8"]);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Retarget acme\/web#7: its base acme\/web#8 has merged/u.test(s.text))).toBe(true);
+  });
+
+  it("tells a binding its pull request is the base of an open pull request, in the wake and in show (BB-287)", async () => {
+    const t = await withPull([]);
+    // #9 is stacked on #7's branch. The binding must know not to delete it.
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "Stacked" }, { head: "bb/eng-12-stacked", base: "bb/eng-12-retry" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.stackedPulls).toEqual(["acme/web#9"]);
+    expect(t.sends.filter((s) => s.threadId === t.steward).some((s) => /Base of open pull request: acme\/web#9 is stacked on acme\/web#7/u.test(s.text))).toBe(true);
+    // The standing section of the wake names it too, so every later wake carries it.
+    const wake = t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text;
+    expect(wake).toMatch(/BASE OF: acme\/web#9/u);
+    // `bb stewards show` renders the same fact.
+    const shown = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(shown).toContain("BASE OF: acme/web#9");
+  });
+
+  it("wakes the steward to restore the base branch when a stacked pull request closes unmerged with its base branch gone (BB-287)", async () => {
+    const t = await withPull([]);
+    // The base pull request merged and its branch was deleted; GitHub closed
+    // the stacked pull request unmerged. The wake names the sha to restore the
+    // branch at and says the approvals carry.
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Base", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), head: "bb/bb-256-parent", base: "main", headSha: "deadbeef1" }));
+    t.entities.set("acme/web#7", pull({ state: "closed" }, { merged: false, base: "bb/bb-256-parent" }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text;
+    expect(wake).toMatch(/restore the branch at .*deadbeef1.*reopen or replace.*approvals carry/u);
+    expect(t.hooks.store.find("ENG-12")!.stackedRecovered).toEqual(["acme/web#7"]);
+    // The recovery wake is once per pull request, not on every look.
+    const wakes = t.sends.filter((s) => s.threadId === t.steward).length;
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).length).toBe(wakes);
+  });
+
   it("does not merge while a worker is still running", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
@@ -9747,13 +9817,14 @@ describe("dependency stewards", () => {
     ...over,
   });
 
-  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = []) {
+  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = [], graphEmpty = false) {
     const t = await setup();
     // The fixture's primary (acme/bb) is a stewarded repo too; these tests watch one repo.
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb"] }, ...project });
     t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
     t.files[playbookPath("deps-prs")] = DEPS_PRS;
     t.dependabotAlerts.set("acme/web", alerts);
+    if (graphEmpty) t.dependabotGraphEmpty.add("acme/web");
     for (const [id, entity] of entities) t.entities.set(id, entity);
     await t.hooks.sweep();
     await t.flush();
@@ -9879,6 +9950,20 @@ describe("dependency stewards", () => {
     expect(wakes().at(-1)).toContain("#### acme/web#7");
     expect(wakes().at(-1)).toMatch(/\*\*critical\*\* priority urgent/u);
     expect(wakes().at(-1)).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+  });
+
+  it("says the dependency graph is empty, naming the toggle, instead of 'no open alerts' when the graph parsed nothing (BB-289)", async () => {
+    const { wakes } = await watching([], {}, [], true);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/\*\*Dependency graph empty\.\*\*/u);
+    expect(first).toMatch(/Dependabot cannot see any manifest/u);
+    expect(first).toMatch(/Settings → Advanced Security → Dependency graph/u);
+    expect(first).not.toMatch(/\*\*No open alerts\.\*\*/u);
+
+    // A repo whose graph is readable still says "no open alerts" when there are none.
+    const { wakes: readable } = await watching([]);
+    expect(readable()[0]).toMatch(/\*\*No open alerts\.\*\*/u);
+    expect(readable()[0]).not.toMatch(/Dependency graph empty/u);
   });
 
   it("replays SC-111: the adoption decision is durable plugin state, the SLA clock is the alert's, and reminders land in needs and the digest", async () => {
@@ -10236,6 +10321,13 @@ describe("dependency stewards", () => {
     expect(check.stdout).toMatch(/deps-alerts: deps-alerts@/u);
     expect(check.stdout).toMatch(/deps-prs: deps-prs@/u);
     expect(check.stdout).toMatch(/deps: watching 1 repo for alerts: acme\/web/u);
+  });
+
+  it("check says a repo's dependency graph is empty, naming the toggle (BB-289)", async () => {
+    const { t } = await watching([], {}, [], true);
+    const check = await t.harness.behavior.runCli(["check"], { projectId: "p1" });
+    expect(check.stdout).toMatch(/deps: acme\/web: dependency graph empty/u);
+    expect(check.stdout).toMatch(/Settings → Advanced Security → Dependency graph/u);
   });
 });
 

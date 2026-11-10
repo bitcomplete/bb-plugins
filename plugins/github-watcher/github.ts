@@ -762,6 +762,36 @@ const severityOf = (value: string | null | undefined): DependabotSeverity => {
 };
 
 /**
+ * One repository's dependency-graph manifest count, for the dependency watch's
+ * "dependency graph empty" flag (BB-289): a graph that has parsed zero
+ * manifests has an empty Dependabot alert feed for a reason a person must
+ * turn on by hand, not because there is nothing to find.
+ */
+export const DEPENDENCY_GRAPH_QUERY = `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { nameWithOwner dependencyGraphManifests(first: 1) { totalCount } } }`;
+
+const dependencyGraphPayload = z.object({
+  data: z.object({ repository: z.object({ nameWithOwner: z.string(), dependencyGraphManifests: z.object({ totalCount: z.number() }).nullish() }).nullable() }).nullable(),
+});
+
+/**
+ * How many manifests the repository's dependency graph has parsed, or null
+ * when the repository is not there, not visible, or the field is absent.
+ * Throws when GitHub refused the read; the caller must not read a failed read
+ * as an empty graph.
+ */
+export function parseDependencyGraphCount(payload: unknown): number | null {
+  const errors = graphqlErrors(payload);
+  const parsed = dependencyGraphPayload.safeParse(payload);
+  if (!parsed.success) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : "GitHub answered without data");
+  const repository = parsed.data.data?.repository ?? null;
+  if (repository === null) {
+    if (errors.length > 0 && errorTypes(payload).some((t) => t !== "NOT_FOUND")) throw new Error(`GitHub: ${errors.join("; ")}`);
+    return null;
+  }
+  return repository.dependencyGraphManifests?.totalCount ?? null;
+}
+
+/**
  * One page of `GET /repos/{owner}/{repo}/dependabot/alerts`, as the shared
  * contract wants it. `repo` is the name the caller asked with; GitHub's
  * answer does not repeat it. The alert number is the repository's own alert

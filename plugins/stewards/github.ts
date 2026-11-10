@@ -110,8 +110,23 @@ export interface GithubWriter {
    * every state, or null when none is visible. A stacked pull request's base
    * names the branch of the pull request it is stacked on; the plugin reads
    * this to tell an open base (a merge hold) from a merged one (a retarget).
+   * `headSha` is the branch's last commit, which a recovery restores a deleted
+   * base branch at (BB-287).
    */
-  pullByHead(repo: string, head: string): Promise<{ number: number; key: string; state: string; merged: boolean } | null>;
+  pullByHead(repo: string, head: string): Promise<{ number: number; key: string; state: string; merged: boolean; headSha: string | null } | null>;
+  /**
+   * The open pull requests in `repo` whose base branch is `base` (BB-287). A
+   * binding whose own pull request is the base of one of these must not have
+   * its branch deleted: the deletion closes the stacked pull request unmerged.
+   */
+  openPullsByBase(repo: string, base: string): Promise<Array<{ number: number; key: string; state: string }>>;
+  /**
+   * Whether `branch` still exists (BB-287), for a stacked pull request GitHub
+   * closed because its base branch was deleted (`delete_branch_on_merge`). A
+   * read failure is reported as existing, so the recovery never fires on a
+   * transient error.
+   */
+  branchExists(repo: string, branch: string): Promise<boolean>;
   /** Open a pull request and return its URL and number (BB-108). */
   createPull(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
   /** Close a pull request without merging it (BB-108 Drop). */
@@ -203,12 +218,38 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       if (!Array.isArray(body)) return null;
       for (const item of body) {
         if (item === null || typeof item !== "object") continue;
-        const pr = item as { number?: unknown; state?: unknown; merged_at?: unknown; head?: { ref?: unknown } };
+        const pr = item as { number?: unknown; state?: unknown; merged_at?: unknown; head?: { ref?: unknown; sha?: unknown } };
         if (typeof pr.number !== "number") continue;
         if (typeof pr.head?.ref === "string" && pr.head.ref !== head) continue;
-        return { number: pr.number, key: `${repo}#${pr.number}`, state: typeof pr.state === "string" ? pr.state : "", merged: pr.merged_at !== null && pr.merged_at !== undefined };
+        return { number: pr.number, key: `${repo}#${pr.number}`, state: typeof pr.state === "string" ? pr.state : "", merged: pr.merged_at !== null && pr.merged_at !== undefined, headSha: typeof pr.head?.sha === "string" && pr.head.sha !== "" ? pr.head.sha : null };
       }
       return null;
+    },
+    async openPullsByBase(repo, base) {
+      // `base` filters by the base branch's name; `state=open` is what makes
+      // this the stacked-on-me check, and the list is newest first.
+      const query = `base=${encodeURIComponent(base)}&state=open&sort=created&direction=desc&per_page=100`;
+      const response = await request("GET", `/repos/${repo}/pulls?${query}`, undefined);
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (!Array.isArray(body)) return [];
+      const pulls: Array<{ number: number; key: string; state: string }> = [];
+      for (const item of body) {
+        if (item === null || typeof item !== "object") continue;
+        const pr = item as { number?: unknown; state?: unknown; base?: { ref?: unknown } };
+        if (typeof pr.number !== "number") continue;
+        if (typeof pr.base?.ref === "string" && pr.base.ref !== base) continue;
+        pulls.push({ number: pr.number, key: `${repo}#${pr.number}`, state: typeof pr.state === "string" ? pr.state : "" });
+      }
+      return pulls;
+    },
+    async branchExists(repo, branch) {
+      try {
+        await request("GET", `/repos/${repo}/branches/${encodeURIComponent(branch)}`, undefined);
+        return true;
+      } catch (error) {
+        if (error instanceof GithubApiError && / 404 /u.test(error.message)) return false;
+        throw error;
+      }
     },
     async dispatchWorkflow(repo, workflow, ref, inputs) {
       await request("POST", `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, { ref, inputs });

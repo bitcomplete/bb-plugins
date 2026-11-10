@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -486,8 +486,9 @@ describe("the actor rename migration (BB-97)", () => {
     // and BB-215's stack group follows it (migrations.test.ts pins the whole
     // list, this only checks the group order).
     // BB-256 appended the merge-hold group after BB-255's wake-retry group,
-    // and BB-264 appended the retarget-pulls column after that.
-    const groups = [RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // BB-264 appended the retarget-pulls column after that, and BB-287
+    // appended the stacked-pull columns after that.
+    const groups = [STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -575,10 +576,13 @@ describe("the escalation route rename migration (BB-209)", () => {
     // provenance column) was appended after this one, BB-242's
     // worker-stop-reason column after that, BB-251's assumptions table after
     // that, BB-247's dated-wait columns after that, BB-255's wake-retry
-    // columns after that, BB-256's merge-hold column after that, and BB-264's
-    // retarget-pulls column after that.
-    const withRetarget = MIGRATIONS.slice(0, -RETARGET_PULLS_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-RETARGET_PULLS_MIGRATIONS.length)).toEqual([...RETARGET_PULLS_MIGRATIONS]);
+    // columns after that, BB-256's merge-hold column after that, BB-264's
+    // retarget-pulls column after that, and BB-287's stacked-pull columns
+    // after that.
+    const withStacked = MIGRATIONS.slice(0, -STACKED_PULLS_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-STACKED_PULLS_MIGRATIONS.length)).toEqual([...STACKED_PULLS_MIGRATIONS]);
+    const withRetarget = withStacked.slice(0, -RETARGET_PULLS_MIGRATIONS.length);
+    expect(withStacked.slice(-RETARGET_PULLS_MIGRATIONS.length)).toEqual([...RETARGET_PULLS_MIGRATIONS]);
     const withMergeBehind = withRetarget.slice(0, -MERGE_BEHIND_MIGRATIONS.length);
     expect(withRetarget.slice(-MERGE_BEHIND_MIGRATIONS.length)).toEqual([...MERGE_BEHIND_MIGRATIONS]);
     const withWakeRetry = withMergeBehind.slice(0, -WAKE_RETRY_MIGRATIONS.length);
