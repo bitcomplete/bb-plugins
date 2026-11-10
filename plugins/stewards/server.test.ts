@@ -12121,6 +12121,105 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.pending.some((n) => n.quiet === true && /created/.test(n.text))).toBe(true);
   });
 
+  // BB-286: a non-final doorbell used to note quietly and stop; a dropped
+  // final doorbell then waited for the half-hourly sweep. The doorbell path
+  // now schedules a re-read, so the final status is caught within the
+  // debounce.
+  it("re-reads after a non-final deployment doorbell and settles on the final status (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The doorbell is in_progress, but the deployment source already has the
+    // success: the scheduled re-read settles the watch with no second doorbell.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the re-read repeats while the last read was non-final. The first
+  // re-read still sees in_progress; the poll settles it when it turns success
+  // later, rather than waiting for the half-hourly sweep.
+  it("keeps polling while the deployment is non-final and settles when it turns final (BB-286)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, deploymentPollMs: 20 } });
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    // The source is still in_progress for the doorbell and the first re-read.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "in_progress" }));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentState: "in_progress" });
+    // The final status lands later; the poll re-reads and settles it.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "success" })]);
+    await new Promise((r) => setTimeout(r, 30));
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the same re-read on the sweep read path.
+  it("re-reads after a non-final deployment status found on the sweep (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "in_progress" })]);
+    await t.hooks.sweep();
+    // The sweep noted in_progress and scheduled a re-read; the source has the
+    // final status by the time it runs.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: the deploy debounce keys on the deployment id and state, so two
+  // statuses inside the window both run and the newest wins. A first-wins
+  // debounce kept only the in_progress closure and dropped the success.
+  it("keeps the newest of two deployment statuses inside the debounce (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const send = (state: string) =>
+      t.harness.callRpc("stewardsRing", { source: "github", id: "acme/bb-gate#7", deployment: deployment({ state }) }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    // Both inside the same debounce window, before either timer fires.
+    await Promise.all([send("in_progress"), send("success")]);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success", deploymentId: 7 });
+  });
+
+  // BB-286: a watch recorded under an older rule is re-matched against the
+  // playbook on every read. When the rule is now live-at-merge it settles with
+  // the live note and no deadline, and the steward hears "Deployed at merge".
+  it("settles a pre-existing merged watch when the playbook's rule becomes live-at-merge (BB-286)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook("    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }");
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    const steward = t.spawns[1]!.id;
+    // The rule becomes live-at-merge; the next read settles it without any
+    // deployment read. Forget the cached config so the new playbook is read.
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Deployed at merge: acme\/web#7/u);
+  });
+
+  // BB-286: github-watcher's reconnect sweep rings stewards once per repo with
+  // a deployment interest, and the repo ring re-reads that repo's deployments
+  // (BB-59) rather than waiting for the half-hourly sweep.
+  it("re-reads deployments for a repo when github-watcher rings it on reconnect (BB-286)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    // The final deployment already exists at the source when the ring arrives.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.ring("github", "acme/bb-gate");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success" });
+  });
+
   // BB-204: a success whose image is behind the merge leaves the watch where
   // it was and does not wake the steward.
   it("keeps a success whose image is behind the merge quiet (BB-204)", async () => {
