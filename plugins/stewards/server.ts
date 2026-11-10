@@ -97,7 +97,7 @@ import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTarget
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, markerKey, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -237,30 +237,12 @@ export interface StewardsDeps {
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-/** The comparable form of a message: whitespace collapsed, trimmed, lowercased. */
-const normalizeText = (text: string) => text.replace(/\s+/gu, " ").trim().toLowerCase();
-
 /**
  * The key a text the plugin sent is recorded under, so the ready gate can tell
  * the plugin's own wakes from the owner's words (BB-178). Content, not the
  * thread: the same wake to two stewards is the same plugin text.
  */
 const sentHash = (text: string) => createHash("sha256").update(normalizeText(text)).digest("hex");
-
-/**
- * The text parts of a `client/turn/requested` event's input, joined; null when
- * it carries none. bb stores a turn's input as parts under `data.input`, with
- * the words in the `text` parts (BB-178).
- */
-function turnText(input: unknown): string | null {
-  if (!Array.isArray(input)) return null;
-  const parts = input.flatMap((part) => {
-    if (typeof part !== "object" || part === null) return [];
-    const p = part as { type?: unknown; text?: unknown };
-    return p.type === "text" && typeof p.text === "string" ? [p.text] : [];
-  });
-  return parts.length === 0 ? null : parts.join("\n");
-}
 
 /** The server setting the footer toggle stores the replaced navigation in (BB-184). */
 export const NAVIGATION_RESTORE_KEY = "sidebar.navigationRestore";
@@ -3288,20 +3270,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the reconcile loop ------------------------------------------------------------------
 
-    /**
-     * A thread the plugin does not know as a steward, a worker or the project
-     * steward is one the user runs themselves. Its signed comments count as
-     * the user's own words, including for the spec (criterion 4).
-     */
-    function isUserThread(threadId: string): boolean {
-      return store.byThread(threadId) === null && store.worker(threadId) === null && store.projectByThread(threadId) === null;
-    }
-
     /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
-    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, isUserThread);
+    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId));
 
     /** The text a binding's approval pins, stored as `approvedText` so BB-249 can diff a later edit against it. */
-    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, isUserThread);
+    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId));
 
     /** The escalation-routing helpers bound to this server's store and wakes (escalations.ts). */
     const escalationsCtx: EscalationsContext = { store, scheduleReconcile, wakeProject };
@@ -3942,7 +3915,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: (threadId) => isUserThread(approvalsCtx, threadId) });
       changes.push(...fresh);
       // BB-248: a label that changes the phase with no state change is news
       // on its own; a state move already carries its own actionable line. The
@@ -6549,26 +6522,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       sendTo,
       wakeProject,
       pullChangedFiles,
-      recentUserTurnTexts: async (threadId) => {
-        const out: string[] = [];
-        const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" });
-        for (const row of rows) {
-          if (now() - row.createdAt > timing.approvalLookbackMs) break;
-          // A turn from before this plugin started recording its sends cannot be
-          // told from the plugin's own wakes, so it is never the owner's (BB-178).
-          if (row.createdAt < sentSince) continue;
-          const data = row.data as { initiator?: string; input?: unknown };
-          if (data.initiator !== "user") continue;
-          const text = turnText(data.input);
-          if (text === null) continue;
-          // A wake the plugin sent is recorded under its text's hash; it quotes
-          // the entity verbatim and must never count as the owner's approval.
-          if ((await bb.storage.kv.get(`sent/${sentHash(text)}`)) !== undefined) continue;
-          out.push(normalizeText(text));
-        }
-        return out;
-      },
-      isUserThread,
+      turnRequests: (threadId) => bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "30" }),
+      pluginSent: async (text) => (await bb.storage.kv.get(`sent/${sentHash(text)}`)) !== undefined,
+      approvalLookbackMs: timing.approvalLookbackMs,
+      sentSince,
       loadDecisions: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? [],
       loadDecisionsOrNull: async (projectId) => (await loadConfig(projectId))?.file.bigDecisions ?? null,
       observedPulls,
@@ -6663,7 +6620,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const approvedText = prior?.approvedText ?? b.ready.voidedApprovedText;
       const approvedAt = prior?.at ?? b.ready.voidedApprovedAt;
       const reapproval = approvedText !== null && approvedAt !== null ? specDiff(approvedText, currentText) : null;
-      const specComment = reapproval === null || approvedAt === null ? null : newestEditComment(entity, b.threadId, isUserThread, approvedAt);
+      const specComment = reapproval === null || approvedAt === null ? null : newestEditComment(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), approvedAt);
       const what =
         reapproval === null
           ? `Approve ${b.entityKey}'s spec`

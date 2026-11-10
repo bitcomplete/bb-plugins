@@ -6,7 +6,7 @@
 // BB-279: an owner's page approval and the project steward's decision deliver
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
-import { approvePrPageAction, deliverProjectApproval, recordProjectDecision, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approvePrPageAction, deliverProjectApproval, isUserThread, recordProjectDecision, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { isSelfWidening } from "./decisions.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
 import type { Binding, Need } from "./store.js";
@@ -157,5 +157,28 @@ describe("the approval-recording files are self-widening (BB-280)", () => {
   it("keeps the user's approval detection in approvals.ts", () => {
     expect(typeof userSaid).toBe("function");
     expect(typeof userApprovedOnEntity).toBe("function");
+  });
+
+  it("filters the user's turns in approvals.ts, so the logic cannot move back to server.ts", async () => {
+    const at = 1_000_000;
+    const turn = (createdAt: number, initiator: string, text: string) => ({ createdAt, data: { initiator, input: [{ type: "text", text }] } });
+    const ctx = (rows: Array<{ createdAt: number; data: unknown }>, sent: string[] = [], sentSince = 0) =>
+      ({ now: () => at, approvalLookbackMs: 60_000, sentSince, turnRequests: async () => rows, pluginSent: async (text: string) => sent.includes(text) }) as unknown as ApprovalsContext;
+    // A genuine user turn counts; the plugin's own wake, recorded under its hash, does not.
+    await expect(userSaid(ctx([turn(at, "user", "LGTM"), turn(at, "user", "LGTM wake")], ["LGTM wake"]), "thr_user", "LGTM")).resolves.toBe(true);
+    await expect(userSaid(ctx([turn(at, "user", "LGTM wake")], ["LGTM wake"]), "thr_user", "LGTM")).resolves.toBe(false);
+    // A steward's turn, and a turn from before the plugin recorded its sends, do not count.
+    await expect(userSaid(ctx([turn(at, "steward", "LGTM")]), "thr_user", "LGTM")).resolves.toBe(false);
+    await expect(userSaid(ctx([turn(at, "user", "LGTM")], [], at + 1), "thr_user", "LGTM")).resolves.toBe(false);
+    // A turn older than the lookback does not count.
+    await expect(userSaid(ctx([turn(at - 120_000, "user", "LGTM")]), "thr_user", "LGTM")).resolves.toBe(false);
+  });
+
+  it("decides whose thread a signed comment is from the store, not a server closure", () => {
+    const ctx = (byThread: unknown, worker: unknown, projectByThread: unknown) => ({ store: { byThread: () => byThread, worker: () => worker, projectByThread: () => projectByThread } }) as unknown as ApprovalsContext;
+    expect(isUserThread(ctx(null, null, null), "thr_user")).toBe(true);
+    expect(isUserThread(ctx({}, null, null), "thr_user")).toBe(false);
+    expect(isUserThread(ctx(null, {}, null), "thr_user")).toBe(false);
+    expect(isUserThread(ctx(null, null, {}), "thr_user")).toBe(false);
   });
 });

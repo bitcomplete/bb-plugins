@@ -17,6 +17,19 @@ import type { Binding, Escalation, Need, Observed, Store } from "./store.js";
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
+export const normalizeText = (text: string) => text.replace(/\s+/gu, " ").trim().toLowerCase();
+
+/** The text of a turn's input parts, joined; null when it carries no text (BB-178). */
+function turnText(input: unknown): string | null {
+  if (!Array.isArray(input)) return null;
+  const parts = input.flatMap((part) => {
+    if (typeof part !== "object" || part === null) return [];
+    const p = part as { type?: unknown; text?: unknown };
+    return p.type === "text" && typeof p.text === "string" ? [p.text] : [];
+  });
+  return parts.length === 0 ? null : parts.join("\n");
+}
+
 /**
  * What the approval functions need from the server: the store and GitHub
  * writer, the clock, and the few server helpers that read snapshots, deliver
@@ -34,10 +47,14 @@ export type ApprovalsContext = {
   sendTo: (threadId: string, text: string) => Promise<"sent" | "gone" | "failed" | "unavailable">;
   wakeProject: (projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[] }) => Promise<void>;
   pullChangedFiles: (entity: EntitySnapshot) => Promise<string[] | null>;
-  /** The user's own recent turn texts in a thread, normalized, newest first, excluding the plugin's own wakes (BB-178). */
-  recentUserTurnTexts: (threadId: string) => Promise<string[]>;
-  /** Whether a thread is the user's own rather than a steward's, a worker's or the project steward's. */
-  isUserThread: (threadId: string) => boolean;
+  /** The raw `client/turn/requested` rows for a thread, newest first. */
+  turnRequests: (threadId: string) => Promise<ReadonlyArray<{ createdAt: number; data: unknown }>>;
+  /** Whether the plugin itself sent this text as a wake, recorded under its hash (BB-178). */
+  pluginSent: (text: string) => Promise<boolean>;
+  /** How far back an approval quote is looked for. */
+  approvalLookbackMs: number;
+  /** The time this plugin started recording its sends; a turn from before it is never the user's (BB-178). */
+  sentSince: number;
   loadDecisions: (projectId: string) => Promise<readonly BigDecision[]>;
   /** The project's decide list, or null when the project file could not be read (BB-280). */
   loadDecisionsOrNull: (projectId: string) => Promise<readonly BigDecision[] | null>;
@@ -130,6 +147,10 @@ export async function recordProjectDecision(ctx: ApprovalsContext, b: Binding, p
 /** Whether `threadId` is the thread of `b`'s project steward (BB-280). */
 export const isProjectSteward = (ctx: ApprovalsContext, threadId: string, b: Binding): boolean => ctx.store.project(b.projectId).threadId === threadId;
 
+/** Whether a thread is the user's own rather than a steward's, a worker's or the project steward's. */
+export const isUserThread = (ctx: ApprovalsContext, threadId: string): boolean =>
+  ctx.store.byThread(threadId) === null && ctx.store.worker(threadId) === null && ctx.store.projectByThread(threadId) === null;
+
 /**
  * Whether the project steward's thread may approve `b`'s spec under the
  * playbook's `mode`: `project` and the project steward's own thread. `user` is
@@ -146,8 +167,24 @@ export const specApprovedByProject = (ctx: ApprovalsContext, threadId: string, b
  * normalized. The path was in server.ts before (BB-280).
  */
 export async function userSaid(ctx: ApprovalsContext, threadId: string, quote: string): Promise<boolean> {
-  const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
-  return (await ctx.recentUserTurnTexts(threadId)).some((text) => text.includes(want));
+  const want = normalizeText(quote);
+  const rows = await ctx.turnRequests(threadId);
+  for (const row of rows) {
+    if (ctx.now() - row.createdAt > ctx.approvalLookbackMs) break;
+    // A turn from before this plugin started recording its sends cannot be
+    // told from the plugin's own wakes, so it is never the owner's (BB-178).
+    if (row.createdAt < ctx.sentSince) continue;
+    const data = row.data as { initiator?: string; input?: unknown };
+    if (data.initiator !== "user") continue;
+    const text = turnText(data.input);
+    if (text === null) continue;
+    if (!normalizeText(text).includes(want)) continue;
+    // A wake the plugin sent is recorded under its text's hash; it quotes
+    // the entity verbatim and must never count as the owner's approval.
+    if (await ctx.pluginSent(text)) continue;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -159,7 +196,7 @@ export async function userSaid(ctx: ApprovalsContext, threadId: string, quote: s
 export function userApprovedOnEntity(ctx: ApprovalsContext, entity: EntitySnapshot | null, stewardThreadId: string | null, quote: string): boolean {
   if (entity === null || entity.viewer === null) return false;
   const viewer = entity.viewer.toLowerCase();
-  const latestSpec = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, ctx.isUserThread)).reduce((max, c) => (c.createdAt > max ? c.createdAt : max), "");
+  const latestSpec = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, (threadId) => isUserThread(ctx, threadId))).reduce((max, c) => (c.createdAt > max ? c.createdAt : max), "");
   const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
   return entity.comments.some(
     (c) =>
