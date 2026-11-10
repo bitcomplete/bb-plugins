@@ -1,25 +1,30 @@
 import { describe, expect, it } from "vitest";
 import {
-  bindingRoles,
   DEPENDENCY_BOTS,
   depsTargets,
-  filingTargetProblems,
   githubStateLabels,
   isTerminal,
   k8sTargets,
   labelPhaseName,
   legacyOpsPresent,
-  legacyRole,
   modelSpecSchema,
   opsTeam,
   parsePlaybook,
   parseProjectFile,
-  parseRolesFile,
   phaseInstructions,
   phaseOf,
   playbookLabels,
   playbookNameFor,
   playbookStates,
+  sentryTargets,
+  ticketWatchId,
+  ticketWatchProblems,
+} from "./config.js";
+import {
+  bindingRoles,
+  filingTargetProblems,
+  legacyRole,
+  parseRolesFile,
   projectStewardProblem,
   pullWatchId,
   pullWatchProblems,
@@ -33,12 +38,9 @@ import {
   roleSentryTargets,
   roleUsesOps,
   roleWarnings,
-  sentryTargets,
-  ticketWatchId,
-  ticketWatchProblems,
   usesKind,
   watchProblems,
-} from "./config.js";
+} from "./roles.js";
 import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
