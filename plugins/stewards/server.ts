@@ -97,7 +97,7 @@ import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTarget
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, recordProjectDecision, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -1961,10 +1961,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.setServerSetting(guidanceRenderedKey(projectId), String(now()));
     }
 
-    /** The AGENTS.md and playbook units a wake renders: `AGENTS.md` always, plus the binding's playbook (BB-288). */
+    /** The AGENTS.md and playbook units a wake renders: the binding's playbook first, then `AGENTS.md` (BB-288). The order matters because the index is compact but `fit` clips from the end: a clipped wake keeps the playbook ids that bind this binding. */
     function guidanceFor(units: readonly GuidanceUnit[], playbookName: string | null): GuidanceUnit[] {
       const file = playbookName === null ? null : playbookPath(playbookName);
-      return units.filter((u) => u.file === "AGENTS.md" || (file !== null && u.file === file));
+      const playbook = file === null ? [] : units.filter((u) => u.file === file);
+      const agents = units.filter((u) => u.file === "AGENTS.md");
+      return [...playbook, ...agents];
     }
 
     /** The guidance units for a wake, read (and cached) from `.bb` HEAD, recording the first render (BB-288). */
@@ -6003,8 +6005,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-288: the decide list decides who lands the lesson, exactly as it
       // decides any other pull request. A `user` file (AGENTS.md, the project
       // file, roles.json) files the owner's Review PR/Drop item; a `project`
-      // file (a playbook) is the project steward's, and the ordinary project
-      // approval is recorded before the merge.
+      // file (a playbook) is the project steward's, whose `complete` is the
+      // approval. No approval marker is posted: recording a project-steward
+      // approval is the user's code, and the project steward's own `complete`
+      // already carries the decision.
       const decisions = (await loadConfig(lesson.projectId))?.file.bigDecisions ?? [];
       if (lessonLandingMark(lesson, decisions) === "user") {
         const filed = fileLessonOwnerNeed(lesson, result.branch, result.url, retire);
@@ -6013,16 +6017,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           : "the decide list makes this the user's to approve, and the lesson has no binding to file it on";
         store.noteLesson(lesson.id, message);
         return { ok: false, message };
-      }
-      const binding = lesson.bindingId === null ? null : store.binding(lesson.bindingId);
-      const projectThreadId = store.project(lesson.projectId).threadId;
-      const pull = await snapshot("github", `${result.repo}#${result.number}`).catch(() => null);
-      if (binding !== null && projectThreadId !== null && pull !== null && (pull.pull?.headSha ?? "") !== "") {
-        const files = github.files === undefined ? null : await github.files(result.repo, result.number).catch(() => null);
-        const entry = files === null ? null : (explainDecision(files, decisions).winner?.text ?? null);
-        await recordProjectDecision(approvalsCtx, binding, pull, projectThreadId, { headSha: pull.pull?.headSha ?? "", entry, verdict: "approved", reasoning: note }).catch((error: unknown) => {
-          bb.log.warn(`stewards: could not record the project approval for lesson ${lesson.id}: ${errorMessage(error)}`);
-        });
       }
       try {
         const { sha } = await github.squashMerge(result.repo, result.number, `Lesson ${lesson.id}`, note);
