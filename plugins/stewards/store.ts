@@ -633,7 +633,38 @@ export const RETARGET_PULLS_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN retar
 // per pull request. Additive and defaulted: an old row reads as neither.
 export const STACKED_PULLS_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN stacked_pulls TEXT NOT NULL DEFAULT '[]'`, `ALTER TABLE bindings ADD COLUMN stacked_recovered TEXT NOT NULL DEFAULT '[]'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS];
+// BB-293 (child 2 of BB-291): the shadow assessment and its divergence log.
+// `assessments` keeps the latest assessment per binding; `assessment_divergences`
+// keeps one row per distinct (binding, surface, old, new), with a first and
+// last seen time and a count, so an unchanged divergence is not re-logged
+// every tick. Both are new tables, so nothing existing is altered and a store
+// from before this step behaves exactly as before. `divergences` is bounded by
+// the reconcile's prune (a row count and an age), never by the writer.
+export const ASSESSMENT_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS assessments (
+     binding_id TEXT PRIMARY KEY,
+     at INTEGER NOT NULL,
+     gate TEXT NOT NULL,
+     worker TEXT NOT NULL,
+     liveness TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS assessment_divergences (
+     id TEXT PRIMARY KEY,
+     binding_id TEXT NOT NULL,
+     surface TEXT NOT NULL,
+     old TEXT NOT NULL,
+     new TEXT NOT NULL,
+     inputs TEXT NOT NULL DEFAULT '{}',
+     first_seen_at INTEGER NOT NULL,
+     last_seen_at INTEGER NOT NULL,
+     count INTEGER NOT NULL DEFAULT 1,
+     UNIQUE (binding_id, surface, old, new)
+   )`,
+  `CREATE INDEX IF NOT EXISTS assessment_divergences_binding ON assessment_divergences (binding_id, surface)`,
+  `CREATE INDEX IF NOT EXISTS assessment_divergences_seen ON assessment_divergences (last_seen_at)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1335,6 +1366,26 @@ export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | "misspawn";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null };
 
+/**
+ * BB-293: the latest shadow assessment stored for a binding. The three answers
+ * are kept as JSON so the shape can grow without another migration; nothing
+ * reads them to decide or render.
+ */
+export type AssessmentRow = { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown };
+
+/** One place the shadow assessment and the predicate it will replace disagree. */
+export type DivergenceRow = {
+  id: string;
+  bindingId: string;
+  surface: string;
+  old: string;
+  new: string;
+  inputs: Record<string, unknown>;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  count: number;
+};
+
 /** The requester thread the plugin spawned for an open provide-secret need (BB-22). */
 export type SecretRequester = { threadId: string; needId: string; createdAt: number };
 
@@ -1512,6 +1563,25 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // Touches `filed_by_thread`, so it is prepared lazily too: a legacy store
   // opened without the migration must still start (migrations.test.ts).
   const setTicket = lazy<[string, number, number, string | null, string, string], unknown>("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ?, filed_by_thread = ? WHERE project_id = ? AND fingerprint = ?");
+
+  // BB-293: the shadow assessment and its divergence log, prepared lazily for
+  // the same reason: a store from before this group has no tables yet.
+  const upsertAssessmentStmt = lazy<[string, number, string, string, string], unknown>(
+    "INSERT INTO assessments (binding_id, at, gate, worker, liveness) VALUES (?, ?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET at = excluded.at, gate = excluded.gate, worker = excluded.worker, liveness = excluded.liveness",
+  );
+  const getAssessmentStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessments WHERE binding_id = ?");
+  const allAssessmentsStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessments ORDER BY at DESC");
+  const insertDivergenceStmt = lazy<[string, string, string, string, string, string, number, number], unknown>(
+    "INSERT INTO assessment_divergences (id, binding_id, surface, old, new, inputs, first_seen_at, last_seen_at, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1) ON CONFLICT (binding_id, surface, old, new) DO UPDATE SET last_seen_at = excluded.last_seen_at, inputs = excluded.inputs, count = count + 1",
+  );
+  const divergencesAllStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessment_divergences ORDER BY last_seen_at DESC, surface");
+  const divergencesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? ORDER BY last_seen_at DESC, surface");
+  const divergencesBySurfaceStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE surface = ? ORDER BY last_seen_at DESC, binding_id");
+  const divergencesByBothStmt = lazy<[string, string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? AND surface = ? ORDER BY last_seen_at DESC");
+  const pruneDivergencesByAgeStmt = lazy<[number], unknown>("DELETE FROM assessment_divergences WHERE last_seen_at < ?");
+  const pruneDivergencesByCountStmt = lazy<[number], unknown>(
+    "DELETE FROM assessment_divergences WHERE id NOT IN (SELECT id FROM assessment_divergences ORDER BY last_seen_at DESC, id LIMIT ?)",
+  );
 
   // BB-251: assumptions, prepared lazily for the same reason: a store from
   // before this group has no `assumptions` table yet.
@@ -1711,6 +1781,34 @@ export function createStore(db: Database.Database, now: () => number, options: S
     threadId: String(r.thread_id),
     needId: String(r.need_id),
     createdAt: Number(r.created_at),
+  });
+  // BB-293: the stored shadow assessment and its divergence rows. The three
+  // answers are JSON so the shape can grow without another migration.
+  const parseJson = (raw: unknown): unknown => {
+    if (raw === null || raw === undefined) return null;
+    try {
+      return JSON.parse(String(raw));
+    } catch {
+      return null;
+    }
+  };
+  const toAssessmentRow = (r: Record<string, unknown>): AssessmentRow => ({
+    bindingId: String(r.binding_id),
+    at: Number(r.at),
+    gate: parseJson(r.gate),
+    worker: parseJson(r.worker),
+    liveness: parseJson(r.liveness),
+  });
+  const toDivergenceRow = (r: Record<string, unknown>): DivergenceRow => ({
+    id: String(r.id),
+    bindingId: String(r.binding_id),
+    surface: String(r.surface),
+    old: String(r.old),
+    new: String(r.new),
+    inputs: json(z.record(z.string(), z.unknown()), r.inputs === null || r.inputs === undefined ? null : String(r.inputs), {}),
+    firstSeenAt: Number(r.first_seen_at),
+    lastSeenAt: Number(r.last_seen_at),
+    count: Number(r.count),
   });
   const toFingerprint = (r: Record<string, unknown>): Fingerprint => ({
     projectId: String(r.project_id),
@@ -2845,6 +2943,53 @@ export function createStore(db: Database.Database, now: () => number, options: S
     setServerSetting(key: string, value: string): void {
       db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
     },
+
+    // BB-293: the shadow assessment and its divergence log. The reconcile
+    // writes them; the `bb stewards divergences` command reads them.
+    /** Store the latest shadow assessment for a binding, replacing any earlier one. */
+    recordAssessment(fields: { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown }): void {
+      upsertAssessmentStmt().run(fields.bindingId, fields.at, JSON.stringify(fields.gate), JSON.stringify(fields.worker), JSON.stringify(fields.liveness));
+    },
+    /** The latest shadow assessment for a binding, or null. */
+    assessment(bindingId: string): AssessmentRow | null {
+      const r = getAssessmentStmt().get(bindingId);
+      return r === undefined ? null : toAssessmentRow(r);
+    },
+    /** Every binding's latest shadow assessment, newest first. */
+    assessments(): AssessmentRow[] {
+      return allAssessmentsStmt().all().map(toAssessmentRow);
+    },
+    /**
+     * Record the divergences a reconcile found. One row per distinct
+     * (binding, surface, old, new): an unchanged divergence bumps its count and
+     * last-seen time instead of adding a row, so a tick does not re-log it.
+     */
+    recordDivergences(divergences: ReadonlyArray<{ bindingId: string; surface: string; old: string; new: string; inputs: Record<string, unknown> }>, at = now()): number {
+      for (const d of divergences) insertDivergenceStmt().run(newId("dvg"), d.bindingId, d.surface, d.old, d.new, JSON.stringify(d.inputs), at, at);
+      return divergences.length;
+    },
+    /** The divergence log, newest first, filtered by binding and/or surface. */
+    divergences(opts: { bindingId?: string; surface?: string } = {}): DivergenceRow[] {
+      const rows =
+        opts.bindingId !== undefined && opts.surface !== undefined
+          ? divergencesByBothStmt().all(opts.bindingId, opts.surface)
+          : opts.bindingId !== undefined
+            ? divergencesByBindingStmt().all(opts.bindingId)
+            : opts.surface !== undefined
+              ? divergencesBySurfaceStmt().all(opts.surface)
+              : divergencesAllStmt().all();
+      return rows.map(toDivergenceRow);
+    },
+    /**
+     * Bound the divergence log: drop rows last seen before `maxAgeMs` and keep
+     * at most `maxRows` (newest first). Called by the reconcile, never by a
+     * reader; returns the number of rows removed.
+     */
+    pruneDivergences(maxAgeMs: number, maxRows: number, at = now()): number {
+      let removed = pruneDivergencesByAgeStmt().run(at - maxAgeMs).changes;
+      removed += pruneDivergencesByCountStmt().run(maxRows).changes;
+      return removed;
+    },
     /**
      * Forget a deleted project: its bindings and everything keyed by them
      * (escalations, workers, needs, approvals, fingerprints, queued answers),
@@ -2858,7 +3003,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         const ids = db.prepare<[string], { id: string }>("SELECT id FROM bindings WHERE project_id = ?").all(projectId).map((r) => r.id);
         const byBinding = "SELECT id FROM bindings WHERE project_id = ?";
         db.prepare(`DELETE FROM secret_requesters WHERE thread_id IN (SELECT thread_id FROM workers WHERE binding_id IN (${byBinding}))`).run(projectId);
-        for (const table of ["escalations", "workers", "needs", "project_approvals"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
+        for (const table of ["escalations", "workers", "needs", "project_approvals", "assessments", "assessment_divergences"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
         db.prepare(`DELETE FROM pending_deliveries WHERE origin_binding_id IN (${byBinding})`).run(projectId);
         for (const table of ["ops_fingerprints", "deps_decisions", "lessons", "guidance_citations", "assumptions", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
         options.onProjectChange?.(projectId, ["purged"]);

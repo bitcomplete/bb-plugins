@@ -916,3 +916,17 @@ export function stuckDue(binding: Pick<Binding, "advancedAt" | "createdAt" | "ph
 /** Whether a new status record moved on from the last one. */
 export const advanced = (before: Binding["status"], after: { phase: string; summary: string; nextAction: string }): boolean =>
   before === null || before.phase !== after.phase || before.summary !== after.summary || before.nextAction !== after.nextAction;
+
+/**
+ * BB-293: the stall the shadow assessment derives from what the plugin can
+ * observe, rather than the `noWakeSource` flag stored at report time. A
+ * non-empty `waitingOn` with no live tracked source and no dated wait still
+ * ahead is a stall the rows show on their own; the flag is the report path's
+ * copy of the same fact.
+ */
+export function observedStall(binding: Pick<Binding, "status" | "requeueUntil">, live: boolean, now: number): boolean {
+  if ((binding.status?.waitingOn ?? "").trim() === "") return false;
+  if (live) return false;
+  if (binding.requeueUntil !== null && binding.requeueUntil > now) return false;
+  return true;
+}

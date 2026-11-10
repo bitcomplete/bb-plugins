@@ -658,6 +658,31 @@ At the project file's time, 01:00 US Eastern by default:
 All of it must finish before 03:00, when bb-gate's quiet window restarts
 servers to apply staged updates and would kill a running turn.
 
+### The shadow assessment (BB-293)
+
+BB-291's direction is one assessment per binding: the merge gate, the worker
+state and the wait liveness answered in one place instead of by the several
+predicates that disagree today. This step adds only the derivation and the
+evidence it is safe, in shadow:
+
+- `assessment.ts` is pure. `assess` reads the rows a reconcile already has
+  in hand — no extra GitHub or Linear call — and derives the gate (with the
+decide-list mark and the recorded project approvals the `approvals.ts` path
+omits), the worker state (an explicit `parked`, distinct from `running`) and
+the liveness (wake source, idle, stall from the observable rows, not the
+report-time `noWakeSource` flag). `compare` runs the predicates the
+assessment will replace and returns every disagreement.
+- `reconcile.ts` calls it on every binding inside a try/catch that can never
+  change the reconcile's own result, stores the latest assessment per binding
+  in `assessments`, and logs each distinct divergence to
+  `assessment_divergences` (one row per binding/surface/old/new, with a first
+  and last seen time and a count). The log is bounded by an age and a row
+  count, pruned on each reconcile.
+- `bb stewards divergences [--binding] [--surface] [--json]` prints the log,
+  read-only. Nothing reads the assessment to decide or render anything: a
+  consumer is added only after the comparison has run clean in production for
+  several days. The log's `inputs` hold only ids, shas, states and timestamps.
+
 ## 7. The ready gate
 
 No ticket reaches implementation until it is fully specified, and no
