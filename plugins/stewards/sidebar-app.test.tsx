@@ -2462,7 +2462,12 @@ describe("the sidebar's one-project RPC (BB-100)", () => {
       rpc: { stewardsSidebar: () => sidebarData() } as never,
     });
     await pickProject(slot, "Personal");
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsSidebar", input: { projectId: "personal" } }));
+    // BB-295: the call carries the client's stamp for the queue-time report.
+    await waitFor(() =>
+      expect(slot.inspection.rpcCalls).toContainEqual(
+        expect.objectContaining({ method: "stewardsSidebar", input: expect.objectContaining({ projectId: "personal", clientSentAt: expect.any(Number) }) }),
+      ),
+    );
     slot.lifecycle.unmount();
   });
 

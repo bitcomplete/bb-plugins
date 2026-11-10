@@ -558,13 +558,18 @@ export function withUserActions(): { actions: NeedAction[]; freeText: boolean } 
   return { actions: [], freeText: false };
 }
 
-/** One RPC method's or CLI command's in-memory stat (BB-100). */
+/** One RPC method's or CLI command's in-memory stat (BB-100). The `queue*` fields are the client-reported round trip before the handler ran (BB-295). */
 const methodStatSchema = z.object({
   count: z.number(),
   totalMs: z.number(),
   maxMs: z.number(),
   lastMs: z.number(),
   lastAt: z.number().nullable(),
+  /** Calls that reported a client-side stamp, and the time from stamp to handler start. */
+  queueCount: z.number(),
+  queueTotalMs: z.number(),
+  queueMaxMs: z.number(),
+  queueLastMs: z.number(),
 });
 /** The plugin's in-memory handler table, read by `bb stewards stats` and the Status section (BB-100). */
 const statsSchema = z.object({
@@ -817,7 +822,16 @@ export const rpcContract = defineRpcContract({
   // the previous image still validates because `reviewers` stays optional for
   // one release (BB-100).
   stewardsSidebar: {
-    input: z.object({ projectId: z.string().min(1).max(100).nullable() }),
+    input: z.object({
+      projectId: z.string().min(1).max(100).nullable(),
+      /**
+       * The client's `Date.now()` when it built the call (BB-295). The server
+       * reports `now() - clientSentAt` as the call's queue time beside the
+       * handler time, so a slowdown can be told from event-loop contention.
+       * Optional, so a client built from the previous image still validates.
+       */
+      clientSentAt: z.number().optional(),
+    }),
     output: z.object({
       /** Every stewarded project, for the picker, with its needs-you binding count and claimed thread ids. */
       projects: z.array(
@@ -1203,18 +1217,36 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // nightly schedule share one bucket and a core change is out of scope; this
     // table is the plugin's own, read by `bb stewards stats` and the Status
     // section. It is per process, like the debug lines BB-95 added.
-    type MethodStat = { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null };
+    type MethodStat = { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null; queueCount: number; queueTotalMs: number; queueMaxMs: number; queueLastMs: number };
     const methodStats = { rpc: new Map<string, MethodStat>(), cli: new Map<string, MethodStat>() };
+    const blankStat = (): MethodStat => ({ count: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastAt: null, queueCount: 0, queueTotalMs: 0, queueMaxMs: 0, queueLastMs: 0 });
     /** Published signals, for the per-project count in the last hour. */
     const signalLog: Array<{ projectId: string; at: number }> = [];
     function recordStat(kind: "rpc" | "cli", name: string, ms: number): void {
       const table = methodStats[kind];
-      const entry = table.get(name) ?? { count: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastAt: null };
+      const entry = table.get(name) ?? blankStat();
       entry.count += 1;
       entry.totalMs += ms;
       entry.maxMs = Math.max(entry.maxMs, ms);
       entry.lastMs = ms;
       entry.lastAt = now();
+      table.set(name, entry);
+    }
+    /**
+     * Record the time from the client's stamp on the call to the handler's
+     * start (BB-295). The handler's own `measured` time cannot see the queue:
+     * better-sqlite3 is synchronous, so a call can wait behind another handler
+     * on the plugin's event loop before its own handler runs. The client stamps
+     * every `stewardsSidebar` call with `Date.now()` and the difference is the
+     * queue (clamped at zero for clock skew).
+     */
+    function recordQueue(kind: "rpc" | "cli", name: string, ms: number): void {
+      const table = methodStats[kind];
+      const entry = table.get(name) ?? blankStat();
+      entry.queueCount += 1;
+      entry.queueTotalMs += ms;
+      entry.queueMaxMs = Math.max(entry.queueMaxMs, ms);
+      entry.queueLastMs = ms;
       table.set(name, entry);
     }
     async function measured<T>(kind: "rpc" | "cli", name: string, fn: () => T | Promise<T>): Promise<T> {
@@ -2075,12 +2107,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** Every project with a stewards configuration, whether or not this server has it switched on. */
     async function configuredProjects(force = false, projects?: Awaited<ReturnType<typeof bb.sdk.projects.list>>): Promise<ProjectConfig[]> {
       const list = projects ?? (await bb.sdk.projects.list());
-      const out: ProjectConfig[] = [];
-      for (const p of list) {
-        const config = await loadConfig(p.id, force);
-        if (config !== null) out.push(config);
-      }
-      return out;
+      // BB-295: read the projects' configurations concurrently. The reads are
+      // independent, and a cold `.bb` read through multi-repo is the slow half
+      // of the first call after a restart; serialising them made the first
+      // sidebar call (or the startup sweep) pay for each project in turn.
+      const loaded = await Promise.all(list.map((p) => loadConfig(p.id, force)));
+      return loaded.filter((c): c is ProjectConfig => c !== null);
     }
 
     /** Every project this server stewards: configured in `.bb` and switched on here. `projects` reuses a list already fetched this call (BB-95). */
@@ -5187,7 +5219,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const opsPlaybook = playbookFor(config, "ops");
       if (opsPlaybook !== null) for (const target of roleOpsTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
       if (config.depsAlerts !== null) for (const target of roleDepsTargets(config.role, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
-      const existing = store.all(config.projectId).filter((b) => b.kind === "ops");
+      // BB-295: only this project's ops bindings, open and ended, read narrow.
+      // `store.all(config.projectId).filter(kind === "ops")` parsed every
+      // binding's `lastSnapshot`; an open-only read would drop the ended-reopen
+      // path below, so both halves are read here.
+      const existing = [...store.openOfKind(config.projectId, "ops"), ...store.endedOfKind(config.projectId, "ops")];
       for (const b of existing) {
         if (wanted.has(b.entityId)) continue;
         if (b.endedAt === null) {
@@ -8542,8 +8578,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const projects = ids.map((projectId) => {
           const config = configsById.get(projectId) ?? null;
           const row = store.project(projectId);
-          const bindings = store.all(projectId);
-          const open = bindings.filter((b) => b.endedAt === null);
+          const open = store.open(projectId);
+          const total = store.bindingCount(projectId);
           const { questions: projectQuestions, openIds } = needsUserInputs(projectId, open);
           const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
           return {
@@ -8552,7 +8588,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             configured: config !== null,
             // A project that still has bindings was stewarded before: restoring
             // its project.json is the fix, not onboarding it again.
-            onboard: !hasProjectSteward(config) && bindings.length === 0,
+            onboard: !hasProjectSteward(config) && total === 0,
             enabled: config?.enabled ?? false,
             source: config?.source.kind ?? null,
             label: config?.file.label ?? null,
@@ -8567,7 +8603,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             lastNight: row.nightlyDate,
             projectStewardThreadId: row.threadId,
             digestAt: row.digestAt,
-            endedCount: bindings.length - open.length,
+            endedCount: total - open.length,
             stewards: open.map((b) => ({
               key: b.entityKey,
               url: b.url,
@@ -8634,15 +8670,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (picked === undefined) return { projects, board: null };
         const { projectId } = picked;
         const row = store.project(projectId);
-        const all = store.all(projectId);
-        const open = all.filter((b) => b.endedAt === null);
+        const open = store.open(projectId);
         const { questions: projectQuestions, openIds } = needsUserInputs(projectId, open);
         const { questions, withUser, needs } = needsYou(projectId, open, projectQuestions);
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
         ]);
-        const ended = all.filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS).sort((a, b) => b.endedAt! - a.endedAt!).slice(0, 30);
+        const ended = store.endedSince(projectId, now() - ENDED_ON_BOARD_MS, 30);
         const boardConfig = configs.find((c) => c.projectId === projectId) ?? null;
         const roleMap = bindingRoles(boardConfig?.roles ?? null, boardConfig?.githubLogin === null || boardConfig?.githubLogin === undefined ? null : lc(boardConfig.githubLogin), boardConfig?.repos ?? []);
         return {
@@ -8703,7 +8738,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
             })),
             stuck: stuck.map(({ b, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, why, since })),
-            ended: ended.map((b) => ({ key: b.entityKey, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt!, threadId: b.threadId })),
+            ended: ended.map((b) => ({ key: b.key, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt, threadId: b.threadId })),
           },
         };
       },
@@ -8711,8 +8746,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // plus the picker's per-project needs count. The project is the input, or
       // the first by name when null. There is no per-worker `threads.list`: the
       // client derives reviewers from the live thread tree (BB-100).
-      async stewardsSidebar({ projectId: wanted }) {
+      async stewardsSidebar({ projectId: wanted, clientSentAt }) {
         const started = now();
+        // BB-295: the client's stamp measures the wait before this handler ran,
+        // which the handler's own duration cannot see (a synchronous store call
+        // on the event loop blocks a poll landing behind it).
+        const queueMs = clientSentAt === undefined ? null : Math.max(0, started - clientSentAt);
+        if (queueMs !== null) recordQueue("rpc", "stewardsSidebar", queueMs);
         // One project list for both the names and the configurations (BB-95),
         // instead of `bb.sdk.projects.list()` twice.
         const projectList = await bb.sdk.projects.list();
@@ -8824,7 +8864,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // One debug line per call, with its duration and binding/worker counts,
         // so the next slowdown has numbers (BB-95).
         const workerCount = section.bindings.reduce((n, b) => n + b.workers.length, 0);
-        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms (${projectId}: ${section.bindings.length} bindings, ${workerCount} workers, ${cached === undefined ? "recomputed" : "cached"})`);
+        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms${queueMs === null ? "" : `, queued ${queueMs}ms`} (${projectId}: ${section.bindings.length} bindings, ${workerCount} workers, ${cached === undefined ? "recomputed" : "cached"})`);
         // `projectStewardThreadId` is read fresh: `patchProject` does not publish
         // a store change, so it is not part of the cached section.
         return { projects: picker, roleProblem, projectStewardThreadId: store.project(projectId).threadId, ...section };
@@ -11017,10 +11057,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // stranded `[ended: disabled]` cannot survive a sweep. A binding
       // detached by hand stays ended; a reopened one is woken by the reconcile
       // scheduled for it below.
-      for (const b of store.all(config.projectId)) {
-        if (!switchOffHeld(b)) continue;
-        await serial(`b:${b.id}`, async () => {
-          const fresh = store.binding(b.id);
+      for (const id of store.heldBySwitchOff(config.projectId)) {
+        await serial(`b:${id}`, async () => {
+          const fresh = store.binding(id);
           if (fresh === null || !switchOffHeld(fresh)) return;
           await reopen(fresh, "the project's stewards were switched back on");
         });
@@ -11305,10 +11344,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // whose stop turn is still running (`ending === "disabled"`, not
         // ended) is reopened too, so the turn going idle cannot end it after
         // the project is already back on (BB-116).
-        for (const b of store.all(projectId)) {
-          if (!switchOffHeld(b)) continue;
-          await serial(`b:${b.id}`, async () => {
-            const fresh = store.binding(b.id);
+        for (const id of store.heldBySwitchOff(projectId)) {
+          await serial(`b:${id}`, async () => {
+            const fresh = store.binding(id);
             if (fresh === null || !switchOffHeld(fresh)) return;
             await reopen(fresh, "the project's stewards were switched back on");
           });
@@ -12463,7 +12501,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           stats: cliCommand({
             summary: "Per-method RPC and CLI call counts and timings, and published signals in the last hour",
             description:
-              "The in-memory table bb core's own handler stat cannot show: one row per RPC method and CLI command, plus the signals each project published in the last hour (BB-100). Reset by a restart.",
+              "The in-memory table bb core's own handler stat cannot show: one row per RPC method and CLI command, plus the signals each project published in the last hour (BB-100). The `queue` half of a `stewardsSidebar` row is the client-reported wait from the call's stamp to the handler, so a slowdown can be told from event-loop contention (BB-295). Reset by a restart.",
             options: { json: JSON_OPTION },
             async run(input) {
               const stats = statsSnapshot();
@@ -12476,7 +12514,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   return;
                 }
                 for (const [name, s] of rows.sort((a, b) => a[0].localeCompare(b[0]))) {
-                  lines.push(`  ${name}: ${s.count} call${s.count === 1 ? "" : "s"}, total ${s.totalMs}ms, max ${s.maxMs}ms, last ${s.lastMs}ms${s.lastAt === null ? "" : ` at ${iso(s.lastAt)}`}`);
+                  const queue = s.queueCount === 0 ? "" : `; queue ${s.queueCount} call${s.queueCount === 1 ? "" : "s"}, total ${s.queueTotalMs}ms, max ${s.queueMaxMs}ms, last ${s.queueLastMs}ms`;
+                  lines.push(`  ${name}: ${s.count} call${s.count === 1 ? "" : "s"}, total ${s.totalMs}ms, max ${s.maxMs}ms, last ${s.lastMs}ms${s.lastAt === null ? "" : ` at ${iso(s.lastAt)}`}${queue}`);
                 }
               };
               section("RPC methods:", Object.entries(stats.rpc));

@@ -1372,8 +1372,11 @@ export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | "misspawn";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null };
 
-/** The sidebar's ended-list row (BB-294): the columns it renders, never `lastSnapshot`. */
-export type EndedBindingRow = { key: string; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number };
+/** The sidebar's ended-list row (BB-294): the columns it renders, never `lastSnapshot`. `url` is added for the board's ended list (BB-295). */
+export type EndedBindingRow = { key: string; url: string | null; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number };
+
+/** A binding's reconciliation columns, without its `lastSnapshot` (BB-295): what `syncOpsBindings` reads. */
+export type KindBindingRow = { id: string; entityId: string; endedAt: number | null; manualDetach: boolean };
 
 /**
  * BB-293: the latest shadow assessment stored for a binding. The three answers
@@ -1499,8 +1502,27 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // `last_snapshot` before the sort and limit apply. The columns are named for
   // the row type directly. `created_at ASC` breaks ties as the old in-memory
   // stable sort did.
-  const endedSinceForProject = db.prepare<[string, number, number], { entity_key: string; kind: string; thread_id: string | null; title: string | null; phase: string | null; end_reason: string | null; ended_at: number }>(
-    "SELECT entity_key, kind, thread_id, title, phase, end_reason, ended_at FROM bindings WHERE project_id = ? AND ended_at IS NOT NULL AND ended_at >= ? ORDER BY ended_at DESC, created_at ASC LIMIT ?",
+  const endedSinceForProject = db.prepare<[string, number, number], { entity_key: string; url: string | null; kind: string; thread_id: string | null; title: string | null; phase: string | null; end_reason: string | null; ended_at: number }>(
+    "SELECT entity_key, url, kind, thread_id, title, phase, end_reason, ended_at FROM bindings WHERE project_id = ? AND ended_at IS NOT NULL AND ended_at >= ? ORDER BY ended_at DESC, created_at ASC LIMIT ?",
+  );
+  // BB-295: the board and overview parse no ended binding, and the sweep's two
+  // loops filter in SQL. `openOfKind` and `endedOfKind` return a project's
+  // bindings of one kind without `SELECT *`, so `syncOpsBindings` never parses
+  // a ticket binding's `lastSnapshot` to find the few ops ones; `bindingCount`
+  // and `heldBySwitchOff` are counts and id lists. A store migration is not
+  // needed: these are reads of existing columns.
+  const openOfKindStmt = db.prepare<[string, string], { id: string; entity_id: string; ended_at: number | null; manual_detach: number }>(
+    "SELECT id, entity_id, ended_at, manual_detach FROM bindings WHERE project_id = ? AND kind = ? AND ended_at IS NULL ORDER BY created_at",
+  );
+  const endedOfKindStmt = db.prepare<[string, string], { id: string; entity_id: string; ended_at: number; manual_detach: number }>(
+    "SELECT id, entity_id, ended_at, manual_detach FROM bindings WHERE project_id = ? AND kind = ? AND ended_at IS NOT NULL ORDER BY created_at",
+  );
+  const bindingCountStmt = db.prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM bindings WHERE project_id = ?");
+  // BB-295: the sweep's switch-off reopen set, expressed in SQL rather than a
+  // full parse. It is `switchOffHeld` (an open binding ending `disabled`, or an
+  // ended one whose `end_reason` is `disabled` and was not detached by hand).
+  const heldBySwitchOffStmt = db.prepare<[string], { id: string }>(
+    "SELECT id FROM bindings WHERE project_id = ? AND ((ended_at IS NULL AND ending = 'disabled') OR (ended_at IS NOT NULL AND end_reason = 'disabled' AND manual_detach = 0)) ORDER BY created_at",
   );
   /**
    * The picker's needs count (BB-104): one statement per project, so the
@@ -2228,7 +2250,23 @@ export function createStore(db: Database.Database, now: () => number, options: S
      * `lastSnapshot` read.
      */
     endedSince(projectId: string, since: number, limit: number): EndedBindingRow[] {
-      return endedSinceForProject.all(projectId, since, limit).map((r) => ({ key: r.entity_key, kind: r.kind as BindingKind, threadId: r.thread_id, title: r.title, phase: r.phase, endReason: r.end_reason, endedAt: r.ended_at }));
+      return endedSinceForProject.all(projectId, since, limit).map((r) => ({ key: r.entity_key, url: r.url, kind: r.kind as BindingKind, threadId: r.thread_id, title: r.title, phase: r.phase, endReason: r.end_reason, endedAt: r.ended_at }));
+    },
+    /** A project's open bindings of one kind (BB-295), the same four columns as `endedOfKind`, never `lastSnapshot`. */
+    openOfKind(projectId: string, kind: BindingKind): KindBindingRow[] {
+      return openOfKindStmt.all(projectId, kind).map((r) => ({ id: r.id, entityId: r.entity_id, endedAt: r.ended_at, manualDetach: Number(r.manual_detach) === 1 }));
+    },
+    /** A project's ended bindings of one kind (BB-295), the four columns `syncOpsBindings` reads, never `lastSnapshot`. */
+    endedOfKind(projectId: string, kind: BindingKind): KindBindingRow[] {
+      return endedOfKindStmt.all(projectId, kind).map((r) => ({ id: r.id, entityId: r.entity_id, endedAt: r.ended_at, manualDetach: Number(r.manual_detach) === 1 }));
+    },
+    /** How many bindings a project has ever held, open or ended (BB-295), for the overview's counts without parsing one. */
+    bindingCount(projectId: string): number {
+      return bindingCountStmt.get(projectId)?.n ?? 0;
+    },
+    /** The ids of a project's bindings the switch-off holds (BB-295): the sweep's reopen set, computed in SQL. */
+    heldBySwitchOff(projectId: string): string[] {
+      return heldBySwitchOffStmt.all(projectId).map((r) => r.id);
     },
     /** The open bindings of a project that `needsUser` would flag, counted in SQL (BB-104). */
     countNeedsUser(projectId: string): number {

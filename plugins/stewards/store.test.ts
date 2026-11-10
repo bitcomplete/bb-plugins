@@ -300,6 +300,60 @@ describe("the sidebar's narrow binding reads (BB-294)", () => {
   });
 });
 
+// BB-295: the sweep's two loops and the overview's counts read narrow rows; a
+// mixed seed gives the same answer as the old `store.all` derivation.
+describe("the sweep's narrow binding reads (BB-295)", () => {
+  const add = (s: ReturnType<typeof store>["s"], projectId: string, n: number, kind: "ticket" | "ops" = "ticket") =>
+    s.create({ projectId, source: kind === "ops" ? "ops" : "linear", entityId: `uuid-${n}`, entityKey: kind === "ops" ? `ops-${n}` : `ENG-${n}`, url: null, title: null, kind, playbook: kind === "ops" ? "ops-watch" : "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+
+  it("openOfKind and endedOfKind match the old store.all filter on a mixed seed", () => {
+    const { s } = store();
+    const openOps = add(s, "p1", 1, "ops");
+    const endedOps = add(s, "p1", 2, "ops");
+    s.patch(endedOps.id, { endedAt: 5_000, endReason: "unconfigured" });
+    const detachedOps = add(s, "p1", 3, "ops");
+    s.patch(detachedOps.id, { endedAt: 6_000, endReason: "unconfigured", manualDetach: true });
+    add(s, "p1", 4, "ticket");
+    const endedTicket = add(s, "p1", 5, "ticket");
+    s.patch(endedTicket.id, { endedAt: 7_000 });
+    add(s, "p2", 6, "ops");
+
+    expect(s.openOfKind("p1", "ops").map((b) => b.id)).toEqual([openOps.id]);
+    expect(s.openOfKind("p1", "ops").map((b) => b.id)).toEqual(s.all("p1").filter((b) => b.kind === "ops" && b.endedAt === null).map((b) => b.id));
+    // The ended read has no meaningful order for the sync; compare as sets.
+    expect(s.endedOfKind("p1", "ops").map((b) => b.id).sort()).toEqual(s.all("p1").filter((b) => b.kind === "ops" && b.endedAt !== null).map((b) => b.id).sort());
+    expect(s.endedOfKind("p1", "ops").map((b) => [b.entityId, b.endedAt, b.manualDetach]).sort()).toEqual([
+      [endedOps.entityId, 5_000, false],
+      [detachedOps.entityId, 6_000, true],
+    ]);
+  });
+
+  it("heldBySwitchOff matches the old switchOffHeld derivation on a mixed seed", () => {
+    const { s } = store();
+    const seed = (n: number, fields: Partial<Binding>) => {
+      const b = add(s, "p1", n);
+      s.patch(b.id, fields);
+      return b;
+    };
+    const heldOpen = seed(20, { ending: "disabled" });
+    seed(21, { ending: "terminal" });
+    const heldEnded = seed(22, { endedAt: 5_000, endReason: "disabled" });
+    seed(23, { endedAt: 6_000, endReason: "disabled", manualDetach: true });
+    seed(24, { endedAt: 7_000, endReason: "terminal" });
+    const old = s.all("p1").filter((b) => (b.endedAt === null && b.ending === "disabled") || (b.endedAt !== null && b.endReason === "disabled" && !b.manualDetach)).map((b) => b.id);
+    expect(s.heldBySwitchOff("p1").sort()).toEqual([heldOpen.id, heldEnded.id].sort());
+    expect(s.heldBySwitchOff("p1").sort()).toEqual(old.sort());
+  });
+
+  it("bindingCount counts open and ended bindings, and nothing for an unknown project", () => {
+    const { s } = store();
+    const ended = add(s, "p1", 20, "ops");
+    s.patch(ended.id, { endedAt: 5_000 });
+    expect(s.bindingCount("p1")).toBe(2);
+    expect(s.bindingCount("p2")).toBe(0);
+  });
+});
+
 describe("lessons", () => {
   it("are recorded pending with their source, and resolved once", () => {
     const { s, binding, advance } = store();
