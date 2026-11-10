@@ -202,6 +202,13 @@ export const depsLookSchema = z.object({
   error: z.string().nullable(),
   viewer: z.string().nullable(),
   alerts: z.array(depsFindingSchema),
+  /**
+   * Whether the repository's dependency graph parsed no manifests, so an
+   * empty alert list means Dependabot cannot see anything rather than that
+   * there is nothing to see (BB-289). Optional so a look stored before this
+   * field parses; absent means false.
+   */
+  graphEmpty: z.boolean().optional(),
 });
 export type DepsLook = z.infer<typeof depsLookSchema>;
 

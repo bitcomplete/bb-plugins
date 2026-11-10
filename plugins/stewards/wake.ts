@@ -1034,6 +1034,10 @@ export function formatDepsWake(input: DepsWakeInput): string {
   const head = out.splice(0);
   out.push("", "## 3. The alerts", "");
   if (look.error !== null) out.push(`The repository could not be read: ${look.error}. Nothing to do until it can; \`bb stewards check\` says why.`);
+  else if (look.alerts.length === 0 && look.graphEmpty === true)
+    out.push(
+      "**Dependency graph empty.** Dependabot cannot see any manifest for this repository, so an empty alert list is not evidence that there is nothing to fix. Turn the dependency graph on by hand in the repository's Settings → Advanced Security → Dependency graph; the next look will then read real alerts. Nothing to file, comment on or close: report that with steward_report (actor other) and end the turn.",
+    );
   else if (look.alerts.length === 0) out.push("**No open alerts.** Nothing to file, comment on or close: report that with steward_report (actor other) and end the turn.");
   for (const c of present) {
     out.push("", `### ${DEPS_CLASS_TITLES[c]}`, "");
