@@ -1259,7 +1259,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // and several connected clients share one recompute. The picker and
     // `roleProblem` are recomputed each call: both are one query (a per-project
     // count and the grouped claimed set) plus the config cache.
-    const sidebarCache = new Map<string, SidebarSection>();
+    //
+    // The entry also expires after a short TTL, because a few writes that change
+    // the section never signal — a project-routed `stuck` escalation, a quiet
+    // `note`, a project approval — and the section bakes in the worker and ended
+    // time windows. The TTL is under the client's 30 s poll, so the poll is the
+    // fallback that sees those without an unrelated signal, while a burst of
+    // signals and several clients still share one recompute.
+    const SIDEBAR_CACHE_TTL_MS = 25_000;
+    const sidebarCache = new Map<string, { at: number; section: SidebarSection }>();
     // The store reports a project whose sidebar- or board-visible state
     // changed; the sidebar, the board page and the overview refetch on the
     // channel. Keeping it a callback keeps store.ts free of bb, so
@@ -8741,7 +8749,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-296: the per-project section is the expensive half. Serve it from
         // the cache when the reconcile has not changed the project, so several
         // connected clients and a burst of signals share one recompute.
-        const cached = sidebarCache.get(projectId);
+        const entry = sidebarCache.get(projectId);
+        const cached = entry !== undefined && now() - entry.at <= SIDEBAR_CACHE_TTL_MS ? entry.section : undefined;
         const section = cached ?? (() => {
           const open = store.open(projectId);
           const ended = store.endedSince(projectId, started - ENDED_ON_BOARD_MS, 30);
@@ -8809,7 +8818,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             bindings,
             ended: ended.map((b) => ({ key: b.key, kind: b.kind, threadId: b.threadId, title: b.title, phase: b.phase, endReason: b.endReason, endedAt: b.endedAt })),
           };
-          sidebarCache.set(projectId, computed);
+          sidebarCache.set(projectId, { at: now(), section: computed });
           return computed;
         })();
         // One debug line per call, with its duration and binding/worker counts,

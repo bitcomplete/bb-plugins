@@ -6591,6 +6591,25 @@ describe("the stewards sidebar call", () => {
     expect(recomputes).toBe(2);
     expect(result.projects.find((p) => p.projectId === "p2")!.needsCount).toBe(1);
   });
+
+  it("expires a warm cache entry so a silent write shows on the poll (BB-296)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    // A project-routed `stuck` escalation does not publish a store signal, so
+    // the cache is not dropped; the TTL is what lets the next poll see it.
+    const first = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(first.bindings.find((x) => x.key === "ENG-12")!.stuck).toBe(false);
+    t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
+    // Warm cache: still the old section.
+    const warm = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(warm.bindings.find((x) => x.key === "ENG-12")!.stuck).toBe(false);
+    // Past the TTL (under the client's 30 s poll), the next call recomputes.
+    t.advance(26_000);
+    const after = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(after.bindings.find((x) => x.key === "ENG-12")!.stuck).toBe(true);
+  });
 });
 
 // BB-46: the sidebar's "needs you" count and items, and the realtime signal
