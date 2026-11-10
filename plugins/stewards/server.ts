@@ -11647,8 +11647,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   stdout: rows
                     .map((n) => {
                       const b = store.binding(n.bindingId);
+                      const head = `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` (${n.url})`}`;
+                      // A closed row is a record of what happened, not an open
+                      // item: show its resolution rather than needView's reason
+                      // it cannot be acted on now (BB-283).
+                      if (n.status === "done") return `${head}${n.resolution === null ? "" : ` → ${n.resolution}`}`;
                       const view = b === null ? null : needView(n, b);
-                      return `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` (${n.url})`}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
+                      return `${head}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
                     })
                     .join("\n"),
                 };

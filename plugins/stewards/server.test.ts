@@ -8781,6 +8781,31 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     expect(Array.isArray(all)).toBe(true);
   });
 
+  it("shows a done need's resolution and no actionability reason in --all (BB-283)", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    // A merged, observed pull request: `needView` on this closed approve-pr row
+    // would fall through to "the pull request has not been observed yet".
+    const merged = pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "merged" }, { merged: true, mergeCommit: "b".repeat(40), checks: { state: "success", failing: [] } });
+    t.entities.set("acme/web#7", merged);
+    t.hooks.store.patch(b.id, { lastSnapshot: { entity: t.entities.get("uuid-12")!, pulls: [merged] } });
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub", how: null, filedBy: "plugin" });
+    t.hooks.store.closeNeed(need.id, "Approved on the Stewards page.");
+    const out = (await t.harness.behavior.runCli(["needs", "--all", "--project", "p1"])).stdout;
+    const line = out.split("\n").find((l) => l.startsWith(need.id))!;
+    expect(line).toBe(`${need.id} — approve-pr, ENG-12: Approve acme/web#7 on GitHub (https://github.com/acme/web/pull/7) → Approved on the Stewards page.`);
+    expect(line).not.toContain("[not actionable");
+  });
+
+  it("keeps an open need's --all line byte-for-byte, with its actionability reason (BB-283)", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/999", what: "Approve an unobserved pull request", how: null });
+    const out = (await t.harness.behavior.runCli(["needs", "--all", "--project", "p1"])).stdout;
+    const line = out.split("\n").find((l) => l.startsWith(need.id))!;
+    expect(line).toBe(`${need.id} — approve-pr, ENG-12: Approve an unobserved pull request (https://github.com/acme/web/pull/999) [not actionable: the pull request has not been observed yet]`);
+  });
+
   it("the printed done command closes the question and the escalation it names", async () => {
     const t = await adopted();
     const b = t.binding();
