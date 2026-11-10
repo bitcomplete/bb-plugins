@@ -85,3 +85,19 @@ describe("the shipped skills' stacked-PR rule (BB-264)", () => {
     expect(stewardsSkill).toContain("Never answer a schedule escalation by telling a stacked ticket");
   });
 });
+
+// BB-267: a by-hand step outside the repos that a feature needs (an app scope,
+// a webhook, a registry entry, a tailnet rule) is a configure escalation, and
+// the project steward fails item 5 on a spec that leaves it as a README line
+// or a follow-up.
+describe("the shipped stewards skill's by-hand configure step (BB-267)", () => {
+  it("raises it as an escalation, not a README line, and fails item 5 when a spec leaves it undocumented", () => {
+    expect(stewardsSkill).toContain("A by-hand step outside the repos the feature needs to work");
+    expect(stewardsSkill).toMatch(/an app scope, a webhook, a registry entry, a tailnet rule/u);
+    expect(stewardsSkill).toMatch(/a `configure`\s+escalation raised in the spec turn/u);
+    expect(stewardsSkill).toMatch(/never a README line or a\s+closing-comment follow-up/u);
+    expect(stewardsSkill).toMatch(/reopens the step rather than settling\s+it/u);
+    expect(stewardsSkill).toMatch(/Fail checklist item 5/u);
+    expect(stewardsSkill).toMatch(/reopens rather than\s+settling/u);
+  });
+});

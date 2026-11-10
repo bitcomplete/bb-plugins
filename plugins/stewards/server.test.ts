@@ -12227,7 +12227,14 @@ describe("deployment watching (BB-53)", () => {
     expect(reported.error).toBe(false);
     await t.flush();
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
-    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Every pull request is merged and deployed/u);
+    const wrap = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wrap).toMatch(/Every pull request is merged and deployed/u);
+    // BB-267: a by-hand configure step is an escalation with followThrough, not
+    // folded into the closing comment; an "unchanged" provide-secret reopens it.
+    expect(wrap).toMatch(/A by-hand step outside the repos that the feature needs to work/u);
+    expect(wrap).toMatch(/kind: "configure"/u);
+    expect(wrap).toMatch(/keep the binding open with followThrough until it is done/u);
+    expect(wrap).toMatch(/"unchanged" has not provided the value, so reopen that step/u);
   });
 
   it("keeps the pull request awaiting when the steward reports the deployment does not carry the merge", async () => {

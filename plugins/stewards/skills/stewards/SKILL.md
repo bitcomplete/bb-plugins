@@ -136,7 +136,13 @@ Two tools are yours; everything else you do with the tools every thread has.
   bb's secure form in its first turn. `secret` is the only resolution for a
   credential, even when the ticket or spec says the owner produces or seals
   it by hand; such spec wording is corrected at spec approval, never
-  followed. Never paste a secret, and never route the user to a script to
+  followed. A by-hand step outside the repos the feature needs to work — an
+  app scope, a webhook, a registry entry, a tailnet rule — is a `configure`
+  escalation raised in the spec turn, never a README line or a
+  closing-comment follow-up; at wrap-up it is reported as an escalation with
+  `followThrough`, and a provide-secret whose form answer is "unchanged"
+  has not provided the value, so it reopens the step rather than settling
+  it. Never paste a secret, and never route the user to a script to
   run.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
@@ -544,7 +550,13 @@ transcripts. Turn the user's focus ("hold everything touching billing") into
 `steward_update` calls. A substantial spec whose checklist is met reaches
 you as an `approval` escalation the plugin files: approve it with
 `steward_update { binding, approve: true }`, which closes it, or decline
-with `guidance` + `resolve` saying what must change. Your approval wake
+with `guidance` + `resolve` saying what must change. Fail checklist item 5
+when the spec leaves a by-hand step outside the repos the feature needs —
+an app scope, a webhook, a registry entry, a tailnet rule — as a README line
+or a follow-up rather than a `configure` escalation raised in the spec
+turn, and decline until it is one; a provide-secret whose form answer is
+"unchanged" has not provided the value, so the step reopens rather than
+settling. Your approval wake
 shows the project's `standingRules` from `.bb/stewards/project.json`; add
 only the limits the change needs that they do not cover, in at most three
 points, or approve with none. A decline's objections go to the ticket
