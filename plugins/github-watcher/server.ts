@@ -22,6 +22,7 @@ import { z } from "zod";
 import { WATCHES_CHANGED } from "./channels.js";
 import { createGhTokenReader, type TokenReader } from "./gh.js";
 import {
+  DEPENDENCY_GRAPH_QUERY,
   FILE_AT_REF_QUERY,
   GITHUB_API_URL,
   GitHubRequestError,
@@ -43,6 +44,7 @@ import {
   labelPath,
   parseCompare,
   parseDependabotAlerts,
+  parseDependencyGraphCount,
   parseDeploymentStatus,
   parseDeployments,
   parseFileAtRef,
@@ -746,15 +748,21 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       // alerts disabled, not visible) is named in `errors`; the rest are
       // still returned. Reading alerts needs more than read access to the
       // repository (bb-gate/docs/hooks.md, "Admission, alerts").
+      //
+      // One GraphQL read of `dependencyGraphManifests(first: 1) { totalCount }`
+      // per repository says whether an empty alert list is the truth or a
+      // dependency graph that has parsed nothing (BB-289); a failed graph read
+      // is not an empty graph, so it is left unflagged and adds no error.
       async sourceDependabotAlerts({ units, state }) {
         let viewer: string;
         try {
           viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
         } catch (error) {
-          return { viewer: null, alerts: [], errors: [errorMessage(error)] };
+          return { viewer: null, alerts: [], errors: [errorMessage(error)], graphEmpty: [] };
         }
         const alerts: ReturnType<typeof parseDependabotAlerts> = [];
         const errors: string[] = [];
+        const graphEmpty: string[] = [];
         for (const unit of units) {
           const repo = parseRepo(unit);
           if (repo === null) {
@@ -774,8 +782,14 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           } catch (error) {
             errors.push(`${unit}: ${errorMessage(error)}`);
           }
+          try {
+            if (parseDependencyGraphCount(await query(DEPENDENCY_GRAPH_QUERY, { ...repo }, checkSignal())) === 0) graphEmpty.push(name);
+          } catch {
+            // A read the token was refused is not an empty graph: leave the
+            // repository unflagged rather than claim Dependabot can see nothing.
+          }
         }
-        return { viewer, alerts, errors };
+        return { viewer, alerts, errors, graphEmpty };
       },
 
       // A repository's recent deployments, newest first, read with the token

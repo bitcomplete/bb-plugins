@@ -472,6 +472,13 @@ export const sourceContract = {
    * github plugin reads them with the developer's token from the REST API;
    * each repository the token cannot read (no alert access, alerts disabled,
    * not visible) is named in `errors` rather than failing the whole call.
+   *
+   * `graphEmpty` names the repositories whose dependency graph parsed no
+   * manifests (`dependencyGraphManifests.totalCount` is 0), so an empty alert
+   * list means Dependabot cannot see anything rather than that there is
+   * nothing to see (BB-289). Additive and optional: a source that does not
+   * implement it leaves it empty, and a repository whose graph read failed is
+   * not named (a failed read is not an empty graph).
    */
   sourceDependabotAlerts: {
     input: z.object({
@@ -483,6 +490,7 @@ export const sourceContract = {
       viewer: z.string().nullable(),
       alerts: z.array(dependabotAlertSchema),
       errors: z.array(z.string()),
+      graphEmpty: z.array(z.string()).default([]),
     }),
   },
   /**

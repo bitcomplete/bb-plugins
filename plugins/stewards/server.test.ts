@@ -32,6 +32,8 @@ function world() {
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
+  /** Repos whose dependency graph parsed no manifests, lowercased, for the graph-empty wake (BB-289). */
+  const dependabotGraphEmpty = new Set<string>();
   /** Entity ids whose snapshot read throws, for the failed-read test (BB-115). */
   const snapshotErrors = new Set<string>();
   /** The fake linear dedup search: unsupported (github-style decline) or an error, for BB-136. */
@@ -318,7 +320,7 @@ function world() {
     }
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
-      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
+      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [], graphEmpty: units.filter((u) => dependabotGraphEmpty.has(u.toLowerCase())) };
     }
     else if (args.method === "sourceDeployments") {
       const key = `${String(input.repo).toLowerCase()} ${String(input.environment).toLowerCase()}`;
@@ -543,7 +545,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {
@@ -9815,13 +9817,14 @@ describe("dependency stewards", () => {
     ...over,
   });
 
-  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = []) {
+  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = [], graphEmpty = false) {
     const t = await setup();
     // The fixture's primary (acme/bb) is a stewarded repo too; these tests watch one repo.
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb"] }, ...project });
     t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
     t.files[playbookPath("deps-prs")] = DEPS_PRS;
     t.dependabotAlerts.set("acme/web", alerts);
+    if (graphEmpty) t.dependabotGraphEmpty.add("acme/web");
     for (const [id, entity] of entities) t.entities.set(id, entity);
     await t.hooks.sweep();
     await t.flush();
@@ -9947,6 +9950,20 @@ describe("dependency stewards", () => {
     expect(wakes().at(-1)).toContain("#### acme/web#7");
     expect(wakes().at(-1)).toMatch(/\*\*critical\*\* priority urgent/u);
     expect(wakes().at(-1)).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+  });
+
+  it("says the dependency graph is empty, naming the toggle, instead of 'no open alerts' when the graph parsed nothing (BB-289)", async () => {
+    const { wakes } = await watching([], {}, [], true);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/\*\*Dependency graph empty\.\*\*/u);
+    expect(first).toMatch(/Dependabot cannot see any manifest/u);
+    expect(first).toMatch(/Settings → Advanced Security → Dependency graph/u);
+    expect(first).not.toMatch(/\*\*No open alerts\.\*\*/u);
+
+    // A repo whose graph is readable still says "no open alerts" when there are none.
+    const { wakes: readable } = await watching([]);
+    expect(readable()[0]).toMatch(/\*\*No open alerts\.\*\*/u);
+    expect(readable()[0]).not.toMatch(/Dependency graph empty/u);
   });
 
   it("replays SC-111: the adoption decision is durable plugin state, the SLA clock is the alert's, and reminders land in needs and the digest", async () => {
@@ -10304,6 +10321,13 @@ describe("dependency stewards", () => {
     expect(check.stdout).toMatch(/deps-alerts: deps-alerts@/u);
     expect(check.stdout).toMatch(/deps-prs: deps-prs@/u);
     expect(check.stdout).toMatch(/deps: watching 1 repo for alerts: acme\/web/u);
+  });
+
+  it("check says a repo's dependency graph is empty, naming the toggle (BB-289)", async () => {
+    const { t } = await watching([], {}, [], true);
+    const check = await t.harness.behavior.runCli(["check"], { projectId: "p1" });
+    expect(check.stdout).toMatch(/deps: acme\/web: dependency graph empty/u);
+    expect(check.stdout).toMatch(/Settings → Advanced Security → Dependency graph/u);
   });
 });
 

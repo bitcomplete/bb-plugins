@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ADOPTION_CHOICES, DEFAULT_BATCH, DEFAULT_SLA, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, alertLine, batchAlert, dateInText, deadlineAt, depsFindingSchema, dueDate, isBatchable, overdue, priorityFor, reminderText, sightingOf, snoozeUntil } from "./deps.js";
+import { ADOPTION_CHOICES, DEFAULT_BATCH, DEFAULT_SLA, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, alertLine, batchAlert, dateInText, deadlineAt, depsFindingSchema, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, reminderText, sightingOf, snoozeUntil } from "./deps.js";
 import type { DependabotAlert } from "./source-contract.js";
 
 const alert = (over: Partial<DependabotAlert> = {}): DependabotAlert => ({
@@ -196,5 +196,16 @@ describe("the adoption decision", () => {
   it("parses an older look without the ticket's labels or created_at", () => {
     const parsed = depsFindingSchema.parse({ fingerprint: "acme/web#4", alertNumber: 4, severity: "high", package: "lodash", ecosystem: "npm", manifestPath: null, ghsaId: null, fixedVersion: null, summary: "x", state: "open", url: null, dueAt: now, priority: "high", class: "new", ticket: null, ticketState: null, closedAt: null, window: null, assignee: "Jane", firstSeenAt: now, lastCommentedAt: null, batch: { kind: "new" } });
     expect(parsed).toMatchObject({ ticketLabels: [], alertCreatedAt: null });
+  });
+});
+
+describe("the dependency look", () => {
+  const look = { at: now, target: "dependabot/acme/web", error: null, viewer: "Jane", alerts: [] };
+
+  it("keeps the graph-empty flag when present and treats a look stored before it as not empty (BB-289)", () => {
+    expect(depsLookSchema.parse({ ...look, graphEmpty: true }).graphEmpty).toBe(true);
+    expect(depsLookSchema.parse({ ...look, graphEmpty: false }).graphEmpty).toBe(false);
+    // A look written before the field parses; absent means false, so the wake says "no open alerts".
+    expect(depsLookSchema.parse(look).graphEmpty).toBeUndefined();
   });
 });

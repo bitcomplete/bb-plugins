@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -109,6 +109,10 @@ function fakeGitHub() {
     const v = body.variables as { owner: string; name: string; number: number; label?: string };
     if (!body.query.includes("repository(")) return Response.json({ data: { viewer: { login: "dev" } } });
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
+    if (body.query.includes("dependencyGraphManifests")) {
+      if (state.dependencyGraphFail) return Response.json({ data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
+      return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", dependencyGraphManifests: state.dependencyGraph === null ? null : { totalCount: state.dependencyGraph } } } });
+    }
     if (body.query.includes("label(name:")) {
       const has = (state.labels[`${v.owner}/${v.name}`.toLowerCase()] ?? []).some((n) => n.toLowerCase() === String(v.label).toLowerCase());
       return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: has ? { name: String(v.label) } : null } } });
@@ -678,8 +682,21 @@ describe("stewards' source contract", () => {
         },
       ],
       errors: [],
+      graphEmpty: [],
     });
     expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["acme/gone", "widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], errors: ["acme/gone: GitHub answered HTTP 404: Not Found", "widgets: not owner/repo"] });
+  });
+
+  it("names a repository whose dependency graph parsed no manifests, and leaves a failed graph read unflagged (BB-289)", async () => {
+    const w = await setup();
+    w.github.state.dependencyGraph = 0;
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], graphEmpty: ["Acme/Widgets"], errors: [] });
+    // A non-empty graph is not flagged: an empty alert list then means nothing is open.
+    w.github.state.dependencyGraph = 37;
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ graphEmpty: [] });
+    // A graph read the token was refused is not an empty graph: it stays unflagged and adds no error.
+    w.github.state.dependencyGraphFail = true;
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ graphEmpty: [], errors: [] });
   });
 
   it("names a repository whose alerts the token cannot read (403) without failing the whole call", async () => {

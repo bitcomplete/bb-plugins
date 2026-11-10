@@ -4381,6 +4381,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const out = await sourceRpc("github", "sourceDependabotAlerts", { units: [target.repo], state: "open" }, sourceContract.sourceDependabotAlerts.output);
         const alerts: DependabotAlert[] = out.alerts;
+        // The source names a repo whose dependency graph parsed no manifests,
+        // so an empty alert list is not "nothing open" (BB-289).
+        const graphEmpty = out.graphEmpty.some((r) => r.toLowerCase() === target.repo.toLowerCase());
         const rows = store.sight(
           b.projectId,
           b.id,
@@ -4446,11 +4449,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             batch: batchAlert(a, dueAt, open),
           });
         }
-        const look: DepsLook = { at, target: opsTargetKey(target), error: null, viewer: out.viewer, alerts: depsFindings };
+        const look: DepsLook = { at, target: opsTargetKey(target), error: null, viewer: out.viewer, alerts: depsFindings, graphEmpty };
         reconcileDepsDecisions(b, config, look, allRows, tickets, byFingerprint, clockAt);
         return look;
       } catch (error) {
-        return { at, target: opsTargetKey(target), error: errorMessage(error), viewer: null, alerts: [] };
+        return { at, target: opsTargetKey(target), error: errorMessage(error), viewer: null, alerts: [], graphEmpty: false };
       }
     }
 
@@ -11276,6 +11279,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const out = await sourceRpc("github", "sourceDependabotAlerts", { units: depsRepos.map((t) => t.repo), state: "open" }, sourceContract.sourceDependabotAlerts.output);
           if (out.viewer !== null) lines.push(`deps: reading alerts as ${out.viewer}`);
           for (const e of out.errors) lines.push(`deps: skipping ${e}: the gh login cannot read its alerts (a skip, not a problem)`);
+          // A repo whose dependency graph parsed nothing has an empty alert
+          // feed for a reason a person turns on by hand, not because there is
+          // nothing open (BB-289).
+          for (const repo of out.graphEmpty) lines.push(`deps: ${repo}: dependency graph empty — Dependabot cannot see any manifest, so "no open alerts" means nothing; turn it on in the repository's Settings → Advanced Security → Dependency graph`);
         } catch (error) {
           lines.push(`problem: deps: could not read alerts: ${errorMessage(error)}`);
         }
