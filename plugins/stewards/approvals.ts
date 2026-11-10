@@ -92,18 +92,24 @@ function workerThreadFor(ctx: ApprovalsContext, b: Binding, entity: EntitySnapsh
  * Tell the pull request's parked worker that a decision landed, so it merges
  * (or reworks) without a `github_watch` on the owner. The project steward's
  * decision and the owner's page approval both deliver by this one path
- * (BB-279). Returns `worker` when it was told, `steward` when it had ended and
- * the ticket steward must be woken instead.
+ * (BB-279). `actor` is null when the pull request is gate-met with no
+ * approval from anyone (a `no-review` lane): the wake then names the gate
+ * rather than an approver it would be wrong to name. Returns `worker` when it
+ * was told, `steward` when it had ended and the ticket steward must be woken
+ * instead.
  */
-export async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }, actor: "project steward" | "owner"): Promise<"worker" | "steward"> {
+export async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }, actor: "project steward" | "owner" | null): Promise<"worker" | "steward"> {
   const thread = workerThreadFor(ctx, b, entity);
   const info = thread === null ? null : await ctx.threadInfo(thread).catch(() => null);
   const label = decision.verdict === "approved" ? "approved" : "declined";
   const entry = decision.entry === null ? "" : ` (entry ${JSON.stringify(decision.entry)})`;
   const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets, The merge gate), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
+  // A `no-review` pull request is gate-met with no approval from anyone, so the
+  // wake names the gate, not an approver (BB-279).
+  const what = actor === null ? `The lane gate is met (no-review) for ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}` : `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}`;
   if (info !== null && info.deletedAt === null && info.archivedAt === null) {
-    if ((await ctx.sendTo(thread!, `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}: ${decision.reasoning}\n\n${next}.`)) === "sent") {
-      ctx.store.note(b.id, `The ${actor} ${label} ${entity.key}${entry} at ${ctx.shortSha(decision.sha)}; its worker was told.`, true);
+    if ((await ctx.sendTo(thread!, `${what}: ${decision.reasoning}\n\n${next}.`)) === "sent") {
+      ctx.store.note(b.id, `${what}; its worker was told.`, true);
       return "worker";
     }
   }

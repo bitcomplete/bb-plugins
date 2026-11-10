@@ -6923,12 +6923,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 filedBy: "plugin",
               });
               if (!told) {
+                // A `no-review` pull request is gate-met with no approval from
+                // anyone, so the wake names the gate, not an approver (BB-279).
+                const approver = g.projectApproved ? "project steward" : g.ownerApproved ? "owner" : null;
                 await deliverApproval(
                   approvalsCtx,
                   b,
                   pull,
-                  { verdict: "approved", sha: g.headSha ?? "", entry: null, reasoning: "the lane gate is met; a parked worker owns another open pull request of this ticket, so the plugin does not merge out of order" },
-                  g.decision === "project" ? "project steward" : "owner",
+                  { verdict: "approved", sha: g.headSha ?? "", entry: null, reasoning: "a parked worker owns another open pull request of this ticket, so the plugin does not merge out of order" },
+                  approver,
                 );
               }
             } else if (ref !== null && base !== null && base.kind === "default" && !paused) {

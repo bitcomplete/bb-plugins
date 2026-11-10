@@ -7322,6 +7322,36 @@ describe("needs you items", () => {
     expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
   });
 
+  it("a gate-met no-review pull request with a parked worker wakes it naming the gate, not an approver (BB-279)", async () => {
+    const t = await setup();
+    const noReview = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review substantial=no spec=no -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("uuid-12", issue({ linkedPulls: [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/api#8", url: "https://github.com/acme/api/pull/8" },
+    ] }));
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    t.entities.set("acme/api#8", pull({ id: "acme/api#8", key: "acme/api#8", url: "https://github.com/acme/api/pull/8", title: "Add api retry (ENG-12)" }, { head: "bb/eng-12-api", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement both");
+    parkWorker(t, "thr_w1", { result: "Waiting." });
+    t.threads.get("thr_w1")!.status = "idle";
+    // The checks finish after the worker has parked: the pull request is now
+    // gate-met with no approval, and #8 keeps the worker owning the order.
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    // A no-review pull request is gate-met with no approval from anyone, so the
+    // plugin files the Merge item and names the gate rather than an approver it
+    // would be wrong to name (BB-279).
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin" && n.url === "https://github.com/acme/web/pull/7")).toBe(true);
+    const wakes = t.sends.filter((s) => s.threadId === "thr_w1");
+    expect(wakes.some((s) => /The lane gate is met \(no-review\) for acme\/web#7/u.test(s.text) && /merge it now/u.test(s.text))).toBe(true);
+    expect(wakes.some((s) => /The owner approved/u.test(s.text))).toBe(false);
+  });
+
   it("delivers an owner page approval to the parked worker through the same path (BB-279)", async () => {
     // The pull request is the signed-in account's own, so the page posts the
     // unsigned approval comment and then delivers it, exactly as the project

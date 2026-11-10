@@ -6,7 +6,7 @@
 // BB-279: an owner's page approval and the project steward's decision deliver
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
-import { approvePrPageAction, deliverProjectApproval, isUserThread, recordProjectDecision, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approvePrPageAction, deliverApproval, deliverProjectApproval, isUserThread, recordProjectDecision, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { isSelfWidening } from "./decisions.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
 import type { Binding, Need } from "./store.js";
@@ -111,6 +111,18 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(message).toContain("The project steward approved");
     expect(message).toContain("merge it now");
     expect(mechanicalStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers a gate-met no-review pull request naming the gate, not an approver (BB-279)", async () => {
+    const { ctx, worker, sendTo } = deliveryContext();
+    const entity = pull({ comments: [] }, green);
+    await expect(deliverApproval(ctx, { id: "b1" } as never, entity, { verdict: "approved", sha: head, entry: null, reasoning: "a parked worker owns another open pull request." }, null)).resolves.toBe("worker");
+    const [threadId, message] = sendTo.mock.calls[0]!;
+    expect(threadId).toBe(worker.threadId);
+    expect(message).toContain("The lane gate is met (no-review)");
+    expect(message).toContain("merge it now");
+    // It must not claim an approval nobody gave.
+    expect(message).not.toContain("approved");
   });
 
   it("delivers an owner page approval to the parked worker by the same path", async () => {
