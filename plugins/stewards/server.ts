@@ -6893,6 +6893,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A ticket's other linked pull requests (GitHub cross-references) only
       // mention it and must not file gate items here.
       const ownPulls = b.kind === "ticket" ? await ownPullKeys(b, store.workers(b.id), observed) : null;
+      // BB-266: the binding's open own pull requests. A finished worker keeps
+      // deferring the plugin merge while more than one is open: a parked
+      // worker that still owns another pull request is mid-sequence (a
+      // cross-repo ticket lands the consumed repo first), so the plugin must
+      // not merge out of order or retire the worker that owns the rest.
+      const openOwnPulls = observedPulls(b, observed).filter((p) => (ownPulls === null || pullBelongsToTicket(b, p, ownPulls)) && p.pull?.merged !== true && lc(p.state) !== "closed");
+      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && store.workers(b.id).some((w) => w.status === "finished");
       // BB-264: the steward's own merge holds name open bindings in this
       // project, or a stacked base pull request by its key; the plugin's
       // derived stacked-PR holds are recomputed from the base pull requests on
@@ -6998,7 +7005,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
-          } else if (runningWorkerReason(store.workers(b.id)) === null) {
+          } else if (runningWorkerReason(store.workers(b.id)) === null && !parkedWorkerOwnsAnother) {
             // Pause stewards is the kill switch: while it is on, the plugin
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
@@ -7023,8 +7030,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   // BB-266: the approval this merge consumed was what the
                   // binding's parked workers waited on, so retire them the way
                   // a consumed finish is retired; one that asked the steward a
-                  // question stays visible.
-                  await archiveParkedWorkers(b);
+                  // question stays visible. Only when no other own pull
+                  // request is still open, so the worker that owns the rest is
+                  // not retired mid-sequence.
+                  if (openOwnPulls.length <= 1) await archiveParkedWorkers(b);
                 } else if (isHeadMovedRefusal(result.message)) {
                   // A push landed between the look and the merge. GitHub
                   // refused it with 409; the next look judges the new head.

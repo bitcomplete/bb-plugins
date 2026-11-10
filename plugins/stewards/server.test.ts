@@ -7263,6 +7263,37 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
   });
 
+  it("a finished worker keeps deferring the plugin merge while another own pull request is open (BB-266)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/api#8", url: "https://github.com/acme/api/pull/8" },
+    ] }));
+    // #7 is gate met once the owner approves; #8 is still waiting on the owner.
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/api#8", pull({ id: "acme/api#8", key: "acme/api#8", url: "https://github.com/acme/api/pull/8", title: "Add api retry (ENG-12)" }, { head: "bb/eng-12-api", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement both");
+    t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval of acme/web#7 and acme/api#8.");
+    t.threads.get("thr_w1")!.status = "idle";
+    // The owner approves #7. The plugin must not merge it while #8 is still
+    // open, and must not retire the worker that owns the landing order.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "finished" });
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    // #7 has landed; #8 is now the only open own pull request, so the plugin
+    // merges it and retires the parked worker.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner], state: "merged" }, { head: "bb/eng-12-retry", merged: true, checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/api#8", pull({ id: "acme/api#8", key: "acme/api#8", url: "https://github.com/acme/api/pull/8", title: "Add api retry (ENG-12)", comments: [marker, owner] }, { head: "bb/eng-12-api", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+    expect(t.githubMerges[0]).toMatchObject({ repo: "acme/api", number: 8 });
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+  });
+
   it("a finished worker does not suppress the fallback Merge item when the playbook omits merge (BB-266)", async () => {
     const t = await setup();
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
