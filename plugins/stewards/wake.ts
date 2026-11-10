@@ -25,8 +25,6 @@ import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
 
-/** How many guidance units a wake or brief lists before it says how many it left out (BB-288). */
-export const GUIDANCE_UNITS_MAX = 60;
 /** The characters of a unit's own text a wake or brief shows; the `gu_` id is what is cited (BB-288). */
 const GUIDANCE_UNIT_CHARS = 120;
 
@@ -1239,14 +1237,12 @@ function trialLessonsLines(lessons: Lesson[]): string[] {
  */
 function guidanceUnitLines(units: readonly GuidanceUnit[]): string[] {
   if (units.length === 0) return [];
-  const shown = units.slice(0, GUIDANCE_UNITS_MAX);
   return [
     "",
     "## Guidance units",
     "",
     "Each hand-written paragraph of `AGENTS.md` and the playbooks carries its `gu_` id. Cite the id of the paragraph a decision or turn rested on in `steward_update { resolve, cites: [...] }` (or `{ forward, cites }`) or `steward_report { cites: [...] }`.",
-    ...shown.map((u) => `- ${u.id} (${u.file}${u.heading === null ? "" : ` §${u.heading}`}): ${oneLine(u.text, GUIDANCE_UNIT_CHARS)}`),
-    ...(units.length > shown.length ? [`- … and ${units.length - shown.length} more; run \`bb stewards lessons --efficacy\` for the rest.`] : []),
+    ...units.map((u) => `- ${u.id} (${u.file}${u.heading === null ? "" : ` §${u.heading}`}): ${oneLine(u.text, GUIDANCE_UNIT_CHARS)}`),
   ];
 }
 

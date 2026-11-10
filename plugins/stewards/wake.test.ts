@@ -7,7 +7,7 @@ import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./ready-gate.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
-import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, GUIDANCE_UNITS_MAX, initiativeProgress, initiativeProgressFlag, spawnCommand, WAKE_MAX_CHARS, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, initiativeProgress, initiativeProgressFlag, spawnCommand, WAKE_MAX_CHARS, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 import { BRIEF_MAX_CHARS } from "./server.js";
 import type { OpsFinding } from "./ops.js";
 import type { DepsFinding } from "./deps.js";
@@ -401,11 +401,28 @@ describe("the nightly prompt", () => {
     expect(formatWake(wakeInput())).not.toContain("## Guidance units");
   });
 
-  it("keeps the snapshot and What changed when the guidance index is large (BB-288)", () => {
-    // A realistically sized AGENTS.md: far more units than a wake lists, each
-    // with a long paragraph. The compact, capped, clippable block must not
-    // push the wake past its cap or cost the snapshot or the changes.
-    const units = Array.from({ length: 300 }, (_, i) => ({
+  it("lists every guidance unit in a realistically sized wake, keeping the snapshot and What changed (BB-288)", () => {
+    // This project's real `.bb`: 52 AGENTS.md units and 23 playbook units.
+    const units = Array.from({ length: 75 }, (_, i) => ({
+      id: `gu_${String(i).padStart(16, "0")}`,
+      file: i < 52 ? "AGENTS.md" : "stewards/playbooks/linear-tickets.md",
+      heading: `Section ${i}`,
+      text: `Guidance paragraph number ${i}. `.repeat(40),
+      lessonId: null,
+    }));
+    const wake = formatWake(wakeInput({ guidance: units, changes: ["Something changed."] }));
+    expect(wake).toContain("## Guidance units");
+    for (const u of units) expect(wake).toContain(`- ${u.id} `);
+    expect(wake).toContain("## 4. Snapshot");
+    expect(wake).toContain("## 5. What changed since your last turn");
+    expect(wake).toContain("- Something changed.");
+    expect(wake.length).toBeLessThanOrEqual(WAKE_MAX_CHARS + 200);
+  });
+
+  it("keeps the snapshot and What changed when the guidance index is pathologically large (BB-288)", () => {
+    // More units than any wake could show: the compact block is clipped in the
+    // snapshot, never the snapshot or the changes.
+    const units = Array.from({ length: 1_000 }, (_, i) => ({
       id: `gu_${String(i).padStart(16, "0")}`,
       file: "AGENTS.md",
       heading: `Section ${i}`,
@@ -413,8 +430,6 @@ describe("the nightly prompt", () => {
       lessonId: null,
     }));
     const wake = formatWake(wakeInput({ guidance: units, changes: ["Something changed."] }));
-    expect(wake).toContain("## Guidance units");
-    expect(wake).toContain(`and ${units.length - GUIDANCE_UNITS_MAX} more`);
     expect(wake).toContain("## 4. Snapshot");
     expect(wake).toContain("## 5. What changed since your last turn");
     expect(wake).toContain("- Something changed.");
