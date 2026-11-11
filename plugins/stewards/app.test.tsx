@@ -1545,3 +1545,87 @@ describe("the Stewards page's data age and refresh (BB-205)", () => {
     }
   });
 });
+
+// BB-300 slice 3: the Huddle button on the project view and the home page's
+// line to the Stewards page. The button renders only when the server says a
+// huddle is available, and it starts one through the RPC.
+describe("the Huddle button (BB-300)", () => {
+  const renderBoardWithHuddle = async (huddle: { available: boolean; message: string | null } | undefined): Promise<RenderedSlot> => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    return renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            ...(huddle === undefined ? {} : { huddle }),
+          },
+        }),
+        stewardsHuddleStart: () => ({ ok: true, sessionId: "sess_1", message: "Huddle started." }),
+      } as never,
+    });
+  };
+
+  it("shows the button beside Waiting on you when a huddle is available, and starts one", async () => {
+    const slot = await renderBoardWithHuddle({ available: true, message: null });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Huddle" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Huddle" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsHuddleStart", input: { projectId: "p1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("shows no button when a huddle is unavailable", async () => {
+    const slot = await renderBoardWithHuddle({ available: false, message: "no key" });
+    await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the home page line and button, pointing at the project's Stewards page", async () => {
+    const captured = await loadApp();
+    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
+    const slot = renderSlot(section, { projectId: "p1" }, {
+      rpc: {
+        stewardsHuddle: () => ({ available: true, message: null }),
+        stewardsHuddleStart: () => ({ ok: true, sessionId: "sess_1", message: "Huddle started." }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Huddle" })).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Open the Stewards page" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Open the Stewards page" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls.some((call) => call.method === "toPluginPanel")).toBe(true));
+    slot.lifecycle.unmount();
+  });
+
+  it("renders nothing on the home page when a huddle is unavailable", async () => {
+    const captured = await loadApp();
+    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
+    const slot = renderSlot(section, { projectId: "p1" }, { rpc: { stewardsHuddle: () => ({ available: false, message: "no key" }) } as never });
+    await waitFor(() => expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull());
+    expect(slot.queryByRole("button", { name: "Open the Stewards page" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("renders nothing on the home page without a project", async () => {
+    const captured = await loadApp();
+    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
+    const slot = renderSlot(section, { projectId: null }, { rpc: {} as never });
+    expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});

@@ -94,7 +94,8 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { HUDDLE_TOOLS, buildHuddleInstructions, runHuddleTool, type HuddleRecord } from "./huddle.js";
+import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
@@ -731,6 +732,12 @@ export const rpcContract = defineRpcContract({
           /** The playbook schema's stages, in order: the page groups in-flight stewards by them. */
           stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
+          /**
+           * BB-300: whether a huddle can start for this project, and why not.
+           * Optional so a client built from the previous image tolerates its
+           * absence across a restart.
+           */
+          huddle: z.object({ available: z.boolean(), message: z.string().nullable() }).optional(),
           questions: z.array(questionViewSchema),
           /** Open escalations with the user that no question covers: approval requests, and forwards from before questions were kept. */
           withUser: z.array(withUserViewSchema),
@@ -943,6 +950,33 @@ export const rpcContract = defineRpcContract({
       choice: z.string().trim().min(1).max(100).nullable().optional(),
     }),
     output: z.object({ ok: z.boolean(), message: z.string(), threadId: z.string().nullable().optional() }),
+  },
+  // BB-300: whether the Stewards page should offer a Huddle button for a
+  // project. The voice-transcription plugin must be installed with Realtime
+  // enabled (OpenAI's endpoint and a key); the page shows no button otherwise.
+  stewardsHuddle: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({ available: z.boolean(), message: z.string().nullable() }),
+  },
+  // BB-300: start one huddle for a project. Stewards builds the briefing's
+  // instructions and opens the voice plugin's overlay with the fixed tool set.
+  // The huddle's notes live here, in memory, until slice 4 makes them durable.
+  stewardsHuddleStart: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), message: z.string() }),
+  },
+  // BB-300: the one method the voice plugin forwards the model's tool calls to.
+  // It reads state, or takes and retracts notes; it never acts on a steward.
+  // The output is the text itself, so the voice plugin wraps it once for the
+  // model's data channel.
+  stewardsHuddleTool: {
+    input: z.object({
+      sessionId: z.string().min(1).max(200),
+      callId: z.string().max(200).optional(),
+      name: z.string().min(1).max(64),
+      arguments: z.string().max(20_000),
+    }),
+    output: z.string(),
   },
 });
 
@@ -1331,9 +1365,70 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.realtime.publish(PROJECT_CHANGED, { projectId });
       },
     });
-    // BB-300: one briefing reader, shared by the nightly digest and (later) a
-    // huddle; the digest renders it through `toDigestRecords`.
+    // BB-300: one briefing reader, shared by the nightly digest and a huddle;
+    // the digest renders it through `toDigestRecords`.
     const briefing = createBriefing(store, now);
+
+    // ---- the huddle (BB-300 slice 3) --------------------------------------------------
+    //
+    // One spoken stand-up per project, opened from the Stewards page. The
+    // instructions are the briefing ranked decisions first; the model may only
+    // read state and take or retract notes. The notes live in memory here for
+    // the length of the session; slice 4 makes the record durable and reads it
+    // back for the owner to confirm. Nothing here acts on a steward, merges or
+    // resolves anything.
+    const VOICE_PLUGIN_ID = "voice-transcription";
+    /** OpenAI's own endpoint; Realtime exists only against it. */
+    const HUDDLE_OPENAI_BASE_URL = "https://api.openai.com/v1";
+    const huddles = new Map<string, HuddleRecord>();
+    /** Project ids with a start in flight, reserved before the first await so two clicks cannot both start. */
+    const startingHuddles = new Set<string>();
+    const realtimeOpenOutput = z.object({ sessionId: z.string(), maxDurationMs: z.number() });
+
+    /** A base URL with no trailing slash, so the comparison matches the voice plugin's. */
+    const normalizeBaseUrl = (raw: string): string => raw.trim().replace(/\/+$/u, "");
+
+    /** A string setting's default out of a `getSettings` descriptor, for an unset value. */
+    function schemaDefault(schema: Record<string, unknown>, key: string): string {
+      const descriptor = schema[key];
+      if (typeof descriptor === "object" && descriptor !== null && "default" in descriptor) {
+        const value = (descriptor as { default?: unknown }).default;
+        if (typeof value === "string") return value;
+      }
+      return "";
+    }
+
+    /**
+     * Whether a huddle can start: the voice-transcription plugin is installed,
+     * its endpoint is OpenAI's, and its Realtime service reports ready (a key
+     * is set). Realtime exists only against OpenAI, so a transcription-only
+     * endpoint shows no button at all; a failure to read either signal is
+     * reported as unavailable rather than opening a session that would refuse.
+     */
+    async function huddleAvailability(hasProjectSteward: boolean): Promise<{ available: boolean; message: string | null }> {
+      if (!hasProjectSteward) return { available: false, message: "No project steward yet; a huddle needs one." };
+      let baseUrl: string;
+      let schema: Record<string, unknown>;
+      try {
+        const settings = await bb.sdk.plugins.getSettings({ pluginId: VOICE_PLUGIN_ID });
+        const values = settings.values as Record<string, unknown>;
+        schema = settings.schema as Record<string, unknown>;
+        baseUrl = typeof values.baseUrl === "string" && values.baseUrl.trim() !== "" ? values.baseUrl : schemaDefault(schema, "baseUrl");
+      } catch {
+        return { available: false, message: "The voice-transcription plugin is not installed; a huddle needs it." };
+      }
+      if (normalizeBaseUrl(baseUrl) !== HUDDLE_OPENAI_BASE_URL) {
+        return { available: false, message: "Realtime voice needs OpenAI's endpoint in Settings → Plugins → Voice transcription." };
+      }
+      try {
+        const services = await bb.sdk.system.aiServices();
+        const service = services.services.find((s) => s.pluginId === VOICE_PLUGIN_ID && s.id === "openai-compatible");
+        if (service === undefined) return { available: false, message: "The voice service is not registered; set it up in Settings → Plugins → Voice transcription." };
+        return service.status.ready ? { available: true, message: null } : { available: false, message: service.status.message };
+      } catch (error) {
+        return { available: false, message: `Could not read the voice service's status: ${errorMessage(error)}` };
+      }
+    }
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
@@ -8712,6 +8807,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             roleNames: boardConfig?.roleNames ?? [],
             stages: [...STAGES],
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
+            huddle: await huddleAvailability(row.threadId !== null),
             questions,
             withUser,
             needs,
@@ -8889,6 +8985,79 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // `projectStewardThreadId` is read fresh: `patchProject` does not publish
         // a store change, so it is not part of the cached section.
         return { projects: picker, roleProblem, projectStewardThreadId: store.project(projectId).threadId, ...section };
+      },
+      async stewardsHuddle({ projectId }) {
+        // The board already carries this for the project view; the homepage
+        // line asks for it alone, without the rest of the board.
+        return huddleAvailability(store.project(projectId).threadId !== null);
+      },
+      async stewardsHuddleStart({ projectId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a huddle is started from the Stewards page");
+        // Reserve the project before the first await, so a click on the board
+        // and a click on the home page at the same moment cannot both start.
+        if (startingHuddles.has(projectId)) return { ok: false, sessionId: null, message: "A huddle for this project is already starting." };
+        startingHuddles.add(projectId);
+        try {
+          const availability = await huddleAvailability(store.project(projectId).threadId !== null);
+          if (!availability.available) return { ok: false, sessionId: null, message: availability.message ?? "A huddle is not available." };
+          // Supersede any record for this project: the voice plugin does not
+          // tell stewards when an overlay closes, so a stale record must not
+          // lock the project out of a new huddle. The old notes are dropped.
+          for (const [id, huddle] of huddles) if (huddle.projectId === projectId) huddles.delete(id);
+          const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
+          // The first huddle reads since the last digest rather than since the
+          // beginning: a project with a long history would otherwise list every
+          // binding it has ever ended.
+          const since = store.lastHuddle(projectId) ?? store.project(projectId).digestAt ?? 0;
+          const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
+          // The briefing goes to OpenAI, so a token pasted into a ticket, an
+          // escalation or a note is scrubbed first.
+          const instructions = scrubCredentials(buildHuddleInstructions(briefing(projectId, since), name, now(), questions));
+          let opened: { sessionId: string; maxDurationMs: number };
+          try {
+            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: HUDDLE_TOOLS, toolHandler: { method: "stewardsHuddleTool" } }, realtimeOpenOutput);
+          } catch (error) {
+            return { ok: false, sessionId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
+          }
+          huddles.set(opened.sessionId, { projectId, startedAt: now(), notes: [], connected: false });
+          return { ok: true, sessionId: opened.sessionId, message: "Huddle started." };
+        } finally {
+          startingHuddles.delete(projectId);
+        }
+      },
+      async stewardsHuddleTool({ sessionId, name, arguments: rawArgs }, { experimental_caller: caller }) {
+        if (caller.kind !== "plugin" || caller.pluginId !== VOICE_PLUGIN_ID) throw new Error("only the voice-transcription plugin forwards huddle tool calls");
+        const record = huddles.get(sessionId);
+        if (record === undefined) throw new Error("that huddle has ended");
+        // The first tool call proves the overlay connected and the briefing was
+        // delivered, so that is when "since the last huddle" advances. A
+        // session that never connected leaves it alone and the next huddle
+        // re-reports its window.
+        if (!record.connected) {
+          record.connected = true;
+          store.setLastHuddle(record.projectId, record.startedAt);
+        }
+        let args: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(rawArgs.trim() === "" ? "{}" : rawArgs);
+          args = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+        } catch {
+          throw new Error("the tool arguments were not valid JSON");
+        }
+        // A tool result goes to OpenAI too, so it passes the same scrub.
+        return scrubCredentials(
+          await runHuddleTool(name, args, {
+            projectId: record.projectId,
+            now,
+            binding: (key) => store.find(key, record.projectId),
+            openEscalations: (bindingId) => store.openEscalations(bindingId),
+            escalation: (id) => store.escalation(id),
+            lessons: (bindingId) => store.allLessons(record.projectId).filter((l) => l.bindingId === bindingId),
+            guidance: () => guidanceUnits(record.projectId),
+            snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
+            record,
+          }),
+        );
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");

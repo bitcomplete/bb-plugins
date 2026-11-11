@@ -244,6 +244,14 @@ export const redactLine = (line: string, max = LOG_LINE_CHARS): string => {
 };
 
 /**
+ * The same credential scrub as `redactLine`, without the length clip: for text
+ * that leaves the server whole (a huddle's instructions to OpenAI, a tool
+ * result returned to the model) rather than as one log line. A ticket, an
+ * escalation or a note can carry a pasted token.
+ */
+export const scrubCredentials = (text: string): string => text.replace(SECRET, "$1[redacted]");
+
+/**
  * The last lines of a log, clipped and with obvious credentials replaced.
  * They go into a Linear ticket, so a token printed by a crashing process
  * should not.

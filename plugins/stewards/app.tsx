@@ -30,6 +30,7 @@ import {
   useSidebarThreadDraft,
   useSidebarThreadRowStatus,
   type ExperimentalSidebarNavigationProps,
+  type PluginHomepageSectionProps,
   type PluginSidebarThread,
   type PluginThreadActionTarget,
   type PluginThreadActionsTriggerProps,
@@ -744,15 +745,88 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
 
 // ---- The stewards page -------------------------------------------------------------------------
 
-function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
+function Section({ title, count, action, children }: { title: string; count?: number; action?: ReactNode; children: ReactNode }) {
   return (
     <section className="flex flex-col gap-2">
-      <h2 className="text-base font-medium">
+      <h2 className="flex items-center gap-2 text-base font-medium">
         {title}
-        {count === undefined ? null : <span className="ml-2 text-sm font-normal text-muted-foreground">{count}</span>}
+        {count === undefined ? null : <span className="text-sm font-normal text-muted-foreground">{count}</span>}
+        {action === undefined ? null : <span className="ml-auto">{action}</span>}
       </h2>
       {children}
     </section>
+  );
+}
+
+/**
+ * BB-300: the Huddle button. It starts one spoken stand-up for a project; the
+ * voice plugin's overlay opens on its own realtime signal, so the page only
+ * makes the call. It renders only when the server says a huddle is available,
+ * and the server's refusal (or a failed call) is shown in place.
+ */
+function HuddleButton({ projectId }: { projectId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
+  const start = () => {
+    setState("starting");
+    rpc.call("stewardsHuddleStart", { projectId }).then(
+      (result) => setState(result.ok ? "idle" : { error: result.message }),
+      (e: unknown) => setState({ error: message(e) }),
+    );
+  };
+  return (
+    <span className="flex items-center gap-2">
+      <button
+        type="button"
+        className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
+        disabled={state === "starting"}
+        onClick={start}
+      >
+        {state === "starting" ? "Starting…" : "Huddle"}
+      </button>
+      {typeof state === "object" ? <span className="text-xs text-destructive">{state.error}</span> : null}
+    </span>
+  );
+}
+
+/**
+ * BB-300: the home page's line to the Stewards page, with the Huddle button
+ * beside it. It follows the compose surface's project; a projectless compose
+ * has nothing to point at, so it renders nothing.
+ */
+function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const [availability, setAvailability] = useState<{ available: boolean; message: string | null } | null>(null);
+  useEffect(() => {
+    if (projectId === null) {
+      setAvailability(null);
+      return;
+    }
+    let live = true;
+    rpc.call("stewardsHuddle", { projectId }).then(
+      (result) => {
+        if (live) setAvailability(result);
+      },
+      () => {
+        if (live) setAvailability(null);
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [rpc, projectId]);
+  // The line is part of the huddle's surface, not an unconditional addition to
+  // every home page: a developer who cannot huddle (no key, a non-OpenAI
+  // endpoint, no project steward) sees no change at all.
+  if (projectId === null || availability?.available !== true) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-3 text-sm">
+      <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(projectId) })}>
+        Open the Stewards page
+      </button>
+      <HuddleButton projectId={projectId} />
+    </div>
   );
 }
 
@@ -1051,7 +1125,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
         </p>
       ) : null}
 
-      <Section title="Waiting on you" count={orphans.length}>
+      <Section title="Waiting on you" count={orphans.length} action={b.huddle?.available === true ? <HuddleButton projectId={b.projectId} /> : undefined}>
         {orphans.length === 0 ? (
           <None>Nothing is waiting on you.</None>
         ) : (
@@ -3175,6 +3249,13 @@ export default definePluginApp((app) => {
     run: () => {
       getStewardsSidebarCommand()?.compose();
     },
+  });
+  // BB-300: the home page's line to the Stewards page, carrying the Huddle
+  // button when a huddle is available for the project in view.
+  app.slots.homepageSection({
+    id: "huddle",
+    title: "Stewards",
+    component: HuddleHomepageSection,
   });
   app.slots.navPanel({
     id: "board",
