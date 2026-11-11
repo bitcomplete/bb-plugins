@@ -3079,6 +3079,20 @@ export function createStore(db: Database.Database, now: () => number, options: S
     setServerSetting(key: string, value: string): void {
       db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
     },
+    /**
+     * When a project last held a huddle, or null (BB-300). Kept in the server
+     * settings table under a project-scoped key so "since the last huddle" is
+     * storable now, with no migration; the durable huddle record gets its own
+     * table and migration in slice 4.
+     */
+    lastHuddle(projectId: string): number | null {
+      const r = db.prepare<[string], { value: string }>("SELECT value FROM server_settings WHERE key = ?").get(`stewards:last-huddle:${projectId}`);
+      return r === undefined ? null : Number(r.value);
+    },
+    /** Record when a project last held a huddle (BB-300). */
+    setLastHuddle(projectId: string, at: number): void {
+      db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`stewards:last-huddle:${projectId}`, String(at));
+    },
 
     // BB-293: the shadow assessment and its divergence log. The reconcile
     // writes them; the `bb stewards divergences` command reads them.
