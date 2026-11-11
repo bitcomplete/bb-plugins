@@ -221,4 +221,30 @@ describe("buildHuddleInstructions (BB-300)", () => {
     // The decisions section survives even when the tail is huge.
     expect(text).toContain("Approve the spec");
   });
+
+  it("drops the tail to fit the cap and never empties a section into '(none)'", () => {
+    // Each section is under the per-section cap, but the whole is well over the
+    // voice plugin's limit, so the length loop must empty some later sections.
+    const long = (label: string, i: number): string => `${label}-${i}: ${"x".repeat(180)}`;
+    const needs = Array.from({ length: 35 }, (_, i) => ({ need: { what: long("need", i), kind: "approve-spec" } as never, binding: binding({ entityKey: `ENG-${i}` }) }));
+    const escalations = Array.from({ length: 35 }, (_, i) => ({ escalation: escalation({ question: long("esc", i) }), from: binding({ entityKey: `ENG-${i}` }) }));
+    const stuck = Array.from({ length: 35 }, (_, i) => ({ escalation: escalation({ kind: "stuck", question: long("stuck", i) }), from: binding({ entityKey: `ENG-${i}` }) }));
+    const moved = Array.from({ length: 35 }, (_, i) => binding({ entityKey: `ENG-${i}`, status: { summary: long("moved", i) } as never }));
+    const assumptions = Array.from({ length: 35 }, (_, i) => ({ assumption: { text: long("assume", i) } as never, binding: binding({ entityKey: `ENG-${i}` }) }));
+    const text = buildHuddleInstructions(
+      briefing({
+        decisions: { needs, withUser: [] },
+        escalations,
+        stuck: { stuck, held: [], noWakeSource: [], stall: [], datedWaits: [] },
+        done: { moved, ended: [], answered: [] },
+        assumptions,
+      }),
+      "Acme",
+      10_000,
+    );
+    expect(text.length).toBeLessThanOrEqual(HUDDLE_MAX_INSTRUCTIONS_CHARS);
+    // A section the loop emptied says it was omitted, not that it had nothing.
+    expect(text).toContain("(omitted to fit the briefing limit)");
+    expect(text).not.toMatch(/## Done since\n- \(none\)/u);
+  });
 });

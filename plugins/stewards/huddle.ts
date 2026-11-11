@@ -324,9 +324,14 @@ export async function runHuddleTool(name: string, args: Record<string, unknown>,
   }
 }
 
-/** One "- " bullet per item, or a single "(none)" line. */
-function bullets(lines: readonly string[]): string {
-  return lines.length === 0 ? "- (none)" : lines.map((line) => `- ${line}`).join("\n");
+/**
+ * One "- " bullet per item. An empty section says "(none)" only when it was
+ * empty to begin with; one the length loop emptied says so instead, so a
+ * section that had items never reads as if there were none.
+ */
+function bullets(lines: readonly string[], truncated = false): string {
+  if (lines.length === 0) return truncated ? "- (omitted to fit the briefing limit)" : "- (none)";
+  return lines.map((line) => `- ${line}`).join("\n");
 }
 
 /** An open question put to the owner, with the binding it attaches to resolved to a key. */
@@ -405,12 +410,14 @@ export function buildHuddleInstructions(briefing: Briefing, projectName: string,
   const capped = sections.map((section) => ({
     heading: section.heading,
     lines: section.lines.length <= HUDDLE_SECTION_MAX ? section.lines : [...section.lines.slice(0, HUDDLE_SECTION_MAX), `…and ${section.lines.length - HUDDLE_SECTION_MAX} more`],
+    truncated: section.lines.length > HUDDLE_SECTION_MAX,
   }));
-  const render = (): string => [...header, ...capped.flatMap((section) => ["", `## ${section.heading}`, bullets(section.lines)])].join("\n");
+  const render = (): string => [...header, ...capped.flatMap((section) => ["", `## ${section.heading}`, bullets(section.lines, section.truncated)])].join("\n");
   while (render().length > HUDDLE_MAX_INSTRUCTIONS_CHARS) {
     const last = [...capped].reverse().find((section) => section.lines.length > 0);
     if (last === undefined) break;
     last.lines.pop();
+    last.truncated = true;
   }
   const text = render();
   return text.length <= HUDDLE_MAX_INSTRUCTIONS_CHARS ? text : `${text.slice(0, HUDDLE_MAX_INSTRUCTIONS_CHARS - 20)}\n… (truncated)`;
