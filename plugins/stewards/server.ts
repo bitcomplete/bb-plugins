@@ -95,7 +95,7 @@ import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult,
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
 import { HUDDLE_TOOLS, buildHuddleInstructions, runHuddleTool, type HuddleRecord } from "./huddle.js";
-import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
@@ -9010,7 +9010,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // binding it has ever ended.
           const since = store.lastHuddle(projectId) ?? store.project(projectId).digestAt ?? 0;
           const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
-          const instructions = buildHuddleInstructions(briefing(projectId, since), name, now(), questions);
+          // The briefing goes to OpenAI, so a token pasted into a ticket, an
+          // escalation or a note is scrubbed first.
+          const instructions = scrubCredentials(buildHuddleInstructions(briefing(projectId, since), name, now(), questions));
           let opened: { sessionId: string; maxDurationMs: number };
           try {
             opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: HUDDLE_TOOLS, toolHandler: { method: "stewardsHuddleTool" } }, realtimeOpenOutput);
@@ -9042,17 +9044,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } catch {
           throw new Error("the tool arguments were not valid JSON");
         }
-        return runHuddleTool(name, args, {
-          projectId: record.projectId,
-          now,
-          binding: (key) => store.find(key, record.projectId),
-          openEscalations: (bindingId) => store.openEscalations(bindingId),
-          escalation: (id) => store.escalation(id),
-          lessons: (bindingId) => store.allLessons(record.projectId).filter((l) => l.bindingId === bindingId),
-          guidance: () => guidanceUnits(record.projectId),
-          snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
-          record,
-        });
+        // A tool result goes to OpenAI too, so it passes the same scrub.
+        return scrubCredentials(
+          await runHuddleTool(name, args, {
+            projectId: record.projectId,
+            now,
+            binding: (key) => store.find(key, record.projectId),
+            openEscalations: (bindingId) => store.openEscalations(bindingId),
+            escalation: (id) => store.escalation(id),
+            lessons: (bindingId) => store.allLessons(record.projectId).filter((l) => l.bindingId === bindingId),
+            guidance: () => guidanceUnits(record.projectId),
+            snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
+            record,
+          }),
+        );
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");

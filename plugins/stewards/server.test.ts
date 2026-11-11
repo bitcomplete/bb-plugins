@@ -14762,6 +14762,16 @@ describe("the huddle (BB-300)", () => {
     expect(retracted).toContain("No note");
   });
 
+  it("scrubs a pasted credential from a tool result before it reaches the model", async () => {
+    const t = await adopted();
+    // A ticket body can carry a pasted token; it must not reach OpenAI.
+    t.entities.set("uuid-12", issue({ description: "Please use token: abc123 in the call." }));
+    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
+    const output = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
+    expect(output).toContain("token: [redacted]");
+    expect(output).not.toContain("abc123");
+  });
+
   it("refuses a tool call from anyone but the voice plugin, and an unknown tool", async () => {
     const t = await adopted();
     const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
