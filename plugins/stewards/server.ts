@@ -93,7 +93,7 @@ import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
-import { nightlyDue, stillNight } from "./nightly.js";
+import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -1331,6 +1331,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.realtime.publish(PROJECT_CHANGED, { projectId });
       },
     });
+    // BB-300: one briefing reader, shared by the nightly digest and (later) a
+    // huddle; the digest renders it through `toDigestRecords`.
+    const briefing = createBriefing(store, now);
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
@@ -5980,27 +5983,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function digestRecords(projectId: string): DigestRecords {
       const row = store.project(projectId);
       const since = row.digestAt ?? now() - 86_400_000;
-      const all = store.all(projectId);
-      const open = all.filter((b) => b.endedAt === null);
-      const openWith = (pick: (x: Escalation) => boolean) => open.flatMap((b) => store.openEscalations(b.id).filter(pick).map((escalation) => ({ escalation, from: b })));
-      const coveredInDigest = new Set(store.openQuestionEscalationIds(projectId));
-      return {
-        previous: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
-        since,
-        notes: store.peekProjectNotes(projectId),
-        moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
-        ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
-        answered: store.answeredSince(projectId, since),
-        withUser: openWith((x) => x.route === "user" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
-        needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
-        assumptions: store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) })),
-        stuck: openWith((x) => x.kind === "stuck"),
-        noWakeSource: open.filter((b) => b.noWakeSource),
-        stall: openWith((x) => x.kind === "stall"),
-        // BB-247: the dated waits still ahead, listed separately from stalls.
-        datedWaits: open.filter((b) => b.requeueUntil !== null && b.requeueUntil > now()),
-        held: open.filter((b) => b.hold !== null),
-      };
+      return toDigestRecords(briefing(projectId, since));
     }
 
     // ---- lessons -------------------------------------------------------------------------------
