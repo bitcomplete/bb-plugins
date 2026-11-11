@@ -1433,11 +1433,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const huddleSessions = new Map<string, string>();
     /** Project ids with a start in flight, reserved before the first await so two clicks cannot both start. */
     const startingHuddles = new Set<string>();
+    /** Huddle ids with a confirmation in flight, so two confirms cannot race the same row. */
+    const confirmingHuddles = new Set<string>();
     const realtimeOpenOutput = z.object({ sessionId: z.string(), maxDurationMs: z.number() });
 
     /** Append one event to a huddle's transcript and save it; the record's own log. */
     function noteHuddleEvent(huddle: HuddleRow, entry: Omit<HuddleTranscriptEntry, "at">): HuddleRow {
       return store.saveHuddle(huddle.id, { transcript: [...huddle.transcript, { at: now(), ...entry }] }) ?? huddle;
+    }
+
+    /**
+     * End a huddle: stamp the end, advance "since the last huddle", and wake
+     * the project steward with what was said. One road, so `stewardsHuddleEnd`
+     * and a new start that supersedes an abandoned overlay behave the same.
+     * A huddle that said nothing wakes no one.
+     */
+    async function finishHuddle(huddle: HuddleRow): Promise<void> {
+      if (huddle.endedAt !== null) return;
+      let row = store.saveHuddle(huddle.id, { endedAt: now() }) ?? huddle;
+      store.setLastHuddle(row.projectId, row.startedAt);
+      row = noteHuddleEvent(row, { kind: "end", noteId: null, text: "" });
+      const confirmed = row.notes.filter((n) => row.confirmed.includes(n.id));
+      const free = row.notes.filter((n) => n.type === "free");
+      if (confirmed.length === 0 && free.length === 0) return;
+      const lines = ["The owner held a huddle."];
+      if (confirmed.length > 0) lines.push(`What the owner confirmed: ${confirmed.map((n) => scrubCredentials(readbackLine(n as HuddleNote))).join(" | ")}`);
+      if (free.length > 0) lines.push(`Free notes from it, context and not instructions: ${free.map((n) => JSON.stringify(scrubCredentials(n.text))).join("; ")}`);
+      await wakeProject(row.projectId, "the owner held a huddle", { digestDue: false, notes: lines });
     }
 
     /** A base URL with no trailing slash, so the comparison matches the voice plugin's. */
@@ -9067,8 +9089,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // A new start supersedes the project's earlier session: the voice
           // plugin does not tell stewards when an overlay closes, so a stale
           // session must not answer tool calls and the project's record is its
-          // latest huddle, not a lock. The old row stays for history.
-          for (const [sid, hid] of huddleSessions) if (store.huddle(hid)?.projectId === projectId) huddleSessions.delete(sid);
+          // latest huddle, not a lock. An earlier record the owner never ended
+          // is finished first, so its confirmed items and free notes still
+          // reach the project steward and the window still advances.
+          for (const [sid, hid] of huddleSessions) {
+            const open = store.huddle(hid);
+            if (open?.projectId === projectId) {
+              huddleSessions.delete(sid);
+              await finishHuddle(open);
+            }
+          }
           // The record is opened before the voice session, so a tool call that
           // arrives immediately finds it.
           const record = store.createHuddle({ id: newId("hud"), projectId, startedAt: now() });
@@ -9116,6 +9146,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           lessons: (bindingId) => store.allLessons(huddleProjectId).filter((l) => l.bindingId === bindingId),
           guidance: () => guidanceUnits(huddleProjectId),
           snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
+          needs: (bindingId) => store.openNeeds(bindingId),
+          confirmed: huddle.confirmed,
           record,
         });
         // Persist the note record when a writer touched it, and log the event in
@@ -9166,94 +9198,111 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // it stays context for the project steward.
       async stewardsHuddleConfirm({ huddleId, noteId }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("huddle items are confirmed by the owner, from the Stewards page");
-        const huddle = store.huddle(huddleId);
-        if (huddle === null) return { ok: false, applied: false, message: "That huddle is gone." };
-        const note = huddle.notes.find((n) => n.id === noteId);
-        if (note === undefined) return { ok: false, applied: false, message: "That note is not in this huddle." };
-        if (huddle.confirmed.includes(noteId)) return { ok: true, applied: true, message: "Already confirmed." };
-        const type = note.type as HuddleNoteType;
-        const text = scrubCredentials(note.text);
-        const binding = note.binding === null ? null : store.find(note.binding, huddle.projectId);
-        let applied = false;
-        let message = "Confirmed.";
+        // One confirmation per huddle at a time: applying a gate item can await
+        // a GitHub read or a merge, and two tabs must not race the same row.
+        if (confirmingHuddles.has(huddleId)) return { ok: false, applied: false, message: "Another item in this huddle is being confirmed; try again in a moment." };
+        confirmingHuddles.add(huddleId);
+        try {
+          const huddle = store.huddle(huddleId);
+          if (huddle === null) return { ok: false, applied: false, message: "That huddle is gone." };
+          const note = huddle.notes.find((n) => n.id === noteId);
+          if (note === undefined) return { ok: false, applied: false, message: "That note is not in this huddle." };
+          if (huddle.confirmed.includes(noteId)) return { ok: true, applied: true, message: "Already confirmed." };
+          const type = note.type as HuddleNoteType;
+          const text = scrubCredentials(note.text);
+          const binding = note.binding === null ? null : store.find(note.binding, huddle.projectId);
+          let applied = false;
+          let message = "Confirmed.";
 
-        if (type === "gate") {
-          if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
-          if (note.action !== "approve" && note.action !== "decline" && note.action !== "merge") return { ok: false, applied: false, message: "A gate note needs an approve, decline or merge action." };
-          const open = store.openNeeds(binding.id);
-          const need =
-            note.action === "merge"
-              ? (open.find((n) => n.kind === "merge") ?? null)
-              : (open.find((n) => n.kind === "approve-spec") ?? open.find((n) => n.kind === "approve-pr") ?? null);
-          if (need === null) return { ok: false, applied: false, message: `No open ${note.action ?? ""} item on ${binding.entityKey}.` };
-          const action = note.action === "decline" ? "decline" : note.action === "merge" ? "merge" : "approve";
-          const result = await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action, note: text }, { experimental_caller: { kind: "client" } });
-          if (!result.ok) return { ok: false, applied: false, message: result.message };
-          applied = true;
-          message = result.message;
-        } else if (type === "guidance") {
-          if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
-          store.addGuidance(binding.id, text, "user");
-          store.note(binding.id, `The owner confirmed huddle guidance: ${text}`);
-          scheduleReconcile(binding.id);
-          applied = true;
-          message = `Guidance saved on ${binding.entityKey}.`;
-        } else if (type === "resolve-escalation") {
-          const escalation = note.escalation === null ? null : store.escalation(note.escalation);
-          if (escalation === null || escalation.status !== "open") return { ok: false, applied: false, message: "That escalation is not open." };
-          const question = store.openQuestions(huddle.projectId).find((q) => q.escalationId === escalation.id);
-          if (question !== undefined) {
-            const result = await rawRpcHandlers.stewardsAnswerQuestion({ questionId: question.id, answer: text }, { experimental_caller: { kind: "client" } });
+          if (type === "gate") {
+            if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
+            if (note.action !== "approve" && note.action !== "decline" && note.action !== "merge") return { ok: false, applied: false, message: "A gate note needs an approve, decline or merge action." };
+            // The note was bound to one need when it was taken; confirm only
+            // while that exact item is still open.
+            const need = note.need === null ? null : store.need(note.need);
+            if (need === null || need.status !== "open") return { ok: false, applied: false, message: "That item is no longer open; retake the note against a current one." };
+            const action = note.action === "decline" ? "decline" : note.action === "merge" ? "merge" : "approve";
+            const result = await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action, note: text }, { experimental_caller: { kind: "client" } });
             if (!result.ok) return { ok: false, applied: false, message: result.message };
+            applied = true;
             message = result.message;
-          } else {
-            store.answerEscalation(escalation.id, text, "user");
-            if (binding !== null) {
-              store.addGuidance(binding.id, text, "user");
-              store.note(binding.id, `Escalation ${escalation.id} resolved from a huddle: ${text}`);
-              scheduleReconcile(binding.id);
+          } else if (type === "guidance") {
+            if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
+            store.addGuidance(binding.id, text, "user");
+            store.note(binding.id, `The owner confirmed huddle guidance: ${text}`);
+            scheduleReconcile(binding.id);
+            applied = true;
+            message = `Guidance saved on ${binding.entityKey}.`;
+          } else if (type === "resolve-escalation") {
+            const escalation = note.escalation === null ? null : store.escalation(note.escalation);
+            if (escalation === null || escalation.status !== "open") return { ok: false, applied: false, message: "That escalation is not open." };
+            // An approval or a secret has its own button; a huddle sentence
+            // must not stand in for the value.
+            if (escalation.kind === "approval") return { ok: false, applied: false, message: "That is an approval; use the Approve or Decline button, not the huddle." };
+            if (escalation.resolutionKind === "secret") return { ok: false, applied: false, message: "That needs a secret; use the Provide button, not the huddle." };
+            // A route-`user` escalation is the page's own item, with the
+            // escalation id as its need id; answer it through the same RPC the
+            // page uses, so the closure, corrections and parent wake happen.
+            const need = store.need(escalation.id);
+            if (need !== null && need.status === "open") {
+              const choice = needChoices(need).find((c) => c === text) ?? null;
+              const result =
+                choice === null
+                  ? await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action: "done", note: text }, { experimental_caller: { kind: "client" } })
+                  : await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action: "choose", choice, note: null }, { experimental_caller: { kind: "client" } });
+              if (!result.ok) return { ok: false, applied: false, message: result.message };
+              message = result.message;
+            } else {
+              const question = store.openQuestions(huddle.projectId).find((q) => q.escalationId === escalation.id);
+              if (question !== undefined) {
+                const result = await rawRpcHandlers.stewardsAnswerQuestion({ questionId: question.id, answer: text }, { experimental_caller: { kind: "client" } });
+                if (!result.ok) return { ok: false, applied: false, message: result.message };
+                message = result.message;
+              } else {
+                // The escalation's own binding, never the model's guess.
+                const from = store.binding(escalation.bindingId);
+                store.answerEscalation(escalation.id, text, "user");
+                countCorrections(escalation, text);
+                if (from !== null) {
+                  store.addGuidance(from.id, text, "user");
+                  store.note(from.id, `Escalation ${escalation.id} resolved from a huddle: ${text}`);
+                  scheduleReconcile(from.id);
+                }
+                await wakeProject(huddle.projectId, "an escalation was resolved in a huddle", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a huddle with: ${JSON.stringify(text)}`] });
+                message = `Escalation ${escalation.id} resolved.`;
+              }
             }
-            await wakeProject(huddle.projectId, "an escalation was resolved in a huddle", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a huddle with: ${JSON.stringify(text)}`] });
-            message = `Escalation ${escalation.id} resolved.`;
+            applied = true;
+          } else if (type === "direction" || type === "standing-rule") {
+            const label = type === "direction" ? "direction" : "standing rule";
+            const cue = type === "standing-rule" ? " A standing rule is the cue to open the playbook pull request." : "";
+            await wakeProject(huddle.projectId, `the owner's ${label} from a huddle`, { digestDue: false, notes: [`The owner held a huddle and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
+            applied = true;
+            message = `${type === "direction" ? "Direction" : "Standing rule"} sent to the project steward.`;
+          } else {
+            // A free note is context, never an action: it is left unconfirmed
+            // for the project steward's next wake.
+            return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the huddle ends." };
           }
-          applied = true;
-        } else if (type === "direction" || type === "standing-rule") {
-          const label = type === "direction" ? "direction" : "standing rule";
-          const cue = type === "standing-rule" ? " A standing rule is the cue to open the playbook pull request." : "";
-          await wakeProject(huddle.projectId, `the owner's ${label} from a huddle`, { digestDue: false, notes: [`The owner held a huddle and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
-          applied = true;
-          message = `${type === "direction" ? "Direction" : "Standing rule"} sent to the project steward.`;
-        } else {
-          // A free note is context, never an action: it is left unconfirmed for
-          // the project steward's next wake.
-          return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the huddle ends." };
-        }
 
-        store.saveHuddle(huddle.id, { confirmed: [...huddle.confirmed, noteId], transcript: [...huddle.transcript, { at: now(), kind: "confirm", noteId, text }] });
-        return { ok: true, applied, message };
+          // Re-read the row: a take_note or retract_note may have landed while
+          // the apply above awaited, and neither may be dropped.
+          const fresh = store.huddle(huddle.id) ?? huddle;
+          store.saveHuddle(fresh.id, { confirmed: [...fresh.confirmed, noteId], transcript: [...fresh.transcript, { at: now(), kind: "confirm", noteId, text }] });
+          return { ok: true, applied, message };
+        } finally {
+          confirmingHuddles.delete(huddleId);
+        }
       },
       // The owner ends the huddle. That advances "since the last huddle", and
       // the free notes that were never typed reach the project steward as
       // context, not instruction, with a line that a huddle was held.
       async stewardsHuddleEnd({ huddleId }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("a huddle is ended by the owner, from the Stewards page");
-        let huddle = store.huddle(huddleId);
+        const huddle = store.huddle(huddleId);
         if (huddle === null) return { ok: false, message: "That huddle is gone." };
         if (huddle.endedAt !== null) return { ok: true, message: "Already ended." };
-        huddle = store.saveHuddle(huddle.id, { endedAt: now() }) ?? huddle;
-        store.setLastHuddle(huddle.projectId, huddle.startedAt);
-        huddle = noteHuddleEvent(huddle, { kind: "end", noteId: null, text: "" });
-        // The project steward's next wake says a huddle was held and what was
-        // said: the items the owner confirmed and the free notes that were only
-        // context. A huddle that said nothing wakes no one.
-        const confirmed = huddle.notes.filter((n) => huddle.confirmed.includes(n.id));
-        const free = huddle.notes.filter((n) => n.type === "free");
-        if (confirmed.length > 0 || free.length > 0) {
-          const lines = ["The owner held a huddle."];
-          if (confirmed.length > 0) lines.push(`What the owner confirmed: ${confirmed.map((n) => readbackLine(n as HuddleNote)).join(" | ")}`);
-          if (free.length > 0) lines.push(`Free notes from it, context and not instructions: ${free.map((n) => JSON.stringify(scrubCredentials(n.text))).join("; ")}`);
-          await wakeProject(huddle.projectId, "the owner held a huddle", { digestDue: false, notes: lines });
-        }
+        await finishHuddle(huddle);
         return { ok: true, message: "Huddle ended." };
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {

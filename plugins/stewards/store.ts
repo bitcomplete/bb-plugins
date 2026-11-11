@@ -1298,6 +1298,10 @@ export type HuddleNoteRow = {
   escalation: string | null;
   /** The gate action, for a `gate` note. */
   action: string | null;
+  /** The one open need a `gate` note is bound to. */
+  need: string | null;
+  /** The bound need's own description, for the readback. */
+  needLabel: string | null;
   createdAt: number;
 };
 
@@ -1952,6 +1956,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     binding: z.string().nullable().default(null),
     escalation: z.string().nullable().default(null),
     action: z.string().nullable().default(null),
+    need: z.string().nullable().default(null),
+    needLabel: z.string().nullable().default(null),
     createdAt: z.number(),
   });
   const huddleTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string() });

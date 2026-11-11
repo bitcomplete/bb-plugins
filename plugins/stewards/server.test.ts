@@ -6465,6 +6465,23 @@ describe("needs you items", () => {
     expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
   });
 
+  it("applies a confirmed huddle gate note to a pull request through the need-action path", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const voice = { experimental_caller: { kind: "plugin", pluginId: "voice-transcription" } } as const;
+    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string; huddleId: string };
+    await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: b.entityKey, action: "approve", need: need.id }) }, voice);
+    const rec = (await t.harness.callRpc("stewardsHuddleRecord", { projectId: "p1" })) as { huddle: { notes: Array<{ id: string; readback: string }> } };
+    // The readback names the exact pull request the note is bound to.
+    expect(rec.huddle.notes[0]!.readback).toContain("Approve acme/web#7 on GitHub");
+    const res = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: rec.huddle.notes[0]!.id }, client);
+    expect(res).toMatchObject({ ok: true, applied: true });
+    // The same effect the Approve button has: the review lands and the item closes.
+    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "APPROVE", body: "" }]);
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+  });
+
   it("keeps the comment convention when the pull request is the signed-in account's own (BB-118)", async () => {
     const t = await withPull([marker], {}, { author: "jane" });
     const b = t.binding();
@@ -14726,7 +14743,7 @@ describe("the huddle (BB-300)", () => {
     expect(t.hooks.store.lastHuddle("p1")).toBeNull();
   });
 
-  it("lets a new start supersede one that never connected", async () => {
+  it("lets a new start supersede one that never connected, finishing the abandoned record", async () => {
     const t = await adopted();
     const first = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
     expect(first.ok).toBe(true);
@@ -14736,13 +14753,14 @@ describe("the huddle (BB-300)", () => {
     expect(second.ok).toBe(true);
     expect(second.sessionId).not.toBe(first.sessionId);
     expect(t.realtimeOpens).toHaveLength(2);
-    expect(t.hooks.store.lastHuddle("p1")).toBeNull();
+    // Slice 4 finishes the abandoned first huddle on the new start, so "since
+    // the last huddle" advances even when the owner never pressed Done.
+    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
     // The old session's tool calls no longer find a huddle; the new one's do.
     await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: first.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)).rejects.toThrow(/ended/u);
     await t.harness.callRpc("stewardsHuddleTool", { sessionId: second.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
-    // Slice 4 advances "since the last huddle" when the huddle ends, not on
-    // the first tool call, so a session that never ends leaves it alone.
-    expect(t.hooks.store.lastHuddle("p1")).toBeNull();
+    // The second huddle is still open, so the window stays at the first one.
+    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
   });
 
   it("forwards a tool call to the huddle's readers and records notes only in the huddle", async () => {
@@ -14953,6 +14971,47 @@ describe("the huddle (BB-300)", () => {
     const sent = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
     expect(sent).toContain("token: [redacted]");
     expect(sent).not.toContain("abc123");
+  });
+
+  it("resolves a direct escalation using the escalation's own binding", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which database?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    const started = await startHuddle(t);
+    // The model omits the binding; the answer must still land on the escalation's binding.
+    await takeNote(t, started.sessionId, { type: "resolve-escalation", text: "Postgres", escalationId: x.id });
+    const noteId = (await record(t)).huddle!.notes[0]!.id;
+    const res = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId }, client);
+    expect(res).toMatchObject({ ok: true, applied: true });
+    expect(t.hooks.store.escalation(x.id)!.status).toBe("resolved");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("Postgres");
+  });
+
+  it("resolves a forwarded question through the question path", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: x.id, question: "Include SSO?", context: null });
+    const started = await startHuddle(t);
+    await takeNote(t, started.sessionId, { type: "resolve-escalation", text: "Yes, include SSO", escalationId: x.id });
+    const noteId = (await record(t)).huddle!.notes[0]!.id;
+    const res = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId }, client);
+    expect(res).toMatchObject({ ok: true, applied: true });
+    expect(t.hooks.store.question(q.id)!.status).toBe("answered");
+    expect(t.hooks.store.escalation(x.id)!.status).toBe("resolved");
+  });
+
+  it("finishes an abandoned huddle when a new one starts", async () => {
+    const t = await adopted();
+    const first = await startHuddle(t);
+    await takeNote(t, first.sessionId, { type: "free", text: "Remember the cache idea" });
+    await t.flush();
+    const before = t.sends.length;
+    await startHuddle(t);
+    await t.flush();
+    const wake = t.sends.slice(before).find((s) => s.threadId === t.project);
+    expect(wake?.text).toContain("Remember the cache idea");
+    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
   });
 
   it("returns no record for a project that has never huddled", async () => {
