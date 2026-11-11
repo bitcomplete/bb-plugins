@@ -46,7 +46,14 @@ export type HuddleRecord = {
   projectId: string;
   startedAt: number;
   notes: HuddleNote[];
+  /** True once the overlay has connected and the model has called a tool. */
+  connected: boolean;
 };
+
+/** The voice plugin's own `realtime.open` instruction cap; the briefing stays under it. */
+export const HUDDLE_MAX_INSTRUCTIONS_CHARS = 20_000;
+/** The most lines one section lists before it says how many were left out. */
+export const HUDDLE_SECTION_MAX = 40;
 
 /** The only tools that write, and they write only to the huddle record. */
 export const HUDDLE_WRITE_TOOLS: ReadonlySet<string> = new Set(["take_note", "retract_note"]);
@@ -372,30 +379,39 @@ function deviationLines(briefing: Briefing): string[] {
  * project steward's escalations, then what is stuck or held, then what got
  * done since, with playbook deviations called out. The model may ask follow-up
  * questions with the read tools and take or retract notes, and nothing else.
+ *
+ * The text is bounded twice: each section lists at most `HUDDLE_SECTION_MAX`
+ * lines (then says how many it left out), and the whole text is kept under the
+ * voice plugin's `realtime.open` cap. The ranking survives truncation: the
+ * sections stay in order and the tail gives way first.
  */
 export function buildHuddleInstructions(briefing: Briefing, projectName: string, now: number, questions: readonly HuddleOpenQuestion[] = []): string {
   const since = briefing.since === 0 ? "the beginning" : new Date(briefing.since).toISOString();
-  return [
+  const header = [
     `You are the voice of ${projectName}'s stewards in a huddle with the project's owner.`,
     `It is ${new Date(now).toISOString()}. You are reporting what happened since ${since}.`,
     "",
     "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached.",
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the huddle.",
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
-    "",
-    "## Decisions waiting on the owner",
-    bullets(decisionLines(briefing, questions)),
-    "",
-    "## Escalations with the project steward",
-    bullets(projectEscalationLines(briefing)),
-    "",
-    "## Stuck or held",
-    bullets(stuckLines(briefing)),
-    "",
-    "## Done since",
-    bullets(doneLines(briefing)),
-    "",
-    "## Approaches that departed from the written playbook",
-    bullets(deviationLines(briefing)),
-  ].join("\n");
+  ];
+  const sections = [
+    { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions) },
+    { heading: "Escalations with the project steward", lines: projectEscalationLines(briefing) },
+    { heading: "Stuck or held", lines: stuckLines(briefing) },
+    { heading: "Done since", lines: doneLines(briefing) },
+    { heading: "Approaches that departed from the written playbook", lines: deviationLines(briefing) },
+  ];
+  const capped = sections.map((section) => ({
+    heading: section.heading,
+    lines: section.lines.length <= HUDDLE_SECTION_MAX ? section.lines : [...section.lines.slice(0, HUDDLE_SECTION_MAX), `…and ${section.lines.length - HUDDLE_SECTION_MAX} more`],
+  }));
+  const render = (): string => [...header, ...capped.flatMap((section) => ["", `## ${section.heading}`, bullets(section.lines)])].join("\n");
+  while (render().length > HUDDLE_MAX_INSTRUCTIONS_CHARS) {
+    const last = [...capped].reverse().find((section) => section.lines.length > 0);
+    if (last === undefined) break;
+    last.lines.pop();
+  }
+  const text = render();
+  return text.length <= HUDDLE_MAX_INSTRUCTIONS_CHARS ? text : `${text.slice(0, HUDDLE_MAX_INSTRUCTIONS_CHARS - 20)}\n… (truncated)`;
 }

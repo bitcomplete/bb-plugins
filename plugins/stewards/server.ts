@@ -1381,6 +1381,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** OpenAI's own endpoint; Realtime exists only against it. */
     const HUDDLE_OPENAI_BASE_URL = "https://api.openai.com/v1";
     const huddles = new Map<string, HuddleRecord>();
+    /** Project ids with a start in flight, reserved before the first await so two clicks cannot both start. */
+    const startingHuddles = new Set<string>();
     const realtimeOpenOutput = z.object({ sessionId: z.string(), maxDurationMs: z.number() });
 
     /** A base URL with no trailing slash, so the comparison matches the voice plugin's. */
@@ -8991,34 +8993,48 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsHuddleStart({ projectId }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("a huddle is started from the Stewards page");
-        const availability = await huddleAvailability(store.project(projectId).threadId !== null);
-        if (!availability.available) return { ok: false, sessionId: null, message: availability.message ?? "A huddle is not available." };
-        // A record outlives its session here: the voice plugin does not tell
-        // stewards when the overlay closes. One session is capped at 20
-        // minutes, so a record older than that is a stale one to drop.
-        const staleBefore = now() - 25 * 60_000;
-        for (const [id, huddle] of huddles) if (huddle.startedAt < staleBefore) huddles.delete(id);
-        for (const huddle of huddles.values()) {
-          if (huddle.projectId === projectId) return { ok: false, sessionId: null, message: "A huddle for this project is already running." };
-        }
-        const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
-        const since = store.lastHuddle(projectId) ?? 0;
-        const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
-        const instructions = buildHuddleInstructions(briefing(projectId, since), name, now(), questions);
-        let opened: { sessionId: string; maxDurationMs: number };
+        // Reserve the project before the first await, so a click on the board
+        // and a click on the home page at the same moment cannot both start.
+        if (startingHuddles.has(projectId)) return { ok: false, sessionId: null, message: "A huddle for this project is already starting." };
+        startingHuddles.add(projectId);
         try {
-          opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: HUDDLE_TOOLS, toolHandler: { method: "stewardsHuddleTool" } }, realtimeOpenOutput);
-        } catch (error) {
-          return { ok: false, sessionId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
+          const availability = await huddleAvailability(store.project(projectId).threadId !== null);
+          if (!availability.available) return { ok: false, sessionId: null, message: availability.message ?? "A huddle is not available." };
+          // Supersede any record for this project: the voice plugin does not
+          // tell stewards when an overlay closes, so a stale record must not
+          // lock the project out of a new huddle. The old notes are dropped.
+          for (const [id, huddle] of huddles) if (huddle.projectId === projectId) huddles.delete(id);
+          const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
+          // The first huddle reads since the last digest rather than since the
+          // beginning: a project with a long history would otherwise list every
+          // binding it has ever ended.
+          const since = store.lastHuddle(projectId) ?? store.project(projectId).digestAt ?? 0;
+          const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
+          const instructions = buildHuddleInstructions(briefing(projectId, since), name, now(), questions);
+          let opened: { sessionId: string; maxDurationMs: number };
+          try {
+            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: HUDDLE_TOOLS, toolHandler: { method: "stewardsHuddleTool" } }, realtimeOpenOutput);
+          } catch (error) {
+            return { ok: false, sessionId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
+          }
+          huddles.set(opened.sessionId, { projectId, startedAt: now(), notes: [], connected: false });
+          return { ok: true, sessionId: opened.sessionId, message: "Huddle started." };
+        } finally {
+          startingHuddles.delete(projectId);
         }
-        huddles.set(opened.sessionId, { projectId, startedAt: now(), notes: [] });
-        store.setLastHuddle(projectId, now());
-        return { ok: true, sessionId: opened.sessionId, message: "Huddle started." };
       },
       async stewardsHuddleTool({ sessionId, name, arguments: rawArgs }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== VOICE_PLUGIN_ID) throw new Error("only the voice-transcription plugin forwards huddle tool calls");
         const record = huddles.get(sessionId);
         if (record === undefined) throw new Error("that huddle has ended");
+        // The first tool call proves the overlay connected and the briefing was
+        // delivered, so that is when "since the last huddle" advances. A
+        // session that never connected leaves it alone and the next huddle
+        // re-reports its window.
+        if (!record.connected) {
+          record.connected = true;
+          store.setLastHuddle(record.projectId, record.startedAt);
+        }
         let args: Record<string, unknown>;
         try {
           const parsed: unknown = JSON.parse(rawArgs.trim() === "" ? "{}" : rawArgs);

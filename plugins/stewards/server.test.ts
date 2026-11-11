@@ -14706,12 +14706,11 @@ describe("the huddle (BB-300)", () => {
     expect(t.realtimeOpens).toHaveLength(0);
   });
 
-  it("starts a huddle with the ranked briefing and the fixed tool set, and records since", async () => {
+  it("starts a huddle with the ranked briefing and the fixed tool set", async () => {
     const t = await adopted();
     await t.tool("steward_update", { ask: { question: "Should I file an a11y ticket?" } }, t.project);
     await t.flush();
 
-    const before = t.now();
     const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string | null; message: string };
     expect(started.ok).toBe(true);
     expect(started.sessionId).not.toBeNull();
@@ -14722,12 +14721,28 @@ describe("the huddle (BB-300)", () => {
     expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "take_note", "retract_note"]);
     expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
     expect(String(open.input.instructions)).toMatch(/Should I file an a11y ticket\?/u);
-    // The window starts now, so the next huddle reads since this one.
-    expect(t.hooks.store.lastHuddle("p1")).toBeGreaterThanOrEqual(before);
-    // One huddle per project: a second start is refused while the first runs.
-    const second = await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client);
-    expect(second).toMatchObject({ ok: false });
-    expect(t.realtimeOpens).toHaveLength(1);
+    // Opening the session does not advance the window: only a session that
+    // connected (its first tool call) does.
+    expect(t.hooks.store.lastHuddle("p1")).toBeNull();
+  });
+
+  it("lets a new start supersede one that never connected, and advances the window on the first tool call", async () => {
+    const t = await adopted();
+    const first = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
+    expect(first.ok).toBe(true);
+    // A start after a session that was closed or never connected still works:
+    // there is no close signal, so a stale record must not lock the project out.
+    const second = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
+    expect(second.ok).toBe(true);
+    expect(second.sessionId).not.toBe(first.sessionId);
+    expect(t.realtimeOpens).toHaveLength(2);
+    expect(t.hooks.store.lastHuddle("p1")).toBeNull();
+    // The old session's tool calls no longer find a huddle; the new one's do.
+    await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: first.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)).rejects.toThrow(/ended/u);
+    await t.harness.callRpc("stewardsHuddleTool", { sessionId: second.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    // The first tool call proves the overlay connected, so "since the last
+    // huddle" now points at the session's start.
+    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
   });
 
   it("forwards a tool call to the huddle's readers and records notes only in the huddle", async () => {

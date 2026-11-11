@@ -1612,6 +1612,15 @@ describe("the Huddle button (BB-300)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("renders nothing on the home page when a huddle is unavailable", async () => {
+    const captured = await loadApp();
+    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
+    const slot = renderSlot(section, { projectId: "p1" }, { rpc: { stewardsHuddle: () => ({ available: false, message: "no key" }) } as never });
+    await waitFor(() => expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull());
+    expect(slot.queryByRole("button", { name: "Open the Stewards page" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   it("renders nothing on the home page without a project", async () => {
     const captured = await loadApp();
     const section = captured.homepageSections.find((s) => s.id === "huddle")!;

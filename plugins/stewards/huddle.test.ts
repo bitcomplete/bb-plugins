@@ -3,6 +3,7 @@
 // readers are injected, so the whole surface is unit-tested.
 import { describe, expect, it } from "vitest";
 import {
+  HUDDLE_MAX_INSTRUCTIONS_CHARS,
   HUDDLE_NOTE_TYPES,
   HUDDLE_TOOL_NAMES,
   HUDDLE_TOOLS,
@@ -72,7 +73,7 @@ const lesson = (over: Partial<Lesson> = {}): Lesson =>
 const unit = (over: Partial<GuidanceUnit> = {}): GuidanceUnit => ({ id: "gu_1", file: "AGENTS.md", heading: "Merging", text: "Merge only green checks.", lessonId: null, ...over });
 
 function context(over: Partial<HuddleToolContext> = {}): HuddleToolContext {
-  const record: HuddleRecord = { projectId: "p1", startedAt: 1, notes: [] };
+  const record: HuddleRecord = { projectId: "p1", startedAt: 1, notes: [], connected: false };
   return {
     projectId: "p1",
     now: () => 1_000,
@@ -210,5 +211,14 @@ describe("buildHuddleInstructions (BB-300)", () => {
 
   it("says the beginning when there is no previous huddle", () => {
     expect(buildHuddleInstructions(briefing({ since: 0 }), "Acme", 10_000)).toContain("since the beginning");
+  });
+
+  it("keeps a huge briefing under the voice plugin's instruction cap, ranked", () => {
+    const many = Array.from({ length: 400 }, (_, i) => binding({ entityKey: `ENG-${i}` }));
+    const text = buildHuddleInstructions(briefing({ done: { moved: [], ended: many, answered: [] } }), "Acme", 10_000);
+    expect(text.length).toBeLessThanOrEqual(HUDDLE_MAX_INSTRUCTIONS_CHARS);
+    expect(text).toMatch(/…and \d+ more/u);
+    // The decisions section survives even when the tail is huge.
+    expect(text).toContain("Approve the spec");
   });
 });

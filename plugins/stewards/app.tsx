@@ -816,13 +816,16 @@ function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
       live = false;
     };
   }, [rpc, projectId]);
-  if (projectId === null) return null;
+  // The line is part of the huddle's surface, not an unconditional addition to
+  // every home page: a developer who cannot huddle (no key, a non-OpenAI
+  // endpoint, no project steward) sees no change at all.
+  if (projectId === null || availability?.available !== true) return null;
   return (
     <div className="flex flex-wrap items-center gap-3 text-sm">
       <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(projectId) })}>
         Open the Stewards page
       </button>
-      {availability?.available === true ? <HuddleButton projectId={projectId} /> : null}
+      <HuddleButton projectId={projectId} />
     </div>
   );
 }
