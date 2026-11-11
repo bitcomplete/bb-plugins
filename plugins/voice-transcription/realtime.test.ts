@@ -225,6 +225,40 @@ describe("realtime mint route", () => {
     expect(afterClose.status).toBe(404);
   });
 
+  it("mints only once when two clients race for the same session", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    const fetchMock = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return jsonResponse({ value: "ek", expires_at: 1 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const opened = (await open(host, { instructions: "x", tools: [ECHO] })) as { sessionId: string };
+
+    const responses = await Promise.all([
+      host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId })),
+      host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId })),
+    ]);
+
+    expect(responses.map((response) => response.status).sort((a, b) => a - b)).toEqual([200, 409]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the mint claim when OpenAI fails, so a retry can mint", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("boom", { status: 500 }))
+      .mockResolvedValueOnce(jsonResponse({ value: "ek", expires_at: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const opened = (await open(host, { instructions: "x", tools: [ECHO] })) as { sessionId: string };
+
+    const first = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId }));
+    expect(first.status).toBe(502);
+    const second = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId }));
+    expect(second.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects a mint without a session id", async () => {
     const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
     const response = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({}));

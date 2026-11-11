@@ -97,7 +97,10 @@ type PendingRealtimeSession = {
   config: RealtimeSessionConfig;
   toolHandler: { pluginId: string; method: string } | null;
   createdAt: number;
+  /** Set once a secret has been minted; null until then. */
   startedAt: number | null;
+  /** True while a mint is in flight, so a concurrent mint is refused before it reaches OpenAI. */
+  minting: boolean;
   maxMs: number;
 };
 
@@ -398,6 +401,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
               : { pluginId: caller.pluginId, method: input.toolHandler.method },
           createdAt: Date.now(),
           startedAt: null,
+          minting: false,
           maxMs: realtimeMaxMs(config),
         };
         realtimeSessions.set(session.id, session);
@@ -424,61 +428,78 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         if (session.startedAt !== null) {
           return c.json({ error: "That voice session already has a client secret" }, 409);
         }
+        // Claim the session before the OpenAI round trip. The signal reaches
+        // every client at once, so two mints can arrive together; only the
+        // one that claims it may call OpenAI. The claim is released on every
+        // failure path so a retry can still mint.
+        if (session.minting) {
+          return c.json({ error: "That voice session is already being minted" }, 409);
+        }
         if (now - session.createdAt > session.maxMs) {
           realtimeSessions.delete(sessionId);
           return c.json({ error: "That voice session expired before it started" }, 409);
         }
-        const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
-        const url = `${normalizedBaseUrl}${REALTIME_CLIENT_SECRET_PATH}`;
-        let response: Response;
+        session.minting = true;
         try {
-          response = await fetch(url, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify(realtimeClientSecretBody(session.config)),
-          });
-        } catch (error) {
-          bb.log.warn(
-            `voice-transcription: realtime mint could not reach ${url}: ${error instanceof Error ? error.message : String(error)}`,
+          const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+          const url = `${normalizedBaseUrl}${REALTIME_CLIENT_SECRET_PATH}`;
+          let response: Response;
+          try {
+            response = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify(realtimeClientSecretBody(session.config)),
+            });
+          } catch (error) {
+            bb.log.warn(
+              `voice-transcription: realtime mint could not reach ${url}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return c.json({ error: `Could not reach ${url}` }, 502);
+          }
+          if (!response.ok) {
+            const text = await response.text();
+            bb.log.warn(
+              `voice-transcription: realtime mint answered HTTP ${response.status} from ${url}`,
+            );
+            return c.json(
+              { error: `OpenAI refused the session: HTTP ${response.status}: ${errorExcerpt(text, apiKey)}` },
+              502,
+            );
+          }
+          let secret: { value: string; expiresAt: number };
+          try {
+            secret = parseClientSecret(await response.json());
+          } catch (error) {
+            return c.json(
+              { error: error instanceof Error ? error.message : "OpenAI returned an unexpected reply" },
+              502,
+            );
+          }
+          // The overlay may have closed the session while the mint was in
+          // flight; the secret is then discarded with it.
+          if (realtimeSessions.get(sessionId) !== session) {
+            return c.json({ error: "That voice session has ended; start a new one" }, 404);
+          }
+          session.startedAt = Date.now();
+          bb.log.info(
+            `voice-transcription: minted a Realtime client secret for session ${session.id} (expires ${secret.expiresAt})`,
           );
-          return c.json({ error: `Could not reach ${url}` }, 502);
+          const minted: MintedRealtimeSession = {
+            value: secret.value,
+            expiresAt: secret.expiresAt,
+            model: realtimeModel(session.config),
+            voice: realtimeVoice(session.config),
+            instructions: session.config.instructions,
+            tools: session.config.tools,
+            maxDurationMs: session.maxMs,
+          };
+          return c.json(minted, 200);
+        } finally {
+          session.minting = false;
         }
-        if (!response.ok) {
-          const text = await response.text();
-          bb.log.warn(
-            `voice-transcription: realtime mint answered HTTP ${response.status} from ${url}`,
-          );
-          return c.json(
-            { error: `OpenAI refused the session: HTTP ${response.status}: ${errorExcerpt(text, apiKey)}` },
-            502,
-          );
-        }
-        let secret: { value: string; expiresAt: number };
-        try {
-          secret = parseClientSecret(await response.json());
-        } catch (error) {
-          return c.json(
-            { error: error instanceof Error ? error.message : "OpenAI returned an unexpected reply" },
-            502,
-          );
-        }
-        session.startedAt = now;
-        bb.log.info(
-          `voice-transcription: minted a Realtime client secret for session ${session.id} (expires ${secret.expiresAt})`,
-        );
-        const minted: MintedRealtimeSession = {
-          value: secret.value,
-          expiresAt: secret.expiresAt,
-          model: realtimeModel(session.config),
-          voice: realtimeVoice(session.config),
-          instructions: session.config.instructions,
-          tools: session.config.tools,
-          maxDurationMs: session.maxMs,
-        };
-        return c.json(minted, 200);
       },
       { auth: "local" },
     );
