@@ -9,7 +9,10 @@ import {
   HUDDLE_TOOLS,
   HUDDLE_WRITE_TOOLS,
   buildHuddleInstructions,
+  readbackLine,
+  readbackLines,
   runHuddleTool,
+  type HuddleNote,
   type HuddleRecord,
   type HuddleToolContext,
 } from "./huddle.js";
@@ -185,6 +188,25 @@ const briefing = (over: Partial<Briefing> = {}): Briefing => ({
   done: { moved: [binding({ entityKey: "ENG-17" })], ended: [binding({ entityKey: "ENG-18", endReason: "merged" })], answered: [] },
   assumptions: [{ assumption: { text: "the schema is stable" } as never, binding: binding({ entityKey: "ENG-19" }) }],
   ...over,
+});
+
+describe("the mechanical readback (BB-300 slice 4)", () => {
+  const note = (over: Partial<HuddleNote> = {}): HuddleNote => ({ id: "note_1", type: "free", text: "Something", binding: null, escalation: null, action: null, createdAt: 1, ...over });
+
+  it("renders one line per typed shape from the stored note, not the model", () => {
+    expect(readbackLine(note({ type: "resolve-escalation", escalation: "esc_1", text: "Merge it" }))).toBe("Resolve escalation esc_1 with: Merge it");
+    expect(readbackLine(note({ type: "gate", binding: "ENG-12", action: "approve", text: "Looks good" }))).toBe("Approve ENG-12: Looks good");
+    expect(readbackLine(note({ type: "gate", binding: "ENG-12", action: "decline", text: "Not yet" }))).toBe("Decline ENG-12: Not yet");
+    expect(readbackLine(note({ type: "gate", binding: "ENG-12", action: "merge", text: "Ship it" }))).toBe("Merge ENG-12: Ship it");
+    expect(readbackLine(note({ type: "guidance", binding: "ENG-12", text: "Keep it small" }))).toBe("Guidance for ENG-12: Keep it small");
+    expect(readbackLine(note({ type: "direction", text: "Prioritise the migration" }))).toBe("Project direction: Prioritise the migration");
+    expect(readbackLine(note({ type: "standing-rule", text: "Never merge red checks" }))).toBe("Standing rule: Never merge red checks");
+    expect(readbackLine(note({ type: "free", text: "A thought" }))).toBe("Note: A thought");
+  });
+
+  it("keeps the order the notes were taken in", () => {
+    expect(readbackLines([note({ id: "a", type: "direction", text: "One" }), note({ id: "b", type: "free", text: "Two" })])).toEqual(["Project direction: One", "Note: Two"]);
+  });
 });
 
 describe("buildHuddleInstructions (BB-300)", () => {

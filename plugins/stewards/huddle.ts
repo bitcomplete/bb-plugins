@@ -175,6 +175,37 @@ const NOTE_LABEL: Record<HuddleNoteType, string> = {
   free: "a note",
 };
 
+/**
+ * BB-300 slice 4: one typed note as a mechanical readback line. The page
+ * renders these from the stored notes; the model only reads them aloud, it
+ * does not compose them. A free note reads back as a plain note so it is never
+ * mistaken for a typed action item.
+ */
+export function readbackLine(note: HuddleNote): string {
+  const where = note.binding === null ? "" : ` ${note.binding}`;
+  switch (note.type) {
+    case "resolve-escalation":
+      return `Resolve escalation ${note.escalation ?? "(none)"} with: ${note.text}`;
+    case "gate": {
+      const action = note.action === "merge" ? "Merge" : note.action === "decline" ? "Decline" : "Approve";
+      return `${action}${where}: ${note.text}`;
+    }
+    case "guidance":
+      return `Guidance for${where}: ${note.text}`;
+    case "direction":
+      return `Project direction: ${note.text}`;
+    case "standing-rule":
+      return `Standing rule: ${note.text}`;
+    default:
+      return `Note: ${note.text}`;
+  }
+}
+
+/** The readback lines for a record's notes, in the order they were taken. */
+export function readbackLines(notes: readonly HuddleNote[]): string[] {
+  return notes.map(readbackLine);
+}
+
 function requireString(args: Record<string, unknown>, field: string): string {
   const value = args[field];
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${field} is required`);

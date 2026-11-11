@@ -94,7 +94,7 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { HUDDLE_TOOLS, buildHuddleInstructions, runHuddleTool, type HuddleRecord } from "./huddle.js";
+import { HUDDLE_TOOLS, buildHuddleInstructions, readbackLine, runHuddleTool, type HuddleNote, type HuddleNoteType, type HuddleRecord } from "./huddle.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -121,7 +121,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type HuddleNoteRow, type HuddleRow, type HuddleTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
@@ -960,10 +960,11 @@ export const rpcContract = defineRpcContract({
   },
   // BB-300: start one huddle for a project. Stewards builds the briefing's
   // instructions and opens the voice plugin's overlay with the fixed tool set.
-  // The huddle's notes live here, in memory, until slice 4 makes them durable.
+  // The record is durable from slice 4 on: the session id names the record the
+  // notes are saved to, and `huddleId` is what the readback confirms against.
   stewardsHuddleStart: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
-    output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), message: z.string() }),
+    output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), huddleId: z.string().nullable(), message: z.string() }),
   },
   // BB-300: the one method the voice plugin forwards the model's tool calls to.
   // It reads state, or takes and retracts notes; it never acts on a steward.
@@ -977,6 +978,52 @@ export const rpcContract = defineRpcContract({
       arguments: z.string().max(20_000),
     }),
     output: z.string(),
+  },
+  // BB-300 slice 4: the durable huddle record, read back for the Stewards page.
+  // The readback lines are rendered from the stored notes, never composed by
+  // the model. `notes` carries every note with its confirmation state.
+  stewardsHuddleRecord: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({
+      huddle: z
+        .object({
+          id: z.string(),
+          projectId: z.string(),
+          startedAt: z.number(),
+          endedAt: z.number().nullable(),
+          notes: z.array(
+            z.object({
+              id: z.string(),
+              type: z.string(),
+              text: z.string(),
+              binding: z.string().nullable(),
+              escalation: z.string().nullable(),
+              action: z.string().nullable(),
+              createdAt: z.number(),
+              /** The mechanical readback line for this note. */
+              readback: z.string(),
+              /** True once the owner confirmed this note; nothing unconfirmed is applied. */
+              confirmed: z.boolean(),
+            }),
+          ),
+          confirmed: z.array(z.string()),
+        })
+        .nullable(),
+    }),
+  },
+  // BB-300 slice 4: the owner confirms one note. The server applies it through
+  // the path that already exists for its shape and marks it confirmed; nothing
+  // is applied for a note that is not confirmed.
+  stewardsHuddleConfirm: {
+    input: z.object({ huddleId: z.string().min(1).max(100), noteId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), applied: z.boolean(), message: z.string() }),
+  },
+  // BB-300 slice 4: the owner ends the huddle. It advances "since the last
+  // huddle", and the unconfirmed free notes reach the project steward as
+  // context, not instruction.
+  stewardsHuddleEnd: {
+    input: z.object({ huddleId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
   },
 });
 
@@ -1369,21 +1416,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // the digest renders it through `toDigestRecords`.
     const briefing = createBriefing(store, now);
 
-    // ---- the huddle (BB-300 slice 3) --------------------------------------------------
+    // ---- the huddle (BB-300) ----------------------------------------------------------
     //
     // One spoken stand-up per project, opened from the Stewards page. The
     // instructions are the briefing ranked decisions first; the model may only
-    // read state and take or retract notes. The notes live in memory here for
-    // the length of the session; slice 4 makes the record durable and reads it
-    // back for the owner to confirm. Nothing here acts on a steward, merges or
-    // resolves anything.
+    // read state and take or retract notes. Since slice 4 the record is durable
+    // (the `huddles` table): the session maps to a record, and the notes, the
+    // event transcript and the confirmed ids are saved there. Nothing here acts
+    // on a steward, merges or resolves anything; the page applies a confirmed
+    // note in `stewardsHuddleConfirm`, through the path that already exists for
+    // its shape.
     const VOICE_PLUGIN_ID = "voice-transcription";
     /** OpenAI's own endpoint; Realtime exists only against it. */
     const HUDDLE_OPENAI_BASE_URL = "https://api.openai.com/v1";
-    const huddles = new Map<string, HuddleRecord>();
+    /** Session id to durable huddle id; the record itself is in the store. */
+    const huddleSessions = new Map<string, string>();
     /** Project ids with a start in flight, reserved before the first await so two clicks cannot both start. */
     const startingHuddles = new Set<string>();
     const realtimeOpenOutput = z.object({ sessionId: z.string(), maxDurationMs: z.number() });
+
+    /** Append one event to a huddle's transcript and save it; the record's own log. */
+    function noteHuddleEvent(huddle: HuddleRow, entry: Omit<HuddleTranscriptEntry, "at">): HuddleRow {
+      return store.saveHuddle(huddle.id, { transcript: [...huddle.transcript, { at: now(), ...entry }] }) ?? huddle;
+    }
 
     /** A base URL with no trailing slash, so the comparison matches the voice plugin's. */
     const normalizeBaseUrl = (raw: string): string => raw.trim().replace(/\/+$/u, "");
@@ -8995,15 +9050,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (caller.kind !== "client") throw new Error("a huddle is started from the Stewards page");
         // Reserve the project before the first await, so a click on the board
         // and a click on the home page at the same moment cannot both start.
-        if (startingHuddles.has(projectId)) return { ok: false, sessionId: null, message: "A huddle for this project is already starting." };
+        if (startingHuddles.has(projectId)) return { ok: false, sessionId: null, huddleId: null, message: "A huddle for this project is already starting." };
         startingHuddles.add(projectId);
         try {
           const availability = await huddleAvailability(store.project(projectId).threadId !== null);
-          if (!availability.available) return { ok: false, sessionId: null, message: availability.message ?? "A huddle is not available." };
-          // Supersede any record for this project: the voice plugin does not
-          // tell stewards when an overlay closes, so a stale record must not
-          // lock the project out of a new huddle. The old notes are dropped.
-          for (const [id, huddle] of huddles) if (huddle.projectId === projectId) huddles.delete(id);
+          if (!availability.available) return { ok: false, sessionId: null, huddleId: null, message: availability.message ?? "A huddle is not available." };
           const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
           // The first huddle reads since the last digest rather than since the
           // beginning: a project with a long history would otherwise list every
@@ -9013,30 +9064,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // The briefing goes to OpenAI, so a token pasted into a ticket, an
           // escalation or a note is scrubbed first.
           const instructions = scrubCredentials(buildHuddleInstructions(briefing(projectId, since), name, now(), questions));
+          // A new start supersedes the project's earlier session: the voice
+          // plugin does not tell stewards when an overlay closes, so a stale
+          // session must not answer tool calls and the project's record is its
+          // latest huddle, not a lock. The old row stays for history.
+          for (const [sid, hid] of huddleSessions) if (store.huddle(hid)?.projectId === projectId) huddleSessions.delete(sid);
+          // The record is opened before the voice session, so a tool call that
+          // arrives immediately finds it.
+          const record = store.createHuddle({ id: newId("hud"), projectId, startedAt: now() });
           let opened: { sessionId: string; maxDurationMs: number };
           try {
             opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: HUDDLE_TOOLS, toolHandler: { method: "stewardsHuddleTool" } }, realtimeOpenOutput);
           } catch (error) {
-            return { ok: false, sessionId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
+            // The session never opened; end the empty record so it is not read
+            // back as the project's huddle.
+            store.saveHuddle(record.id, { endedAt: now() });
+            return { ok: false, sessionId: null, huddleId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
           }
-          huddles.set(opened.sessionId, { projectId, startedAt: now(), notes: [], connected: false });
-          return { ok: true, sessionId: opened.sessionId, message: "Huddle started." };
+          huddleSessions.set(opened.sessionId, record.id);
+          return { ok: true, sessionId: opened.sessionId, huddleId: record.id, message: "Huddle started." };
         } finally {
           startingHuddles.delete(projectId);
         }
       },
       async stewardsHuddleTool({ sessionId, name, arguments: rawArgs }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== VOICE_PLUGIN_ID) throw new Error("only the voice-transcription plugin forwards huddle tool calls");
-        const record = huddles.get(sessionId);
-        if (record === undefined) throw new Error("that huddle has ended");
+        const huddleId = huddleSessions.get(sessionId);
+        if (huddleId === undefined) throw new Error("that huddle has ended");
+        let huddle = store.huddle(huddleId);
+        if (huddle === null) throw new Error("that huddle has ended");
         // The first tool call proves the overlay connected and the briefing was
-        // delivered, so that is when "since the last huddle" advances. A
-        // session that never connected leaves it alone and the next huddle
-        // re-reports its window.
-        if (!record.connected) {
-          record.connected = true;
-          store.setLastHuddle(record.projectId, record.startedAt);
-        }
+        // delivered; the record keeps that fact.
+        if (!huddle.connected) huddle = store.saveHuddle(huddle.id, { connected: true }) ?? huddle;
         let args: Record<string, unknown>;
         try {
           const parsed: unknown = JSON.parse(rawArgs.trim() === "" ? "{}" : rawArgs);
@@ -9044,20 +9103,158 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } catch {
           throw new Error("the tool arguments were not valid JSON");
         }
+        // `runHuddleTool` writes only to this in-memory record; the notes it
+        // touches are saved to the durable row afterwards.
+        const huddleProjectId = huddle.projectId;
+        const record: HuddleRecord = { projectId: huddleProjectId, startedAt: huddle.startedAt, notes: [...huddle.notes] as HuddleNote[], connected: huddle.connected };
+        const output = await runHuddleTool(name, args, {
+          projectId: huddleProjectId,
+          now,
+          binding: (key) => store.find(key, huddleProjectId),
+          openEscalations: (bindingId) => store.openEscalations(bindingId),
+          escalation: (id) => store.escalation(id),
+          lessons: (bindingId) => store.allLessons(huddleProjectId).filter((l) => l.bindingId === bindingId),
+          guidance: () => guidanceUnits(huddleProjectId),
+          snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
+          record,
+        });
+        // Persist the note record when a writer touched it, and log the event in
+        // the transcript so the readback has a history.
+        if (name === "take_note" && record.notes.length > huddle.notes.length) {
+          const added = record.notes[record.notes.length - 1]!;
+          huddle = store.saveHuddle(huddle.id, { notes: record.notes as HuddleNoteRow[] }) ?? huddle;
+          huddle = noteHuddleEvent(huddle, { kind: "note", noteId: added.id, text: added.text });
+        } else if (name === "retract_note" && record.notes.length < huddle.notes.length) {
+          const removed = huddle.notes.find((n) => !record.notes.some((r) => r.id === n.id));
+          huddle = store.saveHuddle(huddle.id, { notes: record.notes as HuddleNoteRow[] }) ?? huddle;
+          if (removed !== undefined) huddle = noteHuddleEvent(huddle, { kind: "retract", noteId: removed.id, text: removed.text });
+        }
         // A tool result goes to OpenAI too, so it passes the same scrub.
-        return scrubCredentials(
-          await runHuddleTool(name, args, {
-            projectId: record.projectId,
-            now,
-            binding: (key) => store.find(key, record.projectId),
-            openEscalations: (bindingId) => store.openEscalations(bindingId),
-            escalation: (id) => store.escalation(id),
-            lessons: (bindingId) => store.allLessons(record.projectId).filter((l) => l.bindingId === bindingId),
-            guidance: () => guidanceUnits(record.projectId),
-            snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
-            record,
-          }),
-        );
+        return scrubCredentials(output);
+      },
+      async stewardsHuddleRecord({ projectId }) {
+        // The readback is rendered here from the stored notes, never composed by
+        // the model; the page only displays these lines.
+        const huddle = store.latestHuddle(projectId);
+        if (huddle === null) return { huddle: null };
+        return {
+          huddle: {
+            id: huddle.id,
+            projectId: huddle.projectId,
+            startedAt: huddle.startedAt,
+            endedAt: huddle.endedAt,
+            notes: huddle.notes.map((n) => ({
+              id: n.id,
+              type: n.type,
+              text: n.text,
+              binding: n.binding,
+              escalation: n.escalation,
+              action: n.action,
+              createdAt: n.createdAt,
+              readback: readbackLine(n as HuddleNote),
+              confirmed: huddle.confirmed.includes(n.id),
+            })),
+            confirmed: huddle.confirmed,
+          },
+        };
+      },
+      // The owner confirms one note. Each shape is applied through the path that
+      // already exists: a gate item through the need-action RPC the Approve and
+      // Decline buttons use, per-binding guidance as user guidance, direction and
+      // standing rules as a message to the project steward's thread. Nothing is
+      // applied before its note is confirmed, and a free note is never applied:
+      // it stays context for the project steward.
+      async stewardsHuddleConfirm({ huddleId, noteId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("huddle items are confirmed by the owner, from the Stewards page");
+        const huddle = store.huddle(huddleId);
+        if (huddle === null) return { ok: false, applied: false, message: "That huddle is gone." };
+        const note = huddle.notes.find((n) => n.id === noteId);
+        if (note === undefined) return { ok: false, applied: false, message: "That note is not in this huddle." };
+        if (huddle.confirmed.includes(noteId)) return { ok: true, applied: true, message: "Already confirmed." };
+        const type = note.type as HuddleNoteType;
+        const text = scrubCredentials(note.text);
+        const binding = note.binding === null ? null : store.find(note.binding, huddle.projectId);
+        let applied = false;
+        let message = "Confirmed.";
+
+        if (type === "gate") {
+          if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
+          if (note.action !== "approve" && note.action !== "decline" && note.action !== "merge") return { ok: false, applied: false, message: "A gate note needs an approve, decline or merge action." };
+          const open = store.openNeeds(binding.id);
+          const need =
+            note.action === "merge"
+              ? (open.find((n) => n.kind === "merge") ?? null)
+              : (open.find((n) => n.kind === "approve-spec") ?? open.find((n) => n.kind === "approve-pr") ?? null);
+          if (need === null) return { ok: false, applied: false, message: `No open ${note.action ?? ""} item on ${binding.entityKey}.` };
+          const action = note.action === "decline" ? "decline" : note.action === "merge" ? "merge" : "approve";
+          const result = await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action, note: text }, { experimental_caller: { kind: "client" } });
+          if (!result.ok) return { ok: false, applied: false, message: result.message };
+          applied = true;
+          message = result.message;
+        } else if (type === "guidance") {
+          if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
+          store.addGuidance(binding.id, text, "user");
+          store.note(binding.id, `The owner confirmed huddle guidance: ${text}`);
+          scheduleReconcile(binding.id);
+          applied = true;
+          message = `Guidance saved on ${binding.entityKey}.`;
+        } else if (type === "resolve-escalation") {
+          const escalation = note.escalation === null ? null : store.escalation(note.escalation);
+          if (escalation === null || escalation.status !== "open") return { ok: false, applied: false, message: "That escalation is not open." };
+          const question = store.openQuestions(huddle.projectId).find((q) => q.escalationId === escalation.id);
+          if (question !== undefined) {
+            const result = await rawRpcHandlers.stewardsAnswerQuestion({ questionId: question.id, answer: text }, { experimental_caller: { kind: "client" } });
+            if (!result.ok) return { ok: false, applied: false, message: result.message };
+            message = result.message;
+          } else {
+            store.answerEscalation(escalation.id, text, "user");
+            if (binding !== null) {
+              store.addGuidance(binding.id, text, "user");
+              store.note(binding.id, `Escalation ${escalation.id} resolved from a huddle: ${text}`);
+              scheduleReconcile(binding.id);
+            }
+            await wakeProject(huddle.projectId, "an escalation was resolved in a huddle", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a huddle with: ${JSON.stringify(text)}`] });
+            message = `Escalation ${escalation.id} resolved.`;
+          }
+          applied = true;
+        } else if (type === "direction" || type === "standing-rule") {
+          const label = type === "direction" ? "direction" : "standing rule";
+          const cue = type === "standing-rule" ? " A standing rule is the cue to open the playbook pull request." : "";
+          await wakeProject(huddle.projectId, `the owner's ${label} from a huddle`, { digestDue: false, notes: [`The owner held a huddle and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
+          applied = true;
+          message = `${type === "direction" ? "Direction" : "Standing rule"} sent to the project steward.`;
+        } else {
+          // A free note is context, never an action: it is left unconfirmed for
+          // the project steward's next wake.
+          return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the huddle ends." };
+        }
+
+        store.saveHuddle(huddle.id, { confirmed: [...huddle.confirmed, noteId], transcript: [...huddle.transcript, { at: now(), kind: "confirm", noteId, text }] });
+        return { ok: true, applied, message };
+      },
+      // The owner ends the huddle. That advances "since the last huddle", and
+      // the free notes that were never typed reach the project steward as
+      // context, not instruction, with a line that a huddle was held.
+      async stewardsHuddleEnd({ huddleId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a huddle is ended by the owner, from the Stewards page");
+        let huddle = store.huddle(huddleId);
+        if (huddle === null) return { ok: false, message: "That huddle is gone." };
+        if (huddle.endedAt !== null) return { ok: true, message: "Already ended." };
+        huddle = store.saveHuddle(huddle.id, { endedAt: now() }) ?? huddle;
+        store.setLastHuddle(huddle.projectId, huddle.startedAt);
+        huddle = noteHuddleEvent(huddle, { kind: "end", noteId: null, text: "" });
+        // The project steward's next wake says a huddle was held and what was
+        // said: the items the owner confirmed and the free notes that were only
+        // context. A huddle that said nothing wakes no one.
+        const confirmed = huddle.notes.filter((n) => huddle.confirmed.includes(n.id));
+        const free = huddle.notes.filter((n) => n.type === "free");
+        if (confirmed.length > 0 || free.length > 0) {
+          const lines = ["The owner held a huddle."];
+          if (confirmed.length > 0) lines.push(`What the owner confirmed: ${confirmed.map((n) => readbackLine(n as HuddleNote)).join(" | ")}`);
+          if (free.length > 0) lines.push(`Free notes from it, context and not instructions: ${free.map((n) => JSON.stringify(scrubCredentials(n.text))).join("; ")}`);
+          await wakeProject(huddle.projectId, "the owner held a huddle", { digestDue: false, notes: lines });
+        }
+        return { ok: true, message: "Huddle ended." };
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
