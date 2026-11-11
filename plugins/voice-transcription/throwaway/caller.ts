@@ -16,7 +16,7 @@ export type ThrowawayCallerTransport = {
   open: (config: {
     instructions: string;
     tools: RealtimeTool[];
-    toolHandler: { pluginId: string; method: string } | null;
+    toolHandler: { method: string } | null;
   }) => Promise<{ sessionId: string }>;
   mint: (sessionId: string) => Promise<MintedRealtimeSession>;
   toolCall: (call: {
@@ -49,7 +49,7 @@ export async function runThrowawayCaller(
   const opened = await transport.open({
     instructions: THROWAWAY_INSTRUCTIONS,
     tools: THROWAWAY_TOOLS,
-    toolHandler: { pluginId: "throwaway-caller", method: "echo" },
+    toolHandler: { method: "echo" },
   });
   const minted = await transport.mint(opened.sessionId);
   const tool = await transport.toolCall({

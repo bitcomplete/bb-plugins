@@ -5,6 +5,7 @@ import {
   DEFAULT_REALTIME_MODEL,
   DEFAULT_REALTIME_VOICE,
   REALTIME_CLIENT_SECRET_PATH,
+  REALTIME_INPUT_TRANSCRIPTION_MODEL,
   REALTIME_SECRET_TTL_SECONDS,
   REALTIME_SESSION_MAX_MS,
   isOpenAIBaseUrl,
@@ -96,7 +97,10 @@ describe("realtime policy", () => {
         type: "realtime",
         model: DEFAULT_REALTIME_MODEL,
         instructions: "Say hi.",
-        audio: { output: { voice: DEFAULT_REALTIME_VOICE } },
+        audio: {
+          input: { transcription: { model: REALTIME_INPUT_TRANSCRIPTION_MODEL } },
+          output: { voice: DEFAULT_REALTIME_VOICE },
+        },
         tools: [{ type: "function", name: "echo", description: "Echo the given text." }],
       },
     });
@@ -236,7 +240,7 @@ describe("realtime tool route", () => {
     const opened = (await open(host, {
       instructions: "x",
       tools: [ECHO],
-      toolHandler: { pluginId: "throwaway-caller", method: "echo" },
+      toolHandler: { method: "echo" },
     })) as { sessionId: string };
     await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId }));
 

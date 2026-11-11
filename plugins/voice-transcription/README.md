@@ -46,8 +46,9 @@ and never the audio or the transcript.
 The plugin can also carry a two-way spoken session, for a plugin that wants a
 voice conversation rather than a one-shot transcript. It is **inert unless
 `baseUrl` is OpenAI's own endpoint and a key is set**: the transcription-only
-vendors have no Realtime API, so nothing is registered, no session can be
-opened, and the ordinary transcription above is untouched.
+vendors have no Realtime API, so the routes refuse and the overlay renders
+nothing, no session can be opened, and the ordinary transcription above is
+untouched.
 
 A session has three pieces:
 
@@ -68,8 +69,8 @@ A session has three pieces:
 
 Spend is bounded: the ephemeral secret expires after 60 seconds, one session
 is capped at 20 minutes (the overlay counts down and closes itself, and the
-server refuses a session that outlives the cap), and the session is dropped
-when the overlay closes.
+server refuses tool calls once a session is past the cap), and the session is
+dropped when the overlay closes.
 
 `throwaway/` holds a minimal caller used to prove the surface end to end
 without a second plugin; it is disposable once a real caller exists. The

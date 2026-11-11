@@ -6,6 +6,11 @@
  *
  * Nothing here knows the plugin's standard key; it only ever sees the
  * short-lived ephemeral secret in `MintedRealtimeSession`.
+ *
+ * The session config — instructions, tools, voice and the input-transcription
+ * model that drives the live transcript — is set once, on the server, in the
+ * request that mints the ephemeral secret, so the WebRTC connection inherits
+ * it and the overlay never has to send a `session.update`.
  */
 import type { MintedRealtimeSession } from "./realtime-shared.js";
 
@@ -17,17 +22,27 @@ export type RealtimeClientCallbacks = {
   mint: () => Promise<MintedRealtimeSession>;
   /** Forward one model tool call to the opener; resolves to the tool output string. */
   toolCall: (call: { callId: string; name: string; arguments: string }) => Promise<string>;
-  /** Tell the server the session is over. */
+  /** Tell the server the session is over. Only called by the client that minted it. */
   close: () => Promise<void>;
   onLine: (line: RealtimeLine) => void;
   onStatus: (status: RealtimeStatus, message?: string) => void;
   onSecondsLeft: (seconds: number) => void;
 };
 
-/** OpenAI's WebRTC endpoint, with the session's model selected. */
-export function realtimeWebRtcUrl(model: string): string {
-  return `https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+/**
+ * Thrown by `mint` when the server says another client already took the
+ * session (HTTP 409). The overlay that loses the race drops out quietly
+ * without ending the winner's session.
+ */
+export class RealtimeSessionTakenError extends Error {
+  constructor() {
+    super("Another client already took this voice session");
+    this.name = "RealtimeSessionTakenError";
+  }
 }
+
+/** OpenAI's GA WebRTC endpoint; the ephemeral secret's session config picks the model. */
+export const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
 export class RealtimeSessionClient {
   private readonly callbacks: RealtimeClientCallbacks;
@@ -38,6 +53,7 @@ export class RealtimeSessionClient {
   private timer: number | null = null;
   private deadline = 0;
   private stopped = false;
+  private ownsSession = false;
   private assistant = "";
 
   constructor(callbacks: RealtimeClientCallbacks) {
@@ -48,6 +64,15 @@ export class RealtimeSessionClient {
     try {
       this.callbacks.onStatus("connecting");
       const minted = await this.callbacks.mint();
+      // The mint succeeded, so the session exists on the server; from here on
+      // this client owns it and must end it, even if it was stopped while the
+      // secret was being minted.
+      this.ownsSession = true;
+      if (this.stopped) {
+        await this.endSession();
+        return;
+      }
+
       const pc = new RTCPeerConnection();
       this.pc = pc;
       const audio = document.createElement("audio");
@@ -63,19 +88,24 @@ export class RealtimeSessionClient {
           void audio.play().catch(() => {});
         }
       });
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (this.stopped) {
+        this.stopStream(stream);
+        return;
+      }
       this.stream = stream;
       for (const track of stream.getAudioTracks()) pc.addTrack(track, stream);
       const channel = pc.createDataChannel("oai-events");
       this.channel = channel;
       channel.addEventListener("message", (event) => this.onMessage(event.data));
-      channel.addEventListener("open", () => {
-        this.sendSessionUpdate(minted);
-        this.callbacks.onStatus("live");
-      });
+      channel.addEventListener("open", () => this.callbacks.onStatus("live"));
+
       const offer = await pc.createOffer();
+      if (this.stopped) return;
       await pc.setLocalDescription(offer);
-      const answer = await fetch(realtimeWebRtcUrl(minted.model), {
+      if (this.stopped) return;
+      const answer = await fetch(REALTIME_CALLS_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${minted.value}`,
@@ -83,6 +113,7 @@ export class RealtimeSessionClient {
         },
         body: offer.sdp ?? "",
       });
+      if (this.stopped) return;
       if (!answer.ok) {
         const detail = await answer.text().catch(() => "");
         throw new Error(
@@ -90,8 +121,23 @@ export class RealtimeSessionClient {
         );
       }
       await pc.setRemoteDescription({ type: "answer", sdp: await answer.text() });
+      if (this.stopped) return;
       this.startClock(minted.maxDurationMs);
     } catch (error) {
+      if (error instanceof RealtimeSessionTakenError) {
+        // Another client won the race for this session. This overlay goes away
+        // without ending the winner's session.
+        this.stopped = true;
+        this.teardown();
+        this.callbacks.onStatus("closed");
+        return;
+      }
+      // A stop can race an in-flight WebRTC step and make it reject; that is a
+      // teardown, not an error to show.
+      if (this.stopped) {
+        this.teardown();
+        return;
+      }
       this.callbacks.onStatus("error", error instanceof Error ? error.message : String(error));
       await this.stop();
     }
@@ -105,6 +151,13 @@ export class RealtimeSessionClient {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    this.teardown();
+    await this.endSession();
+    this.callbacks.onStatus("closed");
+  }
+
+  /** Close the resources this client opened. Idempotent. */
+  private teardown(): void {
     if (this.timer !== null) {
       window.clearInterval(this.timer);
       this.timer = null;
@@ -114,42 +167,41 @@ export class RealtimeSessionClient {
     } catch {
       // already closed
     }
+    this.channel = null;
     try {
       this.pc?.close();
     } catch {
       // already closed
     }
-    for (const track of this.stream?.getTracks() ?? []) track.stop();
+    this.pc = null;
+    if (this.stream !== null) {
+      this.stopStream(this.stream);
+      this.stream = null;
+    }
     if (this.audio !== null) {
       this.audio.srcObject = null;
       this.audio.remove();
+      this.audio = null;
     }
+  }
+
+  private stopStream(stream: MediaStream): void {
+    for (const track of stream.getTracks()) track.stop();
+  }
+
+  /** End the server session, but only once, and only if this client minted it. */
+  private async endSession(): Promise<void> {
+    if (!this.ownsSession) return;
+    this.ownsSession = false;
     try {
       await this.callbacks.close();
     } catch {
       // the session is ending anyway
     }
-    this.callbacks.onStatus("closed");
   }
 
   private send(payload: unknown): void {
     if (this.channel?.readyState === "open") this.channel.send(JSON.stringify(payload));
-  }
-
-  private sendSessionUpdate(minted: MintedRealtimeSession): void {
-    this.send({
-      type: "session.update",
-      session: {
-        instructions: minted.instructions,
-        tools: minted.tools.map((tool) => ({
-          type: "function",
-          name: tool.name,
-          ...(tool.description !== undefined ? { description: tool.description } : {}),
-          ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {}),
-        })),
-        audio: { output: { voice: minted.voice } },
-      },
-    });
   }
 
   private startClock(maxMs: number): void {

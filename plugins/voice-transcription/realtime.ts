@@ -18,6 +18,12 @@ import type { RealtimeSessionConfig, RealtimeTool } from "./realtime-shared.js";
 export const DEFAULT_REALTIME_MODEL = "gpt-realtime";
 /** The default spoken voice for model replies. */
 export const DEFAULT_REALTIME_VOICE = "alloy";
+/**
+ * The model that transcribes the user's speech inside a Realtime session, so
+ * the overlay can show the live transcript. Separate from the batch
+ * transcription model above: Realtime has its own input-transcription model.
+ */
+export const REALTIME_INPUT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 /** OpenAI's endpoint for minting an ephemeral Realtime client secret. */
 export const REALTIME_CLIENT_SECRET_PATH = "/realtime/client_secrets";
 /**
@@ -114,7 +120,10 @@ export function realtimeClientSecretBody(
         ...(tool.description !== undefined ? { description: tool.description } : {}),
         ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {}),
       })),
-      audio: { output: { voice: realtimeVoice(config) } },
+      audio: {
+        input: { transcription: { model: REALTIME_INPUT_TRANSCRIPTION_MODEL } },
+        output: { voice: realtimeVoice(config) },
+      },
     },
   };
 }

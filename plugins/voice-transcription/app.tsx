@@ -19,9 +19,21 @@ import {
 } from "./realtime-shared.js";
 import {
   RealtimeSessionClient,
+  RealtimeSessionTakenError,
   type RealtimeLine,
   type RealtimeStatus,
 } from "./realtime-client.js";
+
+/** A failed route call, carrying the HTTP status so the overlay can tell a lost race from an error. */
+class RouteError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RouteError";
+  }
+}
 
 /** POST JSON to one of this plugin's own routes and unwrap the error envelope. */
 async function callRoute(path: string, body: unknown): Promise<unknown> {
@@ -39,7 +51,7 @@ async function callRoute(path: string, body: unknown): Promise<unknown> {
       typeof (payload as { error: unknown }).error === "string"
         ? (payload as { error: string }).error
         : `HTTP ${response.status}`;
-    throw new Error(message);
+    throw new RouteError(response.status, message);
   }
   return payload;
 }
@@ -67,8 +79,18 @@ function RealtimeVoiceOverlay() {
     setSecondsLeft(null);
     setMuted(false);
     const client = new RealtimeSessionClient({
-      mint: async () =>
-        (await callRoute(REALTIME_MINT_PATH, { sessionId })) as MintedRealtimeSession,
+      mint: async () => {
+        try {
+          return (await callRoute(REALTIME_MINT_PATH, { sessionId })) as MintedRealtimeSession;
+        } catch (error) {
+          // 409 means another client already minted this session; drop out
+          // quietly rather than ending the winner's session.
+          if (error instanceof RouteError && error.status === 409) {
+            throw new RealtimeSessionTakenError();
+          }
+          throw error;
+        }
+      },
       toolCall: async (tool) => {
         const result = (await callRoute(REALTIME_TOOL_PATH, {
           sessionId,

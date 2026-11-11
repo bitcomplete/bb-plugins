@@ -83,7 +83,7 @@ export const rpcContract = defineRpcContract({
   "realtime.open": {
     input: realtimeSessionConfigSchema.extend({
       toolHandler: z
-        .object({ pluginId: z.string().trim().min(1), method: z.string().trim().min(1) })
+        .object({ method: z.string().trim().min(1) })
         .nullable()
         .default(null),
     }),
@@ -389,7 +389,13 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const session: PendingRealtimeSession = {
           id: crypto.randomUUID(),
           config,
-          toolHandler: input.toolHandler,
+          // The handler is the caller's own RPC method, never one it names for
+          // another plugin: the model's tool calls reach the opener, and only
+          // the opener, under its own identity.
+          toolHandler:
+            input.toolHandler === null
+              ? null
+              : { pluginId: caller.pluginId, method: input.toolHandler.method },
           createdAt: Date.now(),
           startedAt: null,
           maxMs: realtimeMaxMs(config),
