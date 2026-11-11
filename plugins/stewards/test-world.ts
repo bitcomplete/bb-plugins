@@ -228,6 +228,18 @@ export function world() {
   };
   let n = 0;
 
+  // BB-300: the voice-transcription plugin as the huddle sees it. Tests set
+  // the endpoint, the AI-service status and a refusal; the default is a ready
+  // OpenAI endpoint, so a huddle can start.
+  const realtimeOpens: Array<{ input: Record<string, unknown>; sessionId: string }> = [];
+  let voiceBaseUrl = "https://api.openai.com/v1";
+  let voiceServicePresent = true;
+  let voiceServiceReady = true;
+  let voiceServiceMessage = "Set the API key in Settings → Plugins → Voice transcription";
+  let voiceSettingsThrow: string | null = null;
+  let voiceRealtimeRefusal: string | null = null;
+  let realtimeSessionSeq = 0;
+
   const callRpc = async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
     const input = (args.input ?? {}) as Record<string, unknown>;
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
@@ -332,12 +344,31 @@ export function world() {
     else if (args.method === "sourceCompare") {
       out = { status: sourceCompares.get(`${String(input.repo).toLowerCase()} ${String(input.base)} ${String(input.head)}`) ?? null, error: null };
     }
+    else if (args.pluginId === "voice-transcription" && args.method === "realtime.open") {
+      if (voiceRealtimeRefusal !== null) throw new Error(voiceRealtimeRefusal);
+      const sessionId = `sess_${++realtimeSessionSeq}`;
+      realtimeOpens.push({ input, sessionId });
+      out = { sessionId, maxDurationMs: 1_200_000 };
+    }
     else throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
     return args.outputSchema.parse(out);
   };
 
   const sdk = {
-    plugins: { callRpc },
+    plugins: {
+      callRpc,
+      // BB-300: the huddle reads the voice plugin's non-secret settings for the
+      // endpoint, and its AI-service status for the key.
+      getSettings: async (args: { pluginId: string }) => {
+        if (voiceSettingsThrow !== null) throw new Error(voiceSettingsThrow);
+        if (args.pluginId !== "voice-transcription") throw new Error(`no plugin ${args.pluginId}`);
+        return {
+          ok: true,
+          schema: { baseUrl: { type: "string", label: "Endpoint base URL", default: "https://api.openai.com/v1" }, apiKey: { type: "string", label: "API key", secret: true } },
+          values: { baseUrl: voiceBaseUrl },
+        };
+      },
+    },
     projects: {
       list: async () => projectList.map((p) => ({ ...p })),
       // A checkout on a machine that is off (the default source) and one on a machine that is on.
@@ -524,6 +555,22 @@ export function world() {
       },
     },
     system: {
+      // BB-300: the voice service's readiness for the huddle button.
+      aiServices: async () => ({
+        selections: {},
+        services: voiceServicePresent
+          ? [
+              {
+                automaticRank: null,
+                displayName: "OpenAI-compatible",
+                id: "openai-compatible",
+                pluginId: "voice-transcription",
+                status: voiceServiceReady ? { ready: true } : { ready: false, message: voiceServiceMessage },
+                tasks: ["voice"],
+              },
+            ]
+          : [],
+      }),
       uiPreferences: {
         list: async () => ({ preferences: Object.fromEntries([...uiPreferences].map(([key, entry]) => [key, { ...entry }])) }),
         set: async (args: { key: string; value: unknown; expectedRevision: number }) => {
@@ -538,7 +585,7 @@ export function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, realtimeOpens, setVoiceBaseUrl: (value: string) => { voiceBaseUrl = value; }, setVoiceServicePresent: (value: boolean) => { voiceServicePresent = value; }, setVoiceServiceReady: (value: boolean, message?: string) => { voiceServiceReady = value; if (message !== undefined) voiceServiceMessage = message; }, setVoiceSettingsThrow: (value: string | null) => { voiceSettingsThrow = value; }, setVoiceRealtimeRefusal: (value: string | null) => { voiceRealtimeRefusal = value; }, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set") {

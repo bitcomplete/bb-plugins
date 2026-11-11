@@ -14655,3 +14655,113 @@ describe("bb stewards divergences (BB-293)", () => {
   });
 });
 
+
+// BB-300 slice 3: the huddle. The Stewards page starts one spoken stand-up per
+// project; the server builds the briefing's instructions, opens the voice
+// plugin's overlay with the fixed tool set, and records notes in memory. No
+// test here calls OpenAI: the voice plugin is a stub in `test-world`.
+describe("the huddle (BB-300)", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  const voice = { experimental_caller: { kind: "plugin", pluginId: "voice-transcription" } } as const;
+
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward };
+  }
+
+  it("reports a huddle as available on the board when the voice plugin is ready", async () => {
+    const t = await adopted();
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { huddle?: { available: boolean; message: string | null } } };
+    expect(board.board.huddle).toEqual({ available: true, message: null });
+  });
+
+  it("reports why a huddle is unavailable, and starts none, off OpenAI or without a key", async () => {
+    const t = await adopted();
+    t.setVoiceBaseUrl("https://api.groq.com/openai/v1");
+    let board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { huddle?: { available: boolean; message: string | null } } };
+    expect(board.board.huddle?.available).toBe(false);
+    expect(board.board.huddle?.message).toMatch(/OpenAI/u);
+
+    t.setVoiceBaseUrl("https://api.openai.com/v1");
+    t.setVoiceServiceReady(false, "Set the API key in Settings → Plugins → Voice transcription");
+    board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { huddle?: { available: boolean; message: string | null } } };
+    expect(board.board.huddle?.available).toBe(false);
+    expect(board.board.huddle?.message).toMatch(/API key/u);
+
+    const refused = await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client);
+    expect(refused).toMatchObject({ ok: false, sessionId: null });
+    expect(t.realtimeOpens).toHaveLength(0);
+  });
+
+  it("reports an absent voice plugin rather than opening a session", async () => {
+    const t = await adopted();
+    t.setVoiceSettingsThrow("no plugin voice-transcription");
+    const result = await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client);
+    expect(result).toMatchObject({ ok: false, sessionId: null });
+    expect((result as { message: string }).message).toMatch(/voice-transcription/u);
+    expect(t.realtimeOpens).toHaveLength(0);
+  });
+
+  it("starts a huddle with the ranked briefing and the fixed tool set, and records since", async () => {
+    const t = await adopted();
+    await t.tool("steward_update", { ask: { question: "Should I file an a11y ticket?" } }, t.project);
+    await t.flush();
+
+    const before = t.now();
+    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string | null; message: string };
+    expect(started.ok).toBe(true);
+    expect(started.sessionId).not.toBeNull();
+    expect(t.realtimeOpens).toHaveLength(1);
+    const open = t.realtimeOpens[0]!;
+    expect(open.input).toMatchObject({ toolHandler: { method: "stewardsHuddleTool" } });
+    const tools = open.input.tools as Array<{ name: string }>;
+    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "take_note", "retract_note"]);
+    expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
+    expect(String(open.input.instructions)).toMatch(/Should I file an a11y ticket\?/u);
+    // The window starts now, so the next huddle reads since this one.
+    expect(t.hooks.store.lastHuddle("p1")).toBeGreaterThanOrEqual(before);
+    // One huddle per project: a second start is refused while the first runs.
+    const second = await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client);
+    expect(second).toMatchObject({ ok: false });
+    expect(t.realtimeOpens).toHaveLength(1);
+  });
+
+  it("forwards a tool call to the huddle's readers and records notes only in the huddle", async () => {
+    const t = await adopted();
+    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
+    const before = JSON.stringify(t.hooks.store.find("ENG-12"));
+
+    const status = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
+    expect(status).toContain("ENG-12");
+
+    const taken = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "guidance", text: "Keep the retry small", binding: "ENG-12" }) }, voice)) as string;
+    expect(taken).toContain("Keep the retry small");
+    // The note is in the huddle, not on the binding: the store row is untouched.
+    expect(JSON.stringify(t.hooks.store.find("ENG-12"))).toBe(before);
+
+    const retracted = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "retract_note", arguments: JSON.stringify({ id: "note_nope" }) }, voice)) as string;
+    expect(retracted).toContain("No note");
+  });
+
+  it("refuses a tool call from anyone but the voice plugin, and an unknown tool", async () => {
+    const t = await adopted();
+    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
+    await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "steward_status", arguments: "{}" }, client)).rejects.toThrow(/voice-transcription/u);
+    await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "merge_everything", arguments: "{}" }, voice)).rejects.toThrow(/No huddle tool/u);
+  });
+
+  it("exposes the homepage line's readiness on its own call, and needs a project steward", async () => {
+    const t = await adopted();
+    const ready = await t.harness.callRpc("stewardsHuddle", { projectId: "p1" });
+    expect(ready).toEqual({ available: true, message: null });
+    t.setVoiceServiceReady(false, "no key");
+    expect(await t.harness.callRpc("stewardsHuddle", { projectId: "p1" })).toEqual({ available: false, message: "no key" });
+
+    const empty = await setup();
+    expect(await empty.harness.callRpc("stewardsHuddle", { projectId: "p1" })).toEqual({ available: false, message: "No project steward yet; a huddle needs one." });
+  });
+});
