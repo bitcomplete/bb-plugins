@@ -9,7 +9,10 @@ import {
   HUDDLE_TOOLS,
   HUDDLE_WRITE_TOOLS,
   buildHuddleInstructions,
+  readbackLine,
+  readbackLines,
   runHuddleTool,
+  type HuddleNote,
   type HuddleRecord,
   type HuddleToolContext,
 } from "./huddle.js";
@@ -83,6 +86,8 @@ function context(over: Partial<HuddleToolContext> = {}): HuddleToolContext {
     lessons: () => [lesson()],
     guidance: async () => [unit()],
     snapshot: async () => issue(),
+    needs: () => [],
+    confirmed: [],
     record,
     ...over,
   };
@@ -173,6 +178,26 @@ describe("runHuddleTool (BB-300)", () => {
   it("reports a note that is not there rather than failing", async () => {
     expect(await runHuddleTool("retract_note", { id: "note_nope" }, context())).toContain("No note");
   });
+
+  it("refuses to retract a note the owner already confirmed", async () => {
+    const ctx = context({ confirmed: ["note_1"] });
+    ctx.record.notes.push({ id: "note_1", type: "guidance", text: "Keep it", binding: "ENG-12", escalation: null, action: null, need: null, needLabel: null, createdAt: 1 });
+    const out = await runHuddleTool("retract_note", { id: "note_1" }, ctx);
+    expect(out).toContain("already been applied");
+    expect(ctx.record.notes).toHaveLength(1);
+  });
+
+  it("binds a gate note to one open need, and refuses an ambiguous one", async () => {
+    const first = { id: "need_1", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", url: "https://github.com/acme/web/pull/7" } as never;
+    const second = { id: "need_2", kind: "approve-pr", what: "Approve acme/web#8 on GitHub", url: "https://github.com/acme/web/pull/8" } as never;
+    const one = context({ needs: () => [first] });
+    expect(await runHuddleTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve" }, one)).toContain("Looks good");
+    expect(one.record.notes[0]).toMatchObject({ need: "need_1", needLabel: "Approve acme/web#7 on GitHub" });
+    await expect(runHuddleTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve" }, context({ needs: () => [first, second] }))).rejects.toThrow(/several open gate items/u);
+    const named = context({ needs: () => [first, second] });
+    await runHuddleTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "need_2" }, named);
+    expect(named.record.notes[0]).toMatchObject({ need: "need_2" });
+  });
 });
 
 const briefing = (over: Partial<Briefing> = {}): Briefing => ({
@@ -185,6 +210,25 @@ const briefing = (over: Partial<Briefing> = {}): Briefing => ({
   done: { moved: [binding({ entityKey: "ENG-17" })], ended: [binding({ entityKey: "ENG-18", endReason: "merged" })], answered: [] },
   assumptions: [{ assumption: { text: "the schema is stable" } as never, binding: binding({ entityKey: "ENG-19" }) }],
   ...over,
+});
+
+describe("the mechanical readback (BB-300 slice 4)", () => {
+  const note = (over: Partial<HuddleNote> = {}): HuddleNote => ({ id: "note_1", type: "free", text: "Something", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: 1, ...over });
+
+  it("renders one line per typed shape from the stored note, not the model", () => {
+    expect(readbackLine(note({ type: "resolve-escalation", escalation: "esc_1", text: "Merge it" }))).toBe("Resolve escalation esc_1 with: Merge it");
+    expect(readbackLine(note({ type: "gate", binding: "ENG-12", action: "approve", text: "Looks good" }))).toBe("Approve ENG-12: Looks good");
+    expect(readbackLine(note({ type: "gate", binding: "ENG-12", action: "decline", text: "Not yet" }))).toBe("Decline ENG-12: Not yet");
+    expect(readbackLine(note({ type: "gate", binding: "ENG-12", action: "merge", text: "Ship it" }))).toBe("Merge ENG-12: Ship it");
+    expect(readbackLine(note({ type: "guidance", binding: "ENG-12", text: "Keep it small" }))).toBe("Guidance for ENG-12: Keep it small");
+    expect(readbackLine(note({ type: "direction", text: "Prioritise the migration" }))).toBe("Project direction: Prioritise the migration");
+    expect(readbackLine(note({ type: "standing-rule", text: "Never merge red checks" }))).toBe("Standing rule: Never merge red checks");
+    expect(readbackLine(note({ type: "free", text: "A thought" }))).toBe("Note: A thought");
+  });
+
+  it("keeps the order the notes were taken in", () => {
+    expect(readbackLines([note({ id: "a", type: "direction", text: "One" }), note({ id: "b", type: "free", text: "Two" })])).toEqual(["Project direction: One", "Note: Two"]);
+  });
 });
 
 describe("buildHuddleInstructions (BB-300)", () => {

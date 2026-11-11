@@ -11,7 +11,7 @@
 // escalation, a merge or a resolution. The page applies confirmed notes in a
 // later slice (the fan-out), through the paths it already uses.
 import type { Briefing } from "./nightly.js";
-import type { Binding, Escalation, Lesson } from "./store.js";
+import type { Binding, Escalation, Lesson, Need } from "./store.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
 
@@ -38,6 +38,14 @@ export type HuddleNote = {
   escalation: string | null;
   /** The gate action, for a `gate` note. */
   action: "approve" | "decline" | "merge" | null;
+  /**
+   * The one need a `gate` note acts on (BB-300 slice 4). Bound when the note is
+   * taken, so a binding with several open gate items never applies the wrong
+   * one, and confirmed only while that need is still open.
+   */
+  need: string | null;
+  /** The bound need's own description, for the readback line. */
+  needLabel: string | null;
   createdAt: number;
 };
 
@@ -127,6 +135,7 @@ export const HUDDLE_TOOLS: HuddleTool[] = [
         binding: stringParam("The ticket or pull-request key a gate or guidance note is about."),
         escalationId: stringParam("The escalation id a resolve-escalation note answers."),
         action: { type: "string", enum: ["approve", "decline", "merge"], description: "For a gate note: the action the owner wants taken." },
+        need: stringParam("For a gate note: the need id or the pull request URL of the exact item to act on. Required when the binding has more than one open item of that kind."),
       },
       required: ["type", "text"],
     },
@@ -161,6 +170,10 @@ export type HuddleToolContext = {
   guidance: () => Promise<GuidanceUnit[]>;
   /** The entity snapshot for a binding, read fresh when the source answers. */
   snapshot: (binding: Binding) => Promise<EntitySnapshot | null>;
+  /** A binding's open "needs you" items, so a gate note binds to exactly one (BB-300 slice 4). */
+  needs: (bindingId: string) => Need[];
+  /** The note ids the owner has already confirmed; a confirmed note cannot be retracted. */
+  confirmed: readonly string[];
   /** The huddle's note record. Only `take_note` and `retract_note` touch it. */
   record: HuddleRecord;
 };
@@ -174,6 +187,37 @@ const NOTE_LABEL: Record<HuddleNoteType, string> = {
   "standing-rule": "a standing rule",
   free: "a note",
 };
+
+/**
+ * BB-300 slice 4: one typed note as a mechanical readback line. The page
+ * renders these from the stored notes; the model only reads them aloud, it
+ * does not compose them. A free note reads back as a plain note so it is never
+ * mistaken for a typed action item.
+ */
+export function readbackLine(note: HuddleNote): string {
+  const where = note.binding === null ? "" : ` ${note.binding}`;
+  switch (note.type) {
+    case "resolve-escalation":
+      return `Resolve escalation ${note.escalation ?? "(none)"} with: ${note.text}`;
+    case "gate": {
+      const action = note.action === "merge" ? "Merge" : note.action === "decline" ? "Decline" : "Approve";
+      return `${action}${where}${note.needLabel === null ? "" : ` (${note.needLabel})`}: ${note.text}`;
+    }
+    case "guidance":
+      return `Guidance for${where}: ${note.text}`;
+    case "direction":
+      return `Project direction: ${note.text}`;
+    case "standing-rule":
+      return `Standing rule: ${note.text}`;
+    default:
+      return `Note: ${note.text}`;
+  }
+}
+
+/** The readback lines for a record's notes, in the order they were taken. */
+export function readbackLines(notes: readonly HuddleNote[]): string[] {
+  return notes.map(readbackLine);
+}
 
 function requireString(args: Record<string, unknown>, field: string): string {
   const value = args[field];
@@ -269,6 +313,29 @@ async function playbookTool(ctx: HuddleToolContext, args: Record<string, unknown
     .join("\n\n");
 }
 
+/** The gate kinds a note's action applies to, so a gate note binds to one open need. */
+function gateKinds(action: string | null): string[] {
+  if (action === "merge") return ["merge"];
+  return ["approve-spec", "approve-pr"];
+}
+
+/**
+ * Resolve the one open need a gate note acts on. The caller may name it by id,
+ * URL or description; otherwise it must be unambiguous. Throws with the
+ * candidates when it is not, so the model can ask the owner which one.
+ */
+function gateNeed(ctx: HuddleToolContext, binding: Binding, action: string | null, wanted: string | null): Need {
+  const candidates = ctx.needs(binding.id).filter((n) => gateKinds(action).includes(n.kind));
+  if (candidates.length === 0) throw new Error(`No open ${action ?? "gate"} item on ${binding.entityKey}`);
+  if (wanted !== null) {
+    const match = candidates.find((n) => n.id === wanted || n.url === wanted || n.what === wanted);
+    if (match === undefined) throw new Error(`No open gate item on ${binding.entityKey} matches ${JSON.stringify(wanted)}`);
+    return match;
+  }
+  if (candidates.length > 1) throw new Error(`${binding.entityKey} has several open gate items; name the exact one: ${candidates.map((n) => `${n.id} (${n.what})`).join(", ")}`);
+  return candidates[0]!;
+}
+
 /** Append a typed or free note to the record; the only write in the read tool set. */
 function takeNote(ctx: HuddleToolContext, args: Record<string, unknown>): string {
   const type = requireString(args, "type");
@@ -276,22 +343,38 @@ function takeNote(ctx: HuddleToolContext, args: Record<string, unknown>): string
   const text = requireString(args, "text");
   const action = optionalString(args, "action");
   if (action !== null && !["approve", "decline", "merge"].includes(action)) throw new Error("action must be approve, decline or merge");
+  const bindingKey = optionalString(args, "binding");
+  // A gate note is bound to exactly one open need when it is taken, so a
+  // binding with several open items can never apply the wrong one later.
+  let need: string | null = null;
+  let needLabel: string | null = null;
+  if (type === "gate") {
+    if (bindingKey === null) throw new Error("a gate note needs a binding");
+    const binding = ctx.binding(bindingKey);
+    if (binding === null) throw new Error(`No steward for ${bindingKey}`);
+    const item = gateNeed(ctx, binding, action, optionalString(args, "need"));
+    need = item.id;
+    needLabel = item.what;
+  }
   const note: HuddleNote = {
     id: `note_${crypto.randomUUID()}`,
     type: type as HuddleNoteType,
     text,
-    binding: optionalString(args, "binding"),
+    binding: bindingKey,
     escalation: optionalString(args, "escalationId"),
     action: action as HuddleNote["action"],
+    need,
+    needLabel,
     createdAt: ctx.now(),
   };
   ctx.record.notes.push(note);
   return `Noted (${NOTE_LABEL[note.type]}, ${note.id}): ${note.text}`;
 }
 
-/** Remove a note from the record; the second and last write. */
+/** Remove a note from the record; the second and last write. A confirmed note stays. */
 function retractNote(ctx: HuddleToolContext, args: Record<string, unknown>): string {
   const id = requireString(args, "id");
+  if (ctx.confirmed.includes(id)) return `Note ${id} has already been applied and cannot be retracted.`;
   const index = ctx.record.notes.findIndex((n) => n.id === id);
   if (index === -1) return `No note ${id} in this huddle.`;
   const [removed] = ctx.record.notes.splice(index, 1);

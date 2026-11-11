@@ -670,7 +670,27 @@ export const ASSESSMENT_MIGRATIONS = [
 // with the live work. A new index, so nothing existing is altered.
 export const ENDED_READ_MIGRATIONS = [`CREATE INDEX IF NOT EXISTS bindings_project_ended ON bindings (project_id, ended_at DESC)`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS];
+// BB-300 slice 4: the durable huddle record. One row per huddle; a project
+// holds one at a time and `latestHuddle` is the project's record. `transcript`
+// is the ordered event log (notes taken and retracted, items confirmed, the
+// end), `notes` the model's typed and free notes, and `confirmed` the note ids
+// the owner has confirmed one by one. A new table, so nothing existing is
+// altered and a store from before this step behaves exactly as before.
+export const HUDDLE_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS huddles (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     started_at INTEGER NOT NULL,
+     ended_at INTEGER,
+     connected INTEGER NOT NULL DEFAULT 0,
+     transcript TEXT NOT NULL DEFAULT '[]',
+     notes TEXT NOT NULL DEFAULT '[]',
+     confirmed TEXT NOT NULL DEFAULT '[]'
+   )`,
+  `CREATE INDEX IF NOT EXISTS huddles_project_started ON huddles (project_id, started_at DESC)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1263,6 +1283,52 @@ export function needChoices(n: Pick<Need, "data">): string[] {
 }
 
 /**
+ * BB-300 slice 4: one note in a durable huddle record. Structurally the
+ * `HuddleNote` the huddle tools take; kept here so the store owns the row
+ * shape and `huddle.ts` can import it without a runtime cycle.
+ */
+export type HuddleNoteRow = {
+  id: string;
+  type: string;
+  /** The note in the owner's words. */
+  text: string;
+  /** The binding key the note is about, for a gate item or per-binding guidance. */
+  binding: string | null;
+  /** The escalation id the note resolves, for `resolve-escalation`. */
+  escalation: string | null;
+  /** The gate action, for a `gate` note. */
+  action: string | null;
+  /** The one open need a `gate` note is bound to. */
+  need: string | null;
+  /** The bound need's own description, for the readback. */
+  needLabel: string | null;
+  createdAt: number;
+};
+
+/** One event in a huddle's transcript: a note taken or retracted, an item confirmed, the end. */
+export type HuddleTranscriptEntry = {
+  at: number;
+  kind: "note" | "retract" | "confirm" | "end";
+  noteId: string | null;
+  /** The words carried, for a note and its confirmation; empty for a retract and the end. */
+  text: string;
+};
+
+/** A durable huddle record (BB-300 slice 4): the session, its notes and what the owner confirmed. */
+export type HuddleRow = {
+  id: string;
+  projectId: string;
+  startedAt: number;
+  endedAt: number | null;
+  /** True once the overlay connected and the model called a tool. */
+  connected: boolean;
+  transcript: HuddleTranscriptEntry[];
+  notes: HuddleNoteRow[];
+  /** The ids of the notes the owner confirmed one by one; nothing else is applied. */
+  confirmed: string[];
+};
+
+/**
  * A recorded assumption (BB-251): a question the guidance does not settle that
  * a steward proceeds under rather than asking, so it is visible instead of
  * silent and blocks nothing. It is not a user item: no need, escalation or
@@ -1650,6 +1716,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const insertDivergenceStmt = lazy<[string, string, string, string, string, string, number, number], unknown>(
     "INSERT INTO assessment_divergences (id, binding_id, surface, old, new, inputs, first_seen_at, last_seen_at, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1) ON CONFLICT (binding_id, surface, old, new) DO UPDATE SET last_seen_at = excluded.last_seen_at, inputs = excluded.inputs, count = count + 1",
   );
+  // BB-300 slice 4: the durable huddle record. One row per huddle, read by id
+  // for a session and by project for the readback and the next wake. Prepared
+  // lazily, like the assessment statements: a legacy store opened without the
+  // migration must still start (migrations.test.ts).
+  const insertHuddleStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO huddles (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed)");
+  const getHuddleStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM huddles WHERE id = ?");
+  const latestHuddleStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM huddles WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
+  const updateHuddleStmt = lazy<[Record<string, unknown>], unknown>("UPDATE huddles SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed WHERE id = @id");
   const divergencesAllStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessment_divergences ORDER BY last_seen_at DESC, surface");
   const divergencesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? ORDER BY last_seen_at DESC, surface");
   const divergencesBySurfaceStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE surface = ? ORDER BY last_seen_at DESC, binding_id");
@@ -1874,6 +1948,28 @@ export function createStore(db: Database.Database, now: () => number, options: S
     gate: parseJson(r.gate),
     worker: parseJson(r.worker),
     liveness: parseJson(r.liveness),
+  });
+  const huddleNoteRowSchema = z.object({
+    id: z.string(),
+    type: z.string(),
+    text: z.string(),
+    binding: z.string().nullable().default(null),
+    escalation: z.string().nullable().default(null),
+    action: z.string().nullable().default(null),
+    need: z.string().nullable().default(null),
+    needLabel: z.string().nullable().default(null),
+    createdAt: z.number(),
+  });
+  const huddleTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string() });
+  const toHuddle = (r: Record<string, unknown>): HuddleRow => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    startedAt: Number(r.started_at),
+    endedAt: r.ended_at === null || r.ended_at === undefined ? null : Number(r.ended_at),
+    connected: Number(r.connected) !== 0,
+    transcript: json(z.array(huddleTranscriptSchema), r.transcript === null || r.transcript === undefined ? null : String(r.transcript), []),
+    notes: json(z.array(huddleNoteRowSchema), r.notes === null || r.notes === undefined ? null : String(r.notes), []),
+    confirmed: json(z.array(z.string()), r.confirmed === null || r.confirmed === undefined ? null : String(r.confirmed), []),
   });
   const toDivergenceRow = (r: Record<string, unknown>): DivergenceRow => ({
     id: String(r.id),
@@ -3092,6 +3188,42 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Record when a project last held a huddle (BB-300). */
     setLastHuddle(projectId: string, at: number): void {
       db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`stewards:last-huddle:${projectId}`, String(at));
+    },
+
+    // BB-300 slice 4: the durable huddle record. The server opens one when a
+    // huddle starts, saves the model's notes as tools take and retract them,
+    // confirms each item the owner confirms, and reads it back for the page and
+    // the project steward's next wake. The record is the only thing a huddle
+    // writes; nothing here acts on a binding, a need, an escalation or a merge.
+    /** Open a huddle record and return it. */
+    createHuddle(fields: { id: string; projectId: string; startedAt: number }): HuddleRow {
+      insertHuddleStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]" });
+      return toHuddle(getHuddleStmt().get(fields.id)!);
+    },
+    /** One huddle by id, or null. */
+    huddle(id: string): HuddleRow | null {
+      const r = getHuddleStmt().get(id);
+      return r === undefined ? null : toHuddle(r);
+    },
+    /** A project's latest huddle, open or ended, or null when it has never held one. */
+    latestHuddle(projectId: string): HuddleRow | null {
+      const r = latestHuddleStmt().get(projectId);
+      return r === undefined ? null : toHuddle(r);
+    },
+    /** Replace a huddle's mutable columns; the notes and transcript the caller passes are stored whole. */
+    saveHuddle(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: HuddleTranscriptEntry[]; notes?: HuddleNoteRow[]; confirmed?: string[] }): HuddleRow | null {
+      const current = getHuddleStmt().get(id);
+      if (current === undefined) return null;
+      const row = toHuddle(current);
+      updateHuddleStmt().run({
+        id,
+        ended_at: fields.endedAt === undefined ? row.endedAt : fields.endedAt,
+        connected: (fields.connected === undefined ? row.connected : fields.connected) ? 1 : 0,
+        transcript: JSON.stringify(fields.transcript ?? row.transcript),
+        notes: JSON.stringify(fields.notes ?? row.notes),
+        confirmed: JSON.stringify(fields.confirmed ?? row.confirmed),
+      });
+      return toHuddle(getHuddleStmt().get(id)!);
     },
 
     // BB-293: the shadow assessment and its divergence log. The reconcile

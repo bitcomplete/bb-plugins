@@ -764,13 +764,16 @@ function Section({ title, count, action, children }: { title: string; count?: nu
  * makes the call. It renders only when the server says a huddle is available,
  * and the server's refusal (or a failed call) is shown in place.
  */
-function HuddleButton({ projectId }: { projectId: string }) {
+function HuddleButton({ projectId, onStarted }: { projectId: string; onStarted?: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
   const start = () => {
     setState("starting");
     rpc.call("stewardsHuddleStart", { projectId }).then(
-      (result) => setState(result.ok ? "idle" : { error: result.message }),
+      (result) => {
+        setState(result.ok ? "idle" : { error: result.message });
+        if (result.ok) onStarted?.();
+      },
       (e: unknown) => setState({ error: message(e) }),
     );
   };
@@ -827,6 +830,115 @@ function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
       </button>
       <HuddleButton projectId={projectId} />
     </div>
+  );
+}
+
+/** The typed note shapes that carry an action; a free note is context only. */
+const HUDDLE_ACTION_TYPES: ReadonlySet<string> = new Set(["resolve-escalation", "gate", "guidance", "direction", "standing-rule"]);
+
+/**
+ * BB-300 slice 4: the mechanical readback of a project's huddle. The page
+ * fetches the stored record and renders the server's readback lines (the model
+ * only reads them aloud; it does not compose them). Each typed item is
+ * confirmed on its own and applied by the server through the path that already
+ * exists for its shape; nothing is applied unconfirmed. A free note is shown
+ * as context with no button, and Done ends the huddle.
+ */
+function HuddleReadback({ projectId, refreshKey, onChanged }: { projectId: string; refreshKey: number; onChanged: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [huddle, setHuddle] = useState<HuddleRecordView | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => {
+    rpc.call("stewardsHuddleRecord", { projectId }).then(
+      (r) => setHuddle(r.huddle),
+      () => setHuddle(null),
+    );
+  }, [rpc, projectId]);
+  useEffect(load, [load, refreshKey]);
+  if (huddle === null || huddle.endedAt !== null) return null;
+  const confirm = (noteId: string) => {
+    setBusy(noteId);
+    setError(null);
+    rpc.call("stewardsHuddleConfirm", { huddleId: huddle.id, noteId }).then(
+      (r) => {
+        setBusy(null);
+        if (!r.ok) setError(r.message);
+        else {
+          load();
+          onChanged();
+        }
+      },
+      (e: unknown) => {
+        setBusy(null);
+        setError(message(e));
+      },
+    );
+  };
+  const end = () => {
+    setBusy("end");
+    setError(null);
+    rpc.call("stewardsHuddleEnd", { huddleId: huddle.id }).then(
+      (r) => {
+        setBusy(null);
+        if (!r.ok) setError(r.message);
+        else {
+          setHuddle(null);
+          onChanged();
+        }
+      },
+      (e: unknown) => {
+        setBusy(null);
+        setError(message(e));
+      },
+    );
+  };
+  const typed = huddle.notes.filter((n) => HUDDLE_ACTION_TYPES.has(n.type));
+  const free = huddle.notes.filter((n) => n.type === "free");
+  const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  return (
+    <Section
+      title="Huddle readback"
+      count={huddle.notes.length}
+      action={
+        <span className="flex items-center gap-2">
+          <button type="button" className={button} disabled={busy !== null} onClick={load}>
+            Refresh
+          </button>
+          <button type="button" className={button} disabled={busy !== null} onClick={end}>
+            Done
+          </button>
+        </span>
+      }
+    >
+      {huddle.notes.length === 0 ? (
+        <None>The huddle has not recorded a note yet.</None>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {typed.length > 0 ? (
+            <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
+              {typed.map((n) => (
+                <li key={n.id} className="flex items-start justify-between gap-3 p-3">
+                  <span className={n.confirmed ? "text-muted-foreground" : undefined}>{n.readback}</span>
+                  {n.confirmed ? <Badge>Confirmed</Badge> : <button type="button" className={button} disabled={busy !== null} onClick={() => confirm(n.id)}>{busy === n.id ? "Confirming…" : "Confirm"}</button>}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {free.length > 0 ? (
+            <div className="rounded-lg border border-border p-3">
+              <p className="text-xs text-muted-foreground">Free notes (context for the project steward, not instructions)</p>
+              <ul className="mt-1 flex flex-col gap-1">
+                {free.map((n) => (
+                  <li key={n.id}>{n.text}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      )}
+      {error !== null ? <p className="text-xs text-destructive">{error}</p> : null}
+    </Section>
   );
 }
 
@@ -953,6 +1065,8 @@ type BoardSteward = Board["stewards"][number];
 type BoardQuestion = Board["questions"][number];
 type BoardWithUser = Board["withUser"][number];
 type BoardNeed = Board["needs"][number];
+type HuddleRecordResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { huddle: unknown }> : never;
+type HuddleRecordView = NonNullable<HuddleRecordResult["huddle"]>;
 
 /** One needs-you item on the page, tagged so its card knows which write the controls make. */
 type NeedsYouItem =
@@ -1069,6 +1183,8 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
   const now = useNow();
   const rpc = useRpc<typeof rpcContract>();
   const [turnOn, setTurnOn] = useState<"idle" | "running" | { error: string }>("idle");
+  // BB-300: bumped when a huddle starts, so the readback panel below reloads.
+  const [huddleRefresh, setHuddleRefresh] = useState(0);
   const { efforts, orphans } = boardEfforts(b);
   const enable = () => {
     setTurnOn("running");
@@ -1125,7 +1241,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
         </p>
       ) : null}
 
-      <Section title="Waiting on you" count={orphans.length} action={b.huddle?.available === true ? <HuddleButton projectId={b.projectId} /> : undefined}>
+      <Section title="Waiting on you" count={orphans.length} action={b.huddle?.available === true ? <HuddleButton projectId={b.projectId} onStarted={() => setHuddleRefresh((n) => n + 1)} /> : undefined}>
         {orphans.length === 0 ? (
           <None>Nothing is waiting on you.</None>
         ) : (
@@ -1136,6 +1252,8 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
           </ul>
         )}
       </Section>
+
+      <HuddleReadback projectId={b.projectId} refreshKey={huddleRefresh} onChanged={refetch} />
 
       <p data-board-count-line="" className="text-muted-foreground">
         {boardCountLine(efforts, b.ended.length)}

@@ -1628,4 +1628,105 @@ describe("the Huddle button (BB-300)", () => {
     expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull();
     slot.lifecycle.unmount();
   });
+
+  // BB-300 slice 4: the readback renders the stored readback lines, confirms
+  // each typed item on its own, and shows a free note as context with no button.
+  const recordResult = {
+    huddle: {
+      id: "hud_1",
+      projectId: "p1",
+      startedAt: 1,
+      endedAt: null,
+      notes: [
+        { id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, createdAt: 1, readback: "Guidance for ENG-12: Keep it small", confirmed: false },
+        { id: "note_2", type: "free", text: "A passing thought", binding: null, escalation: null, action: null, createdAt: 2, readback: "Note: A passing thought", confirmed: false },
+      ],
+      confirmed: [],
+    },
+  };
+
+  const renderBoardWithRecord = async (): Promise<RenderedSlot> => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    return renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            huddle: { available: true, message: null },
+          },
+        }),
+        stewardsHuddleRecord: () => recordResult,
+        stewardsHuddleConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
+        stewardsHuddleEnd: () => ({ ok: true, message: "Huddle ended." }),
+      } as never,
+    });
+  };
+
+  it("renders the stored readback and confirms a typed item on its own", async () => {
+    const slot = await renderBoardWithRecord();
+    await waitFor(() => expect(slot.getByText("Guidance for ENG-12: Keep it small")).toBeTruthy());
+    // The free note is context with no button of its own; only the typed note has one.
+    expect(slot.getByText("A passing thought")).toBeTruthy();
+    expect(slot.getAllByRole("button", { name: "Confirm" })).toHaveLength(1);
+    fireEvent.click(slot.getByRole("button", { name: "Confirm" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsHuddleConfirm", input: { huddleId: "hud_1", noteId: "note_1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("ends the huddle from the readback panel", async () => {
+    const slot = await renderBoardWithRecord();
+    await waitFor(() => expect(slot.getByRole("button", { name: "Done" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsHuddleEnd", input: { huddleId: "hud_1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("shows no readback when there is no open huddle", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+          },
+        }),
+        stewardsHuddleRecord: () => ({ huddle: null }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
+    expect(slot.queryByText("Huddle readback")).toBeNull();
+    slot.lifecycle.unmount();
+  });
 });
