@@ -222,6 +222,28 @@ describe("materializing from the template tree", () => {
     expect(before).not.toBe(remoteHead);
   });
 
+  it("syncs a branch that appears without the base moving", async () => {
+    const remote = await makeRemote("alpha");
+    const source = await projectSource();
+    const root = workspaceRoot(dataDir, "thread1");
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
+
+    await provision({ dataDir, pathKey: "thread1", source, url: remote });
+    const template = templatePathFor(dataDir, remote, "main");
+    const base = await gitLine(template, ["rev-parse", "HEAD"]);
+
+    // A new branch, with the base branch exactly where it already was: the
+    // sync must run anyway, or `git checkout <branch>` works after a clone but
+    // not after a copy.
+    await gitIn(remote, ["branch", "feature-only"]);
+    const featureHead = await gitLine(remote, ["rev-parse", "feature-only"]);
+
+    const second = await provision({ dataDir, pathKey: "thread2", source, url: remote });
+    const repo = second.repos.find((entry) => entry.dir === "alpha")!;
+    expect(await gitLine(repo.path, ["rev-parse", "HEAD"])).toBe(base);
+    expect(await gitLine(repo.path, ["rev-parse", "refs/remotes/origin/feature-only"])).toBe(featureHead);
+  });
+
   it("keeps templates for branches with slashes as siblings, never nested", async () => {
     const remote = await makeRemote("alpha", "trunk");
     const source = await projectSource();

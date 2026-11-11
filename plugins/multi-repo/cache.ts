@@ -378,15 +378,24 @@ export async function ensureTemplate(args: {
   let usable = false;
   if (await isGitWorktree(template, options)) {
     await minimal();
-    usable = await templateIsAt(template, sha, args.base, options);
-    if (!usable) {
-      await syncRefs();
-      await gitIn(template, ["reset", "--hard", "--quiet", sha], options);
-      await gitIn(template, ["clean", "-fdx", "--quiet"], options);
+    // Fetch unconditionally: `reset --hard` moves only the local branch, and a
+    // copy inherits every remote-tracking ref the template has. A branch that
+    // appeared or disappeared on the cache without moving the base must still
+    // reach the copy, or `git checkout <someone-else's-branch>` works after a
+    // clone but not after a copy.
+    const synced = await syncRefs();
+    if (synced.code === 0) {
       usable = await templateIsAt(template, sha, args.base, options);
+      if (!usable) {
+        await gitIn(template, ["reset", "--hard", "--quiet", sha], options);
+        await gitIn(template, ["clean", "-fdx", "--quiet"], options);
+        usable = await templateIsAt(template, sha, args.base, options);
+      }
     }
   }
   if (!usable) {
+    // A template that cannot be synced is rebuilt from the cache, which is the
+    // only way to get a complete, current set of remote-tracking refs.
     await rm(template, { recursive: true, force: true });
     await mkdir(path.dirname(template), { recursive: true });
     const cloned = await git(
