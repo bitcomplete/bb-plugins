@@ -45,6 +45,11 @@ export function settingDefaults(env: Env): {
   };
 }
 
+/** `https://api.openai.com/v1/` and the default compare equal. */
+export function normalizeBaseUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/u, "");
+}
+
 /** The stored key if there is one, else the environment's, else null. */
 export function resolveApiKey(stored: unknown, env: Env): string | null {
   const own = typeof stored === "string" ? stored.trim() : "";
