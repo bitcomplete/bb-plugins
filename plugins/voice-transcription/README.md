@@ -24,7 +24,7 @@ Editable under **Settings → Plugins → Voice transcription**, or with
 | key | default | meaning |
 | -- | -- | -- |
 | `baseUrl` | `https://api.openai.com/v1` | No trailing slash; `/audio/transcriptions` is appended. |
-| `apiKey` | empty | Sent only as `Authorization: Bearer` to `baseUrl`. Stored in the plugin's 0600 secrets file and never sent to the frontend. Leave empty for a self-hosted server with no auth. |
+| `apiKey` | empty | Sent only as `Authorization: Bearer` to `baseUrl`. Stored in the plugin's 0600 secrets file and never sent to the frontend. The same key mints short-lived Realtime client secrets when `baseUrl` is OpenAI's. Leave empty for a self-hosted server with no auth. |
 | `model` | `gpt-4o-transcribe` | Passed through verbatim. |
 | `language` | empty | ISO-639-1 code such as `en`. Empty lets the endpoint auto-detect. |
 
@@ -40,6 +40,41 @@ signal timeout, an abort and every 4xx are final. A failed call reports the stat
 the endpoint and the first 200 characters of the response body with the key
 removed. The server log gets one line per call — duration, bytes, status —
 and never the audio or the transcript.
+
+## Realtime voice
+
+The plugin can also carry a two-way spoken session, for a plugin that wants a
+voice conversation rather than a one-shot transcript. It is **inert unless
+`baseUrl` is OpenAI's own endpoint and a key is set**: the transcription-only
+vendors have no Realtime API, so nothing is registered, no session can be
+opened, and the ordinary transcription above is untouched.
+
+A session has three pieces:
+
+* An opener — another plugin — calls the `realtime.open` RPC with the session
+  instructions and the tools the model may call, and names its own RPC method
+  for the tool results. It receives a session id.
+* The plugin's **mint route** (`POST
+  /api/v1/plugins/voice-transcription/http/realtime/session`) exchanges the
+  plugin's stored key for a short-lived OpenAI **ephemeral client secret** and
+  returns that to the browser. The standard key is used only in the server's
+  request to OpenAI and never reaches the browser. It refuses with a clear
+  status when the endpoint is not OpenAI's (400) or no key is set (403), and
+  for an unknown or already-minted session (404/409).
+* The app-wide **overlay** opens the WebRTC session straight from the browser
+  to OpenAI with the ephemeral secret, plays the model's audio, shows the live
+  transcript, and forwards each model tool call to the opener, returning its
+  result. It ends the session on the server when it closes.
+
+Spend is bounded: the ephemeral secret expires after 60 seconds, one session
+is capped at 20 minutes (the overlay counts down and closes itself, and the
+server refuses a session that outlives the cap), and the session is dropped
+when the overlay closes.
+
+`throwaway/` holds a minimal caller used to prove the surface end to end
+without a second plugin; it is disposable once a real caller exists. The
+browser audio path still needs a by-hand check with a real key and a
+microphone.
 
 ## Deployment-wide defaults
 

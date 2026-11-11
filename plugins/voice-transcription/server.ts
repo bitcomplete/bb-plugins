@@ -8,18 +8,44 @@
 // registration contract is `PluginAiServiceDeclaration` from
 // `bb.experimental_aiServices` (bb desktop-v0.44.0 and later; plugin services
 // are listed in Automatic since desktop-v0.45.0).
-import type { BbPluginApi, PluginAiServiceStatus } from "@get-bb/plugin-sdk";
+import {
+  defineRpcContract,
+  type BbPluginApi,
+  type PluginAiServiceStatus,
+} from "@get-bb/plugin-sdk";
+import type { Context } from "hono";
+import { z } from "zod";
 import {
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
+  normalizeBaseUrl,
   resolveApiKey,
   settingDefaults,
   type Env,
 } from "./config.js";
+import {
+  REALTIME_CLIENT_SECRET_PATH,
+  REALTIME_MAX_INSTRUCTIONS_CHARS,
+  REALTIME_MAX_TOOLS,
+  declaresTool,
+  parseClientSecret,
+  realtimeClientSecretBody,
+  realtimeMaxMs,
+  realtimeModel,
+  realtimeReadiness,
+  realtimeVoice,
+} from "./realtime.js";
+import {
+  PLUGIN_ID,
+  REALTIME_CLOSE_PATH,
+  REALTIME_MINT_PATH,
+  REALTIME_SIGNAL_CHANNEL,
+  REALTIME_TOOL_PATH,
+  type MintedRealtimeSession,
+  type RealtimeSessionConfig,
+} from "./realtime-shared.js";
 
-export { DEFAULT_BASE_URL, DEFAULT_MODEL };
-
-export const PLUGIN_ID = "voice-transcription";
+export { DEFAULT_BASE_URL, DEFAULT_MODEL, PLUGIN_ID, normalizeBaseUrl };
 /** Stable service id: the picker names it `voice-transcription:openai-compatible`. */
 export const SERVICE_ID = "openai-compatible";
 /** Appended to `baseUrl`; both carry no trailing slash. */
@@ -32,6 +58,60 @@ export const NOT_CONFIGURED_MESSAGE =
   "Set the endpoint and model in Settings → Plugins → Voice transcription";
 export const MISSING_KEY_MESSAGE =
   "Set the API key in Settings → Plugins → Voice transcription";
+
+/**
+ * The RPC another plugin calls to open a Realtime session before its UI shows
+ * the overlay. The browser-facing routes below mint and drive the session;
+ * this is the one cross-plugin entry point. `toolHandler` names the caller's
+ * own RPC method that the model's tool calls are forwarded to.
+ */
+const realtimeToolSchema = z.object({
+  name: z.string().trim().min(1).max(64),
+  description: z.string().max(2000).optional(),
+  parameters: z.record(z.string(), z.unknown()).optional(),
+});
+
+const realtimeSessionConfigSchema = z.object({
+  instructions: z.string().min(1).max(REALTIME_MAX_INSTRUCTIONS_CHARS),
+  tools: z.array(realtimeToolSchema).max(REALTIME_MAX_TOOLS),
+  model: z.string().trim().min(1).max(100).optional(),
+  voice: z.string().trim().min(1).max(40).optional(),
+  maxDurationMs: z.number().int().positive().optional(),
+});
+
+export const rpcContract = defineRpcContract({
+  "realtime.open": {
+    input: realtimeSessionConfigSchema.extend({
+      toolHandler: z
+        .object({ pluginId: z.string().trim().min(1), method: z.string().trim().min(1) })
+        .nullable()
+        .default(null),
+    }),
+    output: z.object({ sessionId: z.string(), maxDurationMs: z.number() }),
+  },
+});
+
+/** A Realtime session that an opener asked for and the overlay has yet to take. */
+type PendingRealtimeSession = {
+  id: string;
+  config: RealtimeSessionConfig;
+  toolHandler: { pluginId: string; method: string } | null;
+  createdAt: number;
+  startedAt: number | null;
+  maxMs: number;
+};
+
+/** A JSON object body, or null when the body is missing or not one. */
+async function readJsonObject(c: Context): Promise<Record<string, unknown> | null> {
+  try {
+    const value = await c.req.json();
+    return typeof value === "object" && value !== null
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * The settings form's descriptors, with the deployment's base URL and model
@@ -53,7 +133,7 @@ export function settingDescriptors(env: Env) {
       type: "string",
       label: "API key",
       description:
-        "Sent only as `Authorization: Bearer` to the endpoint above, and never to the frontend. Leave empty for a self-hosted server with no auth. Unset, the server's VOICE_TRANSCRIPTION_API_KEY is used when the deployment sets one.",
+        "Sent only as `Authorization: Bearer` to the endpoint above, and never to the frontend. The same key mints short-lived Realtime client secrets when the endpoint is OpenAI's. Leave empty for a self-hosted server with no auth. Unset, the server's VOICE_TRANSCRIPTION_API_KEY is used when the deployment sets one.",
       secret: true,
     },
     model: {
@@ -101,11 +181,6 @@ type SettingsValues = {
   model: string;
   language: string;
 };
-
-/** `https://api.openai.com/v1/` and the default compare equal. */
-export function normalizeBaseUrl(raw: string): string {
-  return raw.trim().replace(/\/+$/u, "");
-}
 
 /**
  * The upload's extension: the MIME type's when it names a known format
@@ -269,6 +344,202 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
       transcribe,
       status,
     });
+
+    // ---- realtime voice ---------------------------------------------------
+    // An opener (another plugin's backend) calls `realtime.open`; the server
+    // publishes a signal, and the app-wide overlay in `app.tsx` mints a
+    // short-lived ephemeral secret and connects straight to OpenAI. The
+    // plugin's own key is used only in the server's request to OpenAI and
+    // never reaches the browser. Nothing is opened against a non-OpenAI
+    // endpoint or without a key: `open` refuses, so no signal is published
+    // and the overlay stays inert. A session is capped at `maxMs` and is
+    // dropped when the overlay closes it.
+    const realtimeSessions = new Map<string, PendingRealtimeSession>();
+
+    async function realtimeKey(): Promise<{ baseUrl: string; apiKey: string }> {
+      const values = await settings.get();
+      return { baseUrl: values.baseUrl, apiKey: resolveApiKey(values.apiKey, env) ?? "" };
+    }
+
+    function pruneRealtimeSessions(now: number): void {
+      for (const [id, session] of realtimeSessions) {
+        const since = session.startedAt ?? session.createdAt;
+        if (now - since > session.maxMs) realtimeSessions.delete(id);
+      }
+    }
+
+    bb.rpc.register(rpcContract, {
+      async "realtime.open"(input, { experimental_caller: caller }) {
+        // The overlay is opened on behalf of a plugin that will answer the
+        // model's tool calls; a browser client has no tool handler to name.
+        if (caller.kind !== "plugin") {
+          throw new Error("realtime.open is called by another plugin, not the browser");
+        }
+        const { baseUrl, apiKey } = await realtimeKey();
+        const refusal = realtimeReadiness({ baseUrl, apiKey });
+        if (refusal !== null) throw new Error(refusal.message);
+        pruneRealtimeSessions(Date.now());
+        const config: RealtimeSessionConfig = {
+          instructions: input.instructions,
+          tools: input.tools,
+          ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.voice !== undefined ? { voice: input.voice } : {}),
+          ...(input.maxDurationMs !== undefined ? { maxDurationMs: input.maxDurationMs } : {}),
+        };
+        const session: PendingRealtimeSession = {
+          id: crypto.randomUUID(),
+          config,
+          toolHandler: input.toolHandler,
+          createdAt: Date.now(),
+          startedAt: null,
+          maxMs: realtimeMaxMs(config),
+        };
+        realtimeSessions.set(session.id, session);
+        bb.realtime.publish(REALTIME_SIGNAL_CHANNEL, { sessionId: session.id });
+        return { sessionId: session.id, maxDurationMs: session.maxMs };
+      },
+    });
+
+    bb.http.route(
+      "POST",
+      REALTIME_MINT_PATH,
+      async (c: Context) => {
+        const body = await readJsonObject(c);
+        const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
+        if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
+        const { baseUrl, apiKey } = await realtimeKey();
+        const refusal = realtimeReadiness({ baseUrl, apiKey });
+        if (refusal !== null) return c.json({ error: refusal.message }, refusal.status);
+        const session = realtimeSessions.get(sessionId);
+        if (session === undefined) {
+          return c.json({ error: "That voice session has ended; start a new one" }, 404);
+        }
+        const now = Date.now();
+        if (session.startedAt !== null) {
+          return c.json({ error: "That voice session already has a client secret" }, 409);
+        }
+        if (now - session.createdAt > session.maxMs) {
+          realtimeSessions.delete(sessionId);
+          return c.json({ error: "That voice session expired before it started" }, 409);
+        }
+        const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+        const url = `${normalizedBaseUrl}${REALTIME_CLIENT_SECRET_PATH}`;
+        let response: Response;
+        try {
+          response = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(realtimeClientSecretBody(session.config)),
+          });
+        } catch (error) {
+          bb.log.warn(
+            `voice-transcription: realtime mint could not reach ${url}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return c.json({ error: `Could not reach ${url}` }, 502);
+        }
+        if (!response.ok) {
+          const text = await response.text();
+          bb.log.warn(
+            `voice-transcription: realtime mint answered HTTP ${response.status} from ${url}`,
+          );
+          return c.json(
+            { error: `OpenAI refused the session: HTTP ${response.status}: ${errorExcerpt(text, apiKey)}` },
+            502,
+          );
+        }
+        let secret: { value: string; expiresAt: number };
+        try {
+          secret = parseClientSecret(await response.json());
+        } catch (error) {
+          return c.json(
+            { error: error instanceof Error ? error.message : "OpenAI returned an unexpected reply" },
+            502,
+          );
+        }
+        session.startedAt = now;
+        bb.log.info(
+          `voice-transcription: minted a Realtime client secret for session ${session.id} (expires ${secret.expiresAt})`,
+        );
+        const minted: MintedRealtimeSession = {
+          value: secret.value,
+          expiresAt: secret.expiresAt,
+          model: realtimeModel(session.config),
+          voice: realtimeVoice(session.config),
+          instructions: session.config.instructions,
+          tools: session.config.tools,
+          maxDurationMs: session.maxMs,
+        };
+        return c.json(minted, 200);
+      },
+      { auth: "local" },
+    );
+
+    bb.http.route(
+      "POST",
+      REALTIME_TOOL_PATH,
+      async (c: Context) => {
+        const body = await readJsonObject(c);
+        const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
+        const callId = typeof body?.callId === "string" ? body.callId : "";
+        const name = typeof body?.name === "string" ? body.name : "";
+        const args = typeof body?.arguments === "string" ? body.arguments : "{}";
+        if (sessionId === "" || name === "") {
+          return c.json({ error: "sessionId and name are required" }, 400);
+        }
+        const session = realtimeSessions.get(sessionId);
+        if (session === undefined) {
+          return c.json({ error: "That voice session has ended; start a new one" }, 404);
+        }
+        if (session.startedAt !== null && Date.now() - session.startedAt > session.maxMs) {
+          realtimeSessions.delete(sessionId);
+          return c.json({ error: "That voice session has reached its time limit" }, 409);
+        }
+        if (!declaresTool(session.config.tools, name)) {
+          return c.json({ error: `This session did not declare a tool named ${name}` }, 422);
+        }
+        if (session.toolHandler === null) {
+          return c.json({ error: "This session has no tool handler attached" }, 409);
+        }
+        let result: unknown;
+        try {
+          result = await bb.sdk.plugins.callRpc({
+            pluginId: session.toolHandler.pluginId,
+            method: session.toolHandler.method,
+            input: { sessionId, callId, name, arguments: args },
+            outputSchema: z.unknown(),
+          });
+        } catch (error) {
+          bb.log.warn(
+            `voice-transcription: tool ${name} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return c.json(
+            { error: `The tool handler failed: ${error instanceof Error ? error.message : String(error)}` },
+            502,
+          );
+        }
+        return c.json(
+          { output: typeof result === "string" ? result : JSON.stringify(result ?? null) },
+          200,
+        );
+      },
+      { auth: "local" },
+    );
+
+    bb.http.route(
+      "POST",
+      REALTIME_CLOSE_PATH,
+      async (c: Context) => {
+        const body = await readJsonObject(c);
+        const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
+        if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
+        realtimeSessions.delete(sessionId);
+        return c.json({ ok: true }, 200);
+      },
+      { auth: "local" },
+    );
   };
 }
 

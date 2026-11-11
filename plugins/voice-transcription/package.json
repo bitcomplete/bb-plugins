@@ -13,7 +13,8 @@
     "branding": {
       "icon": "Mic"
     },
-    "server": "./server.ts"
+    "server": "./server.ts",
+    "app": "./app.tsx"
   },
   "keywords": [
     "bb-plugin"
@@ -23,13 +24,20 @@
     "test": "vitest run",
     "build": "bb plugin build"
   },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.37",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.6.5",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
     "better-sqlite3": "^13.0.3",
     "cron-parser": "^5.10.2",
     "hono": "^4.13.13",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
     "vitest": "^5.0.5"
