@@ -8,10 +8,10 @@
 // returns the four things a briefing reports, in rank order: decisions
 // waiting on the owner, escalations with the project steward, stuck or held
 // bindings and what they wait on, and what merged or deployed since. The
-// nightly pass is its first caller (`since` is the previous digest); a huddle
-// calls it on demand with "since the last huddle". `toDigestRecords` keeps
+// nightly pass is its first caller (`since` is the previous digest); a stand-up
+// calls it on demand with "since the last stand-up". `toDigestRecords` keeps
 // the nightly's rendering byte-identical while the briefing carries the four
-// sections the huddle needs.
+// sections the stand-up needs.
 import type { Assumption, Binding, Escalation, Need, Question, Store } from "./store.js";
 import type { DigestRecords } from "./wake.js";
 
@@ -53,12 +53,12 @@ export const stillNight = (now: number, nightly: { at: string; until: string; ti
 
 /**
  * What a briefing reports, since a moment: the four sections, in the order the
- * huddle ranks them. Read from the store's tables, never from the project
+ * stand-up ranks them. Read from the store's tables, never from the project
  * steward's memory. `previous` and `notes` are the nightly's own memory and
- * ride along so the digest renders from one value; a huddle ignores them.
+ * ride along so the digest renders from one value; a stand-up ignores them.
  */
 export type Briefing = {
-  /** The window's start: the previous digest, or the last huddle. */
+  /** The window's start: the previous digest, or the last stand-up. */
   since: number;
   /** The last digest kept, and when; null before the first. */
   previous: { text: string; at: number } | null;
@@ -91,9 +91,9 @@ export type Briefing = {
 
 /**
  * Build the briefing reader for one server. `store` and `now` are injected so
- * the digest and the huddle share one reader, and tests a fixed clock. The
+ * the digest and the stand-up share one reader, and tests a fixed clock. The
  * returned `briefing(project, since)` is the on-demand entry point: the
- * nightly pass passes the previous digest, a huddle the stored last huddle.
+ * nightly pass passes the previous digest, a stand-up the stored last stand-up.
  */
 export function createBriefing(store: Store, now: () => number): (projectId: string, since: number) => Briefing {
   return function briefing(projectId: string, since: number): Briefing {
@@ -113,7 +113,7 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         // The digest's predicate, verbatim: a user-routed question escalation
         // is left out here (the questions section covers it), as is a
-        // resolution-kind one. That is right for the digest; a huddle ranking
+        // resolution-kind one. That is right for the digest; a stand-up ranking
         // "decisions waiting on the owner" may want the broader set, and
         // slice 3 decides.
         withUser: openWith((x) => x.route === "user" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
@@ -140,7 +140,7 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
 /**
  * Flatten a briefing back to the shape `formatRecords` has always rendered, so
  * the nightly digest text is unchanged by the extraction. The four sections
- * are the huddle's, not the renderer's; `escalations` is not part of the
+ * are the stand-up's, not the renderer's; `escalations` is not part of the
  * digest record and is dropped here.
  */
 export function toDigestRecords(briefing: Briefing): DigestRecords {

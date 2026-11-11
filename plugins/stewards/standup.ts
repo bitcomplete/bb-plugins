@@ -1,4 +1,4 @@
-// BB-300 slice 3: the huddle's brain. A huddle is a spoken stand-up between
+// BB-300 slice 3: the stand-up's brain. A stand-up is a spoken stand-up between
 // the owner and one project's stewards. This module builds the model's
 // instructions from a `Briefing`, declares the fixed tool set the model may
 // call, and runs a tool call. It is deliberately pure where it can be: the
@@ -7,7 +7,7 @@
 //
 // "Nothing is acted on while you talk" holds by construction, not by prompt:
 // every tool here reads state, and the only two that write append to or remove
-// from the huddle's own note record. No tool touches a binding, a need, an
+// from the stand-up's own note record. No tool touches a binding, a need, an
 // escalation, a merge or a resolution. The page applies confirmed notes in a
 // later slice (the fan-out), through the paths it already uses.
 import type { Briefing } from "./nightly.js";
@@ -16,20 +16,20 @@ import type { EntitySnapshot } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
 
 /** One function tool, shaped the way the Realtime API's `realtime.open` expects. */
-export type HuddleTool = {
+export type StandupTool = {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
 };
 
 /** The fixed shapes a typed note may take, plus a free note (BB-300). */
-export const HUDDLE_NOTE_TYPES = ["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "free"] as const;
-export type HuddleNoteType = (typeof HUDDLE_NOTE_TYPES)[number];
+export const STANDUP_NOTE_TYPES = ["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "free"] as const;
+export type StandupNoteType = (typeof STANDUP_NOTE_TYPES)[number];
 
-/** What one note in the huddle record is: an action item in a typed shape, or a free note. */
-export type HuddleNote = {
+/** What one note in the stand-up record is: an action item in a typed shape, or a free note. */
+export type StandupNote = {
   id: string;
-  type: HuddleNoteType;
+  type: StandupNoteType;
   /** The note in the owner's words. */
   text: string;
   /** The binding key the note is about, for a gate item or per-binding guidance. */
@@ -49,30 +49,30 @@ export type HuddleNote = {
   createdAt: number;
 };
 
-/** The huddle's in-memory record. Slice 4 makes it durable and reads it back. */
-export type HuddleRecord = {
+/** The stand-up's in-memory record. Slice 4 makes it durable and reads it back. */
+export type StandupRecord = {
   projectId: string;
   startedAt: number;
-  notes: HuddleNote[];
+  notes: StandupNote[];
   /** True once the overlay has connected and the model has called a tool. */
   connected: boolean;
 };
 
 /** The voice plugin's own `realtime.open` instruction cap; the briefing stays under it. */
-export const HUDDLE_MAX_INSTRUCTIONS_CHARS = 20_000;
+export const STANDUP_MAX_INSTRUCTIONS_CHARS = 20_000;
 /** The most lines one section lists before it says how many were left out. */
-export const HUDDLE_SECTION_MAX = 40;
+export const STANDUP_SECTION_MAX = 40;
 
-/** The only tools that write, and they write only to the huddle record. */
-export const HUDDLE_WRITE_TOOLS: ReadonlySet<string> = new Set(["take_note", "retract_note"]);
+/** The only tools that write, and they write only to the stand-up record. */
+export const STANDUP_WRITE_TOOLS: ReadonlySet<string> = new Set(["take_note", "retract_note"]);
 
 const stringParam = (description: string): Record<string, unknown> => ({ type: "string", description });
 
 /**
- * The fixed, small tool set the huddle opens with. The names are the contract
- * the tests enumerate; the readers behind them are in `runHuddleTool`.
+ * The fixed, small tool set the stand-up opens with. The names are the contract
+ * the tests enumerate; the readers behind them are in `runStandupTool`.
  */
-export const HUDDLE_TOOLS: HuddleTool[] = [
+export const STANDUP_TOOLS: StandupTool[] = [
   {
     name: "steward_status",
     description: "The status of one steward, by its ticket or pull-request key (for example ENG-12 or owner/repo#34): phase, what it waits on, the guidance it carries, its open escalation and its recent notes.",
@@ -126,11 +126,11 @@ export const HUDDLE_TOOLS: HuddleTool[] = [
   },
   {
     name: "take_note",
-    description: "Record an action item for the owner to confirm after the huddle, or a free note. This writes only to the huddle record; it never acts on a steward, merges or resolves anything.",
+    description: "Record an action item for the owner to confirm after the stand-up, or a free note. This writes only to the stand-up record; it never acts on a steward, merges or resolves anything.",
     parameters: {
       type: "object",
       properties: {
-        type: { type: "string", enum: [...HUDDLE_NOTE_TYPES], description: "resolve-escalation, gate, guidance, direction, standing-rule, or free." },
+        type: { type: "string", enum: [...STANDUP_NOTE_TYPES], description: "resolve-escalation, gate, guidance, direction, standing-rule, or free." },
         text: stringParam("The note, in the owner's words."),
         binding: stringParam("The ticket or pull-request key a gate or guidance note is about."),
         escalationId: stringParam("The escalation id a resolve-escalation note answers."),
@@ -142,7 +142,7 @@ export const HUDDLE_TOOLS: HuddleTool[] = [
   },
   {
     name: "retract_note",
-    description: "Remove a note the huddle recorded, by its id. This writes only to the huddle record.",
+    description: "Remove a note the stand-up recorded, by its id. This writes only to the stand-up record.",
     parameters: {
       type: "object",
       properties: { id: stringParam("The note id (note_…) to remove.") },
@@ -152,10 +152,10 @@ export const HUDDLE_TOOLS: HuddleTool[] = [
 ];
 
 /** The tool names, in declaration order. */
-export const HUDDLE_TOOL_NAMES: readonly string[] = HUDDLE_TOOLS.map((tool) => tool.name);
+export const STANDUP_TOOL_NAMES: readonly string[] = STANDUP_TOOLS.map((tool) => tool.name);
 
 /** The reader and record a tool call runs against; the server injects the real ones. */
-export type HuddleToolContext = {
+export type StandupToolContext = {
   projectId: string;
   now: () => number;
   /** The binding for a key (or id), open first, or null. */
@@ -174,12 +174,12 @@ export type HuddleToolContext = {
   needs: (bindingId: string) => Need[];
   /** The note ids the owner has already confirmed; a confirmed note cannot be retracted. */
   confirmed: readonly string[];
-  /** The huddle's note record. Only `take_note` and `retract_note` touch it. */
-  record: HuddleRecord;
+  /** The stand-up's note record. Only `take_note` and `retract_note` touch it. */
+  record: StandupRecord;
 };
 
 /** One line for a note's kind, so a note reads back unambiguously. */
-const NOTE_LABEL: Record<HuddleNoteType, string> = {
+const NOTE_LABEL: Record<StandupNoteType, string> = {
   "resolve-escalation": "resolve an escalation",
   gate: "approve or decline a gate item",
   guidance: "guidance for a binding",
@@ -194,7 +194,7 @@ const NOTE_LABEL: Record<HuddleNoteType, string> = {
  * does not compose them. A free note reads back as a plain note so it is never
  * mistaken for a typed action item.
  */
-export function readbackLine(note: HuddleNote): string {
+export function readbackLine(note: StandupNote): string {
   const where = note.binding === null ? "" : ` ${note.binding}`;
   switch (note.type) {
     case "resolve-escalation":
@@ -215,7 +215,7 @@ export function readbackLine(note: HuddleNote): string {
 }
 
 /** The readback lines for a record's notes, in the order they were taken. */
-export function readbackLines(notes: readonly HuddleNote[]): string[] {
+export function readbackLines(notes: readonly StandupNote[]): string[] {
   return notes.map(readbackLine);
 }
 
@@ -231,7 +231,7 @@ function optionalString(args: Record<string, unknown>, field: string): string | 
 }
 
 /** The steward's own status line, or a clear "no such steward" the model can read aloud. */
-function stewardStatus(ctx: HuddleToolContext, key: string): string {
+function stewardStatus(ctx: StandupToolContext, key: string): string {
   const b = ctx.binding(key);
   if (b === null) return `No steward for ${key} in this project.`;
   const lines = [`${b.entityKey}: ${b.title ?? "(no title)"} — ${b.kind}${b.phase === null ? "" : `, phase ${b.phase}`}.`];
@@ -254,7 +254,7 @@ function escalationText(x: Escalation): string {
 }
 
 /** The escalation tool: by id, or every open escalation for one binding key. */
-function escalationTool(ctx: HuddleToolContext, args: Record<string, unknown>): string {
+function escalationTool(ctx: StandupToolContext, args: Record<string, unknown>): string {
   const id = optionalString(args, "escalationId");
   if (id !== null) {
     const x = ctx.escalation(id);
@@ -270,7 +270,7 @@ function escalationTool(ctx: HuddleToolContext, args: Record<string, unknown>): 
 }
 
 /** The entity tool: the source snapshot, or the last one the steward kept. */
-async function entityTool(ctx: HuddleToolContext, key: string): Promise<string> {
+async function entityTool(ctx: StandupToolContext, key: string): Promise<string> {
   const b = ctx.binding(key);
   if (b === null) return `No steward for ${key} in this project.`;
   const entity = (await ctx.snapshot(b).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
@@ -283,7 +283,7 @@ async function entityTool(ctx: HuddleToolContext, key: string): Promise<string> 
 }
 
 /** The rationale tool: the lessons and resolutions behind a binding's decisions. */
-function rationaleTool(ctx: HuddleToolContext, key: string): string {
+function rationaleTool(ctx: StandupToolContext, key: string): string {
   const b = ctx.binding(key);
   if (b === null) return `No steward for ${key} in this project.`;
   const lessons = ctx.lessons(b.id);
@@ -296,7 +296,7 @@ function rationaleTool(ctx: HuddleToolContext, key: string): string {
 }
 
 /** The playbook tool: the guidance paragraphs, filtered by file or query. */
-async function playbookTool(ctx: HuddleToolContext, args: Record<string, unknown>): Promise<string> {
+async function playbookTool(ctx: StandupToolContext, args: Record<string, unknown>): Promise<string> {
   const file = optionalString(args, "file");
   const query = optionalString(args, "query");
   const units = await ctx.guidance();
@@ -324,7 +324,7 @@ function gateKinds(action: string | null): string[] {
  * URL or description; otherwise it must be unambiguous. Throws with the
  * candidates when it is not, so the model can ask the owner which one.
  */
-function gateNeed(ctx: HuddleToolContext, binding: Binding, action: string | null, wanted: string | null): Need {
+function gateNeed(ctx: StandupToolContext, binding: Binding, action: string | null, wanted: string | null): Need {
   const candidates = ctx.needs(binding.id).filter((n) => gateKinds(action).includes(n.kind));
   if (candidates.length === 0) throw new Error(`No open ${action ?? "gate"} item on ${binding.entityKey}`);
   if (wanted !== null) {
@@ -337,9 +337,9 @@ function gateNeed(ctx: HuddleToolContext, binding: Binding, action: string | nul
 }
 
 /** Append a typed or free note to the record; the only write in the read tool set. */
-function takeNote(ctx: HuddleToolContext, args: Record<string, unknown>): string {
+function takeNote(ctx: StandupToolContext, args: Record<string, unknown>): string {
   const type = requireString(args, "type");
-  if (!(HUDDLE_NOTE_TYPES as readonly string[]).includes(type)) throw new Error(`type must be one of ${HUDDLE_NOTE_TYPES.join(", ")}`);
+  if (!(STANDUP_NOTE_TYPES as readonly string[]).includes(type)) throw new Error(`type must be one of ${STANDUP_NOTE_TYPES.join(", ")}`);
   const text = requireString(args, "text");
   const action = optionalString(args, "action");
   if (action !== null && !["approve", "decline", "merge"].includes(action)) throw new Error("action must be approve, decline or merge");
@@ -356,13 +356,13 @@ function takeNote(ctx: HuddleToolContext, args: Record<string, unknown>): string
     need = item.id;
     needLabel = item.what;
   }
-  const note: HuddleNote = {
+  const note: StandupNote = {
     id: `note_${crypto.randomUUID()}`,
-    type: type as HuddleNoteType,
+    type: type as StandupNoteType,
     text,
     binding: bindingKey,
     escalation: optionalString(args, "escalationId"),
-    action: action as HuddleNote["action"],
+    action: action as StandupNote["action"],
     need,
     needLabel,
     createdAt: ctx.now(),
@@ -372,11 +372,11 @@ function takeNote(ctx: HuddleToolContext, args: Record<string, unknown>): string
 }
 
 /** Remove a note from the record; the second and last write. A confirmed note stays. */
-function retractNote(ctx: HuddleToolContext, args: Record<string, unknown>): string {
+function retractNote(ctx: StandupToolContext, args: Record<string, unknown>): string {
   const id = requireString(args, "id");
   if (ctx.confirmed.includes(id)) return `Note ${id} has already been applied and cannot be retracted.`;
   const index = ctx.record.notes.findIndex((n) => n.id === id);
-  if (index === -1) return `No note ${id} in this huddle.`;
+  if (index === -1) return `No note ${id} in this stand-up.`;
   const [removed] = ctx.record.notes.splice(index, 1);
   return `Retracted ${id}: ${removed!.text}`;
 }
@@ -386,7 +386,7 @@ function retractNote(ctx: HuddleToolContext, args: Record<string, unknown>): str
  * text and never writes; `take_note` and `retract_note` return text and touch
  * only `ctx.record.notes`.
  */
-export async function runHuddleTool(name: string, args: Record<string, unknown>, ctx: HuddleToolContext): Promise<string> {
+export async function runStandupTool(name: string, args: Record<string, unknown>, ctx: StandupToolContext): Promise<string> {
   switch (name) {
     case "steward_status":
       return stewardStatus(ctx, requireString(args, "key"));
@@ -403,7 +403,7 @@ export async function runHuddleTool(name: string, args: Record<string, unknown>,
     case "retract_note":
       return retractNote(ctx, args);
     default:
-      throw new Error(`No huddle tool named ${name}`);
+      throw new Error(`No stand-up tool named ${name}`);
   }
 }
 
@@ -418,15 +418,15 @@ function bullets(lines: readonly string[], truncated = false): string {
 }
 
 /** An open question put to the owner, with the binding it attaches to resolved to a key. */
-export type HuddleOpenQuestion = { key: string | null; question: string; choices: string[] };
+export type StandupOpenQuestion = { key: string | null; question: string; choices: string[] };
 
 /** The owner's decisions, as one line each: needs, forwarded escalations and open questions. */
-function decisionLines(briefing: Briefing, questions: readonly HuddleOpenQuestion[]): string[] {
+function decisionLines(briefing: Briefing, questions: readonly StandupOpenQuestion[]): string[] {
   const out: string[] = [];
   for (const { need, binding } of briefing.decisions.needs) out.push(`${binding.entityKey}: ${need.what} (${need.kind})`);
   for (const { escalation, from } of briefing.decisions.withUser) out.push(`${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`);
   // The briefing's `withUser` leaves questions to the digest's own section
-  // (slice 1); the huddle is exactly where the owner answers them, so they are
+  // (slice 1); the stand-up is exactly where the owner answers them, so they are
   // added here as decisions rather than dropped.
   for (const q of questions) out.push(`${q.key ?? "the project"}: ${q.question}${q.choices.length === 0 ? "" : ` (choices: ${q.choices.join(" / ")})`}`);
   return out;
@@ -468,19 +468,19 @@ function deviationLines(briefing: Briefing): string[] {
  * done since, with playbook deviations called out. The model may ask follow-up
  * questions with the read tools and take or retract notes, and nothing else.
  *
- * The text is bounded twice: each section lists at most `HUDDLE_SECTION_MAX`
+ * The text is bounded twice: each section lists at most `STANDUP_SECTION_MAX`
  * lines (then says how many it left out), and the whole text is kept under the
  * voice plugin's `realtime.open` cap. The ranking survives truncation: the
  * sections stay in order and the tail gives way first.
  */
-export function buildHuddleInstructions(briefing: Briefing, projectName: string, now: number, questions: readonly HuddleOpenQuestion[] = []): string {
+export function buildStandupInstructions(briefing: Briefing, projectName: string, now: number, questions: readonly StandupOpenQuestion[] = []): string {
   const since = briefing.since === 0 ? "the beginning" : new Date(briefing.since).toISOString();
   const header = [
-    `You are the voice of ${projectName}'s stewards in a huddle with the project's owner.`,
+    `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner.`,
     `It is ${new Date(now).toISOString()}. You are reporting what happened since ${since}.`,
     "",
     "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached.",
-    "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the huddle.",
+    "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
   ];
   const sections = [
@@ -492,16 +492,16 @@ export function buildHuddleInstructions(briefing: Briefing, projectName: string,
   ];
   const capped = sections.map((section) => ({
     heading: section.heading,
-    lines: section.lines.length <= HUDDLE_SECTION_MAX ? section.lines : [...section.lines.slice(0, HUDDLE_SECTION_MAX), `…and ${section.lines.length - HUDDLE_SECTION_MAX} more`],
-    truncated: section.lines.length > HUDDLE_SECTION_MAX,
+    lines: section.lines.length <= STANDUP_SECTION_MAX ? section.lines : [...section.lines.slice(0, STANDUP_SECTION_MAX), `…and ${section.lines.length - STANDUP_SECTION_MAX} more`],
+    truncated: section.lines.length > STANDUP_SECTION_MAX,
   }));
   const render = (): string => [...header, ...capped.flatMap((section) => ["", `## ${section.heading}`, bullets(section.lines, section.truncated)])].join("\n");
-  while (render().length > HUDDLE_MAX_INSTRUCTIONS_CHARS) {
+  while (render().length > STANDUP_MAX_INSTRUCTIONS_CHARS) {
     const last = [...capped].reverse().find((section) => section.lines.length > 0);
     if (last === undefined) break;
     last.lines.pop();
     last.truncated = true;
   }
   const text = render();
-  return text.length <= HUDDLE_MAX_INSTRUCTIONS_CHARS ? text : `${text.slice(0, HUDDLE_MAX_INSTRUCTIONS_CHARS - 20)}\n… (truncated)`;
+  return text.length <= STANDUP_MAX_INSTRUCTIONS_CHARS ? text : `${text.slice(0, STANDUP_MAX_INSTRUCTIONS_CHARS - 20)}\n… (truncated)`;
 }

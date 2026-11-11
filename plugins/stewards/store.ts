@@ -670,12 +670,13 @@ export const ASSESSMENT_MIGRATIONS = [
 // with the live work. A new index, so nothing existing is altered.
 export const ENDED_READ_MIGRATIONS = [`CREATE INDEX IF NOT EXISTS bindings_project_ended ON bindings (project_id, ended_at DESC)`];
 
-// BB-300 slice 4: the durable huddle record. One row per huddle; a project
-// holds one at a time and `latestHuddle` is the project's record. `transcript`
+// BB-300 slice 4: the durable stand-up record. One row per stand-up; a project
+// holds one at a time and `latestStandup` is the project's record. `transcript`
 // is the ordered event log (notes taken and retracted, items confirmed, the
 // end), `notes` the model's typed and free notes, and `confirmed` the note ids
 // the owner has confirmed one by one. A new table, so nothing existing is
-// altered and a store from before this step behaves exactly as before.
+// altered and a store from before this step behaves exactly as before. The
+// table shipped as `huddles`; `STANDUP_MIGRATIONS` renames it.
 export const HUDDLE_MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS huddles (
      id TEXT PRIMARY KEY,
@@ -690,7 +691,17 @@ export const HUDDLE_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS huddles_project_started ON huddles (project_id, started_at DESC)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS];
+// The feature is a stand-up in stewards (a huddle is the voice-transcription
+// plugin's word for the session it opens). The table shipped as `huddles` and
+// the shipped statements above are append-only, so the rename is its own step:
+// the table and the project-scoped "last stand-up" settings key move to the
+// new name, data intact, and a store from before this step is read as before.
+export const STANDUP_MIGRATIONS = [
+  `ALTER TABLE huddles RENAME TO standups`,
+  `UPDATE server_settings SET key = 'stewards:last-standup:' || substr(key, length('stewards:last-huddle:') + 1) WHERE key LIKE 'stewards:last-huddle:%'`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1283,11 +1294,11 @@ export function needChoices(n: Pick<Need, "data">): string[] {
 }
 
 /**
- * BB-300 slice 4: one note in a durable huddle record. Structurally the
- * `HuddleNote` the huddle tools take; kept here so the store owns the row
- * shape and `huddle.ts` can import it without a runtime cycle.
+ * BB-300 slice 4: one note in a durable stand-up record. Structurally the
+ * `StandupNote` the stand-up tools take; kept here so the store owns the row
+ * shape and `standup.ts` can import it without a runtime cycle.
  */
-export type HuddleNoteRow = {
+export type StandupNoteRow = {
   id: string;
   type: string;
   /** The note in the owner's words. */
@@ -1305,8 +1316,8 @@ export type HuddleNoteRow = {
   createdAt: number;
 };
 
-/** One event in a huddle's transcript: a note taken or retracted, an item confirmed, the end. */
-export type HuddleTranscriptEntry = {
+/** One event in a stand-up's transcript: a note taken or retracted, an item confirmed, the end. */
+export type StandupTranscriptEntry = {
   at: number;
   kind: "note" | "retract" | "confirm" | "end";
   noteId: string | null;
@@ -1314,16 +1325,16 @@ export type HuddleTranscriptEntry = {
   text: string;
 };
 
-/** A durable huddle record (BB-300 slice 4): the session, its notes and what the owner confirmed. */
-export type HuddleRow = {
+/** A durable stand-up record (BB-300 slice 4): the session, its notes and what the owner confirmed. */
+export type StandupRow = {
   id: string;
   projectId: string;
   startedAt: number;
   endedAt: number | null;
   /** True once the overlay connected and the model called a tool. */
   connected: boolean;
-  transcript: HuddleTranscriptEntry[];
-  notes: HuddleNoteRow[];
+  transcript: StandupTranscriptEntry[];
+  notes: StandupNoteRow[];
   /** The ids of the notes the owner confirmed one by one; nothing else is applied. */
   confirmed: string[];
 };
@@ -1716,14 +1727,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const insertDivergenceStmt = lazy<[string, string, string, string, string, string, number, number], unknown>(
     "INSERT INTO assessment_divergences (id, binding_id, surface, old, new, inputs, first_seen_at, last_seen_at, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1) ON CONFLICT (binding_id, surface, old, new) DO UPDATE SET last_seen_at = excluded.last_seen_at, inputs = excluded.inputs, count = count + 1",
   );
-  // BB-300 slice 4: the durable huddle record. One row per huddle, read by id
+  // BB-300 slice 4: the durable stand-up record. One row per stand-up, read by id
   // for a session and by project for the readback and the next wake. Prepared
   // lazily, like the assessment statements: a legacy store opened without the
   // migration must still start (migrations.test.ts).
-  const insertHuddleStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO huddles (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed)");
-  const getHuddleStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM huddles WHERE id = ?");
-  const latestHuddleStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM huddles WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
-  const updateHuddleStmt = lazy<[Record<string, unknown>], unknown>("UPDATE huddles SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed WHERE id = @id");
+  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed)");
+  const getStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE id = ?");
+  const latestStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
+  const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed WHERE id = @id");
   const divergencesAllStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessment_divergences ORDER BY last_seen_at DESC, surface");
   const divergencesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? ORDER BY last_seen_at DESC, surface");
   const divergencesBySurfaceStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE surface = ? ORDER BY last_seen_at DESC, binding_id");
@@ -1949,7 +1960,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     worker: parseJson(r.worker),
     liveness: parseJson(r.liveness),
   });
-  const huddleNoteRowSchema = z.object({
+  const standupNoteRowSchema = z.object({
     id: z.string(),
     type: z.string(),
     text: z.string(),
@@ -1960,15 +1971,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
     needLabel: z.string().nullable().default(null),
     createdAt: z.number(),
   });
-  const huddleTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string() });
-  const toHuddle = (r: Record<string, unknown>): HuddleRow => ({
+  const standupTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string() });
+  const toStandup = (r: Record<string, unknown>): StandupRow => ({
     id: String(r.id),
     projectId: String(r.project_id),
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null || r.ended_at === undefined ? null : Number(r.ended_at),
     connected: Number(r.connected) !== 0,
-    transcript: json(z.array(huddleTranscriptSchema), r.transcript === null || r.transcript === undefined ? null : String(r.transcript), []),
-    notes: json(z.array(huddleNoteRowSchema), r.notes === null || r.notes === undefined ? null : String(r.notes), []),
+    transcript: json(z.array(standupTranscriptSchema), r.transcript === null || r.transcript === undefined ? null : String(r.transcript), []),
+    notes: json(z.array(standupNoteRowSchema), r.notes === null || r.notes === undefined ? null : String(r.notes), []),
     confirmed: json(z.array(z.string()), r.confirmed === null || r.confirmed === undefined ? null : String(r.confirmed), []),
   });
   const toDivergenceRow = (r: Record<string, unknown>): DivergenceRow => ({
@@ -3176,46 +3187,46 @@ export function createStore(db: Database.Database, now: () => number, options: S
       db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
     },
     /**
-     * When a project last held a huddle, or null (BB-300). Kept in the server
-     * settings table under a project-scoped key so "since the last huddle" is
-     * storable now, with no migration; the durable huddle record gets its own
+     * When a project last held a stand-up, or null (BB-300). Kept in the server
+     * settings table under a project-scoped key so "since the last stand-up" is
+     * storable now, with no migration; the durable stand-up record gets its own
      * table and migration in slice 4.
      */
-    lastHuddle(projectId: string): number | null {
-      const r = db.prepare<[string], { value: string }>("SELECT value FROM server_settings WHERE key = ?").get(`stewards:last-huddle:${projectId}`);
+    lastStandup(projectId: string): number | null {
+      const r = db.prepare<[string], { value: string }>("SELECT value FROM server_settings WHERE key = ?").get(`stewards:last-standup:${projectId}`);
       return r === undefined ? null : Number(r.value);
     },
-    /** Record when a project last held a huddle (BB-300). */
-    setLastHuddle(projectId: string, at: number): void {
-      db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`stewards:last-huddle:${projectId}`, String(at));
+    /** Record when a project last held a stand-up (BB-300). */
+    setLastStandup(projectId: string, at: number): void {
+      db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`stewards:last-standup:${projectId}`, String(at));
     },
 
-    // BB-300 slice 4: the durable huddle record. The server opens one when a
-    // huddle starts, saves the model's notes as tools take and retract them,
+    // BB-300 slice 4: the durable stand-up record. The server opens one when a
+    // stand-up starts, saves the model's notes as tools take and retract them,
     // confirms each item the owner confirms, and reads it back for the page and
-    // the project steward's next wake. The record is the only thing a huddle
+    // the project steward's next wake. The record is the only thing a stand-up
     // writes; nothing here acts on a binding, a need, an escalation or a merge.
-    /** Open a huddle record and return it. */
-    createHuddle(fields: { id: string; projectId: string; startedAt: number }): HuddleRow {
-      insertHuddleStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]" });
-      return toHuddle(getHuddleStmt().get(fields.id)!);
+    /** Open a stand-up record and return it. */
+    createStandup(fields: { id: string; projectId: string; startedAt: number }): StandupRow {
+      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]" });
+      return toStandup(getStandupStmt().get(fields.id)!);
     },
-    /** One huddle by id, or null. */
-    huddle(id: string): HuddleRow | null {
-      const r = getHuddleStmt().get(id);
-      return r === undefined ? null : toHuddle(r);
+    /** One stand-up by id, or null. */
+    standup(id: string): StandupRow | null {
+      const r = getStandupStmt().get(id);
+      return r === undefined ? null : toStandup(r);
     },
-    /** A project's latest huddle, open or ended, or null when it has never held one. */
-    latestHuddle(projectId: string): HuddleRow | null {
-      const r = latestHuddleStmt().get(projectId);
-      return r === undefined ? null : toHuddle(r);
+    /** A project's latest stand-up, open or ended, or null when it has never held one. */
+    latestStandup(projectId: string): StandupRow | null {
+      const r = latestStandupStmt().get(projectId);
+      return r === undefined ? null : toStandup(r);
     },
-    /** Replace a huddle's mutable columns; the notes and transcript the caller passes are stored whole. */
-    saveHuddle(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: HuddleTranscriptEntry[]; notes?: HuddleNoteRow[]; confirmed?: string[] }): HuddleRow | null {
-      const current = getHuddleStmt().get(id);
+    /** Replace a stand-up's mutable columns; the notes and transcript the caller passes are stored whole. */
+    saveStandup(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: StandupTranscriptEntry[]; notes?: StandupNoteRow[]; confirmed?: string[] }): StandupRow | null {
+      const current = getStandupStmt().get(id);
       if (current === undefined) return null;
-      const row = toHuddle(current);
-      updateHuddleStmt().run({
+      const row = toStandup(current);
+      updateStandupStmt().run({
         id,
         ended_at: fields.endedAt === undefined ? row.endedAt : fields.endedAt,
         connected: (fields.connected === undefined ? row.connected : fields.connected) ? 1 : 0,
@@ -3223,7 +3234,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         notes: JSON.stringify(fields.notes ?? row.notes),
         confirmed: JSON.stringify(fields.confirmed ?? row.confirmed),
       });
-      return toHuddle(getHuddleStmt().get(id)!);
+      return toStandup(getStandupStmt().get(id)!);
     },
 
     // BB-293: the shadow assessment and its divergence log. The reconcile

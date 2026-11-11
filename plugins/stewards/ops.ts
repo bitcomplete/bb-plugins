@@ -245,7 +245,7 @@ export const redactLine = (line: string, max = LOG_LINE_CHARS): string => {
 
 /**
  * The same credential scrub as `redactLine`, without the length clip: for text
- * that leaves the server whole (a huddle's instructions to OpenAI, a tool
+ * that leaves the server whole (a stand-up's instructions to OpenAI, a tool
  * result returned to the model) rather than as one log line. A ticket, an
  * escalation or a note can carry a pasted token.
  */

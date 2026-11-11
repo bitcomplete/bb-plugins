@@ -228,9 +228,9 @@ export function world() {
   };
   let n = 0;
 
-  // BB-300: the voice-transcription plugin as the huddle sees it. Tests set
+  // BB-300: the voice-transcription plugin as the stand-up sees it. Tests set
   // the endpoint, the AI-service status and a refusal; the default is a ready
-  // OpenAI endpoint, so a huddle can start.
+  // OpenAI endpoint, so a stand-up can start.
   const realtimeOpens: Array<{ input: Record<string, unknown>; sessionId: string }> = [];
   let voiceBaseUrl = "https://api.openai.com/v1";
   let voiceServicePresent = true;
@@ -357,7 +357,7 @@ export function world() {
   const sdk = {
     plugins: {
       callRpc,
-      // BB-300: the huddle reads the voice plugin's non-secret settings for the
+      // BB-300: the stand-up reads the voice plugin's non-secret settings for the
       // endpoint, and its AI-service status for the key.
       getSettings: async (args: { pluginId: string }) => {
         if (voiceSettingsThrow !== null) throw new Error(voiceSettingsThrow);
@@ -555,7 +555,7 @@ export function world() {
       },
     },
     system: {
-      // BB-300: the voice service's readiness for the huddle button.
+      // BB-300: the voice service's readiness for the stand-up button.
       aiServices: async () => ({
         selections: {},
         services: voiceServicePresent

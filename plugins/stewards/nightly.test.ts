@@ -31,8 +31,8 @@ describe("the nightly window", () => {
 });
 
 // BB-300: the nightly digest generalised into briefing(project, since). The
-// nightly pass is its first caller; a huddle calls it on demand with "since
-// the last huddle".
+// nightly pass is its first caller; a stand-up calls it on demand with "since
+// the last stand-up".
 describe("briefing", () => {
   const SINCE = 10_000_000;
 
@@ -73,7 +73,7 @@ describe("briefing", () => {
     return { store, now, moved, held, noWake, dated, ended, userEsc, projectEsc, stuckEsc, stallEsc, need, assumption, question };
   }
 
-  it("reads the four sections the huddle ranks, since the given moment", () => {
+  it("reads the four sections the stand-up ranks, since the given moment", () => {
     const f = fixture();
     const b = createBriefing(f.store, f.now)("p1", SINCE);
     expect(b.since).toBe(SINCE);
@@ -116,14 +116,14 @@ describe("briefing", () => {
     expect(formatRecords(records, []).join("\n")).toContain("## The record since");
   });
 
-  it("keeps 'since the last huddle' per project with no migration", () => {
+  it("keeps 'since the last stand-up' per project with no migration", () => {
     const { store } = world();
-    expect(store.lastHuddle("p1")).toBeNull();
-    store.setLastHuddle("p1", 111);
-    store.setLastHuddle("p2", 222);
-    expect(store.lastHuddle("p1")).toBe(111);
-    expect(store.lastHuddle("p2")).toBe(222);
-    store.setLastHuddle("p1", 333);
-    expect(store.lastHuddle("p1")).toBe(333);
+    expect(store.lastStandup("p1")).toBeNull();
+    store.setLastStandup("p1", 111);
+    store.setLastStandup("p2", 222);
+    expect(store.lastStandup("p1")).toBe(111);
+    expect(store.lastStandup("p2")).toBe(222);
+    store.setLastStandup("p1", 333);
+    expect(store.lastStandup("p1")).toBe(333);
   });
 });

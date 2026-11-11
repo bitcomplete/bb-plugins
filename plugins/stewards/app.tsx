@@ -759,17 +759,17 @@ function Section({ title, count, action, children }: { title: string; count?: nu
 }
 
 /**
- * BB-300: the Huddle button. It starts one spoken stand-up for a project; the
+ * BB-300: the Stand-up button. It starts one spoken stand-up for a project; the
  * voice plugin's overlay opens on its own realtime signal, so the page only
- * makes the call. It renders only when the server says a huddle is available,
+ * makes the call. It renders only when the server says a stand-up is available,
  * and the server's refusal (or a failed call) is shown in place.
  */
-function HuddleButton({ projectId, onStarted }: { projectId: string; onStarted?: () => void }) {
+function StandupButton({ projectId, onStarted }: { projectId: string; onStarted?: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
   const start = () => {
     setState("starting");
-    rpc.call("stewardsHuddleStart", { projectId }).then(
+    rpc.call("stewardsStandupStart", { projectId }).then(
       (result) => {
         setState(result.ok ? "idle" : { error: result.message });
         if (result.ok) onStarted?.();
@@ -785,7 +785,7 @@ function HuddleButton({ projectId, onStarted }: { projectId: string; onStarted?:
         disabled={state === "starting"}
         onClick={start}
       >
-        {state === "starting" ? "Starting…" : "Huddle"}
+        {state === "starting" ? "Starting…" : "Stand-up"}
       </button>
       {typeof state === "object" ? <span className="text-xs text-destructive">{state.error}</span> : null}
     </span>
@@ -793,11 +793,11 @@ function HuddleButton({ projectId, onStarted }: { projectId: string; onStarted?:
 }
 
 /**
- * BB-300: the home page's line to the Stewards page, with the Huddle button
+ * BB-300: the home page's line to the Stewards page, with the Stand-up button
  * beside it. It follows the compose surface's project; a projectless compose
  * has nothing to point at, so it renders nothing.
  */
-function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
+function StandupHomepageSection({ projectId }: PluginHomepageSectionProps) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [availability, setAvailability] = useState<{ available: boolean; message: string | null } | null>(null);
@@ -807,7 +807,7 @@ function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
       return;
     }
     let live = true;
-    rpc.call("stewardsHuddle", { projectId }).then(
+    rpc.call("stewardsStandup", { projectId }).then(
       (result) => {
         if (live) setAvailability(result);
       },
@@ -819,8 +819,8 @@ function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
       live = false;
     };
   }, [rpc, projectId]);
-  // The line is part of the huddle's surface, not an unconditional addition to
-  // every home page: a developer who cannot huddle (no key, a non-OpenAI
+  // The line is part of the stand-up's surface, not an unconditional addition to
+  // every home page: a developer who cannot standup (no key, a non-OpenAI
   // endpoint, no project steward) sees no change at all.
   if (projectId === null || availability?.available !== true) return null;
   return (
@@ -828,39 +828,39 @@ function HuddleHomepageSection({ projectId }: PluginHomepageSectionProps) {
       <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(projectId) })}>
         Open the Stewards page
       </button>
-      <HuddleButton projectId={projectId} />
+      <StandupButton projectId={projectId} />
     </div>
   );
 }
 
 /** The typed note shapes that carry an action; a free note is context only. */
-const HUDDLE_ACTION_TYPES: ReadonlySet<string> = new Set(["resolve-escalation", "gate", "guidance", "direction", "standing-rule"]);
+const STANDUP_ACTION_TYPES: ReadonlySet<string> = new Set(["resolve-escalation", "gate", "guidance", "direction", "standing-rule"]);
 
 /**
- * BB-300 slice 4: the mechanical readback of a project's huddle. The page
+ * BB-300 slice 4: the mechanical readback of a project's stand-up. The page
  * fetches the stored record and renders the server's readback lines (the model
  * only reads them aloud; it does not compose them). Each typed item is
  * confirmed on its own and applied by the server through the path that already
  * exists for its shape; nothing is applied unconfirmed. A free note is shown
- * as context with no button, and Done ends the huddle.
+ * as context with no button, and Done ends the stand-up.
  */
-function HuddleReadback({ projectId, refreshKey, onChanged }: { projectId: string; refreshKey: number; onChanged: () => void }) {
+function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: string; refreshKey: number; onChanged: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [huddle, setHuddle] = useState<HuddleRecordView | null>(null);
+  const [standup, setStandup] = useState<StandupRecordView | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(() => {
-    rpc.call("stewardsHuddleRecord", { projectId }).then(
-      (r) => setHuddle(r.huddle),
-      () => setHuddle(null),
+    rpc.call("stewardsStandupRecord", { projectId }).then(
+      (r) => setStandup(r.standup),
+      () => setStandup(null),
     );
   }, [rpc, projectId]);
   useEffect(load, [load, refreshKey]);
-  if (huddle === null || huddle.endedAt !== null) return null;
+  if (standup === null || standup.endedAt !== null) return null;
   const confirm = (noteId: string) => {
     setBusy(noteId);
     setError(null);
-    rpc.call("stewardsHuddleConfirm", { huddleId: huddle.id, noteId }).then(
+    rpc.call("stewardsStandupConfirm", { standupId: standup.id, noteId }).then(
       (r) => {
         setBusy(null);
         if (!r.ok) setError(r.message);
@@ -878,12 +878,12 @@ function HuddleReadback({ projectId, refreshKey, onChanged }: { projectId: strin
   const end = () => {
     setBusy("end");
     setError(null);
-    rpc.call("stewardsHuddleEnd", { huddleId: huddle.id }).then(
+    rpc.call("stewardsStandupEnd", { standupId: standup.id }).then(
       (r) => {
         setBusy(null);
         if (!r.ok) setError(r.message);
         else {
-          setHuddle(null);
+          setStandup(null);
           onChanged();
         }
       },
@@ -893,13 +893,13 @@ function HuddleReadback({ projectId, refreshKey, onChanged }: { projectId: strin
       },
     );
   };
-  const typed = huddle.notes.filter((n) => HUDDLE_ACTION_TYPES.has(n.type));
-  const free = huddle.notes.filter((n) => n.type === "free");
+  const typed = standup.notes.filter((n) => STANDUP_ACTION_TYPES.has(n.type));
+  const free = standup.notes.filter((n) => n.type === "free");
   const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
     <Section
-      title="Huddle readback"
-      count={huddle.notes.length}
+      title="Stand-up readback"
+      count={standup.notes.length}
       action={
         <span className="flex items-center gap-2">
           <button type="button" className={button} disabled={busy !== null} onClick={load}>
@@ -911,8 +911,8 @@ function HuddleReadback({ projectId, refreshKey, onChanged }: { projectId: strin
         </span>
       }
     >
-      {huddle.notes.length === 0 ? (
-        <None>The huddle has not recorded a note yet.</None>
+      {standup.notes.length === 0 ? (
+        <None>The stand-up has not recorded a note yet.</None>
       ) : (
         <div className="flex flex-col gap-2">
           {typed.length > 0 ? (
@@ -1065,8 +1065,8 @@ type BoardSteward = Board["stewards"][number];
 type BoardQuestion = Board["questions"][number];
 type BoardWithUser = Board["withUser"][number];
 type BoardNeed = Board["needs"][number];
-type HuddleRecordResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { huddle: unknown }> : never;
-type HuddleRecordView = NonNullable<HuddleRecordResult["huddle"]>;
+type StandupRecordResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { standup: unknown }> : never;
+type StandupRecordView = NonNullable<StandupRecordResult["standup"]>;
 
 /** One needs-you item on the page, tagged so its card knows which write the controls make. */
 type NeedsYouItem =
@@ -1183,8 +1183,8 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
   const now = useNow();
   const rpc = useRpc<typeof rpcContract>();
   const [turnOn, setTurnOn] = useState<"idle" | "running" | { error: string }>("idle");
-  // BB-300: bumped when a huddle starts, so the readback panel below reloads.
-  const [huddleRefresh, setHuddleRefresh] = useState(0);
+  // BB-300: bumped when a stand-up starts, so the readback panel below reloads.
+  const [standupRefresh, setStandupRefresh] = useState(0);
   const { efforts, orphans } = boardEfforts(b);
   const enable = () => {
     setTurnOn("running");
@@ -1241,7 +1241,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
         </p>
       ) : null}
 
-      <Section title="Waiting on you" count={orphans.length} action={b.huddle?.available === true ? <HuddleButton projectId={b.projectId} onStarted={() => setHuddleRefresh((n) => n + 1)} /> : undefined}>
+      <Section title="Waiting on you" count={orphans.length} action={b.standup?.available === true ? <StandupButton projectId={b.projectId} onStarted={() => setStandupRefresh((n) => n + 1)} /> : undefined}>
         {orphans.length === 0 ? (
           <None>Nothing is waiting on you.</None>
         ) : (
@@ -1253,7 +1253,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
         )}
       </Section>
 
-      <HuddleReadback projectId={b.projectId} refreshKey={huddleRefresh} onChanged={refetch} />
+      <StandupReadback projectId={b.projectId} refreshKey={standupRefresh} onChanged={refetch} />
 
       <p data-board-count-line="" className="text-muted-foreground">
         {boardCountLine(efforts, b.ended.length)}
@@ -3368,12 +3368,12 @@ export default definePluginApp((app) => {
       getStewardsSidebarCommand()?.compose();
     },
   });
-  // BB-300: the home page's line to the Stewards page, carrying the Huddle
-  // button when a huddle is available for the project in view.
+  // BB-300: the home page's line to the Stewards page, carrying the Stand-up
+  // button when a stand-up is available for the project in view.
   app.slots.homepageSection({
-    id: "huddle",
+    id: "stand-up",
     title: "Stewards",
-    component: HuddleHomepageSection,
+    component: StandupHomepageSection,
   });
   app.slots.navPanel({
     id: "board",

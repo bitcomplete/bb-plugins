@@ -1546,11 +1546,11 @@ describe("the Stewards page's data age and refresh (BB-205)", () => {
   });
 });
 
-// BB-300 slice 3: the Huddle button on the project view and the home page's
+// BB-300 slice 3: the Stand-up button on the project view and the home page's
 // line to the Stewards page. The button renders only when the server says a
-// huddle is available, and it starts one through the RPC.
-describe("the Huddle button (BB-300)", () => {
-  const renderBoardWithHuddle = async (huddle: { available: boolean; message: string | null } | undefined): Promise<RenderedSlot> => {
+// stand-up is available, and it starts one through the RPC.
+describe("the Stand-up button (BB-300)", () => {
+  const renderBoardWithStandup = async (standup: { available: boolean; message: string | null } | undefined): Promise<RenderedSlot> => {
     const captured = await loadApp();
     const panel = captured.navPanels[0]!;
     return renderSlot(panel, { subPath: "" }, {
@@ -1573,67 +1573,67 @@ describe("the Huddle button (BB-300)", () => {
             stewards: [],
             stuck: [],
             ended: [],
-            ...(huddle === undefined ? {} : { huddle }),
+            ...(standup === undefined ? {} : { standup }),
           },
         }),
-        stewardsHuddleStart: () => ({ ok: true, sessionId: "sess_1", message: "Huddle started." }),
+        stewardsStandupStart: () => ({ ok: true, sessionId: "sess_1", message: "Stand-up started." }),
       } as never,
     });
   };
 
-  it("shows the button beside Waiting on you when a huddle is available, and starts one", async () => {
-    const slot = await renderBoardWithHuddle({ available: true, message: null });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Huddle" })).toBeTruthy());
-    fireEvent.click(slot.getByRole("button", { name: "Huddle" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsHuddleStart", input: { projectId: "p1" } }));
+  it("shows the button beside Waiting on you when a stand-up is available, and starts one", async () => {
+    const slot = await renderBoardWithStandup({ available: true, message: null });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Stand-up" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1" } }));
     slot.lifecycle.unmount();
   });
 
-  it("shows no button when a huddle is unavailable", async () => {
-    const slot = await renderBoardWithHuddle({ available: false, message: "no key" });
+  it("shows no button when a stand-up is unavailable", async () => {
+    const slot = await renderBoardWithStandup({ available: false, message: "no key" });
     await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
-    expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Stand-up" })).toBeNull();
     slot.lifecycle.unmount();
   });
 
   it("shows the home page line and button, pointing at the project's Stewards page", async () => {
     const captured = await loadApp();
-    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
+    const section = captured.homepageSections.find((s) => s.id === "stand-up")!;
     const slot = renderSlot(section, { projectId: "p1" }, {
       rpc: {
-        stewardsHuddle: () => ({ available: true, message: null }),
-        stewardsHuddleStart: () => ({ ok: true, sessionId: "sess_1", message: "Huddle started." }),
+        stewardsStandup: () => ({ available: true, message: null }),
+        stewardsStandupStart: () => ({ ok: true, sessionId: "sess_1", message: "Stand-up started." }),
       } as never,
     });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Huddle" })).toBeTruthy());
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
     expect(slot.getByRole("button", { name: "Open the Stewards page" })).toBeTruthy();
     fireEvent.click(slot.getByRole("button", { name: "Open the Stewards page" }));
     await waitFor(() => expect(slot.inspection.navigateCalls.some((call) => call.method === "toPluginPanel")).toBe(true));
     slot.lifecycle.unmount();
   });
 
-  it("renders nothing on the home page when a huddle is unavailable", async () => {
+  it("renders nothing on the home page when a stand-up is unavailable", async () => {
     const captured = await loadApp();
-    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
-    const slot = renderSlot(section, { projectId: "p1" }, { rpc: { stewardsHuddle: () => ({ available: false, message: "no key" }) } as never });
-    await waitFor(() => expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull());
+    const section = captured.homepageSections.find((s) => s.id === "stand-up")!;
+    const slot = renderSlot(section, { projectId: "p1" }, { rpc: { stewardsStandup: () => ({ available: false, message: "no key" }) } as never });
+    await waitFor(() => expect(slot.queryByRole("button", { name: "Stand-up" })).toBeNull());
     expect(slot.queryByRole("button", { name: "Open the Stewards page" })).toBeNull();
     slot.lifecycle.unmount();
   });
 
   it("renders nothing on the home page without a project", async () => {
     const captured = await loadApp();
-    const section = captured.homepageSections.find((s) => s.id === "huddle")!;
+    const section = captured.homepageSections.find((s) => s.id === "stand-up")!;
     const slot = renderSlot(section, { projectId: null }, { rpc: {} as never });
-    expect(slot.queryByRole("button", { name: "Huddle" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Stand-up" })).toBeNull();
     slot.lifecycle.unmount();
   });
 
   // BB-300 slice 4: the readback renders the stored readback lines, confirms
   // each typed item on its own, and shows a free note as context with no button.
   const recordResult = {
-    huddle: {
-      id: "hud_1",
+    standup: {
+      id: "sup_1",
       projectId: "p1",
       startedAt: 1,
       endedAt: null,
@@ -1668,12 +1668,12 @@ describe("the Huddle button (BB-300)", () => {
             stewards: [],
             stuck: [],
             ended: [],
-            huddle: { available: true, message: null },
+            standup: { available: true, message: null },
           },
         }),
-        stewardsHuddleRecord: () => recordResult,
-        stewardsHuddleConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
-        stewardsHuddleEnd: () => ({ ok: true, message: "Huddle ended." }),
+        stewardsStandupRecord: () => recordResult,
+        stewardsStandupConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
+        stewardsStandupEnd: () => ({ ok: true, message: "Stand-up ended." }),
       } as never,
     });
   };
@@ -1685,19 +1685,19 @@ describe("the Huddle button (BB-300)", () => {
     expect(slot.getByText("A passing thought")).toBeTruthy();
     expect(slot.getAllByRole("button", { name: "Confirm" })).toHaveLength(1);
     fireEvent.click(slot.getByRole("button", { name: "Confirm" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsHuddleConfirm", input: { huddleId: "hud_1", noteId: "note_1" } }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupConfirm", input: { standupId: "sup_1", noteId: "note_1" } }));
     slot.lifecycle.unmount();
   });
 
-  it("ends the huddle from the readback panel", async () => {
+  it("ends the stand-up from the readback panel", async () => {
     const slot = await renderBoardWithRecord();
     await waitFor(() => expect(slot.getByRole("button", { name: "Done" })).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: "Done" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsHuddleEnd", input: { huddleId: "hud_1" } }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupEnd", input: { standupId: "sup_1" } }));
     slot.lifecycle.unmount();
   });
 
-  it("shows no readback when there is no open huddle", async () => {
+  it("shows no readback when there is no open stand-up", async () => {
     const captured = await loadApp();
     const panel = captured.navPanels[0]!;
     const slot = renderSlot(panel, { subPath: "" }, {
@@ -1722,11 +1722,11 @@ describe("the Huddle button (BB-300)", () => {
             ended: [],
           },
         }),
-        stewardsHuddleRecord: () => ({ huddle: null }),
+        stewardsStandupRecord: () => ({ standup: null }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
-    expect(slot.queryByText("Huddle readback")).toBeNull();
+    expect(slot.queryByText("Stand-up readback")).toBeNull();
     slot.lifecycle.unmount();
   });
 });
