@@ -187,7 +187,11 @@ export async function materializeRepo(args: MaterializeArgs): Promise<WorkspaceR
         if (base === null) return { kind: "no-branch", base: null };
         if (!(await cacheHasBranch(cache.path, base, args.signal))) return { kind: "no-branch", base };
 
-        if (await reflinkSupported(cacheRoot(args.dataDir), args.root)) {
+        // Probe the directory the per-thread roots live in, not the root
+        // itself: they are the same filesystem, and keying on the parent lets
+        // one process decide once for every thread instead of re-probing per
+        // thread start.
+        if (await reflinkSupported(cacheRoot(args.dataDir), path.dirname(args.root))) {
           const template = await ensureTemplate({
             dataDir: args.dataDir,
             url: args.repo.url,

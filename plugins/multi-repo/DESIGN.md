@@ -162,11 +162,14 @@ one another and a copy of `main` would carry `main/next`'s files.
 Materializing a repo, under the entry lock:
 
 1. `ensureCache` as above.
-2. Bring the template to the fetched tip: `git reset --hard <sha of
-   refs/heads/<base> in the cache>` then `git clean -fdx`. Before use, confirm
-   `git status --porcelain` is empty and HEAD equals the cache ref; a template
-   that still does not verify is rebuilt from scratch (`rm` + `clone --shared`),
-   never repaired.
+2. Bring the template to the fetched tip: `git fetch --prune origin` (local,
+   from the bare cache), then `git reset --hard <sha of refs/heads/<base> in
+   the cache>` and `git clean -fdx`. The fetch is what moves
+   `refs/remotes/origin/*`; `reset --hard` moves only the local branch, and a
+   copy inherits whatever the template has. Before use, confirm `git status
+   --porcelain` is empty and both HEAD and `refs/remotes/origin/<base>` equal
+   the cache ref; a template that still does not verify is rebuilt from
+   scratch (`rm` + `clone --shared`), never repaired.
 3. `cp -a --reflink=always <template> <dest>`. This copies the tree and the
    template's small `.git` (index, refs, config, the absolute alternates
    pointer).
@@ -178,11 +181,12 @@ The reset and the copy share the entry lock, so a copy never observes a
 half-refreshed template.
 
 **Probe and fallback.** Reflinks only work within one filesystem/pool, so the
-plugin decides once per process per (cache root, workspace root) pair by
+plugin decides once per process per (cache root, workspaces directory) pair by
 trying it: write a small file under the cache root and `cp --reflink=always`
-it into the workspace root. On failure the template is never built and the
-ordinary `git clone --shared` path runs exactly as before. There is no "plain
-copy" middle option.
+it into the workspaces directory. (The per-thread roots are all its children
+on one filesystem, so keying on the parent keeps the probe off every thread
+start.) On failure the template is never built and the ordinary `git clone
+--shared` path runs exactly as before. There is no "plain copy" middle option.
 
 **Index trust.** The copied index holds the template's inode numbers and
 ctimes, so a default `git status` would rehash the whole tree on first run.

@@ -231,13 +231,14 @@ root and the workspace root share a filesystem that supports reflinks (ZFS
 with block cloning, btrfs, XFS), a workspace repo is a `cp -a
 --reflink=always` copy-on-write copy of the template — near-instant, no disk
 until a file is modified, and the full tree with nothing to hint or widen.
-The plugin decides once per process per (cache root, workspace root) pair by
-trying it: write a small file under the cache root and `cp --reflink=always`
-it into the workspace root. Reflinks only work within one filesystem/pool, so
-a machine that keeps workspaces elsewhere gets the ordinary `git clone
---shared` path, unchanged; there is no "plain copy" middle option. Before a
-copy the template is reset to the cache ref and verified clean, and a template
-that does not verify is rebuilt from scratch. The copy and the reset share the
+The plugin decides once per process per (cache root, workspaces directory)
+pair by trying it: write a small file under the cache root and `cp
+--reflink=always` it into the workspaces directory. Reflinks only work within
+one filesystem/pool, so a machine that keeps workspaces elsewhere gets the
+ordinary `git clone --shared` path, unchanged; there is no "plain copy" middle
+option. Before a copy the template's remote-tracking refs are fetched from the
+cache and it is reset to the cache ref and verified clean, and a template that
+does not verify is rebuilt from scratch. The copy and the reset share the
 cache entry's lock, so a copy never observes a half-refreshed template.
 `core.checkStat=minimal` on the template — inherited by every copy — keeps a
 fresh workspace's first `git status` from rehashing the tree against the

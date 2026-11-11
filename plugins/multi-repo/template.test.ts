@@ -99,7 +99,7 @@ describe("materializing from the template tree", () => {
     const remote = await makeRemote("alpha");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    const supported = await reflinkSupported(cacheRoot(dataDir), root);
+    const supported = await reflinkSupported(cacheRoot(dataDir), path.dirname(root));
     if (!supported) return;
 
     const result = await provision({ dataDir, pathKey: "thread1", source, url: remote });
@@ -129,7 +129,7 @@ describe("materializing from the template tree", () => {
     const remote = await makeRemote("alpha");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    if (!(await reflinkSupported(cacheRoot(dataDir), root))) return;
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
 
     const result = await provision({ dataDir, pathKey: "thread1", source, url: remote });
     const repo = result.repos.find((entry) => entry.dir === "alpha")!;
@@ -153,7 +153,7 @@ describe("materializing from the template tree", () => {
     const remote = await makeRemote("alpha");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    if (!(await reflinkSupported(cacheRoot(dataDir), root))) return;
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
 
     await provision({ dataDir, pathKey: "thread1", source, url: remote });
     const template = templatePathFor(dataDir, remote, "main");
@@ -175,7 +175,7 @@ describe("materializing from the template tree", () => {
     const remote = await makeRemote("alpha");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    if (!(await reflinkSupported(cacheRoot(dataDir), root))) return;
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
 
     // A directory at the template path that git cannot use: the refresh must
     // rebuild it from scratch rather than try to repair it field by field.
@@ -195,7 +195,7 @@ describe("materializing from the template tree", () => {
     const remote = await makeRemote("alpha");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    if (!(await reflinkSupported(cacheRoot(dataDir), root))) return;
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
 
     await provision({ dataDir, pathKey: "thread1", source, url: remote });
     const template = templatePathFor(dataDir, remote, "main");
@@ -204,12 +204,21 @@ describe("materializing from the template tree", () => {
     await writeFile(path.join(remote, "later.txt"), "later\n", "utf8");
     await gitIn(remote, ["add", "-A"]);
     await gitIn(remote, ["commit", "--quiet", "-m", "later"]);
+    // A branch that did not exist when the template was built: its
+    // remote-tracking ref has to reach the copy too, or `git branch -r` and a
+    // fetch-based merge base miss it.
+    await gitIn(remote, ["branch", "feature-new"]);
     const remoteHead = await gitLine(remote, ["rev-parse", "HEAD"]);
+    const featureHead = await gitLine(remote, ["rev-parse", "feature-new"]);
 
     const second = await provision({ dataDir, pathKey: "thread2", source, url: remote });
     const repo = second.repos.find((entry) => entry.dir === "alpha")!;
     expect(await gitLine(repo.path, ["rev-parse", "HEAD"])).toBe(remoteHead);
     expect(await gitLine(template, ["rev-parse", "HEAD"])).toBe(remoteHead);
+    // The reset moves HEAD; only the fetch moves the remote-tracking refs, and
+    // the copy inherits them.
+    expect(await gitLine(repo.path, ["rev-parse", "refs/remotes/origin/main"])).toBe(remoteHead);
+    expect(await gitLine(repo.path, ["rev-parse", "refs/remotes/origin/feature-new"])).toBe(featureHead);
     expect(before).not.toBe(remoteHead);
   });
 
@@ -217,7 +226,7 @@ describe("materializing from the template tree", () => {
     const remote = await makeRemote("alpha", "trunk");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    if (!(await reflinkSupported(cacheRoot(dataDir), root))) return;
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
 
     await gitIn(remote, ["branch", "release/1.0"]);
     const result = await provision({ dataDir, pathKey: "thread1", source, url: remote, branch: "release/1.0" });
@@ -243,7 +252,7 @@ describe("the clone fallback when the probe fails", () => {
       const source = await projectSource();
       const root = workspaceRoot(shm, "thread1");
       // tmpfs does not support reflinks, so the probe must fail.
-      if (await reflinkSupported(cacheRoot(shm), root)) return;
+      if (await reflinkSupported(cacheRoot(shm), path.dirname(root))) return;
 
       const result = await provision({ dataDir: shm, pathKey: "thread1", source, url: remote });
       const repo = result.repos.find((entry) => entry.dir === "alpha")!;
@@ -272,12 +281,16 @@ describe("the background sweep and the templates", () => {
     const remote = await makeRemote("alpha");
     const source = await projectSource();
     const root = workspaceRoot(dataDir, "thread1");
-    if (!(await reflinkSupported(cacheRoot(dataDir), root))) return;
+    if (!(await reflinkSupported(cacheRoot(dataDir), path.dirname(root)))) return;
 
     await provision({ dataDir, pathKey: "thread1", source, url: remote });
     const template = templatePathFor(dataDir, remote, "main");
     await writeFile(path.join(template, "scratch.txt"), "left over\n", "utf8");
     await writeFile(path.join(template, "README.md"), "tampered\n", "utf8");
+    await writeFile(path.join(remote, "swept.txt"), "new\n", "utf8");
+    await gitIn(remote, ["add", "-A"]);
+    await gitIn(remote, ["commit", "--quiet", "-m", "swept"]);
+    const remoteHead = await gitLine(remote, ["rev-parse", "HEAD"]);
 
     // A second repo whose cache exists but which no thread has materialized:
     // the sweep must not build a template for it.
@@ -288,10 +301,13 @@ describe("the background sweep and the templates", () => {
 
     await refreshCaches(dataDir, [remote, untouched], 0, undefined);
 
-    // Existing template: reset, and left clean.
+    // Existing template: reset to the new tip, remote-tracking refs synced,
+    // and left clean.
     expect((await gitIn(template, ["status", "--porcelain"])).stdout.trim()).toBe("");
     expect(await exists(path.join(template, "scratch.txt"))).toBe(false);
     expect(await readFile(path.join(template, "README.md"), "utf8")).toBe("# alpha\n");
+    expect(await gitLine(template, ["rev-parse", "HEAD"])).toBe(remoteHead);
+    expect(await gitLine(template, ["rev-parse", "refs/remotes/origin/main"])).toBe(remoteHead);
     // No template: still none.
     expect(await exists(untouchedTemplate)).toBe(false);
   });

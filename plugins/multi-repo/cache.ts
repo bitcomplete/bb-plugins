@@ -320,9 +320,18 @@ async function isGitWorktree(dir: string, options: RunOptions): Promise<boolean>
   return (await gitLine(dir, ["rev-parse", "--is-inside-work-tree"], options)) === "true";
 }
 
-/** A template is usable only when HEAD is exactly `sha` and the tree is clean. */
-async function templateIsAt(template: string, sha: string, options: RunOptions): Promise<boolean> {
+/** A template is usable only when HEAD and `origin/<base>` are `sha` and the tree is clean. */
+async function templateIsAt(template: string, sha: string, base: string, options: RunOptions): Promise<boolean> {
   if ((await gitLine(template, ["rev-parse", "HEAD"], options)) !== sha) return false;
+  // The remote-tracking ref is what the diff layer's merge base resolves
+  // through, so a stale one makes commits that landed on the base since the
+  // template was built look like the thread's own work.
+  const remoteRef = await gitLine(
+    template,
+    ["rev-parse", "--verify", `refs/remotes/origin/${base}^{commit}`],
+    options,
+  );
+  if (remoteRef !== sha) return false;
   return (await gitLine(template, ["status", "--porcelain"], options)) === "";
 }
 
@@ -360,15 +369,21 @@ export async function ensureTemplate(args: {
   // the template's own status trusts size and mtime rather than rehashing the
   // tree. It lives in the template's config and every copy inherits it.
   const minimal = () => gitIn(template, ["config", "core.checkStat", "minimal"], options);
+  // The template's `origin` is the bare cache. Fetching here is local, moves no
+  // objects (alternates already reach them), and brings every
+  // `refs/remotes/origin/*` up to the cache's current branches, which
+  // `reset --hard` does not touch.
+  const syncRefs = () => gitIn(template, ["fetch", "--prune", "--quiet", "origin"], options);
 
   let usable = false;
   if (await isGitWorktree(template, options)) {
     await minimal();
-    usable = await templateIsAt(template, sha, options);
+    usable = await templateIsAt(template, sha, args.base, options);
     if (!usable) {
+      await syncRefs();
       await gitIn(template, ["reset", "--hard", "--quiet", sha], options);
       await gitIn(template, ["clean", "-fdx", "--quiet"], options);
-      usable = await templateIsAt(template, sha, options);
+      usable = await templateIsAt(template, sha, args.base, options);
     }
   }
   if (!usable) {
@@ -380,7 +395,7 @@ export async function ensureTemplate(args: {
     );
     if (cloned.code !== 0) return null;
     await minimal();
-    usable = await templateIsAt(template, sha, options);
+    usable = await templateIsAt(template, sha, args.base, options);
     if (!usable) return null;
   }
   return template;
@@ -435,6 +450,11 @@ async function resetTemplates(args: {
     if (!(await isGitWorktree(template, options))) continue;
     const sha = await gitLine(args.cachePath, ["rev-parse", "--verify", `refs/heads/${base}^{commit}`], options);
     if (sha === null) continue;
+    // Sync remote-tracking refs first, so the reset leaves a template a copy
+    // can trust; a failed fetch leaves it for the next materialize to refresh
+    // or rebuild.
+    const synced = await gitIn(template, ["fetch", "--prune", "--quiet", "origin"], options);
+    if (synced.code !== 0) continue;
     await gitIn(template, ["reset", "--hard", "--quiet", sha], options);
     await gitIn(template, ["clean", "-fdx", "--quiet"], options);
     await gitIn(template, ["config", "core.checkStat", "minimal"], options);
