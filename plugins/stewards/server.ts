@@ -9091,14 +9091,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // session must not answer tool calls and the project's record is its
           // latest huddle, not a lock. An earlier record the owner never ended
           // is finished first, so its confirmed items and free notes still
-          // reach the project steward and the window still advances.
-          for (const [sid, hid] of huddleSessions) {
-            const open = store.huddle(hid);
-            if (open?.projectId === projectId) {
-              huddleSessions.delete(sid);
-              await finishHuddle(open);
-            }
-          }
+          // reach the project steward and the window still advances. The open
+          // record is found in the store, not the in-memory session map, so it
+          // survives a server restart that empties the map.
+          for (const [sid, hid] of huddleSessions) if (store.huddle(hid)?.projectId === projectId) huddleSessions.delete(sid);
+          const open = store.latestHuddle(projectId);
+          if (open !== null && open.endedAt === null) await finishHuddle(open);
           // The record is opened before the voice session, so a tool call that
           // arrives immediately finds it.
           const record = store.createHuddle({ id: newId("hud"), projectId, startedAt: now() });

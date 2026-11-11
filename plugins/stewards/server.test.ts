@@ -15001,16 +15001,19 @@ describe("the huddle (BB-300)", () => {
     expect(t.hooks.store.escalation(x.id)!.status).toBe("resolved");
   });
 
-  it("finishes an abandoned huddle when a new one starts", async () => {
+  it("finishes an abandoned huddle found in the store when a new one starts", async () => {
     const t = await adopted();
-    const first = await startHuddle(t);
-    await takeNote(t, first.sessionId, { type: "free", text: "Remember the cache idea" });
+    // A record left open by a huddle whose session is gone: a server restart
+    // empties the in-memory session map, so the store must be the source.
+    const old = t.hooks.store.createHuddle({ id: "hud_old", projectId: "p1", startedAt: t.now() });
+    t.hooks.store.saveHuddle(old.id, { notes: [{ id: "note_old", type: "free", text: "Remember the cache idea", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: t.now() }] });
     await t.flush();
     const before = t.sends.length;
     await startHuddle(t);
     await t.flush();
     const wake = t.sends.slice(before).find((s) => s.threadId === t.project);
     expect(wake?.text).toContain("Remember the cache idea");
+    expect(t.hooks.store.huddle(old.id)!.endedAt).not.toBeNull();
     expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
   });
 
