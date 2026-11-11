@@ -164,7 +164,8 @@ safe — the check is root-relative.
 so every `git commit` would fail on a sandboxed write to `objects`/`refs`. A
 clone puts `.git` **inside** `cwd`, where it is writable. `--shared` makes the
 objects resolve from a per-machine cache, so the disk cost of a clone is close
-to a worktree's.
+to a worktree's — and on a reflink-capable filesystem the tree itself is a
+copy-on-write copy of the cache's template rather than a fresh checkout.
 
 A second benefit: two threads cannot both check out `main` as worktrees of one
 repo, but independent clones can — and `.bb` is on its default branch in every
@@ -223,10 +224,31 @@ Cache repos are alternates targets, so `gc.auto=0` and `gc.pruneExpire=never`
 are set on them and repacking uses `git gc --no-prune`: an automatic prune
 could delete an object only a borrowing clone still references.
 
+Beside the bare store, `<plugin host-data>/repos/<key>.tree/<base>/` is a
+**template**: a normal `--shared` clone checked out at base branch `<base>`,
+never worked in, one per base branch a thread has asked for. When the cache
+root and the workspace root share a filesystem that supports reflinks (ZFS
+with block cloning, btrfs, XFS), a workspace repo is a `cp -a
+--reflink=always` copy-on-write copy of the template — near-instant, no disk
+until a file is modified, and the full tree with nothing to hint or widen.
+The plugin decides once per process per (cache root, workspaces directory)
+pair by trying it: write a small file under the cache root and `cp
+--reflink=always` it into the workspaces directory. Reflinks only work within
+one filesystem/pool, so a machine that keeps workspaces elsewhere gets the
+ordinary `git clone --shared` path, unchanged; there is no "plain copy" middle
+option. Before a copy the template's remote-tracking refs are fetched from the
+cache and it is reset to the cache ref and verified clean, and a template that
+does not verify is rebuilt from scratch. The copy and the reset share the
+cache entry's lock, so a copy never observes a half-refreshed template.
+`core.checkStat=minimal` on the template — inherited by every copy — keeps a
+fresh workspace's first `git status` from rehashing the tree against the
+template's inodes and ctimes.
+
 Concurrent thread creation against one cache entry is the expected case, so
 access is serialized by a real cross-process file lock with a heartbeat and a
-staleness window. A background sweep keeps existing entries warm hourly so a
-cold start stays rare rather than routine.
+staleness window. A background sweep keeps existing entries warm hourly —
+fetching them and resetting the templates they already have — so a cold start
+stays rare rather than routine. It resets existing templates and creates none.
 
 ### The agent's view
 
@@ -392,9 +414,10 @@ Accepted consequences, not bugs.
   the environment for a fork, and a plugin cannot provision a second workspace
   for an environment core considers provisioned. Sharing is surfaced rather
   than prevented.
-- **A rebuild re-clones.** `pathKeys: "per-thread"` means a rebuild takes a
-  fresh key to avoid dead paths. The object cache keeps that cost local rather
-  than networked.
+- **A rebuild re-materializes every repo.** `pathKeys: "per-thread"` means a
+  rebuild takes a fresh key to avoid dead paths. The object cache keeps the
+  objects local, and on a reflink-capable filesystem the working tree is a
+  copy of the template rather than a fresh checkout.
 - **The file opener claims common source extensions.** It delegates straight to
   bb's own preview for any file outside a multi-repo workspace, and only adds a
   header naming the repo inside one. Pin bb's preview per extension under
