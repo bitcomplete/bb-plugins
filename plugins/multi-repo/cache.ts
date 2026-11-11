@@ -21,9 +21,9 @@
  * carries stale refs and branches that exist nowhere else, so the mirror is a
  * head start on the objects, never an answer about the refs.
  */
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { git, gitIn, gitLine, gitOrThrow, firstProblemLine } from "./git.js";
+import { git, gitIn, gitLine, gitOrThrow, firstProblemLine, run, type RunOptions } from "./git.js";
 import { withLock } from "./lock.js";
 import { cacheKeyForUrl, normalizeRemoteUrl } from "./paths.js";
 
@@ -31,8 +31,12 @@ export const CACHE_DIR_NAME = "repos";
 const FETCHED_MARKER = "bb-fetched-at";
 const CLONE_TIMEOUT_MS = 30 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 10 * 60 * 1000;
+const TEMPLATE_TIMEOUT_MS = 30 * 60 * 1000;
+const COPY_TIMEOUT_MS = 10 * 60 * 1000;
 /** A clone can run for half an hour; the lock must outlive it, not it the lock. */
 const LOCK_STALE_MS = 120_000;
+/** The suffix of the directory holding this entry's template trees. */
+export const TREE_DIR_SUFFIX = ".tree";
 
 export interface CacheProgress {
   step(text: string): void;
@@ -126,6 +130,20 @@ export interface EnsureCacheArgs {
  * winner's clone rather than start a second one into the same directory.
  */
 export async function ensureCache(args: EnsureCacheArgs): Promise<CacheRef> {
+  return withCache(args, async (cache) => cache);
+}
+
+/**
+ * Acquire the entry's lock, bring it up to date, and run `body` with it.
+ *
+ * `body` runs while the lock is held, which is what lets a caller refresh the
+ * template and copy from it without another materialize or a sweep resetting
+ * the template underneath the copy.
+ */
+export async function withCache<T>(
+  args: EnsureCacheArgs,
+  body: (cache: CacheRef) => Promise<T>,
+): Promise<T> {
   const { key, path: repoPath } = cachePathFor(args.dataDir, args.url);
   await mkdir(cacheRoot(args.dataDir), { recursive: true });
   const lockPath = path.join(cacheRoot(args.dataDir), `${key}.lock`);
@@ -137,38 +155,41 @@ export async function ensureCache(args: EnsureCacheArgs): Promise<CacheRef> {
       ...(args.signal === undefined ? {} : { signal: args.signal }),
       onWait: () => args.report?.log(`Waiting for another thread to finish caching ${args.url}`),
     },
-    async () => {
-      const present = await isBareRepo(repoPath);
-      if (!present) {
-        // A directory that exists but is not a bare repo is the debris of an
-        // interrupted clone. Nothing in it is worth keeping.
-        await rm(repoPath, { recursive: true, force: true });
-        await cloneCache({ ...args, repoPath, key });
-      }
-      await configureCache(repoPath, args.url, args.signal);
-
-      const fetchedAt = await readFetchedAt(repoPath);
-      const fresh = fetchedAt !== null && Date.now() - fetchedAt < args.fetchTtlMs;
-      if (fresh) return { key, path: repoPath, fetchedAt };
-
-      args.report?.step(`Fetching ${args.url}`);
-      const result = await git(["-C", repoPath, "fetch", "--prune", "--quiet", "origin"], {
-        timeoutMs: FETCH_TIMEOUT_MS,
-        ...(args.signal === undefined ? {} : { signal: args.signal }),
-      });
-      if (result.code !== 0) {
-        // A stale cache still clones. Report and carry on rather than failing
-        // the whole environment because a remote was briefly unreachable —
-        // unless there is nothing cached at all, which `cloneCache` above
-        // would already have thrown for.
-        args.report?.log(`Could not fetch ${args.url}: ${firstProblemLine(result)}`);
-        return { key, path: repoPath, fetchedAt };
-      }
-      const now = Date.now();
-      await writeFetchedAt(repoPath, now);
-      return { key, path: repoPath, fetchedAt: now };
-    },
+    async () => body(await ensureCacheLocked(args, repoPath, key)),
   );
+}
+
+/** The cache work itself; the caller holds the entry lock. */
+async function ensureCacheLocked(args: EnsureCacheArgs, repoPath: string, key: string): Promise<CacheRef> {
+  const present = await isBareRepo(repoPath);
+  if (!present) {
+    // A directory that exists but is not a bare repo is the debris of an
+    // interrupted clone. Nothing in it is worth keeping.
+    await rm(repoPath, { recursive: true, force: true });
+    await cloneCache({ ...args, repoPath, key });
+  }
+  await configureCache(repoPath, args.url, args.signal);
+
+  const fetchedAt = await readFetchedAt(repoPath);
+  const fresh = fetchedAt !== null && Date.now() - fetchedAt < args.fetchTtlMs;
+  if (fresh) return { key, path: repoPath, fetchedAt };
+
+  args.report?.step(`Fetching ${args.url}`);
+  const result = await git(["-C", repoPath, "fetch", "--prune", "--quiet", "origin"], {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
+  });
+  if (result.code !== 0) {
+    // A stale cache still clones. Report and carry on rather than failing
+    // the whole environment because a remote was briefly unreachable —
+    // unless there is nothing cached at all, which `cloneCache` above
+    // would already have thrown for.
+    args.report?.log(`Could not fetch ${args.url}: ${firstProblemLine(result)}`);
+    return { key, path: repoPath, fetchedAt };
+  }
+  const now = Date.now();
+  await writeFetchedAt(repoPath, now);
+  return { key, path: repoPath, fetchedAt: now };
 }
 
 async function cloneCache(args: EnsureCacheArgs & { repoPath: string; key: string }): Promise<void> {
@@ -213,6 +234,211 @@ export async function cacheHasBranch(repoPath: string, branch: string, signal?: 
     ...(signal === undefined ? {} : { signal }),
   });
   return result.code === 0;
+}
+
+/**
+ * `<cacheRoot>/<key>.tree`: one template working tree per base branch.
+ *
+ * The template is a normal `--shared` clone of the bare cache, checked out at
+ * its base branch and never worked in. A workspace repo is a reflink copy of
+ * it, so the per-thread cost is metadata rather than a fresh checkout.
+ */
+export function templateRoot(dataDir: string, url: string): string {
+  const { key } = cachePathFor(dataDir, url);
+  return path.join(cacheRoot(dataDir), `${key}${TREE_DIR_SUFFIX}`);
+}
+
+/**
+ * A branch name as one path segment.
+ *
+ * A branch is a ref name and may contain `/`, but a template must be a direct
+ * child of the tree root: with a nested path, the templates for `main` and
+ * `main/next` would sit inside one another and a copy of `main` would carry
+ * `main/next`'s files. Encoding is reversible, so the sweep can name the
+ * branch again; `main` and every other slashless branch are unchanged.
+ */
+function templateDirName(base: string): string {
+  return encodeURIComponent(base);
+}
+
+function baseFromTemplateDirName(name: string): string | null {
+  try {
+    const decoded = decodeURIComponent(name);
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where the template for `base` lives. Exported for tests and diagnostics. */
+export function templatePathFor(dataDir: string, url: string, base: string): string {
+  return path.join(templateRoot(dataDir, url), templateDirName(base));
+}
+
+const reflinkProbes = new Map<string, Promise<boolean>>();
+
+/**
+ * Whether `cp --reflink=always` can copy from the cache root into the
+ * workspace root, decided once per process per (cache root, workspace root)
+ * pair by actually trying it.
+ *
+ * Reflinks only work within one filesystem/pool, so a machine that puts
+ * workspaces somewhere other than `host-data` falls back to a normal clone.
+ * Memoizing the answer keeps the probe off every thread start.
+ */
+export function reflinkSupported(cacheRootPath: string, workspaceRootPath: string): Promise<boolean> {
+  const memoKey = `${cacheRootPath}\0${workspaceRootPath}`;
+  const known = reflinkProbes.get(memoKey);
+  if (known !== undefined) return known;
+  const probe = probeReflink(cacheRootPath, workspaceRootPath);
+  reflinkProbes.set(memoKey, probe);
+  return probe;
+}
+
+async function probeReflink(cacheRootPath: string, workspaceRootPath: string): Promise<boolean> {
+  const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const source = path.join(cacheRootPath, `.reflink-probe-${token}`);
+  const target = path.join(workspaceRootPath, `.reflink-probe-${token}`);
+  const content = "bb-reflink-probe\n";
+  try {
+    await mkdir(cacheRootPath, { recursive: true });
+    await mkdir(workspaceRootPath, { recursive: true });
+    await writeFile(source, content, "utf8");
+    const result = await run("cp", ["-a", "--reflink=always", "--", source, target], { timeoutMs: 30_000 });
+    if (result.code !== 0) return false;
+    return (await readFile(target, "utf8")) === content;
+  } catch {
+    // No `cp`, no permission, no such filesystem: all mean "fall back".
+    return false;
+  } finally {
+    await rm(source, { force: true }).catch(() => undefined);
+    await rm(target, { force: true, recursive: true }).catch(() => undefined);
+  }
+}
+
+async function isGitWorktree(dir: string, options: RunOptions): Promise<boolean> {
+  return (await gitLine(dir, ["rev-parse", "--is-inside-work-tree"], options)) === "true";
+}
+
+/** A template is usable only when HEAD is exactly `sha` and the tree is clean. */
+async function templateIsAt(template: string, sha: string, options: RunOptions): Promise<boolean> {
+  if ((await gitLine(template, ["rev-parse", "HEAD"], options)) !== sha) return false;
+  return (await gitLine(template, ["status", "--porcelain"], options)) === "";
+}
+
+/**
+ * Make the template for `base` a clean checkout of the cache's current
+ * `refs/heads/<base>` and return its path, or null when that is not possible.
+ *
+ * **The caller must hold the entry lock.** A reset here and a copy made from
+ * the returned path must not interleave with another materialize or a sweep,
+ * or a workspace could observe a half-refreshed template.
+ *
+ * A template that is missing, dirty or behind the cache is brought back with
+ * `reset --hard` + `clean -fdx`; a template that does not verify after that is
+ * rebuilt from scratch, never repaired field by field.
+ */
+export async function ensureTemplate(args: {
+  dataDir: string;
+  url: string;
+  cachePath: string;
+  base: string;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const options: RunOptions = {
+    timeoutMs: TEMPLATE_TIMEOUT_MS,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
+  };
+  const template = templatePathFor(args.dataDir, args.url, args.base);
+  const sha = await gitLine(args.cachePath, ["rev-parse", "--verify", `refs/heads/${args.base}^{commit}`], {
+    timeoutMs: 15_000,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
+  });
+  if (sha === null) return null;
+
+  // `core.checkStat=minimal` is set before the first `git status`, so even
+  // the template's own status trusts size and mtime rather than rehashing the
+  // tree. It lives in the template's config and every copy inherits it.
+  const minimal = () => gitIn(template, ["config", "core.checkStat", "minimal"], options);
+
+  let usable = false;
+  if (await isGitWorktree(template, options)) {
+    await minimal();
+    usable = await templateIsAt(template, sha, options);
+    if (!usable) {
+      await gitIn(template, ["reset", "--hard", "--quiet", sha], options);
+      await gitIn(template, ["clean", "-fdx", "--quiet"], options);
+      usable = await templateIsAt(template, sha, options);
+    }
+  }
+  if (!usable) {
+    await rm(template, { recursive: true, force: true });
+    await mkdir(path.dirname(template), { recursive: true });
+    const cloned = await git(
+      ["clone", "--shared", "--quiet", "--branch", args.base, args.cachePath, template],
+      options,
+    );
+    if (cloned.code !== 0) return null;
+    await minimal();
+    usable = await templateIsAt(template, sha, options);
+    if (!usable) return null;
+  }
+  return template;
+}
+
+/**
+ * Copy a prepared template to `dest` as a reflink clone.
+ *
+ * **The caller must hold the entry lock**, so the template cannot be reset
+ * while it is being copied. Returns false when `cp` refuses (the probe said
+ * reflinks work but the copy hit a file it could not share), with nothing left
+ * at `dest` for the caller's clone fallback to trip over.
+ */
+export async function copyTemplate(template: string, dest: string, signal?: AbortSignal): Promise<boolean> {
+  const result = await run("cp", ["-a", "--reflink=always", "--", template, dest], {
+    timeoutMs: COPY_TIMEOUT_MS,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  if (result.code === 0) return true;
+  await rm(dest, { recursive: true, force: true }).catch(() => undefined);
+  return false;
+}
+
+/**
+ * Reset every template that already exists for this cache entry.
+ *
+ * Called by the background sweep under the entry lock. It **creates none**: a
+ * branch no thread has requested yet is not the sweep's business, and building
+ * it would pay a checkout on a machine that may never open a thread on it.
+ */
+async function resetTemplates(args: {
+  dataDir: string;
+  url: string;
+  cachePath: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const root = templateRoot(args.dataDir, args.url);
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return;
+  }
+  const options: RunOptions = {
+    timeoutMs: 10 * 60 * 1000,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
+  };
+  for (const entry of entries) {
+    const base = baseFromTemplateDirName(entry);
+    if (base === null) continue;
+    const template = path.join(root, entry);
+    if (!(await isGitWorktree(template, options))) continue;
+    const sha = await gitLine(args.cachePath, ["rev-parse", "--verify", `refs/heads/${base}^{commit}`], options);
+    if (sha === null) continue;
+    await gitIn(template, ["reset", "--hard", "--quiet", sha], options);
+    await gitIn(template, ["clean", "-fdx", "--quiet"], options);
+    await gitIn(template, ["config", "core.checkStat", "minimal"], options);
+  }
 }
 
 /** Pack size in bytes from `git count-objects`, which is cheap; null if unknown. */
@@ -263,11 +489,14 @@ export async function cacheStatus(dataDir: string, urls: readonly string[]): Pro
 }
 
 /**
- * The background sweep: fetch every entry older than `maxAgeMs`.
+ * The background sweep: fetch every entry older than `maxAgeMs` and reset the
+ * templates it finds.
  *
  * Only touches entries that already exist. A repo nobody has cloned yet is not
  * this sweep's business — cloning it here would pay a cold start on a machine
- * that may never open a thread on that project.
+ * that may never open a thread on that project. The same rule applies to
+ * templates: the sweep resets the ones a thread has already asked for and
+ * creates none.
  */
 export async function refreshCaches(
   dataDir: string,
@@ -284,13 +513,20 @@ export async function refreshCaches(
       continue;
     }
     const fetchedAt = await readFetchedAt(repoPath);
-    if (fetchedAt !== null && Date.now() - fetchedAt < maxAgeMs) {
-      results.push({ key, url, present: true, fetchedAt, sizeBytes: null, error: null });
-      continue;
-    }
+    const fresh = fetchedAt !== null && Date.now() - fetchedAt < maxAgeMs;
     try {
-      const entry = await ensureCache({ dataDir, url, mirrors: [], fetchTtlMs: maxAgeMs, ...(signal === undefined ? {} : { signal }) });
-      await repackCache(repoPath, signal);
+      // The reset of existing templates runs under the same lock as the fetch
+      // and as every materialize, so a copy can never observe a half-refreshed
+      // template. A fresh entry still gets its templates reset — the sweep is
+      // what keeps a cold start down to the delta.
+      const entry = await withCache(
+        { dataDir, url, mirrors: [], fetchTtlMs: maxAgeMs, ...(signal === undefined ? {} : { signal }) },
+        async (cache) => {
+          await resetTemplates({ dataDir, url, cachePath: cache.path, ...(signal === undefined ? {} : { signal }) });
+          return cache;
+        },
+      );
+      if (!fresh) await repackCache(repoPath, signal);
       results.push({ key, url, present: true, fetchedAt: entry.fetchedAt, sizeBytes: null, error: null });
     } catch (error) {
       results.push({

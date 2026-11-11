@@ -21,7 +21,16 @@ import { mkdir, mkdtemp, readdir, rm, writeFile, access, cp, lstat, symlink } fr
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { experimental_killProcessesWithCwdUnder as killProcessesUnder } from "@get-bb/plugin-sdk/host";
-import { cacheDefaultBranch, cacheHasBranch, ensureCache, type CacheProgress } from "./cache.js";
+import {
+  cacheDefaultBranch,
+  cacheHasBranch,
+  cacheRoot,
+  copyTemplate,
+  ensureTemplate,
+  reflinkSupported,
+  withCache,
+  type CacheProgress,
+} from "./cache.js";
 import { git, gitIn, gitLine, firstProblemLine } from "./git.js";
 import type { RepoRequest } from "./contract.js";
 import type { WorkspaceRepo } from "./layout.js";
@@ -102,7 +111,25 @@ export interface MaterializeArgs {
 }
 
 /**
- * Clone one repo into the workspace.
+ * What the lock-protected half of a checkout decided.
+ *
+ * `copied` means the destination is already a reflink copy of the template;
+ * `clone` means the caller must run the ordinary `git clone --shared` from
+ * `cachePath` once the lock is released.
+ */
+type Prepared =
+  | { kind: "no-branch"; base: string | null }
+  | { kind: "copied"; base: string }
+  | { kind: "clone"; base: string; cachePath: string };
+
+/**
+ * Materialize one repo into the workspace.
+ *
+ * When the filesystem supports reflinks and the probe says the workspace and
+ * cache share one, the repo is a copy-on-write copy of the cache's template
+ * tree; otherwise it is the ordinary `git clone --shared`. Either way the
+ * result is the same shape: its own writable `.git` under `cwd`, `origin`
+ * repointed at the real remote, and the thread's branch checked out.
  *
  * Never throws: a repo that fails to materialize is recorded as `failed` and
  * the thread carries on with the rest. A workspace with three of four repos is
@@ -141,40 +168,66 @@ export async function materializeRepo(args: MaterializeArgs): Promise<WorkspaceR
     // thing that makes a directory trustworthy.
     await rm(dest, { recursive: true, force: true });
 
-    const cache = await ensureCache({
-      dataDir: args.dataDir,
-      url: args.repo.url,
-      mirrors: args.mirrors,
-      fetchTtlMs: args.fetchTtlMs,
-      ...(args.signal === undefined ? {} : { signal: args.signal }),
-      ...(args.report === undefined ? {} : { report: args.report }),
-    });
+    args.report?.step(`Checking out ${args.repo.dir}`);
+    // One lock acquisition for the whole checkout: the cache fetch, the
+    // template refresh and the reflink copy must not interleave with another
+    // materialize or with the sweep. The clone fallback runs after the lock is
+    // released, as it always has, so two cold clones still overlap.
+    const prepared = await withCache(
+      {
+        dataDir: args.dataDir,
+        url: args.repo.url,
+        mirrors: args.mirrors,
+        fetchTtlMs: args.fetchTtlMs,
+        ...(args.signal === undefined ? {} : { signal: args.signal }),
+        ...(args.report === undefined ? {} : { report: args.report }),
+      },
+      async (cache): Promise<Prepared> => {
+        const base = args.repo.branch ?? (await cacheDefaultBranch(cache.path, args.signal));
+        if (base === null) return { kind: "no-branch", base: null };
+        if (!(await cacheHasBranch(cache.path, base, args.signal))) return { kind: "no-branch", base };
 
-    const base = args.repo.branch ?? (await cacheDefaultBranch(cache.path, args.signal));
-    if (base === null) {
-      return failed(`${args.repo.url} has no branches.`);
-    }
-    if (!(await cacheHasBranch(cache.path, base, args.signal))) {
+        if (await reflinkSupported(cacheRoot(args.dataDir), args.root)) {
+          const template = await ensureTemplate({
+            dataDir: args.dataDir,
+            url: args.repo.url,
+            cachePath: cache.path,
+            base,
+            ...(args.signal === undefined ? {} : { signal: args.signal }),
+          });
+          if (template !== null && (await copyTemplate(template, dest, args.signal))) {
+            return { kind: "copied", base };
+          }
+        }
+        return { kind: "clone", base, cachePath: cache.path };
+      },
+    );
+
+    if (prepared.kind === "no-branch") {
       return failed(
-        args.repo.branch === undefined || args.repo.branch === null
-          ? `${args.repo.url} has no branch "${base}".`
-          : `${args.repo.url} has no branch "${base}" (set in repos.json).`,
+        prepared.base === null
+          ? `${args.repo.url} has no branches.`
+          : args.repo.branch === undefined || args.repo.branch === null
+            ? `${args.repo.url} has no branch "${prepared.base}".`
+            : `${args.repo.url} has no branch "${prepared.base}" (set in repos.json).`,
       );
     }
 
-    args.report?.step(`Checking out ${args.repo.dir}`);
-    // `--shared` points this clone's `objects/info/alternates` at the cache.
-    // The pointer is only ever read, and reads are unrestricted in the
-    // sandbox, so the agent gets the full object graph while its own `.git`
-    // stays inside `cwd` and writable.
-    const cloned = await git(
-      ["clone", "--shared", "--quiet", "--branch", base, cache.path, dest],
-      {
-        timeoutMs: CLONE_TIMEOUT_MS,
-        ...(args.signal === undefined ? {} : { signal: args.signal }),
-      },
-    );
-    if (cloned.code !== 0) return failed(firstProblemLine(cloned));
+    const base = prepared.base;
+    if (prepared.kind === "clone") {
+      // `--shared` points this clone's `objects/info/alternates` at the cache.
+      // The pointer is only ever read, and reads are unrestricted in the
+      // sandbox, so the agent gets the full object graph while its own `.git`
+      // stays inside `cwd` and writable.
+      const cloned = await git(
+        ["clone", "--shared", "--quiet", "--branch", base, prepared.cachePath, dest],
+        {
+          timeoutMs: CLONE_TIMEOUT_MS,
+          ...(args.signal === undefined ? {} : { signal: args.signal }),
+        },
+      );
+      if (cloned.code !== 0) return failed(firstProblemLine(cloned));
+    }
 
     const gitOptions = {
       timeoutMs: GIT_TIMEOUT_MS,

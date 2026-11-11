@@ -35,9 +35,10 @@ A **thread workspace** is a plain directory holding one clone per repo, plus `.b
 ```
 <plugin host-data>/
   repos/<key>.git            bare, self-contained object cache (per machine)
+  repos/<key>.tree/<base>/   reflink template per base branch, never worked in
   workspaces/<pathKey>/      ← environment.path (plain dir, isGitRepo: false)
-    bb-dylan/                clone, origin = real remote
-    bb-plugins/              clone, origin = real remote
+    bb-dylan/                clone or reflink copy, origin = real remote
+    bb-plugins/              clone or reflink copy, origin = real remote
     .bb/                     clone of the project-source checkout
 ```
 
@@ -145,6 +146,65 @@ Two rules:
 - **Always fetch from the real remote after mirroring.** A local checkout carries stale refs and local-only branches.
 
 Cache repos are alternates targets, so set `gc.auto=0` and `gc.pruneExpire=never` on them; repack with `git gc --no-prune`.
+
+### The template tree
+
+Checking out a fresh working tree per thread is the remaining per-thread cost
+once objects are shared. Beside the bare store,
+`host-data/repos/<key>.tree/<base>/` is a normal `--shared` clone of the bare
+store checked out at base branch `<base>`, never worked in. One exists per base
+branch a thread has actually requested — `repos.json` may base the same repo on
+different branches — and the tree root holds one child per branch. A branch
+name is a ref name and may contain `/`, so it is encoded to a single path
+segment: otherwise the templates for `main` and `main/next` would sit inside
+one another and a copy of `main` would carry `main/next`'s files.
+
+Materializing a repo, under the entry lock:
+
+1. `ensureCache` as above.
+2. Bring the template to the fetched tip: `git reset --hard <sha of
+   refs/heads/<base> in the cache>` then `git clean -fdx`. Before use, confirm
+   `git status --porcelain` is empty and HEAD equals the cache ref; a template
+   that still does not verify is rebuilt from scratch (`rm` + `clone --shared`),
+   never repaired.
+3. `cp -a --reflink=always <template> <dest>`. This copies the tree and the
+   template's small `.git` (index, refs, config, the absolute alternates
+   pointer).
+4. The unchanged post-steps: `git remote set-url origin <real url>`, `git
+   config bb-multi-repo.baseBranch <base>`, `git checkout -b <thread branch>`,
+   mark completed.
+
+The reset and the copy share the entry lock, so a copy never observes a
+half-refreshed template.
+
+**Probe and fallback.** Reflinks only work within one filesystem/pool, so the
+plugin decides once per process per (cache root, workspace root) pair by
+trying it: write a small file under the cache root and `cp --reflink=always`
+it into the workspace root. On failure the template is never built and the
+ordinary `git clone --shared` path runs exactly as before. There is no "plain
+copy" middle option.
+
+**Index trust.** The copied index holds the template's inode numbers and
+ctimes, so a default `git status` would rehash the whole tree on first run.
+Set `core.checkStat=minimal` on the template (inherited by every copy) so the
+index is trusted on size and mtime, which `cp -a` preserves.
+
+**Reflinks, never hardlinks.** An in-place append in a workspace would corrupt
+a hardlinked template; copy-on-write at block level has no such failure.
+
+**Keep the bare store and alternates.** The template is not standalone: a
+workspace that repacks would rewrite its own packfile, while alternates keep
+objects shared from the cache regardless of what git does inside the
+workspace.
+
+**Background sweep.** `refreshCaches` also resets the templates it finds, so a
+cold thread start pays only the delta since the last sweep. It resets existing
+templates and creates none: a branch no thread has requested is not the
+sweep's business.
+
+**Disk accounting.** `du` on a workspace reports the full tree even when every
+block is shared. The Repos panel's cache size (`count-objects`) is unaffected;
+no per-workspace size display may use `du`.
 
 **The lock is the plugin's to build.** Nothing in the published SDK is a mutex: `experimental_retainWorker()` returns an `ExperimentalHostWorkerLease`, which only keeps a host worker alive past the current call (`packages/plugin-sdk/src/host-contract.ts:102-134`), and the ref-mutation lock in `bb-environment-provider-host/locks` is private. Budget a real cross-process file lock — concurrent thread creation against one cache entry is the expected case, not a rare one.
 
