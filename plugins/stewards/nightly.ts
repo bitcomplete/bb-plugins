@@ -111,6 +111,11 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
       notes: store.peekProjectNotes(projectId),
       decisions: {
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
+        // The digest's predicate, verbatim: a user-routed question escalation
+        // is left out here (the questions section covers it), as is a
+        // resolution-kind one. That is right for the digest; a huddle ranking
+        // "decisions waiting on the owner" may want the broader set, and
+        // slice 3 decides.
         withUser: openWith((x) => x.route === "user" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
       },
       escalations: openWith((x) => x.route === "project"),
