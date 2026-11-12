@@ -571,14 +571,17 @@ function projectEscalationLines(briefing: Briefing, now: number): string[] {
   return briefing.escalations.map(({ escalation, from }) => withAge(`${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`, now, escalation.createdAt));
 }
 
-/** The stuck and held bindings, as one line each. */
+/** The stuck and held bindings, as one line each. A hold, a no-wake-source wait
+ * and a dated wait are properties of a binding, not records with their own
+ * `createdAt`, so they carry no age: `Binding.createdAt` is when the steward was
+ * bound, not when the wait started (BB-306). */
 function stuckLines(briefing: Briefing, now: number): string[] {
   const out: string[] = [];
   for (const { escalation, from } of briefing.stuck.stuck) out.push(withAge(`${from.entityKey}: stuck — ${escalation.question}`, now, escalation.createdAt));
   for (const { escalation, from } of briefing.stuck.stall) out.push(withAge(`${from.entityKey}: stalled — ${escalation.question}`, now, escalation.createdAt));
-  for (const b of briefing.stuck.held) out.push(withAge(`${b.entityKey}: on hold${b.hold === null ? "" : ` — ${b.hold}`}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, now, b.createdAt));
-  for (const b of briefing.stuck.noWakeSource) out.push(withAge(`${b.entityKey}: waiting with nothing the plugin tracks to wake it`, now, b.createdAt));
-  for (const b of briefing.stuck.datedWaits) out.push(withAge(`${b.entityKey}: waiting until ${b.requeueUntil === null ? "?" : new Date(b.requeueUntil).toISOString()}`, now, b.createdAt));
+  for (const b of briefing.stuck.held) out.push(`${b.entityKey}: on hold${b.hold === null ? "" : ` — ${b.hold}`}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`);
+  for (const b of briefing.stuck.noWakeSource) out.push(`${b.entityKey}: waiting with nothing the plugin tracks to wake it`);
+  for (const b of briefing.stuck.datedWaits) out.push(`${b.entityKey}: waiting until ${b.requeueUntil === null ? "?" : new Date(b.requeueUntil).toISOString()}`);
   return out;
 }
 

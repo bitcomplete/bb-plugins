@@ -350,6 +350,20 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(text).not.toContain("x".repeat(STANDUP_CONTEXT_MAX_CHARS + 1));
   });
 
+  it("leaves a hold undated because the store records no hold time (BB-306)", () => {
+    const now = Date.parse("2026-11-12T00:00:00Z");
+    const text = buildStandupInstructions(
+      briefing({ stuck: { stuck: [], held: [binding({ entityKey: "ENG-15", hold: "behind ENG-16", holdBehind: ["ENG-16"], createdAt: 1 })], noWakeSource: [], stall: [], datedWaits: [] } }),
+      "Acme",
+      now,
+    );
+    const line = text.split("\n").find((l) => l.includes("ENG-15: on hold"));
+    expect(line).toBeDefined();
+    // `Binding.createdAt` is when the steward was bound, not when the hold started.
+    expect(line).not.toContain("open since");
+    expect(line).not.toContain("days");
+  });
+
   it("says no digest yet, and the last digest date once there is one (BB-306)", () => {
     expect(buildStandupInstructions(briefing(), "Acme", 10_000)).toContain("has not filed a digest yet");
     const at = Date.parse("2026-11-10T00:00:00Z");
