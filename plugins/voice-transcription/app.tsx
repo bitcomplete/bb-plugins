@@ -26,6 +26,9 @@ import {
   type RealtimeStatus,
 } from "./realtime-client.js";
 
+/** How close to the bottom of the transcript still counts as pinned, in pixels. */
+const PIN_THRESHOLD_PX = 24;
+
 /** A failed route call, carrying the HTTP status so the overlay can tell a lost race from an error. */
 class RouteError extends Error {
   constructor(
@@ -76,7 +79,7 @@ function realtimeClientId(): string {
   }
 }
 
-function RealtimeVoiceOverlay() {
+export function RealtimeVoiceOverlay() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   // Made on mount, before any click can ask for a session, so the opener
   // always finds it.
@@ -87,6 +90,16 @@ function RealtimeVoiceOverlay() {
   const [muted, setMuted] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
   const clientRef = useRef<RealtimeSessionClient | null>(null);
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  // The pane follows new text until the owner scrolls away from the bottom.
+  // The ref mirrors the state so the effects and the ResizeObserver callback
+  // read it without re-subscribing.
+  const pinnedRef = useRef(true);
+  const [pinned, setPinned] = useState(true);
+  // The scrollTop a programmatic scroll was aiming at, so its own scroll event
+  // is not mistaken for the owner scrolling away.
+  const programmaticTargetRef = useRef<number | null>(null);
 
   useRealtime(REALTIME_SIGNAL_CHANNEL, (payload) => {
     if (typeof payload !== "object" || payload === null || !("sessionId" in payload)) return;
@@ -165,6 +178,57 @@ function RealtimeVoiceOverlay() {
     clientRef.current?.setMuted(muted);
   }, [muted]);
 
+  const setPinnedState = (value: boolean): void => {
+    if (pinnedRef.current === value) return;
+    pinnedRef.current = value;
+    setPinned(value);
+  };
+
+  const scrollToBottom = (): void => {
+    const pane = paneRef.current;
+    if (pane === null) return;
+    programmaticTargetRef.current = pane.scrollHeight;
+    pane.scrollTop = pane.scrollHeight;
+  };
+
+  // A new line, or a delta that grows an existing bubble, changes `lines`.
+  useEffect(() => {
+    if (!pinnedRef.current) return;
+    scrollToBottom();
+  }, [lines]);
+
+  // `lines` alone misses a bubble that grows without a new entry (BB-310 keys
+  // bubbles by id), so watch the content itself.
+  useEffect(() => {
+    const pane = paneRef.current;
+    const content = contentRef.current;
+    if (pane === null || content === null || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (pinnedRef.current) scrollToBottom();
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [sessionId]);
+
+  const handleScroll = (): void => {
+    const pane = paneRef.current;
+    if (pane === null) return;
+    const target = programmaticTargetRef.current;
+    programmaticTargetRef.current = null;
+    // A programmatic scroll to the bottom is not the owner scrolling away.
+    if (target !== null && pane.scrollTop >= target) {
+      setPinnedState(true);
+      return;
+    }
+    const distance = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
+    setPinnedState(distance <= PIN_THRESHOLD_PX);
+  };
+
+  const jumpToLatest = (): void => {
+    setPinnedState(true);
+    scrollToBottom();
+  };
+
   if (sessionId === null) return null;
 
   return (
@@ -211,6 +275,9 @@ function RealtimeVoiceOverlay() {
       )}
       {status === "connecting" && <div style={{ opacity: 0.75 }}>Connecting…</div>}
       <div
+        ref={paneRef}
+        data-testid="realtime-transcript"
+        onScroll={handleScroll}
         style={{
           overflowY: "auto",
           display: "flex",
@@ -218,24 +285,49 @@ function RealtimeVoiceOverlay() {
           gap: "0.35rem",
         }}
       >
-        {lines.length === 0 && status === "live" && (
-          <div style={{ opacity: 0.6 }}>Listening…</div>
-        )}
-        {lines.map((line) => (
-          <div
-            key={line.id}
+        <div
+          ref={contentRef}
+          style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}
+        >
+          {lines.length === 0 && status === "live" && (
+            <div style={{ opacity: 0.6 }}>Listening…</div>
+          )}
+          {lines.map((line) => (
+            <div
+              key={line.id}
+              style={{
+                alignSelf: line.role === "user" ? "flex-end" : "flex-start",
+                maxWidth: "85%",
+                padding: "0.25rem 0.5rem",
+                borderRadius: "0.5rem",
+                background: line.role === "user" ? "rgba(80,120,255,0.35)" : "rgba(255,255,255,0.1)",
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {line.truncated === true ? `${line.text}…` : line.text}
+            </div>
+          ))}
+        </div>
+        {!pinned && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
             style={{
-              alignSelf: line.role === "user" ? "flex-end" : "flex-start",
-              maxWidth: "85%",
-              padding: "0.25rem 0.5rem",
-              borderRadius: "0.5rem",
-              background: line.role === "user" ? "rgba(80,120,255,0.35)" : "rgba(255,255,255,0.1)",
-              whiteSpace: "pre-wrap",
+              position: "sticky",
+              bottom: "0.25rem",
+              alignSelf: "center",
+              padding: "0.15rem 0.6rem",
+              borderRadius: "999px",
+              border: "1px solid rgba(127,127,127,0.4)",
+              background: "rgba(60,60,66,0.95)",
+              color: "#f5f5f5",
+              cursor: "pointer",
+              fontSize: "0.75rem",
             }}
           >
-            {line.truncated === true ? `${line.text}…` : line.text}
-          </div>
-        ))}
+            Jump to latest
+          </button>
+        )}
       </div>
     </div>
   );
