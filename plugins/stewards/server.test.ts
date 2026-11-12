@@ -14753,8 +14753,8 @@ describe("the stand-up (BB-300)", () => {
       speaksFirst: true,
     });
     const tools = open.input.tools as Array<{ name: string }>;
-    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
-    expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
+    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "search_tickets", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
+    expect(String(open.input.instructions)).toMatch(/## Needs your input/u);
     expect(String(open.input.instructions)).toMatch(/Should I file an a11y ticket\?/u);
     // Opening the session does not advance the window: only a session that
     // connected (its first tool call) does.
@@ -14835,8 +14835,12 @@ describe("the stand-up (BB-300)", () => {
 
   it("scrubs a pasted credential from a tool result before it reaches the model", async () => {
     const t = await adopted();
-    // A ticket body can carry a pasted token; it must not reach OpenAI.
+    // A ticket body can carry a pasted token; it must not reach OpenAI. The
+    // read goes through the entity cache, so the token is in the stored
+    // snapshot the cache serves.
     t.entities.set("uuid-12", issue({ description: "Please use token: abc123 in the call." }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
     const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string };
     const output = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
     expect(output).toContain("token: [redacted]");
@@ -14898,7 +14902,7 @@ describe("the stand-up (BB-300)", () => {
     expect(instructions).toContain("This stand-up is about ENG-12 only");
     expect(instructions).not.toContain("## Done since");
     // The fixed tool set is unchanged by the scope.
-    expect((t.realtimeOpens[0]!.input.tools as Array<{ name: string }>).map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
+    expect((t.realtimeOpens[0]!.input.tools as Array<{ name: string }>).map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "search_tickets", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
     const rec = (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { binding: string | null } };
     expect(rec.standup.binding).toBe("ENG-12");
     // Opening a scoped stand-up does not advance the window.
@@ -15545,5 +15549,116 @@ describe("the stand-up (BB-300)", () => {
     const read = await record(t);
     expect(read.standup!.delegations[0]).toMatchObject({ outcome: "error", answer: null });
     expect(read.standup!.delegations[0]!.error).toContain("without an answer");
+  });
+
+  // BB-312: the entity cache, the scope guard and the tiered brief.
+  it("refuses a key outside the project and serves a stewardless key (BB-312)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    const outside = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "OTHER-1" }) }, voice)) as string;
+    expect(outside).toContain("not in this project");
+    // A key in one of the project's repos answers through the entity path, with no steward.
+    t.entities.set("acme/web#42", githubIssue({ id: "acme/web#42", key: "acme/web#42", title: "Stewardless issue" }));
+    const out = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "acme/web#42" }) }, voice)) as string;
+    expect(out).toContain("Stewardless issue");
+  });
+
+  it("search_tickets calls sourceSearchIssues with the project's units (BB-312)", async () => {
+    const t = await adopted();
+    t.entities.set("acme/web#42", githubIssue({ id: "acme/web#42", key: "acme/web#42", title: "A login issue" }));
+    const started = await startStandup(t);
+    t.rpcCalls.length = 0;
+    const out = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "search_tickets", arguments: JSON.stringify({ query: "login" }) }, voice)) as string;
+    const calls = t.rpcCalls.filter((c) => c.method === "sourceSearchIssues");
+    expect(calls.map((c) => c.pluginId).sort()).toEqual(["github-watcher", "linear"]);
+    expect(calls.find((c) => c.pluginId === "linear")!.input.units).toEqual(["ENG"]);
+    expect([...(calls.find((c) => c.pluginId === "github-watcher")!.input.units as string[])].sort()).toEqual(["acme/bb", "acme/web"]);
+    expect(out).toContain("acme/web#42");
+  });
+
+  it("falls back to the stored snapshot when the canonical read fails, and never fails the brief (BB-312)", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    // Make the stored snapshot stale so the read must go to the source, then fail it.
+    t.hooks.store.patch(b.id, { lastSnapshot: { ...b.lastSnapshot!, at: 0 } });
+    t.setSnapshotError("uuid-12", true);
+    const before = JSON.stringify(t.hooks.store.find("ENG-12"));
+    const started = await startStandup(t);
+    expect(started.ok).toBe(true);
+    const out = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
+    expect(out).toContain("Fix login");
+    // The failed read wrote nothing on the binding.
+    expect(JSON.stringify(t.hooks.store.find("ENG-12"))).toBe(before);
+  });
+
+  it("leaves lastSnapshot and commentCursor unchanged, and a ring drops the cache entry (BB-312)", async () => {
+    const t = await adopted();
+    const before = JSON.stringify(t.hooks.store.find("ENG-12"));
+    const started = await startStandup(t);
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    expect(JSON.stringify(t.hooks.store.find("ENG-12"))).toBe(before);
+    // The read filled the cache; a doorbell for the entity drops it.
+    expect(t.hooks.entityCache.peek("p1", "ENG-12")).toBeDefined();
+    t.entities.set("uuid-12", issue({ title: "Changed" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.entityCache.peek("p1", "ENG-12")).toBeUndefined();
+  });
+
+  it("leaves a binding's stored rows byte-identical across a whole stand-up open with lookups (BB-312)", async () => {
+    const t = await adopted();
+    const before = JSON.stringify(t.hooks.store.find("ENG-12"));
+    const started = await startStandup(t);
+    for (const [name, args] of [
+      ["entity_snapshot", { key: "ENG-12" }],
+      ["steward_status", { key: "ENG-12" }],
+      ["search_tickets", { query: "login" }],
+    ] as const) {
+      await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name, arguments: JSON.stringify(args) }, voice);
+    }
+    expect(JSON.stringify(t.hooks.store.find("ENG-12"))).toBe(before);
+  });
+
+  it("does not read the open tier's entities at open, so a cold source cannot hold the greeting (BB-312)", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    // A stale stored snapshot and an empty cache: an open-tier read would hit the source.
+    t.hooks.store.patch(b.id, { lastSnapshot: { ...b.lastSnapshot!, at: 0 } });
+    t.hooks.entityCache.clear("p1");
+    t.rpcCalls.length = 0;
+    await startStandup(t);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceSnapshot" && c.input.id === "uuid-12")).toHaveLength(0);
+  });
+
+  it("scrubs a 'token: abc' comment from the brief and the read tools (BB-312)", async () => {
+    const t = await adoptedWithPull();
+    const b = t.hooks.store.find("ENG-12")!;
+    t.entities.set("uuid-12", { ...b.lastSnapshot!.entity, comments: [comment({ id: "c1", author: "Sam", body: "use token: abc here" })] });
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const started = await startStandup(t);
+    const instructions = String(t.realtimeOpens[0]!.input.instructions);
+    expect(instructions).toContain("token: [redacted]");
+    expect(instructions).not.toContain("abc");
+    const out = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
+    expect(out).toContain("token: [redacted]");
+    expect(out).not.toContain("abc");
+  });
+
+  it("marks a stand-up completed only when it ends, so an interrupted one does not move the clamp (BB-312)", async () => {
+    const t = await adopted();
+    const page = await startStandup(t);
+    expect(t.hooks.store.lastCompletedStandup("p1")).toBeNull();
+    await t.harness.callRpc("stewardsStandupEnd", { standupId: page.standupId }, client);
+    expect(t.hooks.store.lastCompletedStandup("p1")).toBe(t.now());
+    // An overlay close is an interruption: it does not move the marker.
+    const interrupted = await startStandup(t);
+    t.advance(60_000);
+    await t.harness.callRpc("stewardsStandupClose", { sessionId: interrupted.sessionId }, voice);
+    expect(t.hooks.store.lastCompletedStandup("p1")).toBe(t.now() - 60_000);
+    // A new start that supersedes an abandoned record does not move it either.
+    await startStandup(t);
+    t.advance(60_000);
+    await startStandup(t);
+    expect(t.hooks.store.lastCompletedStandup("p1")).toBe(t.now() - 120_000);
   });
 });

@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -647,8 +647,9 @@ describe("the actor rename migration (BB-97)", () => {
     // assessment and divergence-log tables after that, BB-294 appended the
     // ended-read index after that, BB-300 slice 4 appended the stand-up table
     // after that, its rename follows, and BB-303 appended the scope column
-    // after that, and BB-307 appended the delegation log after that.
-    const groups = [STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // after that, BB-307 appended the delegation log after that, and BB-312
+    // appended the completed flag after that.
+    const groups = [STANDUP_COMPLETED_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -741,9 +742,12 @@ describe("the escalation route rename migration (BB-209)", () => {
     // that, BB-293's shadow-assessment tables after that, BB-294's
     // ended-read index after that, BB-300 slice 4's huddle table after that,
     // its rename to the stand-up table after that, BB-303's scope column
-    // after that, and BB-307's delegation log after that.
-    const withoutDelegations = MIGRATIONS.slice(0, -STANDUP_DELEGATION_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-STANDUP_DELEGATION_MIGRATIONS.length)).toEqual([...STANDUP_DELEGATION_MIGRATIONS]);
+    // after that, BB-307's delegation log after that, and BB-312's completed
+    // flag after that.
+    const withoutCompleted = MIGRATIONS.slice(0, -STANDUP_COMPLETED_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-STANDUP_COMPLETED_MIGRATIONS.length)).toEqual([...STANDUP_COMPLETED_MIGRATIONS]);
+    const withoutDelegations = withoutCompleted.slice(0, -STANDUP_DELEGATION_MIGRATIONS.length);
+    expect(withoutCompleted.slice(-STANDUP_DELEGATION_MIGRATIONS.length)).toEqual([...STANDUP_DELEGATION_MIGRATIONS]);
     const withoutBinding = withoutDelegations.slice(0, -STANDUP_BINDING_MIGRATIONS.length);
     expect(withoutDelegations.slice(-STANDUP_BINDING_MIGRATIONS.length)).toEqual([...STANDUP_BINDING_MIGRATIONS]);
     const withHuddle = withoutBinding.slice(0, -STANDUP_MIGRATIONS.length);
@@ -1275,6 +1279,7 @@ describe("the stand-up rename (after BB-300)", () => {
     for (const sql of STANDUP_MIGRATIONS) db.exec(sql);
     for (const sql of STANDUP_BINDING_MIGRATIONS) db.exec(sql);
     for (const sql of STANDUP_DELEGATION_MIGRATIONS) db.exec(sql);
+    for (const sql of STANDUP_COMPLETED_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 200);
     expect(s.standup("hud_1")?.notes.map((n) => n.text)).toEqual(["Ship it"]);
     expect(s.latestStandup("p1")?.endedAt).toBe(150);
@@ -1294,11 +1299,36 @@ describe("the stand-up scope migration (BB-303)", () => {
     db.prepare("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (?, ?, ?, ?, 0, '[]', '[]', '[]')").run("sup_old", "p1", 100, null);
     for (const sql of STANDUP_BINDING_MIGRATIONS) db.exec(sql);
     for (const sql of STANDUP_DELEGATION_MIGRATIONS) db.exec(sql);
+    for (const sql of STANDUP_COMPLETED_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 200);
     expect(s.standup("sup_old")?.binding).toBeNull();
     // A scoped row stores its key; a project row stays null.
     expect(s.createStandup({ id: "sup_scoped", projectId: "p1", startedAt: 200, binding: "ENG-12" }).binding).toBe("ENG-12");
     expect(s.standup("sup_scoped")?.binding).toBe("ENG-12");
     expect(s.createStandup({ id: "sup_project", projectId: "p1", startedAt: 300 }).binding).toBeNull();
+  });
+});
+
+describe("the stand-up completion marker (BB-312)", () => {
+  it("moves only when a stand-up is marked completed, so an interrupted one leaves it", () => {
+    const { s } = store();
+    const first = s.createStandup({ id: "sup_1", projectId: "p1", startedAt: 100 });
+    expect(s.lastCompletedStandup("p1")).toBeNull();
+    // An interrupted stand-up (ended without the completed flag) does not move it.
+    s.saveStandup(first.id, { endedAt: 150 });
+    expect(s.lastCompletedStandup("p1")).toBeNull();
+    // A completed one does.
+    s.saveStandup(first.id, { completed: true });
+    expect(s.lastCompletedStandup("p1")).toBe(100);
+    // A later completed stand-up wins; an interrupted later one does not.
+    const second = s.createStandup({ id: "sup_2", projectId: "p1", startedAt: 200 });
+    s.saveStandup(second.id, { endedAt: 250 });
+    expect(s.lastCompletedStandup("p1")).toBe(100);
+    s.saveStandup(second.id, { completed: true });
+    expect(s.lastCompletedStandup("p1")).toBe(200);
+    // A scoped stand-up (BB-303) completes but does not move the project clamp.
+    const scoped = s.createStandup({ id: "sup_3", projectId: "p1", startedAt: 300, binding: "ENG-12" });
+    s.saveStandup(scoped.id, { endedAt: 350, completed: true });
+    expect(s.lastCompletedStandup("p1")).toBe(200);
   });
 });

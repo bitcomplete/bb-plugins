@@ -94,7 +94,8 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, STANDUP_DELEGATE_ANSWER_MAX_CHARS, type StandupAskOutcome, type StandupDelegation, type StandupEndOutcome, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
+import { STANDUP_TOOLS, buildStandupBrief, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, STANDUP_DELEGATE_ANSWER_MAX_CHARS, type StandupAskOutcome, type StandupDelegation, type StandupEndOutcome, type StandupEntityFacts, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
+import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -115,6 +116,7 @@ import {
   type DependabotSeverity,
   type Deployment,
   type EntitySnapshot,
+  type SearchIssue,
   type SessionWake,
   type Source,
   type WorkflowRun,
@@ -1491,6 +1493,113 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // the digest renders it through `toDigestRecords`.
     const briefing = createBriefing(store, now);
 
+    // BB-312: the entity cache every stand-up read falls through. One entry per
+    // project and key, an hour's TTL by default (the project file may lower
+    // it), at most 500 entries per project, at most four canonical reads at
+    // once. A canonical read here never writes a binding: the reconcile loop
+    // compares against `lastSnapshot` and its comment cursor, and a stand-up
+    // read must not move either.
+    const ENTITY_CACHE_MAX_PER_PROJECT = 500;
+    const ENTITY_CACHE_MAX_CONCURRENT = 4;
+    const ENTITY_CACHE_TTL_MS = 3_600_000;
+    const ENTITY_AGENDA_TIMEOUT_MS = 1_500;
+    const ENTITY_CLOSED_TIMEOUT_MS = 1_500;
+
+    /** The source a key belongs to, from the project's own teams and repos, or null when it is out of scope. */
+    function sourceForKey(projectId: string, key: string): Source | null {
+      const config = configs.get(projectId)?.value ?? null;
+      if (config === null) return null;
+      const ref = parsePullRef(key);
+      if (ref !== null) return config.repos.some((repo) => lc(repo) === lc(ref.repo)) ? "github" : null;
+      const team = key.split("-")[0] ?? "";
+      return config.file.linear.teams.some((t) => lc(t) === lc(team)) ? "linear" : null;
+    }
+
+    /** Whether a key is one of the project's own entities: a binding, or a key in its teams and repos. */
+    function keyInScope(projectId: string, key: string): boolean {
+      return store.find(key, projectId) !== null || sourceForKey(projectId, key) !== null;
+    }
+
+    /** The canonical read for the entity cache: a fresh source snapshot, for a binding or a stewardless key. */
+    async function canonicalEntity(projectId: string, key: string): Promise<EntityRecord | null> {
+      const binding = store.find(key, projectId);
+      if (binding !== null && binding.source !== "ops") {
+        const entity = await snapshot(binding.source, binding.entityId);
+        if (entity === null) return null;
+        const pulls = binding.kind === "ticket" ? await linkedPulls(entity) : [];
+        return { entity, pulls, at: now() };
+      }
+      const source = sourceForKey(projectId, key);
+      if (source === null) return null;
+      const entity = await snapshot(source, key);
+      if (entity === null) return null;
+      const pulls = entity.kind === "issue" ? await linkedPulls(entity) : [];
+      return { entity, pulls, at: now() };
+    }
+
+    const entityCache = new EntityCache({
+      now,
+      ttlMs: ENTITY_CACHE_TTL_MS,
+      maxPerProject: ENTITY_CACHE_MAX_PER_PROJECT,
+      maxConcurrent: ENTITY_CACHE_MAX_CONCURRENT,
+      stored: (projectId, key) => {
+        const binding = store.find(key, projectId);
+        if (binding === null || binding.lastSnapshot === null) return null;
+        return { entity: binding.lastSnapshot.entity, pulls: binding.lastSnapshot.pulls, at: binding.lastSnapshot.at ?? 0 };
+      },
+      canonical: canonicalEntity,
+    });
+
+    /** Drop the cache entry a `stewardsRing` doorbell names, for the binding and for a stewardless key. */
+    function invalidateEntity(source: Source, id: string): void {
+      const binding = store.byEntity(source, id);
+      if (binding !== null) entityCache.invalidate(binding.projectId, binding.entityKey);
+      entityCache.invalidateKey(id);
+    }
+
+    /**
+     * The merged entity facts the brief renders from, through the cache. The
+     * agenda bindings read first, with TTL 0 and a short timeout, so a fresh
+     * read answers the greeting; the closed bindings read next, from cache or
+     * stored with a timeout, so a cold source never holds the open. The open
+     * tier renders only from the binding, so it reads nothing.
+     */
+    async function readBriefEntities(projectId: string, agendaBindings: readonly Binding[], closedBindings: readonly Binding[], ttlMs: number): Promise<Map<string, StandupEntityFacts>> {
+      const entities = new Map<string, StandupEntityFacts>();
+      const read = async (b: Binding, options: { ttlMs: number; timeoutMs: number }): Promise<void> => {
+        const result = await entityCache.read(projectId, b.entityKey, options);
+        if (result !== null) entities.set(b.id, { entity: result.record.entity, pulls: result.record.pulls });
+      };
+      await Promise.all(agendaBindings.map((b) => read(b, { ttlMs: 0, timeoutMs: ENTITY_AGENDA_TIMEOUT_MS })));
+      await Promise.all(closedBindings.map((b) => read(b, { ttlMs, timeoutMs: ENTITY_CLOSED_TIMEOUT_MS })));
+      return entities;
+    }
+
+    /** Search the project's own Linear teams and GitHub repos through the source contract. */
+    async function standupSearchIssues(projectId: string, query: string, limit: number): Promise<SearchIssue[]> {
+      const config = await loadConfig(projectId);
+      const teams = config?.file.linear.teams ?? [];
+      const repos = config?.repos ?? [];
+      const issues: SearchIssue[] = [];
+      const asks: Array<Promise<void>> = [];
+      if (teams.length > 0) {
+        asks.push(
+          sourceRpc("linear", "sourceSearchIssues", { units: teams, query, limit }, sourceContract.sourceSearchIssues.output)
+            .then((out) => void issues.push(...out.issues))
+            .catch(() => undefined),
+        );
+      }
+      if (repos.length > 0) {
+        asks.push(
+          sourceRpc("github", "sourceSearchIssues", { units: repos, query, limit }, sourceContract.sourceSearchIssues.output)
+            .then((out) => void issues.push(...out.issues))
+            .catch(() => undefined),
+        );
+      }
+      await Promise.all(asks);
+      return issues;
+    }
+
     // ---- the stand-up (BB-300) ----------------------------------------------------------
     //
     // One spoken stand-up per project, opened from the Stewards page. The
@@ -1700,9 +1809,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * only the project stand-up is the "since" the next project stand-up reads.
      * A stand-up that said nothing wakes no one.
      */
-    async function finishStandup(standup: StandupRow, via: "page" | "voice" | "start" = "page"): Promise<void> {
+    async function finishStandup(standup: StandupRow, via: "page" | "voice" | "start" = "page", completed = false): Promise<void> {
       if (standup.endedAt !== null) return;
-      let row = store.saveStandup(standup.id, { endedAt: now() }) ?? standup;
+      let row = store.saveStandup(standup.id, { endedAt: now(), ...(completed ? { completed: true } : {}) }) ?? standup;
       // A scoped stand-up is about one steward and does not move the project's
       // "since the last stand-up" cursor; the next project stand-up still reads
       // the last project one.
@@ -2982,10 +3091,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const fresh = await snapshot(b.source, b.entityId).catch(() => null);
       if (fresh === null) return { observed: b.lastSnapshot, complete: false };
       const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
-      if (b.kind !== "ticket") return { observed: { entity, pulls: [] }, complete: true };
+      if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now() }, complete: true };
       const keys = linkedPullKeys(entity);
       const pulls = await linkedPulls(entity);
-      return { observed: { entity, pulls }, complete: pulls.length >= keys.length };
+      return { observed: { entity, pulls, at: now() }, complete: pulls.length >= keys.length };
     }
 
     /**
@@ -4522,7 +4631,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       // An unread relation keeps the last known parent and children (BB-244).
       entity = keepRelations(b.lastSnapshot?.entity ?? null, entity);
-      const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
+      const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [], at: now() };
       const prev = b.lastSnapshot;
 
       // BB-53: a merged pull request whose playbook names a deployment target
@@ -9134,6 +9243,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           debounce(`deploy:${lc(id)}:${deployment.state}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));
           return { ok: true };
         }
+        // BB-312: a doorbell for an entity drops its cache entry, so a comment
+        // posted during the stand-up is seen on the next lookup.
+        invalidateEntity(source, id);
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));
         return { ok: true };
       },
@@ -9554,9 +9666,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             .filter((q) => scoped === null || q.bindingId === scoped.id)
             .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
           const scopeKey = scoped?.entityKey ?? null;
-          // The briefing goes to OpenAI, so a token pasted into a ticket, an
+          const standupConfig = await loadConfig(targetProjectId);
+          const brief = briefing(targetProjectId, since, scoped?.id);
+          // BB-312: the project brief is steward-tiered and enriched from the
+          // entity cache; the scoped stand-up (BB-303) keeps its builder. The
+          // briefing goes to OpenAI, so a token pasted into a ticket, an
           // escalation or a note is scrubbed first.
-          const instructions = scrubCredentials(buildStandupInstructions(briefing(targetProjectId, since, scoped?.id), name, now(), questions, scopeKey));
+          let instructions: string;
+          if (scoped === null) {
+            const all = store.all(targetProjectId);
+            const agendaIds = new Set<string>([
+              ...brief.decisions.needs.map((x) => x.binding.id),
+              ...brief.decisions.withUser.map((x) => x.from.id),
+            ]);
+            for (const q of questions) {
+              const binding = q.key === null ? null : store.find(q.key, targetProjectId);
+              if (binding !== null) agendaIds.add(binding.id);
+            }
+            const closedLimit = standupConfig?.file.standup.closedLimit ?? 10;
+            const closedDays = standupConfig?.file.standup.closedDays ?? 3;
+            const lastCompletedAt = store.lastCompletedStandup(targetProjectId);
+            // Read only the bindings the three tiers can show: every open
+            // binding, the agenda bindings, and the recently-closed ones within
+            // the clamp. The closed set is the builder's own filter, repeated
+            // here so the bulk read does not touch bindings no tier shows.
+            const clampStart = Math.max(now() - closedDays * 86_400_000, lastCompletedAt ?? 0);
+            const closed = all
+              .filter((b): b is Binding & { endedAt: number } => b.endedAt !== null && b.endedAt >= clampStart)
+              .sort((a, b) => b.endedAt - a.endedAt)
+              .slice(0, closedLimit);
+            const ttlMs = (standupConfig?.file.standup.cacheTtl ?? 3_600) * 1_000;
+            const entities = await readBriefEntities(targetProjectId, all.filter((b) => agendaIds.has(b.id)), closed, ttlMs);
+            instructions = buildStandupBrief(brief, all, entities, name, now(), questions, { closedLimit, closedDays, lastCompletedAt });
+          } else {
+            instructions = buildStandupInstructions(brief, name, now(), questions, scopeKey);
+          }
+          const scrubbedInstructions = scrubCredentials(instructions);
           // A new start supersedes the project's earlier session: the voice
           // plugin does not tell stewards when an overlay closes, so a stale
           // session must not answer tool calls and the project's record is its
@@ -9591,7 +9736,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           let opened: { sessionId: string; maxDurationMs: number };
           try {
             opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", {
-              instructions,
+              instructions: scrubbedInstructions,
               tools: STANDUP_TOOLS,
               toolHandler: { method: "stewardsStandupTool" },
               client: client ?? null,
@@ -9636,6 +9781,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // `runStandupTool` writes only to this in-memory record; the notes it
         // touches are saved to the durable row afterwards.
         const standupProjectId = standup.projectId;
+        // BB-312: the read tools go through the entity cache, scoped to the
+        // project's own teams and repos. Loading the config also warms
+        // `configs`, which `sourceForKey` reads.
+        const toolConfig = await loadConfig(standupProjectId);
+        const toolTtlMs = (toolConfig?.file.standup.cacheTtl ?? 3_600) * 1_000;
         const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected, delegations: [...standup.delegations] as StandupDelegation[] };
         const result = await runStandupTool(name, args, {
           projectId: standupProjectId,
@@ -9645,7 +9795,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           escalation: (id) => store.escalation(id),
           lessons: (bindingId) => store.allLessons(standupProjectId).filter((l) => l.bindingId === bindingId),
           guidance: () => guidanceUnits(standupProjectId),
-          snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
+          entity: async (key) => {
+            const read = await entityCache.read(standupProjectId, key, { ttlMs: toolTtlMs });
+            return read === null ? null : { entity: read.record.entity, pulls: read.record.pulls };
+          },
+          inScope: (key) => keyInScope(standupProjectId, key),
+          searchIssues: (query, limit) => standupSearchIssues(standupProjectId, query, limit),
           needs: (bindingId) => store.openNeeds(bindingId),
           confirmed: standup.confirmed,
           record,
@@ -9701,7 +9856,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 if (outcome.ok && outcome.applied) applied.push(id);
                 else skipped.push({ id, reason: outcome.message });
               }
-              await finishStandup(row, "voice");
+              // BB-312: `end_standup` completed the stand-up; the clamp may
+              // read it as the last completed stand-up. An overlay close
+              // (stewardsStandupClose) does not.
+              await finishStandup(row, "voice", true);
               const parts = [
                 applied.length === 0 ? "Nothing was applied." : `Applied ${applied.length} confirmed item${applied.length === 1 ? "" : "s"}.`,
               ];
@@ -9811,7 +9969,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const standup = store.standup(standupId);
         if (standup === null) return { ok: false, message: "That stand-up is gone." };
         if (standup.endedAt !== null) return { ok: true, message: "Already ended." };
-        await finishStandup(standup, "page");
+        // BB-312: the page's end completed the stand-up.
+        await finishStandup(standup, "page", true);
         return { ok: true, message: "Stand-up ended." };
       },
       // BB-301: the voice plugin calls this when the session ends for any
@@ -13532,12 +13691,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, archiveOrphanStandupDelegates, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, readCounts, reconcilePass });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, archiveOrphanStandupDelegates, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, readCounts, reconcilePass });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; archiveOrphanStandupDelegates(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; archiveOrphanStandupDelegates(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void> }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
