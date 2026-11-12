@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REALTIME_CALLS_URL,
+  REALTIME_STOP_FALLBACK_MS,
   RealtimeSessionClient,
   RealtimeSessionTakenError,
   type RealtimeClientCallbacks,
@@ -16,16 +17,24 @@ const MINTED: MintedRealtimeSession = {
   instructions: "Say hi.",
   tools: [],
   maxDurationMs: 20 * 60 * 1000,
+  speaksFirst: false,
 };
 
 class FakeDataChannel {
   readyState = "open";
   readonly sent: string[] = [];
+  private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
   send(data: string): void {
     this.sent.push(data);
   }
-  addEventListener(): void {
-    // The tests never deliver a channel message.
+  addEventListener(type: string, listener: (event: unknown) => void): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(listener);
+    this.listeners.set(type, list);
+  }
+  /** Deliver a channel event to the client, as the real data channel would. */
+  emit(type: string, event: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
   }
   close(): void {
     this.readyState = "closed";
@@ -57,13 +66,20 @@ class FakePeerConnection {
 function callbacks(overrides: Partial<RealtimeClientCallbacks> = {}): RealtimeClientCallbacks {
   return {
     mint: async () => MINTED,
-    toolCall: async () => "",
+    toolCall: async () => ({ output: "" }),
     close: async () => {},
     onLine: () => {},
     onStatus: () => {},
     onSecondsLeft: () => {},
     ...overrides,
   };
+}
+
+/** Wire the browser media and fetch so a client can reach the data channel. */
+function stubConnect(minted: MintedRealtimeSession = MINTED): void {
+  const track = { enabled: true, stop: vi.fn() };
+  vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn(async () => streamOf(track)) } });
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("answer-sdp", { status: 200 })));
 }
 
 function streamOf(track: { enabled: boolean; stop: ReturnType<typeof vi.fn> }): MediaStream {
@@ -148,5 +164,118 @@ describe("RealtimeSessionClient", () => {
     // used to send a session.update.
     expect(pc.channel.sent).toEqual([]);
     await client.stop();
+  });
+
+  it("sends no opening response.create unless the session opts into speaksFirst", async () => {
+    stubConnect();
+    const client = new RealtimeSessionClient(callbacks());
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+    expect(pc.channel.sent).toEqual([]);
+    await client.stop();
+
+    FakePeerConnection.instances.length = 0;
+    const speaking = new RealtimeSessionClient(
+      callbacks({ mint: async () => ({ ...MINTED, speaksFirst: true }) }),
+    );
+    await speaking.start();
+    const speakingPc = FakePeerConnection.instances[0]!;
+    speakingPc.channel.emit("open", {});
+    expect(speakingPc.channel.sent).toEqual([JSON.stringify({ type: "response.create" })]);
+    await speaking.stop();
+  });
+
+  it("stops after the goodbye's audio finishes when a tool reply is last", async () => {
+    stubConnect();
+    const close = vi.fn(async () => {});
+    const toolCall = vi.fn(async () => ({ output: "done", last: true }));
+    const client = new RealtimeSessionClient(callbacks({ toolCall, close }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+    pc.channel.emit("message", {
+      data: JSON.stringify({ type: "response.function_call_arguments.done", response_id: "resp_call", call_id: "c1", name: "end_standup", arguments: "{}" }),
+    });
+    await vi.waitFor(() => expect(toolCall).toHaveBeenCalled());
+    await vi.waitFor(() => expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true));
+    expect(close).not.toHaveBeenCalled();
+    // The response that made the call finishing does not stop the session, and
+    // a late event of that response is not mistaken for the goodbye.
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_call" }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_item.done", response_id: "resp_call" }) });
+    expect(close).not.toHaveBeenCalled();
+    // The goodbye's response.done only arms a fallback; its audio finishing closes.
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_goodbye" }) });
+    expect(close).not.toHaveBeenCalled();
+    pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_goodbye" }) });
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not mistake a late event of the calling response for the goodbye", async () => {
+    stubConnect();
+    const close = vi.fn(async () => {});
+    const toolCall = vi.fn(async () => ({ output: "done", last: true }));
+    const client = new RealtimeSessionClient(callbacks({ toolCall, close }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+    pc.channel.emit("message", {
+      data: JSON.stringify({ type: "response.function_call_arguments.done", response_id: "resp_call", call_id: "c1", name: "end_standup", arguments: "{}" }),
+    });
+    await vi.waitFor(() => expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true));
+    // The calling response's own audio-finished signal must not stop the session.
+    pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_call" }) });
+    expect(close).not.toHaveBeenCalled();
+    // The goodbye's does.
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_goodbye" }) });
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  });
+
+  it("closes on the fallback when the goodbye's audio signal never arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      stubConnect();
+      const close = vi.fn(async () => {});
+      const toolCall = vi.fn(async () => ({ output: "done", last: true }));
+      const client = new RealtimeSessionClient(callbacks({ toolCall, close }));
+      await client.start();
+      const pc = FakePeerConnection.instances[0]!;
+      pc.channel.emit("open", {});
+      pc.channel.emit("message", {
+        data: JSON.stringify({ type: "response.function_call_arguments.done", response_id: "resp_call", call_id: "c1", name: "end_standup", arguments: "{}" }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true);
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_goodbye" }) });
+      expect(close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(REALTIME_STOP_FALLBACK_MS);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the session open when a tool reply has no last flag", async () => {
+    stubConnect();
+    const close = vi.fn(async () => {});
+    const toolCall = vi.fn(async () => ({ output: "ok" }));
+    const client = new RealtimeSessionClient(callbacks({ toolCall, close }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+    pc.channel.emit("message", {
+      data: JSON.stringify({ type: "response.function_call_arguments.done", call_id: "c1", name: "echo", arguments: "{}" }),
+    });
+    await vi.waitFor(() => expect(toolCall).toHaveBeenCalled());
+    await vi.waitFor(() => expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true));
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_2" } }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_2" }) });
+    expect(close).not.toHaveBeenCalled();
+    await client.stop();
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });

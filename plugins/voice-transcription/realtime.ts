@@ -12,7 +12,7 @@
  * network or a key. The route handlers in `server.ts` hold the state.
  */
 import { DEFAULT_BASE_URL } from "./config.js";
-import type { RealtimeSessionConfig, RealtimeTool } from "./realtime-shared.js";
+import type { RealtimeSessionConfig, RealtimeTool, RealtimeToolReply } from "./realtime-shared.js";
 
 /** The OpenAI model used when a caller does not name one. */
 export const DEFAULT_REALTIME_MODEL = "gpt-realtime";
@@ -38,6 +38,12 @@ export const REALTIME_SECRET_TTL_SECONDS = 60;
  * outlives this even if the overlay is gone.
  */
 export const REALTIME_SESSION_MAX_MS = 20 * 60 * 1000;
+/**
+ * How often the server reaps sessions past their cap and tells their opener.
+ * The overlay enforces the cap while it is alive; this covers a closed tab or a
+ * model that goes quiet.
+ */
+export const REALTIME_SWEEP_INTERVAL_MS = 30 * 1000;
 /** The most tools one session may declare. */
 export const REALTIME_MAX_TOOLS = 32;
 /** The most instruction characters one session may carry. */
@@ -159,4 +165,24 @@ export function parseClientSecret(payload: unknown): {
 /** Every tool a session declared, by name, for validating a model's call. */
 export function declaresTool(tools: RealtimeTool[], name: string): boolean {
   return tools.some((tool) => tool.name === name);
+}
+
+/**
+ * Normalise whatever an opener's tool handler returned into the tool route's
+ * reply. The original contract is a plain string; the extended one is an
+ * object with `output` and an optional `last` flag, which the overlay reads as
+ * "let the in-flight response finish, then stop the session". Anything else is
+ * stringified as before, so an opener that returns JSON data is unchanged.
+ */
+export function toolReply(result: unknown): RealtimeToolReply {
+  if (typeof result === "string") return { output: result };
+  if (typeof result === "object" && result !== null) {
+    const record = result as Record<string, unknown>;
+    if (typeof record.output === "string") {
+      return record.last === true
+        ? { output: record.output, last: true }
+        : { output: record.output };
+    }
+  }
+  return { output: JSON.stringify(result ?? null) };
 }

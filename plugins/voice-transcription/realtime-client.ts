@@ -12,7 +12,7 @@
  * request that mints the ephemeral secret, so the WebRTC connection inherits
  * it and the overlay never has to send a `session.update`.
  */
-import type { MintedRealtimeSession } from "./realtime-shared.js";
+import type { MintedRealtimeSession, RealtimeToolReply } from "./realtime-shared.js";
 
 export type RealtimeLine = { role: "user" | "assistant"; text: string };
 export type RealtimeStatus = "connecting" | "live" | "closed" | "error";
@@ -20,8 +20,8 @@ export type RealtimeStatus = "connecting" | "live" | "closed" | "error";
 export type RealtimeClientCallbacks = {
   /** Mint the ephemeral secret for this session (the plugin's own route). */
   mint: () => Promise<MintedRealtimeSession>;
-  /** Forward one model tool call to the opener; resolves to the tool output string. */
-  toolCall: (call: { callId: string; name: string; arguments: string }) => Promise<string>;
+  /** Forward one model tool call to the opener; resolves to the tool output and whether it is the last turn. */
+  toolCall: (call: { callId: string; name: string; arguments: string }) => Promise<RealtimeToolReply>;
   /** Tell the server the session is over. Only called by the client that minted it. */
   close: () => Promise<void>;
   onLine: (line: RealtimeLine) => void;
@@ -43,6 +43,12 @@ export class RealtimeSessionTakenError extends Error {
 
 /** OpenAI's GA WebRTC endpoint; the ephemeral secret's session config picks the model. */
 export const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
+/**
+ * How long after a `last` reply's `response.done` the overlay waits for the
+ * WebRTC-only `output_audio_buffer.stopped` (the audio actually finishing)
+ * before it closes anyway. The cap is the final backstop.
+ */
+export const REALTIME_STOP_FALLBACK_MS = 15_000;
 
 export class RealtimeSessionClient {
   private readonly callbacks: RealtimeClientCallbacks;
@@ -55,6 +61,12 @@ export class RealtimeSessionClient {
   private stopped = false;
   private ownsSession = false;
   private assistant = "";
+  /** Set by a tool reply with `last: true`: stop once the in-flight response finishes. */
+  private stopAfterResponse = false;
+  /** The response the stop waits on; set from the goodbye response's `response.created`. */
+  private stopResponseId: string | null = null;
+  /** A fallback that closes if `output_audio_buffer.stopped` never arrives. */
+  private stopFallback: number | null = null;
 
   constructor(callbacks: RealtimeClientCallbacks) {
     this.callbacks = callbacks;
@@ -99,7 +111,12 @@ export class RealtimeSessionClient {
       const channel = pc.createDataChannel("oai-events");
       this.channel = channel;
       channel.addEventListener("message", (event) => this.onMessage(event.data));
-      channel.addEventListener("open", () => this.callbacks.onStatus("live"));
+      channel.addEventListener("open", () => {
+        this.callbacks.onStatus("live");
+        // Opt-in: the opener asked the agent to speak first, so one response
+        // request gets the model going instead of waiting for the owner.
+        if (minted.speaksFirst) this.send({ type: "response.create" });
+      });
 
       const offer = await pc.createOffer();
       if (this.stopped) return;
@@ -162,6 +179,10 @@ export class RealtimeSessionClient {
       window.clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.stopFallback !== null) {
+      window.clearTimeout(this.stopFallback);
+      this.stopFallback = null;
+    }
     try {
       this.channel?.close();
     } catch {
@@ -222,6 +243,14 @@ export class RealtimeSessionClient {
       return;
     }
     const type = typeof event.type === "string" ? event.type : "";
+    const responseId = this.responseIdOf(event);
+    // Only `response.created` opens a response, so it is the one event that can
+    // name the goodbye. Later events from the response that made the tool call
+    // (its `output_item.done`, its own `output_audio_buffer.stopped`) cannot be
+    // mistaken for the stop target.
+    if (type === "response.created" && this.stopAfterResponse && this.stopResponseId === null && responseId !== null) {
+      this.stopResponseId = responseId;
+    }
     switch (type) {
       case "response.audio_transcript.delta":
       case "response.output_audio_transcript.delta": {
@@ -248,6 +277,22 @@ export class RealtimeSessionClient {
       case "response.function_call_arguments.done":
         void this.handleToolCall(event);
         break;
+      case "response.done": {
+        // The response's text is generated; its audio is still playing. Wait
+        // for `output_audio_buffer.stopped`, with a fallback in case this
+        // transport never sends it.
+        if (this.stopAfterResponse && responseId !== null && responseId === this.stopResponseId) {
+          this.armStopFallback();
+        }
+        break;
+      }
+      case "output_audio_buffer.stopped": {
+        // The goodbye's audio has finished playing; now the overlay closes.
+        if (this.stopAfterResponse && responseId !== null && responseId === this.stopResponseId) {
+          void this.stop();
+        }
+        break;
+      }
       case "error": {
         const error = event.error;
         const message =
@@ -263,6 +308,31 @@ export class RealtimeSessionClient {
     }
   }
 
+  /** The response id an event belongs to, if it carries one. */
+  private responseIdOf(event: Record<string, unknown>): string | null {
+    const direct = event.response_id;
+    if (typeof direct === "string" && direct !== "") return direct;
+    const response = event.response;
+    if (
+      typeof response === "object" &&
+      response !== null &&
+      "id" in response &&
+      typeof (response as { id: unknown }).id === "string"
+    ) {
+      return (response as { id: string }).id;
+    }
+    return null;
+  }
+
+  /** Close after a short grace if the audio-finished signal never arrives. */
+  private armStopFallback(): void {
+    if (this.stopFallback !== null) return;
+    this.stopFallback = window.setTimeout(() => {
+      this.stopFallback = null;
+      void this.stop();
+    }, REALTIME_STOP_FALLBACK_MS);
+  }
+
   private async handleToolCall(event: Record<string, unknown>): Promise<void> {
     const callId =
       typeof event.call_id === "string"
@@ -272,18 +342,27 @@ export class RealtimeSessionClient {
           : "";
     const name = typeof event.name === "string" ? event.name : "";
     const args = typeof event.arguments === "string" ? event.arguments : "{}";
-    let output: string;
+    let reply: RealtimeToolReply;
     try {
-      output = await this.callbacks.toolCall({ callId, name, arguments: args });
+      reply = await this.callbacks.toolCall({ callId, name, arguments: args });
     } catch (error) {
-      output = JSON.stringify({
-        error: error instanceof Error ? error.message : String(error),
-      });
+      reply = {
+        output: JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      };
     }
     this.send({
       type: "conversation.item.create",
-      item: { type: "function_call_output", call_id: callId, output },
+      item: { type: "function_call_output", call_id: callId, output: reply.output },
     });
     this.send({ type: "response.create" });
+    // `last` means the opener is done after this reply: let the model finish
+    // its goodbye, then close. The stop waits on the next response, not the
+    // one that made the call, so the goodbye is not cut off.
+    if (reply.last === true) {
+      this.stopAfterResponse = true;
+      this.stopResponseId = null;
+    }
   }
 }

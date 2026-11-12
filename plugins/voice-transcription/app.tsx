@@ -95,10 +95,11 @@ function RealtimeVoiceOverlay() {
         const result = (await callRoute(REALTIME_TOOL_PATH, {
           sessionId,
           ...tool,
-        })) as { output?: unknown };
-        return typeof result.output === "string"
-          ? result.output
-          : JSON.stringify(result.output ?? null);
+        })) as { output?: unknown; last?: unknown };
+        return {
+          output: typeof result.output === "string" ? result.output : JSON.stringify(result.output ?? null),
+          ...(result.last === true ? { last: true } : {}),
+        };
       },
       close: async () => {
         await callRoute(REALTIME_CLOSE_PATH, { sessionId });
@@ -120,7 +121,16 @@ function RealtimeVoiceOverlay() {
     });
     clientRef.current = client;
     void client.start();
+    // A tab that is closing does not run the cleanup below, so nudge the close
+    // route on `pagehide`; the server's own sweep is the guarantee.
+    const onPageHide = (): void => {
+      if (typeof navigator.sendBeacon !== "function") return;
+      const body = new Blob([JSON.stringify({ sessionId })], { type: "application/json" });
+      navigator.sendBeacon(`/api/v1/plugins/${PLUGIN_ID}/http${REALTIME_CLOSE_PATH}`, body);
+    };
+    window.addEventListener("pagehide", onPageHide);
     return () => {
+      window.removeEventListener("pagehide", onPageHide);
       clientRef.current = null;
       void client.stop();
     };

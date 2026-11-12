@@ -27,6 +27,7 @@ import {
   REALTIME_CLIENT_SECRET_PATH,
   REALTIME_MAX_INSTRUCTIONS_CHARS,
   REALTIME_MAX_TOOLS,
+  REALTIME_SWEEP_INTERVAL_MS,
   declaresTool,
   parseClientSecret,
   realtimeClientSecretBody,
@@ -34,6 +35,7 @@ import {
   realtimeModel,
   realtimeReadiness,
   realtimeVoice,
+  toolReply,
 } from "./realtime.js";
 import {
   PLUGIN_ID,
@@ -77,12 +79,21 @@ const realtimeSessionConfigSchema = z.object({
   model: z.string().trim().min(1).max(100).optional(),
   voice: z.string().trim().min(1).max(40).optional(),
   maxDurationMs: z.number().int().positive().optional(),
+  speaksFirst: z.boolean().optional(),
 });
 
 export const rpcContract = defineRpcContract({
   "realtime.open": {
     input: realtimeSessionConfigSchema.extend({
       toolHandler: z
+        .object({ method: z.string().trim().min(1) })
+        .nullable()
+        .default(null),
+      /**
+       * The opener's own RPC method, called with the session id when the
+       * session ends for any reason. Null means no handler.
+       */
+      onClose: z
         .object({ method: z.string().trim().min(1) })
         .nullable()
         .default(null),
@@ -96,6 +107,8 @@ type PendingRealtimeSession = {
   id: string;
   config: RealtimeSessionConfig;
   toolHandler: { pluginId: string; method: string } | null;
+  /** The opener's own method called when the session ends, or null. */
+  closeHandler: { pluginId: string; method: string } | null;
   createdAt: number;
   /** Set once a secret has been minted; null until then. */
   startedAt: number | null;
@@ -364,12 +377,65 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
       return { baseUrl: values.baseUrl, apiKey: resolveApiKey(values.apiKey, env) ?? "" };
     }
 
-    function pruneRealtimeSessions(now: number): void {
-      for (const [id, session] of realtimeSessions) {
+    /**
+     * End one session: take it out of the map first, so a second end (the
+     * overlay's close racing the cap sweep, say) finds nothing, then tell the
+     * opener at most once. The RPC is fired and not awaited: awaiting another
+     * plugin's method here can deadlock (the opener may hold a lock it needs for
+     * its own `realtime.open`), and the session is over whatever the handler
+     * does with the news.
+     */
+    function endRealtimeSession(id: string): void {
+      const session = realtimeSessions.get(id);
+      if (session === undefined) return;
+      realtimeSessions.delete(id);
+      if (session.closeHandler === null) return;
+      void bb.sdk.plugins
+        .callRpc({
+          pluginId: session.closeHandler.pluginId,
+          method: session.closeHandler.method,
+          input: { sessionId: id },
+          outputSchema: z.unknown(),
+        })
+        .catch((error: unknown) => {
+          bb.log.warn(
+            `voice-transcription: close handler for session ${id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    }
+
+    /**
+     * Reap every session past its cap through `endRealtimeSession`, so a session
+     * abandoned by a closed tab is reported even when nobody opens another one.
+     */
+    function sweepRealtimeSessions(nowMs = Date.now()): void {
+      for (const [id, session] of [...realtimeSessions]) {
         const since = session.startedAt ?? session.createdAt;
-        if (now - since > session.maxMs) realtimeSessions.delete(id);
+        if (nowMs - since > session.maxMs) endRealtimeSession(id);
       }
     }
+
+    // The cap is enforced by the overlay's own clock, but a tab that closes or
+    // a model that goes quiet has no clock; this sweep is the guarantee that
+    // every session ends and its opener hears about it.
+    bb.background.service("realtime-sweep", {
+      start(signal) {
+        sweepRealtimeSessions();
+        return new Promise<void>((resolve) => {
+          const timer = setInterval(() => {
+            sweepRealtimeSessions();
+          }, REALTIME_SWEEP_INTERVAL_MS);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearInterval(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      },
+    });
 
     bb.rpc.register(rpcContract, {
       async "realtime.open"(input, { experimental_caller: caller }) {
@@ -381,13 +447,17 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const { baseUrl, apiKey } = await realtimeKey();
         const refusal = realtimeReadiness({ baseUrl, apiKey });
         if (refusal !== null) throw new Error(refusal.message);
-        pruneRealtimeSessions(Date.now());
+        // The background sweep is the guarantee; this eager pass only keeps the
+        // map small, and is not awaited so a stale session's handler cannot
+        // block the new open.
+        sweepRealtimeSessions(Date.now());
         const config: RealtimeSessionConfig = {
           instructions: input.instructions,
           tools: input.tools,
           ...(input.model !== undefined ? { model: input.model } : {}),
           ...(input.voice !== undefined ? { voice: input.voice } : {}),
           ...(input.maxDurationMs !== undefined ? { maxDurationMs: input.maxDurationMs } : {}),
+          ...(input.speaksFirst !== undefined ? { speaksFirst: input.speaksFirst } : {}),
         };
         const session: PendingRealtimeSession = {
           id: crypto.randomUUID(),
@@ -399,6 +469,12 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
             input.toolHandler === null
               ? null
               : { pluginId: caller.pluginId, method: input.toolHandler.method },
+          // The close handler is the same rule: the opener's own method, under
+          // its own identity, called when the session ends.
+          closeHandler:
+            input.onClose === null
+              ? null
+              : { pluginId: caller.pluginId, method: input.onClose.method },
           createdAt: Date.now(),
           startedAt: null,
           minting: false,
@@ -436,7 +512,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           return c.json({ error: "That voice session is already being minted" }, 409);
         }
         if (now - session.createdAt > session.maxMs) {
-          realtimeSessions.delete(sessionId);
+          endRealtimeSession(sessionId);
           return c.json({ error: "That voice session expired before it started" }, 409);
         }
         session.minting = true;
@@ -495,6 +571,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
             instructions: session.config.instructions,
             tools: session.config.tools,
             maxDurationMs: session.maxMs,
+            speaksFirst: session.config.speaksFirst === true,
           };
           return c.json(minted, 200);
         } finally {
@@ -521,7 +598,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           return c.json({ error: "That voice session has ended; start a new one" }, 404);
         }
         if (session.startedAt !== null && Date.now() - session.startedAt > session.maxMs) {
-          realtimeSessions.delete(sessionId);
+          endRealtimeSession(sessionId);
           return c.json({ error: "That voice session has reached its time limit" }, 409);
         }
         if (!declaresTool(session.config.tools, name)) {
@@ -548,7 +625,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           );
         }
         return c.json(
-          { output: typeof result === "string" ? result : JSON.stringify(result ?? null) },
+          toolReply(result),
           200,
         );
       },
@@ -562,7 +639,10 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const body = await readJsonObject(c);
         const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
         if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
-        realtimeSessions.delete(sessionId);
+        // One end path for every kind of end: take the session out, then tell
+        // the opener at most once. The handler is not awaited: the session is
+        // over whatever the opener does with the news.
+        endRealtimeSession(sessionId);
         return c.json({ ok: true }, 200);
       },
       { auth: "local" },

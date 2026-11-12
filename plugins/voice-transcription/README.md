@@ -54,7 +54,13 @@ A session has three pieces:
 
 * An opener — another plugin — calls the `realtime.open` RPC with the session
   instructions and the tools the model may call, and names its own RPC method
-  for the tool results. It receives a session id.
+  for the tool results. It receives a session id. Two optional opt-ins shape the
+  turn-taking: `speaksFirst: true` makes the overlay send one `response.create`
+  when the data channel opens, so the model greets and leads instead of waiting
+  for the owner to speak; and `onClose: { method }` names the opener's own RPC
+  method that the close route calls with the session id whenever the session
+  ends. Both default off, so an opener that wants today's behaviour is
+  unchanged.
 * The plugin's **mint route** (`POST
   /api/v1/plugins/voice-transcription/http/realtime/session`) exchanges the
   plugin's stored key for a short-lived OpenAI **ephemeral client secret** and
@@ -66,6 +72,25 @@ A session has three pieces:
   to OpenAI with the ephemeral secret, plays the model's audio, shows the live
   transcript, and forwards each model tool call to the opener, returning its
   result. It ends the session on the server when it closes.
+
+The tool route's reply is `{ output }`, or `{ output, last: true }` when the
+opener returns an object with that flag instead of a plain string. A `last`
+reply lets the model finish its current response and its audio (the overlay
+waits for the WebRTC `output_audio_buffer.stopped` signal, with a short
+fallback), then stops the session itself, which is how an opener ends a
+conversation from inside a tool call. Note that the extended shape reserves an
+object with a string `output` field: an opener that returns other JSON is
+stringified as before, but one that returns data under an `output` key now
+gets the unwrapped text, so use a different key for data.
+
+The close route calls the opener's `onClose` method with the session id for
+every kind of end: the End button, the 20-minute cap, the overlay unmounting
+(a closed tab), and a model-initiated end after a `last` tool reply. The
+overlay also nudges the route on `pagehide`, and the server sweeps expired
+sessions on its own timer, so a closed tab or a quiet model still ends the
+session and reaches the opener. An opener that named no `onClose` is
+unaffected, the handler is called at most once per session, and a failed
+handler is logged, not surfaced to the browser.
 
 Spend is bounded: the ephemeral secret expires after 60 seconds, one session
 is capped at 20 minutes (the overlay counts down and closes itself, and the
