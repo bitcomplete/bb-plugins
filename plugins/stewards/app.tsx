@@ -17,6 +17,7 @@ import {
   ThreadTitle,
   definePluginApp,
   experimental_Icon as Icon,
+  experimental_THREAD_ACTION_GROUPS,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
   experimental_ThreadActionsMenu as ThreadActionsMenu,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
@@ -32,6 +33,8 @@ import {
   type ExperimentalSidebarNavigationProps,
   type PluginHomepageSectionProps,
   type PluginSidebarThread,
+  type PluginThreadAction,
+  type PluginThreadActionDataInput,
   type PluginThreadActionTarget,
   type PluginThreadActionsTriggerProps,
   type PluginThreadListProps,
@@ -783,12 +786,14 @@ function voiceClientId(): string | null {
  * makes the call. It renders only when the server says a stand-up is available,
  * and the server's refusal (or a failed call) is shown in place.
  */
-function StandupButton({ projectId, onStarted, waiting = 0, errorAsTitle = false }: { projectId: string; onStarted?: () => void; waiting?: number; errorAsTitle?: boolean }) {
+function StandupButton({ projectId, binding = null, onStarted, waiting = 0, errorAsTitle = false }: { projectId: string; binding?: string | null; onStarted?: () => void; waiting?: number; errorAsTitle?: boolean }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
   const start = () => {
     setState("starting");
-    rpc.call("stewardsStandupStart", { projectId, client: voiceClientId() }).then(
+    // A scoped stand-up carries the binding key; the project stand-up sends no
+    // `binding` at all, so a client built from the previous image is untouched.
+    rpc.call("stewardsStandupStart", { projectId, ...(binding === null ? {} : { binding }), client: voiceClientId() }).then(
       (result) => {
         setState(result.ok ? "idle" : { error: result.message });
         if (result.ok) onStarted?.();
@@ -814,6 +819,110 @@ function StandupButton({ projectId, onStarted, waiting = 0, errorAsTitle = false
       </button>
       {error !== null && !errorAsTitle ? <span className="text-xs text-destructive">{error}</span> : null}
     </span>
+  );
+}
+
+/**
+ * BB-303: what the `Stand-up` thread action reads per thread, and the start
+ * call its `run` makes. `useData` runs once for the whole app, so it asks the
+ * server for every visible thread at once; the server resolves the binding and
+ * the project from the thread, never from anything the client sends.
+ */
+type StandupThreadInfo = { projectId: string; binding: string; available: boolean };
+type StandupActionData = {
+  threads: ReadonlyMap<string, StandupThreadInfo>;
+  start: (threadId: string) => Promise<{ ok: boolean; message: string }>;
+};
+
+function useStandupActionData({ threadIds }: PluginThreadActionDataInput): StandupActionData {
+  const rpc = useRpc<typeof rpcContract>();
+  const ids = useMemo(() => [...threadIds], [threadIds.join("\n")]);
+  const [threads, setThreads] = useState<ReadonlyMap<string, StandupThreadInfo>>(new Map());
+  useEffect(() => {
+    if (ids.length === 0) {
+      setThreads(new Map());
+      return;
+    }
+    let live = true;
+    rpc.call("stewardsStandupThreads", { threadIds: ids }).then(
+      (result) => {
+        if (live) setThreads(new Map(result.threads.map((t) => [t.threadId, t])));
+      },
+      () => {
+        if (live) setThreads(new Map());
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [rpc, ids]);
+  const start = useCallback(
+    async (threadId: string) => {
+      const result = await rpc.call("stewardsStandupStart", { threadId, client: voiceClientId() });
+      return { ok: result.ok, message: result.message };
+    },
+    [rpc],
+  );
+  return useMemo(() => ({ threads, start }), [threads, start]);
+}
+
+/**
+ * The `Stand-up` action for one thread, or null when it is not an open
+ * steward's thread or the project's stand-up is not available. Its `run`
+ * starts the scoped stand-up and throws the server's refusal, so the host's
+ * menu reports it; the plugin's own sidebar hover button renders the same call
+ * with a visible "Starting…" and the refusal (BB-303).
+ */
+function standupThreadAction(thread: PluginThreadActionTarget, data: StandupActionData): PluginThreadAction | null {
+  const info = data.threads.get(thread.id);
+  if (info === undefined || !info.available) return null;
+  return {
+    label: "Stand-up",
+    detail: `About ${info.binding} only`,
+    icon: "Mic",
+    run: async () => {
+      const result = await data.start(thread.id);
+      if (!result.ok) throw new Error(result.message);
+    },
+  };
+}
+
+/**
+ * BB-303: the `Stand-up` quick-action button in the plugin's own sidebar row,
+ * beside Archive. It reads the registered action's presence (the host evaluates
+ * the registration and returns it for this key) and starts the same scoped
+ * stand-up directly, so it can show "Starting…" and then the server's refusal
+ * in the button's tooltip, exactly like `StandupButton`.
+ */
+function StandupRowActionButton({ target }: { target: PluginThreadActionTarget }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const entries = experimental_useThreadActions(target, { keys: ["stewards/standup"] });
+  const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
+  if (entries.length === 0) return null;
+  const start = () => {
+    setState("starting");
+    rpc.call("stewardsStandupStart", { threadId: target.id, client: voiceClientId() }).then(
+      (result) => setState(result.ok ? "idle" : { error: result.message }),
+      (e: unknown) => setState({ error: message(e) }),
+    );
+  };
+  const error = typeof state === "object" ? state.error : null;
+  return (
+    <button
+      type="button"
+      aria-label={state === "starting" ? "Starting…" : "Stand-up"}
+      data-thread-action="stewards/standup"
+      disabled={state === "starting"}
+      title={error ?? undefined}
+      className={ROW_ACTION_CLASS}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        start();
+      }}
+    >
+      <Icon name="Mic" className="size-4 max-md:pointer-coarse:size-5" />
+    </button>
   );
 }
 
@@ -930,7 +1039,7 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
   const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
     <Section
-      title="Stand-up readback"
+      title={standup.binding === null ? "Stand-up readback" : `Stand-up · ${standup.binding}`}
       count={standup.notes.length}
       action={
         <span className="flex items-center gap-2">
@@ -1288,7 +1397,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
         ) : (
           <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
             {orphans.map((item) => (
-              <NeedsYouOrphanCard key={needsYouItemKey(item)} entry={item} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
+              <NeedsYouOrphanCard key={needsYouItemKey(item)} entry={item} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} projectId={b.projectId} standupAvailable={b.standup?.available === true} />
             ))}
           </ul>
         )}
@@ -1384,6 +1493,9 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
               <li key={needsYouItemKey(item)} className="flex flex-col gap-2 p-3">
                 <NeedsYouPrompt entry={item} now={now} />
                 <NeedsYouControls entry={item} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
+                {/* BB-303: a scoped stand-up for the binding this item belongs
+                    to. A project-level item has no binding to scope to. */}
+                {needsYouKey(item) !== null && b.standup?.available === true ? <StandupButton projectId={b.projectId} binding={needsYouKey(item)} /> : null}
               </li>
             ))}
           </ul>
@@ -1460,6 +1572,8 @@ function EffortHeading({ board: b, effort }: { board: Board; effort: BoardEffort
           {s.title === null ? null : <span className="min-w-0 flex-1 truncate text-lg font-medium">{s.title}</span>}
           {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
           {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
+          {/* BB-303: the binding's own board row starts a stand-up scoped to it. */}
+          {b.standup?.available === true ? <StandupButton projectId={b.projectId} binding={s.key} /> : null}
         </div>
         <p data-steward-line-two="" className="text-xs text-muted-foreground">
           {kindLabel(s.kind)}
@@ -1543,7 +1657,7 @@ function LessonsList({ lessons, now, className = "rounded-lg border border-borde
  * A needs-you item with no open binding (a project-level question, or one whose
  * binding has ended): its own card at the top of Blocked (BB-78).
  */
-function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId }: { entry: NeedsYouItem; now: number; onChanged: () => void; projectStewardThreadId: string | null }) {
+function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId, projectId, standupAvailable }: { entry: NeedsYouItem; now: number; onChanged: () => void; projectStewardThreadId: string | null; projectId: string; standupAvailable: boolean }) {
   const key = needsYouKey(entry);
   const url = entry.type === "question" ? entry.question.url : entry.type === "withUser" ? entry.withUser.url : (entry.need.entityUrl ?? entry.need.url);
   return (
@@ -1551,6 +1665,10 @@ function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId }: {
       {key !== null ? <EntityLink entityKey={key} url={url} /> : null}
       <NeedsYouPrompt entry={entry} now={now} />
       <NeedsYouControls entry={entry} onChanged={onChanged} projectStewardThreadId={projectStewardThreadId} />
+      {/* BB-303: a scoped stand-up for the binding this item names; the server
+          refuses a binding that has ended, so the action is still offered here
+          and reports the refusal rather than starting one. */}
+      {key !== null && standupAvailable ? <StandupButton projectId={projectId} binding={key} /> : null}
     </li>
   );
 }
@@ -2171,6 +2289,7 @@ function SidebarRowHoverActions({ target }: { target: PluginThreadActionTarget }
           <Icon name={entry.action.icon} className="size-4 max-md:pointer-coarse:size-5" />
         </button>
       ))}
+      <StandupRowActionButton target={target} />
       <ThreadActionsMenu thread={target} trigger={renderThreadActionsTrigger} side="right" align="start" sideOffset={8} onOpenChange={setMenuOpen} />
     </span>
   );
@@ -3447,6 +3566,20 @@ export default definePluginApp((app) => {
     id: "stand-up",
     title: "Stewards",
     component: StandupHomepageSection,
+  });
+  // BB-303: a `Stand-up` action on a steward's own thread, beside bb's own
+  // actions. `useData` asks the server which visible threads are an open
+  // steward's and whether a stand-up is available; `item` offers the action
+  // only for those. It can be pinned to the sidebar hover actions, which the
+  // plugin's own list draws with a visible "Starting…".
+  app.slots.experimental_threadAction<StandupActionData>({
+    id: "standup",
+    title: "Stand-up",
+    icon: "Mic",
+    group: experimental_THREAD_ACTION_GROUPS.organize,
+    order: 72,
+    useData: useStandupActionData,
+    item: ({ thread, data }) => standupThreadAction(thread, data),
   });
   app.slots.navPanel({
     id: "board",

@@ -301,6 +301,20 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(text).toContain("merge gate item is never applied by end_standup");
   });
 
+  it("names the scope and drops the project-wide sections for a scoped stand-up (BB-303)", () => {
+    const text = buildStandupInstructions(briefing(), "Acme", 10_000, [], "ENG-12");
+    expect(text).toContain("This stand-up is about ENG-12 only");
+    expect(text).toContain("about ENG-12 only");
+    // The project-wide sweep and playbook deviations do not belong to one binding.
+    expect(text).not.toContain("## Done since");
+    expect(text).not.toContain("## Approaches that departed from the written playbook");
+    // The three scoped sections stay, and the decisions still read.
+    expect(text).toContain("## Decisions waiting on the owner");
+    expect(text).toContain("## Escalations with the project steward");
+    expect(text).toContain("## Stuck or held");
+    expect(text).toContain("Approve the spec");
+  });
+
   it("keeps a huge briefing under the voice plugin's instruction cap, ranked", () => {
     const many = Array.from({ length: 400 }, (_, i) => binding({ entityKey: `ENG-${i}` }));
     const text = buildStandupInstructions(briefing({ done: { moved: [], ended: many, answered: [] } }), "Acme", 10_000);

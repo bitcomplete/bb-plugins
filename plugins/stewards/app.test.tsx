@@ -1643,6 +1643,116 @@ describe("the Stand-up button (BB-300)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-303: the scoped stand-up on the effort detail. Its board row and each of
+  // its needs-you items start the same RPC with the binding's key.
+  const renderEffortWithStandup = async (standup: { available: boolean; message: string | null }): Promise<RenderedSlot> => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    return renderSlot(panel, { subPath: "p1/ENG-1" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [need({ id: "need_spec", kind: "approve-spec", key: "ENG-1", what: "Approve the spec", how: "Read the spec" })],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true })],
+            stuck: [],
+            ended: [],
+            standup,
+          },
+        }),
+        stewardsStandupStart: () => ({ ok: true, sessionId: "sess_1", message: "Stand-up started." }),
+        stewardsStandupRecord: () => ({ standup: null }),
+      } as never,
+    });
+  };
+
+  it("starts a scoped stand-up from the binding's board row and from its needs-you item (BB-303)", async () => {
+    const slot = await renderEffortWithStandup({ available: true, message: null });
+    await waitFor(() => expect(slot.getByText("Approve the spec")).toBeTruthy());
+    // One on the board row (the heading) and one on the binding's item.
+    const buttons = slot.getAllByRole("button", { name: "Stand-up" });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[0]!);
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1", binding: "ENG-1", client: null } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("offers no scoped stand-up when the project has none available (BB-303)", async () => {
+    const slot = await renderEffortWithStandup({ available: false, message: "no key" });
+    await waitFor(() => expect(slot.getByText("Approve the spec")).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Stand-up" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("registers a Stand-up thread action offered only on an available open steward's thread (BB-303)", async () => {
+    const captured = await loadApp();
+    const registration = captured.threadActions.find((a) => a.id === "standup")!;
+    expect(registration).toMatchObject({ title: "Stand-up", group: "2_organize" });
+    const thread = { id: "thr_steward", projectId: "p1", parentThreadId: null, archivedAt: null, pinnedAt: null, sectionId: null, isUnread: false, status: "idle", environment: null } as never;
+    const start = async () => ({ ok: true, message: "" });
+    const data = { threads: new Map([["thr_steward", { projectId: "p1", binding: "ENG-12", available: true }]]), start };
+    expect(registration.item({ thread, data, sdk: {} as never, navigate: {} as never })).toMatchObject({ label: "Stand-up", detail: "About ENG-12 only" });
+    // Not a steward's thread, or no stand-up available, offers nothing.
+    expect(registration.item({ thread, data: { threads: new Map(), start }, sdk: {} as never, navigate: {} as never })).toBeNull();
+    expect(registration.item({ thread, data: { threads: new Map([["thr_steward", { projectId: "p1", binding: "ENG-12", available: false }]]), start }, sdk: {} as never, navigate: {} as never })).toBeNull();
+  });
+
+  it("titles a scoped stand-up readback with its binding (BB-303)", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            standup: { available: true, message: null },
+          },
+        }),
+        stewardsStandupRecord: () => ({
+          standup: {
+            id: "sup_scoped",
+            projectId: "p1",
+            startedAt: 1,
+            endedAt: null,
+            binding: "ENG-12",
+            notes: [{ id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, createdAt: 1, readback: "Guidance for ENG-12: Keep it small", confirmed: false, confirmedBy: null }],
+            confirmed: [],
+          },
+        }),
+        stewardsStandupConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
+        stewardsStandupEnd: () => ({ ok: true, message: "Stand-up ended." }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Stand-up · ENG-12")).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
   // BB-300 slice 4: the readback renders the stored readback lines, confirms
   // each typed item on its own, and shows a free note as context with no button.
   const recordResult = {

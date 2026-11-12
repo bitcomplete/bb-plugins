@@ -92,14 +92,22 @@ export type Briefing = {
 /**
  * Build the briefing reader for one server. `store` and `now` are injected so
  * the digest and the stand-up share one reader, and tests a fixed clock. The
- * returned `briefing(project, since)` is the on-demand entry point: the
- * nightly pass passes the previous digest, a stand-up the stored last stand-up.
+ * returned `briefing(project, since, bindingId?)` is the on-demand entry point:
+ * the nightly pass passes the previous digest, a stand-up the stored last
+ * stand-up, and a scoped stand-up (BB-303) one binding's id, which narrows the
+ * four sections to that binding and drops the "since" sweep.
  */
-export function createBriefing(store: Store, now: () => number): (projectId: string, since: number) => Briefing {
-  return function briefing(projectId: string, since: number): Briefing {
+export function createBriefing(store: Store, now: () => number): (projectId: string, since: number, bindingId?: string) => Briefing {
+  return function briefing(projectId: string, since: number, bindingId?: string): Briefing {
     const row = store.project(projectId);
     const all = store.all(projectId);
-    const open = all.filter((b) => b.endedAt === null);
+    // A scoped stand-up (BB-303) reports one binding only: its decisions, its
+    // open escalations and its hold/stuck state. The "since the last stand-up"
+    // sweep is a project-wide comparison, so it is empty for a scoped one, and
+    // another binding never appears. A binding id that is not in the project
+    // (or has ended) yields an empty briefing; the caller refuses it first.
+    const scoped = bindingId === undefined ? null : (all.find((b) => b.id === bindingId) ?? null);
+    const open = scoped === null ? all.filter((b) => b.endedAt === null) : all.filter((b) => b.id === scoped.id && b.endedAt === null);
     // Every open escalation once, in binding then creation order, so the four
     // sections partition one read rather than repeating it.
     const allEscalations = open.flatMap((b) => store.openEscalations(b.id).map((escalation) => ({ escalation, from: b })));
@@ -127,12 +135,21 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
         // BB-247: the dated waits still ahead, listed separately from stalls.
         datedWaits: open.filter((b) => b.requeueUntil !== null && b.requeueUntil > now()),
       },
-      done: {
-        moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
-        ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
-        answered: store.answeredSince(projectId, since),
-      },
-      assumptions: store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) })),
+      done:
+        scoped === null
+          ? {
+              moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
+              ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
+              answered: store.answeredSince(projectId, since),
+            }
+          : { moved: [], ended: [], answered: [] },
+      assumptions:
+        scoped === null
+          ? store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }))
+          : store
+              .openAssumptionsForProject(projectId)
+              .filter((assumption) => assumption.bindingId === scoped.id)
+              .map((assumption) => ({ assumption, binding: scoped })),
     };
   };
 }

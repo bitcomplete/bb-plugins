@@ -547,31 +547,43 @@ function deviationLines(briefing: Briefing): string[] {
  * done since, with playbook deviations called out. The model may ask follow-up
  * questions with the read tools and take or retract notes, and nothing else.
  *
+ * A scoped stand-up (BB-303) passes the binding key as `scope`: the header says
+ * "This stand-up is about <key> only" so the model does not wander, and the
+ * project-wide "Done since" and playbook-deviation sections are left out, since
+ * the briefing is one binding and the stand-up does not advance the window.
+ *
  * The text is bounded twice: each section lists at most `STANDUP_SECTION_MAX`
  * lines (then says how many it left out), and the whole text is kept under the
  * voice plugin's `realtime.open` cap. The ranking survives truncation: the
  * sections stay in order and the tail gives way first.
  */
-export function buildStandupInstructions(briefing: Briefing, projectName: string, now: number, questions: readonly StandupOpenQuestion[] = []): string {
+export function buildStandupInstructions(briefing: Briefing, projectName: string, now: number, questions: readonly StandupOpenQuestion[] = [], scope: string | null = null): string {
   const since = briefing.since === 0 ? "the beginning" : new Date(briefing.since).toISOString();
   const header = [
-    `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner.`,
-    `It is ${new Date(now).toISOString()}. You are reporting what happened since ${since}.`,
+    scope === null
+      ? `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner.`
+      : `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner about ${scope} only.`,
+    scope === null ? `It is ${new Date(now).toISOString()}. You are reporting what happened since ${since}.` : `It is ${new Date(now).toISOString()}. This stand-up is about ${scope} only; stay on that steward and do not range over the project or the other stewards.`,
     "",
     "Greet the owner briefly and begin immediately; do not wait for them to speak first.",
-    "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind.",
+    scope === null
+      ? "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind."
+      : "Lead with the things only the owner can unblock for this steward, then what is stuck or held. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind.",
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
     "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback, and treat anything short of a clear yes as no confirmation.",
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
   ];
-  const sections = [
+  const allSections = [
     { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions) },
     { heading: "Escalations with the project steward", lines: projectEscalationLines(briefing) },
     { heading: "Stuck or held", lines: stuckLines(briefing) },
     { heading: "Done since", lines: doneLines(briefing) },
     { heading: "Approaches that departed from the written playbook", lines: deviationLines(briefing) },
   ];
+  // A scoped stand-up ranks only the first three sections; the sweep and the
+  // playbook deviations are project-wide and do not belong to one binding.
+  const sections = scope === null ? allSections : allSections.slice(0, 3);
   const capped = sections.map((section) => ({
     heading: section.heading,
     lines: section.lines.length <= STANDUP_SECTION_MAX ? section.lines : [...section.lines.slice(0, STANDUP_SECTION_MAX), `…and ${section.lines.length - STANDUP_SECTION_MAX} more`],

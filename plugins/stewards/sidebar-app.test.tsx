@@ -190,6 +190,11 @@ const phraseClassOf = (slot: RenderedSlot, title: string): string => slot.getByT
 const archiveEntry = (run: () => void = () => {}) => [
   { key: "bb--core/archive", pluginId: "bb--core", group: "4_lifecycle", action: { label: "Archive", icon: "Archive", run } },
 ];
+// BB-303: the plugin's own Stand-up action, which the plugin's sidebar row reads
+// by key and starts itself so it can show "Starting…" and the refusal.
+const standupEntry = (run: () => void = () => {}) => [
+  { key: "stewards/standup", pluginId: "stewards", group: "2_organize", action: { label: "Stand-up", icon: "Mic", run } },
+];
 
 let app: CapturedPluginApp | null = null;
 const loadApp = async () => {
@@ -630,6 +635,35 @@ describe("the stewards sidebar list (BB-44)", () => {
     fireEvent.click(button);
     expect(archive).toHaveBeenCalledTimes(1);
     expect(slot.inspection.navigateCalls).toHaveLength(0);
+    slot.lifecycle.unmount();
+  });
+
+  // BB-303: the Stand-up quick action beside Archive. It starts the scoped
+  // stand-up by thread id and shows "Starting…" until the server answers.
+  it("starts a scoped stand-up from a thread row's hover action, showing Starting… (BB-303)", async () => {
+    let resolveStart: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => {
+      resolveStart = resolve;
+    });
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: "A one-off thread" })],
+      },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding()] }),
+        stewardsStandupStart: () => pending as never,
+      } as never,
+      threadActions: () => standupEntry() as never,
+    });
+    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    const button = await waitFor(() => slot.getByRole("button", { name: "Stand-up" }));
+    fireEvent.click(button);
+    await waitFor(() => expect(slot.getByRole("button", { name: "Starting…" })).toBeTruthy());
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { threadId: "thr_oneoff", client: null } }));
+    resolveStart({ ok: true, sessionId: "sess_1", standupId: "sup_1", message: "Stand-up started." });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 
