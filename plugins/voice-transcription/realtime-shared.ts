@@ -35,6 +35,12 @@ export type RealtimeSessionConfig = {
   model?: string;
   voice?: string;
   maxDurationMs?: number;
+  /**
+   * Opt in to the agent speaking first: the overlay sends one `response.create`
+   * when the data channel opens, so the model greets and leads instead of
+   * waiting for the owner to speak. Off by default.
+   */
+  speaksFirst?: boolean;
 };
 
 /**
@@ -49,4 +55,13 @@ export type MintedRealtimeSession = {
   instructions: string;
   tools: RealtimeTool[];
   maxDurationMs: number;
+  /** Whether the overlay sends the opening `response.create` on channel open. */
+  speaksFirst: boolean;
 };
+
+/**
+ * The tool route's reply to the overlay: the tool output text, and whether the
+ * model's response to it is its last. An opener returns a plain string (the
+ * original contract) or this shape; the voice plugin normalises both.
+ */
+export type RealtimeToolReply = { output: string; last?: boolean };

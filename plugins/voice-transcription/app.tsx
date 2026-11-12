@@ -95,10 +95,11 @@ function RealtimeVoiceOverlay() {
         const result = (await callRoute(REALTIME_TOOL_PATH, {
           sessionId,
           ...tool,
-        })) as { output?: unknown };
-        return typeof result.output === "string"
-          ? result.output
-          : JSON.stringify(result.output ?? null);
+        })) as { output?: unknown; last?: unknown };
+        return {
+          output: typeof result.output === "string" ? result.output : JSON.stringify(result.output ?? null),
+          ...(result.last === true ? { last: true } : {}),
+        };
       },
       close: async () => {
         await callRoute(REALTIME_CLOSE_PATH, { sessionId });

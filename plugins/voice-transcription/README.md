@@ -54,7 +54,13 @@ A session has three pieces:
 
 * An opener — another plugin — calls the `realtime.open` RPC with the session
   instructions and the tools the model may call, and names its own RPC method
-  for the tool results. It receives a session id.
+  for the tool results. It receives a session id. Two optional opt-ins shape the
+  turn-taking: `speaksFirst: true` makes the overlay send one `response.create`
+  when the data channel opens, so the model greets and leads instead of waiting
+  for the owner to speak; and `onClose: { method }` names the opener's own RPC
+  method that the close route calls with the session id whenever the session
+  ends. Both default off, so an opener that wants today's behaviour is
+  unchanged.
 * The plugin's **mint route** (`POST
   /api/v1/plugins/voice-transcription/http/realtime/session`) exchanges the
   plugin's stored key for a short-lived OpenAI **ephemeral client secret** and
@@ -66,6 +72,18 @@ A session has three pieces:
   to OpenAI with the ephemeral secret, plays the model's audio, shows the live
   transcript, and forwards each model tool call to the opener, returning its
   result. It ends the session on the server when it closes.
+
+The tool route's reply is `{ output }`, or `{ output, last: true }` when the
+opener returns an object with that flag instead of a plain string. A `last`
+reply lets the model finish its current response (its goodbye) and then the
+overlay stops the session itself, which is how an opener ends a conversation
+from inside a tool call.
+
+The close route calls the opener's `onClose` method with the session id for
+every kind of end: the End button, the 20-minute cap, the overlay unmounting
+(a closed tab), and a model-initiated end after a `last` tool reply. An opener
+that named no `onClose` is unaffected. The call is best-effort: the session is
+already over, and a failed handler is logged, not surfaced to the browser.
 
 Spend is bounded: the ephemeral secret expires after 60 seconds, one session
 is capped at 20 minutes (the overlay counts down and closes itself, and the

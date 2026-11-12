@@ -12,7 +12,7 @@
  * network or a key. The route handlers in `server.ts` hold the state.
  */
 import { DEFAULT_BASE_URL } from "./config.js";
-import type { RealtimeSessionConfig, RealtimeTool } from "./realtime-shared.js";
+import type { RealtimeSessionConfig, RealtimeTool, RealtimeToolReply } from "./realtime-shared.js";
 
 /** The OpenAI model used when a caller does not name one. */
 export const DEFAULT_REALTIME_MODEL = "gpt-realtime";
@@ -159,4 +159,24 @@ export function parseClientSecret(payload: unknown): {
 /** Every tool a session declared, by name, for validating a model's call. */
 export function declaresTool(tools: RealtimeTool[], name: string): boolean {
   return tools.some((tool) => tool.name === name);
+}
+
+/**
+ * Normalise whatever an opener's tool handler returned into the tool route's
+ * reply. The original contract is a plain string; the extended one is an
+ * object with `output` and an optional `last` flag, which the overlay reads as
+ * "let the in-flight response finish, then stop the session". Anything else is
+ * stringified as before, so an opener that returns JSON data is unchanged.
+ */
+export function toolReply(result: unknown): RealtimeToolReply {
+  if (typeof result === "string") return { output: result };
+  if (typeof result === "object" && result !== null) {
+    const record = result as Record<string, unknown>;
+    if (typeof record.output === "string") {
+      return record.last === true
+        ? { output: record.output, last: true }
+        : { output: record.output };
+    }
+  }
+  return { output: JSON.stringify(result ?? null) };
 }

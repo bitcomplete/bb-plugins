@@ -34,6 +34,7 @@ import {
   realtimeModel,
   realtimeReadiness,
   realtimeVoice,
+  toolReply,
 } from "./realtime.js";
 import {
   PLUGIN_ID,
@@ -77,12 +78,21 @@ const realtimeSessionConfigSchema = z.object({
   model: z.string().trim().min(1).max(100).optional(),
   voice: z.string().trim().min(1).max(40).optional(),
   maxDurationMs: z.number().int().positive().optional(),
+  speaksFirst: z.boolean().optional(),
 });
 
 export const rpcContract = defineRpcContract({
   "realtime.open": {
     input: realtimeSessionConfigSchema.extend({
       toolHandler: z
+        .object({ method: z.string().trim().min(1) })
+        .nullable()
+        .default(null),
+      /**
+       * The opener's own RPC method, called with the session id when the
+       * session ends for any reason. Null means no handler.
+       */
+      onClose: z
         .object({ method: z.string().trim().min(1) })
         .nullable()
         .default(null),
@@ -96,6 +106,8 @@ type PendingRealtimeSession = {
   id: string;
   config: RealtimeSessionConfig;
   toolHandler: { pluginId: string; method: string } | null;
+  /** The opener's own method called when the session ends, or null. */
+  closeHandler: { pluginId: string; method: string } | null;
   createdAt: number;
   /** Set once a secret has been minted; null until then. */
   startedAt: number | null;
@@ -388,6 +400,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           ...(input.model !== undefined ? { model: input.model } : {}),
           ...(input.voice !== undefined ? { voice: input.voice } : {}),
           ...(input.maxDurationMs !== undefined ? { maxDurationMs: input.maxDurationMs } : {}),
+          ...(input.speaksFirst !== undefined ? { speaksFirst: input.speaksFirst } : {}),
         };
         const session: PendingRealtimeSession = {
           id: crypto.randomUUID(),
@@ -399,6 +412,12 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
             input.toolHandler === null
               ? null
               : { pluginId: caller.pluginId, method: input.toolHandler.method },
+          // The close handler is the same rule: the opener's own method, under
+          // its own identity, called when the session ends.
+          closeHandler:
+            input.onClose === null
+              ? null
+              : { pluginId: caller.pluginId, method: input.onClose.method },
           createdAt: Date.now(),
           startedAt: null,
           minting: false,
@@ -495,6 +514,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
             instructions: session.config.instructions,
             tools: session.config.tools,
             maxDurationMs: session.maxMs,
+            speaksFirst: session.config.speaksFirst === true,
           };
           return c.json(minted, 200);
         } finally {
@@ -548,7 +568,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           );
         }
         return c.json(
-          { output: typeof result === "string" ? result : JSON.stringify(result ?? null) },
+          toolReply(result),
           200,
         );
       },
@@ -562,7 +582,25 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const body = await readJsonObject(c);
         const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
         if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
+        // Take the session out first, so a tool call racing the close cannot
+        // still act, then tell the opener it ended. The handler is best-effort:
+        // the session is over whatever the opener does with the news.
+        const session = realtimeSessions.get(sessionId);
         realtimeSessions.delete(sessionId);
+        if (session !== undefined && session.closeHandler !== null) {
+          try {
+            await bb.sdk.plugins.callRpc({
+              pluginId: session.closeHandler.pluginId,
+              method: session.closeHandler.method,
+              input: { sessionId },
+              outputSchema: z.unknown(),
+            });
+          } catch (error) {
+            bb.log.warn(
+              `voice-transcription: close handler for session ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         return c.json({ ok: true }, 200);
       },
       { auth: "local" },
