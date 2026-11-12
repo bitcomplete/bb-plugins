@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REALTIME_CALLS_URL,
+  REALTIME_STOP_FALLBACK_MS,
   RealtimeSessionClient,
   RealtimeSessionTakenError,
   type RealtimeClientCallbacks,
@@ -231,6 +232,31 @@ describe("RealtimeSessionClient", () => {
     pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
     pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_goodbye" }) });
     await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  });
+
+  it("closes on the fallback when the goodbye's audio signal never arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      stubConnect();
+      const close = vi.fn(async () => {});
+      const toolCall = vi.fn(async () => ({ output: "done", last: true }));
+      const client = new RealtimeSessionClient(callbacks({ toolCall, close }));
+      await client.start();
+      const pc = FakePeerConnection.instances[0]!;
+      pc.channel.emit("open", {});
+      pc.channel.emit("message", {
+        data: JSON.stringify({ type: "response.function_call_arguments.done", response_id: "resp_call", call_id: "c1", name: "end_standup", arguments: "{}" }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true);
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_goodbye" }) });
+      expect(close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(REALTIME_STOP_FALLBACK_MS);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the session open when a tool reply has no last flag", async () => {

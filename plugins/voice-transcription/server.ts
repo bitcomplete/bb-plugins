@@ -380,36 +380,38 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
     /**
      * End one session: take it out of the map first, so a second end (the
      * overlay's close racing the cap sweep, say) finds nothing, then tell the
-     * opener at most once. Best-effort: the session is over whatever the opener
+     * opener at most once. The RPC is fired and not awaited: awaiting another
+     * plugin's method here can deadlock (the opener may hold a lock it needs for
+     * its own `realtime.open`), and the session is over whatever the handler
      * does with the news.
      */
-    async function endRealtimeSession(id: string): Promise<void> {
+    function endRealtimeSession(id: string): void {
       const session = realtimeSessions.get(id);
       if (session === undefined) return;
       realtimeSessions.delete(id);
       if (session.closeHandler === null) return;
-      try {
-        await bb.sdk.plugins.callRpc({
+      void bb.sdk.plugins
+        .callRpc({
           pluginId: session.closeHandler.pluginId,
           method: session.closeHandler.method,
           input: { sessionId: id },
           outputSchema: z.unknown(),
+        })
+        .catch((error: unknown) => {
+          bb.log.warn(
+            `voice-transcription: close handler for session ${id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
         });
-      } catch (error) {
-        bb.log.warn(
-          `voice-transcription: close handler for session ${id} failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
     }
 
     /**
      * Reap every session past its cap through `endRealtimeSession`, so a session
      * abandoned by a closed tab is reported even when nobody opens another one.
      */
-    async function sweepRealtimeSessions(nowMs = Date.now()): Promise<void> {
+    function sweepRealtimeSessions(nowMs = Date.now()): void {
       for (const [id, session] of [...realtimeSessions]) {
         const since = session.startedAt ?? session.createdAt;
-        if (nowMs - since > session.maxMs) await endRealtimeSession(id);
+        if (nowMs - since > session.maxMs) endRealtimeSession(id);
       }
     }
 
@@ -418,10 +420,10 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
     // every session ends and its opener hears about it.
     bb.background.service("realtime-sweep", {
       start(signal) {
-        void sweepRealtimeSessions();
+        sweepRealtimeSessions();
         return new Promise<void>((resolve) => {
           const timer = setInterval(() => {
-            void sweepRealtimeSessions();
+            sweepRealtimeSessions();
           }, REALTIME_SWEEP_INTERVAL_MS);
           signal.addEventListener(
             "abort",
@@ -445,7 +447,10 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const { baseUrl, apiKey } = await realtimeKey();
         const refusal = realtimeReadiness({ baseUrl, apiKey });
         if (refusal !== null) throw new Error(refusal.message);
-        await sweepRealtimeSessions(Date.now());
+        // The background sweep is the guarantee; this eager pass only keeps the
+        // map small, and is not awaited so a stale session's handler cannot
+        // block the new open.
+        sweepRealtimeSessions(Date.now());
         const config: RealtimeSessionConfig = {
           instructions: input.instructions,
           tools: input.tools,
@@ -507,7 +512,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           return c.json({ error: "That voice session is already being minted" }, 409);
         }
         if (now - session.createdAt > session.maxMs) {
-          await endRealtimeSession(sessionId);
+          endRealtimeSession(sessionId);
           return c.json({ error: "That voice session expired before it started" }, 409);
         }
         session.minting = true;
@@ -593,7 +598,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           return c.json({ error: "That voice session has ended; start a new one" }, 404);
         }
         if (session.startedAt !== null && Date.now() - session.startedAt > session.maxMs) {
-          await endRealtimeSession(sessionId);
+          endRealtimeSession(sessionId);
           return c.json({ error: "That voice session has reached its time limit" }, 409);
         }
         if (!declaresTool(session.config.tools, name)) {
@@ -635,9 +640,9 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
         if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
         // One end path for every kind of end: take the session out, then tell
-        // the opener at most once. The handler is best-effort: the session is
+        // the opener at most once. The handler is not awaited: the session is
         // over whatever the opener does with the news.
-        await endRealtimeSession(sessionId);
+        endRealtimeSession(sessionId);
         return c.json({ ok: true }, 200);
       },
       { auth: "local" },
