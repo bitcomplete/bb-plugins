@@ -71,14 +71,26 @@ describe("the project file", () => {
   it("takes an optional stand-up delegate model and rejects an unknown key under it (BB-307)", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);
-    // Unset: the plugin's own Haiku default applies.
-    expect(defaults.value.standup).toEqual({});
+    // Unset: the plugin's own Haiku default applies, and the BB-312 tier keys
+    // carry their code defaults (10 closed, 3 days, one hour).
+    expect(defaults.value.standup).toEqual({ closedLimit: 10, closedDays: 3, cacheTtl: 3_600 });
     const explicit = parseProjectFile(JSON.stringify({ version: 1, standup: { delegate: "claude/claude-sonnet-5-5/medium" } }));
     if (!explicit.ok) throw new Error(explicit.error);
     expect(explicit.value.standup.delegate).toMatchObject({ providerId: "claude-code", model: "claude-sonnet-5-5", reasoningLevel: "medium" });
     // Strict, like every other project-file key: a typo is an error, not a silent default.
     expect(parseProjectFile(JSON.stringify({ version: 1, standup: { model: "claude/claude-haiku-5-5/low" } }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, standup: { delegate: "claude//medium" } }))).toMatchObject({ ok: false });
+  });
+
+  it("takes the stand-up tier and cache keys with their defaults (BB-312)", () => {
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, standup: { closedLimit: 4, closedDays: 7, cacheTtl: 60 } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(explicit.value.standup).toMatchObject({ closedLimit: 4, closedDays: 7, cacheTtl: 60 });
+    // Each key is bounded and strict.
+    expect(parseProjectFile(JSON.stringify({ version: 1, standup: { closedLimit: 0 } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, standup: { closedDays: -1 } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, standup: { cacheTtl: -1 } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, standup: { ttl: 60 } }))).toMatchObject({ ok: false });
   });
 
   it("names the file and the field in errors", () => {

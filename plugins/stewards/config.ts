@@ -346,7 +346,18 @@ export const projectFileSchema = z
      * `.bb` opt-in that sets it is usable only after the servers running the
      * change have restarted onto the image that knows the key.
      */
-    standup: z.object({ delegate: modelSpecSchema.optional() }).strict().default({}),
+    standup: z
+      .object({
+        delegate: modelSpecSchema.optional(),
+        /** BB-312: the most recently ended bindings the brief's "Recently closed" tier lists. */
+        closedLimit: z.number().int().min(1).max(100).default(10),
+        /** BB-312: the clamp in days for a recently closed binding, measured from the later of now and the last completed stand-up. */
+        closedDays: z.number().int().min(0).max(365).default(3),
+        /** BB-312: how long an entity cache entry stays fresh, in seconds (default one hour). */
+        cacheTtl: z.number().int().min(0).max(604_800).default(3_600),
+      })
+      .strict()
+      .default({ closedLimit: 10, closedDays: 3, cacheTtl: 3_600 }),
     /** Which playbook governs each kind of binding, and the two the dependency watch uses. */
     playbooks: z
       .object({

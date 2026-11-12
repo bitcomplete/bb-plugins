@@ -12,7 +12,7 @@
 // later slice (the fan-out), through the paths it already uses.
 import type { Briefing } from "./nightly.js";
 import type { Binding, Escalation, Lesson, Need } from "./store.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import type { EntitySnapshot, SearchIssue } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
 import { parsePullRef } from "./github.js";
 import { latestReviewMarker } from "./gate.js";
@@ -98,6 +98,14 @@ export const STANDUP_DELEGATE_ANSWER_MAX_CHARS = 2_000;
 export const STANDUP_CONTEXT_MAX_CHARS = 300;
 /** The most comments `entity_snapshot` renders, newest last (BB-306). */
 export const STANDUP_ENTITY_COMMENTS_MAX = 5;
+/** BB-312: the per-item character budget for one agenda tier item. */
+export const STANDUP_AGENDA_ITEM_CHARS = 1_500;
+/** BB-312: the per-item character budget for one open tier line. */
+export const STANDUP_OPEN_ITEM_CHARS = 250;
+/** BB-312: the per-item character budget for one recently closed line. */
+export const STANDUP_CLOSED_ITEM_CHARS = 200;
+/** BB-312: the most search results `search_tickets` returns. */
+export const STANDUP_SEARCH_MAX = 20;
 /** How much of one comment body `entity_snapshot` carries (BB-306). */
 export const STANDUP_ENTITY_COMMENT_MAX_CHARS = 300;
 /** The most children `entity_snapshot` lists before it says how many were left out (BB-306). */
@@ -171,11 +179,23 @@ export const STANDUP_TOOLS: StandupTool[] = [
   },
   {
     name: "entity_snapshot",
-    description: "The ticket or pull request itself, through the source snapshot the stewards already read: title, state, labels, author, body, the last few comments with their dates, linked pull requests and children.",
+    description: "The ticket or pull request itself, through the source snapshot the stewards already read: title, state, labels, author, body, the last few comments with their dates, linked pull requests and children. Fast, and free to call for any key in this project's teams and repos, with or without a steward.",
     parameters: {
       type: "object",
       properties: { key: stringParam("The ticket or pull-request key.") },
       required: ["key"],
+    },
+  },
+  {
+    name: "search_tickets",
+    description: "Search this project's Linear teams and GitHub repos for tickets matching a term. Fast, and free to call before the owner finishes asking. Returns one line per issue: key, title, state and assignee.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: stringParam("Words to search the tickets for."),
+        limit: { type: "number", description: `The most results to return (default ${STANDUP_SEARCH_MAX}).` },
+      },
+      required: ["query"],
     },
   },
   {
@@ -282,6 +302,18 @@ export type StandupToolContext = {
   guidance: () => Promise<GuidanceUnit[]>;
   /** The entity snapshot for a binding, read fresh when the source answers. */
   snapshot: (binding: Binding) => Promise<EntitySnapshot | null>;
+  /**
+   * BB-312: the merged entity record for any key in the project, with or
+   * without a steward, through the one cache path. Null when nothing has it.
+   */
+  entity: (key: string) => Promise<{ entity: EntitySnapshot; pulls: EntitySnapshot[] } | null>;
+  /**
+   * BB-312: whether a key is inside the project's own Linear teams and GitHub
+   * repos. `entity_snapshot` and `search_tickets` refuse anything outside it.
+   */
+  inScope: (key: string) => boolean;
+  /** BB-312: search the project's own units through the source contract. */
+  searchIssues: (query: string, limit: number) => Promise<SearchIssue[]>;
   /** A binding's open "needs you" items, so a gate note binds to exactly one (BB-300 slice 4). */
   needs: (bindingId: string) => Need[];
   /** The note ids the owner has already confirmed; a confirmed note cannot be retracted. */
@@ -404,18 +436,8 @@ function escalationTool(ctx: StandupToolContext, args: Record<string, unknown>):
   return open.map(escalationText).join("\n\n");
 }
 
-/** The entity tool: the source snapshot, or the last one the steward kept. */
-async function entityTool(ctx: StandupToolContext, key: string): Promise<string> {
-  const b = ctx.binding(key);
-  if (b === null) return `No steward for ${key} in this project.`;
-  // BB-309: a pull-request key resolves to the ticket binding that holds its
-  // gate need. Render that pull's own snapshot from what the binding already
-  // holds, never the ticket's snapshot or a "No steward" line. The binding's
-  // own key is the entity even when it parses as a pull reference (a GitHub
-  // issue key has the same shape).
-  const linked = key === b.entityKey ? null : pullFromKey(b, key);
-  const entity = linked ?? (await ctx.snapshot(b).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
-  if (entity === null) return `No snapshot is available for ${key}.`;
+/** Render one entity snapshot as the spoken answer, with the binding's linked pulls when there is one. */
+function renderEntity(entity: EntitySnapshot, binding: Binding | null): string {
   const lines = [`${entity.key}: ${entity.title ?? "(no title)"}`];
   lines.push(`State: ${entity.state ?? "unknown"}${entity.labels.length === 0 ? "" : ` · labels: ${entity.labels.join(", ")}`}`);
   if (entity.author !== null) lines.push(`Author: ${entity.author}`);
@@ -436,7 +458,7 @@ async function entityTool(ctx: StandupToolContext, key: string): Promise<string>
       `Linked pull requests: ${entity.linkedPulls
         .map((p) => {
           const linkKey = p.key ?? p.url;
-          const pull = linkedPullFor(b, p);
+          const pull = binding === null ? null : linkedPullFor(binding, p);
           return pull === null ? linkKey : `${linkKey} ${pull.title ?? "(no title)"} (${pull.state ?? "unknown"})`;
         })
         .join(", ")}`,
@@ -448,6 +470,41 @@ async function entityTool(ctx: StandupToolContext, key: string): Promise<string>
     lines.push(`Children: ${shown.map((c) => `${c.key} ${c.title ?? "(no title)"} (${c.state ?? "unknown"})`).join("; ")}${more > 0 ? `; and ${more} more` : ""}`);
   }
   return lines.join("\n");
+}
+
+/** The entity tool: the source snapshot, or the last one the steward kept, for any key in scope. */
+async function entityTool(ctx: StandupToolContext, key: string): Promise<string> {
+  // BB-312: a key outside the project's teams and repos is refused, whether or
+  // not it names a steward; the brief and the tools read only this project.
+  if (!ctx.inScope(key)) return `${key} is not in this project's teams or repos.`;
+  const b = ctx.binding(key);
+  // BB-312: a key with no steward still answers, through the same entity path.
+  if (b === null) {
+    const record = await ctx.entity(key).catch(() => null);
+    if (record === null) return `No snapshot is available for ${key}.`;
+    return renderEntity(record.entity, null);
+  }
+  // BB-309: a pull-request key resolves to the ticket binding that holds its
+  // gate need. Render that pull's own snapshot from what the binding already
+  // holds, never the ticket's snapshot or a "No steward" line. The binding's
+  // own key is the entity even when it parses as a pull reference (a GitHub
+  // issue key has the same shape).
+  const linked = key === b.entityKey ? null : pullFromKey(b, key);
+  const entity = linked ?? (await ctx.snapshot(b).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+  if (entity === null) return `No snapshot is available for ${key}.`;
+  return renderEntity(entity, b);
+}
+
+/** BB-312: search the project's own tickets through the source contract. */
+async function searchTicketsTool(ctx: StandupToolContext, args: Record<string, unknown>): Promise<string> {
+  const query = requireString(args, "query");
+  const rawLimit = args["limit"];
+  const limit = typeof rawLimit === "number" && Number.isFinite(rawLimit) ? Math.max(1, Math.min(STANDUP_SEARCH_MAX, Math.floor(rawLimit))) : STANDUP_SEARCH_MAX;
+  const results = await ctx.searchIssues(query, limit);
+  // BB-312: a result outside the project's units is dropped, never shown.
+  const scoped = results.filter((issue) => ctx.inScope(issue.key));
+  if (scoped.length === 0) return `No ticket in this project matches ${JSON.stringify(query)}.`;
+  return scoped.map((issue) => `${issue.key}: ${issue.title ?? "(no title)"} — ${issue.state}${issue.assignee === null ? "" : `, assigned to ${issue.assignee}`}`).join("\n");
 }
 
 /** The rationale tool: the lessons and resolutions behind a binding's decisions. */
@@ -574,6 +631,8 @@ export async function runStandupTool(name: string, args: Record<string, unknown>
       return escalationTool(ctx, args);
     case "entity_snapshot":
       return entityTool(ctx, requireString(args, "key"));
+    case "search_tickets":
+      return searchTicketsTool(ctx, args);
     case "decision_rationale":
       return rationaleTool(ctx, requireString(args, "key"));
     case "playbook_paragraph":
@@ -863,6 +922,211 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
     if (last === undefined) break;
     last.lines.pop();
     last.truncated = true;
+  }
+  const text = render();
+  return text.length <= STANDUP_MAX_INSTRUCTIONS_CHARS ? text : `${text.slice(0, STANDUP_MAX_INSTRUCTIONS_CHARS - 20)}\n… (truncated)`;
+}
+
+// ---- BB-312: the steward-tiered brief ---------------------------------------
+
+/** The raw entity facts the brief renders from, keyed by binding: the entity and its linked pulls. */
+export type StandupEntityFacts = { entity: EntitySnapshot; pulls: EntitySnapshot[] };
+
+/** The project-file keys the tiered brief reads, with the defaults resolved. */
+export type StandupBriefOptions = {
+  /** The most recently ended bindings the "Recently closed" tier lists. */
+  closedLimit: number;
+  /** The clamp in days for a recently closed binding. */
+  closedDays: number;
+  /** When the project last completed a stand-up (ms), or null. */
+  lastCompletedAt: number | null;
+};
+
+/** One line naming a binding's deployment state from the watches it already holds. */
+function deployStateText(binding: Binding): string | null {
+  const watches = Object.values(binding.deployments ?? {});
+  if (watches.length === 0) return null;
+  const live = watches.filter((w) => w.state === "deployed").length;
+  const failed = watches.filter((w) => w.state === "failed").length;
+  return `Deploy: ${live}/${watches.length} confirmed${failed > 0 ? `, ${failed} failed` : ""}`;
+}
+
+/** The pull a need's URL names among the facts' pulls, or null. */
+function factsPull(facts: StandupEntityFacts | null, url: string): EntitySnapshot | null {
+  if (facts === null) return null;
+  return facts.pulls.find((p) => samePullRef(p.key, url) || (p.url !== null && samePullRef(p.url, url))) ?? null;
+}
+
+/** A "moved today"/"moved yesterday" tag from the binding's last advance, or null. */
+function movedTag(binding: Binding, now: number): string | null {
+  if (binding.advancedAt === null) return null;
+  const days = Math.floor(Math.max(0, now - binding.advancedAt) / DAY_MS);
+  if (days <= 0) return "moved today";
+  if (days === 1) return "moved yesterday";
+  return null;
+}
+
+/** The flags on an open steward's line: stuck, stall, held, no wake source, a dated wait. */
+function openFlags(binding: Binding, briefing: Briefing, now: number): string[] {
+  const flags: string[] = [];
+  if (briefing.stuck.stuck.some((x) => x.from.id === binding.id)) flags.push("stuck");
+  if (briefing.stuck.stall.some((x) => x.from.id === binding.id)) flags.push("stalled");
+  if (binding.hold !== null || (binding.holdBehind?.length ?? 0) > 0 || (binding.holdStack?.length ?? 0) > 0) {
+    flags.push(binding.hold === null ? "held" : `held: ${binding.hold}`);
+  }
+  if (binding.noWakeSource) flags.push("no wake source");
+  if (binding.requeueUntil !== null && binding.requeueUntil > now) flags.push(`waiting until ${new Date(binding.requeueUntil).toISOString()}`);
+  return flags;
+}
+
+/** One comprehensive agenda item for a need, clipped to its per-item budget. */
+function agendaNeedItem(need: Need, binding: Binding, facts: StandupEntityFacts | null, now: number): string {
+  const head = `${binding.entityKey}: ${binding.title ?? "(no title)"} — ${binding.kind}${binding.phase === null ? "" : `, phase ${binding.phase}`}`;
+  const lines = [`Needs you: ${need.what} (${need.kind})`];
+  if (need.how !== null && need.how.trim() !== "") lines.push(`How: ${clipText(need.how, STANDUP_CONTEXT_MAX_CHARS)}`);
+  const pull = factsPull(facts, need.url);
+  if (pull !== null) {
+    lines.push(`PR "${pull.title ?? "(no title)"}" (${pull.state ?? "unknown"})`);
+    const marker = latestReviewMarker(pull.comments);
+    if (marker !== null) lines.push(`Review: ${marker.verdict}${marker.lane === null ? "" : `, lane ${marker.lane}`}${marker.approver === undefined ? "" : `, approver ${marker.approver}`}`);
+    if (pull.pull !== null && pull.pull.checks !== null) lines.push(`Checks: ${pull.pull.checks.state}`);
+  }
+  if (binding.status !== null) {
+    if (binding.status.summary.trim() !== "") lines.push(`Steward summary: ${clipText(binding.status.summary, STANDUP_CONTEXT_MAX_CHARS)}`);
+    if (binding.status.waitingOn !== null && binding.status.waitingOn.trim() !== "") lines.push(`Waiting on: ${clipText(binding.status.waitingOn, STANDUP_CONTEXT_MAX_CHARS)}`);
+  }
+  const deploy = deployStateText(binding);
+  if (deploy !== null) lines.push(deploy);
+  if (binding.guidance.length > 0) lines.push(`Guidance: ${binding.guidance.slice(-3).map((g) => clipText(g.text, STANDUP_CONTEXT_MAX_CHARS)).join(" | ")}`);
+  if (facts !== null && facts.entity.comments.length > 0) {
+    lines.push(`Comments: ${facts.entity.comments.slice(-3).map((c) => `${c.author}: ${clipText(c.body, 160)}`).join(" | ")}`);
+  }
+  const age = openSince(now, need.createdAt);
+  if (age !== null) lines.push(age);
+  return clipBlock(`${head}\n  ${lines.join("\n  ")}`, STANDUP_AGENDA_ITEM_CHARS);
+}
+
+/** One comprehensive agenda item for a user-routed escalation. */
+function agendaEscalationItem(escalation: Escalation, from: Binding, now: number): string {
+  const head = `${from.entityKey}: ${from.title ?? "(no title)"} — ${from.kind}${from.phase === null ? "" : `, phase ${from.phase}`}`;
+  const lines = [`Needs you: ${escalation.question}`];
+  if (escalation.context !== null && escalation.context.trim() !== "") lines.push(`Context: ${clipText(escalation.context, STANDUP_CONTEXT_MAX_CHARS)}`);
+  if (escalation.choices.length > 0) lines.push(`Choices: ${escalation.choices.join(" / ")}`);
+  if (escalation.meanwhile !== "") lines.push(`Meanwhile: ${escalation.meanwhile}`);
+  if (escalation.recommendation !== null) lines.push(`Recommendation: ${escalation.recommendation}`);
+  const age = openSince(now, escalation.createdAt);
+  if (age !== null) lines.push(age);
+  return clipBlock(`${head}\n  ${lines.join("\n  ")}`, STANDUP_AGENDA_ITEM_CHARS);
+}
+
+/** One comprehensive agenda item for an open question. */
+function agendaQuestionItem(q: StandupOpenQuestion, now: number): string {
+  const head = `${q.key ?? "the project"}: ${q.question}`;
+  const lines: string[] = [];
+  if (q.choices.length > 0) lines.push(`Choices: ${q.choices.join(" / ")}`);
+  if (q.context !== null && q.context.trim() !== "") lines.push(`Context: ${clipText(q.context, STANDUP_CONTEXT_MAX_CHARS)}`);
+  const age = openSince(now, q.createdAt);
+  if (age !== null) lines.push(age);
+  return lines.length === 0 ? head : clipBlock(`${head}\n  ${lines.join("\n  ")}`, STANDUP_AGENDA_ITEM_CHARS);
+}
+
+/** Two lines for one open steward not on the agenda: key, title, phase, summary, wait and flags. */
+function openStewardItem(binding: Binding, briefing: Briefing, now: number): string {
+  const tag = movedTag(binding, now);
+  const head = `${binding.entityKey}: ${binding.title ?? "(no title)"} — ${binding.kind}${binding.phase === null ? "" : `, phase ${binding.phase}`}${tag === null ? "" : ` (${tag})`}`;
+  const summary = binding.status === null || binding.status.summary.trim() === "" ? "no status summary" : clipText(binding.status.summary, STANDUP_OPEN_ITEM_CHARS);
+  const waiting = binding.status !== null && binding.status.waitingOn !== null && binding.status.waitingOn !== undefined && binding.status.waitingOn.trim() !== "" ? `; waiting on ${binding.status.waitingOn}` : "";
+  const flags = openFlags(binding, briefing, now);
+  const second = `${summary}${waiting}${flags.length === 0 ? "" : `; ${flags.join(", ")}`}`;
+  return clipBlock(`${head}\n  ${second}`, STANDUP_OPEN_ITEM_CHARS);
+}
+
+/** One line for a recently closed binding: when and why it ended, its merge and its deployment. */
+function closedStewardItem(binding: Binding, facts: StandupEntityFacts | null): string {
+  const ended = binding.endedAt === null ? "unknown" : new Date(binding.endedAt).toISOString();
+  const merged = facts === null ? 0 : facts.pulls.filter((p) => p.pull !== null && (p.pull.merged || p.state.toLowerCase() === "merged")).length;
+  const watches = Object.values(binding.deployments ?? {});
+  const deployed = watches.filter((w) => w.state === "deployed").length;
+  const deploy = watches.length === 0 ? "no deployment" : deployed > 0 ? "deploy confirmed" : "deploy not confirmed";
+  return clipBlock(`${binding.entityKey}: ${binding.title ?? "(no title)"} — ended ${ended}${binding.endReason === null ? "" : ` (${binding.endReason})`}; ${merged} PR merged; ${deploy}`, STANDUP_CLOSED_ITEM_CHARS);
+}
+
+/**
+ * BB-312: the steward-tiered stand-up brief. Three tiers, ranked and rendered
+ * within budgets: "Needs your input" (the agenda: open needs, user-routed
+ * escalations and open questions), "Other open stewards" (with their flags on
+ * the line, not a separate section) and "Recently closed". The tail gives way
+ * first: closed before open before agenda. The scoped stand-up (BB-303) keeps
+ * `buildStandupInstructions`; this is the project-wide brief.
+ */
+export function buildStandupBrief(
+  briefing: Briefing,
+  bindings: readonly Binding[],
+  entities: ReadonlyMap<string, StandupEntityFacts>,
+  projectName: string,
+  now: number,
+  questions: readonly StandupOpenQuestion[],
+  options: StandupBriefOptions,
+): string {
+  const factsFor = (binding: Binding): StandupEntityFacts | null => entities.get(binding.id) ?? null;
+  // The agenda is strictly "needs you": the open needs, the user-routed
+  // escalations and the open questions. Every other open binding falls to the
+  // open tier.
+  const agendaLines: string[] = [];
+  const agendaBindingIds = new Set<string>();
+  for (const { need, binding } of briefing.decisions.needs) {
+    agendaBindingIds.add(binding.id);
+    agendaLines.push(agendaNeedItem(need, binding, factsFor(binding), now));
+  }
+  for (const { escalation, from } of briefing.decisions.withUser) {
+    agendaBindingIds.add(from.id);
+    agendaLines.push(agendaEscalationItem(escalation, from, now));
+  }
+  const byKey = new Map(bindings.map((b) => [b.entityKey, b] as const));
+  for (const q of questions) {
+    const binding = q.key === null ? null : (byKey.get(q.key) ?? null);
+    if (binding !== null) agendaBindingIds.add(binding.id);
+    agendaLines.push(agendaQuestionItem(q, now));
+  }
+  const open = bindings.filter((b) => b.endedAt === null);
+  const openLines = open.filter((b) => !agendaBindingIds.has(b.id)).map((b) => openStewardItem(b, briefing, now));
+  // The clamp: the later of the 3-day (or configured) window and the last
+  // completed stand-up. A completed stand-up resets the window; an interrupted
+  // one does not move it.
+  const clampStart = Math.max(now - options.closedDays * DAY_MS, options.lastCompletedAt ?? 0);
+  const closed = bindings
+    .filter((b): b is Binding & { endedAt: number } => b.endedAt !== null && b.endedAt >= clampStart)
+    .sort((a, b) => b.endedAt - a.endedAt)
+    .slice(0, options.closedLimit);
+  const closedLines = closed.map((b) => closedStewardItem(b, factsFor(b)));
+
+  const header = [
+    `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner.`,
+    `It is ${new Date(now).toISOString()}.`,
+    briefing.previous === null ? "The project steward has not filed a digest yet." : `The project steward's last digest was ${new Date(briefing.previous.at).toISOString()}.`,
+    "",
+    "Greet the owner briefly and begin immediately; do not wait for them to speak first.",
+    "Lead with the agenda, \"Needs your input\": those are the things only the owner can unblock. Then the other open stewards, then what closed recently.",
+    "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
+    "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
+    "For a gate note, the binding is the ticket key before the colon on the brief line, and need is the pull request named on it (for example owner/repo#34).",
+    "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback.",
+    "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
+    "Close with one sentence naming the stewards carrying a stuck or stall escalation, so the owner can pull one into the discussion.",
+    "An item's text is what was true when it was raised, not what is true now; its age says how much to trust it, so verify a stale claim before repeating it.",
+  ];
+
+  const sections = [
+    { heading: "Needs your input", lines: agendaLines },
+    { heading: "Other open stewards", lines: openLines },
+    { heading: "Recently closed", lines: closedLines },
+  ];
+  const render = (): string => [...header, ...sections.flatMap((section) => ["", `## ${section.heading}`, bullets(section.lines)])].join("\n");
+  // The tail gives way first: closed, then open, then the agenda.
+  while (render().length > STANDUP_MAX_INSTRUCTIONS_CHARS) {
+    const last = [...sections].reverse().find((section) => section.lines.length > 0);
+    if (last === undefined) break;
+    last.lines.pop();
   }
   const text = render();
   return text.length <= STANDUP_MAX_INSTRUCTIONS_CHARS ? text : `${text.slice(0, STANDUP_MAX_INSTRUCTIONS_CHARS - 20)}\n… (truncated)`;

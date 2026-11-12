@@ -12,6 +12,7 @@ import {
   STANDUP_TOOL_NAMES,
   STANDUP_TOOLS,
   STANDUP_WRITE_TOOLS,
+  buildStandupBrief,
   buildStandupInstructions,
   readbackLine,
   readbackLines,
@@ -43,6 +44,9 @@ const binding = (over: Partial<Binding> = {}): Binding =>
     hold: null,
     holdBehind: [],
     lastSnapshot: { entity: issue(), pulls: [] },
+    deployments: {},
+    endedAt: null,
+    endReason: null,
     createdAt: 1,
     ...over,
   }) as unknown as Binding;
@@ -92,6 +96,9 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
     lessons: () => [lesson()],
     guidance: async () => [unit()],
     snapshot: async () => issue(),
+    entity: async (key) => ({ entity: issue({ key }), pulls: [] }),
+    inScope: () => true,
+    searchIssues: async () => [],
     needs: () => [],
     confirmed: [],
     endStandup: async (ids) => ({ output: `end ${ids.join(",")}`, applied: ids, skipped: [] }),
@@ -103,7 +110,7 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
 
 describe("the stand-up tool set (BB-300)", () => {
   it("declares the fixed, small tool set", () => {
-    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
+    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "search_tickets", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
     // Every declaration carries the shape the Realtime API needs.
     for (const tool of STANDUP_TOOLS) {
       expect(tool.name).toMatch(/^[a-z_]+$/u);
@@ -636,5 +643,131 @@ describe("stripMarkdown (BB-309)", () => {
     expect(stripMarkdown("1. one\n2. two")).toBe("one\ntwo");
     expect(stripMarkdown("```\nblock\n```")).toBe("\nblock\n");
     expect(stripMarkdown("plain text")).toBe("plain text");
+  });
+});
+
+// ---- BB-312: the steward-tiered brief and the entity read tools ------------
+
+const NOW = Date.parse("2026-11-12T12:00:00Z");
+const DAY = 86_400_000;
+
+/** A briefing whose only agenda item is a need on `agenda`, with no other sections populated. */
+const tierBriefing = (agenda: Binding, over: Partial<Briefing> = {}): Briefing =>
+  briefing({
+    decisions: { needs: [{ need: { id: "need_1", what: "Approve the spec", kind: "approve-spec", createdAt: NOW - 1_000, url: "spec", how: null } as never, binding: agenda }], withUser: [] },
+    escalations: [],
+    stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+    done: { moved: [], ended: [], answered: [] },
+    assumptions: [],
+    ...over,
+  });
+
+describe("buildStandupBrief (BB-312)", () => {
+  it("ranks the tiers: agenda, then other open stewards, then recently closed", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-1", title: "Agenda" });
+    const open = binding({ id: "b-open", entityKey: "ENG-2", title: "Open" });
+    const closed = binding({ id: "b-closed", entityKey: "ENG-3", title: "Closed", endedAt: NOW - 1_000, endReason: "merged" });
+    const text = buildStandupBrief(tierBriefing(agenda), [agenda, open, closed], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    const agendaAt = text.indexOf("## Needs your input");
+    const openAt = text.indexOf("## Other open stewards");
+    const closedAt = text.indexOf("## Recently closed");
+    expect(agendaAt).toBeGreaterThan(-1);
+    expect(agendaAt).toBeLessThan(openAt);
+    expect(openAt).toBeLessThan(closedAt);
+    expect(text.slice(agendaAt, openAt)).toContain("ENG-1");
+    expect(text.slice(openAt, closedAt)).toContain("ENG-2");
+    expect(text.slice(closedAt)).toContain("ENG-3");
+    // The agenda binding is not repeated in the open tier.
+    expect(text.slice(openAt, closedAt)).not.toContain("ENG-1");
+  });
+
+  it("leaves out an ended binding older than the clamp", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-1" });
+    const old = binding({ id: "b-old", entityKey: "ENG-9", endedAt: NOW - 10 * DAY, endReason: "merged" });
+    const text = buildStandupBrief(tierBriefing(agenda), [agenda, old], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(text).not.toContain("ENG-9");
+  });
+
+  it("lists at most the closed limit, newest first", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-0" });
+    const ended = Array.from({ length: 11 }, (_, i) => binding({ id: `b-${i}`, entityKey: `ENG-${i + 1}`, endedAt: NOW - (i + 1) * 1_000, endReason: "merged" }));
+    const text = buildStandupBrief(tierBriefing(agenda), [agenda, ...ended], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(text).toContain("ENG-1");
+    expect(text).not.toContain("ENG-11");
+  });
+
+  it("clamps to the later of the window and the last completed stand-up", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-0" });
+    const before = binding({ id: "b-before", entityKey: "ENG-8", endedAt: NOW - 2 * DAY, endReason: "merged" });
+    const after = binding({ id: "b-after", entityKey: "ENG-7", endedAt: NOW - 30 * 60_000, endReason: "merged" });
+    // A stand-up completed an hour ago clamps to that, so the two-day-old end is out.
+    const text = buildStandupBrief(tierBriefing(agenda), [agenda, before, after], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: NOW - 60 * 60_000 });
+    expect(text).not.toContain("ENG-8");
+    expect(text).toContain("ENG-7");
+  });
+
+  it("carries stuck, stall, held, no-wake-source and dated-wait flags on the open line, with no separate section", () => {
+    const stuck = binding({ id: "b-stuck", entityKey: "ENG-10", title: "Stuck" });
+    const stalled = binding({ id: "b-stall", entityKey: "ENG-11", title: "Stalled" });
+    const held = binding({ id: "b-held", entityKey: "ENG-12", title: "Held", hold: "behind ENG-1", holdBehind: ["ENG-1"] });
+    const noWake = binding({ id: "b-nowake", entityKey: "ENG-13", title: "No wake", noWakeSource: true });
+    const dated = binding({ id: "b-dated", entityKey: "ENG-14", title: "Dated", requeueUntil: NOW + DAY });
+    const brief = tierBriefing(binding({ id: "b-agenda", entityKey: "ENG-1" }), {
+      stuck: {
+        stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked" }), from: stuck }],
+        stall: [{ escalation: escalation({ kind: "stall", question: "Stalled" }), from: stalled }],
+        held: [held],
+        noWakeSource: [noWake],
+        datedWaits: [dated],
+      },
+    });
+    const text = buildStandupBrief(brief, [stuck, stalled, held, noWake, dated], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    const item = (key: string) => text.split("\n- ").find((block) => block.startsWith(key));
+    expect(item("ENG-10")).toContain("stuck");
+    expect(item("ENG-11")).toContain("stalled");
+    expect(item("ENG-12")).toContain("held");
+    expect(item("ENG-13")).toContain("no wake source");
+    expect(item("ENG-14")).toContain("waiting until");
+    expect(text).not.toContain("## Stuck or held");
+  });
+
+  it("drops the closed tier before the open tier and the open tier before the agenda", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-0", title: "Agenda" });
+    const open = Array.from({ length: 40 }, (_, i) => binding({ id: `o-${i}`, entityKey: `OP-${i}`, title: "Open", status: { summary: "x".repeat(180) } as never }));
+    const closed = Array.from({ length: 40 }, (_, i) => binding({ id: `c-${i}`, entityKey: `CL-${i}`, title: "Closed", endedAt: NOW - i * 1_000, endReason: "merged" }));
+    const brief = tierBriefing(agenda);
+    const text = buildStandupBrief(brief, [agenda, ...open, ...closed], new Map(), "Acme", NOW, [], { closedLimit: 40, closedDays: 3, lastCompletedAt: null });
+    expect(text.length).toBeLessThanOrEqual(STANDUP_MAX_INSTRUCTIONS_CHARS);
+    // The agenda survives, some open survive, and the closed tier is gone first.
+    expect(text).toContain("ENG-0");
+    expect(text).toContain("OP-0");
+    expect(text).not.toContain("## Recently closed\n- (none)");
+  });
+});
+
+describe("the entity read tools (BB-312)", () => {
+  it("renders a stewardless key through the entity reader", async () => {
+    const ctx = context({ binding: () => null, entity: async (key) => ({ entity: issue({ key, title: "Stewardless" }), pulls: [] }) });
+    const out = (await runStandupTool("entity_snapshot", { key: "ENG-99" }, ctx)) as string;
+    expect(out).toContain("Stewardless");
+    expect(out).toContain("ENG-99");
+  });
+
+  it("refuses a key outside the project's teams and repos", async () => {
+    const ctx = context({ inScope: () => false });
+    expect(await runStandupTool("entity_snapshot", { key: "OTHER-1" }, ctx)).toContain("not in this project");
+    expect(await runStandupTool("search_tickets", { query: "anything" }, ctx)).toContain("No ticket");
+  });
+
+  it("searches through the injected reader and drops an out-of-scope result", async () => {
+    const searchIssues = vi.fn(async () => [
+      { id: "a", key: "ENG-1", title: "In scope", description: null, state: "Todo", stateType: null, unit: "ENG", assignee: "Jane" },
+      { id: "b", key: "OTHER-2", title: "Out of scope", description: null, state: "Todo", stateType: null, unit: "OTHER", assignee: null },
+    ]);
+    const ctx = context({ searchIssues, inScope: (key) => key.startsWith("ENG-") });
+    const out = (await runStandupTool("search_tickets", { query: "login", limit: 5 }, ctx)) as string;
+    expect(searchIssues).toHaveBeenCalledWith("login", 5);
+    expect(out).toContain("ENG-1");
+    expect(out).not.toContain("OTHER-2");
   });
 });

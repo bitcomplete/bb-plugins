@@ -713,7 +713,13 @@ export const STANDUP_BINDING_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN bind
 // statements above stay untouched.
 export const STANDUP_DELEGATION_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN delegations TEXT NOT NULL DEFAULT '[]'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS];
+// BB-312: whether a stand-up reached its end (`end_standup` or the page's end)
+// rather than being interrupted. The "recently closed" clamp reads the last
+// completed stand-up; an interrupted one does not move it. A new column with a
+// default, so every row written before this step reads back as not completed.
+export const STANDUP_COMPLETED_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN completed INTEGER NOT NULL DEFAULT 0`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -797,7 +803,16 @@ export const storedStatusRecordSchema = z
  * pull requests linked to it. Compared with the next observation to decide
  * whether a judgment turn is due.
  */
-export const observedSchema = z.object({ entity: entitySnapshotSchema, pulls: z.array(entitySnapshotSchema).default([]) });
+export const observedSchema = z.object({
+  entity: entitySnapshotSchema,
+  pulls: z.array(entitySnapshotSchema).default([]),
+  /**
+   * BB-312: when the snapshot was read, so the entity cache can tell a fresh
+   * stored snapshot from a stale one. Optional: a row written before this
+   * field existed has no time and is treated as stale.
+   */
+  at: z.number().optional(),
+});
 export type Observed = z.infer<typeof observedSchema>;
 
 /**
@@ -1379,6 +1394,12 @@ export type StandupRow = {
   confirmed: string[];
   /** BB-307: every `ask_a_thread` delegation this stand-up made, for its page log. */
   delegations: StandupDelegationRow[];
+  /**
+   * BB-312: true once the stand-up reached its end (`end_standup` or the
+   * page's end), so the clamp can tell a completed stand-up from one the
+   * overlay abandoned. A row written before the column existed reads false.
+   */
+  completed: boolean;
 };
 
 /**
@@ -1773,10 +1794,11 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // for a session and by project for the readback and the next wake. Prepared
   // lazily, like the assessment statements: a legacy store opened without the
   // migration must still start (migrations.test.ts).
-  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed, binding, delegations) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed, @binding, @delegations)");
+  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed, binding, delegations, completed) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed, @binding, @delegations, @completed)");
   const getStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE id = ?");
   const latestStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
-  const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed, delegations = @delegations WHERE id = @id");
+  const lastCompletedStandupStmt = lazy<[string], { started_at: number }>("SELECT started_at FROM standups WHERE project_id = ? AND completed = 1 ORDER BY started_at DESC, rowid DESC LIMIT 1");
+  const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed, delegations = @delegations, completed = @completed WHERE id = @id");
   const divergencesAllStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessment_divergences ORDER BY last_seen_at DESC, surface");
   const divergencesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? ORDER BY last_seen_at DESC, surface");
   const divergencesBySurfaceStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE surface = ? ORDER BY last_seen_at DESC, binding_id");
@@ -2038,6 +2060,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     confirmed: json(z.array(z.string()), r.confirmed === null || r.confirmed === undefined ? null : String(r.confirmed), []),
     // A row written before the BB-307 column existed has no value; it made no delegations.
     delegations: json(z.array(standupDelegationRowSchema), r.delegations === null || r.delegations === undefined ? null : String(r.delegations), []),
+    // A row written before the BB-312 column existed was not completed.
+    completed: Number(r.completed ?? 0) !== 0,
   });
   const toDivergenceRow = (r: Record<string, unknown>): DivergenceRow => ({
     id: String(r.id),
@@ -3265,7 +3289,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     // writes; nothing here acts on a binding, a need, an escalation or a merge.
     /** Open a stand-up record and return it. */
     createStandup(fields: { id: string; projectId: string; startedAt: number; binding?: string | null }): StandupRow {
-      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]", binding: fields.binding ?? null, delegations: "[]" });
+      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]", binding: fields.binding ?? null, delegations: "[]", completed: 0 });
       return toStandup(getStandupStmt().get(fields.id)!);
     },
     /** One stand-up by id, or null. */
@@ -3278,8 +3302,17 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const r = latestStandupStmt().get(projectId);
       return r === undefined ? null : toStandup(r);
     },
+    /**
+     * BB-312: when the project last completed a stand-up (the voice
+     * `end_standup` or the page's end), or null when none has. An interrupted
+     * stand-up does not move this.
+     */
+    lastCompletedStandup(projectId: string): number | null {
+      const r = lastCompletedStandupStmt().get(projectId);
+      return r === undefined ? null : Number(r.started_at);
+    },
     /** Replace a stand-up's mutable columns; the notes and transcript the caller passes are stored whole. */
-    saveStandup(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: StandupTranscriptEntry[]; notes?: StandupNoteRow[]; confirmed?: string[]; delegations?: StandupDelegationRow[] }): StandupRow | null {
+    saveStandup(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: StandupTranscriptEntry[]; notes?: StandupNoteRow[]; confirmed?: string[]; delegations?: StandupDelegationRow[]; completed?: boolean }): StandupRow | null {
       const current = getStandupStmt().get(id);
       if (current === undefined) return null;
       const row = toStandup(current);
@@ -3291,6 +3324,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         notes: JSON.stringify(fields.notes ?? row.notes),
         confirmed: JSON.stringify(fields.confirmed ?? row.confirmed),
         delegations: JSON.stringify(fields.delegations ?? row.delegations),
+        completed: (fields.completed === undefined ? row.completed : fields.completed) ? 1 : 0,
       });
       return toStandup(getStandupStmt().get(id)!);
     },
