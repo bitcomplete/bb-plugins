@@ -82,12 +82,18 @@ function stubConnect(minted: MintedRealtimeSession = MINTED): void {
   vi.stubGlobal("fetch", vi.fn(async () => new Response("answer-sdp", { status: 200 })));
 }
 
-function streamOf(track: { enabled: boolean; stop: ReturnType<typeof vi.fn> }): MediaStream {
+function streamOf(track: FakeTrack): MediaStream {
   return {
     getAudioTracks: () => [track],
     getTracks: () => [track],
   } as unknown as MediaStream;
 }
+
+type FakeTrack = {
+  enabled: boolean;
+  stop: ReturnType<typeof vi.fn>;
+  getSettings?: () => MediaTrackSettings;
+};
 
 beforeEach(() => {
   FakePeerConnection.instances.length = 0;
@@ -143,6 +149,83 @@ describe("RealtimeSessionClient", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(track.stop).toHaveBeenCalled();
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks the microphone for echo cancellation, noise suppression and auto gain control", async () => {
+    const track: FakeTrack = { enabled: true, stop: vi.fn(), getSettings: () => ({}) };
+    const getUserMedia = vi.fn(async () => streamOf(track));
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("answer-sdp", { status: 200 })));
+    const client = new RealtimeSessionClient(callbacks());
+
+    await client.start();
+
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    await client.stop();
+  });
+
+  it("retries once with a plain microphone when the constrained call is overconstrained", async () => {
+    const track: FakeTrack = { enabled: true, stop: vi.fn(), getSettings: () => ({}) };
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValueOnce(Object.assign(new Error("overconstrained"), { name: "OverconstrainedError" }))
+      .mockResolvedValueOnce(streamOf(track));
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    const fetchMock = vi.fn(async () => new Response("answer-sdp", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onStatus = vi.fn();
+    const client = new RealtimeSessionClient(callbacks({ onStatus }));
+
+    await client.start();
+
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(getUserMedia.mock.calls[0]![0]).toEqual({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    expect(getUserMedia.mock.calls[1]![0]).toEqual({ audio: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onStatus).not.toHaveBeenCalledWith("error", expect.anything());
+    await client.stop();
+  });
+
+  it("does not retry a microphone error that is not overconstrained", async () => {
+    const getUserMedia = vi.fn(async () => {
+      throw Object.assign(new Error("Permission denied"), { name: "NotAllowedError" });
+    });
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    const onStatus = vi.fn();
+    const client = new RealtimeSessionClient(callbacks({ onStatus }));
+
+    await client.start();
+
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(onStatus).toHaveBeenCalledWith("error", "Permission denied");
+  });
+
+  it("reports the applied processing settings once at connect", async () => {
+    const track: FakeTrack = {
+      enabled: true,
+      stop: vi.fn(),
+      getSettings: () => ({ echoCancellation: true, noiseSuppression: false }),
+    };
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn(async () => streamOf(track)) } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("answer-sdp", { status: 200 })));
+    const onStatus = vi.fn();
+    const client = new RealtimeSessionClient(callbacks({ onStatus }));
+
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+
+    expect(onStatus).toHaveBeenCalledWith(
+      "live",
+      "echoCancellation=true noiseSuppression=false autoGainControl=unknown",
+    );
+    expect(onStatus.mock.calls.filter(([status]) => status === "live")).toHaveLength(1);
+    await client.stop();
   });
 
   it("opens the GA WebRTC endpoint with the ephemeral secret and no session.update", async () => {
