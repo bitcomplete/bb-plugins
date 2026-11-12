@@ -31,6 +31,7 @@ import {
   declaresTool,
   parseClientSecret,
   realtimeClientSecretBody,
+  realtimeInstructions,
   realtimeMaxMs,
   realtimeModel,
   realtimeReadiness,
@@ -163,8 +164,8 @@ export function settingDescriptors(env: Env) {
       type: "string",
       label: "Language",
       description:
-        "ISO-639-1 code such as `en`. Empty lets the endpoint auto-detect.",
-      default: "",
+        "ISO-639-1 code such as `en`, for transcription and for the language a Realtime voice session speaks. Empty lets the endpoint auto-detect, which guesses wrong on short or noisy audio.",
+      default: "en",
     },
   } as const;
 }
@@ -372,9 +373,9 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
     // dropped when the overlay closes it.
     const realtimeSessions = new Map<string, PendingRealtimeSession>();
 
-    async function realtimeKey(): Promise<{ baseUrl: string; apiKey: string }> {
+    async function realtimeKey(): Promise<{ baseUrl: string; apiKey: string; language: string }> {
       const values = await settings.get();
-      return { baseUrl: values.baseUrl, apiKey: resolveApiKey(values.apiKey, env) ?? "" };
+      return { baseUrl: values.baseUrl, apiKey: resolveApiKey(values.apiKey, env) ?? "", language: values.language.trim() };
     }
 
     /**
@@ -444,7 +445,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         if (caller.kind !== "plugin") {
           throw new Error("realtime.open is called by another plugin, not the browser");
         }
-        const { baseUrl, apiKey } = await realtimeKey();
+        const { baseUrl, apiKey, language } = await realtimeKey();
         const refusal = realtimeReadiness({ baseUrl, apiKey });
         if (refusal !== null) throw new Error(refusal.message);
         // The background sweep is the guarantee; this eager pass only keeps the
@@ -458,6 +459,9 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           ...(input.voice !== undefined ? { voice: input.voice } : {}),
           ...(input.maxDurationMs !== undefined ? { maxDurationMs: input.maxDurationMs } : {}),
           ...(input.speaksFirst !== undefined ? { speaksFirst: input.speaksFirst } : {}),
+          // The plugin's language setting, not the opener's: one setting
+          // decides what every voice session on this server speaks.
+          ...(language === "" ? {} : { language }),
         };
         const session: PendingRealtimeSession = {
           id: crypto.randomUUID(),
@@ -568,7 +572,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
             expiresAt: secret.expiresAt,
             model: realtimeModel(session.config),
             voice: realtimeVoice(session.config),
-            instructions: session.config.instructions,
+            instructions: realtimeInstructions(session.config),
             tools: session.config.tools,
             maxDurationMs: session.maxMs,
             speaksFirst: session.config.speaksFirst === true,

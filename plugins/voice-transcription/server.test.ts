@@ -283,8 +283,24 @@ describe("transcribe", () => {
     expect(file.type).toBe("audio/webm;codecs=opus");
   });
 
+  it("sends the default language, English, when the setting is left alone", async () => {
+    const { service } = await load({ apiKey: "sk-test" });
+    let captured: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        captured = init;
+        return jsonResponse({ text: "ok" });
+      }),
+    );
+
+    await service.transcribe!(audio(), { signal: signal(), hint: null });
+
+    expect((captured!.body as FormData).get("language")).toBe("en");
+  });
+
   it("omits prompt and language when there is none, and Authorization when the key is empty", async () => {
-    const { service } = await load({ baseUrl: "http://whisper.local:8080/v1" });
+    const { service } = await load({ baseUrl: "http://whisper.local:8080/v1", language: "" });
     let captured: RequestInit | undefined;
     vi.stubGlobal(
       "fetch",

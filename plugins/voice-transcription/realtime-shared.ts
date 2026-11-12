@@ -41,6 +41,12 @@ export type RealtimeSessionConfig = {
    * waiting for the owner to speak. Off by default.
    */
   speaksFirst?: boolean;
+  /**
+   * The ISO-639-1 code the session speaks and transcribes in: the plugin's
+   * `language` setting, filled in by `realtime.open`. Empty leaves OpenAI to
+   * auto-detect, which guesses wrong on the first fragment of audio.
+   */
+  language?: string;
 };
 
 /**

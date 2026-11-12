@@ -94,6 +94,36 @@ export function realtimeVoice(config: RealtimeSessionConfig): string {
   return voice === "" ? DEFAULT_REALTIME_VOICE : voice;
 }
 
+/** The session's language as a lower-case ISO-639-1 code, or null for auto-detect. */
+export function realtimeLanguage(config: RealtimeSessionConfig): string | null {
+  const language = config.language?.trim().toLowerCase() ?? "";
+  return /^[a-z]{2,3}$/u.test(language) ? language : null;
+}
+
+/** The language's English name for the instructions ("en" → "English"), the code itself when ICU has no name. */
+export function languageName(code: string): string {
+  try {
+    const name = new Intl.DisplayNames(["en"], { type: "language" }).of(code);
+    return name === undefined || name === code ? code : name;
+  } catch {
+    return code;
+  }
+}
+
+/**
+ * The instructions the model is given: the opener's, led by the language it
+ * must speak. The line is pinned to the session's language rather than the
+ * owner's, because the first audio the model hears is often a cough or a
+ * keyboard, auto-detected as any language at all, and a model left to mirror
+ * it opens the stand-up in that language.
+ */
+export function realtimeInstructions(config: RealtimeSessionConfig): string {
+  const language = realtimeLanguage(config);
+  if (language === null) return config.instructions;
+  const name = languageName(language);
+  return `Speak ${name} throughout, whatever language the other person's audio seems to be in; switch only when they clearly ask you to.\n\n${config.instructions}`;
+}
+
 /**
  * The session length: the caller's request clamped to the plugin's cap, and
  * the cap itself when the caller named none.
@@ -114,12 +144,13 @@ export function realtimeMaxMs(config: RealtimeSessionConfig): number {
 export function realtimeClientSecretBody(
   config: RealtimeSessionConfig,
 ): Record<string, unknown> {
+  const language = realtimeLanguage(config);
   return {
     expires_after: { anchor: "created_at", seconds: REALTIME_SECRET_TTL_SECONDS },
     session: {
       type: "realtime",
       model: realtimeModel(config),
-      instructions: config.instructions,
+      instructions: realtimeInstructions(config),
       tools: config.tools.map((tool) => ({
         type: "function",
         name: tool.name,
@@ -127,7 +158,12 @@ export function realtimeClientSecretBody(
         ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {}),
       })),
       audio: {
-        input: { transcription: { model: REALTIME_INPUT_TRANSCRIPTION_MODEL } },
+        input: {
+          transcription: {
+            model: REALTIME_INPUT_TRANSCRIPTION_MODEL,
+            ...(language === null ? {} : { language }),
+          },
+        },
         output: { voice: realtimeVoice(config) },
       },
     },

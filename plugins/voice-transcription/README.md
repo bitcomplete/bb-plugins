@@ -26,7 +26,7 @@ Editable under **Settings → Plugins → Voice transcription**, or with
 | `baseUrl` | `https://api.openai.com/v1` | No trailing slash; `/audio/transcriptions` is appended. |
 | `apiKey` | empty | Sent only as `Authorization: Bearer` to `baseUrl`. Stored in the plugin's 0600 secrets file and never sent to the frontend. The same key mints short-lived Realtime client secrets when `baseUrl` is OpenAI's. Leave empty for a self-hosted server with no auth. |
 | `model` | `gpt-4o-transcribe` | Passed through verbatim. |
-| `language` | empty | ISO-639-1 code such as `en`. Empty lets the endpoint auto-detect. |
+| `language` | `en` | ISO-639-1 code, for transcription and for the language a Realtime voice session speaks and transcribes in. Empty lets the endpoint auto-detect, which guesses wrong on short or noisy audio (a stand-up once opened in Arabic). |
 
 The service is **not ready** while `baseUrl` or `model` is empty, and it is
 also not ready when `apiKey` is empty against the default OpenAI endpoint —
@@ -148,7 +148,7 @@ A self-hosted whisper.cpp or faster-whisper server on the tailnet, no auth:
 baseUrl  http://whisper.local:8080/v1
 apiKey   (empty)
 model    whisper-1
-language (empty, auto-detect)
+language (set empty to auto-detect)
 ```
 
 ## Choosing the service
