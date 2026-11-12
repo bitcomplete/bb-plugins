@@ -55,6 +55,14 @@ export const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
  */
 export const REALTIME_STOP_FALLBACK_MS = 15_000;
 
+/**
+ * A rough speaking rate (about 150 words per minute), used to turn a
+ * `conversation.item.truncated` playback offset into the text that had been
+ * heard. Generation runs ahead of playback, so the delta arrival times cannot
+ * map to `audio_end_ms`; a rate is the honest estimate this client can make.
+ */
+export const REALTIME_SPEECH_CHARS_PER_SECOND = 15;
+
 /** True for the one browser error that a constrained `getUserMedia` may still throw. */
 function isOverconstrained(error: unknown): boolean {
   return (
@@ -82,10 +90,8 @@ export class RealtimeSessionClient {
   private readonly itemResponse = new Map<string, string>();
   /** The item ids each response has produced. */
   private readonly responseItems = new Map<string, Set<string>>();
-  /** When each item's transcript started, for mapping a truncation offset. */
-  private readonly itemStartedAt = new Map<string, number>();
-  /** The cumulative text length at each delta's arrival, per item. */
-  private readonly itemTimeline = new Map<string, Array<{ at: number; length: number }>>();
+  /** When each response's audio started playing, to bound a truncation offset. */
+  private readonly playbackStartedAt = new Map<string, number>();
   /** Items the owner truncated; a later transcript `done` must not expand them. */
   private readonly truncatedItems = new Set<string>();
   /** Set by a tool reply with `last: true`: stop once the in-flight response finishes. */
@@ -258,6 +264,7 @@ export class RealtimeSessionClient {
       this.audio.remove();
       this.audio = null;
     }
+    this.clearTranscript();
   }
 
   private stopStream(stream: MediaStream): void {
@@ -315,7 +322,6 @@ export class RealtimeSessionClient {
           const text = (this.assistantBuffers.get(itemId) ?? "") + delta;
           this.assistantBuffers.set(itemId, text);
           this.itemText.set(itemId, text);
-          this.noteDelta(itemId, text.length);
           if (responseId !== null) this.noteResponseItem(responseId, itemId);
           this.callbacks.onLine({
             id: itemId,
@@ -349,7 +355,8 @@ export class RealtimeSessionClient {
         }
         break;
       }
-      case "conversation.item.created": {
+      case "conversation.item.created":
+      case "conversation.item.added": {
         const item = event.item;
         if (typeof item !== "object" || item === null) break;
         const id = typeof (item as { id?: unknown }).id === "string" ? (item as { id: string }).id : null;
@@ -366,8 +373,20 @@ export class RealtimeSessionClient {
       case "conversation.item.input_audio_transcription.completed": {
         const transcript = typeof event.transcript === "string" ? event.transcript : "";
         const itemId = this.itemIdOf(event);
-        if (itemId !== null && transcript !== "") {
+        if (itemId === null) break;
+        // An empty transcription (a VAD noise burst) or a failed one must not
+        // leave the placeholder on screen.
+        if (transcript === "") {
+          this.callbacks.onLine({ id: itemId, role: "user", text: "", removed: true });
+        } else {
           this.callbacks.onLine({ id: itemId, role: "user", text: transcript });
+        }
+        break;
+      }
+      case "conversation.item.input_audio_transcription.failed": {
+        const itemId = this.itemIdOf(event);
+        if (itemId !== null) {
+          this.callbacks.onLine({ id: itemId, role: "user", text: "", removed: true });
         }
         break;
       }
@@ -407,6 +426,14 @@ export class RealtimeSessionClient {
         // transport never sends it.
         if (this.stopAfterResponse && responseId !== null && responseId === this.stopResponseId) {
           this.armStopFallback();
+        }
+        break;
+      }
+      case "output_audio_buffer.started": {
+        // The response's audio began playing; remember when, so a truncation's
+        // `audio_end_ms` cannot claim more playback than has elapsed.
+        if (responseId !== null && !this.playbackStartedAt.has(responseId)) {
+          this.playbackStartedAt.set(responseId, Date.now());
         }
         break;
       }
@@ -478,59 +505,53 @@ export class RealtimeSessionClient {
   }
 
   /**
-   * Record when a delta arrived and how long the item's text is now, so a
-   * later `conversation.item.truncated` can map its `audio_end_ms` onto the
-   * text that had been spoken by then.
-   */
-  private noteDelta(itemId: string, length: number): void {
-    const now = Date.now();
-    const started = this.itemStartedAt.get(itemId);
-    if (started === undefined) {
-      this.itemStartedAt.set(itemId, now);
-      this.itemTimeline.set(itemId, [{ at: 0, length }]);
-      return;
-    }
-    const timeline = this.itemTimeline.get(itemId) ?? [];
-    timeline.push({ at: now - started, length });
-    this.itemTimeline.set(itemId, timeline);
-  }
-
-  /**
-   * The text shown at the moment of a truncation. When the item's delta timing
-   * maps onto `audio_end_ms`, clip to what had played by then; otherwise keep
-   * the text shown so far. Null when the item has no text to show at all.
+   * The text shown at the moment of a truncation. `audio_end_ms` is the
+   * playback offset, and generation runs ahead of playback, so the delta
+   * arrival times cannot map to it: estimate the heard text from the offset at
+   * a speaking rate, snap back to a word boundary and cap it at the text shown
+   * so far. Null when the item has no text to show at all.
    */
   private clipItem(itemId: string, audioEndMs: number | null): string | null {
     const buffer = this.assistantBuffers.get(itemId) ?? this.itemText.get(itemId);
     if (buffer === undefined) return null;
     if (audioEndMs === null) return buffer;
-    const timeline = this.itemTimeline.get(itemId);
-    if (timeline === undefined || timeline.length === 0) return buffer;
-    let length = 0;
-    for (const entry of timeline) {
-      if (entry.at <= audioEndMs) length = entry.length;
-      else break;
-    }
-    // No delta had arrived by the truncation offset: keep what was shown
-    // rather than blank the bubble.
-    return length > 0 ? buffer.slice(0, length) : buffer;
+    const responseId = this.itemResponse.get(itemId);
+    const playbackStarted =
+      responseId !== undefined ? this.playbackStartedAt.get(responseId) : undefined;
+    // The audio cannot have played further than the wall clock since it
+    // started, whatever the offset claims.
+    const elapsed = playbackStarted !== undefined ? Date.now() - playbackStarted : null;
+    const heardMs = elapsed === null ? audioEndMs : Math.min(audioEndMs, elapsed);
+    const heard = Math.floor((heardMs / 1000) * REALTIME_SPEECH_CHARS_PER_SECOND);
+    // Nothing maps, or the whole text had played: keep what was shown.
+    if (heard <= 0 || heard >= buffer.length) return buffer;
+    const clipped = buffer.slice(0, heard);
+    const lastSpace = clipped.lastIndexOf(" ");
+    return lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped;
   }
 
-  /** Drop one item's buffered transcript, shown text and timing. */
-  private forgetItem(itemId: string): void {
-    this.assistantBuffers.delete(itemId);
-    this.itemText.delete(itemId);
-    this.itemResponse.delete(itemId);
-    this.itemStartedAt.delete(itemId);
-    this.itemTimeline.delete(itemId);
-    this.truncatedItems.delete(itemId);
-  }
-
-  /** Drop the buffers of every item a response produced, leaving rendered text alone. */
+  /**
+   * Drop the streaming buffers of every item a response produced. The rendered
+   * text, the shown text and the truncation flag are kept, so a
+   * `conversation.item.truncated` that arrives after a cancelled `response.done`
+   * can still clip the bubble.
+   */
   private dropResponse(responseId: string | null): void {
     if (responseId === null) return;
-    for (const itemId of this.responseItems.get(responseId) ?? []) this.forgetItem(itemId);
+    for (const itemId of this.responseItems.get(responseId) ?? []) {
+      this.assistantBuffers.delete(itemId);
+    }
     this.responseItems.delete(responseId);
+  }
+
+  /** Forget all per-item transcript state when the session tears down. */
+  private clearTranscript(): void {
+    this.assistantBuffers.clear();
+    this.itemText.clear();
+    this.itemResponse.clear();
+    this.responseItems.clear();
+    this.playbackStartedAt.clear();
+    this.truncatedItems.clear();
   }
 
   /** Close after a short grace if the audio-finished signal never arrives. */

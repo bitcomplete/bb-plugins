@@ -534,4 +534,12 @@ describe("realtime overlay transcript", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]!.truncated).toBe(true);
   });
+
+  it("removes a line whose transcription completed empty", () => {
+    let lines: RealtimeLine[] = [];
+    lines = upsertRealtimeLine(lines, { id: "u1", role: "user", text: REALTIME_USER_PLACEHOLDER, previousId: null });
+    lines = upsertRealtimeLine(lines, { id: "u1", role: "user", text: "", removed: true });
+
+    expect(lines).toEqual([]);
+  });
 });

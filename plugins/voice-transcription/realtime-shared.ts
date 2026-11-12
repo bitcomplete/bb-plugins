@@ -34,6 +34,11 @@ export type RealtimeLine = {
   previousId?: string | null;
   /** True once the item was truncated, so the overlay marks it cut off. */
   truncated?: boolean;
+  /**
+   * True when the line must be dropped rather than shown: a user item whose
+   * transcription completed empty or failed (VAD noise) leaves no bubble.
+   */
+  removed?: boolean;
 };
 
 /**
@@ -41,10 +46,17 @@ export type RealtimeLine = {
  * place, never by position, so a streaming delta updates its own bubble and a
  * new assistant response opens a new one. A new user line goes where its
  * `previousId` puts it (at the start for `null`, at the end when the anchor
- * has not arrived); every other new line is appended.
+ * has not arrived); every other new line is appended. A line marked `removed`
+ * drops any line with its id.
  */
 export function upsertRealtimeLine(lines: RealtimeLine[], line: RealtimeLine): RealtimeLine[] {
   const existing = lines.findIndex((candidate) => candidate.id === line.id);
+  if (line.removed === true) {
+    if (existing === -1) return lines;
+    const next = [...lines];
+    next.splice(existing, 1);
+    return next;
+  }
   if (existing !== -1) {
     const next = [...lines];
     next[existing] = {
