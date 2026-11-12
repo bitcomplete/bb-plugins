@@ -15426,6 +15426,22 @@ describe("the stand-up (BB-300)", () => {
     expect(t.sends.some((s) => s.threadId === t.steward)).toBe(false);
   });
 
+  it("keeps a note taken while a follow-up spawn is in flight (BB-313)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "follow-up", text: "Look into it", binding: "ENG-12" });
+    const note = (await record(t)).standup!.notes[0]!;
+    t.setSpawnDelayMs(50);
+    const confirm = t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: note.id }, client);
+    // The confirm is awaiting the spawn; a note taken meanwhile must survive it.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    await confirm;
+    const read = await record(t);
+    expect(read.standup!.notes.map((n) => n.type)).toEqual(["follow-up", "guidance"]);
+    expect(read.standup!.notes[0]!.thread).toBeDefined();
+  });
+
   it("confirming a follow-up note twice opens one thread (BB-313)", async () => {
     const t = await adopted();
     const started = await startStandup(t);

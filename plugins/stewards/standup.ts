@@ -103,8 +103,6 @@ export const STANDUP_MAX_INSTRUCTIONS_CHARS = 20_000;
 export const STANDUP_SECTION_MAX = 40;
 /** The most days an open item may sit before the brief calls it stale (BB-306). */
 export const STANDUP_STALE_DAYS = 3;
-/** BB-313: the default model a follow-up thread is spawned with. */
-export const STANDUP_FOLLOWUP_DEFAULT_MODEL = "claude/claude-haiku-5-5/low";
 /** How much of a question's context the brief carries (BB-306). */
 export const STANDUP_CONTEXT_MAX_CHARS = 300;
 /** The most comments `lookup` renders, newest last (BB-306). */
@@ -388,9 +386,9 @@ function renderEntity(entity: EntitySnapshot, binding: Binding | null): string {
   lines.push(`State: ${entity.state ?? "unknown"}${entity.labels.length === 0 ? "" : ` · labels: ${entity.labels.join(", ")}`}`);
   if (entity.author !== null) lines.push(`Author: ${entity.author}`);
   if (entity.assignees.length > 0) lines.push(`Assignees: ${entity.assignees.join(", ")}`);
-  // BB-309: a pull request's body is clipped for the spoken answer; a ticket's
-  // body is rendered as written, as before.
-  if (entity.description !== null && entity.description.trim() !== "") lines.push(entity.kind === "pull" ? clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS) : entity.description.trim());
+  // BB-313: the entity body is clipped to the spoken-answer budget for both a
+  // ticket and a pull request, so a long description cannot crowd the record.
+  if (entity.description !== null && entity.description.trim() !== "") lines.push(clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS));
   // BB-306: the snapshot already fetched these; render them so the model does
   // not have to spend a lookup on what the tool already has.
   const comments = entity.comments.slice(-STANDUP_ENTITY_COMMENTS_MAX);
@@ -433,7 +431,10 @@ async function lookupTool(ctx: StandupToolContext, key: string): Promise<string>
   if (b === null) {
     const record = await ctx.entity(key).catch(() => null);
     if (record === null) return `No snapshot is available for ${key}.`;
-    const parts = [renderEntity(record.entity, null), ...record.pulls.map((p) => renderPull(p, null))];
+    const parts = [renderEntity(record.entity, null)];
+    // BB-313: a pull request key renders its own verdict, checks, merge and deploy state too.
+    if (record.entity.kind === "pull") parts.push(renderPull(record.entity, null));
+    else for (const p of record.pulls) parts.push(renderPull(p, null));
     return parts.join("\n\n");
   }
   // BB-309: a pull-request key resolves to the ticket binding that holds its
@@ -449,8 +450,11 @@ async function lookupTool(ctx: StandupToolContext, key: string): Promise<string>
   if (entity === null) return `No snapshot is available for ${key}.`;
   const pulls = linked !== null ? [linked] : (record?.pulls ?? []);
   const parts: string[] = [renderEntity(entity, b)];
-  // Every pull the binding holds, each with its own verdict, checks, merge and deploy state.
-  for (const p of pulls) parts.push(renderPull(p, b));
+  // Every pull the entity carries, each with its own verdict, checks, merge and deploy state.
+  // BB-313: a pull request that is the entity itself (a stewardless PR, or a PR
+  // steward's own PR) renders its details too; its `pulls` list is empty.
+  if (entity.kind === "pull") parts.push(renderPull(entity, b));
+  else for (const p of pulls) parts.push(renderPull(p, b));
   parts.push(stewardStatusText(ctx, b));
   const open = ctx.openEscalations(b.id);
   parts.push(open.length === 0 ? "Open escalations: none." : `Open escalations:\n${open.map(escalationText).join("\n\n")}`);

@@ -211,13 +211,35 @@ describe("runStandupTool (BB-300)", () => {
     expect(out).toContain("…");
   });
 
-  it("renders a ticket body as written, without the pull clip (BB-309)", async () => {
+  it("clips a ticket body to the spoken-answer budget (BB-313)", async () => {
     const long = "z".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50);
     const entity = issue({ description: long });
     const b = binding({ lastSnapshot: { entity, pulls: [] } });
     const ctx = context({ entity: async () => ({ entity, pulls: [] }), binding: (key) => (key === "ENG-12" ? b : null) });
     const out = (await runStandupTool("lookup", { key: "ENG-12" }, ctx)) as string;
-    expect(out).toContain(long);
+    expect(out).not.toContain(long);
+    expect(out).toContain("…");
+  });
+
+  it("renders a pull request's own verdict, checks, merge and deploy when it is the entity (BB-313)", async () => {
+    const linked = pull(
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Add login retry", comments: [comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->" })] },
+      { checks: { state: "failure", failing: ["test"] }, mergeCommit: "abcdef1" },
+    );
+    // A PR steward's own PR: the binding's key is the entity.
+    const b = binding({ kind: "pr", entityKey: "acme/web#7", lastSnapshot: { entity: linked, pulls: [] }, deployments: { d1: { state: "deployed" } } as never });
+    const ctx = context({ binding: (key) => (key === "acme/web#7" ? b : null), entity: async () => ({ entity: linked, pulls: [] }) });
+    const out = (await runStandupTool("lookup", { key: "acme/web#7" }, ctx)) as string;
+    expect(out).toContain("Review: approved, lane owner-reviewed, approver owner");
+    expect(out).toContain("Checks: failure (failing: test)");
+    expect(out).toContain("Merge commit: abcdef1");
+    expect(out).toContain("Deploy: 1/1 confirmed");
+    // A stewardless PR key answers the same way, with no deploy state.
+    const noSteward = context({ binding: () => null, entity: async () => ({ entity: linked, pulls: [] }) });
+    const out2 = (await runStandupTool("lookup", { key: "acme/web#7" }, noSteward)) as string;
+    expect(out2).toContain("Review: approved");
+    expect(out2).toContain("Checks: failure (failing: test)");
+    expect(out2).toContain("Merge commit: abcdef1");
   });
 
   it("rejects the removed tool names as unknown (BB-313)", async () => {

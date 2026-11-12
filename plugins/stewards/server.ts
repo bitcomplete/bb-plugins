@@ -94,7 +94,7 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { STANDUP_TOOLS, STANDUP_FOLLOWUP_DEFAULT_MODEL, buildStandupBrief, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, type StandupDelegation, type StandupEndOutcome, type StandupEntityFacts, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolContext, type StandupToolReply } from "./standup.js";
+import { STANDUP_TOOLS, buildStandupBrief, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, type StandupDelegation, type StandupEndOutcome, type StandupEntityFacts, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolContext, type StandupToolReply } from "./standup.js";
 import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
@@ -1797,15 +1797,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } else if (current.threadPending) {
           return { ok: false, applied: false, message: "A thread for this note is already starting." };
         } else {
-          saveStandupNote(fresh, { ...current, threadPending: true });
+          saveStandupNote(fresh.id, current.id, { threadPending: true });
           try {
             const threadId = await spawnFollowUpThread(fresh, current);
-            saveStandupNote(fresh, { ...current, thread: threadId, threadError: null, threadPending: false });
+            saveStandupNote(fresh.id, current.id, { thread: threadId, threadError: null, threadPending: false });
             applied = true;
             message = `Opened follow-up thread ${threadId}.`;
           } catch (error) {
             const reason = errorMessage(error);
-            saveStandupNote(fresh, { ...current, thread: null, threadError: reason, threadPending: false });
+            saveStandupNote(fresh.id, current.id, { thread: null, threadError: reason, threadPending: false });
             return { ok: false, applied: false, message: `Could not open a follow-up thread: ${reason}` };
           }
         }
@@ -1818,9 +1818,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { ok: true, applied, message };
     }
 
-    /** Replace one note in a stand-up's record, saving the whole notes array. */
-    function saveStandupNote(standup: StandupRow, note: StandupNoteRow): void {
-      store.saveStandup(standup.id, { notes: standup.notes.map((n) => (n.id === note.id ? note : n)) });
+    /** Patch one note in a stand-up's record, re-reading it so a concurrent write is not lost. */
+    function saveStandupNote(standupId: string, noteId: string, patch: Partial<StandupNoteRow>): void {
+      const current = store.standup(standupId);
+      if (current === null) return;
+      store.saveStandup(standupId, { notes: current.notes.map((n) => (n.id === noteId ? { ...n, ...patch } : n)) });
     }
 
     /**
@@ -1858,7 +1860,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         environment: freshEnvironment(config?.source ?? null, hostId),
         prompt: lines.join("\n"),
         title: key === null ? "Follow-up from a stand-up" : `Follow-up from a stand-up · ${key}`,
-        ...modelArgs(parseModel(STANDUP_FOLLOWUP_DEFAULT_MODEL)),
+        // No model override: the owner's thread runs on the owner's default,
+        // as it does for permissions.
         pluginMetadata: { role: "follow-up", standupId: standup.id, noteId: note.id },
       });
       bb.log.info(`stewards: opened follow-up thread ${thread.id} for ${standup.id} note ${note.id}`);
@@ -1899,7 +1902,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } else {
           text = buildStandupInstructions(brief, name, now(), questions, scoped.entityKey);
         }
-        return text.split("\n").filter((line) => line.includes(key));
+        // Match the key as a whole token, so a follow-up about ENG-1 does not
+        // pick up the brief lines for ENG-12 or ENG-100.
+        const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+        const pattern = new RegExp(`(?<![\\w-])${escaped}(?!\\d)`, "u");
+        return text.split("\n").filter((line) => pattern.test(line));
       } catch (error) {
         bb.log.warn(`stewards: follow-up brief lines for ${key} failed: ${errorMessage(error)}`);
         return [];
