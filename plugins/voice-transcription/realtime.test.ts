@@ -11,6 +11,8 @@ import {
   isOpenAIBaseUrl,
   parseClientSecret,
   realtimeClientSecretBody,
+  realtimeInstructions,
+  languageName,
   realtimeMaxMs,
   realtimeReadiness,
   toolReply,
@@ -109,6 +111,27 @@ describe("realtime policy", () => {
     expect(REALTIME_SECRET_TTL_SECONDS).toBeLessThanOrEqual(60);
   });
 
+  it("pins the session to the language setting: transcription and the instructions both carry it", () => {
+    const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], language: " EN " }) as {
+      session: { instructions: string; audio: { input: { transcription: Record<string, string> } } };
+    };
+    expect(body.session.audio.input.transcription).toEqual({ model: REALTIME_INPUT_TRANSCRIPTION_MODEL, language: "en" });
+    expect(body.session.instructions).toMatch(/^Speak English throughout/u);
+    expect(body.session.instructions.endsWith("\n\nSay hi.")).toBe(true);
+    expect(realtimeInstructions({ instructions: "Say hi.", tools: [], language: "fr" })).toMatch(/^Speak French/u);
+  });
+
+  it("leaves auto-detect alone when the language is empty or malformed", () => {
+    for (const language of [undefined, "", "english", "e n"]) {
+      const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], language }) as {
+        session: { instructions: string; audio: { input: { transcription: Record<string, string> } } };
+      };
+      expect(body.session.audio.input.transcription).toEqual({ model: REALTIME_INPUT_TRANSCRIPTION_MODEL });
+      expect(body.session.instructions).toBe("Say hi.");
+    }
+    expect(languageName("zz")).toBe("zz");
+  });
+
   it("reads the ephemeral secret from either OpenAI reply shape", () => {
     expect(parseClientSecret({ value: "ek_a", expires_at: 10 })).toEqual({ value: "ek_a", expiresAt: 10 });
     expect(parseClientSecret({ client_secret: { value: "ek_b", expires_at: 20 } })).toEqual({ value: "ek_b", expiresAt: 20 });
@@ -129,7 +152,7 @@ describe("realtime policy", () => {
 
 describe("realtime mint route", () => {
   it("mints an ephemeral secret and never returns the standard key", async () => {
-    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL, language: "de" });
     const calls: Array<{ url: string; init: RequestInit }> = [];
     vi.stubGlobal(
       "fetch",
@@ -166,9 +189,11 @@ describe("realtime mint route", () => {
     expect(calls[0]!.url).toBe(`${DEFAULT_BASE_URL}${REALTIME_CLIENT_SECRET_PATH}`);
     expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe(`Bearer ${STANDARD_KEY}`);
     const sent = JSON.parse(String(calls[0]!.init.body)) as {
-      session: { instructions: string; tools: Array<{ name: string }> };
+      session: { instructions: string; tools: Array<{ name: string }>; audio: { input: { transcription: { language?: string } } } };
     };
-    expect(sent.session.instructions).toBe("You are a test.");
+    // The plugin's language setting pins both what is transcribed and what is spoken.
+    expect(sent.session.instructions).toBe("Speak German throughout, whatever language the other person's audio seems to be in; switch only when they clearly ask you to.\n\nYou are a test.");
+    expect(sent.session.audio.input.transcription.language).toBe("de");
     expect(sent.session.tools.map((tool) => tool.name)).toEqual(["echo"]);
   });
 
