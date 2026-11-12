@@ -417,9 +417,10 @@ describe("the loop", () => {
     await s.done;
   });
 
-  it("leases a tokenless source with no token, and a service that does not know it is said once and left to the sweep", async () => {
+  it("leases a tokenless source with no token, and an old service that answers 400 is said once and left to the sweep", async () => {
     const hooks = fakeHooks();
-    hooks.state.answer = () => new Response("unknown source\n", { status: 400 });
+    // The pre-BB-314 service rejects a tokenless subscribe with `bad request` before it looks up the source.
+    hooks.state.answer = () => new Response("bad request\n", { status: 400 });
     const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "bb-gate-production" }] });
     await tick();
     hooks.last().send(hooks.hello("c_1"));
@@ -427,7 +428,7 @@ describe("the loop", () => {
     // The subscribe body carries no token at all, and the source is named.
     expect(hooks.subscribes).toEqual([{ connection: "c_1", source: "alertmanager", token: "", watches: [{ kind: "namespace", id: "bb-gate-production" }] }]);
     expect(s.loop.connected).toBe(false);
-    expect(s.loop.status().sourceUnknown).toBe(true);
+    expect(s.loop.status().sourceProblem).toBe("unknown");
     expect(s.logs.filter((l) => l.includes("does not know the alertmanager source"))).toHaveLength(1);
     // The sweep is the scheduled look; the problem is not logged again.
     expect(s.sweeps).toEqual(["connected"]);
@@ -439,7 +440,26 @@ describe("the loop", () => {
     hooks.state.answer = (body) => Response.json({ leases: body.watches, rejected: [] });
     await tick(30 * MINUTE);
     expect(s.loop.connected).toBe(true);
-    expect(s.loop.status().sourceUnknown).toBe(false);
+    expect(s.loop.status().sourceProblem).toBeNull();
+    s.controller.abort();
+    await s.done;
+  });
+
+  it("says once when the service has no adapter configured (503), then leases when it does", async () => {
+    const hooks = fakeHooks();
+    hooks.state.answer = () => new Response("not configured\n", { status: 503 });
+    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "bb-gate-production" }] });
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    expect(s.loop.status().sourceProblem).toBe("unconfigured");
+    expect(s.logs.filter((l) => l.includes("has no alertmanager adapter configured"))).toHaveLength(1);
+    await tick(30 * MINUTE);
+    expect(s.logs.filter((l) => l.includes("has no alertmanager adapter configured"))).toHaveLength(1);
+    hooks.state.answer = (body) => Response.json({ leases: body.watches, rejected: [] });
+    await tick(30 * MINUTE);
+    expect(s.loop.connected).toBe(true);
+    expect(s.loop.status().sourceProblem).toBeNull();
     s.controller.abort();
     await s.done;
   });

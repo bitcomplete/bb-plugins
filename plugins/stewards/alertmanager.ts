@@ -54,8 +54,23 @@ const obj = (v: unknown): Json => (typeof v === "object" && v !== null && !Array
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
 
+/**
+ * One line of alert text, safe to put in a fence: control characters
+ * (newlines included) and runs of whitespace collapse to single spaces, so a
+ * value can never close a fence or start a new Markdown line, then
+ * `redactLine` scrubs credentials and clips the length. Everything an alert
+ * carries goes through here before it reaches a wake or a ticket.
+ */
+export const safeAlertText = (value: string): string => value.replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
+
+/** A label value shown in the plugin's own heading: one line, clipped short. */
+const safeAlertLabel = (value: string, max = 120): string => {
+  const clean = safeAlertText(value);
+  return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
+};
+
 /** One label or annotation, as a `key=value` line. */
-const pairLine = (key: string, value: string): string => redactLine(`${key}=${value}`);
+const pairLine = (key: string, value: string): string => redactLine(`${safeAlertLabel(key)}=${safeAlertText(value)}`);
 
 /**
  * The label and annotation pairs a wake shows, sorted by key, values redacted
@@ -102,16 +117,16 @@ export function alertOf(json: unknown): AlertmanagerAlert | null {
   const state = str(status.state) ?? "active";
   return {
     fingerprint,
-    alertname: str(labels.alertname) ?? "(no alertname)",
-    namespace: str(labels.namespace) ?? "",
-    severity: str(labels.severity),
-    status: state,
-    summary: annotations.summary === undefined ? null : redactLine(String(annotations.summary)),
-    description: annotations.description === undefined ? null : redactLine(String(annotations.description)),
+    alertname: safeAlertLabel(str(labels.alertname) ?? "(no alertname)"),
+    namespace: safeAlertLabel(str(labels.namespace) ?? ""),
+    severity: str(labels.severity) === null ? null : safeAlertLabel(str(labels.severity)!, 60),
+    status: safeAlertLabel(state, 60),
+    summary: annotations.summary === undefined ? null : redactLine(safeAlertText(String(annotations.summary))),
+    description: annotations.description === undefined ? null : redactLine(safeAlertText(String(annotations.description))),
     startsAt: str(a.startsAt),
     endsAt: str(a.endsAt),
     updatedAt: str(a.updatedAt),
-    generatorURL: str(a.generatorURL) === null ? null : redactLine(str(a.generatorURL)!),
+    generatorURL: str(a.generatorURL) === null ? null : redactLine(safeAlertText(str(a.generatorURL)!)),
     labels: pairsOf(labels),
     annotations: pairsOf(annotations),
   };
@@ -191,33 +206,39 @@ const REASON_ORDER: Record<AlertmanagerReason, number> = { new: 0, rung: 1, reso
 export type AlertmanagerRung = { firing: Set<string>; resolved: Set<string> };
 
 /**
- * Which alerts a look reports, and why. `since` is the last look; `rung` the
- * fingerprints doorbells named since it, split by action; `known` the
- * fingerprints already in the map (a known alert still firing is a sighting,
- * so its ticket gets the comment the playbook asks for); `wasActive` the
- * fingerprints the previous look saw firing, so an alert that disappeared
- * without a doorbell (the hooks service was down) is still noted as resolved.
+ * Which alerts a look reports, and why. `rung` the fingerprints doorbells
+ * named since the last look, split by action; `known` the fingerprint-map
+ * rows (a row means the alert has been seen; a row with a ticket is one the
+ * steward filed or commented on); `wasActive` the fingerprints the previous
+ * look saw firing, so an alert that disappeared without a doorbell (the hooks
+ * service was down) is still noted as resolved.
  *
- * A resolved alert is a sighting only when it has a ticket: there is nothing
- * to note on one nobody filed. An alert still in the list is never resolved,
- * however stale the resolved doorbell.
+ * An active alert with no row is `new` whatever its `startsAt`: the scheduled
+ * look compares current state with the map, so an alert already firing when
+ * the watch is adopted, or that started during an outage longer than one
+ * requeue, still surfaces. A row means `ongoing`, plus `rung` when a doorbell
+ * named it. A resolved alert is a sighting only when its row has a ticket:
+ * there is nothing to note on one nobody filed. An alert still in the list is
+ * never resolved, however stale the resolved doorbell.
  */
-export function alertmanagerSightings(alerts: readonly AlertmanagerAlert[], at: { since: number }, rung: AlertmanagerRung, known: ReadonlySet<string>, wasActive: ReadonlySet<string> = new Set()): AlertmanagerSighting[] {
+export function alertmanagerSightings(alerts: readonly AlertmanagerAlert[], rung: AlertmanagerRung, known: ReadonlyMap<string, Pick<FingerprintRow, "ticketKey">>, wasActive: ReadonlySet<string> = new Set()): AlertmanagerSighting[] {
   const out: AlertmanagerSighting[] = [];
-  const seenAfter = (iso: string | null) => iso !== null && Date.parse(iso) >= at.since;
   const current = new Set<string>();
   for (const alert of alerts) {
     current.add(alert.fingerprint);
+    const row = known.get(alert.fingerprint);
     const reasons: AlertmanagerReason[] = [];
-    if (seenAfter(alert.startsAt)) reasons.push("new");
+    if (row === undefined) reasons.push("new");
     if (rung.firing.has(alert.fingerprint)) reasons.push("rung");
-    if (known.has(alert.fingerprint) && !reasons.includes("new")) reasons.push("ongoing");
+    if (row !== undefined) reasons.push("ongoing");
     if (reasons.length === 0) continue;
     out.push({ fingerprint: alert.fingerprint, alert, reasons });
   }
   const resolved = new Set<string>([...rung.resolved, ...wasActive]);
   for (const fingerprint of resolved) {
-    if (current.has(fingerprint) || !known.has(fingerprint)) continue;
+    if (current.has(fingerprint)) continue;
+    const row = known.get(fingerprint);
+    if (row === undefined || row.ticketKey === null) continue;
     out.push({ fingerprint, alert: null, reasons: ["resolved"] });
   }
   out.sort((a, b) => REASON_ORDER[a.reasons[0]!] - REASON_ORDER[b.reasons[0]!] || a.fingerprint.localeCompare(b.fingerprint));

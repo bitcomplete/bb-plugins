@@ -5961,23 +5961,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function lookAtAlertmanager(b: Binding, config: ProjectConfig, target: AlertmanagerTarget, playbook: Playbook): Promise<AlertmanagerLook> {
       const at = now();
       const key = opsTargetKey(target);
-      const since = b.alertmanagerLook !== null && b.alertmanagerLook.error === null ? b.alertmanagerLook.at : at - playbook.requeueDefaultMs;
       const rung = alertmanagerRung.get(b.id) ?? { firing: new Set<string>(), resolved: new Set<string>() };
       const notes: string[] = [];
       try {
         const reader = await alertmanagerReader();
         const alerts = await reader.alerts(target);
-        const known = new Set(store.fingerprints(b.id).map((r) => r.fingerprint));
+        // The fingerprint map, as a map so a resolved sighting can tell an
+        // alert with a ticket (something to comment on) from one nobody filed.
+        const known = new Map(store.fingerprints(b.id).map((r) => [r.fingerprint, r]));
+        // The previous look's findings, so a resolved alert keeps its name and
+        // summary rather than becoming "(resolved)".
+        const prevByFp = new Map((b.alertmanagerLook?.findings ?? []).map((f) => [f.fingerprint, f]));
         // The fingerprints the previous look saw firing, so an alert that
         // vanished without a doorbell (the hooks service was down) still reads
         // as resolved rather than silently disappearing.
-        const wasActive = new Set((b.alertmanagerLook?.findings ?? []).filter((f) => !f.resolved).map((f) => f.fingerprint));
-        const sightings = alertmanagerSightings(alerts, { since }, rung, known, wasActive);
+        const wasActive = new Set([...prevByFp.values()].filter((f) => !f.resolved).map((f) => f.fingerprint));
+        const sightings = alertmanagerSightings(alerts, rung, known, wasActive);
         alertmanagerRung.delete(b.id);
         const rows = store.sight(
           b.projectId,
           b.id,
-          sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.alert === null ? "resolved" : alertmanagerSummary(s.alert) })),
+          sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.alert === null ? (prevByFp.get(s.fingerprint)?.summary ?? "resolved") : alertmanagerSummary(s.alert) })),
         );
         const tickets = await ticketStates(filingTargetFor(config), [...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         const asSightings: Sighting[] = sightings.map((s) => ({ fingerprint: s.fingerprint, workload: s.alert?.alertname ?? "resolved", pods: [], container: null, signature: s.reasons[0] ?? "ongoing", summary: s.alert === null ? "resolved" : alertmanagerSummary(s.alert), restarts: 0, events: [], logs: null, previous: false }));
@@ -5985,20 +5989,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const findings: AlertmanagerFinding[] = sightings.map((s, i) => {
           const c = classified[i]!;
           const a = s.alert;
+          const prev = a === null ? prevByFp.get(s.fingerprint) : undefined;
           return {
             fingerprint: s.fingerprint,
-            alertname: a?.alertname ?? "(resolved)",
-            namespace: a?.namespace ?? target.namespace,
-            severity: a?.severity ?? null,
+            alertname: a?.alertname ?? prev?.alertname ?? "(resolved)",
+            namespace: a?.namespace ?? prev?.namespace ?? target.namespace,
+            severity: a?.severity ?? prev?.severity ?? null,
             status: a?.status ?? "resolved",
-            summary: a?.summary ?? null,
-            description: a?.description ?? null,
-            startsAt: a?.startsAt ?? null,
-            endsAt: a?.endsAt ?? null,
-            updatedAt: a?.updatedAt ?? null,
-            generatorURL: a?.generatorURL ?? null,
-            labels: a?.labels ?? [],
-            annotations: a?.annotations ?? [],
+            summary: a?.summary ?? prev?.summary ?? null,
+            description: a?.description ?? prev?.description ?? null,
+            startsAt: a?.startsAt ?? prev?.startsAt ?? null,
+            endsAt: a?.endsAt ?? prev?.endsAt ?? null,
+            updatedAt: a?.updatedAt ?? prev?.updatedAt ?? null,
+            generatorURL: a?.generatorURL ?? prev?.generatorURL ?? null,
+            labels: a?.labels ?? prev?.labels ?? [],
+            annotations: a?.annotations ?? prev?.annotations ?? [],
             reasons: s.reasons,
             resolved: a === null,
             class: c.class,
@@ -12903,7 +12908,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           const status = alertmanagerHooks.status();
           if (hooksUrl === "") lines.push("alertmanager: no bb-gate-hooks here (BB_HOOKS_URL is not set), so alerts are seen by the periodic look only");
-          else if (status.sourceUnknown) lines.push("problem: alertmanager: bb-gate-hooks does not know the alertmanager source yet; only the periodic look sees it until the service is updated");
+          else if (status.sourceProblem === "unknown") lines.push("problem: alertmanager: bb-gate-hooks does not know the alertmanager source yet; only the periodic look sees it until the service is updated");
+          else if (status.sourceProblem === "unconfigured") lines.push("problem: alertmanager: bb-gate-hooks has no alertmanager adapter configured (its secret is not set); only the periodic look sees it until the service is updated");
           else lines.push(`alertmanager: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
         }
       }

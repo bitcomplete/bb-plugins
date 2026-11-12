@@ -259,8 +259,13 @@ export type HooksStatus = {
   sweeps: number;
   lastSweepAt: number;
   lastSweepReason: string | null;
-  /** The service answered 400 `unknown source`: its image predates this source, so only the periodic look sees it. */
-  sourceUnknown: boolean;
+  /**
+   * The service cannot lease this source: `unknown` (its image predates the
+   * source, or a tokenless subscribe was rejected), `unconfigured` (the
+   * adapter is present but its secret is not set, a 503), or null when it is
+   * fine. Said once, and only the periodic look sees the watch until it clears.
+   */
+  sourceProblem: "unknown" | "unconfigured" | null;
 };
 
 /** The window the status counts doorbells and sweeps over. */
@@ -313,6 +318,22 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
+/**
+ * Why the service cannot lease this source, or null when the failure is not
+ * about the source. A tokenless subscribe rejected with 400 is the old
+ * service's `bad request` (before it knew the source) as much as a 400
+ * `unknown source`; a 503 is the adapter present but not configured.
+ */
+function sourceProblemOf(error: unknown, tokenless: boolean): "unknown" | "unconfigured" | null {
+  if (!(error instanceof HooksRequestError)) return null;
+  if (error.unknownSource || (tokenless && error.status === 400)) return "unknown";
+  if (error.status === 503) return "unconfigured";
+  return null;
+}
+
+const sourceProblemMessage = (source: string, problem: "unknown" | "unconfigured"): string =>
+  problem === "unknown" ? `bb-gate-hooks does not know the ${source} source yet; the periodic look carries it until the service is updated` : `bb-gate-hooks has no ${source} adapter configured (its secret is not set); the periodic look carries it until the service is updated`;
+
 export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   const timing: HooksTiming = { ...DEFAULT_TIMING, ...deps.timing };
   let connection: string | null = null;
@@ -324,9 +345,8 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   let lastSweepAt = 0;
   let lastSweepReason: string | null = null;
   let wrongUrlLogged = false;
-  /** The service's image does not know this source yet; said once, then only the periodic look carries the watch. */
-  let sourceUnknown = false;
-  let sourceUnknownLogged = false;
+  /** The service cannot lease this source; said once per problem, then only the periodic look carries the watch. */
+  let sourceProblem: "unknown" | "unconfigured" | null = null;
 
   const doorbells = createWindowCounter(STATUS_WINDOW_MS, deps.now);
   const sweeps = createWindowCounter(STATUS_WINDOW_MS, deps.now);
@@ -364,12 +384,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     const current = connection;
     const started = deps.now();
     try {
-      const token = deps.token === null ? "" : ((await deps.token())?.trim() ?? "");
-      if (deps.token !== null && token === "") return false;
+      const tokenFn = deps.token;
+      const token = tokenFn === null ? "" : ((await tokenFn())?.trim() ?? "");
+      if (tokenFn !== null && token === "") return false;
       const result = await subscribe(deps.fetch, deps.baseUrl, current, deps.source, token, ids, signal);
       refusedLogged = false;
-      sourceUnknown = false;
-      sourceUnknownLogged = false;
+      sourceProblem = null;
       if (connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
       if (result.rejected.length > 0) await deps.onRejected(result.rejected);
       return true;
@@ -380,12 +400,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         refusedLogged = true;
         return false;
       }
-      if (error instanceof HooksRequestError && error.unknownSource) {
-        sourceUnknown = true;
-        if (!sourceUnknownLogged) {
-          sourceUnknownLogged = true;
-          deps.log.warn(`bb-gate-hooks does not know the ${deps.source} source yet; the periodic look carries it until the service is updated`);
-        }
+      const problem = sourceProblemOf(error, deps.token === null);
+      if (problem !== null) {
+        if (sourceProblem !== problem) deps.log.warn(sourceProblemMessage(deps.source, problem));
+        sourceProblem = problem;
         return false;
       }
       if (error instanceof HooksRequestError && error.status === 404) {
@@ -488,7 +506,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         sweeps: sweeps.count(),
         lastSweepAt,
         lastSweepReason,
-        sourceUnknown,
+        sourceProblem,
       };
     },
 
