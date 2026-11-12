@@ -783,7 +783,7 @@ function voiceClientId(): string | null {
  * makes the call. It renders only when the server says a stand-up is available,
  * and the server's refusal (or a failed call) is shown in place.
  */
-function StandupButton({ projectId, onStarted }: { projectId: string; onStarted?: () => void }) {
+function StandupButton({ projectId, onStarted, waiting = 0, errorAsTitle = false }: { projectId: string; onStarted?: () => void; waiting?: number; errorAsTitle?: boolean }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
   const start = () => {
@@ -796,17 +796,23 @@ function StandupButton({ projectId, onStarted }: { projectId: string; onStarted?
       (e: unknown) => setState({ error: message(e) }),
     );
   };
+  const error = typeof state === "object" ? state.error : null;
+  const label = state === "starting" ? "Starting…" : waiting > 0 ? `Stand-up · ${waiting}` : "Stand-up";
   return (
     <span className="flex items-center gap-2">
       <button
         type="button"
         className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
         disabled={state === "starting"}
+        // BB-302: the sidebar is narrow, so it carries the refusal in the
+        // button's tooltip rather than an inline span; the page and home line
+        // keep the inline message.
+        title={errorAsTitle && error !== null ? error : undefined}
         onClick={start}
       >
-        {state === "starting" ? "Starting…" : "Stand-up"}
+        {label}
       </button>
-      {typeof state === "object" ? <span className="text-xs text-destructive">{state.error}</span> : null}
+      {error !== null && !errorAsTitle ? <span className="text-xs text-destructive">{error}</span> : null}
     </span>
   );
 }
@@ -2589,7 +2595,7 @@ const SidebarCollapsible = memo(function SidebarCollapsible({ title, count, reve
  * closes through Radix's own dismissal. Presentational only: `onPick` is the
  * parent's stable callback, so the memo (BB-95) still holds.
  */
-const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompactViewport, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; isCompactViewport: boolean; onPick: (projectId: string) => void; onNewThread: () => void }) {
+const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompactViewport, onPick, onNewThread, standup }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; isCompactViewport: boolean; onPick: (projectId: string) => void; onNewThread: () => void; standup: { projectId: string; available: boolean; waiting: number } | null }) {
   const activeIndex = tabs.findIndex((t) => t.projectId === activeId);
   const active = tabs[activeIndex === -1 ? 0 : activeIndex];
   const activeCount = active === undefined ? 0 : counts.get(active.projectId) ?? 0;
@@ -2732,15 +2738,18 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompac
         </PopoverPrimitive.Portal>
       </PopoverPrimitive.Root>
       {tabs.length > 0 ? (
-        <button
-          type="button"
-          aria-label="New thread"
-          title={activeName === undefined ? "New thread" : `New thread in ${activeName}`}
-          className="flex size-8 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-state-hover hover:text-foreground"
-          onClick={onNewThread}
-        >
-          <Icon name="MessageSquarePlus" className="size-4" />
-        </button>
+        <>
+          {standup !== null && standup.available && standup.projectId === activeId ? <StandupButton projectId={standup.projectId} waiting={standup.waiting} errorAsTitle /> : null}
+          <button
+            type="button"
+            aria-label="New thread"
+            title={activeName === undefined ? "New thread" : `New thread in ${activeName}`}
+            className="flex size-8 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-state-hover hover:text-foreground"
+            onClick={onNewThread}
+          >
+            <Icon name="MessageSquarePlus" className="size-4" />
+          </button>
+        </>
       ) : null}
     </div>
   );
@@ -2980,6 +2989,34 @@ function StewardsSidebarCore({
     [tabs, byId, data],
   );
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs.find((t) => t.projectId === data?.projectId) ?? tabs[0] ?? null;
+  // BB-302: the sidebar's Stand-up button asks the server for the active
+  // project's availability and its "Waiting on you" count, refreshing on the
+  // tab change and on the same poll/realtime refetch the list already follows.
+  // A failed call hides the button; the object keeps its identity when nothing
+  // changed, so `ProjectTabs`' memo still holds.
+  const [standupStatus, setStandupStatus] = useState<{ projectId: string; available: boolean; waiting: number } | null>(null);
+  const standupProjectId = active?.projectId ?? null;
+  useEffect(() => {
+    if (standupProjectId === null) {
+      setStandupStatus(null);
+      return;
+    }
+    let live = true;
+    rpc.call("stewardsStandupStatus", { projectId: standupProjectId }).then(
+      (result) => {
+        if (!live) return;
+        setStandupStatus((prev) =>
+          prev !== null && prev.projectId === standupProjectId && prev.available === result.available && prev.waiting === result.waiting ? prev : { projectId: standupProjectId, available: result.available, waiting: result.waiting },
+        );
+      },
+      () => {
+        if (live) setStandupStatus(null);
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [rpc, standupProjectId, fetchedAt]);
   // A steward's visible change updates the badge and block within seconds; the
   // half-minute poll stays the fallback. Only a signal that names the shown
   // project triggers a refetch, not one for another listed project (BB-100),
@@ -3161,6 +3198,7 @@ function StewardsSidebarCore({
         isCompactViewport={isCompactViewport}
         onPick={pick}
         onNewThread={newThread}
+        standup={standupStatus}
       />
       {!rpcReady ? (
         !skeleton && staleTab !== null ? body(staleTab, true) : <SidebarSkeleton />

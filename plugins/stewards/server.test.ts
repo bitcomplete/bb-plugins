@@ -14815,6 +14815,33 @@ describe("the stand-up (BB-300)", () => {
     expect(await empty.harness.callRpc("stewardsStandup", { projectId: "p1" })).toEqual({ available: false, message: "No project steward yet; a stand-up needs one." });
   });
 
+  // BB-302: the sidebar's status call. It reports the page's availability gate
+  // and the page's "Waiting on you" count (the board's orphans), so the
+  // sidebar button and the page cannot disagree.
+  it("reports the sidebar's stand-up status with the page's waiting count (BB-302)", async () => {
+    const t = await adopted();
+    expect(await t.harness.callRpc("stewardsStandupStatus", { projectId: "p1" })).toEqual({ available: true, waiting: 0 });
+
+    // A project-level question has no open binding, so it is a board orphan:
+    // it waits in "Waiting on you" and the button carries it as a badge.
+    t.hooks.store.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "A project-level question?", context: null });
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as {
+      board: { questions: Array<{ key: string | null }>; withUser: Array<{ key: string }>; needs: Array<{ key: string }>; stewards: Array<{ key: string }> };
+    };
+    const openKeys = new Set(board.board.stewards.map((s) => s.key));
+    const orphans = [...board.board.questions, ...board.board.withUser, ...board.board.needs].filter((item) => item.key === null || !openKeys.has(item.key)).length;
+    expect(orphans).toBe(1);
+    expect(await t.harness.callRpc("stewardsStandupStatus", { projectId: "p1" })).toEqual({ available: true, waiting: orphans });
+
+    t.setVoiceServiceReady(false, "no key");
+    expect(await t.harness.callRpc("stewardsStandupStatus", { projectId: "p1" })).toEqual({ available: false, waiting: orphans });
+  });
+
+  it("reports the sidebar's stand-up status as unavailable without a project steward (BB-302)", async () => {
+    const empty = await setup();
+    expect(await empty.harness.callRpc("stewardsStandupStatus", { projectId: "p1" })).toEqual({ available: false, waiting: 0 });
+  });
+
   // BB-300 slice 4: the durable record, the mechanical readback, per-item
   // confirmation and the fan-out. Each item is confirmed on its own, and
   // nothing is applied before its confirmation.
