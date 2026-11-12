@@ -974,9 +974,37 @@ export const rpcContract = defineRpcContract({
   // `client` is the voice overlay's per-tab id, read by the page from
   // `sessionStorage`, so the tab that pressed the button is the one that
   // answers; without it every tab of the server races for the session.
+  //
+  // BB-303: `binding` scopes the stand-up to one binding's key. `threadId` is
+  // the thread action's path: the server derives the binding and the project
+  // from the thread, never from a project id the client sent, and refuses a
+  // thread that is not an open steward's.
   stewardsStandupStart: {
-    input: z.object({ projectId: z.string().min(1).max(100), client: z.string().trim().min(1).max(100).nullable().optional() }),
+    input: z.object({
+      projectId: z.string().min(1).max(100).nullable().optional(),
+      binding: z.string().trim().min(1).max(200).nullable().optional(),
+      threadId: z.string().trim().min(1).max(200).nullable().optional(),
+      client: z.string().trim().min(1).max(100).nullable().optional(),
+    }),
     output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), standupId: z.string().nullable(), message: z.string() }),
+  },
+  // BB-303: the thread action's read. Given the threads a visible surface shows
+  // actions for, it reports the ones that are an open steward's thread, the
+  // binding and project the server derived for each, and whether a stand-up is
+  // available for that project. The action is offered only for a thread here
+  // with `available: true`.
+  stewardsStandupThreads: {
+    input: z.object({ threadIds: z.array(z.string().min(1).max(200)).max(200) }),
+    output: z.object({
+      threads: z.array(
+        z.object({
+          threadId: z.string(),
+          projectId: z.string(),
+          binding: z.string(),
+          available: z.boolean(),
+        }),
+      ),
+    }),
   },
   // BB-300: the one method the voice plugin forwards the model's tool calls to.
   // It reads state, or takes and retracts notes; only `end_standup` applies the
@@ -1004,6 +1032,8 @@ export const rpcContract = defineRpcContract({
           projectId: z.string(),
           startedAt: z.number(),
           endedAt: z.number().nullable(),
+          /** BB-303: the binding the stand-up is scoped to, by entity key; null is a project stand-up. */
+          binding: z.string().nullable(),
           notes: z.array(
             z.object({
               id: z.string(),
@@ -1472,16 +1502,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * End a stand-up: stamp the end, advance "since the last stand-up", and wake
-     * the project steward with what was said. One road, so `stewardsStandupEnd`,
-     * the voice close handler and a new start that supersedes an abandoned
-     * overlay behave the same. `via` records how it ended (BB-301).
+     * End a stand-up: stamp the end, advance "since the last stand-up" for a
+     * project stand-up, and wake the project steward with what was said. One
+     * road, so `stewardsStandupEnd`, the voice close handler and a new start
+     * that supersedes an abandoned overlay behave the same. `via` records how it
+     * ended (BB-301). A scoped stand-up (BB-303) does not advance the window:
+     * only the project stand-up is the "since" the next project stand-up reads.
      * A stand-up that said nothing wakes no one.
      */
     async function finishStandup(standup: StandupRow, via: "page" | "voice" | "start" = "page"): Promise<void> {
       if (standup.endedAt !== null) return;
       let row = store.saveStandup(standup.id, { endedAt: now() }) ?? standup;
-      store.setLastStandup(row.projectId, row.startedAt);
+      // A scoped stand-up is about one steward and does not move the project's
+      // "since the last stand-up" cursor; the next project stand-up still reads
+      // the last project one.
+      if (row.binding === null) store.setLastStandup(row.projectId, row.startedAt);
       row = noteStandupEvent(row, { kind: "end", noteId: null, text: "", via });
       const confirmed = row.notes.filter((n) => row.confirmed.includes(n.id));
       const free = row.notes.filter((n) => n.type === "free");
@@ -9225,24 +9260,74 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const availability = await standupAvailability(store.project(projectId).threadId !== null);
         return { available: availability.available, waiting: standupWaiting(projectId) };
       },
-      async stewardsStandupStart({ projectId, client }, { experimental_caller: caller }) {
-        if (caller.kind !== "client") throw new Error("a stand-up is started from the Stewards page");
+      // BB-303: the thread action's read. Given the threads a visible surface
+      // shows actions for, it reports the ones that are an open steward's
+      // thread, the binding and project the server derived for each, and
+      // whether a stand-up is available for that project. The action is offered
+      // only for a thread here with `available: true`.
+      async stewardsStandupThreads({ threadIds }) {
+        const availabilityByProject = new Map<string, boolean>();
+        const threads: Array<{ threadId: string; projectId: string; binding: string; available: boolean }> = [];
+        for (const threadId of threadIds) {
+          const binding = store.byThread(threadId);
+          // Only a steward's own open thread carries the action; an ended
+          // binding's thread does not, so a stand-up is never offered on a
+          // closed one.
+          if (binding === null || binding.endedAt !== null) continue;
+          let available = availabilityByProject.get(binding.projectId);
+          if (available === undefined) {
+            available = (await standupAvailability(store.project(binding.projectId).threadId !== null)).available;
+            availabilityByProject.set(binding.projectId, available);
+          }
+          threads.push({ threadId, projectId: binding.projectId, binding: binding.entityKey, available });
+        }
+        return { threads };
+      },
+      async stewardsStandupStart({ projectId, binding, threadId, client }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a stand-up is started from the Stewards page or a thread's actions");
+        // Resolve the scope before reserving the project. The thread action
+        // sends only a thread id; the server derives the binding and the
+        // project from the thread, never from a project id the client sent.
+        let scopeProjectId = projectId ?? null;
+        let scoped: Binding | null = null;
+        if (threadId !== null && threadId !== undefined) {
+          const fromThread = store.byThread(threadId);
+          if (fromThread === null) return { ok: false, sessionId: null, standupId: null, message: "That thread is not a steward's thread." };
+          if (fromThread.endedAt !== null) return { ok: false, sessionId: null, standupId: null, message: `${fromThread.entityKey} has ended; a stand-up is not available.` };
+          scopeProjectId = fromThread.projectId;
+          scoped = fromThread;
+        } else if (binding !== null && binding !== undefined) {
+          if (scopeProjectId === null) return { ok: false, sessionId: null, standupId: null, message: "A scoped stand-up needs a project." };
+          // Resolve the key inside the stand-up's own project, never across
+          // projects; an unknown key or a closed one refuses and starts none.
+          scoped = store.find(binding, scopeProjectId);
+          if (scoped === null) return { ok: false, sessionId: null, standupId: null, message: `No steward for ${binding} in this project.` };
+          if (scoped.endedAt !== null) return { ok: false, sessionId: null, standupId: null, message: `${binding} has ended; a stand-up is not available.` };
+        }
+        if (scopeProjectId === null) return { ok: false, sessionId: null, standupId: null, message: "A stand-up needs a project." };
+        const targetProjectId = scopeProjectId;
         // Reserve the project before the first await, so a click on the board
         // and a click on the home page at the same moment cannot both start.
-        if (startingStandups.has(projectId)) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
-        startingStandups.add(projectId);
+        if (startingStandups.has(targetProjectId)) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
+        startingStandups.add(targetProjectId);
         try {
-          const availability = await standupAvailability(store.project(projectId).threadId !== null);
+          const availability = await standupAvailability(store.project(targetProjectId).threadId !== null);
           if (!availability.available) return { ok: false, sessionId: null, standupId: null, message: availability.message ?? "A stand-up is not available." };
-          const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
+          const name = (await bb.sdk.projects.list()).find((p) => p.id === targetProjectId)?.name ?? targetProjectId;
           // The first stand-up reads since the last digest rather than since the
           // beginning: a project with a long history would otherwise list every
           // binding it has ever ended.
-          const since = store.lastStandup(projectId) ?? store.project(projectId).digestAt ?? 0;
-          const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
+          const since = store.lastStandup(targetProjectId) ?? store.project(targetProjectId).digestAt ?? 0;
+          // A scoped stand-up lists only its own questions; the briefing is
+          // narrowed to the binding's id inside `briefing`.
+          const questions = store
+            .openQuestions(targetProjectId)
+            .filter((q) => scoped === null || q.bindingId === scoped.id)
+            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
+          const scopeKey = scoped?.entityKey ?? null;
           // The briefing goes to OpenAI, so a token pasted into a ticket, an
           // escalation or a note is scrubbed first.
-          const instructions = scrubCredentials(buildStandupInstructions(briefing(projectId, since), name, now(), questions));
+          const instructions = scrubCredentials(buildStandupInstructions(briefing(targetProjectId, since, scoped?.id), name, now(), questions, scopeKey));
           // A new start supersedes the project's earlier session: the voice
           // plugin does not tell stewards when an overlay closes, so a stale
           // session must not answer tool calls and the project's record is its
@@ -9250,13 +9335,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // is finished first, so its confirmed items and free notes still
           // reach the project steward and the window still advances. The open
           // record is found in the store, not the in-memory session map, so it
-          // survives a server restart that empties the map.
-          for (const [sid, hid] of standupSessions) if (store.standup(hid)?.projectId === projectId) standupSessions.delete(sid);
-          const open = store.latestStandup(projectId);
-          if (open !== null && open.endedAt === null) await finishStandup(open, "start");
+          // survives a server restart that empties the map. One stand-up at a
+          // time per project: a scoped start while the project's open record
+          // still has a session is refused with the existing message rather
+          // than ending the owner's stand-up, which may be open in another tab.
+          // `stewardsStandupClose` removes the session when the overlay ends,
+          // so the only in-map session for a finished stand-up is one the voice
+          // plugin will sweep at `maxMs`; a restart empties the map. A project
+          // start keeps superseding, as it did before, so the never-connected
+          // record of the existing test is still replaced.
+          const open = store.latestStandup(targetProjectId);
+          if (open !== null && open.endedAt === null) {
+            const sessionOpen = [...standupSessions.values()].some((hid) => hid === open.id);
+            if (scoped !== null && sessionOpen) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
+            await finishStandup(open, "start");
+          }
+          // Drop this project's stale sessions (a superseded record, a closed
+          // overlay, a server restart) so a late tool call cannot find them.
+          for (const [sid, hid] of standupSessions) {
+            const row = store.standup(hid);
+            if (row === null || row.projectId === targetProjectId) standupSessions.delete(sid);
+          }
           // The record is opened before the voice session, so a tool call that
           // arrives immediately finds it.
-          const record = store.createStandup({ id: newId("sup"), projectId, startedAt: now() });
+          const record = store.createStandup({ id: newId("sup"), projectId: targetProjectId, startedAt: now(), binding: scopeKey });
           let opened: { sessionId: string; maxDurationMs: number };
           try {
             opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", {
@@ -9278,7 +9380,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           standupSessions.set(opened.sessionId, record.id);
           return { ok: true, sessionId: opened.sessionId, standupId: record.id, message: "Stand-up started." };
         } finally {
-          startingStandups.delete(projectId);
+          startingStandups.delete(targetProjectId);
         }
       },
       async stewardsStandupTool({ sessionId, name, arguments: rawArgs }, { experimental_caller: caller }) {
@@ -9416,6 +9518,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectId: standup.projectId,
             startedAt: standup.startedAt,
             endedAt: standup.endedAt,
+            binding: standup.binding,
             notes: standup.notes.map((n) => {
               const confirmed = standup.confirmed.includes(n.id);
               return {

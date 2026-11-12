@@ -701,7 +701,13 @@ export const STANDUP_MIGRATIONS = [
   `UPDATE server_settings SET key = 'stewards:last-standup:' || substr(key, length('stewards:last-huddle:') + 1) WHERE key LIKE 'stewards:last-huddle:%'`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS];
+// BB-303: a stand-up can be scoped to one binding. The column is nullable,
+// and null is a project stand-up, which is what every row written before this
+// step means; the reader treats a missing value as null. A new column, so a
+// store from before this step reads back exactly as before.
+export const STANDUP_BINDING_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN binding TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1337,6 +1343,11 @@ export type StandupRow = {
   projectId: string;
   startedAt: number;
   endedAt: number | null;
+  /**
+   * The binding the stand-up is scoped to, by entity key (BB-303); null is a
+   * project stand-up. Every row written before the column existed is null.
+   */
+  binding: string | null;
   /** True once the overlay connected and the model called a tool. */
   connected: boolean;
   transcript: StandupTranscriptEntry[];
@@ -1737,7 +1748,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // for a session and by project for the readback and the next wake. Prepared
   // lazily, like the assessment statements: a legacy store opened without the
   // migration must still start (migrations.test.ts).
-  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed)");
+  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed, binding) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed, @binding)");
   const getStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE id = ?");
   const latestStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
   const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed WHERE id = @id");
@@ -1983,6 +1994,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
     projectId: String(r.project_id),
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null || r.ended_at === undefined ? null : Number(r.ended_at),
+    // A row written before the BB-303 column existed has no value; it is a
+    // project stand-up.
+    binding: r.binding === null || r.binding === undefined ? null : String(r.binding),
     connected: Number(r.connected) !== 0,
     transcript: json(z.array(standupTranscriptSchema), r.transcript === null || r.transcript === undefined ? null : String(r.transcript), []),
     notes: json(z.array(standupNoteRowSchema), r.notes === null || r.notes === undefined ? null : String(r.notes), []),
@@ -3213,8 +3227,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     // the project steward's next wake. The record is the only thing a stand-up
     // writes; nothing here acts on a binding, a need, an escalation or a merge.
     /** Open a stand-up record and return it. */
-    createStandup(fields: { id: string; projectId: string; startedAt: number }): StandupRow {
-      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]" });
+    createStandup(fields: { id: string; projectId: string; startedAt: number; binding?: string | null }): StandupRow {
+      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]", binding: fields.binding ?? null });
       return toStandup(getStandupStmt().get(fields.id)!);
     },
     /** One stand-up by id, or null. */

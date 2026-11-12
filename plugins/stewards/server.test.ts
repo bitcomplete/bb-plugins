@@ -14847,6 +14847,100 @@ describe("the stand-up (BB-300)", () => {
     expect(await empty.harness.callRpc("stewardsStandupStatus", { projectId: "p1" })).toEqual({ available: false, waiting: 0 });
   });
 
+  // BB-303: a stand-up scoped to one binding. It names the scope, narrows the
+  // briefing, records the binding and leaves the project window alone.
+  it("starts a scoped stand-up that names the scope and records the binding", async () => {
+    const t = await adopted();
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client)) as { ok: boolean; sessionId: string; standupId: string };
+    expect(started.ok).toBe(true);
+    const instructions = String(t.realtimeOpens[0]!.input.instructions);
+    expect(instructions).toContain("This stand-up is about ENG-12 only");
+    expect(instructions).not.toContain("## Done since");
+    // The fixed tool set is unchanged by the scope.
+    expect((t.realtimeOpens[0]!.input.tools as Array<{ name: string }>).map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
+    const rec = (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { binding: string | null } };
+    expect(rec.standup.binding).toBe("ENG-12");
+    // Opening a scoped stand-up does not advance the window.
+    expect(t.hooks.store.lastStandup("p1")).toBeNull();
+  });
+
+  it("refuses an unknown or closed binding and starts no session", async () => {
+    const t = await adopted();
+    const unknown = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-999" }, client);
+    expect(unknown).toMatchObject({ ok: false, sessionId: null });
+    expect((unknown as { message: string }).message).toMatch(/No steward for ENG-999/u);
+    t.hooks.store.patch(t.hooks.store.find("ENG-12")!.id, { endedAt: t.now(), endReason: "done" });
+    const closed = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client);
+    expect(closed).toMatchObject({ ok: false, sessionId: null });
+    expect((closed as { message: string }).message).toMatch(/has ended/u);
+    expect(t.realtimeOpens).toHaveLength(0);
+  });
+
+  it("does not advance the window for a scoped stand-up, in either order", async () => {
+    const t = await adopted();
+    // A project stand-up advances it.
+    const project = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { standupId: string };
+    await t.harness.callRpc("stewardsStandupEnd", { standupId: project.standupId }, client);
+    expect(t.hooks.store.lastStandup("p1")).toBe(t.now());
+    // A scoped stand-up after it leaves the cursor where the project one put it.
+    t.hooks.store.setLastStandup("p1", 4_242);
+    const scoped = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client)) as { standupId: string };
+    await t.harness.callRpc("stewardsStandupEnd", { standupId: scoped.standupId }, client);
+    expect(t.hooks.store.lastStandup("p1")).toBe(4_242);
+    // Scoped first, before any project stand-up, leaves it null.
+    const fresh = await adopted();
+    const onlyScoped = (await fresh.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client)) as { standupId: string };
+    await fresh.harness.callRpc("stewardsStandupEnd", { standupId: onlyScoped.standupId }, client);
+    expect(fresh.hooks.store.lastStandup("p1")).toBeNull();
+  });
+
+  it("refuses a scoped start while a connected stand-up is live and keeps it open", async () => {
+    const t = await adopted();
+    const live = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { standupId: string; sessionId: string };
+    // The first tool call marks the overlay connected, so it is live.
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: live.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    const refused = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client);
+    expect(refused).toMatchObject({ ok: false, sessionId: null });
+    expect((refused as { message: string }).message).toMatch(/already starting/u);
+    // The live record stays open and its session still answers tool calls.
+    expect(t.hooks.store.standup(live.standupId)!.endedAt).toBeNull();
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: live.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    expect(t.realtimeOpens).toHaveLength(1);
+  });
+
+  it("refuses a scoped start while a stand-up is open but has made no tool call yet", async () => {
+    const t = await adopted();
+    const open = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { standupId: string; sessionId: string };
+    // The agent speaks first, so the overlay commonly has no tool call yet; the
+    // session being open is enough to make a scoped start refuse.
+    const refused = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client);
+    expect(refused).toMatchObject({ ok: false, sessionId: null });
+    expect((refused as { message: string }).message).toMatch(/already starting/u);
+    expect(t.hooks.store.standup(open.standupId)!.endedAt).toBeNull();
+    expect(t.realtimeOpens).toHaveLength(1);
+  });
+
+  it("reports a steward's thread and starts the same scoped stand-up from the thread id alone", async () => {
+    const t = await adopted();
+    const stewardThread = t.hooks.store.find("ENG-12")!.threadId!;
+    const threads = (await t.harness.callRpc("stewardsStandupThreads", { threadIds: [stewardThread, "thr_not_a_steward"] })) as { threads: Array<{ threadId: string; projectId: string; binding: string; available: boolean }> };
+    expect(threads.threads).toEqual([{ threadId: stewardThread, projectId: "p1", binding: "ENG-12", available: true }]);
+    // The thread action sends only the thread id; the server derives the
+    // binding and the project from it.
+    const started = (await t.harness.callRpc("stewardsStandupStart", { threadId: stewardThread }, client)) as { ok: boolean };
+    expect(started.ok).toBe(true);
+    expect(String(t.realtimeOpens[0]!.input.instructions)).toContain("This stand-up is about ENG-12 only");
+    expect(((await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { binding: string | null } }).standup.binding).toBe("ENG-12");
+  });
+
+  it("refuses a thread that is not an open steward's", async () => {
+    const t = await adopted();
+    const refused = await t.harness.callRpc("stewardsStandupStart", { threadId: "thr_nope" }, client);
+    expect(refused).toMatchObject({ ok: false, sessionId: null });
+    expect((refused as { message: string }).message).toMatch(/not a steward's thread/u);
+    expect(t.realtimeOpens).toHaveLength(0);
+  });
+
   // BB-300 slice 4: the durable record, the mechanical readback, per-item
   // confirmation and the fan-out. Each item is confirmed on its own, and
   // nothing is applied before its confirmation.

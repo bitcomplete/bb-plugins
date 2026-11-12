@@ -92,6 +92,27 @@ describe("briefing", () => {
     expect(b.assumptions.map((x) => x.assumption.id)).toEqual([f.assumption.id]);
   });
 
+  it("narrows to one binding and drops the sweep when scoped (BB-303)", () => {
+    const f = fixture();
+    const scoped = createBriefing(f.store, f.now)("p1", SINCE, f.moved.id);
+    // Only the scoped binding's decisions, escalations and hold/stuck state.
+    expect(scoped.decisions.needs.map((x) => x.need.id)).toEqual([f.need.id, f.userEsc.id]);
+    expect(scoped.decisions.withUser.map((x) => x.escalation.id)).toEqual([f.userEsc.id]);
+    expect(scoped.escalations.map((x) => x.escalation.id)).toEqual([f.projectEsc.id]);
+    expect(scoped.stuck.stuck).toEqual([]);
+    expect(scoped.stuck.held).toEqual([]);
+    expect(scoped.stuck.noWakeSource).toEqual([]);
+    expect(scoped.stuck.datedWaits).toEqual([]);
+    expect(scoped.decisions.needs.every((x) => x.binding.id === f.moved.id)).toBe(true);
+    // The "since the last stand-up" sweep and the other bindings are not in it.
+    expect(scoped.done).toEqual({ moved: [], ended: [], answered: [] });
+    expect(scoped.assumptions).toEqual([]);
+    // Without a binding the project-wide briefing is exactly as before.
+    const full = createBriefing(f.store, f.now)("p1", SINCE);
+    expect(full.done.moved.map((x) => x.id)).toEqual([f.moved.id]);
+    expect(full.stuck.held.map((x) => x.id)).toEqual([f.held.id]);
+  });
+
   it("flattens to the digest record the nightly rendered before, so its output is unchanged", () => {
     const f = fixture();
     const records = toDigestRecords(createBriefing(f.store, f.now)("p1", SINCE));
