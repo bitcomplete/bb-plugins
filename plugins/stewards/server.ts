@@ -958,6 +958,15 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().min(1).max(100) }),
     output: z.object({ available: z.boolean(), message: z.string().nullable() }),
   },
+  // BB-302: the sidebar's Stand-up button asks, per project, whether a stand-up
+  // can start and how many items wait on the owner there. `available` is
+  // exactly what `stewardsStandup` reports; `waiting` is the same count the
+  // Stewards page's "Waiting on you" section shows, so the button's badge and
+  // the page cannot disagree.
+  stewardsStandupStatus: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({ available: z.boolean(), waiting: z.number() }),
+  },
   // BB-300: start one stand-up for a project. Stewards builds the briefing's
   // instructions and opens the voice plugin's overlay with the fixed tool set.
   // The record is durable from slice 4 on: the session id names the record the
@@ -1476,6 +1485,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (typeof value === "string") return value;
       }
       return "";
+    }
+
+    /**
+     * BB-302: the number of items waiting on the owner for a project, exactly
+     * as the Stewards page's "Waiting on you" section counts them. That is the
+     * board's `orphans`: the open questions, with-user rows and needs whose
+     * binding is not open (a project-level question, or one whose binding has
+     * ended). The sidebar's button badge and the page must never disagree.
+     */
+    function standupWaiting(projectId: string): number {
+      const open = store.open(projectId);
+      const { questions, withUser, needs } = needsYou(projectId, open, store.openQuestions(projectId));
+      const openKeys = new Set(open.map((b) => b.entityKey));
+      return [...questions, ...withUser, ...needs].filter((item) => item.key === null || !openKeys.has(item.key)).length;
     }
 
     /**
@@ -9070,6 +9093,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // The board already carries this for the project view; the homepage
         // line asks for it alone, without the rest of the board.
         return standupAvailability(store.project(projectId).threadId !== null);
+      },
+      async stewardsStandupStatus({ projectId }) {
+        // BB-302: the sidebar's button, one call for the active project. The
+        // availability gate is the page's own; the count is the page's
+        // "Waiting on you" count.
+        const availability = await standupAvailability(store.project(projectId).threadId !== null);
+        return { available: availability.available, waiting: standupWaiting(projectId) };
       },
       async stewardsStandupStart({ projectId, client }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("a stand-up is started from the Stewards page");

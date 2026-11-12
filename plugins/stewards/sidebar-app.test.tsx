@@ -2943,3 +2943,82 @@ describe("the stewards sidebar's data age and refresh (BB-205)", () => {
     slot.lifecycle.unmount();
   });
 });
+
+// BB-302: the Stand-up button beside New thread. It is shown for the active
+// project only when the server reports a stand-up available, carries the
+// "Waiting on you" count when non-zero, retargets on a project switch, and
+// starts a stand-up through the same RPC the page uses.
+describe("the sidebar Stand-up button (BB-302)", () => {
+  it("shows beside New thread only when a stand-up is available, and starts one", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData(),
+        stewardsStandupStatus: () => ({ available: true, waiting: 0 }),
+        stewardsStandupStart: () => ({ ok: true, sessionId: "sess_1", standupId: "sup_1", message: "Stand-up started." }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
+    expect(slot.getByRole("button", { name: "New thread" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Stand-up" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1", client: null } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("shows no button when the status is unavailable", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData(),
+        stewardsStandupStatus: () => ({ available: false, waiting: 3 }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Nothing in flight.")).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Stand-up" })).toBeNull();
+    expect(slot.getByRole("button", { name: "New thread" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("labels the button with the waiting count only when non-zero", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData(),
+        stewardsStandupStatus: () => ({ available: true, waiting: 4 }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up · 4" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("retargets the button when the active project changes", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: (input: { projectId: string | null }) => sidebarData({ projectId: input.projectId ?? "p1" }),
+        stewardsStandupStatus: (input: { projectId: string }) => ({ available: true, waiting: input.projectId === "p1" ? 2 : 0 }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up · 2" })).toBeTruthy());
+    await pickProject(slot, "Personal");
+    await waitFor(() => expect(shownProject(slot)).toBe("personal"));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Stand-up · 2" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the refusal as the button's tooltip, not an inline line", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData(),
+        stewardsStandupStatus: () => ({ available: true, waiting: 0 }),
+        stewardsStandupStart: () => ({ ok: false, sessionId: null, standupId: null, message: "A stand-up needs a project steward." }),
+      } as never,
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Stand-up" })));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" }).getAttribute("title")).toBe("A stand-up needs a project steward."));
+    expect(slot.queryByText("A stand-up needs a project steward.")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});
