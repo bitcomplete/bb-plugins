@@ -68,6 +68,19 @@ describe("the project file", () => {
     expect(parseProjectFile(JSON.stringify({ version: 1, notifications: { unknown: true } }))).toMatchObject({ ok: false });
   });
 
+  it("takes an optional stand-up delegate model and rejects an unknown key under it (BB-307)", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    // Unset: the plugin's own Haiku default applies.
+    expect(defaults.value.standup).toEqual({});
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, standup: { delegate: "claude/claude-sonnet-5-5/medium" } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(explicit.value.standup.delegate).toMatchObject({ providerId: "claude-code", model: "claude-sonnet-5-5", reasoningLevel: "medium" });
+    // Strict, like every other project-file key: a typo is an error, not a silent default.
+    expect(parseProjectFile(JSON.stringify({ version: 1, standup: { model: "claude/claude-haiku-5-5/low" } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, standup: { delegate: "claude//medium" } }))).toMatchObject({ ok: false });
+  });
+
   it("names the file and the field in errors", () => {
     const bad = parseProjectFile(JSON.stringify({ version: 1, nightly: { timezone: "Mars/Olympus" } }));
     expect(bad).toMatchObject({ ok: false });

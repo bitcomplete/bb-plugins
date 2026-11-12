@@ -531,6 +531,8 @@ export function world() {
         metadata.set(args.threadId, next);
         return next;
       },
+      getPluginMetadata: async (args: { threadId: string }) => ({ ...(metadata.get(args.threadId) ?? {}) }),
+      experimental_listPluginMetadata: async (args: { threadIds: string[] }) => ({ threads: args.threadIds.filter((id) => metadata.has(id)).map((threadId) => ({ threadId, metadata: { ...(metadata.get(threadId) ?? {}) } })) }),
       events: {
         list: async ({ threadId, types, order }: { threadId: string; types?: string[]; order?: string }) => {
           if (types?.includes("thread/contextWindowUsage/updated")) return usage.has(threadId) ? [{ id: "u", seq: 1, threadId, createdAt: now, scope: "thread", type: "thread/contextWindowUsage/updated", data: { contextWindowUsage: { usedTokens: usage.get(threadId), modelContextWindow: 1_000_000, estimated: true } } }] : [];

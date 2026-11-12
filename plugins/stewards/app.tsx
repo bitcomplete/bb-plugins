@@ -1019,7 +1019,7 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
   // A live stand-up is the readback itself. An ended one is kept only while it
   // still has something to show: what it applied, or typed notes still to
   // confirm. An ended record with nothing to act on disappears.
-  if (ended && applied.length === 0 && pending.length === 0) return null;
+  if (ended && applied.length === 0 && pending.length === 0 && standup.delegations.length === 0) return null;
   const confirm = (noteId: string) => {
     setBusy(noteId);
     setError(null);
@@ -1107,6 +1107,28 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
           ) : null}
         </div>
       )}
+      {standup.delegations.length > 0 ? (
+        <div className="mt-2 rounded-lg border border-border p-3">
+          <p className="text-xs text-muted-foreground">
+            Thread lookups ({standup.delegations.length}) — questions the stand-up handed to its hidden delegate
+          </p>
+          <ul className="mt-1 flex flex-col gap-2">
+            {standup.delegations.map((d, i) => (
+              <li key={`${d.startedAt}-${i}`} className="text-xs">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="font-medium">{d.question}</span>
+                  <span className="shrink-0 text-muted-foreground">
+                    {d.key === null ? "" : `${d.key} · `}
+                    {d.outcome === "success" ? "answered" : d.outcome === "timeout" ? "timed out" : "failed"}
+                    {` · ${d.elapsedMs >= 1000 ? `${Math.round(d.elapsedMs / 1000)}s` : `${d.elapsedMs}ms`}`}
+                  </span>
+                </div>
+                {d.answer !== null ? <p className="mt-1 whitespace-pre-wrap">{d.answer}</p> : d.error !== null ? <p className="mt-1 text-destructive">{d.error}</p> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {error !== null ? <p className="text-xs text-destructive">{error}</p> : null}
     </Section>
   );

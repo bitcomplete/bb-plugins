@@ -14,6 +14,7 @@ import type { Briefing } from "./nightly.js";
 import type { Binding, Escalation, Lesson, Need } from "./store.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
+import { redactLine } from "./ops.js";
 
 /** One function tool, shaped the way the Realtime API's `realtime.open` expects. */
 export type StandupTool = {
@@ -79,6 +80,8 @@ export type StandupRecord = {
   notes: StandupNote[];
   /** True once the overlay has connected and the model has called a tool. */
   connected: boolean;
+  /** BB-307: every `ask_a_thread` delegation, for the log on the stand-up page. */
+  delegations: StandupDelegation[];
 };
 
 /** The voice plugin's own `realtime.open` instruction cap; the briefing stays under it. */
@@ -87,6 +90,8 @@ export const STANDUP_MAX_INSTRUCTIONS_CHARS = 20_000;
 export const STANDUP_SECTION_MAX = 40;
 /** The most days an open item may sit before the brief calls it stale (BB-306). */
 export const STANDUP_STALE_DAYS = 3;
+/** BB-307: how much of a delegate's answer is kept, after `redactLine`'s credential scrub. */
+export const STANDUP_DELEGATE_ANSWER_MAX_CHARS = 2_000;
 /** How much of a question's context the brief carries (BB-306). */
 export const STANDUP_CONTEXT_MAX_CHARS = 300;
 /** The most comments `entity_snapshot` renders, newest last (BB-306). */
@@ -99,6 +104,38 @@ const DAY_MS = 86_400_000;
 
 /** The only tools that write, and they write only to the stand-up record. */
 export const STANDUP_WRITE_TOOLS: ReadonlySet<string> = new Set(["take_note", "retract_note"]);
+
+/**
+ * BB-307: one `ask_a_thread` delegation, as the stand-up record logs it. The
+ * answer is the delegate's own words, scrubbed and capped; a timeout or an
+ * error leaves it null and carries why. It is a log, not state any tool acts on.
+ */
+export type StandupDelegation = {
+  question: string;
+  /** The steward key the question was about, when one was given. */
+  key: string | null;
+  startedAt: number;
+  finishedAt: number;
+  elapsedMs: number;
+  /** The delegate's answer, after `redactLine`'s scrub and the length cap. */
+  answer: string | null;
+  outcome: "success" | "timeout" | "error";
+  /** The failure's message for an error, null otherwise. */
+  error: string | null;
+};
+
+/**
+ * What the injected `askThread` returns to the tool. `busy` means a lookup was
+ * already in flight for this stand-up; it is a line, not a logged delegation.
+ * The answer is raw: the tool scrubs and caps it before it is logged or read.
+ */
+export type StandupAskOutcome = {
+  outcome: "success" | "timeout" | "error" | "busy";
+  answer: string | null;
+  startedAt: number;
+  finishedAt: number;
+  error: string | null;
+};
 
 const stringParam = (description: string): Record<string, unknown> => ({ type: "string", description });
 
@@ -156,6 +193,19 @@ export const STANDUP_TOOLS: StandupTool[] = [
         file: stringParam("A .bb-relative file to read, such as AGENTS.md."),
       },
       required: [],
+    },
+  },
+  {
+    name: "ask_a_thread",
+    description:
+      "Hand one question to a hidden, read-only delegate thread and read its answer back. Use it only for a fact the brief and the other read tools cannot give you, such as whether a build or run is still failing, a ticket that has no steward, or what a file or recent history says. Try steward_status, escalation, entity_snapshot and playbook_paragraph first. The lookup takes up to a minute or two and the owner waits in silence, so ask only when it is warranted.",
+    parameters: {
+      type: "object",
+      properties: {
+        question: stringParam("The question to put to the delegate, in full."),
+        key: stringParam("The ticket or pull-request key the question is about, when there is one; its steward status is prepended for the delegate."),
+      },
+      required: ["question"],
     },
   },
   {
@@ -240,6 +290,13 @@ export type StandupToolContext = {
   endStandup: (ids: string[]) => Promise<StandupEndOutcome>;
   /** The stand-up's note record. Only `take_note` and `retract_note` touch it. */
   record: StandupRecord;
+  /**
+   * BB-307: hand a question to the stand-up's delegate and resolve with its
+   * answer, a timeout or an error. The one tool that reaches outside the
+   * record besides `end_standup`; it is injected so the tool set stays
+   * testable without a server, a thread or a network.
+   */
+  askThread: (question: string, key: string | null) => Promise<StandupAskOutcome>;
 };
 
 /** One line for a note's kind, so a note reads back unambiguously. */
@@ -486,6 +543,8 @@ export async function runStandupTool(name: string, args: Record<string, unknown>
       return rationaleTool(ctx, requireString(args, "key"));
     case "playbook_paragraph":
       return playbookTool(ctx, args);
+    case "ask_a_thread":
+      return askThreadTool(ctx, args);
     case "readback":
       return readbackTool(ctx);
     case "take_note":
@@ -508,6 +567,36 @@ export async function runStandupTool(name: string, args: Record<string, unknown>
 function readbackTool(ctx: StandupToolContext): string {
   if (ctx.record.notes.length === 0) return "No notes have been taken in this stand-up yet.";
   return ctx.record.notes.map((note) => `${readbackLine(note)} (id ${note.id})`).join("\n");
+}
+
+/**
+ * BB-307: hand one question to the injected delegate and log the delegation.
+ * The answer is scrubbed with `redactLine`'s SECRET pattern and capped before
+ * it is written to the record or returned to the model, so a token in the
+ * delegate's words reaches neither OpenAI nor the durable log. A lookup already
+ * in flight for this stand-up is refused with a line and logs nothing; a
+ * timeout returns the "did not finish" line, and the server logs a late answer
+ * on the record without delivering it.
+ */
+async function askThreadTool(ctx: StandupToolContext, args: Record<string, unknown>): Promise<string> {
+  const question = requireString(args, "question");
+  const key = optionalString(args, "key");
+  const result = await ctx.askThread(question, key);
+  if (result.outcome === "busy") return "A lookup is already running for this stand-up; wait for it to finish before asking again.";
+  const answer = result.answer === null ? null : redactLine(result.answer, STANDUP_DELEGATE_ANSWER_MAX_CHARS);
+  ctx.record.delegations.push({
+    question,
+    key,
+    startedAt: result.startedAt,
+    finishedAt: result.finishedAt,
+    elapsedMs: Math.max(0, result.finishedAt - result.startedAt),
+    answer,
+    outcome: result.outcome,
+    error: result.error,
+  });
+  if (result.outcome === "success" && answer !== null) return answer;
+  if (result.outcome === "timeout") return "The lookup did not finish in time; the answer will be logged if it arrives, but it is not available now.";
+  return `The lookup failed: ${result.error ?? "unknown error"}`;
 }
 
 /**
@@ -633,6 +722,7 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
     "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback, and treat anything short of a clear yes as no confirmation.",
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
     "An item's text is what was true when it was raised, not what is true now; its age says how much to trust it, so verify a stale claim before repeating it.",
+    "When the owner questions a claim in the brief, or a claim is more than a few days old, treat that as not having the information: verify it with ask_a_thread rather than repeating it.",
   ];
   const allSections = [
     { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions, now) },

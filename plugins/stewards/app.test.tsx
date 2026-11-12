@@ -1748,6 +1748,7 @@ describe("the Stand-up button (BB-300)", () => {
             binding: "ENG-12",
             notes: [{ id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, createdAt: 1, readback: "Guidance for ENG-12: Keep it small", confirmed: false, confirmedBy: null }],
             confirmed: [],
+            delegations: [],
           },
         }),
         stewardsStandupConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
@@ -1771,6 +1772,9 @@ describe("the Stand-up button (BB-300)", () => {
         { id: "note_2", type: "free", text: "A passing thought", binding: null, escalation: null, action: null, createdAt: 2, readback: "Note: A passing thought", confirmed: false },
       ],
       confirmed: [],
+      delegations: [
+        { question: "Are the builds still stalling?", key: "ENG-12", startedAt: 10, finishedAt: 40, elapsedMs: 30, answer: "Yes, the integration job is still red.", outcome: "success", error: null },
+      ],
     },
   };
 
@@ -1812,6 +1816,9 @@ describe("the Stand-up button (BB-300)", () => {
     await waitFor(() => expect(slot.getByText("Guidance for ENG-12: Keep it small")).toBeTruthy());
     // The free note is context with no button of its own; only the typed note has one.
     expect(slot.getByText("A passing thought")).toBeTruthy();
+    // BB-307: the delegate log renders beside the notes.
+    expect(slot.getByText("Are the builds still stalling?")).toBeTruthy();
+    expect(slot.getByText("Yes, the integration job is still red.")).toBeTruthy();
     expect(slot.getAllByRole("button", { name: "Confirm" })).toHaveLength(1);
     fireEvent.click(slot.getByRole("button", { name: "Confirm" }));
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupConfirm", input: { standupId: "sup_1", noteId: "note_1" } }));
@@ -1864,6 +1871,7 @@ describe("the Stand-up button (BB-300)", () => {
               { id: "note_2", type: "guidance", text: "And add a test", binding: "ENG-12", escalation: null, action: null, createdAt: 2, readback: "Guidance for ENG-12: And add a test", confirmed: false, confirmedBy: null },
             ],
             confirmed: ["note_1"],
+            delegations: [],
           },
         }),
         stewardsStandupConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
@@ -1905,7 +1913,7 @@ describe("the Stand-up button (BB-300)", () => {
             standup: { available: true, message: null },
           },
         }),
-        stewardsStandupRecord: () => ({ standup: { id: "sup_3", projectId: "p1", startedAt: 1, endedAt: 2, endedBy: "voice", notes: [], confirmed: [], confirmedBy: null } }),
+        stewardsStandupRecord: () => ({ standup: { id: "sup_3", projectId: "p1", startedAt: 1, endedAt: 2, endedBy: "voice", notes: [], confirmed: [], confirmedBy: null, delegations: [] } }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
