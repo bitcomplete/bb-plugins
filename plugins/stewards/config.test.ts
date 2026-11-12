@@ -68,12 +68,13 @@ describe("the project file", () => {
     expect(parseProjectFile(JSON.stringify({ version: 1, notifications: { unknown: true } }))).toMatchObject({ ok: false });
   });
 
-  it("takes an optional stand-up delegate model and rejects an unknown key under it (BB-307)", () => {
+  it("still accepts a project file that sets standup.delegate, which is deprecated and ignored (BB-313)", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);
-    // Unset: the plugin's own Haiku default applies, and the BB-312 tier keys
-    // carry their code defaults (10 closed, 3 days, one hour).
+    // Unset: the BB-312 tier keys carry their code defaults (10 closed, 3 days, one hour).
     expect(defaults.value.standup).toEqual({ closedLimit: 10, closedDays: 3, cacheTtl: 3_600 });
+    // BB-307's delegate key stays parseable so an existing `.bb` is not broken,
+    // but BB-313 removed the tool and nothing reads it.
     const explicit = parseProjectFile(JSON.stringify({ version: 1, standup: { delegate: "claude/claude-sonnet-5-5/medium" } }));
     if (!explicit.ok) throw new Error(explicit.error);
     expect(explicit.value.standup.delegate).toMatchObject({ providerId: "claude-code", model: "claude-sonnet-5-5", reasoningLevel: "medium" });

@@ -341,10 +341,10 @@ export const projectFileSchema = z
       .default({ at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 }),
     projectSteward: z.object({ model: modelSpecSchema.optional() }).strict().default({}),
     /**
-     * BB-307: the stand-up's `ask_a_thread` delegate model. Unset, the plugin
-     * uses `claude/claude-haiku-5-5/low`. This key is parsed strictly, so a
-     * `.bb` opt-in that sets it is usable only after the servers running the
-     * change have restarted onto the image that knows the key.
+     * BB-307: the stand-up's `ask_a_thread` delegate model. BB-313 removed the
+     * delegate tool, so this key is accepted but ignored, and one deprecation
+     * line is logged when it is set; it stays parseable because the file is
+     * parsed strictly and deleting it would break a `.bb` that sets it.
      */
     standup: z
       .object({
