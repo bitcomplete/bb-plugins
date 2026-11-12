@@ -14690,6 +14690,19 @@ describe("the stand-up (BB-300)", () => {
     return { ...t, project, steward };
   }
 
+  /** A bound ticket with one linked, gate-met pull request and its approve-pr need (BB-309). */
+  async function adoptedWithPull() {
+    const t = await setup();
+    const head = "aaaaaaa1";
+    const marker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=owner -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward };
+  }
+
   it("reports a stand-up as available on the board when the voice plugin is ready", async () => {
     const t = await adopted();
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { standup?: { available: boolean; message: string | null } } };
@@ -14790,6 +14803,34 @@ describe("the stand-up (BB-300)", () => {
 
     const retracted = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "retract_note", arguments: JSON.stringify({ id: "note_nope" }) }, voice)) as string;
     expect(retracted).toContain("No note");
+  });
+
+  it("resolves a pull request key to the ticket binding that holds its gate need (BB-309)", async () => {
+    const t = await adoptedWithPull();
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr");
+    expect(need, "the ticket should hold an approve-pr need").toBeDefined();
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string; standupId: string };
+    // steward_status by the pull key the brief shows resolves to the ticket.
+    const status = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "acme/web#7" }) }, voice)) as string;
+    expect(status).toContain("ENG-12");
+    expect(status).not.toContain("No steward");
+    // entity_snapshot by the pull URL renders the pull's own snapshot.
+    const entity = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "https://github.com/acme/web/pull/7" }) }, voice)) as string;
+    expect(entity).toContain("Add login retry");
+    expect(entity).not.toContain("No steward");
+    // take_note by the pull key binds to the open need, recording the resolved
+    // ticket key so the confirmation path's `store.find` finds it later.
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: "acme/web#7", action: "approve" }) }, voice);
+    const note = t.hooks.store.standup(started.standupId)!.notes[0]!;
+    expect(note).toMatchObject({ binding: "ENG-12", need: need!.id });
+    // Confirming applies it through the need-action path, exactly as the page does.
+    const confirmed = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: note.id }, client);
+    expect(confirmed).toMatchObject({ ok: true, applied: true });
+    expect(t.hooks.store.need(need!.id)!.status).toBe("done");
+    // A pull key with no open gate item still answers "No steward".
+    const unknown = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "acme/web#999" }) }, voice)) as string;
+    expect(unknown).toContain("No steward for acme/web#999");
   });
 
   it("scrubs a pasted credential from a tool result before it reaches the model", async () => {
@@ -15384,6 +15425,8 @@ describe("the stand-up (BB-300)", () => {
     const prompt = String(delegate.prompt);
     expect(prompt).toContain("Read only");
     expect(prompt).toContain("one-line verdict first");
+    // BB-309: the answer is spoken, so the standing instructions ask for plain prose.
+    expect(prompt).toContain("Write plain prose only");
     expect(prompt).toContain("Are the bb-server builds still stalling?");
     expect(prompt).toContain("ENG-12");
     await t.idle(delegate.id, "Yes, the builds are still stalling.");

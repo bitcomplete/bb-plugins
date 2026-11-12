@@ -14,6 +14,8 @@ import type { Briefing } from "./nightly.js";
 import type { Binding, Escalation, Lesson, Need } from "./store.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
+import { parsePullRef } from "./github.js";
+import { latestReviewMarker } from "./gate.js";
 import { redactLine } from "./ops.js";
 
 /** One function tool, shaped the way the Realtime API's `realtime.open` expects. */
@@ -100,6 +102,8 @@ export const STANDUP_ENTITY_COMMENTS_MAX = 5;
 export const STANDUP_ENTITY_COMMENT_MAX_CHARS = 300;
 /** The most children `entity_snapshot` lists before it says how many were left out (BB-306). */
 export const STANDUP_ENTITY_CHILDREN_MAX = 10;
+/** How much of an entity's body `entity_snapshot` carries (BB-309). */
+export const STANDUP_ENTITY_DESCRIPTION_MAX_CHARS = 1_000;
 const DAY_MS = 86_400_000;
 
 /** The only tools that write, and they write only to the stand-up record. */
@@ -404,12 +408,20 @@ function escalationTool(ctx: StandupToolContext, args: Record<string, unknown>):
 async function entityTool(ctx: StandupToolContext, key: string): Promise<string> {
   const b = ctx.binding(key);
   if (b === null) return `No steward for ${key} in this project.`;
-  const entity = (await ctx.snapshot(b).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+  // BB-309: a pull-request key resolves to the ticket binding that holds its
+  // gate need. Render that pull's own snapshot from what the binding already
+  // holds, never the ticket's snapshot or a "No steward" line. The binding's
+  // own key is the entity even when it parses as a pull reference (a GitHub
+  // issue key has the same shape).
+  const linked = key === b.entityKey ? null : pullFromKey(b, key);
+  const entity = linked ?? (await ctx.snapshot(b).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
   if (entity === null) return `No snapshot is available for ${key}.`;
   const lines = [`${entity.key}: ${entity.title ?? "(no title)"}`];
   lines.push(`State: ${entity.state ?? "unknown"}${entity.labels.length === 0 ? "" : ` · labels: ${entity.labels.join(", ")}`}`);
   if (entity.author !== null) lines.push(`Author: ${entity.author}`);
-  if (entity.description !== null && entity.description.trim() !== "") lines.push(entity.description.trim());
+  // BB-309: a pull request's body is clipped for the spoken answer; a ticket's
+  // body is rendered as written, as before.
+  if (entity.description !== null && entity.description.trim() !== "") lines.push(entity.kind === "pull" ? clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS) : entity.description.trim());
   // BB-306: the snapshot already fetched these; render them so the model does
   // not have to spend a lookup on what the tool already has.
   const comments = entity.comments.slice(-STANDUP_ENTITY_COMMENTS_MAX);
@@ -417,7 +429,19 @@ async function entityTool(ctx: StandupToolContext, key: string): Promise<string>
     lines.push(`Comments (last ${comments.length} of ${entity.comments.length}):`);
     for (const c of comments) lines.push(`  ${c.createdAt} ${c.author} ${c.did}: ${clipText(c.body, STANDUP_ENTITY_COMMENT_MAX_CHARS)}`);
   }
-  if (entity.linkedPulls.length > 0) lines.push(`Linked pull requests: ${entity.linkedPulls.map((p) => p.key ?? p.url).join(", ")}`);
+  if (entity.linkedPulls.length > 0) {
+    // BB-309: a ticket's linked pull requests render with the title and state
+    // the binding already read for them, not the key alone.
+    lines.push(
+      `Linked pull requests: ${entity.linkedPulls
+        .map((p) => {
+          const linkKey = p.key ?? p.url;
+          const pull = linkedPullFor(b, p);
+          return pull === null ? linkKey : `${linkKey} ${pull.title ?? "(no title)"} (${pull.state ?? "unknown"})`;
+        })
+        .join(", ")}`,
+    );
+  }
   if (entity.children.length > 0) {
     const shown = entity.children.slice(0, STANDUP_ENTITY_CHILDREN_MAX);
     const more = (entity.childrenTotal ?? entity.children.length) - shown.length;
@@ -472,7 +496,10 @@ function gateNeed(ctx: StandupToolContext, binding: Binding, action: string | nu
   const candidates = ctx.needs(binding.id).filter((n) => gateKinds(action).includes(n.kind));
   if (candidates.length === 0) throw new Error(`No open ${action ?? "gate"} item on ${binding.entityKey}`);
   if (wanted !== null) {
-    const match = candidates.find((n) => n.id === wanted || n.url === wanted || n.what === wanted);
+    // BB-309: the brief names a gate item by its pull request key
+    // (`owner/repo#N`); match it against the need's URL too, not only the id,
+    // the exact URL or the description.
+    const match = candidates.find((n) => n.id === wanted || n.url === wanted || n.what === wanted || samePullRef(n.url, wanted));
     if (match === undefined) throw new Error(`No open gate item on ${binding.entityKey} matches ${JSON.stringify(wanted)}`);
     return match;
   }
@@ -492,11 +519,19 @@ function takeNote(ctx: StandupToolContext, args: Record<string, unknown>): strin
   // binding with several open items can never apply the wrong one later.
   let need: string | null = null;
   let needLabel: string | null = null;
+  // BB-309: the binding may be a pull-request key the brief shows. Record the
+  // resolved binding's own key so the confirmation path's `store.find` finds
+  // it later, and use the pull key to pick the exact item when the caller did
+  // not name one.
+  let bindingValue = bindingKey;
   if (type === "gate") {
     if (bindingKey === null) throw new Error("a gate note needs a binding");
     const binding = ctx.binding(bindingKey);
     if (binding === null) throw new Error(`No steward for ${bindingKey}`);
-    const item = gateNeed(ctx, binding, action, optionalString(args, "need"));
+    bindingValue = binding.entityKey;
+    const explicit = optionalString(args, "need");
+    const wanted = explicit ?? (bindingKey !== binding.entityKey && parsePullRef(bindingKey) !== null ? bindingKey : null);
+    const item = gateNeed(ctx, binding, action, wanted);
     need = item.id;
     needLabel = item.what;
   }
@@ -504,7 +539,7 @@ function takeNote(ctx: StandupToolContext, args: Record<string, unknown>): strin
     id: `note_${crypto.randomUUID()}`,
     type: type as StandupNoteType,
     text,
-    binding: bindingKey,
+    binding: bindingValue,
     escalation: optionalString(args, "escalationId"),
     action: action as StandupNote["action"],
     need,
@@ -583,7 +618,9 @@ async function askThreadTool(ctx: StandupToolContext, args: Record<string, unkno
   const key = optionalString(args, "key");
   const result = await ctx.askThread(question, key);
   if (result.outcome === "busy") return "A lookup is already running for this stand-up; wait for it to finish before asking again.";
-  const answer = result.answer === null ? null : redactLine(result.answer, STANDUP_DELEGATE_ANSWER_MAX_CHARS);
+  // BB-309: the answer is read aloud, so strip the Markdown a model reaches
+  // for anyway; `redactLine` scrubs credentials and caps the length first.
+  const answer = result.answer === null ? null : stripMarkdown(redactLine(result.answer, STANDUP_DELEGATE_ANSWER_MAX_CHARS));
   ctx.record.delegations.push({
     question,
     key,
@@ -635,13 +672,91 @@ function clipText(text: string, max: number): string {
   return one.length <= max ? one : `${one.slice(0, max - 1).trimEnd()}…`;
 }
 
+/** Cap a multi-line body without flattening its line breaks, so it reads as written. */
+function clipBlock(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * BB-309: whether two strings name the same pull request, whatever their
+ * spelling (`owner/repo#N` or a GitHub pull URL). The stand-up's key reader
+ * and its gate-need matcher both use it, so the key the brief shows resolves.
+ */
+export function samePullRef(a: string, b: string): boolean {
+  const x = parsePullRef(a);
+  const y = parsePullRef(b);
+  return x !== null && y !== null && x.repo === y.repo && x.number === y.number;
+}
+
+/** The binding's snapshot of the pull a requested key names, when the key is a pull reference. */
+function pullFromKey(binding: Binding, key: string): EntitySnapshot | null {
+  if (parsePullRef(key) === null) return null;
+  return (binding.lastSnapshot?.pulls ?? []).find((p) => samePullRef(p.key, key) || (p.url !== null && samePullRef(p.url, key))) ?? null;
+}
+
+/** The binding's snapshot of a linked pull, by its link key or url, or null when it was not read. */
+function linkedPullFor(binding: Binding, link: { url: string; key: string | null }): EntitySnapshot | null {
+  return (binding.lastSnapshot?.pulls ?? []).find((p) => (link.key !== null && samePullRef(p.key, link.key)) || samePullRef(p.url ?? "", link.url)) ?? null;
+}
+
+/**
+ * BB-309: the facts a gate need's brief line carries, read only from what the
+ * binding already holds: the pull's title, the steward's status summary and
+ * the last `bb-review` verdict with its lane and approver. No source call.
+ */
+function gateNeedFacts(binding: Binding, need: Need): string[] {
+  const facts: string[] = [];
+  const pull = pullFromKey(binding, need.url);
+  if (pull !== null && pull.title !== null && pull.title.trim() !== "") facts.push(`"${pull.title.trim()}"`);
+  const summary = binding.status?.summary;
+  if (summary !== null && summary !== undefined && summary.trim() !== "") facts.push(clipText(summary, STANDUP_CONTEXT_MAX_CHARS));
+  if (pull !== null) {
+    const marker = latestReviewMarker(pull.comments);
+    if (marker !== null) {
+      const lane = marker.lane === null ? "" : `, lane ${marker.lane}`;
+      const approver = marker.approver === undefined ? "" : `, approver ${marker.approver}`;
+      facts.push(`review ${marker.verdict}${lane}${approver}`);
+    }
+  }
+  return facts;
+}
+
+/**
+ * BB-309: strip the Markdown a delegate reaches for even when asked for plain
+ * prose, so the spoken answer carries no markers. Headings, bullets, numbered
+ * lists, blockquotes, bold, strikethrough, code fences and inline code all keep
+ * their words and lose their punctuation. Single `*`/`_` emphasis is left
+ * alone: it is not a marker a voice model reads, and stripping it would mangle
+ * `snake_case` identifiers and arithmetic.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .replace(/^```[^\n]*$/gmu, "")
+    .replace(/^~~~[^\n]*$/gmu, "")
+    .replace(/^\s{0,3}#{1,6}\s+/gmu, "")
+    .replace(/^\s{0,3}[-*+]\s+/gmu, "")
+    .replace(/^\s{0,3}\d+[.)]\s+/gmu, "")
+    .replace(/^\s{0,3}>\s?/gmu, "")
+    .replace(/\*\*\*(.+?)\*\*\*/gsu, "$1")
+    .replace(/\*\*(.+?)\*\*/gsu, "$1")
+    .replace(/~~(.+?)~~/gsu, "$1")
+    .replace(/`([^`\n]+)`/gu, "$1");
+}
+
 /** An open question put to the owner, with the binding it attaches to resolved to a key. */
 export type StandupOpenQuestion = { key: string | null; question: string; choices: string[]; createdAt: number; context: string | null };
 
 /** The owner's decisions, as one line each: needs, forwarded escalations and open questions. */
 function decisionLines(briefing: Briefing, questions: readonly StandupOpenQuestion[], now: number): string[] {
   const out: string[] = [];
-  for (const { need, binding } of briefing.decisions.needs) out.push(withAge(`${binding.entityKey}: ${need.what} (${need.kind})`, now, need.createdAt));
+  for (const { need, binding } of briefing.decisions.needs) {
+    const base = `${binding.entityKey}: ${need.what} (${need.kind})`;
+    // BB-309: a gate item's line carries the pull's substance from what the
+    // binding already holds, so describing it needs no lookup.
+    const facts = need.kind === "approve-pr" || need.kind === "merge" ? gateNeedFacts(binding, need) : [];
+    out.push(withAge(facts.length === 0 ? base : `${base} — ${facts.join(" · ")}`, now, need.createdAt));
+  }
   for (const { escalation, from } of briefing.decisions.withUser) out.push(withAge(`${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`, now, escalation.createdAt));
   // The briefing's `withUser` leaves questions to the digest's own section
   // (slice 1); the stand-up is exactly where the owner answers them, so they are
@@ -719,6 +834,8 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
       : "Lead with the things only the owner can unblock for this steward, then what is stuck or held. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind.",
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
+    "For a gate note, the binding is the ticket key before the colon on the brief line, and need is the pull request named on it (for example owner/repo#34).",
+    "For a gate note on a pull request, binding may also be the pull request key itself (owner/repo#34) when the brief names it that way.",
     "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback, and treat anything short of a clear yes as no confirmation.",
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
     "An item's text is what was true when it was raised, not what is true now; its age says how much to trust it, so verify a stale claim before repeating it.",

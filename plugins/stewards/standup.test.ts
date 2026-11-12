@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   STANDUP_CONTEXT_MAX_CHARS,
   STANDUP_DELEGATE_ANSWER_MAX_CHARS,
+  STANDUP_ENTITY_DESCRIPTION_MAX_CHARS,
   STANDUP_MAX_INSTRUCTIONS_CHARS,
   STANDUP_NOTE_TYPES,
   STANDUP_STALE_DAYS,
@@ -15,6 +16,7 @@ import {
   readbackLine,
   readbackLines,
   runStandupTool,
+  stripMarkdown,
   type StandupNote,
   type StandupRecord,
   type StandupToolContext,
@@ -22,7 +24,7 @@ import {
 import type { Briefing } from "./nightly.js";
 import type { Binding, Escalation, Lesson } from "./store.js";
 import type { GuidanceUnit } from "./guidance.js";
-import { comment, issue } from "./fixtures.js";
+import { comment, issue, pull } from "./fixtures.js";
 
 const binding = (over: Partial<Binding> = {}): Binding =>
   ({
@@ -164,6 +166,57 @@ describe("runStandupTool (BB-300)", () => {
     expect(out).toContain("Children: acme/web#13 Sub-task (open)");
   });
 
+  it("renders a linked pull request with its title and state, and a pull key's own snapshot (BB-309)", async () => {
+    const linked = pull({
+      id: "acme/web#7",
+      key: "acme/web#7",
+      url: "https://github.com/acme/web/pull/7",
+      title: "Add login retry",
+      state: "open",
+      author: "sam",
+      description: "Retries login.",
+      comments: [comment({ id: "c1", author: "Jane", did: "approved", body: "Looks good to me.", createdAt: "2026-10-03T00:00:00Z" })],
+    });
+    const ticketEntity = issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] });
+    const b = binding({ lastSnapshot: { entity: ticketEntity, pulls: [linked] } });
+    const ctx = context({ snapshot: async () => ticketEntity, binding: (key) => (key === "ENG-12" || key === "acme/web#7" || key === "https://github.com/acme/web/pull/7" ? b : null) });
+    // The ticket lists the linked pull with the title and state the binding holds.
+    const ticket = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
+    expect(ticket).toContain("Linked pull requests: acme/web#7 Add login retry (open)");
+    // A pull key that resolves to the ticket renders the pull, not the ticket.
+    const pr = (await runStandupTool("entity_snapshot", { key: "acme/web#7" }, ctx)) as string;
+    expect(pr).toContain("acme/web#7: Add login retry");
+    expect(pr).toContain("State: open");
+    expect(pr).toContain("Author: sam");
+    expect(pr).toContain("Retries login.");
+    expect(pr).toContain("2026-10-03T00:00:00Z Jane approved: Looks good to me.");
+    expect(pr).not.toContain("No steward");
+    // A pull URL resolves the same way.
+    const byUrl = (await runStandupTool("entity_snapshot", { key: "https://github.com/acme/web/pull/7" }, ctx)) as string;
+    expect(byUrl).toContain("acme/web#7: Add login retry");
+  });
+
+  it("clips a long entity body without flattening it (BB-309)", async () => {
+    const long = pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", description: `first line\n\n${"y".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50)}` });
+    const b = binding({ lastSnapshot: { entity: issue(), pulls: [long] } });
+    const ctx = context({ binding: (key) => (key === "acme/web#8" ? b : null) });
+    const out = (await runStandupTool("entity_snapshot", { key: "acme/web#8" }, ctx)) as string;
+    expect(out).toContain("first line");
+    // The body keeps its line breaks and is clipped at the cap.
+    expect(out).toContain("first line\n\ny");
+    expect(out).not.toContain("y".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 1));
+    expect(out).toContain("…");
+  });
+
+  it("renders a ticket body as written, without the pull clip (BB-309)", async () => {
+    const long = "z".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50);
+    const entity = issue({ description: long });
+    const b = binding({ lastSnapshot: { entity, pulls: [] } });
+    const ctx = context({ snapshot: async () => entity, binding: (key) => (key === "ENG-12" ? b : null) });
+    const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
+    expect(out).toContain(long);
+  });
+
   it("reads the lessons behind a decision", async () => {
     const out = await runStandupTool("decision_rationale", { key: "ENG-12" }, context());
     expect(out).toContain("Prefer the smaller change.");
@@ -257,6 +310,41 @@ describe("runStandupTool (BB-300)", () => {
     await runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "need_2" }, named);
     expect(named.record.notes[0]).toMatchObject({ need: "need_2" });
   });
+
+  it("matches a gate need by the pull request key the brief shows (BB-309)", async () => {
+    const need = { id: "need_1", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", url: "https://github.com/acme/web/pull/7" } as never;
+    const byKey = context({ needs: () => [need] });
+    await runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "acme/web#7" }, byKey);
+    expect(byKey.record.notes[0]).toMatchObject({ need: "need_1", needLabel: "Approve acme/web#7 on GitHub" });
+    const byUrl = context({ needs: () => [need] });
+    await runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "https://github.com/acme/web/pull/7" }, byUrl);
+    expect(byUrl.record.notes[0]).toMatchObject({ need: "need_1" });
+    const noMatch = context({ needs: () => [need] });
+    await expect(runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "acme/web#9" }, noMatch)).rejects.toThrow(/matches/u);
+  });
+
+  it("records the resolved binding key for a gate note taken by pull key (BB-309)", async () => {
+    const need = { id: "need_1", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", url: "https://github.com/acme/web/pull/7" } as never;
+    const ctx = context({ binding: (key) => (key === "ENG-12" || key === "acme/web#7" ? binding() : null), needs: () => [need] });
+    await runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "acme/web#7", action: "approve" }, ctx);
+    // The confirmation path's `store.find` needs the binding's own key, not the pull key.
+    expect(ctx.record.notes[0]).toMatchObject({ binding: "ENG-12", need: "need_1" });
+  });
+
+  it("uses a pull-key binding to pick the exact gate item, and keeps a ticket key ambiguous (BB-309)", async () => {
+    const approve7 = { id: "need_7", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", url: "https://github.com/acme/web/pull/7" } as never;
+    const merge8 = { id: "need_8", kind: "merge", what: "Merge acme/web#8 on GitHub", url: "https://github.com/acme/web/pull/8" } as never;
+    const resolve = (key: string) => (key === "ENG-12" || key === "acme/web#7" || key === "acme/web#8" ? binding() : null);
+    // The pull key names #8, which has no approve item: refuse, never bind #7.
+    await expect(runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "acme/web#8", action: "approve" }, context({ binding: resolve, needs: () => [approve7, merge8] }))).rejects.toThrow(/matches/u);
+    // The pull key with the matching action binds that pull's item, not the first of the kind.
+    const mergeCtx = context({ binding: resolve, needs: () => [approve7, merge8] });
+    await runStandupTool("take_note", { type: "gate", text: "Ship it", binding: "acme/web#8", action: "merge" }, mergeCtx);
+    expect(mergeCtx.record.notes[0]).toMatchObject({ binding: "ENG-12", need: "need_8" });
+    // A ticket key with two items of the action's kind is still ambiguous.
+    const approve7b = { id: "need_7b", kind: "approve-pr", what: "Approve acme/web#7b on GitHub", url: "https://github.com/acme/web/pull/7b" } as never;
+    await expect(runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve" }, context({ needs: () => [approve7, approve7b] }))).rejects.toThrow(/several open gate items/u);
+  });
 });
 
 describe("ask_a_thread (BB-307)", () => {
@@ -313,6 +401,20 @@ describe("ask_a_thread (BB-307)", () => {
 
   it("requires a question", async () => {
     await expect(runStandupTool("ask_a_thread", {}, context())).rejects.toThrow(/question is required/u);
+  });
+
+  it("strips Markdown from a delegate answer before logging or returning it (BB-309)", async () => {
+    const answer = "**Verdict:** the build is fine.\n\n# Details\n\n- item one\n- item two\n\nUse `retry`.";
+    const ctx = context({ askThread: async () => ({ outcome: "success", answer, startedAt: 1, finishedAt: 2, error: null }) });
+    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
+    expect(out).toContain("Verdict: the build is fine.");
+    expect(out).toContain("item one");
+    expect(out).not.toContain("**");
+    expect(out).not.toMatch(/^#/mu);
+    expect(out).not.toMatch(/^- /mu);
+    expect(out).not.toContain("`");
+    // The logged answer is the stripped one, so the record carries no markers either.
+    expect(ctx.record.delegations[0]!.answer).toBe(out);
   });
 });
 
@@ -423,6 +525,30 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(line).not.toContain("days");
   });
 
+  it("carries a gate item's pull title, steward summary and review verdict (BB-309)", () => {
+    const need = { what: "Approve acme/web#7 on GitHub", kind: "approve-pr", createdAt: 1, url: "https://github.com/acme/web/pull/7" } as never;
+    const linked = pull({ comments: [comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })] });
+    const b = binding({ entityKey: "ENG-12", status: { actor: "steward", nextAction: "review", summary: "In review, waiting on the owner", waitingOn: "the approval", at: 1 } as never, lastSnapshot: { entity: issue(), pulls: [linked] } });
+    const text = buildStandupInstructions(briefing({ decisions: { needs: [{ need, binding: b }], withUser: [] } }), "Acme", 10_000);
+    expect(text).toContain("Add login retry");
+    expect(text).toContain("In review, waiting on the owner");
+    expect(text).toContain("review approved, lane owner-reviewed, approver owner");
+  });
+
+  it("clips a long steward summary in a gate item's line (BB-309)", () => {
+    const need = { what: "Approve acme/web#7 on GitHub", kind: "approve-pr", createdAt: 1, url: "https://github.com/acme/web/pull/7" } as never;
+    const longSummary = `In review ${"x".repeat(STANDUP_CONTEXT_MAX_CHARS + 50)}`;
+    const b = binding({ entityKey: "ENG-12", status: { summary: longSummary, actor: "steward", nextAction: "review", waitingOn: "the approval", at: 1 } as never, lastSnapshot: { entity: issue(), pulls: [pull()] } });
+    const text = buildStandupInstructions(briefing({ decisions: { needs: [{ need, binding: b }], withUser: [] } }), "Acme", 10_000);
+    expect(text).not.toContain("x".repeat(STANDUP_CONTEXT_MAX_CHARS + 1));
+  });
+
+  it("tells the model a gate note's binding is the ticket key and need is the pull request (BB-309)", () => {
+    const text = buildStandupInstructions(briefing(), "Acme", 10_000);
+    expect(text).toContain("the binding is the ticket key before the colon on the brief line");
+    expect(text).toContain("need is the pull request named on it");
+  });
+
   it("says no digest yet, and the last digest date once there is one (BB-306)", () => {
     expect(buildStandupInstructions(briefing(), "Acme", 10_000)).toContain("has not filed a digest yet");
     const at = Date.parse("2026-11-10T00:00:00Z");
@@ -491,5 +617,17 @@ describe("buildStandupInstructions (BB-300)", () => {
     // A section the loop emptied says it was omitted, not that it had nothing.
     expect(text).toContain("(omitted to fit the briefing limit)");
     expect(text).not.toMatch(/## Done since\n- \(none\)/u);
+  });
+});
+
+describe("stripMarkdown (BB-309)", () => {
+  it("keeps the words and drops headings, bullets, emphasis and code", () => {
+    expect(stripMarkdown("**Bold** and `code`.")).toBe("Bold and code.");
+    expect(stripMarkdown("keep snake_case and 2 * 3 * 4")).toBe("keep snake_case and 2 * 3 * 4");
+    expect(stripMarkdown("# Heading\n## Two")).toBe("Heading\nTwo");
+    expect(stripMarkdown("- one\n- two")).toBe("one\ntwo");
+    expect(stripMarkdown("1. one\n2. two")).toBe("one\ntwo");
+    expect(stripMarkdown("```\nblock\n```")).toBe("\nblock\n");
+    expect(stripMarkdown("plain text")).toBe("plain text");
   });
 });
