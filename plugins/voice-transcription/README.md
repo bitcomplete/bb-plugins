@@ -60,14 +60,22 @@ A session has three pieces:
   for the owner to speak; and `onClose: { method }` names the opener's own RPC
   method that the close route calls with the session id whenever the session
   ends. Both default off, so an opener that wants today's behaviour is
-  unchanged.
+  unchanged. It may also name the `client` that asked: the overlay in every
+  tab keeps a per-tab id in
+  `sessionStorage` under `voice-transcription:realtime-client`, and an opener
+  whose frontend reads that entry and passes it through its backend gets a
+  session that only that tab answers. Without it the open signal reaches every
+  tab of the same server, and the first overlay to mint takes the session —
+  a stand-up started on a phone can then play from a laptop left open on a
+  desk.
 * The plugin's **mint route** (`POST
   /api/v1/plugins/voice-transcription/http/realtime/session`) exchanges the
   plugin's stored key for a short-lived OpenAI **ephemeral client secret** and
   returns that to the browser. The standard key is used only in the server's
   request to OpenAI and never reaches the browser. It refuses with a clear
-  status when the endpoint is not OpenAI's (400) or no key is set (403), and
-  for an unknown or already-minted session (404/409).
+  status when the endpoint is not OpenAI's (400) or no key is set (403), for
+  an unknown or already-minted session (404/409), and for a session opened
+  for another client (409).
 * The app-wide **overlay** opens the WebRTC session straight from the browser
   to OpenAI with the ephemeral secret, plays the model's audio, shows the live
   transcript, and forwards each model tool call to the opener, returning its

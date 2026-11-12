@@ -148,7 +148,7 @@ describe("realtime mint route", () => {
     expect(opened.maxDurationMs).toBe(REALTIME_SESSION_MAX_MS);
     expect(host.harness.realtimeSignals).toHaveLength(1);
     expect(host.harness.realtimeSignals[0]!.channel).toBe(REALTIME_SIGNAL_CHANNEL);
-    expect(host.harness.realtimeSignals[0]!.payload).toEqual({ sessionId: opened.sessionId });
+    expect(host.harness.realtimeSignals[0]!.payload).toEqual({ sessionId: opened.sessionId, client: null });
 
     const response = await host.harness.fetchHttp(
       "POST",
@@ -253,6 +253,36 @@ describe("realtime mint route", () => {
 
     expect(responses.map((response) => response.status).sort((a, b) => a - b)).toEqual([200, 409]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the opener's client in the signal and mints only for that client", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    const fetchMock = vi.fn(async () => jsonResponse({ value: "ek", expires_at: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const opened = (await open(host, { instructions: "x", tools: [ECHO], client: "tab-phone" })) as { sessionId: string };
+    expect(host.harness.realtimeSignals[0]!.payload).toEqual({ sessionId: opened.sessionId, client: "tab-phone" });
+
+    // The laptop's overlay answers first: it is refused with the status it
+    // already treats as "not mine", and OpenAI is never asked.
+    const laptop = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId, client: "tab-laptop" }));
+    expect(laptop.status).toBe(409);
+    expect(((await laptop.json()) as { error: string }).error).toMatch(/tab that started it/u);
+    const anonymous = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId }));
+    expect(anonymous.status).toBe(409);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // The session is still the phone's to take.
+    const phone = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId, client: "tab-phone" }));
+    expect(phone.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets any client mint a session opened without a client", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ value: "ek", expires_at: 1 })));
+    const opened = (await open(host, { instructions: "x", tools: [ECHO] })) as { sessionId: string };
+    const response = await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId, client: "tab-laptop" }));
+    expect(response.status).toBe(200);
   });
 
   it("releases the mint claim when OpenAI fails, so a retry can mint", async () => {

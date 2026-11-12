@@ -1582,11 +1582,25 @@ describe("the Stand-up button (BB-300)", () => {
   };
 
   it("shows the button beside Waiting on you when a stand-up is available, and starts one", async () => {
+    window.sessionStorage.removeItem("voice-transcription:realtime-client");
     const slot = await renderBoardWithStandup({ available: true, message: null });
     await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: "Stand-up" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1" } }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1", client: null } }));
     slot.lifecycle.unmount();
+  });
+
+  it("sends this tab's voice client id with the start, so the pressing tab answers", async () => {
+    window.sessionStorage.setItem("voice-transcription:realtime-client", "tab-phone");
+    try {
+      const slot = await renderBoardWithStandup({ available: true, message: null });
+      await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
+      fireEvent.click(slot.getByRole("button", { name: "Stand-up" }));
+      await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1", client: "tab-phone" } }));
+      slot.lifecycle.unmount();
+    } finally {
+      window.sessionStorage.removeItem("voice-transcription:realtime-client");
+    }
   });
 
   it("shows no button when a stand-up is unavailable", async () => {

@@ -962,8 +962,11 @@ export const rpcContract = defineRpcContract({
   // instructions and opens the voice plugin's overlay with the fixed tool set.
   // The record is durable from slice 4 on: the session id names the record the
   // notes are saved to, and `standupId` is what the readback confirms against.
+  // `client` is the voice overlay's per-tab id, read by the page from
+  // `sessionStorage`, so the tab that pressed the button is the one that
+  // answers; without it every tab of the server races for the session.
   stewardsStandupStart: {
-    input: z.object({ projectId: z.string().min(1).max(100) }),
+    input: z.object({ projectId: z.string().min(1).max(100), client: z.string().trim().min(1).max(100).nullable().optional() }),
     output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), standupId: z.string().nullable(), message: z.string() }),
   },
   // BB-300: the one method the voice plugin forwards the model's tool calls to.
@@ -9068,7 +9071,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // line asks for it alone, without the rest of the board.
         return standupAvailability(store.project(projectId).threadId !== null);
       },
-      async stewardsStandupStart({ projectId }, { experimental_caller: caller }) {
+      async stewardsStandupStart({ projectId, client }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("a stand-up is started from the Stewards page");
         // Reserve the project before the first await, so a click on the board
         // and a click on the home page at the same moment cannot both start.
@@ -9102,7 +9105,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const record = store.createStandup({ id: newId("sup"), projectId, startedAt: now() });
           let opened: { sessionId: string; maxDurationMs: number };
           try {
-            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: STANDUP_TOOLS, toolHandler: { method: "stewardsStandupTool" } }, realtimeOpenOutput);
+            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: STANDUP_TOOLS, toolHandler: { method: "stewardsStandupTool" }, client: client ?? null }, realtimeOpenOutput);
           } catch (error) {
             // The session never opened; end the empty record so it is not read
             // back as the project's stand-up.
