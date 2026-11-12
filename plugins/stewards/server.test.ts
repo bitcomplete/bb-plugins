@@ -14819,10 +14819,15 @@ describe("the stand-up (BB-300)", () => {
     const entity = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "https://github.com/acme/web/pull/7" }) }, voice)) as string;
     expect(entity).toContain("Add login retry");
     expect(entity).not.toContain("No steward");
-    // take_note by the pull key binds to the open need.
+    // take_note by the pull key binds to the open need, recording the resolved
+    // ticket key so the confirmation path's `store.find` finds it later.
     await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: "acme/web#7", action: "approve" }) }, voice);
     const note = t.hooks.store.standup(started.standupId)!.notes[0]!;
-    expect(note).toMatchObject({ binding: "acme/web#7", need: need!.id });
+    expect(note).toMatchObject({ binding: "ENG-12", need: need!.id });
+    // Confirming applies it through the need-action path, exactly as the page does.
+    const confirmed = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: note.id }, client);
+    expect(confirmed).toMatchObject({ ok: true, applied: true });
+    expect(t.hooks.store.need(need!.id)!.status).toBe("done");
     // A pull key with no open gate item still answers "No steward".
     const unknown = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "acme/web#999" }) }, voice)) as string;
     expect(unknown).toContain("No steward for acme/web#999");

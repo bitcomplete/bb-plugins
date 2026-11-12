@@ -419,7 +419,9 @@ async function entityTool(ctx: StandupToolContext, key: string): Promise<string>
   const lines = [`${entity.key}: ${entity.title ?? "(no title)"}`];
   lines.push(`State: ${entity.state ?? "unknown"}${entity.labels.length === 0 ? "" : ` · labels: ${entity.labels.join(", ")}`}`);
   if (entity.author !== null) lines.push(`Author: ${entity.author}`);
-  if (entity.description !== null && entity.description.trim() !== "") lines.push(clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS));
+  // BB-309: a pull request's body is clipped for the spoken answer; a ticket's
+  // body is rendered as written, as before.
+  if (entity.description !== null && entity.description.trim() !== "") lines.push(entity.kind === "pull" ? clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS) : entity.description.trim());
   // BB-306: the snapshot already fetched these; render them so the model does
   // not have to spend a lookup on what the tool already has.
   const comments = entity.comments.slice(-STANDUP_ENTITY_COMMENTS_MAX);
@@ -517,11 +519,19 @@ function takeNote(ctx: StandupToolContext, args: Record<string, unknown>): strin
   // binding with several open items can never apply the wrong one later.
   let need: string | null = null;
   let needLabel: string | null = null;
+  // BB-309: the binding may be a pull-request key the brief shows. Record the
+  // resolved binding's own key so the confirmation path's `store.find` finds
+  // it later, and use the pull key to pick the exact item when the caller did
+  // not name one.
+  let bindingValue = bindingKey;
   if (type === "gate") {
     if (bindingKey === null) throw new Error("a gate note needs a binding");
     const binding = ctx.binding(bindingKey);
     if (binding === null) throw new Error(`No steward for ${bindingKey}`);
-    const item = gateNeed(ctx, binding, action, optionalString(args, "need"));
+    bindingValue = binding.entityKey;
+    const explicit = optionalString(args, "need");
+    const wanted = explicit ?? (bindingKey !== binding.entityKey && parsePullRef(bindingKey) !== null ? bindingKey : null);
+    const item = gateNeed(ctx, binding, action, wanted);
     need = item.id;
     needLabel = item.what;
   }
@@ -529,7 +539,7 @@ function takeNote(ctx: StandupToolContext, args: Record<string, unknown>): strin
     id: `note_${crypto.randomUUID()}`,
     type: type as StandupNoteType,
     text,
-    binding: bindingKey,
+    binding: bindingValue,
     escalation: optionalString(args, "escalationId"),
     action: action as StandupNote["action"],
     need,
@@ -700,7 +710,7 @@ function gateNeedFacts(binding: Binding, need: Need): string[] {
   const pull = pullFromKey(binding, need.url);
   if (pull !== null && pull.title !== null && pull.title.trim() !== "") facts.push(`"${pull.title.trim()}"`);
   const summary = binding.status?.summary;
-  if (summary !== null && summary !== undefined && summary.trim() !== "") facts.push(summary.trim());
+  if (summary !== null && summary !== undefined && summary.trim() !== "") facts.push(clipText(summary, STANDUP_CONTEXT_MAX_CHARS));
   if (pull !== null) {
     const marker = latestReviewMarker(pull.comments);
     if (marker !== null) {

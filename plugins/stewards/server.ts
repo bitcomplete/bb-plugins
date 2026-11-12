@@ -1721,6 +1721,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-309: the stand-up's key reader. A ticket key resolves as before; a
+     * pull-request key or URL that names no binding of its own resolves to the
+     * open binding holding an open approve-pr or merge need for it, so the key
+     * the brief shows works in every read tool, gate note and confirmation.
+     */
+    function standupBindingFor(projectId: string, key: string): Binding | null {
+      const direct = store.find(key, projectId);
+      if (direct !== null) return direct;
+      if (parsePullRef(key) === null) return null;
+      for (const b of store.open(projectId)) {
+        const held = store.openNeeds(b.id).some((n) => (n.kind === "approve-pr" || n.kind === "merge") && samePullRef(n.url, key));
+        if (held) return b;
+      }
+      return null;
+    }
+
+    /**
      * Apply one confirmed note through the path its shape already uses: a gate
      * item through the need-action RPC the Approve and Decline buttons use,
      * per-binding guidance as user guidance, an escalation through the question
@@ -1732,7 +1749,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function applyStandupNote(standup: StandupRow, note: StandupNoteRow): Promise<{ ok: boolean; applied: boolean; message: string }> {
       const type = note.type as StandupNoteType;
       const text = scrubCredentials(note.text);
-      const binding = note.binding === null ? null : store.find(note.binding, standup.projectId);
+      const binding = note.binding === null ? null : standupBindingFor(standup.projectId, note.binding);
       let applied = false;
       let message = "Confirmed.";
 
@@ -9620,24 +9637,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // touches are saved to the durable row afterwards.
         const standupProjectId = standup.projectId;
         const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected, delegations: [...standup.delegations] as StandupDelegation[] };
-        // BB-309: the stand-up's key reader. A ticket key resolves as before; a
-        // pull-request key or URL that names no binding of its own resolves to
-        // the open binding holding an open approve-pr or merge need for it, so
-        // the key the brief shows works in every read tool and gate note.
-        const standupBinding = (key: string): Binding | null => {
-          const direct = store.find(key, standupProjectId);
-          if (direct !== null) return direct;
-          if (parsePullRef(key) === null) return null;
-          for (const b of store.open(standupProjectId)) {
-            const held = store.openNeeds(b.id).some((n) => (n.kind === "approve-pr" || n.kind === "merge") && samePullRef(n.url, key));
-            if (held) return b;
-          }
-          return null;
-        };
         const result = await runStandupTool(name, args, {
           projectId: standupProjectId,
           now,
-          binding: standupBinding,
+          binding: (key) => standupBindingFor(standupProjectId, key),
           openEscalations: (bindingId) => store.openEscalations(bindingId),
           escalation: (id) => store.escalation(id),
           lessons: (bindingId) => store.allLessons(standupProjectId).filter((l) => l.bindingId === bindingId),

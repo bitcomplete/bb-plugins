@@ -208,6 +208,15 @@ describe("runStandupTool (BB-300)", () => {
     expect(out).toContain("…");
   });
 
+  it("renders a ticket body as written, without the pull clip (BB-309)", async () => {
+    const long = "z".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50);
+    const entity = issue({ description: long });
+    const b = binding({ lastSnapshot: { entity, pulls: [] } });
+    const ctx = context({ snapshot: async () => entity, binding: (key) => (key === "ENG-12" ? b : null) });
+    const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
+    expect(out).toContain(long);
+  });
+
   it("reads the lessons behind a decision", async () => {
     const out = await runStandupTool("decision_rationale", { key: "ENG-12" }, context());
     expect(out).toContain("Prefer the smaller change.");
@@ -312,6 +321,29 @@ describe("runStandupTool (BB-300)", () => {
     expect(byUrl.record.notes[0]).toMatchObject({ need: "need_1" });
     const noMatch = context({ needs: () => [need] });
     await expect(runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "acme/web#9" }, noMatch)).rejects.toThrow(/matches/u);
+  });
+
+  it("records the resolved binding key for a gate note taken by pull key (BB-309)", async () => {
+    const need = { id: "need_1", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", url: "https://github.com/acme/web/pull/7" } as never;
+    const ctx = context({ binding: (key) => (key === "ENG-12" || key === "acme/web#7" ? binding() : null), needs: () => [need] });
+    await runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "acme/web#7", action: "approve" }, ctx);
+    // The confirmation path's `store.find` needs the binding's own key, not the pull key.
+    expect(ctx.record.notes[0]).toMatchObject({ binding: "ENG-12", need: "need_1" });
+  });
+
+  it("uses a pull-key binding to pick the exact gate item, and keeps a ticket key ambiguous (BB-309)", async () => {
+    const approve7 = { id: "need_7", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", url: "https://github.com/acme/web/pull/7" } as never;
+    const merge8 = { id: "need_8", kind: "merge", what: "Merge acme/web#8 on GitHub", url: "https://github.com/acme/web/pull/8" } as never;
+    const resolve = (key: string) => (key === "ENG-12" || key === "acme/web#7" || key === "acme/web#8" ? binding() : null);
+    // The pull key names #8, which has no approve item: refuse, never bind #7.
+    await expect(runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "acme/web#8", action: "approve" }, context({ binding: resolve, needs: () => [approve7, merge8] }))).rejects.toThrow(/matches/u);
+    // The pull key with the matching action binds that pull's item, not the first of the kind.
+    const mergeCtx = context({ binding: resolve, needs: () => [approve7, merge8] });
+    await runStandupTool("take_note", { type: "gate", text: "Ship it", binding: "acme/web#8", action: "merge" }, mergeCtx);
+    expect(mergeCtx.record.notes[0]).toMatchObject({ binding: "ENG-12", need: "need_8" });
+    // A ticket key with two items of the action's kind is still ambiguous.
+    const approve7b = { id: "need_7b", kind: "approve-pr", what: "Approve acme/web#7b on GitHub", url: "https://github.com/acme/web/pull/7b" } as never;
+    await expect(runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve" }, context({ needs: () => [approve7, approve7b] }))).rejects.toThrow(/several open gate items/u);
   });
 });
 
@@ -501,6 +533,14 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(text).toContain("Add login retry");
     expect(text).toContain("In review, waiting on the owner");
     expect(text).toContain("review approved, lane owner-reviewed, approver owner");
+  });
+
+  it("clips a long steward summary in a gate item's line (BB-309)", () => {
+    const need = { what: "Approve acme/web#7 on GitHub", kind: "approve-pr", createdAt: 1, url: "https://github.com/acme/web/pull/7" } as never;
+    const longSummary = `In review ${"x".repeat(STANDUP_CONTEXT_MAX_CHARS + 50)}`;
+    const b = binding({ entityKey: "ENG-12", status: { summary: longSummary, actor: "steward", nextAction: "review", waitingOn: "the approval", at: 1 } as never, lastSnapshot: { entity: issue(), pulls: [pull()] } });
+    const text = buildStandupInstructions(briefing({ decisions: { needs: [{ need, binding: b }], withUser: [] } }), "Acme", 10_000);
+    expect(text).not.toContain("x".repeat(STANDUP_CONTEXT_MAX_CHARS + 1));
   });
 
   it("tells the model a gate note's binding is the ticket key and need is the pull request (BB-309)", () => {
