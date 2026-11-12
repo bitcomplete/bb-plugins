@@ -840,6 +840,7 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
     "An item's text is what was true when it was raised, not what is true now; its age says how much to trust it, so verify a stale claim before repeating it.",
     "When the owner questions a claim in the brief, or a claim is more than a few days old, treat that as not having the information: verify it with ask_a_thread rather than repeating it.",
+    "A brief acknowledgement from the owner (\"okay\", \"yes\", \"nice\", \"mm-hmm\") is not an interruption and needs no reply; after a real interruption, resume from where the reply was cut off and never start the briefing over.",
   ];
   const allSections = [
     { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions, now) },

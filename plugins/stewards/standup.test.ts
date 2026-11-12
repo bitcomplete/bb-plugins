@@ -484,6 +484,13 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(text).toContain("merge gate item is never applied by end_standup");
   });
 
+  it("tells the model a brief acknowledgement is not an interruption and to resume after a real one (BB-308)", () => {
+    const text = buildStandupInstructions(briefing(), "Acme", 10_000);
+    expect(text).toContain("\"okay\", \"yes\", \"nice\", \"mm-hmm\"");
+    expect(text).toContain("is not an interruption and needs no reply");
+    expect(text).toContain("resume from where the reply was cut off and never start the briefing over");
+  });
+
   it("names the scope and drops the project-wide sections for a scoped stand-up (BB-303)", () => {
     const text = buildStandupInstructions(briefing(), "Acme", 10_000, [], "ENG-12");
     expect(text).toContain("This stand-up is about ENG-12 only");

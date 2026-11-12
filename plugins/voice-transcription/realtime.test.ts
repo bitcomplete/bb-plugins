@@ -114,6 +114,39 @@ describe("realtime policy", () => {
     expect(REALTIME_SECRET_TTL_SECONDS).toBeLessThanOrEqual(60);
   });
 
+  it("defaults the input to near-field noise reduction and sceptical server VAD (BB-308)", () => {
+    const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [] }) as {
+      session: { audio: { input: Record<string, unknown> } };
+    };
+    expect(body.session.audio.input.noise_reduction).toEqual({ type: "near_field" });
+    expect(body.session.audio.input.turn_detection).toEqual({
+      type: "server_vad",
+      threshold: 0.75,
+      prefix_padding_ms: 300,
+      silence_duration_ms: 800,
+      create_response: true,
+      interrupt_response: true,
+    });
+  });
+
+  it("passes a caller's noise reduction and turn detection through unchanged, null included (BB-308)", () => {
+    const noiseReduction = { type: "far_field" };
+    const turnDetection = { type: "semantic_vad", eagerness: "low" };
+    const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], noiseReduction, turnDetection }) as {
+      session: { audio: { input: Record<string, unknown> } };
+    };
+    // Verbatim means the same object, not a copy reshaped to the defaults.
+    expect(body.session.audio.input.noise_reduction).toBe(noiseReduction);
+    expect(body.session.audio.input.turn_detection).toBe(turnDetection);
+
+    const off = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], noiseReduction: null, turnDetection: null }) as {
+      session: { audio: { input: Record<string, unknown> } };
+    };
+    // `null` is the caller turning the feature off at OpenAI, not an unset field.
+    expect(off.session.audio.input.noise_reduction).toBeNull();
+    expect(off.session.audio.input.turn_detection).toBeNull();
+  });
+
   it("pins the session to the language setting: transcription and the instructions both carry it", () => {
     const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], language: " EN " }) as {
       session: { instructions: string; audio: { input: { transcription: Record<string, string> } } };
@@ -346,6 +379,31 @@ describe("realtime mint route", () => {
     const on = (await open(host, { instructions: "x", tools: [ECHO], speaksFirst: true })) as { sessionId: string };
     const onBody = (await (await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: on.sessionId }))).json()) as Record<string, unknown>;
     expect(onBody.speaksFirst).toBe(true);
+  });
+
+  it("carries a caller's noise reduction and turn detection through the mint, null included (BB-308)", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    const sent: Array<{ session: { audio: { input: Record<string, unknown> } } }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        sent.push(JSON.parse(String(init?.body)) as { session: { audio: { input: Record<string, unknown> } } });
+        return jsonResponse({ value: "ek", expires_at: 1 });
+      }),
+    );
+
+    const noiseReduction = { type: "far_field" };
+    const turnDetection = { type: "server_vad", threshold: 0.9 };
+    const overridden = (await open(host, { instructions: "x", tools: [ECHO], noiseReduction, turnDetection })) as { sessionId: string };
+    await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: overridden.sessionId }));
+    expect(sent[0]!.session.audio.input.noise_reduction).toEqual(noiseReduction);
+    expect(sent[0]!.session.audio.input.turn_detection).toEqual(turnDetection);
+
+    // `null` is the caller turning the feature off, and must survive the RPC schema.
+    const off = (await open(host, { instructions: "x", tools: [ECHO], noiseReduction: null, turnDetection: null })) as { sessionId: string };
+    await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: off.sessionId }));
+    expect(sent[1]!.session.audio.input.noise_reduction).toBeNull();
+    expect(sent[1]!.session.audio.input.turn_detection).toBeNull();
   });
 
   it("calls the opener's onClose with the session id, and is a no-op without one", async () => {
