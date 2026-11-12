@@ -66,10 +66,22 @@ async function mountOverlay(): Promise<HTMLDivElement> {
   return pane;
 }
 
-/** jsdom reports 0 for both; a test sets the heights it wants the pane to see. */
+/**
+ * jsdom reports 0 for both heights. A test sets the sizes it wants the pane to
+ * see; `scrollTop` clamps to the browser's max, so the programmatic-scroll
+ * guard is exercised the way it is in a real pane.
+ */
 function mockPaneSize(pane: HTMLDivElement, size: { scrollHeight: number; clientHeight: number }): void {
   Object.defineProperty(pane, "scrollHeight", { configurable: true, get: () => size.scrollHeight });
   Object.defineProperty(pane, "clientHeight", { configurable: true, get: () => size.clientHeight });
+  let scrollTop = 0;
+  Object.defineProperty(pane, "scrollTop", {
+    configurable: true,
+    get: () => scrollTop,
+    set: (value: number) => {
+      scrollTop = Math.max(0, Math.min(value, size.scrollHeight - size.clientHeight));
+    },
+  });
 }
 
 async function addLine(line: { id: string; role: "user" | "assistant"; text: string }): Promise<void> {
@@ -119,11 +131,11 @@ describe("RealtimeVoiceOverlay transcript scrolling", () => {
     mockPaneSize(pane, size);
 
     await addLine({ id: "a1", role: "assistant", text: "first" });
-    expect(pane.scrollTop).toBe(300);
+    expect(pane.scrollTop).toBe(200);
 
     size.scrollHeight = 450;
     await addLine({ id: "a2", role: "assistant", text: "second" });
-    expect(pane.scrollTop).toBe(450);
+    expect(pane.scrollTop).toBe(350);
   });
 
   it("stops following after the owner scrolls up past the threshold", async () => {
@@ -131,7 +143,7 @@ describe("RealtimeVoiceOverlay transcript scrolling", () => {
     const size = { scrollHeight: 400, clientHeight: 100 };
     mockPaneSize(pane, size);
     await addLine({ id: "a1", role: "assistant", text: "first" });
-    expect(pane.scrollTop).toBe(400);
+    expect(pane.scrollTop).toBe(300);
     expect(jumpButton()).toBeNull();
 
     await scrollPane(pane, 100);
@@ -155,7 +167,7 @@ describe("RealtimeVoiceOverlay transcript scrolling", () => {
 
     size.scrollHeight = 500;
     await addLine({ id: "a2", role: "assistant", text: "second" });
-    expect(pane.scrollTop).toBe(500);
+    expect(pane.scrollTop).toBe(400);
   });
 
   it("re-pins and scrolls down when Jump to latest is pressed", async () => {
@@ -171,8 +183,26 @@ describe("RealtimeVoiceOverlay transcript scrolling", () => {
       button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    expect(pane.scrollTop).toBe(400);
+    expect(pane.scrollTop).toBe(300);
     expect(jumpButton()).toBeNull();
+  });
+
+  it("resets to pinned when a new session opens after the owner scrolled up", async () => {
+    const pane = await mountOverlay();
+    const size = { scrollHeight: 400, clientHeight: 100 };
+    mockPaneSize(pane, size);
+    await addLine({ id: "a1", role: "assistant", text: "first" });
+    await scrollPane(pane, 50);
+    expect(jumpButton()).not.toBeNull();
+
+    await act(async () => {
+      signalHandler?.({ sessionId: "session-2" });
+    });
+    expect(jumpButton()).toBeNull();
+
+    size.scrollHeight = 500;
+    await addLine({ id: "b1", role: "assistant", text: "second session" });
+    expect(pane.scrollTop).toBe(400);
   });
 
   it("follows content that grows without a new line", async () => {
@@ -195,6 +225,6 @@ describe("RealtimeVoiceOverlay transcript scrolling", () => {
     await act(async () => {
       observers[observers.length - 1]!.callback([], {} as ResizeObserver);
     });
-    expect(pane.scrollTop).toBe(600);
+    expect(pane.scrollTop).toBe(500);
   });
 });

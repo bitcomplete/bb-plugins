@@ -119,6 +119,11 @@ export function RealtimeVoiceOverlay() {
     setLines([]);
     setSecondsLeft(null);
     setMuted(false);
+    // A new session always starts following, whatever the owner left the pane
+    // at when the last one ended.
+    pinnedRef.current = true;
+    setPinned(true);
+    programmaticTargetRef.current = null;
     const client = new RealtimeSessionClient({
       mint: async () => {
         try {
@@ -187,7 +192,9 @@ export function RealtimeVoiceOverlay() {
   const scrollToBottom = (): void => {
     const pane = paneRef.current;
     if (pane === null) return;
-    programmaticTargetRef.current = pane.scrollHeight;
+    // The browser clamps `scrollTop` to this max, so it is the value a
+    // programmatic scroll actually lands on.
+    programmaticTargetRef.current = Math.max(0, pane.scrollHeight - pane.clientHeight);
     pane.scrollTop = pane.scrollHeight;
   };
 
