@@ -793,18 +793,21 @@ describe("the enriched agenda items (BB-312)", () => {
     expect(text).toContain("In review");
   });
 
-  it("renders a queued project note as a flag on the steward it names", () => {
-    const b = binding({ id: "b-note", entityKey: "ENG-6" });
+  it("renders a queued project note as a flag on the steward it names, as a whole token", () => {
+    const target = binding({ id: "b-note", entityKey: "BB-312" });
+    const other = binding({ id: "b-other", entityKey: "BB-31" });
     const brief = briefing({
-      notes: ["The owner asked about ENG-6"],
+      notes: ["The owner asked about BB-312"],
       decisions: { needs: [], withUser: [] },
       escalations: [],
       stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
       done: { moved: [], ended: [], answered: [] },
       assumptions: [],
     });
-    const text = buildStandupBrief(brief, [b], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
-    expect(text).toContain("project note:");
-    expect(text).toContain("ENG-6");
+    const text = buildStandupBrief(brief, [target, other], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    const item = (key: string) => text.split("\n- ").find((block) => block.startsWith(`${key}:`));
+    expect(item("BB-312")).toContain("project note:");
+    // The key is a whole token: a note about BB-312 does not land on BB-31.
+    expect(item("BB-31")).not.toContain("project note:");
   });
 });

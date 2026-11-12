@@ -1006,9 +1006,11 @@ function agendaBindingLines(binding: Binding, facts: StandupEntityFacts | null):
   return lines;
 }
 
-/** A queued project note that names this binding, as a flag, or null. */
+/** A queued project note that names this binding, as a flag, or null. The key is matched as a whole token, so a note about `BB-312` does not land on `BB-31`. */
 function noteFlag(binding: Binding, notes: readonly string[]): string | null {
-  const note = notes.find((n) => n.includes(binding.entityKey));
+  const escaped = binding.entityKey.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const pattern = new RegExp(`(?<![\\w-])${escaped}(?!\\d)`, "u");
+  const note = notes.find((n) => pattern.test(n));
   return note === undefined ? null : `project note: ${clipText(note, 160)}`;
 }
 
