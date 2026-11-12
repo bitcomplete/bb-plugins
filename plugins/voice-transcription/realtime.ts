@@ -19,6 +19,26 @@ export const DEFAULT_REALTIME_MODEL = "gpt-realtime";
 /** The default spoken voice for model replies. */
 export const DEFAULT_REALTIME_VOICE = "alloy";
 /**
+ * The default noise-reduction filter: OpenAI's close-talking-mic filter, which
+ * runs before VAD, so a phone's residual echo and a nearby cough are less
+ * likely to register as speech at all.
+ */
+export const DEFAULT_REALTIME_NOISE_REDUCTION: Record<string, unknown> = { type: "near_field" };
+/**
+ * The default turn detection: server VAD made sceptical of noise and short
+ * bursts (`threshold` above OpenAI's 0.5 default) with a longer silence window,
+ * so a pause inside a sentence does not end the turn. `interrupt_response`
+ * stays on deliberately: the agent must remain interruptible.
+ */
+export const DEFAULT_REALTIME_TURN_DETECTION: Record<string, unknown> = {
+  type: "server_vad",
+  threshold: 0.75,
+  prefix_padding_ms: 300,
+  silence_duration_ms: 800,
+  create_response: true,
+  interrupt_response: true,
+};
+/**
  * The model that transcribes the user's speech inside a Realtime session, so
  * the overlay can show the live transcript. Separate from the batch
  * transcription model above: Realtime has its own input-transcription model.
@@ -159,6 +179,14 @@ export function realtimeClientSecretBody(
       })),
       audio: {
         input: {
+          noise_reduction:
+            config.noiseReduction === undefined
+              ? DEFAULT_REALTIME_NOISE_REDUCTION
+              : config.noiseReduction,
+          turn_detection:
+            config.turnDetection === undefined
+              ? DEFAULT_REALTIME_TURN_DETECTION
+              : config.turnDetection,
           transcription: {
             model: REALTIME_INPUT_TRANSCRIPTION_MODEL,
             ...(language === null ? {} : { language }),

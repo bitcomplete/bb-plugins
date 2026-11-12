@@ -129,6 +129,18 @@ export type RealtimeSessionConfig = {
    * auto-detect, which guesses wrong on the first fragment of audio.
    */
   language?: string;
+  /**
+   * OpenAI's noise-reduction filter for the session's input audio, sent
+   * verbatim. Unset uses the plugin's near-field default; `null` turns the
+   * feature off at OpenAI.
+   */
+  noiseReduction?: Record<string, unknown> | null;
+  /**
+   * OpenAI's turn detection for the session's input audio, sent verbatim.
+   * Unset uses the plugin's sceptical server-VAD default; `null` turns turn
+   * detection off at OpenAI.
+   */
+  turnDetection?: Record<string, unknown> | null;
 };
 
 /**

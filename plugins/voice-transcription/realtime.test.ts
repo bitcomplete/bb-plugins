@@ -114,6 +114,39 @@ describe("realtime policy", () => {
     expect(REALTIME_SECRET_TTL_SECONDS).toBeLessThanOrEqual(60);
   });
 
+  it("defaults the input to near-field noise reduction and sceptical server VAD (BB-308)", () => {
+    const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [] }) as {
+      session: { audio: { input: Record<string, unknown> } };
+    };
+    expect(body.session.audio.input.noise_reduction).toEqual({ type: "near_field" });
+    expect(body.session.audio.input.turn_detection).toEqual({
+      type: "server_vad",
+      threshold: 0.75,
+      prefix_padding_ms: 300,
+      silence_duration_ms: 800,
+      create_response: true,
+      interrupt_response: true,
+    });
+  });
+
+  it("passes a caller's noise reduction and turn detection through unchanged, null included (BB-308)", () => {
+    const noiseReduction = { type: "far_field" };
+    const turnDetection = { type: "semantic_vad", eagerness: "low" };
+    const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], noiseReduction, turnDetection }) as {
+      session: { audio: { input: Record<string, unknown> } };
+    };
+    // Verbatim means the same object, not a copy reshaped to the defaults.
+    expect(body.session.audio.input.noise_reduction).toBe(noiseReduction);
+    expect(body.session.audio.input.turn_detection).toBe(turnDetection);
+
+    const off = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], noiseReduction: null, turnDetection: null }) as {
+      session: { audio: { input: Record<string, unknown> } };
+    };
+    // `null` is the caller turning the feature off at OpenAI, not an unset field.
+    expect(off.session.audio.input.noise_reduction).toBeNull();
+    expect(off.session.audio.input.turn_detection).toBeNull();
+  });
+
   it("pins the session to the language setting: transcription and the instructions both carry it", () => {
     const body = realtimeClientSecretBody({ instructions: "Say hi.", tools: [], language: " EN " }) as {
       session: { instructions: string; audio: { input: { transcription: Record<string, string> } } };
