@@ -3,7 +3,7 @@
 // two-line effort rows with the four glyphs, inline needs-you actions, and the
 // Blocked / In flight / Threads / Monitors / Recently ended sections.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
@@ -2978,46 +2978,88 @@ describe("the stewards sidebar's data age and refresh (BB-205)", () => {
   });
 });
 
-// BB-302: the Stand-up button beside New thread. It is shown for the active
-// project only when the server reports a stand-up available, carries the
-// "Waiting on you" count when non-zero, retargets on a project switch, and
-// starts a stand-up through the same RPC the page uses.
+// BB-302/BB-304: the Stand-up button in the pinned project steward row. It is
+// shown for the active project only when the server reports a stand-up
+// available and the row exists, carries the "Waiting on you" count when
+// non-zero, retargets on a project switch, and starts a stand-up through the
+// same RPC the page uses without opening the steward thread.
 describe("the sidebar Stand-up button (BB-302)", () => {
-  it("shows beside New thread only when a stand-up is available, and starts one", async () => {
+  it("shows in the project steward row only when a stand-up is available, and starts one", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [] },
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_ps", displayTitle: "Acme project steward" })],
+      },
       rpc: {
-        stewardsSidebar: () => sidebarData(),
+        stewardsSidebar: () => sidebarData({ projectStewardThreadId: "thr_ps" }),
         stewardsStandupStatus: () => ({ available: true, waiting: 0 }),
         stewardsStandupStart: () => ({ ok: true, sessionId: "sess_1", standupId: "sup_1", message: "Stand-up started." }),
       } as never,
     });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Stand-up" })).toBeTruthy());
+    const stewardRow = (await waitFor(() => slot.getByText("Acme project steward"))).closest("li")!;
+    const button = await waitFor(() => within(stewardRow).getByRole("button", { name: "Stand-up" }));
+    // The header is the project picker plus New thread; the button is not there.
     expect(slot.getByRole("button", { name: "New thread" })).toBeTruthy();
-    fireEvent.click(slot.getByRole("button", { name: "Stand-up" }));
+    expect(slot.getByRole("button", { name: "New thread" }).parentElement!.contains(button)).toBe(false);
+    fireEvent.click(button);
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsStandupStart", input: { projectId: "p1", client: null } }));
+    // Starting a stand-up never navigates into the steward thread.
+    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_ps" });
     slot.lifecycle.unmount();
   });
 
   it("shows no button when the status is unavailable", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [] },
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_ps", displayTitle: "Acme project steward" })],
+      },
       rpc: {
-        stewardsSidebar: () => sidebarData(),
+        stewardsSidebar: () => sidebarData({ projectStewardThreadId: "thr_ps" }),
         stewardsStandupStatus: () => ({ available: false, waiting: 3 }),
       } as never,
     });
-    await waitFor(() => expect(slot.getByText("Nothing in flight.")).toBeTruthy());
+    await waitFor(() => expect(slot.getByText("project steward")).toBeTruthy());
     expect(slot.queryByRole("button", { name: "Stand-up" })).toBeNull();
     expect(slot.getByRole("button", { name: "New thread" })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
-  it("labels the button with the waiting count only when non-zero", async () => {
-    const slot = await renderSidebar({
+  it("shows no button and no footer row without a steward row", async () => {
+    // No steward id at all.
+    const noId = await renderSidebar({
       sidebarThreads: { projects, threads: [] },
       rpc: {
-        stewardsSidebar: () => sidebarData(),
+        stewardsSidebar: () => sidebarData({ projectStewardThreadId: null }),
+        stewardsStandupStatus: () => ({ available: true, waiting: 2 }),
+      } as never,
+    });
+    await waitFor(() => expect(noId.getByText("Nothing in flight.")).toBeTruthy());
+    expect(noId.queryByRole("button", { name: "Stand-up" })).toBeNull();
+    expect(noId.queryByText("project steward")).toBeNull();
+    noId.lifecycle.unmount();
+    // An id whose thread is not in the sidebar's list.
+    const missing = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ projectStewardThreadId: "thr_missing" }),
+        stewardsStandupStatus: () => ({ available: true, waiting: 2 }),
+      } as never,
+    });
+    await waitFor(() => expect(missing.getByText("Nothing in flight.")).toBeTruthy());
+    expect(missing.queryByRole("button", { name: "Stand-up" })).toBeNull();
+    expect(missing.queryByText("project steward")).toBeNull();
+    missing.lifecycle.unmount();
+  });
+
+  it("labels the button with the waiting count only when non-zero", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_ps", displayTitle: "Acme project steward" })],
+      },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ projectStewardThreadId: "thr_ps" }),
         stewardsStandupStatus: () => ({ available: true, waiting: 4 }),
       } as never,
     });
@@ -3027,9 +3069,19 @@ describe("the sidebar Stand-up button (BB-302)", () => {
 
   it("retargets the button when the active project changes", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [] },
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_ps", displayTitle: "Acme project steward" }),
+          thread({ id: "thr_ps_personal", projectId: "personal", displayTitle: "Personal project steward" }),
+        ],
+      },
       rpc: {
-        stewardsSidebar: (input: { projectId: string | null }) => sidebarData({ projectId: input.projectId ?? "p1" }),
+        stewardsSidebar: (input: { projectId: string | null }) =>
+          sidebarData({
+            projectId: input.projectId ?? "p1",
+            projectStewardThreadId: input.projectId === "personal" ? "thr_ps_personal" : "thr_ps",
+          }),
         stewardsStandupStatus: (input: { projectId: string }) => ({ available: true, waiting: input.projectId === "p1" ? 2 : 0 }),
       } as never,
     });
@@ -3043,9 +3095,12 @@ describe("the sidebar Stand-up button (BB-302)", () => {
 
   it("shows the refusal as the button's tooltip, not an inline line", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [] },
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_ps", displayTitle: "Acme project steward" })],
+      },
       rpc: {
-        stewardsSidebar: () => sidebarData(),
+        stewardsSidebar: () => sidebarData({ projectStewardThreadId: "thr_ps" }),
         stewardsStandupStatus: () => ({ available: true, waiting: 0 }),
         stewardsStandupStart: () => ({ ok: false, sessionId: null, standupId: null, message: "A stand-up needs a project steward." }),
       } as never,

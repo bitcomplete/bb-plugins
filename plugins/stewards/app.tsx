@@ -813,7 +813,13 @@ function StandupButton({ projectId, binding = null, onStarted, waiting = 0, erro
         // button's tooltip rather than an inline span; the page and home line
         // keep the inline message.
         title={errorAsTitle && error !== null ? error : undefined}
-        onClick={start}
+        onClick={(event) => {
+          // BB-304: the sidebar renders this in the pinned project steward row,
+          // whose title opens the steward thread. Starting a stand-up is not a
+          // navigation, so the click never reaches the row.
+          event.stopPropagation();
+          start();
+        }}
       >
         {label}
       </button>
@@ -2730,7 +2736,7 @@ const SidebarCollapsible = memo(function SidebarCollapsible({ title, count, reve
  * closes through Radix's own dismissal. Presentational only: `onPick` is the
  * parent's stable callback, so the memo (BB-95) still holds.
  */
-const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompactViewport, onPick, onNewThread, standup }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; isCompactViewport: boolean; onPick: (projectId: string) => void; onNewThread: () => void; standup: { projectId: string; available: boolean; waiting: number } | null }) {
+const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompactViewport, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; isCompactViewport: boolean; onPick: (projectId: string) => void; onNewThread: () => void }) {
   const activeIndex = tabs.findIndex((t) => t.projectId === activeId);
   const active = tabs[activeIndex === -1 ? 0 : activeIndex];
   const activeCount = active === undefined ? 0 : counts.get(active.projectId) ?? 0;
@@ -2874,7 +2880,6 @@ const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, isCompac
       </PopoverPrimitive.Root>
       {tabs.length > 0 ? (
         <>
-          {standup !== null && standup.available && standup.projectId === activeId ? <StandupButton projectId={standup.projectId} waiting={standup.waiting} errorAsTitle /> : null}
           <button
             type="button"
             aria-label="New thread"
@@ -3318,7 +3323,17 @@ function StewardsSidebarCore({
             unreadKey=""
             threadActions={false}
             entered={loaded}
-            meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
+            // BB-304: the Stand-up button lives in the pinned steward row. Its
+            // `Stand-up · N` label reads as "N waiting with the steward" there,
+            // where beside New thread it read as a thread count. A row with no
+            // button (no stand-up, or a stale tab) keeps the plain label.
+            meta={
+              standupStatus !== null && standupStatus.available && standupStatus.projectId === tab.projectId ? (
+                <StandupButton projectId={tab.projectId} waiting={standupStatus.waiting} errorAsTitle />
+              ) : (
+                <span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>
+              )
+            }
           />
         </div>
       ) : null}
@@ -3333,7 +3348,6 @@ function StewardsSidebarCore({
         isCompactViewport={isCompactViewport}
         onPick={pick}
         onNewThread={newThread}
-        standup={standupStatus}
       />
       {!rpcReady ? (
         !skeleton && staleTab !== null ? body(staleTab, true) : <SidebarSkeleton />
