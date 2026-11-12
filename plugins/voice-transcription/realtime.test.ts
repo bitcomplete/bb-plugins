@@ -22,6 +22,9 @@ import {
   REALTIME_MINT_PATH,
   REALTIME_SIGNAL_CHANNEL,
   REALTIME_TOOL_PATH,
+  REALTIME_USER_PLACEHOLDER,
+  upsertRealtimeLine,
+  type RealtimeLine,
 } from "./realtime-shared.js";
 import { PLUGIN_ID, createVoiceTranscriptionPlugin } from "./server.js";
 
@@ -500,5 +503,43 @@ describe("realtime tool route", () => {
     );
     expect(noHandler.status).toBe(409);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("realtime overlay transcript", () => {
+  it("upserts by id so two assistant items stay two bubbles", () => {
+    let lines: RealtimeLine[] = [];
+    lines = upsertRealtimeLine(lines, { id: "a1", role: "assistant", text: "let me ask", responseId: "r1" });
+    lines = upsertRealtimeLine(lines, { id: "a2", role: "assistant", text: "here's the answer", responseId: "r2" });
+    lines = upsertRealtimeLine(lines, { id: "a1", role: "assistant", text: "let me ask a thread", responseId: "r1" });
+
+    expect(lines.map((line) => line.id)).toEqual(["a1", "a2"]);
+    expect(lines[0]!.text).toBe("let me ask a thread");
+    expect(lines[1]!.text).toBe("here's the answer");
+  });
+
+  it("inserts the owner's line before the assistant reply by previous_item_id", () => {
+    let lines: RealtimeLine[] = [];
+    lines = upsertRealtimeLine(lines, { id: "a1", role: "assistant", text: "sure", responseId: "r1" });
+    lines = upsertRealtimeLine(lines, { id: "u2", role: "user", text: REALTIME_USER_PLACEHOLDER, previousId: null });
+
+    expect(lines.map((line) => line.id)).toEqual(["u2", "a1"]);
+  });
+
+  it("keeps a truncated line cut off when a later update arrives", () => {
+    let lines: RealtimeLine[] = [];
+    lines = upsertRealtimeLine(lines, { id: "a1", role: "assistant", text: "Hello ", truncated: true, responseId: "r1" });
+    lines = upsertRealtimeLine(lines, { id: "a1", role: "assistant", text: "Hello ", responseId: "r1" });
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.truncated).toBe(true);
+  });
+
+  it("removes a line whose transcription completed empty", () => {
+    let lines: RealtimeLine[] = [];
+    lines = upsertRealtimeLine(lines, { id: "u1", role: "user", text: REALTIME_USER_PLACEHOLDER, previousId: null });
+    lines = upsertRealtimeLine(lines, { id: "u1", role: "user", text: "", removed: true });
+
+    expect(lines).toEqual([]);
   });
 });

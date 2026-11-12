@@ -16,12 +16,13 @@ import {
   REALTIME_MINT_PATH,
   REALTIME_SIGNAL_CHANNEL,
   REALTIME_TOOL_PATH,
+  upsertRealtimeLine,
   type MintedRealtimeSession,
+  type RealtimeLine,
 } from "./realtime-shared.js";
 import {
   RealtimeSessionClient,
   RealtimeSessionTakenError,
-  type RealtimeLine,
   type RealtimeStatus,
 } from "./realtime-client.js";
 
@@ -131,14 +132,7 @@ function RealtimeVoiceOverlay() {
       close: async () => {
         await callRoute(REALTIME_CLOSE_PATH, { sessionId });
       },
-      onLine: (line) =>
-        setLines((current) => {
-          const next = [...current];
-          const last = next[next.length - 1];
-          if (line.role === "assistant" && last?.role === "assistant") next[next.length - 1] = line;
-          else next.push(line);
-          return next;
-        }),
+      onLine: (line) => setLines((current) => upsertRealtimeLine(current, line)),
       onStatus: (next, message) => {
         setStatus(next);
         if (next === "error" && message !== undefined) setError(message);
@@ -227,9 +221,9 @@ function RealtimeVoiceOverlay() {
         {lines.length === 0 && status === "live" && (
           <div style={{ opacity: 0.6 }}>Listening…</div>
         )}
-        {lines.map((line, index) => (
+        {lines.map((line) => (
           <div
-            key={index}
+            key={line.id}
             style={{
               alignSelf: line.role === "user" ? "flex-end" : "flex-start",
               maxWidth: "85%",
@@ -239,7 +233,7 @@ function RealtimeVoiceOverlay() {
               whiteSpace: "pre-wrap",
             }}
           >
-            {line.text}
+            {line.truncated === true ? `${line.text}…` : line.text}
           </div>
         ))}
       </div>
