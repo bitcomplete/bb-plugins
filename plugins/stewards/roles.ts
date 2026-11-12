@@ -7,9 +7,9 @@
 // own `check` problems come from config.ts.
 import { z } from "zod";
 import { globError } from "./decisions.js";
-import { opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
+import { opsTargetKey, type AlertmanagerTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { REPO_NAME } from "./source-contract.js";
-import { DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, sentrySlug, sentryTargets, STEWARDS_DIR, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
+import { alertmanagerTargets, DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, roleAlertmanagerSchema, sentrySlug, sentryTargets, STEWARDS_DIR, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
 
 /** The per-person roles: which watches and the project stewardship a GitHub login's server runs. */
 export const ROLES_FILE = `${STEWARDS_DIR}/roles.json`;
@@ -82,6 +82,8 @@ export const roleOpsSchema = z
     team: filingTargetSchema.optional(),
     autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
     sentry: roleSentrySchema,
+    /** Kubernetes namespaces this person watches for Prometheus Alertmanager alerts (BB-314); read through the plugin's Alertmanager URL, no token. */
+    alertmanager: roleAlertmanagerSchema,
     /** Repos whose Dependabot alerts this person watches; `"all"` is every repo in repos.json less github.exclude. */
     dependabot: z.union([z.literal("all"), z.array(dependabotRepoSchema).max(200)]).optional(),
     /** Pull requests this role's server adopts by shape, under a playbook, with no label (BB-164). */
@@ -173,6 +175,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
   const k8sNamespaces: string[] = [];
   const autoAdopt: RoleOps["autoAdopt"] = [];
   const projects: RoleOps["sentry"]["projects"] = [];
+  const alertmanagerNamespaces: string[] = [];
   const dependabot: string[] = [];
   const pulls: RoleOps["pulls"] = [];
   let dependabotAll = false;
@@ -183,6 +186,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
     for (const name of def.k8sNamespaces) if (!k8sNamespaces.includes(name)) k8sNamespaces.push(name);
     for (const priority of def.autoAdopt) if (!autoAdopt.includes(priority)) autoAdopt.push(priority);
     for (const project of def.sentry.projects) if (!projects.some((p) => p.org === project.org && p.project === project.project)) projects.push(project);
+    for (const namespace of def.alertmanager.namespaces) if (!alertmanagerNamespaces.includes(namespace)) alertmanagerNamespaces.push(namespace);
     if (def.context !== undefined && context === undefined) context = def.context;
     if (def.team !== undefined && team === undefined) team = def.team;
     if (def.sentry.resolveOnDone) resolveOnDone = true;
@@ -190,7 +194,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
     else if (Array.isArray(def.dependabot)) for (const repo of def.dependabot) if (!dependabot.includes(repo)) dependabot.push(repo);
     for (const watch of def.pulls) if (!pulls.some((w) => samePullWatch(w, watch))) pulls.push(watch);
   }
-  const ops: RoleOps = { k8sNamespaces, autoAdopt, sentry: { projects, resolveOnDone }, pulls };
+  const ops: RoleOps = { k8sNamespaces, autoAdopt, sentry: { projects, resolveOnDone }, alertmanager: { namespaces: alertmanagerNamespaces }, pulls };
   if (context !== undefined) ops.context = context;
   if (team !== undefined) ops.team = team;
   if (dependabotAll) ops.dependabot = "all";
@@ -250,8 +254,11 @@ export const roleK8sTargets = (role: Role | null): K8sTarget[] => (role?.ops?.k8
 /** The Sentry projects a role watches, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
 export const roleSentryTargets = (role: Role | null): SentryTarget[] => (role?.ops?.sentry?.projects ?? []).map((p) => ({ kind: "sentry-project", org: p.org, project: p.project }));
 
-/** The namespace and Sentry targets a role watches; the Dependabot watch is separate because it defaults to every repo. */
-export const roleOpsTargets = (role: Role | null): OpsTarget[] => [...roleK8sTargets(role), ...roleSentryTargets(role)];
+/** The Kubernetes namespaces a role watches for Alertmanager alerts, which are read through the plugin's Alertmanager URL and rung by bb-gate-hooks. */
+export const roleAlertmanagerTargets = (role: Role | null): AlertmanagerTarget[] => (role?.ops?.alertmanager?.namespaces ?? []).map((namespace) => ({ kind: "alertmanager", namespace }));
+
+/** The namespace, Sentry and Alertmanager targets a role watches; the Dependabot watch is separate because it defaults to every repo. */
+export const roleOpsTargets = (role: Role | null): OpsTarget[] => [...roleK8sTargets(role), ...roleSentryTargets(role), ...roleAlertmanagerTargets(role)];
 
 /**
  * The Dependabot alert targets a role watches: `"all"` is every repo in the
@@ -288,7 +295,7 @@ export const roleOpsTeam = (role: Role | null, project: ProjectFile): FilingTarg
  * playbook is needed. The Dependabot watch runs the separate deps-alerts
  * playbook, so it does not count here.
  */
-export const roleUsesOps = (role: Role | null): boolean => roleK8sTargets(role).length > 0 || roleSentryTargets(role).length > 0;
+export const roleUsesOps = (role: Role | null): boolean => roleK8sTargets(role).length > 0 || roleSentryTargets(role).length > 0 || roleAlertmanagerTargets(role).length > 0;
 
 /**
  * Whether a project uses a kind of binding at all: reviews can be turned off,
@@ -314,6 +321,7 @@ export function legacyRole(project: ProjectFile): Role {
       ...(project.ops.context === undefined ? {} : { context: project.ops.context }),
       autoAdopt: [...project.ops.autoAdopt],
       sentry: { projects: sentryTargets(project).map((t) => ({ org: t.org, project: t.project })), resolveOnDone: project.ops.sentry.resolveOnDone },
+      alertmanager: { namespaces: alertmanagerTargets(project).map((t) => t.namespace) },
       dependabot: explicit.length > 0 ? explicit : "all",
       pulls: [],
     },
@@ -323,6 +331,7 @@ export function legacyRole(project: ProjectFile): Role {
 function watchLabel(key: string): string {
   if (key.startsWith("k8s-namespace/")) return `the ${key.slice("k8s-namespace/".length)} watch`;
   if (key.startsWith("sentry-project/")) return `the Sentry watch for ${key.slice("sentry-project/".length)}`;
+  if (key.startsWith("alertmanager/")) return `the Alertmanager watch for ${key.slice("alertmanager/".length)}`;
   return `the Dependabot watch for ${key.slice("dependabot/".length)}`;
 }
 /** Every watch a role runs, keyed as `opsTargetKey` keys the same target. */
@@ -345,6 +354,7 @@ export function expectedWatches(project: ProjectFile, repos: readonly string[], 
   };
   for (const t of k8sTargets(project)) add(opsTargetKey(t));
   for (const t of sentryTargets(project)) add(opsTargetKey(t));
+  for (const t of alertmanagerTargets(project)) add(opsTargetKey(t));
   const explicit = project.ops.targets.filter((t): t is DependabotTarget => t.kind === "dependabot").map((t) => t.repo);
   if (explicit.length > 0) for (const repo of explicit) add(opsTargetKey({ kind: "dependabot", repo }));
   else if (depsEnabled) for (const repo of repos) add(opsTargetKey({ kind: "dependabot", repo }));

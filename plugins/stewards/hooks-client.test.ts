@@ -123,7 +123,7 @@ describe("subscribe", () => {
     const hooks = fakeHooks();
     const ids: Lease[] = [{ kind: "project", id: "acme/web" }, ...Array.from({ length: 149 }, (_, i) => ({ kind: "issue" as const, id: `i-${i + 1}` }))];
     hooks.state.answer = (body) => Response.json({ leases: body.watches.slice(1), rejected: [{ ...body.watches[0], reason: "forbidden" }] });
-    const result = await subscribe(hooks.fetchImpl, BASE, "c_1", "tok-1", ids, new AbortController().signal);
+    const result = await subscribe(hooks.fetchImpl, BASE, "c_1", "sentry", "tok-1", ids, new AbortController().signal);
     expect(hooks.subscribes).toHaveLength(2);
     expect(hooks.subscribes[0]).toMatchObject({ connection: "c_1", source: "sentry", token: "tok-1" });
     expect(hooks.subscribes[0]!.watches).toHaveLength(100);
@@ -136,13 +136,17 @@ describe("subscribe", () => {
   it("throws with the status and body when the connection is unknown, without the token in the message", async () => {
     const hooks = fakeHooks();
     hooks.state.answer = () => Response.json({ error: "unknown-connection" }, { status: 404 });
-    const error = await subscribe(hooks.fetchImpl, BASE, "c_gone", "tok-secret", [{ kind: "issue", id: "i" }], new AbortController().signal).catch((e: unknown) => e);
+    const error = await subscribe(hooks.fetchImpl, BASE, "c_gone", "sentry", "tok-secret", [{ kind: "issue", id: "i" }], new AbortController().signal).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(HooksRequestError);
     expect((error as HooksRequestError).status).toBe(404);
     expect((error as HooksRequestError).unknownConnection).toBe(true);
     expect((error as Error).message + (error as HooksRequestError).body).not.toContain("tok-secret");
     expect(new HooksRequestError("x", 404, "not found").unknownConnection).toBe(false);
     expect(new HooksRequestError("x", 200, JSON.stringify({ error: "unknown-connection" })).unknownConnection).toBe(false);
+    // The service's image does not know a source: a 400 `unknown source`, distinct from a wrong URL's 404.
+    expect(new HooksRequestError("x", 400, "unknown source\n").unknownSource).toBe(true);
+    expect(new HooksRequestError("x", 400, "bad request\n").unknownSource).toBe(false);
+    expect(new HooksRequestError("x", 404, "unknown source").unknownSource).toBe(false);
   });
 });
 
@@ -159,12 +163,13 @@ describe("the loop", () => {
     await vi.advanceTimersByTimeAsync(ms);
   };
 
-  function start(hooks: ReturnType<typeof fakeHooks>, over: { watchIds?: () => Lease[]; token?: () => Promise<string | null>; idleMs?: number } = {}) {
+  function start(hooks: ReturnType<typeof fakeHooks>, over: { watchIds?: () => Lease[]; token?: (() => Promise<string | null>) | null; source?: string; idleMs?: number } = {}) {
     const logs: string[] = [];
     const sweeps: string[] = [];
     const doorbells: string[] = [];
     const doorbellKinds: string[] = [];
     const units: Array<string | null> = [];
+    const actions: Array<string | null> = [];
     const rejected: Rejection[][] = [];
     let token: string | null = "tok-1";
     const loop = createHooksLoop({
@@ -172,12 +177,16 @@ describe("the loop", () => {
       baseUrl: BASE,
       now: () => now,
       log: { info: (m) => logs.push(`info ${m}`), warn: (m) => logs.push(`warn ${m}`) },
-      token: over.token ?? (async () => token),
+      source: over.source ?? "sentry",
+      token: over.token === undefined ? async () => token : over.token,
       watchIds: over.watchIds ?? (() => [{ kind: "issue", id: "i-1" }, { kind: "issue", id: "i-2" }]),
-      onDoorbell: (kind, id, unit) => {
+      onDoorbell: (kind, id, unit, action) => {
+        // The sentry caller's own kind filter, as server.ts has it.
+        if (kind !== "issue") return;
         doorbellKinds.push(kind);
         doorbells.push(id);
         units.push(unit);
+        actions.push(action);
       },
       onRejected: async (r) => {
         rejected.push(r);
@@ -189,7 +198,7 @@ describe("the loop", () => {
     });
     const controller = new AbortController();
     const done = loop.run(controller.signal);
-    return { loop, logs, sweeps, doorbells, doorbellKinds, units, rejected, controller, done, setToken: (t: string | null) => (token = t) };
+    return { loop, logs, sweeps, doorbells, doorbellKinds, units, actions, rejected, controller, done, setToken: (t: string | null) => (token = t) };
   }
 
   it("subscribes every watch on hello with the current token, sweeps, then rings on doorbells for issues only", async () => {
@@ -326,7 +335,8 @@ describe("the loop", () => {
     hooks.last().send(hooks.doorbell("i-2"));
     hooks.last().send(hooks.doorbell("web", { kind: "project" }));
     await tick();
-    expect(s.loop.status()).toMatchObject({ doorbells: 2, lastDoorbellAt: now });
+    // Every doorbell of the source is counted; the caller filters the kinds it knows.
+    expect(s.loop.status()).toMatchObject({ doorbells: 3, lastDoorbellAt: now });
     // Counts are over the last hour; the last time is kept.
     const lastDoorbellAt = now;
     await tick(61 * MINUTE);
@@ -392,6 +402,68 @@ describe("the loop", () => {
     await t.done;
   });
 
+  it("carries the doorbell's action and unit to the caller", async () => {
+    const hooks = fakeHooks();
+    const s = start(hooks);
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    hooks.last().send(hooks.doorbell("i-1", { action: "resolved", unit: "web" }));
+    hooks.last().send(hooks.doorbell("i-2", { action: "created", unit: "" }));
+    await tick();
+    expect(s.actions).toEqual(["resolved", "created"]);
+    expect(s.units).toEqual(["web", null]);
+    s.controller.abort();
+    await s.done;
+  });
+
+  it("leases a tokenless source with no token, and an old service that answers 400 is said once and left to the sweep", async () => {
+    const hooks = fakeHooks();
+    // The pre-BB-314 service rejects a tokenless subscribe with `bad request` before it looks up the source.
+    hooks.state.answer = () => new Response("bad request\n", { status: 400 });
+    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "bb-gate-production" }] });
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    // The subscribe body carries no token at all, and the source is named.
+    expect(hooks.subscribes).toEqual([{ connection: "c_1", source: "alertmanager", token: "", watches: [{ kind: "namespace", id: "bb-gate-production" }] }]);
+    expect(s.loop.connected).toBe(false);
+    expect(s.loop.status().sourceProblem).toBe("unknown");
+    expect(s.logs.filter((l) => l.includes("does not know the alertmanager source"))).toHaveLength(1);
+    // The sweep is the scheduled look; the problem is not logged again.
+    expect(s.sweeps).toEqual(["connected"]);
+    await tick(30 * MINUTE);
+    expect(hooks.subscribes).toHaveLength(2);
+    expect(s.logs.filter((l) => l.includes("does not know the alertmanager source"))).toHaveLength(1);
+    expect(s.sweeps.filter((r) => r === "failed renewal")).toHaveLength(1);
+    // The service learns the source: the next renewal leases it and clears the problem.
+    hooks.state.answer = (body) => Response.json({ leases: body.watches, rejected: [] });
+    await tick(30 * MINUTE);
+    expect(s.loop.connected).toBe(true);
+    expect(s.loop.status().sourceProblem).toBeNull();
+    s.controller.abort();
+    await s.done;
+  });
+
+  it("says once when the service has no adapter configured (503), then leases when it does", async () => {
+    const hooks = fakeHooks();
+    hooks.state.answer = () => new Response("not configured\n", { status: 503 });
+    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "bb-gate-production" }] });
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    expect(s.loop.status().sourceProblem).toBe("unconfigured");
+    expect(s.logs.filter((l) => l.includes("has no alertmanager adapter configured"))).toHaveLength(1);
+    await tick(30 * MINUTE);
+    expect(s.logs.filter((l) => l.includes("has no alertmanager adapter configured"))).toHaveLength(1);
+    hooks.state.answer = (body) => Response.json({ leases: body.watches, rejected: [] });
+    await tick(30 * MINUTE);
+    expect(s.loop.connected).toBe(true);
+    expect(s.loop.status().sourceProblem).toBeNull();
+    s.controller.abort();
+    await s.done;
+  });
+
   it("says once when the service reports Sentry refused the token, and tries again at the next renewal", async () => {
     const hooks = fakeHooks();
     hooks.state.answer = (body) => (body.token === "tok-good" ? Response.json({ leases: body.watches, rejected: [] }) : new Response("", { status: 401 }));
@@ -402,13 +474,13 @@ describe("the loop", () => {
     expect(hooks.subscribes.map((b) => b.token)).toEqual(["tok-1"]);
     expect(s.loop.connected).toBe(false);
     expect(s.sweeps).toEqual(["connected"]);
-    expect(s.logs.filter((l) => l.includes("Sentry refused the token"))).toHaveLength(1);
+    expect(s.logs.filter((l) => l.includes("sentry refused the token"))).toHaveLength(1);
     expect(s.logs.join("\n")).not.toMatch(/tok-/u);
 
     // Still refused at the renewal: a failed renewal, said no second time.
     await tick(30 * MINUTE);
     expect(hooks.subscribes).toHaveLength(2);
-    expect(s.logs.filter((l) => l.includes("Sentry refused the token"))).toHaveLength(1);
+    expect(s.logs.filter((l) => l.includes("sentry refused the token"))).toHaveLength(1);
     expect(s.sweeps.filter((r) => r === "failed renewal")).toHaveLength(1);
     expect(s.rejected).toEqual([]);
     expect(hooks.streams).toHaveLength(1);

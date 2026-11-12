@@ -15,6 +15,7 @@ import { depsLookSchema, type DepsLook } from "./deps.js";
 import { deploymentsSchema, type Deployments } from "./deploy.js";
 import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
+import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import type { GuidanceCitation } from "./guidance.js";
 import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
@@ -719,7 +720,13 @@ export const STANDUP_DELEGATION_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN d
 // default, so every row written before this step reads back as not completed.
 export const STANDUP_COMPLETED_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN completed INTEGER NOT NULL DEFAULT 0`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS];
+// BB-314: an Alertmanager namespace binding's last look at its target, the
+// alerts firing and the ones resolved since the look before. A new column,
+// null for every other binding and for every row written before this step, so
+// a store from before the step reads back exactly as before.
+export const ALERTMANAGER_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN alertmanager_look TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -949,6 +956,8 @@ export type Binding = {
   depsLook: DepsLook | null;
   /** A Sentry project binding's last look; null for every other kind. */
   sentryLook: SentryLook | null;
+  /** An Alertmanager namespace binding's last look; null for every other kind. */
+  alertmanagerLook: AlertmanagerLook | null;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
   deployments: Deployments;
   /** When the binding became idle in an active stage, or null (BB-83). */
@@ -1043,6 +1052,7 @@ function rowToBinding(r: BindingRow): Binding {
     opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
+    alertmanagerLook: json(alertmanagerLookSchema.nullable(), str("alertmanager_look"), null),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
     idleWokenAt: num("idle_woken_at"),
@@ -1115,6 +1125,7 @@ const COLUMNS = {
   opsLook: "ops_look",
   depsLook: "deps_look",
   sentryLook: "sentry_look",
+  alertmanagerLook: "alertmanager_look",
   deployments: "deployments",
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",

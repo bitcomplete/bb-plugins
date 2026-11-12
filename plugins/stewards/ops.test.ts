@@ -18,6 +18,12 @@ describe("targets", () => {
     expect(parseOpsTargetKey("sentry-project/acme/web-api")).toEqual(sentry);
     expect(parseOpsTargetKey("sentry-project/acme")).toBeNull();
     expect(parseOpsTargetKey("sentry-project/Acme/web")).toBeNull();
+    // An Alertmanager target is a Kubernetes namespace, keyed by the namespace.
+    const alertmanager = { kind: "alertmanager", namespace: "bb-gate-production" } as const;
+    expect(opsTargetKey(alertmanager)).toBe("alertmanager/bb-gate-production");
+    expect(parseOpsTargetKey("alertmanager/bb-gate-production")).toEqual(alertmanager);
+    expect(parseOpsTargetKey("alertmanager/BB-Gate")).toBeNull();
+    expect(parseOpsTargetKey("alertmanager")).toBeNull();
   });
 });
 

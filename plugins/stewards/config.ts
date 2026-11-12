@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { decideEntrySchema, defaultDecideList, globError } from "./decisions.js";
-import { SENTRY_SLUG, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
+import { ALERTMANAGER_NAMESPACE, SENTRY_SLUG, type AlertmanagerTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
@@ -178,7 +178,19 @@ export const sentrySlug = z.string().trim().toLowerCase().regex(SENTRY_SLUG, "a 
 /** A Sentry project whose issues an ops steward watches, read with the plugin's Sentry token. */
 const sentryProjectTargetSchema = z.object({ kind: z.literal("sentry-project"), org: sentrySlug, project: sentrySlug }).strict();
 
-const opsTargetSchema = z.discriminatedUnion("kind", [k8sNamespaceTargetSchema, dependabotTargetSchema, sentryProjectTargetSchema]);
+/** A Kubernetes namespace watched for Prometheus Alertmanager alerts; read through the plugin's Alertmanager URL. */
+export const alertmanagerNamespace = z.string().trim().regex(ALERTMANAGER_NAMESPACE, "a namespace name such as bb-gate-production");
+const alertmanagerTargetSchema = z.object({ kind: z.literal("alertmanager"), namespace: alertmanagerNamespace }).strict();
+
+/**
+ * The Alertmanager namespaces a role watches (BB-314). The opt-in lives in
+ * `roles.json` as `ops.alertmanager.namespaces`, and the strict parser means a
+ * server running an older image rejects the key with one problem line until it
+ * restarts onto the image that knows it.
+ */
+export const roleAlertmanagerSchema = z.object({ namespaces: z.array(alertmanagerNamespace).max(50).default([]) }).strict().default({ namespaces: [] });
+
+export const opsTargetSchema = z.discriminatedUnion("kind", [k8sNamespaceTargetSchema, dependabotTargetSchema, sentryProjectTargetSchema, alertmanagerTargetSchema]);
 
 /** The per-severity SLA and batch window for Dependabot alerts. */
 const slaValueSchema = z.union([z.literal("asap"), durationSchema]);
@@ -435,7 +447,7 @@ export const projectFileSchema = z
   .superRefine((file, ctx) => {
     const seen = new Set<string>();
     file.ops.targets.forEach((t, i) => {
-      const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "dependabot" ? `${t.kind}/${t.repo.toLowerCase()}` : `${t.kind}/${t.org}/${t.project}`;
+      const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "alertmanager" ? `${t.kind}/${t.namespace}` : t.kind === "dependabot" ? `${t.kind}/${t.repo.toLowerCase()}` : `${t.kind}/${t.org}/${t.project}`;
       if (seen.has(key)) ctx.addIssue({ code: "custom", path: ["ops", "targets", i], message: `${key} is listed twice` });
       seen.add(key);
     });
@@ -481,6 +493,9 @@ export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.tar
 
 /** The Sentry projects to watch, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
 export const sentryTargets = (project: ProjectFile): SentryTarget[] => project.ops.targets.filter((t): t is SentryTarget => t.kind === "sentry-project");
+
+/** The Alertmanager namespaces to watch, which are read with the plugin's Alertmanager URL and rung by bb-gate-hooks. */
+export const alertmanagerTargets = (project: ProjectFile): AlertmanagerTarget[] => project.ops.targets.filter((t): t is AlertmanagerTarget => t.kind === "alertmanager");
 
 /**
  * The Dependabot alert targets: the project file's explicit `dependabot`
@@ -723,8 +738,8 @@ export const deploymentsFieldSchema = z
     }
   });
 
-export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
-const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry"] };
+export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry", "alertmanager"] as const;
+const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry", "alertmanager"] };
 
 export const frontMatterSchema = z
   .object({
@@ -836,10 +851,11 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   if (fm.kind === "ops") {
     // An ops binding watches a target, not an entity in a source plugin: a
     // Kubernetes namespace reads k8s, a Dependabot alert target reads
-    // github, and a Sentry project reads sentry. The playbook says which so
-    // its sections can be about the right thing; any is valid, and the
-    // ops-watch playbook serves k8s and Sentry targets alike.
-    if (fm.source === "linear") return { ok: false, error: `${file}: an ops playbook watches k8s, sentry or github, not ${fm.source}` };
+    // github, a Sentry project reads sentry, and an Alertmanager namespace
+    // reads alertmanager. The playbook says which so its sections can be
+    // about the right thing; any is valid, and the ops-watch playbook serves
+    // k8s, Sentry and Alertmanager targets alike.
+    if (fm.source === "linear") return { ok: false, error: `${file}: an ops playbook watches k8s, sentry, alertmanager or github, not ${fm.source}` };
   } else if (!expectedSources.includes(fm.source)) {
     return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSources.join(" or ")}, not ${fm.source}` };
   }
