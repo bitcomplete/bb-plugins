@@ -6,6 +6,7 @@ import {
   RealtimeSessionClient,
   RealtimeSessionTakenError,
   type RealtimeClientCallbacks,
+  type RealtimeLine,
 } from "./realtime-client.js";
 import type { MintedRealtimeSession } from "./realtime-shared.js";
 
@@ -360,5 +361,135 @@ describe("RealtimeSessionClient", () => {
     expect(close).not.toHaveBeenCalled();
     await client.stop();
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("accumulates deltas per item and keeps two assistant responses apart", async () => {
+    stubConnect();
+    const lines: RealtimeLine[] = [];
+    const client = new RealtimeSessionClient(callbacks({ onLine: (line) => lines.push(line) }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "Hel" }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "lo" }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.done", response_id: "r1", item_id: "a1", transcript: "Hello" }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r2", item_id: "a2", delta: "Hi" }) });
+
+    expect(lines).toEqual([
+      { id: "a1", role: "assistant", text: "Hel", responseId: "r1" },
+      { id: "a1", role: "assistant", text: "Hello", responseId: "r1" },
+      { id: "a1", role: "assistant", text: "Hello", responseId: "r1" },
+      { id: "a2", role: "assistant", text: "Hi", responseId: "r2" },
+    ]);
+    await client.stop();
+  });
+
+  it("drops a cancelled response's buffer so nothing leaks into the next", async () => {
+    stubConnect();
+    const lines: RealtimeLine[] = [];
+    const client = new RealtimeSessionClient(callbacks({ onLine: (line) => lines.push(line) }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "let me ask a thread" }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response: { id: "r1", status: "cancelled" } }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r2", item_id: "a2", delta: "clean" }) });
+
+    expect(lines).toEqual([
+      { id: "a1", role: "assistant", text: "let me ask a thread", responseId: "r1" },
+      { id: "a2", role: "assistant", text: "clean", responseId: "r2" },
+    ]);
+    await client.stop();
+  });
+
+  it("clips a truncated item to the audio heard and never expands it on done", async () => {
+    vi.useFakeTimers();
+    try {
+      stubConnect();
+      const lines: RealtimeLine[] = [];
+      const client = new RealtimeSessionClient(callbacks({ onLine: (line) => lines.push(line) }));
+      await client.start();
+      const pc = FakePeerConnection.instances[0]!;
+      pc.channel.emit("open", {});
+      vi.setSystemTime(1_000);
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "Hello " }) });
+      vi.setSystemTime(1_200);
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "world" }) });
+      pc.channel.emit("message", { data: JSON.stringify({ type: "conversation.item.truncated", item_id: "a1", audio_end_ms: 100 }) });
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.done", response_id: "r1", item_id: "a1", transcript: "Hello world" }) });
+
+      const truncated = lines.filter((line) => line.id === "a1" && line.truncated === true);
+      expect(truncated).toHaveLength(1);
+      expect(truncated[0]!.text).toBe("Hello ");
+      // The done after the truncation never expands the bubble.
+      expect(lines[lines.length - 1]).toEqual(truncated[0]);
+      await client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clips a truncation that arrives after the transcript done", async () => {
+    vi.useFakeTimers();
+    try {
+      stubConnect();
+      const lines: RealtimeLine[] = [];
+      const client = new RealtimeSessionClient(callbacks({ onLine: (line) => lines.push(line) }));
+      await client.start();
+      const pc = FakePeerConnection.instances[0]!;
+      pc.channel.emit("open", {});
+      vi.setSystemTime(1_000);
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "Hello " }) });
+      vi.setSystemTime(1_200);
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "world" }) });
+      // The response generated fully and its done arrived; the owner then
+      // interrupted the playback, so the item is truncated afterwards.
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.done", response_id: "r1", item_id: "a1", transcript: "Hello world" }) });
+      pc.channel.emit("message", { data: JSON.stringify({ type: "conversation.item.truncated", item_id: "a1", audio_end_ms: 100 }) });
+      pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_audio_transcript.delta", response_id: "r1", item_id: "a1", delta: "!!!" }) });
+
+      const truncated = lines.filter((line) => line.id === "a1" && line.truncated === true);
+      expect(truncated).toHaveLength(1);
+      expect(truncated[0]!.text).toBe("Hello ");
+      // The late delta never expands it again.
+      expect(lines[lines.length - 1]).toEqual(truncated[0]);
+      await client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("emits the user placeholder where previous_item_id places it, then fills it in", async () => {
+    stubConnect();
+    const lines: RealtimeLine[] = [];
+    const client = new RealtimeSessionClient(callbacks({ onLine: (line) => lines.push(line) }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+
+    pc.channel.emit("message", { data: JSON.stringify({ type: "conversation.item.created", previous_item_id: "a1", item: { id: "u2", role: "user", type: "message" } }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "conversation.item.input_audio_transcription.completed", item_id: "u2", transcript: "what's up" }) });
+
+    expect(lines).toEqual([
+      { id: "u2", role: "user", text: "…", previousId: "a1" },
+      { id: "u2", role: "user", text: "what's up" },
+    ]);
+    await client.stop();
+  });
+
+  it("starts the first user line at the start when previous_item_id is null", async () => {
+    stubConnect();
+    const lines: RealtimeLine[] = [];
+    const client = new RealtimeSessionClient(callbacks({ onLine: (line) => lines.push(line) }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+
+    pc.channel.emit("message", { data: JSON.stringify({ type: "conversation.item.created", previous_item_id: null, item: { id: "u1", role: "user", type: "message" } }) });
+
+    expect(lines).toEqual([{ id: "u1", role: "user", text: "…", previousId: null }]);
+    await client.stop();
   });
 });

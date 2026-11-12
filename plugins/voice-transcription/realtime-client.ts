@@ -12,9 +12,14 @@
  * request that mints the ephemeral secret, so the WebRTC connection inherits
  * it and the overlay never has to send a `session.update`.
  */
-import type { MintedRealtimeSession, RealtimeToolReply } from "./realtime-shared.js";
+import {
+  REALTIME_USER_PLACEHOLDER,
+  type MintedRealtimeSession,
+  type RealtimeLine,
+  type RealtimeToolReply,
+} from "./realtime-shared.js";
 
-export type RealtimeLine = { role: "user" | "assistant"; text: string };
+export type { RealtimeLine };
 export type RealtimeStatus = "connecting" | "live" | "closed" | "error";
 
 export type RealtimeClientCallbacks = {
@@ -69,7 +74,20 @@ export class RealtimeSessionClient {
   private deadline = 0;
   private stopped = false;
   private ownsSession = false;
-  private assistant = "";
+  /** Per-item assistant text accumulated from transcript deltas. */
+  private readonly assistantBuffers = new Map<string, string>();
+  /** The last text shown for each item, kept after `done` for a late truncation. */
+  private readonly itemText = new Map<string, string>();
+  /** The response each assistant item belongs to, for dropping a cancelled one. */
+  private readonly itemResponse = new Map<string, string>();
+  /** The item ids each response has produced. */
+  private readonly responseItems = new Map<string, Set<string>>();
+  /** When each item's transcript started, for mapping a truncation offset. */
+  private readonly itemStartedAt = new Map<string, number>();
+  /** The cumulative text length at each delta's arrival, per item. */
+  private readonly itemTimeline = new Map<string, Array<{ at: number; length: number }>>();
+  /** Items the owner truncated; a later transcript `done` must not expand them. */
+  private readonly truncatedItems = new Set<string>();
   /** Set by a tool reply with `last: true`: stop once the in-flight response finishes. */
   private stopAfterResponse = false;
   /** The response the stop waits on; set from the goodbye response's `response.created`. */
@@ -291,29 +309,99 @@ export class RealtimeSessionClient {
       case "response.audio_transcript.delta":
       case "response.output_audio_transcript.delta": {
         const delta = typeof event.delta === "string" ? event.delta : "";
-        if (delta !== "") {
-          this.assistant += delta;
-          this.callbacks.onLine({ role: "assistant", text: this.assistant });
+        const itemId = this.itemIdOf(event) ?? responseId ?? "assistant";
+        // A truncated item was cut off; a late delta must not expand it again.
+        if (delta !== "" && !this.truncatedItems.has(itemId)) {
+          const text = (this.assistantBuffers.get(itemId) ?? "") + delta;
+          this.assistantBuffers.set(itemId, text);
+          this.itemText.set(itemId, text);
+          this.noteDelta(itemId, text.length);
+          if (responseId !== null) this.noteResponseItem(responseId, itemId);
+          this.callbacks.onLine({
+            id: itemId,
+            role: "assistant",
+            text,
+            ...(responseId !== null ? { responseId } : {}),
+          });
         }
         break;
       }
       case "response.audio_transcript.done":
       case "response.output_audio_transcript.done": {
+        const itemId = this.itemIdOf(event) ?? responseId ?? "assistant";
         const transcript =
-          typeof event.transcript === "string" ? event.transcript : this.assistant;
-        this.assistant = "";
-        if (transcript !== "") this.callbacks.onLine({ role: "assistant", text: transcript });
+          typeof event.transcript === "string"
+            ? event.transcript
+            : (this.assistantBuffers.get(itemId) ?? this.itemText.get(itemId) ?? "");
+        const truncated = this.truncatedItems.has(itemId);
+        this.assistantBuffers.delete(itemId);
+        if (responseId !== null) this.responseItems.get(responseId)?.delete(itemId);
+        // A truncated item keeps the text shown at the interruption; the full
+        // generated transcript never expands it.
+        if (!truncated && transcript !== "") {
+          this.itemText.set(itemId, transcript);
+          this.callbacks.onLine({
+            id: itemId,
+            role: "assistant",
+            text: transcript,
+            ...(responseId !== null ? { responseId } : {}),
+          });
+        }
+        break;
+      }
+      case "conversation.item.created": {
+        const item = event.item;
+        if (typeof item !== "object" || item === null) break;
+        const id = typeof (item as { id?: unknown }).id === "string" ? (item as { id: string }).id : null;
+        if (id === null || (item as { role?: unknown }).role !== "user") break;
+        // The user item is created before the model answers, so its line takes
+        // its place in conversation order even though its transcription lands
+        // later. `previous_item_id` is the anchor; absent means append.
+        const previous = event.previous_item_id;
+        const previousId =
+          typeof previous === "string" ? previous : previous === null ? null : undefined;
+        this.callbacks.onLine({ id, role: "user", text: REALTIME_USER_PLACEHOLDER, previousId });
         break;
       }
       case "conversation.item.input_audio_transcription.completed": {
         const transcript = typeof event.transcript === "string" ? event.transcript : "";
-        if (transcript !== "") this.callbacks.onLine({ role: "user", text: transcript });
+        const itemId = this.itemIdOf(event);
+        if (itemId !== null && transcript !== "") {
+          this.callbacks.onLine({ id: itemId, role: "user", text: transcript });
+        }
+        break;
+      }
+      case "conversation.item.truncated": {
+        const itemId = this.itemIdOf(event);
+        if (itemId === null) break;
+        const audioEndMs = typeof event.audio_end_ms === "number" ? event.audio_end_ms : null;
+        this.truncatedItems.add(itemId);
+        const shown = this.clipItem(itemId, audioEndMs);
+        if (shown !== null) {
+          this.assistantBuffers.set(itemId, shown);
+          this.itemText.set(itemId, shown);
+          const responseIdOfItem = this.itemResponse.get(itemId);
+          this.callbacks.onLine({
+            id: itemId,
+            role: "assistant",
+            text: shown,
+            truncated: true,
+            ...(responseIdOfItem !== undefined ? { responseId: responseIdOfItem } : {}),
+          });
+        }
         break;
       }
       case "response.function_call_arguments.done":
         void this.handleToolCall(event);
         break;
       case "response.done": {
+        // A cancelled or incomplete response may never send transcript `done`
+        // events; drop its buffers so no partial text leaks into the next turn.
+        // The rendered lines are left untouched.
+        const status = this.responseStatusOf(event);
+        if (status === "cancelled" || status === "incomplete" || status === "failed") {
+          this.dropResponse(responseId);
+        }
         // The response's text is generated; its audio is still playing. Wait
         // for `output_audio_buffer.stopped`, with a fallback in case this
         // transport never sends it.
@@ -358,6 +446,91 @@ export class RealtimeSessionClient {
       return (response as { id: string }).id;
     }
     return null;
+  }
+
+  /** The item id a transcript event belongs to, if it carries one. */
+  private itemIdOf(event: Record<string, unknown>): string | null {
+    const itemId = event.item_id;
+    return typeof itemId === "string" && itemId !== "" ? itemId : null;
+  }
+
+  /** The status of the response a `response.done` carries. */
+  private responseStatusOf(event: Record<string, unknown>): string | null {
+    const response = event.response;
+    if (
+      typeof response === "object" &&
+      response !== null &&
+      "status" in response &&
+      typeof (response as { status: unknown }).status === "string"
+    ) {
+      return (response as { status: string }).status;
+    }
+    const direct = event.status;
+    return typeof direct === "string" ? direct : null;
+  }
+
+  /** Remember which response produced an item, so a cancellation can drop it. */
+  private noteResponseItem(responseId: string, itemId: string): void {
+    this.itemResponse.set(itemId, responseId);
+    const items = this.responseItems.get(responseId) ?? new Set<string>();
+    items.add(itemId);
+    this.responseItems.set(responseId, items);
+  }
+
+  /**
+   * Record when a delta arrived and how long the item's text is now, so a
+   * later `conversation.item.truncated` can map its `audio_end_ms` onto the
+   * text that had been spoken by then.
+   */
+  private noteDelta(itemId: string, length: number): void {
+    const now = Date.now();
+    const started = this.itemStartedAt.get(itemId);
+    if (started === undefined) {
+      this.itemStartedAt.set(itemId, now);
+      this.itemTimeline.set(itemId, [{ at: 0, length }]);
+      return;
+    }
+    const timeline = this.itemTimeline.get(itemId) ?? [];
+    timeline.push({ at: now - started, length });
+    this.itemTimeline.set(itemId, timeline);
+  }
+
+  /**
+   * The text shown at the moment of a truncation. When the item's delta timing
+   * maps onto `audio_end_ms`, clip to what had played by then; otherwise keep
+   * the text shown so far. Null when the item has no text to show at all.
+   */
+  private clipItem(itemId: string, audioEndMs: number | null): string | null {
+    const buffer = this.assistantBuffers.get(itemId) ?? this.itemText.get(itemId);
+    if (buffer === undefined) return null;
+    if (audioEndMs === null) return buffer;
+    const timeline = this.itemTimeline.get(itemId);
+    if (timeline === undefined || timeline.length === 0) return buffer;
+    let length = 0;
+    for (const entry of timeline) {
+      if (entry.at <= audioEndMs) length = entry.length;
+      else break;
+    }
+    // No delta had arrived by the truncation offset: keep what was shown
+    // rather than blank the bubble.
+    return length > 0 ? buffer.slice(0, length) : buffer;
+  }
+
+  /** Drop one item's buffered transcript, shown text and timing. */
+  private forgetItem(itemId: string): void {
+    this.assistantBuffers.delete(itemId);
+    this.itemText.delete(itemId);
+    this.itemResponse.delete(itemId);
+    this.itemStartedAt.delete(itemId);
+    this.itemTimeline.delete(itemId);
+    this.truncatedItems.delete(itemId);
+  }
+
+  /** Drop the buffers of every item a response produced, leaving rendered text alone. */
+  private dropResponse(responseId: string | null): void {
+    if (responseId === null) return;
+    for (const itemId of this.responseItems.get(responseId) ?? []) this.forgetItem(itemId);
+    this.responseItems.delete(responseId);
   }
 
   /** Close after a short grace if the audio-finished signal never arrives. */

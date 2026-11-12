@@ -11,6 +11,60 @@
 /** The plugin's id; the overlay builds its own route URLs from it. */
 export const PLUGIN_ID = "voice-transcription";
 
+/** What a user line shows until its transcription completes. */
+export const REALTIME_USER_PLACEHOLDER = "…";
+
+/**
+ * One line of the overlay transcript, keyed by the Realtime `item_id` so an
+ * update lands in place and two assistant turns never merge into one bubble.
+ * The client hands the overlay one line at a time and the overlay upserts it.
+ */
+export type RealtimeLine = {
+  /** The Realtime item id; the overlay's key and the React key. */
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  /** The response an assistant line belongs to, from `response_id`. */
+  responseId?: string;
+  /**
+   * For a user line, the item it follows in conversation order, from
+   * `conversation.item.created.previous_item_id`; `null` is the start of the
+   * conversation. An assistant line omits it and is appended.
+   */
+  previousId?: string | null;
+  /** True once the item was truncated, so the overlay marks it cut off. */
+  truncated?: boolean;
+};
+
+/**
+ * Insert or update one transcript line by `id`. An existing line is merged in
+ * place, never by position, so a streaming delta updates its own bubble and a
+ * new assistant response opens a new one. A new user line goes where its
+ * `previousId` puts it (at the start for `null`, at the end when the anchor
+ * has not arrived); every other new line is appended.
+ */
+export function upsertRealtimeLine(lines: RealtimeLine[], line: RealtimeLine): RealtimeLine[] {
+  const existing = lines.findIndex((candidate) => candidate.id === line.id);
+  if (existing !== -1) {
+    const next = [...lines];
+    next[existing] = {
+      ...next[existing],
+      ...line,
+      truncated: line.truncated ?? next[existing]!.truncated,
+    };
+    return next;
+  }
+  if (line.previousId === undefined) return [...lines, line];
+  const anchor =
+    line.previousId === null
+      ? -1
+      : lines.findIndex((candidate) => candidate.id === line.previousId);
+  const at = anchor === -1 && line.previousId !== null ? lines.length : anchor + 1;
+  const next = [...lines];
+  next.splice(at, 0, line);
+  return next;
+}
+
 /** The realtime signal the server publishes when a session is opened. */
 export const REALTIME_SIGNAL_CHANNEL = "realtime-session";
 
