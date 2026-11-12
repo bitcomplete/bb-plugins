@@ -759,6 +759,25 @@ function Section({ title, count, action, children }: { title: string; count?: nu
 }
 
 /**
+ * Where the voice-transcription plugin's overlay keeps this tab's client id
+ * (its `REALTIME_CLIENT_STORAGE_KEY`; the string is the contract, since a
+ * plugin's frontend cannot import another's). Sent with the start so the
+ * session is answered by the tab that pressed the button, not by whichever
+ * tab of the same server wins the race for the open signal.
+ */
+const VOICE_CLIENT_STORAGE_KEY = "voice-transcription:realtime-client";
+
+/** This tab's voice client id, or null when the overlay has not written one. */
+function voiceClientId(): string | null {
+  try {
+    const id = window.sessionStorage.getItem(VOICE_CLIENT_STORAGE_KEY);
+    return id === null || id === "" ? null : id;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * BB-300: the Stand-up button. It starts one spoken stand-up for a project; the
  * voice plugin's overlay opens on its own realtime signal, so the page only
  * makes the call. It renders only when the server says a stand-up is available,
@@ -769,7 +788,7 @@ function StandupButton({ projectId, onStarted }: { projectId: string; onStarted?
   const [state, setState] = useState<"idle" | "starting" | { error: string }>("idle");
   const start = () => {
     setState("starting");
-    rpc.call("stewardsStandupStart", { projectId }).then(
+    rpc.call("stewardsStandupStart", { projectId, client: voiceClientId() }).then(
       (result) => {
         setState(result.ok ? "idle" : { error: result.message });
         if (result.ok) onStarted?.();

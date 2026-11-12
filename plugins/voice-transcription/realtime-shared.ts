@@ -14,6 +14,22 @@ export const PLUGIN_ID = "voice-transcription";
 /** The realtime signal the server publishes when a session is opened. */
 export const REALTIME_SIGNAL_CHANNEL = "realtime-session";
 
+/**
+ * Where the overlay keeps this tab's client id, so an opener's own frontend
+ * can read it and hand it to its backend. `bb.realtime.publish` reaches every
+ * connected client and the rpc caller carries no client identity, so without
+ * this the first tab to answer the signal takes the session, whichever tab
+ * asked for it. `sessionStorage` is per tab and per origin: every plugin's
+ * frontend runs on bb's page, so the opener reads the same entry the overlay
+ * wrote. An opener that passes the id as `client` to `realtime.open` gets a
+ * session only that tab's overlay will answer; one that passes none keeps the
+ * old behaviour, every overlay racing for it.
+ */
+export const REALTIME_CLIENT_STORAGE_KEY = "voice-transcription:realtime-client";
+
+/** The signal's payload: the session, and the one client that may take it, or null for any. */
+export type RealtimeSignal = { sessionId: string; client: string | null };
+
 /** The route that mints an ephemeral client secret for one session. */
 export const REALTIME_MINT_PATH = "/realtime/session";
 /** The route the overlay forwards a model tool call through. */

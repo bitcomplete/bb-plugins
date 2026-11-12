@@ -11,6 +11,7 @@ import { useEffect, useRef, useState } from "react";
 import { definePluginApp, useRealtime } from "@get-bb/plugin-sdk/app";
 import {
   PLUGIN_ID,
+  REALTIME_CLIENT_STORAGE_KEY,
   REALTIME_CLOSE_PATH,
   REALTIME_MINT_PATH,
   REALTIME_SIGNAL_CHANNEL,
@@ -56,8 +57,29 @@ async function callRoute(path: string, body: unknown): Promise<unknown> {
   return payload;
 }
 
+/**
+ * This tab's client id, made once per tab and kept in `sessionStorage` under
+ * `REALTIME_CLIENT_STORAGE_KEY` so an opener's frontend in the same tab can
+ * read it. A tab whose storage is unavailable gets an id that nothing else can
+ * read; the opener then passes no client and every overlay races as before.
+ */
+function realtimeClientId(): string {
+  try {
+    const stored = window.sessionStorage.getItem(REALTIME_CLIENT_STORAGE_KEY);
+    if (stored !== null && stored !== "") return stored;
+    const fresh = crypto.randomUUID();
+    window.sessionStorage.setItem(REALTIME_CLIENT_STORAGE_KEY, fresh);
+    return fresh;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
 function RealtimeVoiceOverlay() {
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // Made on mount, before any click can ask for a session, so the opener
+  // always finds it.
+  const [clientId] = useState(realtimeClientId);
   const [status, setStatus] = useState<RealtimeStatus | "idle">("idle");
   const [error, setError] = useState<string | null>(null);
   const [lines, setLines] = useState<RealtimeLine[]>([]);
@@ -67,7 +89,12 @@ function RealtimeVoiceOverlay() {
 
   useRealtime(REALTIME_SIGNAL_CHANNEL, (payload) => {
     if (typeof payload !== "object" || payload === null || !("sessionId" in payload)) return;
-    const id = (payload as { sessionId: unknown }).sessionId;
+    const { sessionId: id, client } = payload as { sessionId: unknown; client?: unknown };
+    // A session opened for another tab is not this overlay's: the signal
+    // reaches every tab, and only the one that asked may answer. A signal
+    // with no client (an older server, or an opener that passed none) is
+    // open to any tab, as before.
+    if (typeof client === "string" && client !== "" && client !== clientId) return;
     if (typeof id === "string" && id !== "") setSessionId(id);
   });
 
@@ -81,7 +108,7 @@ function RealtimeVoiceOverlay() {
     const client = new RealtimeSessionClient({
       mint: async () => {
         try {
-          return (await callRoute(REALTIME_MINT_PATH, { sessionId })) as MintedRealtimeSession;
+          return (await callRoute(REALTIME_MINT_PATH, { sessionId, client: clientId })) as MintedRealtimeSession;
         } catch (error) {
           // 409 means another client already minted this session; drop out
           // quietly rather than ending the winner's session.
@@ -134,7 +161,7 @@ function RealtimeVoiceOverlay() {
       clientRef.current = null;
       void client.stop();
     };
-  }, [sessionId]);
+  }, [sessionId, clientId]);
 
   useEffect(() => {
     clientRef.current?.setMuted(muted);

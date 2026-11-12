@@ -14733,7 +14733,7 @@ describe("the stand-up (BB-300)", () => {
     expect(started.sessionId).not.toBeNull();
     expect(t.realtimeOpens).toHaveLength(1);
     const open = t.realtimeOpens[0]!;
-    expect(open.input).toMatchObject({ toolHandler: { method: "stewardsStandupTool" } });
+    expect(open.input).toMatchObject({ toolHandler: { method: "stewardsStandupTool" }, client: null });
     const tools = open.input.tools as Array<{ name: string }>;
     expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "take_note", "retract_note"]);
     expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
@@ -14741,6 +14741,13 @@ describe("the stand-up (BB-300)", () => {
     // Opening the session does not advance the window: only a session that
     // connected (its first tool call) does.
     expect(t.hooks.store.lastStandup("p1")).toBeNull();
+  });
+
+  it("passes the pressing tab's voice client through to the session", async () => {
+    const t = await adopted();
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", client: "tab-phone" }, client)) as { ok: boolean };
+    expect(started.ok).toBe(true);
+    expect(t.realtimeOpens[0]!.input).toMatchObject({ client: "tab-phone" });
   });
 
   it("lets a new start supersede one that never connected, finishing the abandoned record", async () => {

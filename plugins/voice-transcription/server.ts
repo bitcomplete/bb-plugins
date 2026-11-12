@@ -43,6 +43,7 @@ import {
   REALTIME_MINT_PATH,
   REALTIME_SIGNAL_CHANNEL,
   REALTIME_TOOL_PATH,
+  type RealtimeSignal,
   type MintedRealtimeSession,
   type RealtimeSessionConfig,
 } from "./realtime-shared.js";
@@ -97,6 +98,12 @@ export const rpcContract = defineRpcContract({
         .object({ method: z.string().trim().min(1) })
         .nullable()
         .default(null),
+      /**
+       * The overlay client that may take the session: the id the opener's
+       * frontend read from `REALTIME_CLIENT_STORAGE_KEY` in the tab that
+       * asked. Null lets any client take it.
+       */
+      client: z.string().trim().min(1).max(100).nullable().default(null),
     }),
     output: z.object({ sessionId: z.string(), maxDurationMs: z.number() }),
   },
@@ -109,6 +116,8 @@ type PendingRealtimeSession = {
   toolHandler: { pluginId: string; method: string } | null;
   /** The opener's own method called when the session ends, or null. */
   closeHandler: { pluginId: string; method: string } | null;
+  /** The one overlay client that may mint this session, or null for any. */
+  client: string | null;
   createdAt: number;
   /** Set once a secret has been minted; null until then. */
   startedAt: number | null;
@@ -475,13 +484,18 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
             input.onClose === null
               ? null
               : { pluginId: caller.pluginId, method: input.onClose.method },
+          client: input.client,
           createdAt: Date.now(),
           startedAt: null,
           minting: false,
           maxMs: realtimeMaxMs(config),
         };
         realtimeSessions.set(session.id, session);
-        bb.realtime.publish(REALTIME_SIGNAL_CHANNEL, { sessionId: session.id });
+        // The signal reaches every tab; the overlay in any other tab sees the
+        // client and stays inert, and the mint route holds the line for one
+        // that does not.
+        const signal: RealtimeSignal = { sessionId: session.id, client: session.client };
+        bb.realtime.publish(REALTIME_SIGNAL_CHANNEL, signal);
         return { sessionId: session.id, maxDurationMs: session.maxMs };
       },
     });
@@ -492,6 +506,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
       async (c: Context) => {
         const body = await readJsonObject(c);
         const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
+        const client = typeof body?.client === "string" ? body.client : "";
         if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
         const { baseUrl, apiKey } = await realtimeKey();
         const refusal = realtimeReadiness({ baseUrl, apiKey });
@@ -499,6 +514,12 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const session = realtimeSessions.get(sessionId);
         if (session === undefined) {
           return c.json({ error: "That voice session has ended; start a new one" }, 404);
+        }
+        // A session opened for one client is minted only by that client. 409
+        // is the status the overlay already treats as "not mine": it drops out
+        // without ending the session the right tab is about to take.
+        if (session.client !== null && client !== session.client) {
+          return c.json({ error: "That voice session belongs to the tab that started it" }, 409);
         }
         const now = Date.now();
         if (session.startedAt !== null) {
