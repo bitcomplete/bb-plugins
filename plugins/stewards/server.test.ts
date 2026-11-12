@@ -6465,17 +6465,17 @@ describe("needs you items", () => {
     expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Add login retry (#7)", body: "Retries login." }]);
   });
 
-  it("applies a confirmed huddle gate note to a pull request through the need-action path", async () => {
+  it("applies a confirmed stand-up gate note to a pull request through the need-action path", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     const voice = { experimental_caller: { kind: "plugin", pluginId: "voice-transcription" } } as const;
-    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string; huddleId: string };
-    await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: b.entityKey, action: "approve", need: need.id }) }, voice);
-    const rec = (await t.harness.callRpc("stewardsHuddleRecord", { projectId: "p1" })) as { huddle: { notes: Array<{ id: string; readback: string }> } };
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string; standupId: string };
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: b.entityKey, action: "approve", need: need.id }) }, voice);
+    const rec = (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { notes: Array<{ id: string; readback: string }> } };
     // The readback names the exact pull request the note is bound to.
-    expect(rec.huddle.notes[0]!.readback).toContain("Approve acme/web#7 on GitHub");
-    const res = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: rec.huddle.notes[0]!.id }, client);
+    expect(rec.standup.notes[0]!.readback).toContain("Approve acme/web#7 on GitHub");
+    const res = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: rec.standup.notes[0]!.id }, client);
     expect(res).toMatchObject({ ok: true, applied: true });
     // The same effect the Approve button has: the review lands and the item closes.
     expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "APPROVE", body: "" }]);
@@ -14673,11 +14673,11 @@ describe("bb stewards divergences (BB-293)", () => {
 });
 
 
-// BB-300 slice 3: the huddle. The Stewards page starts one spoken stand-up per
+// BB-300 slice 3: the stand-up. The Stewards page starts one spoken stand-up per
 // project; the server builds the briefing's instructions, opens the voice
 // plugin's overlay with the fixed tool set, and records notes in memory. No
 // test here calls OpenAI: the voice plugin is a stub in `test-world`.
-describe("the huddle (BB-300)", () => {
+describe("the stand-up (BB-300)", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
   const voice = { experimental_caller: { kind: "plugin", pluginId: "voice-transcription" } } as const;
 
@@ -14690,26 +14690,26 @@ describe("the huddle (BB-300)", () => {
     return { ...t, project, steward };
   }
 
-  it("reports a huddle as available on the board when the voice plugin is ready", async () => {
+  it("reports a stand-up as available on the board when the voice plugin is ready", async () => {
     const t = await adopted();
-    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { huddle?: { available: boolean; message: string | null } } };
-    expect(board.board.huddle).toEqual({ available: true, message: null });
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { standup?: { available: boolean; message: string | null } } };
+    expect(board.board.standup).toEqual({ available: true, message: null });
   });
 
-  it("reports why a huddle is unavailable, and starts none, off OpenAI or without a key", async () => {
+  it("reports why a stand-up is unavailable, and starts none, off OpenAI or without a key", async () => {
     const t = await adopted();
     t.setVoiceBaseUrl("https://api.groq.com/openai/v1");
-    let board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { huddle?: { available: boolean; message: string | null } } };
-    expect(board.board.huddle?.available).toBe(false);
-    expect(board.board.huddle?.message).toMatch(/OpenAI/u);
+    let board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { standup?: { available: boolean; message: string | null } } };
+    expect(board.board.standup?.available).toBe(false);
+    expect(board.board.standup?.message).toMatch(/OpenAI/u);
 
     t.setVoiceBaseUrl("https://api.openai.com/v1");
     t.setVoiceServiceReady(false, "Set the API key in Settings → Plugins → Voice transcription");
-    board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { huddle?: { available: boolean; message: string | null } } };
-    expect(board.board.huddle?.available).toBe(false);
-    expect(board.board.huddle?.message).toMatch(/API key/u);
+    board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { standup?: { available: boolean; message: string | null } } };
+    expect(board.board.standup?.available).toBe(false);
+    expect(board.board.standup?.message).toMatch(/API key/u);
 
-    const refused = await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client);
+    const refused = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client);
     expect(refused).toMatchObject({ ok: false, sessionId: null });
     expect(t.realtimeOpens).toHaveLength(0);
   });
@@ -14717,66 +14717,66 @@ describe("the huddle (BB-300)", () => {
   it("reports an absent voice plugin rather than opening a session", async () => {
     const t = await adopted();
     t.setVoiceSettingsThrow("no plugin voice-transcription");
-    const result = await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client);
+    const result = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client);
     expect(result).toMatchObject({ ok: false, sessionId: null });
     expect((result as { message: string }).message).toMatch(/voice-transcription/u);
     expect(t.realtimeOpens).toHaveLength(0);
   });
 
-  it("starts a huddle with the ranked briefing and the fixed tool set", async () => {
+  it("starts a stand-up with the ranked briefing and the fixed tool set", async () => {
     const t = await adopted();
     await t.tool("steward_update", { ask: { question: "Should I file an a11y ticket?" } }, t.project);
     await t.flush();
 
-    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string | null; message: string };
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string | null; message: string };
     expect(started.ok).toBe(true);
     expect(started.sessionId).not.toBeNull();
     expect(t.realtimeOpens).toHaveLength(1);
     const open = t.realtimeOpens[0]!;
-    expect(open.input).toMatchObject({ toolHandler: { method: "stewardsHuddleTool" } });
+    expect(open.input).toMatchObject({ toolHandler: { method: "stewardsStandupTool" } });
     const tools = open.input.tools as Array<{ name: string }>;
     expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "take_note", "retract_note"]);
     expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
     expect(String(open.input.instructions)).toMatch(/Should I file an a11y ticket\?/u);
     // Opening the session does not advance the window: only a session that
     // connected (its first tool call) does.
-    expect(t.hooks.store.lastHuddle("p1")).toBeNull();
+    expect(t.hooks.store.lastStandup("p1")).toBeNull();
   });
 
   it("lets a new start supersede one that never connected, finishing the abandoned record", async () => {
     const t = await adopted();
-    const first = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
+    const first = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
     expect(first.ok).toBe(true);
     // A start after a session that was closed or never connected still works:
     // there is no close signal, so a stale record must not lock the project out.
-    const second = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
+    const second = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string };
     expect(second.ok).toBe(true);
     expect(second.sessionId).not.toBe(first.sessionId);
     expect(t.realtimeOpens).toHaveLength(2);
-    // Slice 4 finishes the abandoned first huddle on the new start, so "since
-    // the last huddle" advances even when the owner never pressed Done.
-    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
-    // The old session's tool calls no longer find a huddle; the new one's do.
-    await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: first.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)).rejects.toThrow(/ended/u);
-    await t.harness.callRpc("stewardsHuddleTool", { sessionId: second.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
-    // The second huddle is still open, so the window stays at the first one.
-    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
+    // Slice 4 finishes the abandoned first stand-up on the new start, so "since
+    // the last stand-up" advances even when the owner never pressed Done.
+    expect(t.hooks.store.lastStandup("p1")).toBe(t.now());
+    // The old session's tool calls no longer find a stand-up; the new one's do.
+    await expect(t.harness.callRpc("stewardsStandupTool", { sessionId: first.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)).rejects.toThrow(/ended/u);
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: second.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    // The second stand-up is still open, so the window stays at the first one.
+    expect(t.hooks.store.lastStandup("p1")).toBe(t.now());
   });
 
-  it("forwards a tool call to the huddle's readers and records notes only in the huddle", async () => {
+  it("forwards a tool call to the stand-up's readers and records notes only in the stand-up", async () => {
     const t = await adopted();
-    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string };
     const before = JSON.stringify(t.hooks.store.find("ENG-12"));
 
-    const status = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
+    const status = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
     expect(status).toContain("ENG-12");
 
-    const taken = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "guidance", text: "Keep the retry small", binding: "ENG-12" }) }, voice)) as string;
+    const taken = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "guidance", text: "Keep the retry small", binding: "ENG-12" }) }, voice)) as string;
     expect(taken).toContain("Keep the retry small");
-    // The note is in the huddle, not on the binding: the store row is untouched.
+    // The note is in the stand-up, not on the binding: the store row is untouched.
     expect(JSON.stringify(t.hooks.store.find("ENG-12"))).toBe(before);
 
-    const retracted = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "retract_note", arguments: JSON.stringify({ id: "note_nope" }) }, voice)) as string;
+    const retracted = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "retract_note", arguments: JSON.stringify({ id: "note_nope" }) }, voice)) as string;
     expect(retracted).toContain("No note");
   });
 
@@ -14784,49 +14784,49 @@ describe("the huddle (BB-300)", () => {
     const t = await adopted();
     // A ticket body can carry a pasted token; it must not reach OpenAI.
     t.entities.set("uuid-12", issue({ description: "Please use token: abc123 in the call." }));
-    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
-    const output = (await t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string };
+    const output = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
     expect(output).toContain("token: [redacted]");
     expect(output).not.toContain("abc123");
   });
 
   it("refuses a tool call from anyone but the voice plugin, and an unknown tool", async () => {
     const t = await adopted();
-    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { sessionId: string };
-    await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "steward_status", arguments: "{}" }, client)).rejects.toThrow(/voice-transcription/u);
-    await expect(t.harness.callRpc("stewardsHuddleTool", { sessionId: started.sessionId, name: "merge_everything", arguments: "{}" }, voice)).rejects.toThrow(/No huddle tool/u);
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string };
+    await expect(t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "steward_status", arguments: "{}" }, client)).rejects.toThrow(/voice-transcription/u);
+    await expect(t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "merge_everything", arguments: "{}" }, voice)).rejects.toThrow(/No stand-up tool/u);
   });
 
   it("exposes the homepage line's readiness on its own call, and needs a project steward", async () => {
     const t = await adopted();
-    const ready = await t.harness.callRpc("stewardsHuddle", { projectId: "p1" });
+    const ready = await t.harness.callRpc("stewardsStandup", { projectId: "p1" });
     expect(ready).toEqual({ available: true, message: null });
     t.setVoiceServiceReady(false, "no key");
-    expect(await t.harness.callRpc("stewardsHuddle", { projectId: "p1" })).toEqual({ available: false, message: "no key" });
+    expect(await t.harness.callRpc("stewardsStandup", { projectId: "p1" })).toEqual({ available: false, message: "no key" });
 
     const empty = await setup();
-    expect(await empty.harness.callRpc("stewardsHuddle", { projectId: "p1" })).toEqual({ available: false, message: "No project steward yet; a huddle needs one." });
+    expect(await empty.harness.callRpc("stewardsStandup", { projectId: "p1" })).toEqual({ available: false, message: "No project steward yet; a stand-up needs one." });
   });
 
   // BB-300 slice 4: the durable record, the mechanical readback, per-item
   // confirmation and the fan-out. Each item is confirmed on its own, and
   // nothing is applied before its confirmation.
-  type HuddleRecordResult = {
-    huddle: { id: string; notes: Array<{ id: string; type: string; readback: string; confirmed: boolean }>; confirmed: string[]; endedAt: number | null } | null;
+  type StandupRecordResult = {
+    standup: { id: string; notes: Array<{ id: string; type: string; readback: string; confirmed: boolean }>; confirmed: string[]; endedAt: number | null } | null;
   };
 
-  async function startHuddle(t: Awaited<ReturnType<typeof adopted>>) {
-    const started = (await t.harness.callRpc("stewardsHuddleStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string; huddleId: string };
+  async function startStandup(t: Awaited<ReturnType<typeof adopted>>) {
+    const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { ok: boolean; sessionId: string; standupId: string };
     expect(started.ok).toBe(true);
     return started;
   }
 
   async function takeNote(t: Awaited<ReturnType<typeof adopted>>, sessionId: string, args: Record<string, unknown>) {
-    return t.harness.callRpc("stewardsHuddleTool", { sessionId, name: "take_note", arguments: JSON.stringify(args) }, voice);
+    return t.harness.callRpc("stewardsStandupTool", { sessionId, name: "take_note", arguments: JSON.stringify(args) }, voice);
   }
 
   async function record(t: Awaited<ReturnType<typeof adopted>>) {
-    return (await t.harness.callRpc("stewardsHuddleRecord", { projectId: "p1" })) as HuddleRecordResult;
+    return (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as StandupRecordResult;
   }
 
   /** A project whose spec approval is the user's, so an approve-spec item is filed on the page. */
@@ -14844,42 +14844,42 @@ describe("the huddle (BB-300)", () => {
 
   it("persists the notes per project and reads them back mechanically", async () => {
     const t = await adopted();
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "guidance", text: "Keep the retry small", binding: "ENG-12" });
     await takeNote(t, started.sessionId, { type: "direction", text: "Prefer smaller pull requests" });
     await takeNote(t, started.sessionId, { type: "free", text: "Maybe revisit the cache later" });
 
     const read = await record(t);
-    expect(read.huddle).not.toBeNull();
-    expect(read.huddle!.id).toBe(started.huddleId);
-    expect(read.huddle!.notes.map((n) => n.type)).toEqual(["guidance", "direction", "free"]);
+    expect(read.standup).not.toBeNull();
+    expect(read.standup!.id).toBe(started.standupId);
+    expect(read.standup!.notes.map((n) => n.type)).toEqual(["guidance", "direction", "free"]);
     // The readback is rendered from the stored notes, not composed by the model.
-    expect(read.huddle!.notes[0]!.readback).toBe("Guidance for ENG-12: Keep the retry small");
-    expect(read.huddle!.notes[1]!.readback).toBe("Project direction: Prefer smaller pull requests");
-    expect(read.huddle!.notes[2]!.readback).toBe("Note: Maybe revisit the cache later");
-    expect(read.huddle!.notes.every((n) => !n.confirmed)).toBe(true);
+    expect(read.standup!.notes[0]!.readback).toBe("Guidance for ENG-12: Keep the retry small");
+    expect(read.standup!.notes[1]!.readback).toBe("Project direction: Prefer smaller pull requests");
+    expect(read.standup!.notes[2]!.readback).toBe("Note: Maybe revisit the cache later");
+    expect(read.standup!.notes.every((n) => !n.confirmed)).toBe(true);
     // The note is in the record, not on the binding, until it is confirmed.
     expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(0);
   });
 
   it("applies a confirmed guidance note and leaves an unconfirmed one alone", async () => {
     const t = await adopted();
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "guidance", text: "Keep the retry small", binding: "ENG-12" });
     await takeNote(t, started.sessionId, { type: "guidance", text: "And add a test", binding: "ENG-12" });
     const before = await record(t);
-    const first = before.huddle!.notes[0]!;
-    const second = before.huddle!.notes[1]!;
+    const first = before.standup!.notes[0]!;
+    const second = before.standup!.notes[1]!;
 
-    const confirmed = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: first.id }, client);
+    const confirmed = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: first.id }, client);
     expect(confirmed).toMatchObject({ ok: true, applied: true });
     const texts = t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text);
     expect(texts).toContain("Keep the retry small");
     expect(texts).not.toContain("And add a test");
-    expect((await record(t)).huddle!.confirmed).toEqual([first.id]);
+    expect((await record(t)).standup!.confirmed).toEqual([first.id]);
 
     // Confirming the same item again is idempotent and does not double-apply.
-    expect(await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: first.id }, client)).toMatchObject({ ok: true, applied: true });
+    expect(await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: first.id }, client)).toMatchObject({ ok: true, applied: true });
     expect(t.hooks.store.find("ENG-12")!.guidance.filter((g) => g.text === "Keep the retry small")).toHaveLength(1);
     // The second note is still unconfirmed and unapplied.
     expect(second.confirmed).toBe(false);
@@ -14888,15 +14888,15 @@ describe("the huddle (BB-300)", () => {
   it("applies a confirmed gate item through the need-action path, exactly like the Approve button", async () => {
     const t = await withGate();
     const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "approve-spec")!;
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve" });
 
     // Nothing is applied before the owner confirms it.
     expect(t.hooks.store.need(need.id)!.status).toBe("open");
     expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
 
-    const noteId = (await record(t)).huddle!.notes[0]!.id;
-    const confirmed = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId }, client);
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    const confirmed = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId }, client);
     expect(confirmed).toMatchObject({ ok: true, applied: true });
     expect(t.hooks.store.need(need.id)!.status).toBe("done");
     expect(t.hooks.store.find("ENG-12")!.ready.approval).not.toBeNull();
@@ -14906,67 +14906,67 @@ describe("the huddle (BB-300)", () => {
 
   it("sends a confirmed direction and standing rule to the project steward's thread", async () => {
     const t = await adopted();
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "direction", text: "Prioritise the migration" });
     await takeNote(t, started.sessionId, { type: "standing-rule", text: "Never merge red checks" });
-    const notes = (await record(t)).huddle!.notes;
+    const notes = (await record(t)).standup!.notes;
 
-    await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: notes[0]!.id }, client);
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: notes[0]!.id }, client);
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toContain("Prioritise the migration");
 
-    await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: notes[1]!.id }, client);
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: notes[1]!.id }, client);
     await t.flush();
     const standing = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
     expect(standing).toContain("Never merge red checks");
     expect(standing).toMatch(/playbook pull request/u);
   });
 
-  it("ends the huddle, advances the window, and sends free notes as context, not instruction", async () => {
+  it("ends the stand-up, advances the window, and sends free notes as context, not instruction", async () => {
     const t = await adopted();
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "free", text: "The cache idea is worth revisiting" });
-    expect(t.hooks.store.lastHuddle("p1")).toBeNull();
+    expect(t.hooks.store.lastStandup("p1")).toBeNull();
 
-    const ended = await t.harness.callRpc("stewardsHuddleEnd", { huddleId: started.huddleId }, client);
+    const ended = await t.harness.callRpc("stewardsStandupEnd", { standupId: started.standupId }, client);
     expect(ended).toMatchObject({ ok: true });
     await t.flush();
-    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
+    expect(t.hooks.store.lastStandup("p1")).toBe(t.now());
     const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
-    expect(wake).toContain("The owner held a huddle");
+    expect(wake).toContain("The owner held a stand-up");
     expect(wake).toContain("cache idea");
     expect(wake).toMatch(/context and not instructions/u);
     // Ending twice is idempotent.
-    expect(await t.harness.callRpc("stewardsHuddleEnd", { huddleId: started.huddleId }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Already ended/u) });
+    expect(await t.harness.callRpc("stewardsStandupEnd", { standupId: started.standupId }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Already ended/u) });
   });
 
-  it("summarises what was said in the project steward's next wake when the huddle ends", async () => {
+  it("summarises what was said in the project steward's next wake when the stand-up ends", async () => {
     const t = await adopted();
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "guidance", text: "Keep the retry small", binding: "ENG-12" });
-    const noteId = (await record(t)).huddle!.notes[0]!.id;
-    await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId }, client);
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId }, client);
     await t.flush();
     const before = t.sends.length;
-    await t.harness.callRpc("stewardsHuddleEnd", { huddleId: started.huddleId }, client);
+    await t.harness.callRpc("stewardsStandupEnd", { standupId: started.standupId }, client);
     await t.flush();
     const wake = t.sends.slice(before).find((s) => s.threadId === t.project)!;
-    expect(wake.text).toContain("The owner held a huddle.");
+    expect(wake.text).toContain("The owner held a stand-up.");
     expect(wake.text).toContain("Keep the retry small");
   });
 
   it("never applies a free note even if it is confirmed, and scrubs a credential on the way out", async () => {
     const t = await adopted();
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "free", text: "Just a thought" });
     await takeNote(t, started.sessionId, { type: "direction", text: "Use token: abc123 for the deploy" });
-    const notes = (await record(t)).huddle!.notes;
+    const notes = (await record(t)).standup!.notes;
 
-    const free = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: notes[0]!.id }, client);
+    const free = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: notes[0]!.id }, client);
     expect(free).toMatchObject({ ok: true, applied: false });
-    expect(t.hooks.store.latestHuddle("p1")!.confirmed).toEqual([]);
+    expect(t.hooks.store.latestStandup("p1")!.confirmed).toEqual([]);
 
-    await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId: notes[1]!.id }, client);
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: notes[1]!.id }, client);
     await t.flush();
     const sent = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
     expect(sent).toContain("token: [redacted]");
@@ -14977,11 +14977,11 @@ describe("the huddle (BB-300)", () => {
     const t = await adopted();
     const b = t.hooks.store.find("ENG-12")!;
     const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which database?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     // The model omits the binding; the answer must still land on the escalation's binding.
     await takeNote(t, started.sessionId, { type: "resolve-escalation", text: "Postgres", escalationId: x.id });
-    const noteId = (await record(t)).huddle!.notes[0]!.id;
-    const res = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId }, client);
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    const res = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId }, client);
     expect(res).toMatchObject({ ok: true, applied: true });
     expect(t.hooks.store.escalation(x.id)!.status).toBe("resolved");
     expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("Postgres");
@@ -14992,33 +14992,33 @@ describe("the huddle (BB-300)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: x.id, question: "Include SSO?", context: null });
-    const started = await startHuddle(t);
+    const started = await startStandup(t);
     await takeNote(t, started.sessionId, { type: "resolve-escalation", text: "Yes, include SSO", escalationId: x.id });
-    const noteId = (await record(t)).huddle!.notes[0]!.id;
-    const res = await t.harness.callRpc("stewardsHuddleConfirm", { huddleId: started.huddleId, noteId }, client);
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    const res = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId }, client);
     expect(res).toMatchObject({ ok: true, applied: true });
     expect(t.hooks.store.question(q.id)!.status).toBe("answered");
     expect(t.hooks.store.escalation(x.id)!.status).toBe("resolved");
   });
 
-  it("finishes an abandoned huddle found in the store when a new one starts", async () => {
+  it("finishes an abandoned stand-up found in the store when a new one starts", async () => {
     const t = await adopted();
-    // A record left open by a huddle whose session is gone: a server restart
+    // A record left open by a stand-up whose session is gone: a server restart
     // empties the in-memory session map, so the store must be the source.
-    const old = t.hooks.store.createHuddle({ id: "hud_old", projectId: "p1", startedAt: t.now() });
-    t.hooks.store.saveHuddle(old.id, { notes: [{ id: "note_old", type: "free", text: "Remember the cache idea", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: t.now() }] });
+    const old = t.hooks.store.createStandup({ id: "sup_old", projectId: "p1", startedAt: t.now() });
+    t.hooks.store.saveStandup(old.id, { notes: [{ id: "note_old", type: "free", text: "Remember the cache idea", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: t.now() }] });
     await t.flush();
     const before = t.sends.length;
-    await startHuddle(t);
+    await startStandup(t);
     await t.flush();
     const wake = t.sends.slice(before).find((s) => s.threadId === t.project);
     expect(wake?.text).toContain("Remember the cache idea");
-    expect(t.hooks.store.huddle(old.id)!.endedAt).not.toBeNull();
-    expect(t.hooks.store.lastHuddle("p1")).toBe(t.now());
+    expect(t.hooks.store.standup(old.id)!.endedAt).not.toBeNull();
+    expect(t.hooks.store.lastStandup("p1")).toBe(t.now());
   });
 
-  it("returns no record for a project that has never huddled", async () => {
+  it("returns no record for a project that has never standupd", async () => {
     const t = await setup();
-    expect(await t.harness.callRpc("stewardsHuddleRecord", { projectId: "p1" })).toEqual({ huddle: null });
+    expect(await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })).toEqual({ standup: null });
   });
 });

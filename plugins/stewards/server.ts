@@ -94,7 +94,7 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { HUDDLE_TOOLS, buildHuddleInstructions, readbackLine, runHuddleTool, type HuddleNote, type HuddleNoteType, type HuddleRecord } from "./huddle.js";
+import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, type StandupNote, type StandupNoteType, type StandupRecord } from "./standup.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -121,7 +121,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type HuddleNoteRow, type HuddleRow, type HuddleTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
@@ -733,11 +733,11 @@ export const rpcContract = defineRpcContract({
           stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
           /**
-           * BB-300: whether a huddle can start for this project, and why not.
+           * BB-300: whether a stand-up can start for this project, and why not.
            * Optional so a client built from the previous image tolerates its
            * absence across a restart.
            */
-          huddle: z.object({ available: z.boolean(), message: z.string().nullable() }).optional(),
+          standup: z.object({ available: z.boolean(), message: z.string().nullable() }).optional(),
           questions: z.array(questionViewSchema),
           /** Open escalations with the user that no question covers: approval requests, and forwards from before questions were kept. */
           withUser: z.array(withUserViewSchema),
@@ -951,26 +951,26 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ ok: z.boolean(), message: z.string(), threadId: z.string().nullable().optional() }),
   },
-  // BB-300: whether the Stewards page should offer a Huddle button for a
+  // BB-300: whether the Stewards page should offer a Stand-up button for a
   // project. The voice-transcription plugin must be installed with Realtime
   // enabled (OpenAI's endpoint and a key); the page shows no button otherwise.
-  stewardsHuddle: {
+  stewardsStandup: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
     output: z.object({ available: z.boolean(), message: z.string().nullable() }),
   },
-  // BB-300: start one huddle for a project. Stewards builds the briefing's
+  // BB-300: start one stand-up for a project. Stewards builds the briefing's
   // instructions and opens the voice plugin's overlay with the fixed tool set.
   // The record is durable from slice 4 on: the session id names the record the
-  // notes are saved to, and `huddleId` is what the readback confirms against.
-  stewardsHuddleStart: {
+  // notes are saved to, and `standupId` is what the readback confirms against.
+  stewardsStandupStart: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
-    output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), huddleId: z.string().nullable(), message: z.string() }),
+    output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), standupId: z.string().nullable(), message: z.string() }),
   },
   // BB-300: the one method the voice plugin forwards the model's tool calls to.
   // It reads state, or takes and retracts notes; it never acts on a steward.
   // The output is the text itself, so the voice plugin wraps it once for the
   // model's data channel.
-  stewardsHuddleTool: {
+  stewardsStandupTool: {
     input: z.object({
       sessionId: z.string().min(1).max(200),
       callId: z.string().max(200).optional(),
@@ -979,13 +979,13 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.string(),
   },
-  // BB-300 slice 4: the durable huddle record, read back for the Stewards page.
+  // BB-300 slice 4: the durable stand-up record, read back for the Stewards page.
   // The readback lines are rendered from the stored notes, never composed by
   // the model. `notes` carries every note with its confirmation state.
-  stewardsHuddleRecord: {
+  stewardsStandupRecord: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
     output: z.object({
-      huddle: z
+      standup: z
         .object({
           id: z.string(),
           projectId: z.string(),
@@ -1014,15 +1014,15 @@ export const rpcContract = defineRpcContract({
   // BB-300 slice 4: the owner confirms one note. The server applies it through
   // the path that already exists for its shape and marks it confirmed; nothing
   // is applied for a note that is not confirmed.
-  stewardsHuddleConfirm: {
-    input: z.object({ huddleId: z.string().min(1).max(100), noteId: z.string().min(1).max(100) }),
+  stewardsStandupConfirm: {
+    input: z.object({ standupId: z.string().min(1).max(100), noteId: z.string().min(1).max(100) }),
     output: z.object({ ok: z.boolean(), applied: z.boolean(), message: z.string() }),
   },
-  // BB-300 slice 4: the owner ends the huddle. It advances "since the last
-  // huddle", and the unconfirmed free notes reach the project steward as
+  // BB-300 slice 4: the owner ends the stand-up. It advances "since the last
+  // stand-up", and the unconfirmed free notes reach the project steward as
   // context, not instruction.
-  stewardsHuddleEnd: {
-    input: z.object({ huddleId: z.string().min(1).max(100) }),
+  stewardsStandupEnd: {
+    input: z.object({ standupId: z.string().min(1).max(100) }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
   },
 });
@@ -1412,54 +1412,54 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.realtime.publish(PROJECT_CHANGED, { projectId });
       },
     });
-    // BB-300: one briefing reader, shared by the nightly digest and a huddle;
+    // BB-300: one briefing reader, shared by the nightly digest and a stand-up;
     // the digest renders it through `toDigestRecords`.
     const briefing = createBriefing(store, now);
 
-    // ---- the huddle (BB-300) ----------------------------------------------------------
+    // ---- the stand-up (BB-300) ----------------------------------------------------------
     //
     // One spoken stand-up per project, opened from the Stewards page. The
     // instructions are the briefing ranked decisions first; the model may only
     // read state and take or retract notes. Since slice 4 the record is durable
-    // (the `huddles` table): the session maps to a record, and the notes, the
+    // (the `standups` table): the session maps to a record, and the notes, the
     // event transcript and the confirmed ids are saved there. Nothing here acts
     // on a steward, merges or resolves anything; the page applies a confirmed
-    // note in `stewardsHuddleConfirm`, through the path that already exists for
+    // note in `stewardsStandupConfirm`, through the path that already exists for
     // its shape.
     const VOICE_PLUGIN_ID = "voice-transcription";
     /** OpenAI's own endpoint; Realtime exists only against it. */
-    const HUDDLE_OPENAI_BASE_URL = "https://api.openai.com/v1";
-    /** Session id to durable huddle id; the record itself is in the store. */
-    const huddleSessions = new Map<string, string>();
+    const STANDUP_OPENAI_BASE_URL = "https://api.openai.com/v1";
+    /** Session id to durable stand-up id; the record itself is in the store. */
+    const standupSessions = new Map<string, string>();
     /** Project ids with a start in flight, reserved before the first await so two clicks cannot both start. */
-    const startingHuddles = new Set<string>();
-    /** Huddle ids with a confirmation in flight, so two confirms cannot race the same row. */
-    const confirmingHuddles = new Set<string>();
+    const startingStandups = new Set<string>();
+    /** Stand-up ids with a confirmation in flight, so two confirms cannot race the same row. */
+    const confirmingStandups = new Set<string>();
     const realtimeOpenOutput = z.object({ sessionId: z.string(), maxDurationMs: z.number() });
 
-    /** Append one event to a huddle's transcript and save it; the record's own log. */
-    function noteHuddleEvent(huddle: HuddleRow, entry: Omit<HuddleTranscriptEntry, "at">): HuddleRow {
-      return store.saveHuddle(huddle.id, { transcript: [...huddle.transcript, { at: now(), ...entry }] }) ?? huddle;
+    /** Append one event to a stand-up's transcript and save it; the record's own log. */
+    function noteStandupEvent(standup: StandupRow, entry: Omit<StandupTranscriptEntry, "at">): StandupRow {
+      return store.saveStandup(standup.id, { transcript: [...standup.transcript, { at: now(), ...entry }] }) ?? standup;
     }
 
     /**
-     * End a huddle: stamp the end, advance "since the last huddle", and wake
-     * the project steward with what was said. One road, so `stewardsHuddleEnd`
+     * End a stand-up: stamp the end, advance "since the last stand-up", and wake
+     * the project steward with what was said. One road, so `stewardsStandupEnd`
      * and a new start that supersedes an abandoned overlay behave the same.
-     * A huddle that said nothing wakes no one.
+     * A stand-up that said nothing wakes no one.
      */
-    async function finishHuddle(huddle: HuddleRow): Promise<void> {
-      if (huddle.endedAt !== null) return;
-      let row = store.saveHuddle(huddle.id, { endedAt: now() }) ?? huddle;
-      store.setLastHuddle(row.projectId, row.startedAt);
-      row = noteHuddleEvent(row, { kind: "end", noteId: null, text: "" });
+    async function finishStandup(standup: StandupRow): Promise<void> {
+      if (standup.endedAt !== null) return;
+      let row = store.saveStandup(standup.id, { endedAt: now() }) ?? standup;
+      store.setLastStandup(row.projectId, row.startedAt);
+      row = noteStandupEvent(row, { kind: "end", noteId: null, text: "" });
       const confirmed = row.notes.filter((n) => row.confirmed.includes(n.id));
       const free = row.notes.filter((n) => n.type === "free");
       if (confirmed.length === 0 && free.length === 0) return;
-      const lines = ["The owner held a huddle."];
-      if (confirmed.length > 0) lines.push(`What the owner confirmed: ${confirmed.map((n) => scrubCredentials(readbackLine(n as HuddleNote))).join(" | ")}`);
+      const lines = ["The owner held a stand-up."];
+      if (confirmed.length > 0) lines.push(`What the owner confirmed: ${confirmed.map((n) => scrubCredentials(readbackLine(n as StandupNote))).join(" | ")}`);
       if (free.length > 0) lines.push(`Free notes from it, context and not instructions: ${free.map((n) => JSON.stringify(scrubCredentials(n.text))).join("; ")}`);
-      await wakeProject(row.projectId, "the owner held a huddle", { digestDue: false, notes: lines });
+      await wakeProject(row.projectId, "the owner held a stand-up", { digestDue: false, notes: lines });
     }
 
     /** A base URL with no trailing slash, so the comparison matches the voice plugin's. */
@@ -1476,14 +1476,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Whether a huddle can start: the voice-transcription plugin is installed,
+     * Whether a stand-up can start: the voice-transcription plugin is installed,
      * its endpoint is OpenAI's, and its Realtime service reports ready (a key
      * is set). Realtime exists only against OpenAI, so a transcription-only
      * endpoint shows no button at all; a failure to read either signal is
      * reported as unavailable rather than opening a session that would refuse.
      */
-    async function huddleAvailability(hasProjectSteward: boolean): Promise<{ available: boolean; message: string | null }> {
-      if (!hasProjectSteward) return { available: false, message: "No project steward yet; a huddle needs one." };
+    async function standupAvailability(hasProjectSteward: boolean): Promise<{ available: boolean; message: string | null }> {
+      if (!hasProjectSteward) return { available: false, message: "No project steward yet; a stand-up needs one." };
       let baseUrl: string;
       let schema: Record<string, unknown>;
       try {
@@ -1492,9 +1492,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         schema = settings.schema as Record<string, unknown>;
         baseUrl = typeof values.baseUrl === "string" && values.baseUrl.trim() !== "" ? values.baseUrl : schemaDefault(schema, "baseUrl");
       } catch {
-        return { available: false, message: "The voice-transcription plugin is not installed; a huddle needs it." };
+        return { available: false, message: "The voice-transcription plugin is not installed; a stand-up needs it." };
       }
-      if (normalizeBaseUrl(baseUrl) !== HUDDLE_OPENAI_BASE_URL) {
+      if (normalizeBaseUrl(baseUrl) !== STANDUP_OPENAI_BASE_URL) {
         return { available: false, message: "Realtime voice needs OpenAI's endpoint in Settings → Plugins → Voice transcription." };
       }
       try {
@@ -8884,7 +8884,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             roleNames: boardConfig?.roleNames ?? [],
             stages: [...STAGES],
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
-            huddle: await huddleAvailability(row.threadId !== null),
+            standup: await standupAvailability(row.threadId !== null),
             questions,
             withUser,
             needs,
@@ -9063,67 +9063,67 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // a store change, so it is not part of the cached section.
         return { projects: picker, roleProblem, projectStewardThreadId: store.project(projectId).threadId, ...section };
       },
-      async stewardsHuddle({ projectId }) {
+      async stewardsStandup({ projectId }) {
         // The board already carries this for the project view; the homepage
         // line asks for it alone, without the rest of the board.
-        return huddleAvailability(store.project(projectId).threadId !== null);
+        return standupAvailability(store.project(projectId).threadId !== null);
       },
-      async stewardsHuddleStart({ projectId }, { experimental_caller: caller }) {
-        if (caller.kind !== "client") throw new Error("a huddle is started from the Stewards page");
+      async stewardsStandupStart({ projectId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a stand-up is started from the Stewards page");
         // Reserve the project before the first await, so a click on the board
         // and a click on the home page at the same moment cannot both start.
-        if (startingHuddles.has(projectId)) return { ok: false, sessionId: null, huddleId: null, message: "A huddle for this project is already starting." };
-        startingHuddles.add(projectId);
+        if (startingStandups.has(projectId)) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
+        startingStandups.add(projectId);
         try {
-          const availability = await huddleAvailability(store.project(projectId).threadId !== null);
-          if (!availability.available) return { ok: false, sessionId: null, huddleId: null, message: availability.message ?? "A huddle is not available." };
+          const availability = await standupAvailability(store.project(projectId).threadId !== null);
+          if (!availability.available) return { ok: false, sessionId: null, standupId: null, message: availability.message ?? "A stand-up is not available." };
           const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
-          // The first huddle reads since the last digest rather than since the
+          // The first stand-up reads since the last digest rather than since the
           // beginning: a project with a long history would otherwise list every
           // binding it has ever ended.
-          const since = store.lastHuddle(projectId) ?? store.project(projectId).digestAt ?? 0;
+          const since = store.lastStandup(projectId) ?? store.project(projectId).digestAt ?? 0;
           const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
           // The briefing goes to OpenAI, so a token pasted into a ticket, an
           // escalation or a note is scrubbed first.
-          const instructions = scrubCredentials(buildHuddleInstructions(briefing(projectId, since), name, now(), questions));
+          const instructions = scrubCredentials(buildStandupInstructions(briefing(projectId, since), name, now(), questions));
           // A new start supersedes the project's earlier session: the voice
           // plugin does not tell stewards when an overlay closes, so a stale
           // session must not answer tool calls and the project's record is its
-          // latest huddle, not a lock. An earlier record the owner never ended
+          // latest stand-up, not a lock. An earlier record the owner never ended
           // is finished first, so its confirmed items and free notes still
           // reach the project steward and the window still advances. The open
           // record is found in the store, not the in-memory session map, so it
           // survives a server restart that empties the map.
-          for (const [sid, hid] of huddleSessions) if (store.huddle(hid)?.projectId === projectId) huddleSessions.delete(sid);
-          const open = store.latestHuddle(projectId);
-          if (open !== null && open.endedAt === null) await finishHuddle(open);
+          for (const [sid, hid] of standupSessions) if (store.standup(hid)?.projectId === projectId) standupSessions.delete(sid);
+          const open = store.latestStandup(projectId);
+          if (open !== null && open.endedAt === null) await finishStandup(open);
           // The record is opened before the voice session, so a tool call that
           // arrives immediately finds it.
-          const record = store.createHuddle({ id: newId("hud"), projectId, startedAt: now() });
+          const record = store.createStandup({ id: newId("sup"), projectId, startedAt: now() });
           let opened: { sessionId: string; maxDurationMs: number };
           try {
-            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: HUDDLE_TOOLS, toolHandler: { method: "stewardsHuddleTool" } }, realtimeOpenOutput);
+            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: STANDUP_TOOLS, toolHandler: { method: "stewardsStandupTool" } }, realtimeOpenOutput);
           } catch (error) {
             // The session never opened; end the empty record so it is not read
-            // back as the project's huddle.
-            store.saveHuddle(record.id, { endedAt: now() });
-            return { ok: false, sessionId: null, huddleId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
+            // back as the project's stand-up.
+            store.saveStandup(record.id, { endedAt: now() });
+            return { ok: false, sessionId: null, standupId: null, message: `The voice session could not be opened: ${errorMessage(error)}` };
           }
-          huddleSessions.set(opened.sessionId, record.id);
-          return { ok: true, sessionId: opened.sessionId, huddleId: record.id, message: "Huddle started." };
+          standupSessions.set(opened.sessionId, record.id);
+          return { ok: true, sessionId: opened.sessionId, standupId: record.id, message: "Stand-up started." };
         } finally {
-          startingHuddles.delete(projectId);
+          startingStandups.delete(projectId);
         }
       },
-      async stewardsHuddleTool({ sessionId, name, arguments: rawArgs }, { experimental_caller: caller }) {
-        if (caller.kind !== "plugin" || caller.pluginId !== VOICE_PLUGIN_ID) throw new Error("only the voice-transcription plugin forwards huddle tool calls");
-        const huddleId = huddleSessions.get(sessionId);
-        if (huddleId === undefined) throw new Error("that huddle has ended");
-        let huddle = store.huddle(huddleId);
-        if (huddle === null) throw new Error("that huddle has ended");
+      async stewardsStandupTool({ sessionId, name, arguments: rawArgs }, { experimental_caller: caller }) {
+        if (caller.kind !== "plugin" || caller.pluginId !== VOICE_PLUGIN_ID) throw new Error("only the voice-transcription plugin forwards stand-up tool calls");
+        const standupId = standupSessions.get(sessionId);
+        if (standupId === undefined) throw new Error("that stand-up has ended");
+        let standup = store.standup(standupId);
+        if (standup === null) throw new Error("that stand-up has ended");
         // The first tool call proves the overlay connected and the briefing was
         // delivered; the record keeps that fact.
-        if (!huddle.connected) huddle = store.saveHuddle(huddle.id, { connected: true }) ?? huddle;
+        if (!standup.connected) standup = store.saveStandup(standup.id, { connected: true }) ?? standup;
         let args: Record<string, unknown>;
         try {
           const parsed: unknown = JSON.parse(rawArgs.trim() === "" ? "{}" : rawArgs);
@@ -9131,49 +9131,49 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } catch {
           throw new Error("the tool arguments were not valid JSON");
         }
-        // `runHuddleTool` writes only to this in-memory record; the notes it
+        // `runStandupTool` writes only to this in-memory record; the notes it
         // touches are saved to the durable row afterwards.
-        const huddleProjectId = huddle.projectId;
-        const record: HuddleRecord = { projectId: huddleProjectId, startedAt: huddle.startedAt, notes: [...huddle.notes] as HuddleNote[], connected: huddle.connected };
-        const output = await runHuddleTool(name, args, {
-          projectId: huddleProjectId,
+        const standupProjectId = standup.projectId;
+        const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected };
+        const output = await runStandupTool(name, args, {
+          projectId: standupProjectId,
           now,
-          binding: (key) => store.find(key, huddleProjectId),
+          binding: (key) => store.find(key, standupProjectId),
           openEscalations: (bindingId) => store.openEscalations(bindingId),
           escalation: (id) => store.escalation(id),
-          lessons: (bindingId) => store.allLessons(huddleProjectId).filter((l) => l.bindingId === bindingId),
-          guidance: () => guidanceUnits(huddleProjectId),
+          lessons: (bindingId) => store.allLessons(standupProjectId).filter((l) => l.bindingId === bindingId),
+          guidance: () => guidanceUnits(standupProjectId),
           snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
           needs: (bindingId) => store.openNeeds(bindingId),
-          confirmed: huddle.confirmed,
+          confirmed: standup.confirmed,
           record,
         });
         // Persist the note record when a writer touched it, and log the event in
         // the transcript so the readback has a history.
-        if (name === "take_note" && record.notes.length > huddle.notes.length) {
+        if (name === "take_note" && record.notes.length > standup.notes.length) {
           const added = record.notes[record.notes.length - 1]!;
-          huddle = store.saveHuddle(huddle.id, { notes: record.notes as HuddleNoteRow[] }) ?? huddle;
-          huddle = noteHuddleEvent(huddle, { kind: "note", noteId: added.id, text: added.text });
-        } else if (name === "retract_note" && record.notes.length < huddle.notes.length) {
-          const removed = huddle.notes.find((n) => !record.notes.some((r) => r.id === n.id));
-          huddle = store.saveHuddle(huddle.id, { notes: record.notes as HuddleNoteRow[] }) ?? huddle;
-          if (removed !== undefined) huddle = noteHuddleEvent(huddle, { kind: "retract", noteId: removed.id, text: removed.text });
+          standup = store.saveStandup(standup.id, { notes: record.notes as StandupNoteRow[] }) ?? standup;
+          standup = noteStandupEvent(standup, { kind: "note", noteId: added.id, text: added.text });
+        } else if (name === "retract_note" && record.notes.length < standup.notes.length) {
+          const removed = standup.notes.find((n) => !record.notes.some((r) => r.id === n.id));
+          standup = store.saveStandup(standup.id, { notes: record.notes as StandupNoteRow[] }) ?? standup;
+          if (removed !== undefined) standup = noteStandupEvent(standup, { kind: "retract", noteId: removed.id, text: removed.text });
         }
         // A tool result goes to OpenAI too, so it passes the same scrub.
         return scrubCredentials(output);
       },
-      async stewardsHuddleRecord({ projectId }) {
+      async stewardsStandupRecord({ projectId }) {
         // The readback is rendered here from the stored notes, never composed by
         // the model; the page only displays these lines.
-        const huddle = store.latestHuddle(projectId);
-        if (huddle === null) return { huddle: null };
+        const standup = store.latestStandup(projectId);
+        if (standup === null) return { standup: null };
         return {
-          huddle: {
-            id: huddle.id,
-            projectId: huddle.projectId,
-            startedAt: huddle.startedAt,
-            endedAt: huddle.endedAt,
-            notes: huddle.notes.map((n) => ({
+          standup: {
+            id: standup.id,
+            projectId: standup.projectId,
+            startedAt: standup.startedAt,
+            endedAt: standup.endedAt,
+            notes: standup.notes.map((n) => ({
               id: n.id,
               type: n.type,
               text: n.text,
@@ -9181,10 +9181,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               escalation: n.escalation,
               action: n.action,
               createdAt: n.createdAt,
-              readback: readbackLine(n as HuddleNote),
-              confirmed: huddle.confirmed.includes(n.id),
+              readback: readbackLine(n as StandupNote),
+              confirmed: standup.confirmed.includes(n.id),
             })),
-            confirmed: huddle.confirmed,
+            confirmed: standup.confirmed,
           },
         };
       },
@@ -9194,21 +9194,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // standing rules as a message to the project steward's thread. Nothing is
       // applied before its note is confirmed, and a free note is never applied:
       // it stays context for the project steward.
-      async stewardsHuddleConfirm({ huddleId, noteId }, { experimental_caller: caller }) {
-        if (caller.kind !== "client") throw new Error("huddle items are confirmed by the owner, from the Stewards page");
-        // One confirmation per huddle at a time: applying a gate item can await
+      async stewardsStandupConfirm({ standupId, noteId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("stand-up items are confirmed by the owner, from the Stewards page");
+        // One confirmation per stand-up at a time: applying a gate item can await
         // a GitHub read or a merge, and two tabs must not race the same row.
-        if (confirmingHuddles.has(huddleId)) return { ok: false, applied: false, message: "Another item in this huddle is being confirmed; try again in a moment." };
-        confirmingHuddles.add(huddleId);
+        if (confirmingStandups.has(standupId)) return { ok: false, applied: false, message: "Another item in this stand-up is being confirmed; try again in a moment." };
+        confirmingStandups.add(standupId);
         try {
-          const huddle = store.huddle(huddleId);
-          if (huddle === null) return { ok: false, applied: false, message: "That huddle is gone." };
-          const note = huddle.notes.find((n) => n.id === noteId);
-          if (note === undefined) return { ok: false, applied: false, message: "That note is not in this huddle." };
-          if (huddle.confirmed.includes(noteId)) return { ok: true, applied: true, message: "Already confirmed." };
-          const type = note.type as HuddleNoteType;
+          const standup = store.standup(standupId);
+          if (standup === null) return { ok: false, applied: false, message: "That stand-up is gone." };
+          const note = standup.notes.find((n) => n.id === noteId);
+          if (note === undefined) return { ok: false, applied: false, message: "That note is not in this stand-up." };
+          if (standup.confirmed.includes(noteId)) return { ok: true, applied: true, message: "Already confirmed." };
+          const type = note.type as StandupNoteType;
           const text = scrubCredentials(note.text);
-          const binding = note.binding === null ? null : store.find(note.binding, huddle.projectId);
+          const binding = note.binding === null ? null : store.find(note.binding, standup.projectId);
           let applied = false;
           let message = "Confirmed.";
 
@@ -9227,17 +9227,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           } else if (type === "guidance") {
             if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
             store.addGuidance(binding.id, text, "user");
-            store.note(binding.id, `The owner confirmed huddle guidance: ${text}`);
+            store.note(binding.id, `The owner confirmed stand-up guidance: ${text}`);
             scheduleReconcile(binding.id);
             applied = true;
             message = `Guidance saved on ${binding.entityKey}.`;
           } else if (type === "resolve-escalation") {
             const escalation = note.escalation === null ? null : store.escalation(note.escalation);
             if (escalation === null || escalation.status !== "open") return { ok: false, applied: false, message: "That escalation is not open." };
-            // An approval or a secret has its own button; a huddle sentence
+            // An approval or a secret has its own button; a stand-up sentence
             // must not stand in for the value.
-            if (escalation.kind === "approval") return { ok: false, applied: false, message: "That is an approval; use the Approve or Decline button, not the huddle." };
-            if (escalation.resolutionKind === "secret") return { ok: false, applied: false, message: "That needs a secret; use the Provide button, not the huddle." };
+            if (escalation.kind === "approval") return { ok: false, applied: false, message: "That is an approval; use the Approve or Decline button, not the stand-up." };
+            if (escalation.resolutionKind === "secret") return { ok: false, applied: false, message: "That needs a secret; use the Provide button, not the stand-up." };
             // A route-`user` escalation is the page's own item, with the
             // escalation id as its need id; answer it through the same RPC the
             // page uses, so the closure, corrections and parent wake happen.
@@ -9251,7 +9251,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (!result.ok) return { ok: false, applied: false, message: result.message };
               message = result.message;
             } else {
-              const question = store.openQuestions(huddle.projectId).find((q) => q.escalationId === escalation.id);
+              const question = store.openQuestions(standup.projectId).find((q) => q.escalationId === escalation.id);
               if (question !== undefined) {
                 const result = await rawRpcHandlers.stewardsAnswerQuestion({ questionId: question.id, answer: text }, { experimental_caller: { kind: "client" } });
                 if (!result.ok) return { ok: false, applied: false, message: result.message };
@@ -9263,10 +9263,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 countCorrections(escalation, text);
                 if (from !== null) {
                   store.addGuidance(from.id, text, "user");
-                  store.note(from.id, `Escalation ${escalation.id} resolved from a huddle: ${text}`);
+                  store.note(from.id, `Escalation ${escalation.id} resolved from a stand-up: ${text}`);
                   scheduleReconcile(from.id);
                 }
-                await wakeProject(huddle.projectId, "an escalation was resolved in a huddle", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a huddle with: ${JSON.stringify(text)}`] });
+                await wakeProject(standup.projectId, "an escalation was resolved in a stand-up", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a stand-up with: ${JSON.stringify(text)}`] });
                 message = `Escalation ${escalation.id} resolved.`;
               }
             }
@@ -9274,34 +9274,34 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           } else if (type === "direction" || type === "standing-rule") {
             const label = type === "direction" ? "direction" : "standing rule";
             const cue = type === "standing-rule" ? " A standing rule is the cue to open the playbook pull request." : "";
-            await wakeProject(huddle.projectId, `the owner's ${label} from a huddle`, { digestDue: false, notes: [`The owner held a huddle and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
+            await wakeProject(standup.projectId, `the owner's ${label} from a stand-up`, { digestDue: false, notes: [`The owner held a stand-up and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
             applied = true;
             message = `${type === "direction" ? "Direction" : "Standing rule"} sent to the project steward.`;
           } else {
             // A free note is context, never an action: it is left unconfirmed
             // for the project steward's next wake.
-            return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the huddle ends." };
+            return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the stand-up ends." };
           }
 
           // Re-read the row: a take_note or retract_note may have landed while
           // the apply above awaited, and neither may be dropped.
-          const fresh = store.huddle(huddle.id) ?? huddle;
-          store.saveHuddle(fresh.id, { confirmed: [...fresh.confirmed, noteId], transcript: [...fresh.transcript, { at: now(), kind: "confirm", noteId, text }] });
+          const fresh = store.standup(standup.id) ?? standup;
+          store.saveStandup(fresh.id, { confirmed: [...fresh.confirmed, noteId], transcript: [...fresh.transcript, { at: now(), kind: "confirm", noteId, text }] });
           return { ok: true, applied, message };
         } finally {
-          confirmingHuddles.delete(huddleId);
+          confirmingStandups.delete(standupId);
         }
       },
-      // The owner ends the huddle. That advances "since the last huddle", and
+      // The owner ends the stand-up. That advances "since the last stand-up", and
       // the free notes that were never typed reach the project steward as
-      // context, not instruction, with a line that a huddle was held.
-      async stewardsHuddleEnd({ huddleId }, { experimental_caller: caller }) {
-        if (caller.kind !== "client") throw new Error("a huddle is ended by the owner, from the Stewards page");
-        const huddle = store.huddle(huddleId);
-        if (huddle === null) return { ok: false, message: "That huddle is gone." };
-        if (huddle.endedAt !== null) return { ok: true, message: "Already ended." };
-        await finishHuddle(huddle);
-        return { ok: true, message: "Huddle ended." };
+      // context, not instruction, with a line that a stand-up was held.
+      async stewardsStandupEnd({ standupId }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a stand-up is ended by the owner, from the Stewards page");
+        const standup = store.standup(standupId);
+        if (standup === null) return { ok: false, message: "That stand-up is gone." };
+        if (standup.endedAt !== null) return { ok: true, message: "Already ended." };
+        await finishStandup(standup);
+        return { ok: true, message: "Stand-up ended." };
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");

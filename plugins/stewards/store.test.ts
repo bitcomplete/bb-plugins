@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, HUDDLE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -645,9 +645,9 @@ describe("the actor rename migration (BB-97)", () => {
     // BB-264 appended the retarget-pulls column after that, BB-287 appended the
     // stacked-pull columns after that, BB-293 appended the shadow
     // assessment and divergence-log tables after that, BB-294 appended the
-    // ended-read index after that, and BB-300 slice 4 appended the huddle table
+    // ended-read index after that, and BB-300 slice 4 appended the stand-up table
     // after that.
-    const groups = [HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    const groups = [STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -738,12 +738,14 @@ describe("the escalation route rename migration (BB-209)", () => {
     // columns after that, BB-256's merge-hold column after that, BB-264's
     // retarget-pulls column after that, BB-287's stacked-pull columns after
     // that, BB-293's shadow-assessment tables after that, BB-294's
-    // ended-read index after that, and BB-300 slice 4's huddle table after
-    // that.
-    const withHuddle = MIGRATIONS.slice(0, -HUDDLE_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-HUDDLE_MIGRATIONS.length)).toEqual([...HUDDLE_MIGRATIONS]);
-    const withEnded = withHuddle.slice(0, -ENDED_READ_MIGRATIONS.length);
-    expect(withHuddle.slice(-ENDED_READ_MIGRATIONS.length)).toEqual([...ENDED_READ_MIGRATIONS]);
+    // ended-read index after that, BB-300 slice 4's huddle table after that,
+    // and its rename to the stand-up table after that.
+    const withHuddle = MIGRATIONS.slice(0, -STANDUP_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-STANDUP_MIGRATIONS.length)).toEqual([...STANDUP_MIGRATIONS]);
+    const withStandup = withHuddle.slice(0, -HUDDLE_MIGRATIONS.length);
+    expect(withHuddle.slice(-HUDDLE_MIGRATIONS.length)).toEqual([...HUDDLE_MIGRATIONS]);
+    const withEnded = withStandup.slice(0, -ENDED_READ_MIGRATIONS.length);
+    expect(withStandup.slice(-ENDED_READ_MIGRATIONS.length)).toEqual([...ENDED_READ_MIGRATIONS]);
     const withAssessment = withEnded.slice(0, -ASSESSMENT_MIGRATIONS.length);
     expect(withEnded.slice(-ASSESSMENT_MIGRATIONS.length)).toEqual([...ASSESSMENT_MIGRATIONS]);
     const withStacked = withAssessment.slice(0, -STACKED_PULLS_MIGRATIONS.length);
@@ -1254,5 +1256,24 @@ describe("recorded assumptions (BB-251)", () => {
     expect(s.openAssumptionsForProject("p1").map((a) => a.text)).toEqual(["on the binding", "project-wide"]);
     s.patch(binding.id, { endedAt: 2_000 });
     expect(s.openAssumptionsForProject("p1").map((a) => a.text)).toEqual(["project-wide"]);
+  });
+});
+
+describe("the stand-up rename (after BB-300)", () => {
+  it("carries a huddle record and the last-huddle key from a store built before the rename", () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS.slice(0, MIGRATIONS.indexOf(STANDUP_MIGRATIONS[0]!))) db.exec(sql);
+    db.prepare("INSERT INTO huddles (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (?, ?, ?, ?, 1, '[]', ?, '[]')").run("hud_1", "p1", 100, 150, JSON.stringify([{ id: "note_1", type: "free", text: "Ship it", binding: null, escalation: null, action: null, createdAt: 120 }]));
+    db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?)").run("stewards:last-huddle:p1", "150");
+    db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?)").run("stewards:other", "kept");
+    for (const sql of STANDUP_MIGRATIONS) db.exec(sql);
+    const s = createStore(db, () => 200);
+    expect(s.standup("hud_1")?.notes.map((n) => n.text)).toEqual(["Ship it"]);
+    expect(s.latestStandup("p1")?.endedAt).toBe(150);
+    expect(s.lastStandup("p1")).toBe(150);
+    expect(db.prepare("SELECT value FROM server_settings WHERE key = ?").get("stewards:other")).toEqual({ value: "kept" });
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('huddles', 'standups')").all()).toEqual([{ name: "standups" }]);
+    const fresh = s.createStandup({ id: "sup_2", projectId: "p1", startedAt: 200 });
+    expect(s.latestStandup("p1")?.id).toBe(fresh.id);
   });
 });
