@@ -711,8 +711,8 @@ describe("quiet ops monitors in the stand-up brief (BB-315)", () => {
     const quiet = opsBinding({ id: "b-quiet", entityKey: "sentry-project/acme/web", title: "Sentry watch" });
     const text = buildStandupBrief(tierBriefing(agenda), [agenda, quiet], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
     expect(section(text, "Other open stewards")).not.toContain(quiet.entityKey);
-    // The header names the count of omitted quiet monitors, so the voice can mention them.
-    expect(text).toContain("1 monitor is quiet and not listed; look one up by key if the owner asks.");
+    // The header names the count and the keys of the omitted quiet monitors, so the voice can mention them.
+    expect(text).toContain("1 monitor is quiet and not listed (sentry-project/acme/web).");
   });
 
   it("keeps a stuck ops monitor in the open tier", () => {
@@ -741,7 +741,7 @@ describe("quiet ops monitors in the stand-up brief (BB-315)", () => {
     const agenda = binding({ id: "b-agenda", entityKey: "ENG-1" });
     const quiet = ["a", "b", "c"].map((n) => opsBinding({ id: `b-${n}`, entityKey: `dependabot/acme/${n}`, title: `Watch ${n}` }));
     const text = buildStandupBrief(tierBriefing(agenda), [agenda, ...quiet], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
-    expect(text).toContain("3 monitors are quiet and not listed; look one up by key if the owner asks.");
+    expect(text).toContain("3 monitors are quiet and not listed (dependabot/acme/a, dependabot/acme/b, dependabot/acme/c).");
   });
 });
 
