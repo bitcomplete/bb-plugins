@@ -94,8 +94,8 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, type StandupEndOutcome, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
-import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, STANDUP_DELEGATE_ANSWER_MAX_CHARS, type StandupAskOutcome, type StandupDelegation, type StandupEndOutcome, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
+import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
@@ -121,7 +121,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupDelegationRow, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
@@ -207,6 +207,8 @@ export interface Timing {
   environmentWaitMs: number;
   /** BB-255: the base of the backoff before retrying a failed wake (doubles per attempt). */
   wakeRetryBaseMs: number;
+  /** BB-307: how long `ask_a_thread` waits for the delegate's idle before answering with the timeout line. */
+  standupDelegateTimeoutMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
@@ -222,6 +224,7 @@ export const DEFAULT_TIMING: Timing = {
   environmentPollMs: 1000,
   environmentWaitMs: 60_000,
   wakeRetryBaseMs: 15_000,
+  standupDelegateTimeoutMs: 120_000,
 };
 
 /** BB-255: the plugin retries its own failed wake up to this many attempts (the original is attempt 1). */
@@ -1058,6 +1061,19 @@ export const rpcContract = defineRpcContract({
           confirmed: z.array(z.string()),
           /** How the stand-up ended: by voice, the page's Done, or a new start. */
           endedBy: z.enum(["voice", "page", "start"]).nullable(),
+          /** BB-307: every `ask_a_thread` delegation, for the page's log beside the notes. */
+          delegations: z.array(
+            z.object({
+              question: z.string(),
+              key: z.string().nullable(),
+              startedAt: z.number(),
+              finishedAt: z.number(),
+              elapsedMs: z.number(),
+              answer: z.string().nullable(),
+              outcome: z.enum(["success", "timeout", "error"]),
+              error: z.string().nullable(),
+            }),
+          ),
         })
         .nullable(),
     }),
@@ -1501,6 +1517,179 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return store.saveStandup(standup.id, { transcript: [...standup.transcript, { at: now(), ...entry }] }) ?? standup;
     }
 
+    // BB-307: the `ask_a_thread` delegate. One hidden, read-only thread per
+    // stand-up, spawned on the first question and reused for later ones so a
+    // follow-up keeps context. The thread id is in memory: a server restart
+    // ends every open stand-up, and the startup sweep archives any delegate a
+    // restart left behind from its `role: "delegate"` metadata.
+    const STANDUP_DELEGATE_DEFAULT_MODEL = "claude/claude-haiku-5-5/low";
+    /** Stand-up id -> the delegate thread it spawned. */
+    const standupDelegates = new Map<string, string>();
+    /** Stand-up ids with a lookup in flight; a second call is refused with a line. */
+    const standupDelegateInFlight = new Set<string>();
+    /**
+     * What a delegate lookup settles as: its answer, the 120 s timeout, the
+     * stand-up ending under it, or a turn that ended with no text (a provider
+     * error). A timed-out waiter stays in the map so a late answer is logged.
+     */
+    type StandupDelegateWait = { kind: "answer"; answer: string } | { kind: "timeout" } | { kind: "ended" } | { kind: "no-answer" };
+    /** Delegate thread id -> the waiter its `thread.idle` (or the stand-up's end) resolves. */
+    const standupDelegateWaiters = new Map<string, { standupId: string; resolve: (wait: StandupDelegateWait) => void; timer: ReturnType<typeof setTimeout>; settled: boolean }>();
+
+    /** The delegate's standing instructions: read only, one-line verdict, under 200 words. */
+    const STANDUP_DELEGATE_PREAMBLE = [
+      "You are answering one question for the project owner's stand-up.",
+      "Read only: use Linear search, GitHub (`gh`), the repositories and `bb stewards show`/`list`/`needs` as needed.",
+      "Do not comment on any ticket or pull request, and do not run `bb stewards done`, `escalate` or `merge`, or make any Linear write.",
+      "",
+      "Reply with a one-line verdict first, then the evidence, under 200 words.",
+    ].join("\n");
+
+    /** `bb stewards show <key>` output for the delegate's context, or null when the key has no steward here. */
+    async function standupShowText(projectId: string, key: string): Promise<string | null> {
+      const b = store.find(key, projectId);
+      if (b === null) return null;
+      const config = await loadConfig(b.projectId);
+      return bindingShowLines(b, config).join("\n");
+    }
+
+    /** The message one question becomes: the show context prepended when a key was given. */
+    async function standupDelegateMessage(projectId: string, question: string, key: string | null): Promise<string> {
+      if (key === null) return `Question: ${question}`;
+      const show = await standupShowText(projectId, key).catch(() => null);
+      return show === null ? `Question: ${question}` : `Steward context (bb stewards show ${key}):\n${show}\n\nQuestion: ${question}`;
+    }
+
+    /** Spawn the stand-up's one delegate, hidden, with the model from `standup.delegate` or the default. */
+    async function spawnStandupDelegate(standup: StandupRow, prompt: string): Promise<string> {
+      const config = await loadConfig(standup.projectId);
+      const hostId = await projectHost(standup.projectId);
+      const spec = config?.file.standup.delegate ?? parseModel(STANDUP_DELEGATE_DEFAULT_MODEL);
+      const thread = await bb.sdk.threads.spawn({
+        projectId: standup.projectId,
+        environment: freshEnvironment(config?.source ?? null, hostId),
+        prompt,
+        title: standup.binding === null ? "Stand-up delegate" : `Stand-up delegate · ${standup.binding}`,
+        ...modelArgs(spec),
+        // The narrowest of the Claude provider's public modes (`accept-edits`,
+        // `auto`, `full`): no read-only mode exists in the spawn API. The
+        // delegate runs unattended and hidden, so `accept-edits` is not enough
+        // — its escalations wait on a user who never answers a hidden thread.
+        // `auto` keeps the same workspace sandbox but reviews escalations
+        // provider-natively, which is what lets the read commands run.
+        permissionMode: "auto",
+        pluginMetadata: { role: "delegate", standupId: standup.id },
+      });
+      standupDelegates.set(standup.id, thread.id);
+      // The spec asks for the hidden flag through `threads.update`; a failed
+      // update leaves the delegate visible rather than failing the lookup.
+      await quietly(`hide the stand-up delegate ${thread.id}`, () => bb.sdk.threads.update({ threadId: thread.id, visibility: "hidden" }));
+      bb.log.info(`stewards: started a stand-up delegate for ${standup.id} (${thread.id})`);
+      return thread.id;
+    }
+
+    /** Wait for one delegate idle, or settle at the timeout; the waiter stays for a late answer. */
+    function waitForStandupDelegate(threadId: string, standupId: string): Promise<StandupDelegateWait> {
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          const waiter = standupDelegateWaiters.get(threadId);
+          if (waiter !== undefined) waiter.settled = true;
+          resolve({ kind: "timeout" });
+        }, timing.standupDelegateTimeoutMs);
+        standupDelegateWaiters.set(threadId, { standupId, resolve, timer, settled: false });
+      });
+    }
+
+    /**
+     * Hand one question to the stand-up's delegate. The first call spawns and
+     * the spawn's prompt carries the question; later calls send it to the same
+     * thread. One lookup runs at a time per stand-up. A timeout returns the
+     * "did not finish" line; the waiter stays so the idle that follows logs the
+     * answer on the record without delivering it.
+     */
+    async function askStandupDelegate(standup: StandupRow, question: string, key: string | null): Promise<StandupAskOutcome> {
+      const startedAt = now();
+      if (standupDelegateInFlight.has(standup.id)) return { outcome: "busy", answer: null, startedAt, finishedAt: now(), error: null };
+      standupDelegateInFlight.add(standup.id);
+      let threadId: string;
+      try {
+        const existing = standupDelegates.get(standup.id) ?? null;
+        const message = await standupDelegateMessage(standup.projectId, question, key);
+        if (existing === null) {
+          threadId = await spawnStandupDelegate(standup, `${STANDUP_DELEGATE_PREAMBLE}\n\n${message}`);
+        } else {
+          threadId = existing;
+          await bb.sdk.threads.send({ threadId, input: [{ type: "text", text: message, mentions: [] }], mode: "auto" });
+        }
+      } catch (error) {
+        standupDelegateInFlight.delete(standup.id);
+        return { outcome: "error", answer: null, startedAt, finishedAt: now(), error: errorMessage(error) };
+      }
+      const wait = await waitForStandupDelegate(threadId, standup.id);
+      // A success deletes the waiter in the idle handler; a timeout keeps it,
+      // and keeps the stand-up busy, until the delegate finishes. The end of
+      // the stand-up resolves a pending waiter so the call never hangs.
+      if (wait.kind === "answer") return { outcome: "success", answer: wait.answer, startedAt, finishedAt: now(), error: null };
+      if (wait.kind === "ended") return { outcome: "error", answer: null, startedAt, finishedAt: now(), error: "the stand-up ended while the lookup was running" };
+      if (wait.kind === "no-answer") return { outcome: "error", answer: null, startedAt, finishedAt: now(), error: "the delegate ended its turn without an answer" };
+      return { outcome: "timeout", answer: null, startedAt, finishedAt: now(), error: null };
+    }
+
+    /** Log a late answer on the record, scrubbed and capped, without delivering it to the session. */
+    function logLateStandupDelegateAnswer(standupId: string, answer: string | null): void {
+      if (answer === null || answer.trim() === "") return;
+      const row = store.standup(standupId);
+      if (row === null) return;
+      const text = redactLine(answer, STANDUP_DELEGATE_ANSWER_MAX_CHARS);
+      const delegations = [...row.delegations];
+      // One delegate per stand-up and one lookup at a time, so the newest
+      // timed-out entry with no answer is the one this idle belongs to. Walk
+      // from the end so a late answer never lands on an earlier question.
+      for (let i = delegations.length - 1; i >= 0; i--) {
+        const d = delegations[i]!;
+        if (d.outcome !== "timeout" || d.answer !== null) continue;
+        delegations[i] = { ...d, answer: text, finishedAt: now(), elapsedMs: Math.max(0, now() - d.startedAt) };
+        store.saveStandup(standupId, { delegations });
+        return;
+      }
+    }
+
+    /** Drop the stand-up's waiter, in-flight flag and delegate thread, archiving the thread. */
+    async function archiveStandupDelegate(standupId: string): Promise<void> {
+      const threadId = standupDelegates.get(standupId) ?? null;
+      standupDelegates.delete(standupId);
+      standupDelegateInFlight.delete(standupId);
+      if (threadId !== null) {
+        const waiter = standupDelegateWaiters.get(threadId);
+        if (waiter !== undefined) {
+          clearTimeout(waiter.timer);
+          standupDelegateWaiters.delete(threadId);
+          // The stand-up ended under a pending lookup: settle it so the tool
+          // call returns and logs the error instead of hanging forever.
+          if (!waiter.settled) waiter.resolve({ kind: "ended" });
+        }
+        await quietly(`archive the stand-up delegate ${threadId}`, () => bb.sdk.threads.archive({ threadId }));
+      }
+    }
+
+    /**
+     * BB-307: archive delegates a restart left behind. Every open stand-up ends
+     * when the server restarts, so every thread this plugin marked
+     * `role: "delegate"` is orphaned and is archived here. BB-93's
+     * `UNHIDE_ONCE_KEY` migration is not widened: delegates are hidden, and
+     * this sweep never makes one visible.
+     */
+    async function archiveOrphanStandupDelegates(): Promise<void> {
+      const rows = await bb.sdk.threads.list({ originPluginId: bb.pluginId, archived: false, includeHidden: true });
+      const ids = rows.map((t) => t.id);
+      if (ids.length === 0) return;
+      const { threads } = await bb.sdk.threads.experimental_listPluginMetadata({ pluginId: bb.pluginId, threadIds: ids });
+      for (const row of threads) {
+        if (row.metadata.role !== "delegate") continue;
+        await quietly(`archive the orphaned stand-up delegate ${row.threadId}`, () => bb.sdk.threads.archive({ threadId: row.threadId }));
+      }
+    }
+
     /**
      * End a stand-up: stamp the end, advance "since the last stand-up" for a
      * project stand-up, and wake the project steward with what was said. One
@@ -1518,6 +1707,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // the last project one.
       if (row.binding === null) store.setLastStandup(row.projectId, row.startedAt);
       row = noteStandupEvent(row, { kind: "end", noteId: null, text: "", via });
+      // BB-307: every way a stand-up ends archives its delegate, so none
+      // outlives the stand-up.
+      await archiveStandupDelegate(row.id);
       const confirmed = row.notes.filter((n) => row.confirmed.includes(n.id));
       const free = row.notes.filter((n) => n.type === "free");
       if (confirmed.length === 0 && free.length === 0) return;
@@ -7927,6 +8119,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       scheduleReconcile(owner.id);
     }));
 
+    // BB-307: a stand-up delegate's idle resolves the waiting `ask_a_thread`
+    // call, or logs a late answer after a timeout. It is its own listener so a
+    // lookup is never delayed behind the coalesced steward turn, and it does
+    // nothing for any other thread.
+    bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+      const waiter = standupDelegateWaiters.get(thread.id);
+      if (waiter === undefined) return;
+      standupDelegateWaiters.delete(thread.id);
+      clearTimeout(waiter.timer);
+      standupDelegateInFlight.delete(waiter.standupId);
+      if (!waiter.settled) {
+        // An idle with no text is a turn that ended without an answer (a
+        // provider error, say), not a timeout: report it as an error.
+        waiter.resolve(lastAssistantText === null || lastAssistantText.trim() === "" ? { kind: "no-answer" } : { kind: "answer", answer: lastAssistantText });
+        return;
+      }
+      logLateStandupDelegateAnswer(waiter.standupId, lastAssistantText);
+    });
+
     bb.events.on("thread.idle", store.coalescingTool(async ({ thread, lastAssistantText }) => {
       const worker = store.worker(thread.id);
       if (worker !== null) {
@@ -9407,7 +9618,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // `runStandupTool` writes only to this in-memory record; the notes it
         // touches are saved to the durable row afterwards.
         const standupProjectId = standup.projectId;
-        const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected };
+        const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected, delegations: [...standup.delegations] as StandupDelegation[] };
         const result = await runStandupTool(name, args, {
           projectId: standupProjectId,
           now,
@@ -9420,6 +9631,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           needs: (bindingId) => store.openNeeds(bindingId),
           confirmed: standup.confirmed,
           record,
+          // BB-307: the `ask_a_thread` path. It spawns or reuses the stand-up's
+          // hidden delegate and waits for its idle; the answer is scrubbed and
+          // capped by `runStandupTool` before it is logged or returned.
+          askThread: (question, key) => askStandupDelegate(standup!, question, key),
           // BB-301: the one tool that acts outside the record. It applies only
           // typed notes of this stand-up's own record, skipping free notes, a
           // merge (the page's Confirm keeps that), ids that are not here, and
@@ -9491,6 +9706,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           standup = store.saveStandup(standup.id, { notes: record.notes as StandupNoteRow[] }) ?? standup;
           if (removed !== undefined) standup = noteStandupEvent(standup, { kind: "retract", noteId: removed.id, text: removed.text });
         }
+        // BB-307: persist an `ask_a_thread` delegation the tool appended. A
+        // late answer after a timeout is written by the idle handler instead.
+        if (record.delegations.length > standup.delegations.length) {
+          standup = store.saveStandup(standup.id, { delegations: record.delegations as StandupDelegationRow[] }) ?? standup;
+        }
         // A tool result goes to OpenAI too, so it passes the same scrub. The
         // `last` flag survives the scrub, so the overlay closes after the
         // model's goodbye.
@@ -9538,6 +9758,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }),
             confirmed: standup.confirmed,
             endedBy: endEntry?.via ?? null,
+            delegations: standup.delegations,
           },
         };
       },
@@ -11658,6 +11879,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         .join("\n");
     }
 
+    /**
+     * The lines `bb stewards show` prints for one binding: the row, the project
+     * source and playbook, the ready gate, touches, deployments, guidance,
+     * escalations, assumptions, needs, workers and fingerprints. Shared with
+     * the stand-up delegate's context (BB-307), so the delegate reads exactly
+     * what the owner would see from `bb stewards show <key>`.
+     */
+    function bindingShowLines(b: Binding, config: ProjectConfig | null): string[] {
+      const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
+      const lines = [formatBindings([b], (x) => rolesForBinding(roleMap, x)), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
+      if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
+      if (b.kind !== "ops") {
+        const conflicts = conflictsOf(b, store.open(b.projectId));
+        lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; file-level overlap: ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
+      }
+      for (const line of deploymentLines(b.deployments)) lines.push(`Deployment ${line}`);
+      for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
+      for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
+      for (const x of store.escalations(b.id)) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+      for (const a of store.assumptions(b.id)) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
+      for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
+      for (const w of store.workers(b.id)) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
+      for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.filedByThread === null || f.filedByThread === undefined ? "" : `, filed by ${f.filedByThread}`}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
+      if (b.kind === "ops") {
+        for (const d of store.depsDecisions(b.projectId, b.entityId)) lines.push(`Decision ${d.ticketKey} (${d.status}, raised ${iso(d.raisedAt)}${d.raisedBy === null ? "" : ` by ${d.raisedBy}`}${d.needId === null ? "" : `, item ${d.needId}`}${d.snoozedUntil === null ? "" : `, snoozed until ${iso(d.snoozedUntil)}`}${d.reminded.length === 0 ? "" : `, reminded ${d.reminded.join(", ")}`}): ${d.fingerprints.join(", ")}${d.resolution === null ? "" : ` → ${d.resolution}`}`);
+      }
+      return lines;
+    }
+
     // ---- timers: requeue, the sweep, the nightly pass ----------------------------------------------
 
     async function requeueTick(): Promise<void> {
@@ -11963,6 +12213,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await backfillAutoNeedsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time auto-need backfill: ${errorMessage(e)}`));
         // BB-253: mute the steward trees that already exist, once.
         await muteStewardThreadsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time steward mute: ${errorMessage(e)}`));
+        // BB-307: a restart ends every open stand-up, so archive the delegates
+        // a restart left behind before any new one starts.
+        await archiveOrphanStandupDelegates().catch((e: unknown) => bb.log.warn(`stewards: orphan delegate sweep: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
         const sweeper = setInterval(() => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`)), timing.sweepMs);
         // The first sweep tells linear and github what to watch after a restart.
@@ -12786,24 +13039,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const config = await loadConfig(b.projectId);
               const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id), assumptions: store.assumptions(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
-              const roleMap = bindingRoles(config?.roles ?? null, config?.githubLogin === null || config?.githubLogin === undefined ? null : lc(config.githubLogin), config?.repos ?? []);
-              const lines = [formatBindings([b], (x) => rolesForBinding(roleMap, x)), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
-              if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
-              if (b.kind !== "ops") {
-                const conflicts = conflictsOf(b, store.open(b.projectId));
-                lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; file-level overlap: ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
-              }
-              for (const line of deploymentLines(b.deployments)) lines.push(`Deployment ${line}`);
-              for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
-              for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
-              for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
-              for (const a of detail.assumptions) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
-              for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
-              for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
-              for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.filedByThread === null || f.filedByThread === undefined ? "" : `, filed by ${f.filedByThread}`}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
-              if (b.kind === "ops") {
-                for (const d of store.depsDecisions(b.projectId, b.entityId)) lines.push(`Decision ${d.ticketKey} (${d.status}, raised ${iso(d.raisedAt)}${d.raisedBy === null ? "" : ` by ${d.raisedBy}`}${d.needId === null ? "" : `, item ${d.needId}`}${d.snoozedUntil === null ? "" : `, snoozed until ${iso(d.snoozedUntil)}`}${d.reminded.length === 0 ? "" : `, reminded ${d.reminded.join(", ")}`}): ${d.fingerprints.join(", ")}${d.resolution === null ? "" : ` → ${d.resolution}`}`);
-              }
+              const lines = bindingShowLines(b, config);
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
@@ -13278,12 +13514,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, readCounts, reconcilePass });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, archiveOrphanStandupDelegates, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, readCounts, reconcilePass });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; archiveOrphanStandupDelegates(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void> }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

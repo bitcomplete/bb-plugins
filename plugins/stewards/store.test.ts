@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -647,8 +647,8 @@ describe("the actor rename migration (BB-97)", () => {
     // assessment and divergence-log tables after that, BB-294 appended the
     // ended-read index after that, BB-300 slice 4 appended the stand-up table
     // after that, its rename follows, and BB-303 appended the scope column
-    // after that.
-    const groups = [STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // after that, and BB-307 appended the delegation log after that.
+    const groups = [STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -740,10 +740,12 @@ describe("the escalation route rename migration (BB-209)", () => {
     // retarget-pulls column after that, BB-287's stacked-pull columns after
     // that, BB-293's shadow-assessment tables after that, BB-294's
     // ended-read index after that, BB-300 slice 4's huddle table after that,
-    // its rename to the stand-up table after that, and BB-303's scope column
-    // after that.
-    const withoutBinding = MIGRATIONS.slice(0, -STANDUP_BINDING_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-STANDUP_BINDING_MIGRATIONS.length)).toEqual([...STANDUP_BINDING_MIGRATIONS]);
+    // its rename to the stand-up table after that, BB-303's scope column
+    // after that, and BB-307's delegation log after that.
+    const withoutDelegations = MIGRATIONS.slice(0, -STANDUP_DELEGATION_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-STANDUP_DELEGATION_MIGRATIONS.length)).toEqual([...STANDUP_DELEGATION_MIGRATIONS]);
+    const withoutBinding = withoutDelegations.slice(0, -STANDUP_BINDING_MIGRATIONS.length);
+    expect(withoutDelegations.slice(-STANDUP_BINDING_MIGRATIONS.length)).toEqual([...STANDUP_BINDING_MIGRATIONS]);
     const withHuddle = withoutBinding.slice(0, -STANDUP_MIGRATIONS.length);
     expect(withoutBinding.slice(-STANDUP_MIGRATIONS.length)).toEqual([...STANDUP_MIGRATIONS]);
     const withStandup = withHuddle.slice(0, -HUDDLE_MIGRATIONS.length);
@@ -1272,6 +1274,7 @@ describe("the stand-up rename (after BB-300)", () => {
     db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?)").run("stewards:other", "kept");
     for (const sql of STANDUP_MIGRATIONS) db.exec(sql);
     for (const sql of STANDUP_BINDING_MIGRATIONS) db.exec(sql);
+    for (const sql of STANDUP_DELEGATION_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 200);
     expect(s.standup("hud_1")?.notes.map((n) => n.text)).toEqual(["Ship it"]);
     expect(s.latestStandup("p1")?.endedAt).toBe(150);
@@ -1290,6 +1293,7 @@ describe("the stand-up scope migration (BB-303)", () => {
     // A row the pre-BB-303 build wrote: no binding column at all.
     db.prepare("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed) VALUES (?, ?, ?, ?, 0, '[]', '[]', '[]')").run("sup_old", "p1", 100, null);
     for (const sql of STANDUP_BINDING_MIGRATIONS) db.exec(sql);
+    for (const sql of STANDUP_DELEGATION_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 200);
     expect(s.standup("sup_old")?.binding).toBeNull();
     // A scoped row stores its key; a project row stays null.

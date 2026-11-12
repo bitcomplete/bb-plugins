@@ -14740,7 +14740,7 @@ describe("the stand-up (BB-300)", () => {
       speaksFirst: true,
     });
     const tools = open.input.tools as Array<{ name: string }>;
-    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
     expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
     expect(String(open.input.instructions)).toMatch(/Should I file an a11y ticket\?/u);
     // Opening the session does not advance the window: only a session that
@@ -14857,7 +14857,7 @@ describe("the stand-up (BB-300)", () => {
     expect(instructions).toContain("This stand-up is about ENG-12 only");
     expect(instructions).not.toContain("## Done since");
     // The fixed tool set is unchanged by the scope.
-    expect((t.realtimeOpens[0]!.input.tools as Array<{ name: string }>).map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
+    expect((t.realtimeOpens[0]!.input.tools as Array<{ name: string }>).map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
     const rec = (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { binding: string | null } };
     expect(rec.standup.binding).toBe("ENG-12");
     // Opening a scoped stand-up does not advance the window.
@@ -14951,6 +14951,7 @@ describe("the stand-up (BB-300)", () => {
       confirmed: string[];
       endedAt: number | null;
       endedBy: "voice" | "page" | "start" | null;
+      delegations: Array<{ question: string; key: string | null; outcome: "success" | "timeout" | "error"; answer: string | null; error: string | null; elapsedMs: number; startedAt: number; finishedAt: number }>;
     } | null;
   };
 
@@ -15345,5 +15346,161 @@ describe("the stand-up (BB-300)", () => {
     const voiceRecord = await record(t);
     expect(voiceRecord.standup!.notes[0]!.confirmedBy).toBe("voice");
     expect(voiceRecord.standup!.endedBy).toBe("voice");
+  });
+
+  // BB-307: the `ask_a_thread` delegate. One hidden, read-only thread per
+  // stand-up, reused across questions, with every delegation logged and the
+  // thread archived on every way the stand-up ends.
+  async function adoptedWith(extra: NonNullable<Parameters<typeof setup>[0]>) {
+    const t = await setup({ ...extra, timing: { debounceMs: 1, nightlyStaggerMs: 0, ...extra.timing } });
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward };
+  }
+
+  async function delegateThread(t: Awaited<ReturnType<typeof adopted>>): Promise<Record<string, unknown> & { id: string }> {
+    for (let i = 0; i < 50; i++) {
+      const found = t.spawns.find((s) => (s.pluginMetadata as Record<string, unknown> | undefined)?.role === "delegate");
+      if (found !== undefined) return found;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error("no stand-up delegate was spawned");
+  }
+
+  it("spawns one hidden delegate per stand-up with the Haiku low spec, and reuses it (BB-307)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    const first = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "Are the bb-server builds still stalling?", key: "ENG-12" }) }, voice);
+    const delegate = await delegateThread(t);
+    // The narrowest command-capable Claude mode, the default model, and the
+    // metadata the restart sweep and the log key on.
+    expect(delegate).toMatchObject({ providerId: "claude-code", model: "claude-haiku-5-5", reasoningLevel: "low", permissionMode: "auto" });
+    expect((delegate.pluginMetadata as Record<string, unknown>).standupId).toBe(started.standupId);
+    expect(t.threads.get(delegate.id)!.visibility).toBe("hidden");
+    // The spawn's prompt is read-only and carries the first question and the
+    // show context for the key.
+    const prompt = String(delegate.prompt);
+    expect(prompt).toContain("Read only");
+    expect(prompt).toContain("one-line verdict first");
+    expect(prompt).toContain("Are the bb-server builds still stalling?");
+    expect(prompt).toContain("ENG-12");
+    await t.idle(delegate.id, "Yes, the builds are still stalling.");
+    expect(await first).toBe("Yes, the builds are still stalling.");
+
+    // A second call reuses the same thread and sends the question.
+    const second = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "And what about the tests?" }) }, voice);
+    await t.flush();
+    await t.idle(delegate.id, "The tests are green.");
+    expect(await second).toBe("The tests are green.");
+    expect(t.spawns.filter((s) => (s.pluginMetadata as Record<string, unknown> | undefined)?.role === "delegate")).toHaveLength(1);
+    expect(t.sends.filter((s) => s.threadId === delegate.id).map((s) => s.text)).toEqual(["Question: And what about the tests?"]);
+  });
+
+  it("uses the standup.delegate model from project.json when one is set (BB-307)", async () => {
+    const t = await adopted();
+    const file = JSON.parse(t.files[PROJECT_FILE]!) as Record<string, unknown>;
+    file.standup = { delegate: "claude/claude-sonnet-5-5/medium" };
+    t.files[PROJECT_FILE] = JSON.stringify(file);
+    t.hooks.forgetConfigs();
+    const started = await startStandup(t);
+    const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+    const delegate = await delegateThread(t);
+    expect(delegate).toMatchObject({ providerId: "claude-code", model: "claude-sonnet-5-5", reasoningLevel: "medium" });
+    await t.idle(delegate.id, "answer");
+    await call;
+  });
+
+  it("times out with the did-not-finish line, then logs a late answer without delivering it (BB-307)", async () => {
+    const t = await adoptedWith({ timing: { standupDelegateTimeoutMs: 30 } });
+    const started = await startStandup(t);
+    const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "Is the build still failing?" }) }, voice);
+    const delegate = await delegateThread(t);
+    const out = (await call) as string;
+    expect(out).toContain("did not finish");
+    let read = await record(t);
+    expect(read.standup!.delegations).toHaveLength(1);
+    expect(read.standup!.delegations[0]).toMatchObject({ outcome: "timeout", answer: null });
+    // The late answer lands on the record, and never reaches the session.
+    await t.idle(delegate.id, "It is still failing on the integration tests.");
+    read = await record(t);
+    expect(read.standup!.delegations[0]!.answer).toContain("still failing on the integration tests");
+  });
+
+  it("refuses a second lookup while one is in flight (BB-307)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    const first = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "First?" }) }, voice);
+    const delegate = await delegateThread(t);
+    const second = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "Second?" }) }, voice)) as string;
+    expect(second).toContain("already running");
+    await t.idle(delegate.id, "First answer.");
+    expect(await first).toBe("First answer.");
+  });
+
+  it("archives the delegate on an explicit end and on a closed session (BB-307)", async () => {
+    const explicit = await adopted();
+    const explicitStart = await startStandup(explicit);
+    const explicitCall = explicit.harness.callRpc("stewardsStandupTool", { sessionId: explicitStart.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+    const explicitDelegate = await delegateThread(explicit);
+    await explicit.idle(explicitDelegate.id, "answer");
+    await explicitCall;
+    await explicit.harness.callRpc("stewardsStandupEnd", { standupId: explicitStart.standupId }, client);
+    expect(explicit.threads.get(explicitDelegate.id)!.archivedAt).not.toBeNull();
+
+    const closed = await adopted();
+    const closedStart = await startStandup(closed);
+    const closedCall = closed.harness.callRpc("stewardsStandupTool", { sessionId: closedStart.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+    const closedDelegate = await delegateThread(closed);
+    await closed.idle(closedDelegate.id, "answer");
+    await closedCall;
+    await closed.harness.callRpc("stewardsStandupClose", { sessionId: closedStart.sessionId }, voice);
+    expect(closed.threads.get(closedDelegate.id)!.archivedAt).not.toBeNull();
+  });
+
+  it("archives a delegate a restart left behind, by its role metadata (BB-307)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+    const delegate = await delegateThread(t);
+    await t.idle(delegate.id, "answer");
+    await call;
+    // The restart sweep reads `role: "delegate"` metadata, not the session map.
+    await t.hooks.archiveOrphanStandupDelegates();
+    expect(t.threads.get(delegate.id)!.archivedAt).not.toBeNull();
+  });
+
+  it("settles a pending lookup when the stand-up ends or the session closes (BB-307)", async () => {
+    for (const end of ["page", "close"] as const) {
+      const t = await adopted();
+      const started = await startStandup(t);
+      const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+      const delegate = await delegateThread(t);
+      // The owner ends the stand-up while the delegate is still working.
+      if (end === "page") await t.harness.callRpc("stewardsStandupEnd", { standupId: started.standupId }, client);
+      else await t.harness.callRpc("stewardsStandupClose", { sessionId: started.sessionId }, voice);
+      const out = (await call) as string;
+      // The call resolves rather than hanging, and the delegation is logged as an error.
+      expect(out).toContain("stand-up ended");
+      const read = await record(t);
+      expect(read.standup!.delegations).toHaveLength(1);
+      expect(read.standup!.delegations[0]).toMatchObject({ outcome: "error", answer: null });
+      expect(read.standup!.delegations[0]!.error).toContain("stand-up ended");
+      expect(t.threads.get(delegate.id)!.archivedAt).not.toBeNull();
+    }
+  });
+
+  it("reports an idle with no answer as an error, not a timeout (BB-307)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+    const delegate = await delegateThread(t);
+    await t.idle(delegate.id, null);
+    const out = (await call) as string;
+    expect(out).toContain("without an answer");
+    const read = await record(t);
+    expect(read.standup!.delegations[0]).toMatchObject({ outcome: "error", answer: null });
+    expect(read.standup!.delegations[0]!.error).toContain("without an answer");
   });
 });

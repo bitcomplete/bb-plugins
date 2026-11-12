@@ -340,6 +340,13 @@ export const projectFileSchema = z
       .strict()
       .default({ at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 }),
     projectSteward: z.object({ model: modelSpecSchema.optional() }).strict().default({}),
+    /**
+     * BB-307: the stand-up's `ask_a_thread` delegate model. Unset, the plugin
+     * uses `claude/claude-haiku-5-5/low`. This key is parsed strictly, so a
+     * `.bb` opt-in that sets it is usable only after the servers running the
+     * change have restarted onto the image that knows the key.
+     */
+    standup: z.object({ delegate: modelSpecSchema.optional() }).strict().default({}),
     /** Which playbook governs each kind of binding, and the two the dependency watch uses. */
     playbooks: z
       .object({

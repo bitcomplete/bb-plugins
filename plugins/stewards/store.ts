@@ -707,7 +707,13 @@ export const STANDUP_MIGRATIONS = [
 // store from before this step reads back exactly as before.
 export const STANDUP_BINDING_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN binding TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS];
+// BB-307: the stand-up's `ask_a_thread` log. The column is JSON, defaults to an
+// empty list, and every row written before this step reads back as one; a store
+// from before the step behaves exactly as before. A new column, so the
+// statements above stay untouched.
+export const STANDUP_DELEGATION_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN delegations TEXT NOT NULL DEFAULT '[]'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1337,6 +1343,23 @@ export type StandupTranscriptEntry = {
   via?: "page" | "voice" | "start" | null;
 };
 
+/**
+ * BB-307: one `ask_a_thread` delegation on a durable stand-up record. The
+ * answer is already scrubbed and capped when it is stored; a timeout or an
+ * error leaves it null. Kept here so the store owns the row shape and
+ * `standup.ts` can import it without a runtime cycle.
+ */
+export type StandupDelegationRow = {
+  question: string;
+  key: string | null;
+  startedAt: number;
+  finishedAt: number;
+  elapsedMs: number;
+  answer: string | null;
+  outcome: "success" | "timeout" | "error";
+  error: string | null;
+};
+
 /** A durable stand-up record (BB-300 slice 4): the session, its notes and what the owner confirmed. */
 export type StandupRow = {
   id: string;
@@ -1354,6 +1377,8 @@ export type StandupRow = {
   notes: StandupNoteRow[];
   /** The ids of the notes the owner confirmed one by one; nothing else is applied. */
   confirmed: string[];
+  /** BB-307: every `ask_a_thread` delegation this stand-up made, for its page log. */
+  delegations: StandupDelegationRow[];
 };
 
 /**
@@ -1748,10 +1773,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // for a session and by project for the readback and the next wake. Prepared
   // lazily, like the assessment statements: a legacy store opened without the
   // migration must still start (migrations.test.ts).
-  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed, binding) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed, @binding)");
+  const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed, binding, delegations) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed, @binding, @delegations)");
   const getStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE id = ?");
   const latestStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
-  const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed WHERE id = @id");
+  const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed, delegations = @delegations WHERE id = @id");
   const divergencesAllStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessment_divergences ORDER BY last_seen_at DESC, surface");
   const divergencesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? ORDER BY last_seen_at DESC, surface");
   const divergencesBySurfaceStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE surface = ? ORDER BY last_seen_at DESC, binding_id");
@@ -1989,6 +2014,16 @@ export function createStore(db: Database.Database, now: () => number, options: S
     createdAt: z.number(),
   });
   const standupTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string(), via: z.enum(["page", "voice", "start"]).nullable().default(null) });
+  const standupDelegationRowSchema = z.object({
+    question: z.string(),
+    key: z.string().nullable().default(null),
+    startedAt: z.number(),
+    finishedAt: z.number(),
+    elapsedMs: z.number(),
+    answer: z.string().nullable().default(null),
+    outcome: z.enum(["success", "timeout", "error"]),
+    error: z.string().nullable().default(null),
+  });
   const toStandup = (r: Record<string, unknown>): StandupRow => ({
     id: String(r.id),
     projectId: String(r.project_id),
@@ -2001,6 +2036,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     transcript: json(z.array(standupTranscriptSchema), r.transcript === null || r.transcript === undefined ? null : String(r.transcript), []),
     notes: json(z.array(standupNoteRowSchema), r.notes === null || r.notes === undefined ? null : String(r.notes), []),
     confirmed: json(z.array(z.string()), r.confirmed === null || r.confirmed === undefined ? null : String(r.confirmed), []),
+    // A row written before the BB-307 column existed has no value; it made no delegations.
+    delegations: json(z.array(standupDelegationRowSchema), r.delegations === null || r.delegations === undefined ? null : String(r.delegations), []),
   });
   const toDivergenceRow = (r: Record<string, unknown>): DivergenceRow => ({
     id: String(r.id),
@@ -3228,7 +3265,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     // writes; nothing here acts on a binding, a need, an escalation or a merge.
     /** Open a stand-up record and return it. */
     createStandup(fields: { id: string; projectId: string; startedAt: number; binding?: string | null }): StandupRow {
-      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]", binding: fields.binding ?? null });
+      insertStandupStmt().run({ id: fields.id, project_id: fields.projectId, started_at: fields.startedAt, ended_at: null, connected: 0, transcript: "[]", notes: "[]", confirmed: "[]", binding: fields.binding ?? null, delegations: "[]" });
       return toStandup(getStandupStmt().get(fields.id)!);
     },
     /** One stand-up by id, or null. */
@@ -3242,7 +3279,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return r === undefined ? null : toStandup(r);
     },
     /** Replace a stand-up's mutable columns; the notes and transcript the caller passes are stored whole. */
-    saveStandup(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: StandupTranscriptEntry[]; notes?: StandupNoteRow[]; confirmed?: string[] }): StandupRow | null {
+    saveStandup(id: string, fields: { endedAt?: number | null; connected?: boolean; transcript?: StandupTranscriptEntry[]; notes?: StandupNoteRow[]; confirmed?: string[]; delegations?: StandupDelegationRow[] }): StandupRow | null {
       const current = getStandupStmt().get(id);
       if (current === undefined) return null;
       const row = toStandup(current);
@@ -3253,6 +3290,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         transcript: JSON.stringify(fields.transcript ?? row.transcript),
         notes: JSON.stringify(fields.notes ?? row.notes),
         confirmed: JSON.stringify(fields.confirmed ?? row.confirmed),
+        delegations: JSON.stringify(fields.delegations ?? row.delegations),
       });
       return toStandup(getStandupStmt().get(id)!);
     },

@@ -4,6 +4,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   STANDUP_CONTEXT_MAX_CHARS,
+  STANDUP_DELEGATE_ANSWER_MAX_CHARS,
   STANDUP_MAX_INSTRUCTIONS_CHARS,
   STANDUP_NOTE_TYPES,
   STANDUP_STALE_DAYS,
@@ -79,7 +80,7 @@ const lesson = (over: Partial<Lesson> = {}): Lesson =>
 const unit = (over: Partial<GuidanceUnit> = {}): GuidanceUnit => ({ id: "gu_1", file: "AGENTS.md", heading: "Merging", text: "Merge only green checks.", lessonId: null, ...over });
 
 function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
-  const record: StandupRecord = { projectId: "p1", startedAt: 1, notes: [], connected: false };
+  const record: StandupRecord = { projectId: "p1", startedAt: 1, notes: [], connected: false, delegations: [] };
   return {
     projectId: "p1",
     now: () => 1_000,
@@ -92,6 +93,7 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
     needs: () => [],
     confirmed: [],
     endStandup: async (ids) => ({ output: `end ${ids.join(",")}`, applied: ids, skipped: [] }),
+    askThread: async (question) => ({ outcome: "success", answer: `answer to ${question}`, startedAt: 1, finishedAt: 2, error: null }),
     record,
     ...over,
   };
@@ -99,7 +101,7 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
 
 describe("the stand-up tool set (BB-300)", () => {
   it("declares the fixed, small tool set", () => {
-    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
+    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
     // Every declaration carries the shape the Realtime API needs.
     for (const tool of STANDUP_TOOLS) {
       expect(tool.name).toMatch(/^[a-z_]+$/u);
@@ -254,6 +256,63 @@ describe("runStandupTool (BB-300)", () => {
     const named = context({ needs: () => [first, second] });
     await runStandupTool("take_note", { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve", need: "need_2" }, named);
     expect(named.record.notes[0]).toMatchObject({ need: "need_2" });
+  });
+});
+
+describe("ask_a_thread (BB-307)", () => {
+  it("declares the tool and leaves STANDUP_WRITE_TOOLS alone", () => {
+    expect(STANDUP_TOOL_NAMES).toContain("ask_a_thread");
+    // The tool writes only to the log, not to the notes, so the write set is unchanged.
+    expect([...STANDUP_WRITE_TOOLS].sort()).toEqual(["retract_note", "take_note"]);
+  });
+
+  it("returns the delegate's answer and logs the delegation", async () => {
+    const askThread = vi.fn(async () => ({ outcome: "success" as const, answer: "Yes, the builds are still stalling.", startedAt: 10, finishedAt: 40, error: null }));
+    const ctx = context({ askThread });
+    const out = await runStandupTool("ask_a_thread", { question: "Are the builds stalling?", key: "ENG-12" }, ctx);
+    expect(out).toBe("Yes, the builds are still stalling.");
+    expect(askThread).toHaveBeenCalledWith("Are the builds stalling?", "ENG-12");
+    expect(ctx.record.delegations).toHaveLength(1);
+    expect(ctx.record.delegations[0]).toMatchObject({ question: "Are the builds stalling?", key: "ENG-12", startedAt: 10, finishedAt: 40, elapsedMs: 30, outcome: "success", answer: "Yes, the builds are still stalling.", error: null });
+  });
+
+  it("scrubs a secret from the answer and caps it in both the reply and the log (BB-307 approval)", async () => {
+    const long = `token: abc ${"x".repeat(STANDUP_DELEGATE_ANSWER_MAX_CHARS)}`;
+    const ctx = context({ askThread: async () => ({ outcome: "success", answer: long, startedAt: 1, finishedAt: 2, error: null }) });
+    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
+    // The credential is gone from both places, and neither carries the raw answer.
+    expect(out).toContain("token: [redacted]");
+    expect(out).not.toContain("abc");
+    expect(ctx.record.delegations[0]!.answer).toContain("token: [redacted]");
+    expect(ctx.record.delegations[0]!.answer).not.toContain("abc");
+    // `redactLine` caps at the constant and appends a single ellipsis.
+    expect(out.length).toBeLessThanOrEqual(STANDUP_DELEGATE_ANSWER_MAX_CHARS + 1);
+    expect(ctx.record.delegations[0]!.answer!.length).toBeLessThanOrEqual(STANDUP_DELEGATE_ANSWER_MAX_CHARS + 1);
+  });
+
+  it("logs a timeout and returns the did-not-finish line", async () => {
+    const ctx = context({ askThread: async () => ({ outcome: "timeout", answer: null, startedAt: 1, finishedAt: 2, error: null }) });
+    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
+    expect(out).toContain("did not finish");
+    expect(ctx.record.delegations[0]).toMatchObject({ outcome: "timeout", answer: null, elapsedMs: 1 });
+  });
+
+  it("logs an error and returns its message", async () => {
+    const ctx = context({ askThread: async () => ({ outcome: "error", answer: null, startedAt: 1, finishedAt: 2, error: "the delegate could not start" }) });
+    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
+    expect(out).toContain("the delegate could not start");
+    expect(ctx.record.delegations[0]).toMatchObject({ outcome: "error", answer: null, error: "the delegate could not start" });
+  });
+
+  it("refuses a second call while one is in flight and logs nothing", async () => {
+    const ctx = context({ askThread: async () => ({ outcome: "busy", answer: null, startedAt: 1, finishedAt: 2, error: null }) });
+    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
+    expect(out).toContain("already running");
+    expect(ctx.record.delegations).toHaveLength(0);
+  });
+
+  it("requires a question", async () => {
+    await expect(runStandupTool("ask_a_thread", {}, context())).rejects.toThrow(/question is required/u);
   });
 });
 
