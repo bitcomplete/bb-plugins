@@ -94,7 +94,7 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, STANDUP_DELEGATE_ANSWER_MAX_CHARS, type StandupAskOutcome, type StandupDelegation, type StandupEndOutcome, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
+import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, STANDUP_DELEGATE_ANSWER_MAX_CHARS, type StandupAskOutcome, type StandupDelegation, type StandupEndOutcome, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -1543,6 +1543,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       "Do not comment on any ticket or pull request, and do not run `bb stewards done`, `escalate` or `merge`, or make any Linear write.",
       "",
       "Reply with a one-line verdict first, then the evidence, under 200 words.",
+      "Write plain prose only: no Markdown, no headings, no bullet points, no bold or italics, no code fences. Your answer is read aloud.",
     ].join("\n");
 
     /** `bb stewards show <key>` output for the delegate's context, or null when the key has no steward here. */
@@ -9619,10 +9620,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // touches are saved to the durable row afterwards.
         const standupProjectId = standup.projectId;
         const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected, delegations: [...standup.delegations] as StandupDelegation[] };
+        // BB-309: the stand-up's key reader. A ticket key resolves as before; a
+        // pull-request key or URL that names no binding of its own resolves to
+        // the open binding holding an open approve-pr or merge need for it, so
+        // the key the brief shows works in every read tool and gate note.
+        const standupBinding = (key: string): Binding | null => {
+          const direct = store.find(key, standupProjectId);
+          if (direct !== null) return direct;
+          if (parsePullRef(key) === null) return null;
+          for (const b of store.open(standupProjectId)) {
+            const held = store.openNeeds(b.id).some((n) => (n.kind === "approve-pr" || n.kind === "merge") && samePullRef(n.url, key));
+            if (held) return b;
+          }
+          return null;
+        };
         const result = await runStandupTool(name, args, {
           projectId: standupProjectId,
           now,
-          binding: (key) => store.find(key, standupProjectId),
+          binding: standupBinding,
           openEscalations: (bindingId) => store.openEscalations(bindingId),
           escalation: (id) => store.escalation(id),
           lessons: (bindingId) => store.allLessons(standupProjectId).filter((l) => l.bindingId === bindingId),
