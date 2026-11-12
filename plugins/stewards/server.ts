@@ -1528,10 +1528,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** Stand-up ids with a lookup in flight; a second call is refused with a line. */
     const standupDelegateInFlight = new Set<string>();
     /**
-     * Delegate thread id -> the waiter its `thread.idle` resolves. A timed-out
-     * waiter stays in the map so a late answer is logged, not delivered.
+     * What a delegate lookup settles as: its answer, the 120 s timeout, the
+     * stand-up ending under it, or a turn that ended with no text (a provider
+     * error). A timed-out waiter stays in the map so a late answer is logged.
      */
-    const standupDelegateWaiters = new Map<string, { standupId: string; resolve: (answer: string | null) => void; timer: ReturnType<typeof setTimeout>; settled: boolean }>();
+    type StandupDelegateWait = { kind: "answer"; answer: string } | { kind: "timeout" } | { kind: "ended" } | { kind: "no-answer" };
+    /** Delegate thread id -> the waiter its `thread.idle` (or the stand-up's end) resolves. */
+    const standupDelegateWaiters = new Map<string, { standupId: string; resolve: (wait: StandupDelegateWait) => void; timer: ReturnType<typeof setTimeout>; settled: boolean }>();
 
     /** The delegate's standing instructions: read only, one-line verdict, under 200 words. */
     const STANDUP_DELEGATE_PREAMBLE = [
@@ -1569,9 +1572,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         title: standup.binding === null ? "Stand-up delegate" : `Stand-up delegate · ${standup.binding}`,
         ...modelArgs(spec),
         // The narrowest of the Claude provider's public modes (`accept-edits`,
-        // `auto`, `full`): it still runs read commands, in bb's sandbox, and no
-        // read-only mode exists in the spawn API. Reviewers use `full`.
-        permissionMode: "accept-edits",
+        // `auto`, `full`): no read-only mode exists in the spawn API. The
+        // delegate runs unattended and hidden, so `accept-edits` is not enough
+        // — its escalations wait on a user who never answers a hidden thread.
+        // `auto` keeps the same workspace sandbox but reviews escalations
+        // provider-natively, which is what lets the read commands run.
+        permissionMode: "auto",
         pluginMetadata: { role: "delegate", standupId: standup.id },
       });
       standupDelegates.set(standup.id, thread.id);
@@ -1582,13 +1588,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return thread.id;
     }
 
-    /** Wait for one delegate idle, or resolve null at the timeout; the waiter stays for a late answer. */
-    function waitForStandupDelegate(threadId: string, standupId: string): Promise<string | null> {
+    /** Wait for one delegate idle, or settle at the timeout; the waiter stays for a late answer. */
+    function waitForStandupDelegate(threadId: string, standupId: string): Promise<StandupDelegateWait> {
       return new Promise((resolve) => {
         const timer = setTimeout(() => {
           const waiter = standupDelegateWaiters.get(threadId);
           if (waiter !== undefined) waiter.settled = true;
-          resolve(null);
+          resolve({ kind: "timeout" });
         }, timing.standupDelegateTimeoutMs);
         standupDelegateWaiters.set(threadId, { standupId, resolve, timer, settled: false });
       });
@@ -1619,29 +1625,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         standupDelegateInFlight.delete(standup.id);
         return { outcome: "error", answer: null, startedAt, finishedAt: now(), error: errorMessage(error) };
       }
-      const answer = await waitForStandupDelegate(threadId, standup.id);
+      const wait = await waitForStandupDelegate(threadId, standup.id);
       // A success deletes the waiter in the idle handler; a timeout keeps it,
-      // and keeps the stand-up busy, until the delegate finishes.
-      return { outcome: answer === null ? "timeout" : "success", answer, startedAt, finishedAt: now(), error: null };
+      // and keeps the stand-up busy, until the delegate finishes. The end of
+      // the stand-up resolves a pending waiter so the call never hangs.
+      if (wait.kind === "answer") return { outcome: "success", answer: wait.answer, startedAt, finishedAt: now(), error: null };
+      if (wait.kind === "ended") return { outcome: "error", answer: null, startedAt, finishedAt: now(), error: "the stand-up ended while the lookup was running" };
+      if (wait.kind === "no-answer") return { outcome: "error", answer: null, startedAt, finishedAt: now(), error: "the delegate ended its turn without an answer" };
+      return { outcome: "timeout", answer: null, startedAt, finishedAt: now(), error: null };
     }
 
     /** Log a late answer on the record, scrubbed and capped, without delivering it to the session. */
     function logLateStandupDelegateAnswer(standupId: string, answer: string | null): void {
-      if (answer === null) return;
+      if (answer === null || answer.trim() === "") return;
       const row = store.standup(standupId);
       if (row === null) return;
       const text = redactLine(answer, STANDUP_DELEGATE_ANSWER_MAX_CHARS);
-      let filled = false;
-      const delegations = row.delegations.map((d) => {
-        // One delegate per stand-up and one lookup at a time, so the newest
-        // timed-out entry with no answer is the one this idle belongs to.
-        if (!filled && d.outcome === "timeout" && d.answer === null) {
-          filled = true;
-          return { ...d, answer: text, finishedAt: now(), elapsedMs: Math.max(0, now() - d.startedAt) };
-        }
-        return d;
-      });
-      if (filled) store.saveStandup(standupId, { delegations });
+      const delegations = [...row.delegations];
+      // One delegate per stand-up and one lookup at a time, so the newest
+      // timed-out entry with no answer is the one this idle belongs to. Walk
+      // from the end so a late answer never lands on an earlier question.
+      for (let i = delegations.length - 1; i >= 0; i--) {
+        const d = delegations[i]!;
+        if (d.outcome !== "timeout" || d.answer !== null) continue;
+        delegations[i] = { ...d, answer: text, finishedAt: now(), elapsedMs: Math.max(0, now() - d.startedAt) };
+        store.saveStandup(standupId, { delegations });
+        return;
+      }
     }
 
     /** Drop the stand-up's waiter, in-flight flag and delegate thread, archiving the thread. */
@@ -1654,6 +1664,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (waiter !== undefined) {
           clearTimeout(waiter.timer);
           standupDelegateWaiters.delete(threadId);
+          // The stand-up ended under a pending lookup: settle it so the tool
+          // call returns and logs the error instead of hanging forever.
+          if (!waiter.settled) waiter.resolve({ kind: "ended" });
         }
         await quietly(`archive the stand-up delegate ${threadId}`, () => bb.sdk.threads.archive({ threadId }));
       }
@@ -8117,7 +8130,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       clearTimeout(waiter.timer);
       standupDelegateInFlight.delete(waiter.standupId);
       if (!waiter.settled) {
-        waiter.resolve(lastAssistantText);
+        // An idle with no text is a turn that ended without an answer (a
+        // provider error, say), not a timeout: report it as an error.
+        waiter.resolve(lastAssistantText === null || lastAssistantText.trim() === "" ? { kind: "no-answer" } : { kind: "answer", answer: lastAssistantText });
         return;
       }
       logLateStandupDelegateAnswer(waiter.standupId, lastAssistantText);

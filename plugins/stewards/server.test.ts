@@ -15376,7 +15376,7 @@ describe("the stand-up (BB-300)", () => {
     const delegate = await delegateThread(t);
     // The narrowest command-capable Claude mode, the default model, and the
     // metadata the restart sweep and the log key on.
-    expect(delegate).toMatchObject({ providerId: "claude-code", model: "claude-haiku-5-5", reasoningLevel: "low", permissionMode: "accept-edits" });
+    expect(delegate).toMatchObject({ providerId: "claude-code", model: "claude-haiku-5-5", reasoningLevel: "low", permissionMode: "auto" });
     expect((delegate.pluginMetadata as Record<string, unknown>).standupId).toBe(started.standupId);
     expect(t.threads.get(delegate.id)!.visibility).toBe("hidden");
     // The spawn's prompt is read-only and carries the first question and the
@@ -15469,5 +15469,38 @@ describe("the stand-up (BB-300)", () => {
     // The restart sweep reads `role: "delegate"` metadata, not the session map.
     await t.hooks.archiveOrphanStandupDelegates();
     expect(t.threads.get(delegate.id)!.archivedAt).not.toBeNull();
+  });
+
+  it("settles a pending lookup when the stand-up ends or the session closes (BB-307)", async () => {
+    for (const end of ["page", "close"] as const) {
+      const t = await adopted();
+      const started = await startStandup(t);
+      const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+      const delegate = await delegateThread(t);
+      // The owner ends the stand-up while the delegate is still working.
+      if (end === "page") await t.harness.callRpc("stewardsStandupEnd", { standupId: started.standupId }, client);
+      else await t.harness.callRpc("stewardsStandupClose", { sessionId: started.sessionId }, voice);
+      const out = (await call) as string;
+      // The call resolves rather than hanging, and the delegation is logged as an error.
+      expect(out).toContain("stand-up ended");
+      const read = await record(t);
+      expect(read.standup!.delegations).toHaveLength(1);
+      expect(read.standup!.delegations[0]).toMatchObject({ outcome: "error", answer: null });
+      expect(read.standup!.delegations[0]!.error).toContain("stand-up ended");
+      expect(t.threads.get(delegate.id)!.archivedAt).not.toBeNull();
+    }
+  });
+
+  it("reports an idle with no answer as an error, not a timeout (BB-307)", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    const call = t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "ask_a_thread", arguments: JSON.stringify({ question: "q" }) }, voice);
+    const delegate = await delegateThread(t);
+    await t.idle(delegate.id, null);
+    const out = (await call) as string;
+    expect(out).toContain("without an answer");
+    const read = await record(t);
+    expect(read.standup!.delegations[0]).toMatchObject({ outcome: "error", answer: null });
+    expect(read.standup!.delegations[0]!.error).toContain("without an answer");
   });
 });
