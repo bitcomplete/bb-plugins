@@ -85,6 +85,17 @@ export type StandupRecord = {
 export const STANDUP_MAX_INSTRUCTIONS_CHARS = 20_000;
 /** The most lines one section lists before it says how many were left out. */
 export const STANDUP_SECTION_MAX = 40;
+/** The most days an open item may sit before the brief calls it stale (BB-306). */
+export const STANDUP_STALE_DAYS = 3;
+/** How much of a question's context the brief carries (BB-306). */
+export const STANDUP_CONTEXT_MAX_CHARS = 300;
+/** The most comments `entity_snapshot` renders, newest last (BB-306). */
+export const STANDUP_ENTITY_COMMENTS_MAX = 5;
+/** How much of one comment body `entity_snapshot` carries (BB-306). */
+export const STANDUP_ENTITY_COMMENT_MAX_CHARS = 300;
+/** The most children `entity_snapshot` lists before it says how many were left out (BB-306). */
+export const STANDUP_ENTITY_CHILDREN_MAX = 10;
+const DAY_MS = 86_400_000;
 
 /** The only tools that write, and they write only to the stand-up record. */
 export const STANDUP_WRITE_TOOLS: ReadonlySet<string> = new Set(["take_note", "retract_note"]);
@@ -119,7 +130,7 @@ export const STANDUP_TOOLS: StandupTool[] = [
   },
   {
     name: "entity_snapshot",
-    description: "The ticket or pull request itself, through the source snapshot the stewards already read: title, state, labels, author and body.",
+    description: "The ticket or pull request itself, through the source snapshot the stewards already read: title, state, labels, author, body, the last few comments with their dates, linked pull requests and children.",
     parameters: {
       type: "object",
       properties: { key: stringParam("The ticket or pull-request key.") },
@@ -342,6 +353,19 @@ async function entityTool(ctx: StandupToolContext, key: string): Promise<string>
   lines.push(`State: ${entity.state ?? "unknown"}${entity.labels.length === 0 ? "" : ` · labels: ${entity.labels.join(", ")}`}`);
   if (entity.author !== null) lines.push(`Author: ${entity.author}`);
   if (entity.description !== null && entity.description.trim() !== "") lines.push(entity.description.trim());
+  // BB-306: the snapshot already fetched these; render them so the model does
+  // not have to spend a lookup on what the tool already has.
+  const comments = entity.comments.slice(-STANDUP_ENTITY_COMMENTS_MAX);
+  if (comments.length > 0) {
+    lines.push(`Comments (last ${comments.length} of ${entity.comments.length}):`);
+    for (const c of comments) lines.push(`  ${c.createdAt} ${c.author} ${c.did}: ${clipText(c.body, STANDUP_ENTITY_COMMENT_MAX_CHARS)}`);
+  }
+  if (entity.linkedPulls.length > 0) lines.push(`Linked pull requests: ${entity.linkedPulls.map((p) => p.key ?? p.url).join(", ")}`);
+  if (entity.children.length > 0) {
+    const shown = entity.children.slice(0, STANDUP_ENTITY_CHILDREN_MAX);
+    const more = (entity.childrenTotal ?? entity.children.length) - shown.length;
+    lines.push(`Children: ${shown.map((c) => `${c.key} ${c.title ?? "(no title)"} (${c.state ?? "unknown"})`).join("; ")}${more > 0 ? `; and ${more} more` : ""}`);
+  }
   return lines.join("\n");
 }
 
@@ -496,31 +520,65 @@ function bullets(lines: readonly string[], truncated = false): string {
   return lines.map((line) => `- ${line}`).join("\n");
 }
 
+/**
+ * BB-306: "open since <date>" for one open item, plus a stale marker once the
+ * item is older than `STANDUP_STALE_DAYS`, or null when the record carries no
+ * usable `createdAt`. The age is measured from the record's own creation, so a
+ * claim raised in present tense is read with its age attached.
+ */
+function openSince(now: number, createdAt: number | null | undefined): string | null {
+  if (typeof createdAt !== "number" || !Number.isFinite(createdAt)) return null;
+  const since = `open since ${new Date(createdAt).toISOString()}`;
+  const ageMs = Math.max(0, now - createdAt);
+  if (ageMs <= STANDUP_STALE_DAYS * DAY_MS) return since;
+  return `${since} — open ${Math.floor(ageMs / DAY_MS)} days; a claim this old may be out of date — verify before repeating it`;
+}
+
+/** One line with its age appended, or the line alone when there is no date to show. */
+function withAge(line: string, now: number, createdAt: number | null | undefined): string {
+  const age = openSince(now, createdAt);
+  return age === null ? line : `${line} (${age})`;
+}
+
+/** Collapse and clip long text so one record cannot crowd the brief. */
+function clipText(text: string, max: number): string {
+  const one = text.replace(/\s+/gu, " ").trim();
+  return one.length <= max ? one : `${one.slice(0, max - 1).trimEnd()}…`;
+}
+
 /** An open question put to the owner, with the binding it attaches to resolved to a key. */
-export type StandupOpenQuestion = { key: string | null; question: string; choices: string[] };
+export type StandupOpenQuestion = { key: string | null; question: string; choices: string[]; createdAt: number; context: string | null };
 
 /** The owner's decisions, as one line each: needs, forwarded escalations and open questions. */
-function decisionLines(briefing: Briefing, questions: readonly StandupOpenQuestion[]): string[] {
+function decisionLines(briefing: Briefing, questions: readonly StandupOpenQuestion[], now: number): string[] {
   const out: string[] = [];
-  for (const { need, binding } of briefing.decisions.needs) out.push(`${binding.entityKey}: ${need.what} (${need.kind})`);
-  for (const { escalation, from } of briefing.decisions.withUser) out.push(`${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`);
+  for (const { need, binding } of briefing.decisions.needs) out.push(withAge(`${binding.entityKey}: ${need.what} (${need.kind})`, now, need.createdAt));
+  for (const { escalation, from } of briefing.decisions.withUser) out.push(withAge(`${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`, now, escalation.createdAt));
   // The briefing's `withUser` leaves questions to the digest's own section
   // (slice 1); the stand-up is exactly where the owner answers them, so they are
-  // added here as decisions rather than dropped.
-  for (const q of questions) out.push(`${q.key ?? "the project"}: ${q.question}${q.choices.length === 0 ? "" : ` (choices: ${q.choices.join(" / ")})`}`);
+  // added here as decisions rather than dropped. A question's context renders
+  // indented under its line, clipped, so the model can say what it is about
+  // without a lookup (BB-306).
+  for (const q of questions) {
+    const line = withAge(`${q.key ?? "the project"}: ${q.question}${q.choices.length === 0 ? "" : ` (choices: ${q.choices.join(" / ")})`}`, now, q.createdAt);
+    out.push(q.context === null || q.context.trim() === "" ? line : `${line}\n  ${clipText(q.context, STANDUP_CONTEXT_MAX_CHARS)}`);
+  }
   return out;
 }
 
 /** The project steward's escalations, as one line each. */
-function projectEscalationLines(briefing: Briefing): string[] {
-  return briefing.escalations.map(({ escalation, from }) => `${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`);
+function projectEscalationLines(briefing: Briefing, now: number): string[] {
+  return briefing.escalations.map(({ escalation, from }) => withAge(`${from.entityKey}: ${escalation.question}${escalation.recommendation === null ? "" : ` — recommendation: ${escalation.recommendation}`}`, now, escalation.createdAt));
 }
 
-/** The stuck and held bindings, as one line each. */
-function stuckLines(briefing: Briefing): string[] {
+/** The stuck and held bindings, as one line each. A hold, a no-wake-source wait
+ * and a dated wait are properties of a binding, not records with their own
+ * `createdAt`, so they carry no age: `Binding.createdAt` is when the steward was
+ * bound, not when the wait started (BB-306). */
+function stuckLines(briefing: Briefing, now: number): string[] {
   const out: string[] = [];
-  for (const { escalation, from } of briefing.stuck.stuck) out.push(`${from.entityKey}: stuck — ${escalation.question}`);
-  for (const { escalation, from } of briefing.stuck.stall) out.push(`${from.entityKey}: stalled — ${escalation.question}`);
+  for (const { escalation, from } of briefing.stuck.stuck) out.push(withAge(`${from.entityKey}: stuck — ${escalation.question}`, now, escalation.createdAt));
+  for (const { escalation, from } of briefing.stuck.stall) out.push(withAge(`${from.entityKey}: stalled — ${escalation.question}`, now, escalation.createdAt));
   for (const b of briefing.stuck.held) out.push(`${b.entityKey}: on hold${b.hold === null ? "" : ` — ${b.hold}`}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`);
   for (const b of briefing.stuck.noWakeSource) out.push(`${b.entityKey}: waiting with nothing the plugin tracks to wake it`);
   for (const b of briefing.stuck.datedWaits) out.push(`${b.entityKey}: waiting until ${b.requeueUntil === null ? "?" : new Date(b.requeueUntil).toISOString()}`);
@@ -564,6 +622,7 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
       ? `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner.`
       : `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner about ${scope} only.`,
     scope === null ? `It is ${new Date(now).toISOString()}. You are reporting what happened since ${since}.` : `It is ${new Date(now).toISOString()}. This stand-up is about ${scope} only; stay on that steward and do not range over the project or the other stewards.`,
+    briefing.previous === null ? "The project steward has not filed a digest yet." : `The project steward's last digest was ${new Date(briefing.previous.at).toISOString()}.`,
     "",
     "Greet the owner briefly and begin immediately; do not wait for them to speak first.",
     scope === null
@@ -573,11 +632,12 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
     "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback, and treat anything short of a clear yes as no confirmation.",
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
+    "An item's text is what was true when it was raised, not what is true now; its age says how much to trust it, so verify a stale claim before repeating it.",
   ];
   const allSections = [
-    { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions) },
-    { heading: "Escalations with the project steward", lines: projectEscalationLines(briefing) },
-    { heading: "Stuck or held", lines: stuckLines(briefing) },
+    { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions, now) },
+    { heading: "Escalations with the project steward", lines: projectEscalationLines(briefing, now) },
+    { heading: "Stuck or held", lines: stuckLines(briefing, now) },
     { heading: "Done since", lines: doneLines(briefing) },
     { heading: "Approaches that departed from the written playbook", lines: deviationLines(briefing) },
   ];
