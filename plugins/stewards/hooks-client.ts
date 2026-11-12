@@ -1,31 +1,33 @@
-// The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md) for Sentry:
-// one SSE stream for doorbells, a lease per watched Sentry project (and per
-// issue with an open ticket) proven with the plugin's Sentry token, renewed
-// at half-life, and a re-check of every watch whenever coverage cannot be
-// proven. The service promises nothing beyond "something about this entity
-// changed while you were leased", so this module never decides anything
-// about an issue; it only says when to look.
+// The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md) for one
+// source at a time: one SSE stream for doorbells, a lease per watched entity
+// (proven with the plugin's token for a token source, or admitted without one
+// for a tokenless source such as Alertmanager), renewed at half-life, and a
+// re-check of every watch whenever coverage cannot be proven. The service
+// promises nothing beyond "something about this entity changed while you were
+// leased", so this module never decides anything about an entity; it only
+// says when to look.
 //
 // A copy of github-watcher's hooks-client.ts with the GitHub parts taken
-// out: stewards has no sentry plugin to lease through (the token is its own
-// secret setting), so it subscribes itself. Everything that touches the
-// world is injected: fetch, the clock, the token, the watch list, and what
-// to do on a doorbell or a rejected lease. The token goes into one request
-// body and nowhere else: not a log line, not an error message.
+// out: stewards has no sentry or alertmanager plugin to lease through, so it
+// subscribes itself, with the source named per loop. Everything that touches
+// the world is injected: fetch, the clock, the source, the token, the watch
+// list, and what to do on a doorbell or a rejected lease. The token goes into
+// one request body and nowhere else: not a log line, not an error message.
 import { z } from "zod";
 
 export const HOOKS_URL_ENV = "BB_HOOKS_URL";
-export const SOURCE = "sentry";
 /** The service refuses more watches than this in one call (413). */
 export const SUBSCRIBE_BATCH = 100;
 
 /**
- * What a lease hangs off. `issue` is one Sentry issue, by its id; `project`
- * is a whole project, sent as "org/slug" (Sentry needs the organization to
- * read it) and leased under the slug, which is what doorbells carry as the
- * unit. Doorbells are always `issue` (bb-gate/docs/hooks.md, "Sentry").
+ * What a lease hangs off, per source. Sentry: `issue` is one issue by its
+ * id; `project` is a whole project, sent as "org/slug" (Sentry needs the
+ * organization to read it) and leased under the slug, which is what its
+ * doorbells carry as the unit. Alertmanager: `namespace` is a Kubernetes
+ * namespace, which is what its `alert` doorbells carry as the unit
+ * (bb-gate/docs/hooks.md, "Sentry" and "Alertmanager").
  */
-export type LeaseKind = "issue" | "project";
+export type LeaseKind = "issue" | "project" | "namespace";
 export type Lease = { kind: LeaseKind; id: string };
 
 // ---- server-sent events ----------------------------------------------------
@@ -118,7 +120,7 @@ export async function* readSse(body: ReadableStream<Uint8Array>, signal: AbortSi
 // ---- the wire shapes ---------------------------------------------------------
 
 export const helloSchema = z.object({ connection: z.string().min(1), leaseSeconds: z.number().positive().optional() });
-export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1), unit: z.string().optional() }).loose();
+export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1), unit: z.string().optional(), action: z.string().optional() }).loose();
 export const subscribeResponseSchema = z.object({
   leases: z.array(z.object({ kind: z.string(), id: z.string() }).loose()).default([]),
   rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
@@ -146,6 +148,11 @@ export class HooksRequestError extends Error {
       return false;
     }
   }
+
+  /** The service does not know the source (HTTP 400, plain `unknown source`); its image predates the source. */
+  get unknownSource(): boolean {
+    return this.status === 400 && this.body.trim().toLowerCase() === "unknown source";
+  }
 }
 
 /** The service guarantees a keepalive every 20 s; this much silence means the stream is dead. */
@@ -158,14 +165,14 @@ type FetchLike = (url: string | URL, init: RequestInit) => Promise<Response>;
  * A 404 means the connection is gone and is thrown as such so the caller
  * reconnects; nothing about the request body is ever put in an error.
  */
-export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, leases: Lease[], signal: AbortSignal): Promise<SubscribeResponse> {
+export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, source: string, token: string, leases: Lease[], signal: AbortSignal): Promise<SubscribeResponse> {
   const merged: SubscribeResponse = { leases: [], rejected: [] };
   for (let i = 0; i < leases.length; i += SUBSCRIBE_BATCH) {
     const watches = leases.slice(i, i + SUBSCRIBE_BATCH).map(({ kind, id }) => ({ kind, id }));
     const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ connection, source: SOURCE, token, watches }),
+      body: JSON.stringify({ connection, source, token, watches }),
       signal,
     });
     if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
@@ -209,15 +216,22 @@ export interface HooksLoopDeps {
   baseUrl: string;
   now: () => number;
   log: { info(message: string): void; warn(message: string): void };
-  /** The plugin's Sentry token; null when none is configured, and then nothing is leased. */
-  token: () => Promise<string | null>;
+  /** The source this loop leases and rings for: `sentry`, `alertmanager`, ... */
+  source: string;
+  /**
+   * The plugin's token for a source that proves a lease with one; null for a
+   * tokenless source (Alertmanager), whose leases are admitted without one.
+   */
+  token: (() => Promise<string | null>) | null;
   /** Every lease to hold, right now: the projects the project files list, and the issues with open tickets. */
   watchIds: () => Lease[];
   /**
-   * A doorbell: the kind (`issue`), the issue id, and the unit (the project
-   * slug) when the service named one. The caller decides what to look at.
+   * A doorbell: the kind (`issue`, `alert`), the entity id, the unit (the
+   * project slug or namespace) when the service named one, and the action
+   * (`created`, `firing`, `resolved`, ...) when it named one. The caller
+   * decides what to look at.
    */
-  onDoorbell: (kind: string, id: string, unit: string | null) => void;
+  onDoorbell: (kind: string, id: string, unit: string | null, action: string | null) => void;
   /** Leases the service refused. The caller decides what that means for each watch. */
   onRejected: (rejected: Rejection[]) => Promise<void>;
   /** Check every watch against its cursor. */
@@ -245,6 +259,8 @@ export type HooksStatus = {
   sweeps: number;
   lastSweepAt: number;
   lastSweepReason: string | null;
+  /** The service answered 400 `unknown source`: its image predates this source, so only the periodic look sees it. */
+  sourceUnknown: boolean;
 };
 
 /** The window the status counts doorbells and sweeps over. */
@@ -308,6 +324,9 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   let lastSweepAt = 0;
   let lastSweepReason: string | null = null;
   let wrongUrlLogged = false;
+  /** The service's image does not know this source yet; said once, then only the periodic look carries the watch. */
+  let sourceUnknown = false;
+  let sourceUnknownLogged = false;
 
   const doorbells = createWindowCounter(STATUS_WINDOW_MS, deps.now);
   const sweeps = createWindowCounter(STATUS_WINDOW_MS, deps.now);
@@ -325,17 +344,19 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     lastSweepAt = deps.now();
     lastSweepReason = reason;
     sweeps.push();
-    deps.sweep(reason).catch((error: unknown) => deps.log.warn(`Sentry watch sweep (${reason}) failed: ${errorMessage(error)}`));
+    deps.sweep(reason).catch((error: unknown) => deps.log.warn(`${deps.source} watch sweep (${reason}) failed: ${errorMessage(error)}`));
   }
 
   /**
    * Lease these on the current connection. Returns whether the service
    * accepted the call; a 404 means the connection is gone and drops the
-   * stream. Without a token nothing can be proven, so nothing is sent and
-   * the loop counts as unleased: the sweeps carry the watch until one is
-   * set. A 401 is the token itself, refused by Sentry on the service's side;
-   * there is no refresh path, so it is said (once per token) and the next
-   * renewal tries again with whatever the setting holds then.
+   * stream. A token source without a token proves nothing, so nothing is
+   * sent and the loop counts as unleased: the sweeps carry the watch until
+   * one is set. A tokenless source sends no token at all. A 401 is the token
+   * itself, refused by the source on the service's side; there is no refresh
+   * path, so it is said (once per token) and the next renewal tries again
+   * with whatever the setting holds then. A 400 `unknown source` is an image
+   * that predates the source: said once, and the periodic look carries it.
    */
   let refusedLogged = false;
   async function lease(ids: Lease[], signal: AbortSignal): Promise<boolean> {
@@ -343,18 +364,28 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     const current = connection;
     const started = deps.now();
     try {
-      const token = (await deps.token())?.trim() ?? "";
-      if (token === "") return false;
-      const result = await subscribe(deps.fetch, deps.baseUrl, current, token, ids, signal);
+      const token = deps.token === null ? "" : ((await deps.token())?.trim() ?? "");
+      if (deps.token !== null && token === "") return false;
+      const result = await subscribe(deps.fetch, deps.baseUrl, current, deps.source, token, ids, signal);
       refusedLogged = false;
+      sourceUnknown = false;
+      sourceUnknownLogged = false;
       if (connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
       if (result.rejected.length > 0) await deps.onRejected(result.rejected);
       return true;
     } catch (error) {
       if (signal.aborted) return false;
       if (error instanceof HooksRequestError && error.status === 401) {
-        if (!refusedLogged) deps.log.warn("bb-gate-hooks says Sentry refused the token; check the Sentry token setting of the stewards plugin");
+        if (!refusedLogged) deps.log.warn(`bb-gate-hooks says ${deps.source} refused the token; check the ${deps.source} token setting of the stewards plugin`);
         refusedLogged = true;
+        return false;
+      }
+      if (error instanceof HooksRequestError && error.unknownSource) {
+        sourceUnknown = true;
+        if (!sourceUnknownLogged) {
+          sourceUnknownLogged = true;
+          deps.log.warn(`bb-gate-hooks does not know the ${deps.source} source yet; the periodic look carries it until the service is updated`);
+        }
         return false;
       }
       if (error instanceof HooksRequestError && error.status === 404) {
@@ -373,7 +404,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         }
         return false;
       }
-      deps.log.warn(`Sentry watch lease failed: ${errorMessage(error)}`);
+      deps.log.warn(`${deps.source} watch lease failed: ${errorMessage(error)}`);
       return false;
     }
   }
@@ -388,7 +419,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       else ok = await lease(ids, signal);
       if (reason === "hello" || !ok || late) runSweep(reason === "hello" ? "connected" : ok ? "late renewal" : "failed renewal");
     } catch (error) {
-      if (!signal.aborted) deps.log.warn(`Sentry watch renewal failed: ${errorMessage(error)}`);
+      if (!signal.aborted) deps.log.warn(`${deps.source} watch renewal failed: ${errorMessage(error)}`);
     }
   }
 
@@ -406,8 +437,8 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           connection = hello.data.connection;
           setState("connected");
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
-          deps.log.info(`Sentry watches: connected to bb-gate-hooks as ${connection}`);
-          // Not awaited: doorbells behind the hello must not wait for Sentry.
+          deps.log.info(`${deps.source} watches: connected to bb-gate-hooks as ${connection}`);
+          // Not awaited: doorbells behind the hello must not wait for a look.
           void renew("hello", signal);
           if (renewTimer !== null) clearInterval(renewTimer);
           if (baselineTimer !== null) clearInterval(baselineTimer);
@@ -421,13 +452,14 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
             continue;
           }
           const doorbell = doorbellSchema.safeParse(parsed);
-          // `action` and `at` are for the service's logs; the reaction to any
-          // doorbell is the same check. The unit is passed on so a project
-          // lease can tell which of its doorbells it was rung for.
-          if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") {
+          // The unit and the action are passed on so a lease can tell which
+          // of its doorbells it was rung for and how. The caller filters the
+          // kinds it knows.
+          if (doorbell.success && doorbell.data.source === deps.source) {
             doorbells.push();
             const unit = doorbell.data.unit?.trim() ?? "";
-            deps.onDoorbell(doorbell.data.kind, doorbell.data.id, unit === "" ? null : unit);
+            const action = doorbell.data.action?.trim() ?? "";
+            deps.onDoorbell(doorbell.data.kind, doorbell.data.id, unit === "" ? null : unit, action === "" ? null : action);
           }
         }
       }
@@ -456,6 +488,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         sweeps: sweeps.count(),
         lastSweepAt,
         lastSweepReason,
+        sourceUnknown,
       };
     },
 
