@@ -184,6 +184,12 @@ describe("runStandupTool (BB-300)", () => {
     await expect(runStandupTool("end_standup", {}, context())).rejects.toThrow(/must be an array/u);
   });
 
+  it("passes a busy end_standup outcome through as last: false", async () => {
+    const endStandup = vi.fn(async () => ({ output: "Retry.", applied: [], skipped: [], last: false }));
+    const out = await runStandupTool("end_standup", { ids: ["note_1"] }, context({ endStandup }));
+    expect(out).toEqual({ output: "Retry.", last: false });
+  });
+
   it("takes and retracts notes, touching only the stand-up record", async () => {
     const ctx = context();
     const before = JSON.stringify(ctx.record.notes);

@@ -9290,6 +9290,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // The first tool call proves the overlay connected and the briefing was
         // delivered; the record keeps that fact.
         if (!standup.connected) standup = store.saveStandup(standup.id, { connected: true }) ?? standup;
+        // A record the owner already ended is read-only: a late take_note or
+        // retract_note must not write to it (BB-301).
+        if (standup.endedAt !== null && (name === "take_note" || name === "retract_note")) {
+          return "This stand-up has already ended; its notes can no longer be changed.";
+        }
         let args: Record<string, unknown>;
         try {
           const parsed: unknown = JSON.parse(rawArgs.trim() === "" ? "{}" : rawArgs);
@@ -9320,7 +9325,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           endStandup: async (ids): Promise<StandupEndOutcome> => {
             const row = store.standup(standupId);
             if (row === null) return { output: "That stand-up has already ended.", applied: [], skipped: ids.map((id) => ({ id, reason: "the stand-up is gone" })) };
-            if (confirmingStandups.has(standupId)) return { output: "Another item in this stand-up is being confirmed; try again in a moment.", applied: [], skipped: [] };
+            // A record the owner already ended (the page's Done, or a second
+            // end_standup) applies nothing: a spoken yes must not land items
+            // after the stand-up is over.
+            if (row.endedAt !== null) {
+              return { output: "That stand-up has already ended; nothing was applied.", applied: [], skipped: ids.map((id) => ({ id, reason: "the stand-up has ended" })) };
+            }
+            // Another confirm is in flight; tell the model to retry, and do not
+            // close the session on it.
+            if (confirmingStandups.has(standupId)) return { output: "Another item in this stand-up is being confirmed; try again in a moment.", applied: [], skipped: [], last: false };
             confirmingStandups.add(standupId);
             try {
               const applied: string[] = [];

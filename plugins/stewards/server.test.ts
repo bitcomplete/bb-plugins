@@ -15146,6 +15146,60 @@ describe("the stand-up (BB-300)", () => {
     expect(result.output).toMatch(/Nothing was applied/u);
   });
 
+  it("applies nothing on an ended record and refuses late note writes", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    await t.harness.callRpc("stewardsStandupEnd", { standupId: started.standupId }, client);
+    const before = t.hooks.store.find("ENG-12")!.guidance.length;
+
+    // A spoken yes after the owner already ended the stand-up lands nothing,
+    // but the session still closes.
+    const ended = (await t.harness.callRpc(
+      "stewardsStandupTool",
+      { sessionId: started.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: [noteId] }) },
+      voice,
+    )) as { output: string; last?: boolean };
+    expect(ended.last).toBe(true);
+    expect(ended.output).toMatch(/already ended/u);
+    expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(before);
+    expect(t.hooks.store.latestStandup("p1")!.confirmed).toEqual([]);
+
+    // The write tools refuse an ended record too.
+    const taken = (await t.harness.callRpc(
+      "stewardsStandupTool",
+      { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "free", text: "late" }) },
+      voice,
+    )) as string;
+    expect(taken).toMatch(/already ended/u);
+    const retracted = (await t.harness.callRpc(
+      "stewardsStandupTool",
+      { sessionId: started.sessionId, name: "retract_note", arguments: JSON.stringify({ id: noteId }) },
+      voice,
+    )) as string;
+    expect(retracted).toMatch(/already ended/u);
+    expect(t.hooks.store.latestStandup("p1")!.notes).toHaveLength(1);
+  });
+
+  it("does not close the session when another confirm is in flight", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "direction", text: "Prioritise the migration" });
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    const args = { sessionId: started.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: [noteId] }) };
+    // Two end_standup calls at once: the second finds the first confirming and
+    // must be told to retry, not closed on.
+    const [first, second] = await Promise.all([
+      t.harness.callRpc("stewardsStandupTool", args, voice),
+      t.harness.callRpc("stewardsStandupTool", args, voice),
+    ]);
+    const results = [first, second].map((value) => (typeof value === "string" ? { output: value, last: false } : (value as { output: string; last?: boolean })));
+    const retry = results.find((result) => result.last === false);
+    expect(retry?.output).toMatch(/try again/u);
+    expect(results.some((result) => result.last !== false && /Applied/u.test(result.output))).toBe(true);
+  });
+
   it("the close handler ends the record and leaves unconfirmed notes unconfirmed", async () => {
     const t = await adopted();
     const started = await startStandup(t);

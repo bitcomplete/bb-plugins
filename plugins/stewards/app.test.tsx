@@ -1758,9 +1758,43 @@ describe("the Stand-up button (BB-300)", () => {
     await waitFor(() => expect(slot.getByText("Applied by voice")).toBeTruthy());
     expect(slot.getByText(/Ended by voice\./u)).toBeTruthy();
     expect(slot.getByText("Guidance for ENG-12: And add a test")).toBeTruthy();
-    // The unconfirmed note keeps its Confirm button and the panel keeps Done.
+    // The unconfirmed note keeps its Confirm button; an ended stand-up has no Done.
     expect(slot.getAllByRole("button", { name: "Confirm" })).toHaveLength(1);
-    expect(slot.getByRole("button", { name: "Done" })).toBeTruthy();
+    expect(slot.queryByRole("button", { name: "Done" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("hides an ended stand-up that has nothing to show", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            standup: { available: true, message: null },
+          },
+        }),
+        stewardsStandupRecord: () => ({ standup: { id: "sup_3", projectId: "p1", startedAt: 1, endedAt: 2, endedBy: "voice", notes: [], confirmed: [], confirmedBy: null } }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
+    expect(slot.queryByText("Stand-up readback")).toBeNull();
     slot.lifecycle.unmount();
   });
 

@@ -38,6 +38,11 @@ export type StandupEndOutcome = {
   output: string;
   applied: string[];
   skipped: Array<{ id: string; reason: string }>;
+  /**
+   * False when the model should retry (another confirm is already running), so
+   * the overlay must not close. Default true.
+   */
+  last?: boolean;
 };
 
 /** The fixed shapes a typed note may take, plus a free note (BB-300). */
@@ -466,8 +471,9 @@ export async function runStandupTool(name: string, args: Record<string, unknown>
     case "end_standup": {
       const outcome = await ctx.endStandup(requireStringArray(args, "ids"));
       // The opener's reply carries `last`, so the overlay lets the model's
-      // goodbye finish and then closes the session itself.
-      return { output: outcome.output, last: true };
+      // goodbye finish and then closes the session itself. A busy retry says
+      // `last: false` so the model can try again instead of the session ending.
+      return { output: outcome.output, last: outcome.last ?? true };
     }
     default:
       throw new Error(`No stand-up tool named ${name}`);
