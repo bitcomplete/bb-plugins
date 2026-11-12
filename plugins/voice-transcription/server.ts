@@ -82,6 +82,9 @@ const realtimeSessionConfigSchema = z.object({
   voice: z.string().trim().min(1).max(40).optional(),
   maxDurationMs: z.number().int().positive().optional(),
   speaksFirst: z.boolean().optional(),
+  // Passed to OpenAI verbatim; null turns the feature off, unset uses the plugin's default.
+  noiseReduction: z.record(z.string(), z.unknown()).nullable().optional(),
+  turnDetection: z.record(z.string(), z.unknown()).nullable().optional(),
 });
 
 export const rpcContract = defineRpcContract({
@@ -468,6 +471,8 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           ...(input.voice !== undefined ? { voice: input.voice } : {}),
           ...(input.maxDurationMs !== undefined ? { maxDurationMs: input.maxDurationMs } : {}),
           ...(input.speaksFirst !== undefined ? { speaksFirst: input.speaksFirst } : {}),
+          ...(input.noiseReduction !== undefined ? { noiseReduction: input.noiseReduction } : {}),
+          ...(input.turnDetection !== undefined ? { turnDetection: input.turnDetection } : {}),
           // The plugin's language setting, not the opener's: one setting
           // decides what every voice session on this server speaks.
           ...(language === "" ? {} : { language }),

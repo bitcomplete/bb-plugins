@@ -381,6 +381,31 @@ describe("realtime mint route", () => {
     expect(onBody.speaksFirst).toBe(true);
   });
 
+  it("carries a caller's noise reduction and turn detection through the mint, null included (BB-308)", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    const sent: Array<{ session: { audio: { input: Record<string, unknown> } } }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL, init?: RequestInit) => {
+        sent.push(JSON.parse(String(init?.body)) as { session: { audio: { input: Record<string, unknown> } } });
+        return jsonResponse({ value: "ek", expires_at: 1 });
+      }),
+    );
+
+    const noiseReduction = { type: "far_field" };
+    const turnDetection = { type: "server_vad", threshold: 0.9 };
+    const overridden = (await open(host, { instructions: "x", tools: [ECHO], noiseReduction, turnDetection })) as { sessionId: string };
+    await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: overridden.sessionId }));
+    expect(sent[0]!.session.audio.input.noise_reduction).toEqual(noiseReduction);
+    expect(sent[0]!.session.audio.input.turn_detection).toEqual(turnDetection);
+
+    // `null` is the caller turning the feature off, and must survive the RPC schema.
+    const off = (await open(host, { instructions: "x", tools: [ECHO], noiseReduction: null, turnDetection: null })) as { sessionId: string };
+    await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: off.sessionId }));
+    expect(sent[1]!.session.audio.input.noise_reduction).toBeNull();
+    expect(sent[1]!.session.audio.input.turn_detection).toBeNull();
+  });
+
   it("calls the opener's onClose with the session id, and is a no-op without one", async () => {
     const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
     host.harness.sdk.stub("plugins.callRpc", async () => ({ ok: true }));
