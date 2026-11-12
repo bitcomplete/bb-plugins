@@ -14908,6 +14908,18 @@ describe("the stand-up (BB-300)", () => {
     expect(t.realtimeOpens).toHaveLength(1);
   });
 
+  it("refuses a scoped start while a stand-up is open but has made no tool call yet", async () => {
+    const t = await adopted();
+    const open = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { standupId: string; sessionId: string };
+    // The agent speaks first, so the overlay commonly has no tool call yet; the
+    // session being open is enough to make a scoped start refuse.
+    const refused = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client);
+    expect(refused).toMatchObject({ ok: false, sessionId: null });
+    expect((refused as { message: string }).message).toMatch(/already starting/u);
+    expect(t.hooks.store.standup(open.standupId)!.endedAt).toBeNull();
+    expect(t.realtimeOpens).toHaveLength(1);
+  });
+
   it("reports a steward's thread and starts the same scoped stand-up from the thread id alone", async () => {
     const t = await adopted();
     const stewardThread = t.hooks.store.find("ENG-12")!.threadId!;

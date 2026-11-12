@@ -9336,16 +9336,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // reach the project steward and the window still advances. The open
           // record is found in the store, not the in-memory session map, so it
           // survives a server restart that empties the map. One stand-up at a
-          // time per project: a scoped start while a connected stand-up's
-          // session is still open is refused with the existing message rather
+          // time per project: a scoped start while the project's open record
+          // still has a session is refused with the existing message rather
           // than ending the owner's stand-up, which may be open in another tab.
-          // A project start keeps superseding, as it did before, and a scoped
-          // start supersedes a record whose overlay never connected (a restart,
-          // a closed tab).
+          // `stewardsStandupClose` removes the session when the overlay ends,
+          // so the only in-map session for a finished stand-up is one the voice
+          // plugin will sweep at `maxMs`; a restart empties the map. A project
+          // start keeps superseding, as it did before, so the never-connected
+          // record of the existing test is still replaced.
           const open = store.latestStandup(targetProjectId);
           if (open !== null && open.endedAt === null) {
-            const live = open.connected && [...standupSessions.values()].some((hid) => hid === open.id);
-            if (scoped !== null && live) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
+            const sessionOpen = [...standupSessions.values()].some((hid) => hid === open.id);
+            if (scoped !== null && sessionOpen) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
             await finishStandup(open, "start");
           }
           // Drop this project's stale sessions (a superseded record, a closed
