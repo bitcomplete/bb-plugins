@@ -50,6 +50,15 @@ export const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
  */
 export const REALTIME_STOP_FALLBACK_MS = 15_000;
 
+/** True for the one browser error that a constrained `getUserMedia` may still throw. */
+function isOverconstrained(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { name?: unknown }).name === "OverconstrainedError"
+  );
+}
+
 export class RealtimeSessionClient {
   private readonly callbacks: RealtimeClientCallbacks;
   private pc: RTCPeerConnection | null = null;
@@ -101,7 +110,7 @@ export class RealtimeSessionClient {
         }
       });
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await this.openMicrophone();
       if (this.stopped) {
         this.stopStream(stream);
         return;
@@ -112,7 +121,7 @@ export class RealtimeSessionClient {
       this.channel = channel;
       channel.addEventListener("message", (event) => this.onMessage(event.data));
       channel.addEventListener("open", () => {
-        this.callbacks.onStatus("live");
+        this.callbacks.onStatus("live", this.processingSettings(stream));
         // Opt-in: the opener asked the agent to speak first, so one response
         // request gets the model going instead of waiting for the owner.
         if (minted.speaksFirst) this.send({ type: "response.create" });
@@ -158,6 +167,33 @@ export class RealtimeSessionClient {
       this.callbacks.onStatus("error", error instanceof Error ? error.message : String(error));
       await this.stop();
     }
+  }
+
+  /**
+   * Ask the browser for echo cancellation, noise suppression and automatic
+   * gain control. They are ideal constraints, so a device that cannot honour
+   * one still returns a track; the plain `{ audio: true }` retry only covers
+   * the spec-compliant `OverconstrainedError` a browser may report anyway.
+   */
+  private async openMicrophone(): Promise<MediaStream> {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (error) {
+      if (isOverconstrained(error)) return navigator.mediaDevices.getUserMedia({ audio: true });
+      throw error;
+    }
+  }
+
+  /** The three processing flags the browser actually applied, once at connect. */
+  private processingSettings(stream: MediaStream): string {
+    const settings: MediaTrackSettings = stream.getAudioTracks()[0]?.getSettings?.() ?? {};
+    const flag = (name: "echoCancellation" | "noiseSuppression" | "autoGainControl"): string => {
+      const value = settings[name];
+      return typeof value === "boolean" ? String(value) : "unknown";
+    };
+    return `echoCancellation=${flag("echoCancellation")} noiseSuppression=${flag("noiseSuppression")} autoGainControl=${flag("autoGainControl")}`;
   }
 
   /** Mute or unmute the microphone. */

@@ -141,7 +141,11 @@ function RealtimeVoiceOverlay() {
         }),
       onStatus: (next, message) => {
         setStatus(next);
-        if (message !== undefined) setError(message);
+        if (next === "error" && message !== undefined) setError(message);
+        // The microphone's applied processing flags ride the `live` status;
+        // they are not an error, so log them for a by-hand stand-up instead of
+        // showing them in the alert box.
+        if (next === "live" && message !== undefined) console.info(`[voice] microphone processing: ${message}`);
         if (next === "closed") setSessionId(null);
       },
       onSecondsLeft: (seconds) => setSecondsLeft(seconds),
