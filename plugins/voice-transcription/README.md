@@ -75,15 +75,22 @@ A session has three pieces:
 
 The tool route's reply is `{ output }`, or `{ output, last: true }` when the
 opener returns an object with that flag instead of a plain string. A `last`
-reply lets the model finish its current response (its goodbye) and then the
-overlay stops the session itself, which is how an opener ends a conversation
-from inside a tool call.
+reply lets the model finish its current response and its audio (the overlay
+waits for the WebRTC `output_audio_buffer.stopped` signal, with a short
+fallback), then stops the session itself, which is how an opener ends a
+conversation from inside a tool call. Note that the extended shape reserves an
+object with a string `output` field: an opener that returns other JSON is
+stringified as before, but one that returns data under an `output` key now
+gets the unwrapped text, so use a different key for data.
 
 The close route calls the opener's `onClose` method with the session id for
 every kind of end: the End button, the 20-minute cap, the overlay unmounting
-(a closed tab), and a model-initiated end after a `last` tool reply. An opener
-that named no `onClose` is unaffected. The call is best-effort: the session is
-already over, and a failed handler is logged, not surfaced to the browser.
+(a closed tab), and a model-initiated end after a `last` tool reply. The
+overlay also nudges the route on `pagehide`, and the server sweeps expired
+sessions on its own timer, so a closed tab or a quiet model still ends the
+session and reaches the opener. An opener that named no `onClose` is
+unaffected, the handler is called at most once per session, and a failed
+handler is logged, not surfaced to the browser.
 
 Spend is bounded: the ephemeral secret expires after 60 seconds, one session
 is capped at 20 minutes (the overlay counts down and closes itself, and the

@@ -185,7 +185,7 @@ describe("RealtimeSessionClient", () => {
     await speaking.stop();
   });
 
-  it("stops after the in-flight response when a tool reply is last", async () => {
+  it("stops after the goodbye's audio finishes when a tool reply is last", async () => {
     stubConnect();
     const close = vi.fn(async () => {});
     const toolCall = vi.fn(async () => ({ output: "done", last: true }));
@@ -194,17 +194,42 @@ describe("RealtimeSessionClient", () => {
     const pc = FakePeerConnection.instances[0]!;
     pc.channel.emit("open", {});
     pc.channel.emit("message", {
-      data: JSON.stringify({ type: "response.function_call_arguments.done", call_id: "c1", name: "end_standup", arguments: "{}" }),
+      data: JSON.stringify({ type: "response.function_call_arguments.done", response_id: "resp_call", call_id: "c1", name: "end_standup", arguments: "{}" }),
     });
     await vi.waitFor(() => expect(toolCall).toHaveBeenCalled());
     await vi.waitFor(() => expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true));
     expect(close).not.toHaveBeenCalled();
-    // The response that made the call finishing does not stop the session...
+    // The response that made the call finishing does not stop the session, and
+    // a late event of that response is not mistaken for the goodbye.
     pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_call" }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.output_item.done", response_id: "resp_call" }) });
     expect(close).not.toHaveBeenCalled();
-    // ...the model's goodbye response does.
+    // The goodbye's response.done only arms a fallback; its audio finishing closes.
     pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
     pc.channel.emit("message", { data: JSON.stringify({ type: "response.done", response_id: "resp_goodbye" }) });
+    expect(close).not.toHaveBeenCalled();
+    pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_goodbye" }) });
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not mistake a late event of the calling response for the goodbye", async () => {
+    stubConnect();
+    const close = vi.fn(async () => {});
+    const toolCall = vi.fn(async () => ({ output: "done", last: true }));
+    const client = new RealtimeSessionClient(callbacks({ toolCall, close }));
+    await client.start();
+    const pc = FakePeerConnection.instances[0]!;
+    pc.channel.emit("open", {});
+    pc.channel.emit("message", {
+      data: JSON.stringify({ type: "response.function_call_arguments.done", response_id: "resp_call", call_id: "c1", name: "end_standup", arguments: "{}" }),
+    });
+    await vi.waitFor(() => expect(pc.channel.sent.some((m) => m.includes("function_call_output"))).toBe(true));
+    // The calling response's own audio-finished signal must not stop the session.
+    pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_call" }) });
+    expect(close).not.toHaveBeenCalled();
+    // The goodbye's does.
+    pc.channel.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "resp_goodbye" } }) });
+    pc.channel.emit("message", { data: JSON.stringify({ type: "output_audio_buffer.stopped", response_id: "resp_goodbye" }) });
     await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
   });
 

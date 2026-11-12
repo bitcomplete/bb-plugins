@@ -27,6 +27,7 @@ const disposals: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const dispose of disposals.splice(0)) await dispose();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 /** Load the plugin into the fake host with the given stored settings. */
@@ -334,6 +335,58 @@ describe("realtime mint route", () => {
     expect(closed.status).toBe(200);
     expect(await closed.json()).toEqual({ ok: true });
     expect(host.harness.logEntries.some((entry) => entry.level === "warn" && entry.message.includes("close handler"))).toBe(true);
+  });
+
+  it("ends a session past its cap through onClose, exactly once", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ ok: true }));
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ value: "ek", expires_at: 1 })));
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const opened = (await open(host, {
+      instructions: "x",
+      tools: [ECHO],
+      onClose: { method: "stewardsStandupClose" },
+    })) as { sessionId: string };
+    await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId }));
+
+    nowSpy.mockReturnValue(1_000_000 + REALTIME_SESSION_MAX_MS + 1);
+    const tool = await host.harness.fetchHttp(
+      "POST",
+      REALTIME_TOOL_PATH,
+      jsonRequest({ sessionId: opened.sessionId, callId: "c", name: "echo", arguments: "{}" }),
+    );
+    expect(tool.status).toBe(409);
+    expect(host.harness.sdk.callsTo("plugins.callRpc")).toHaveLength(1);
+    // The overlay's later close finds no session, so onClose is not called twice.
+    await host.harness.fetchHttp("POST", REALTIME_CLOSE_PATH, jsonRequest({ sessionId: opened.sessionId }));
+    expect(host.harness.sdk.callsTo("plugins.callRpc")).toHaveLength(1);
+  });
+
+  it("reaps an abandoned session past its cap through the sweep, exactly once", async () => {
+    const host = await load({ apiKey: STANDARD_KEY, baseUrl: DEFAULT_BASE_URL });
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ ok: true }));
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ value: "ek", expires_at: 1 })));
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
+    const opened = (await open(host, {
+      instructions: "x",
+      tools: [ECHO],
+      onClose: { method: "stewardsStandupClose" },
+    })) as { sessionId: string };
+    await host.harness.fetchHttp("POST", REALTIME_MINT_PATH, jsonRequest({ sessionId: opened.sessionId }));
+
+    nowSpy.mockReturnValue(2_000_000 + REALTIME_SESSION_MAX_MS + 1);
+    const service = host.harness.registrations.services.find((entry) => entry.name === "realtime-sweep");
+    expect(service).toBeDefined();
+    const controller = new AbortController();
+    try {
+      void service!.start(controller.signal);
+      await vi.waitFor(() => expect(host.harness.sdk.callsTo("plugins.callRpc")).toHaveLength(1));
+    } finally {
+      controller.abort();
+    }
+    // A second end finds nothing and does not call onClose again.
+    await host.harness.fetchHttp("POST", REALTIME_CLOSE_PATH, jsonRequest({ sessionId: opened.sessionId }));
+    expect(host.harness.sdk.callsTo("plugins.callRpc")).toHaveLength(1);
   });
 });
 

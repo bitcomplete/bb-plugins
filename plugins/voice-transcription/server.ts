@@ -27,6 +27,7 @@ import {
   REALTIME_CLIENT_SECRET_PATH,
   REALTIME_MAX_INSTRUCTIONS_CHARS,
   REALTIME_MAX_TOOLS,
+  REALTIME_SWEEP_INTERVAL_MS,
   declaresTool,
   parseClientSecret,
   realtimeClientSecretBody,
@@ -376,12 +377,63 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
       return { baseUrl: values.baseUrl, apiKey: resolveApiKey(values.apiKey, env) ?? "" };
     }
 
-    function pruneRealtimeSessions(now: number): void {
-      for (const [id, session] of realtimeSessions) {
-        const since = session.startedAt ?? session.createdAt;
-        if (now - since > session.maxMs) realtimeSessions.delete(id);
+    /**
+     * End one session: take it out of the map first, so a second end (the
+     * overlay's close racing the cap sweep, say) finds nothing, then tell the
+     * opener at most once. Best-effort: the session is over whatever the opener
+     * does with the news.
+     */
+    async function endRealtimeSession(id: string): Promise<void> {
+      const session = realtimeSessions.get(id);
+      if (session === undefined) return;
+      realtimeSessions.delete(id);
+      if (session.closeHandler === null) return;
+      try {
+        await bb.sdk.plugins.callRpc({
+          pluginId: session.closeHandler.pluginId,
+          method: session.closeHandler.method,
+          input: { sessionId: id },
+          outputSchema: z.unknown(),
+        });
+      } catch (error) {
+        bb.log.warn(
+          `voice-transcription: close handler for session ${id} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
+
+    /**
+     * Reap every session past its cap through `endRealtimeSession`, so a session
+     * abandoned by a closed tab is reported even when nobody opens another one.
+     */
+    async function sweepRealtimeSessions(nowMs = Date.now()): Promise<void> {
+      for (const [id, session] of [...realtimeSessions]) {
+        const since = session.startedAt ?? session.createdAt;
+        if (nowMs - since > session.maxMs) await endRealtimeSession(id);
+      }
+    }
+
+    // The cap is enforced by the overlay's own clock, but a tab that closes or
+    // a model that goes quiet has no clock; this sweep is the guarantee that
+    // every session ends and its opener hears about it.
+    bb.background.service("realtime-sweep", {
+      start(signal) {
+        void sweepRealtimeSessions();
+        return new Promise<void>((resolve) => {
+          const timer = setInterval(() => {
+            void sweepRealtimeSessions();
+          }, REALTIME_SWEEP_INTERVAL_MS);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearInterval(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      },
+    });
 
     bb.rpc.register(rpcContract, {
       async "realtime.open"(input, { experimental_caller: caller }) {
@@ -393,7 +445,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const { baseUrl, apiKey } = await realtimeKey();
         const refusal = realtimeReadiness({ baseUrl, apiKey });
         if (refusal !== null) throw new Error(refusal.message);
-        pruneRealtimeSessions(Date.now());
+        await sweepRealtimeSessions(Date.now());
         const config: RealtimeSessionConfig = {
           instructions: input.instructions,
           tools: input.tools,
@@ -455,7 +507,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           return c.json({ error: "That voice session is already being minted" }, 409);
         }
         if (now - session.createdAt > session.maxMs) {
-          realtimeSessions.delete(sessionId);
+          await endRealtimeSession(sessionId);
           return c.json({ error: "That voice session expired before it started" }, 409);
         }
         session.minting = true;
@@ -541,7 +593,7 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
           return c.json({ error: "That voice session has ended; start a new one" }, 404);
         }
         if (session.startedAt !== null && Date.now() - session.startedAt > session.maxMs) {
-          realtimeSessions.delete(sessionId);
+          await endRealtimeSession(sessionId);
           return c.json({ error: "That voice session has reached its time limit" }, 409);
         }
         if (!declaresTool(session.config.tools, name)) {
@@ -582,25 +634,10 @@ export function createVoiceTranscriptionPlugin(env: Env = process.env) {
         const body = await readJsonObject(c);
         const sessionId = typeof body?.sessionId === "string" ? body.sessionId : "";
         if (sessionId === "") return c.json({ error: "A sessionId is required" }, 400);
-        // Take the session out first, so a tool call racing the close cannot
-        // still act, then tell the opener it ended. The handler is best-effort:
-        // the session is over whatever the opener does with the news.
-        const session = realtimeSessions.get(sessionId);
-        realtimeSessions.delete(sessionId);
-        if (session !== undefined && session.closeHandler !== null) {
-          try {
-            await bb.sdk.plugins.callRpc({
-              pluginId: session.closeHandler.pluginId,
-              method: session.closeHandler.method,
-              input: { sessionId },
-              outputSchema: z.unknown(),
-            });
-          } catch (error) {
-            bb.log.warn(
-              `voice-transcription: close handler for session ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
+        // One end path for every kind of end: take the session out, then tell
+        // the opener at most once. The handler is best-effort: the session is
+        // over whatever the opener does with the news.
+        await endRealtimeSession(sessionId);
         return c.json({ ok: true }, 200);
       },
       { auth: "local" },

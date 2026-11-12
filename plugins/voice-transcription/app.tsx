@@ -121,7 +121,16 @@ function RealtimeVoiceOverlay() {
     });
     clientRef.current = client;
     void client.start();
+    // A tab that is closing does not run the cleanup below, so nudge the close
+    // route on `pagehide`; the server's own sweep is the guarantee.
+    const onPageHide = (): void => {
+      if (typeof navigator.sendBeacon !== "function") return;
+      const body = new Blob([JSON.stringify({ sessionId })], { type: "application/json" });
+      navigator.sendBeacon(`/api/v1/plugins/${PLUGIN_ID}/http${REALTIME_CLOSE_PATH}`, body);
+    };
+    window.addEventListener("pagehide", onPageHide);
     return () => {
+      window.removeEventListener("pagehide", onPageHide);
       clientRef.current = null;
       void client.stop();
     };
