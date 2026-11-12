@@ -881,7 +881,16 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
     );
   }, [rpc, projectId]);
   useEffect(load, [load, refreshKey]);
-  if (standup === null || standup.endedAt !== null) return null;
+  if (standup === null) return null;
+  const ended = standup.endedAt !== null;
+  const typed = standup.notes.filter((n) => STANDUP_ACTION_TYPES.has(n.type));
+  const free = standup.notes.filter((n) => n.type === "free");
+  const applied = typed.filter((n) => n.confirmed);
+  const pending = typed.filter((n) => !n.confirmed);
+  // A live stand-up is the readback itself. An ended one is kept only while it
+  // still has something to show: what it applied, or typed notes still to
+  // confirm. An ended record with nothing to act on disappears.
+  if (ended && applied.length === 0 && pending.length === 0) return null;
   const confirm = (noteId: string) => {
     setBusy(noteId);
     setError(null);
@@ -918,8 +927,6 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
       },
     );
   };
-  const typed = standup.notes.filter((n) => STANDUP_ACTION_TYPES.has(n.type));
-  const free = standup.notes.filter((n) => n.type === "free");
   const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
     <Section
@@ -930,12 +937,21 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
           <button type="button" className={button} disabled={busy !== null} onClick={load}>
             Refresh
           </button>
-          <button type="button" className={button} disabled={busy !== null} onClick={end}>
-            Done
-          </button>
+          {ended ? null : (
+            <button type="button" className={button} disabled={busy !== null} onClick={end}>
+              Done
+            </button>
+          )}
         </span>
       }
     >
+      {ended ? (
+        <p className="text-xs text-muted-foreground">
+          {standup.endedBy === "voice" ? "Ended by voice." : "This stand-up has ended."}
+          {applied.length > 0 ? ` ${applied.length} item${applied.length === 1 ? "" : "s"} applied.` : ""}
+          {typed.length > applied.length ? " The rest are still unconfirmed below." : ""}
+        </p>
+      ) : null}
       {standup.notes.length === 0 ? (
         <None>The stand-up has not recorded a note yet.</None>
       ) : (
@@ -945,7 +961,7 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
               {typed.map((n) => (
                 <li key={n.id} className="flex items-start justify-between gap-3 p-3">
                   <span className={n.confirmed ? "text-muted-foreground" : undefined}>{n.readback}</span>
-                  {n.confirmed ? <Badge>Confirmed</Badge> : <button type="button" className={button} disabled={busy !== null} onClick={() => confirm(n.id)}>{busy === n.id ? "Confirming…" : "Confirm"}</button>}
+                  {n.confirmed ? <Badge>{n.confirmedBy === "voice" ? "Applied by voice" : "Confirmed"}</Badge> : <button type="button" className={button} disabled={busy !== null} onClick={() => confirm(n.id)}>{busy === n.id ? "Confirming…" : "Confirm"}</button>}
                 </li>
               ))}
             </ul>

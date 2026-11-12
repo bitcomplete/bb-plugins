@@ -1,7 +1,7 @@
 // BB-300 slice 3: the stand-up's instruction builder, its fixed tool set, and
 // the note record. Nothing here touches OpenAI or the network: the tool
 // readers are injected, so the whole surface is unit-tested.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   STANDUP_MAX_INSTRUCTIONS_CHARS,
   STANDUP_NOTE_TYPES,
@@ -88,6 +88,7 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
     snapshot: async () => issue(),
     needs: () => [],
     confirmed: [],
+    endStandup: async (ids) => ({ output: `end ${ids.join(",")}`, applied: ids, skipped: [] }),
     record,
     ...over,
   };
@@ -95,7 +96,7 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
 
 describe("the stand-up tool set (BB-300)", () => {
   it("declares the fixed, small tool set", () => {
-    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "take_note", "retract_note"]);
+    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
     // Every declaration carries the shape the Realtime API needs.
     for (const tool of STANDUP_TOOLS) {
       expect(tool.name).toMatch(/^[a-z_]+$/u);
@@ -153,6 +154,40 @@ describe("runStandupTool (BB-300)", () => {
 
   it("refuses an unknown tool", async () => {
     await expect(runStandupTool("merge_everything", {}, context())).rejects.toThrow(/No stand-up tool/u);
+  });
+
+  it("reads the mechanical readback lines, with note ids, and writes nothing", async () => {
+    const ctx = context();
+    ctx.record.notes.push(
+      { id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, need: null, needLabel: null, createdAt: 1 },
+      { id: "note_2", type: "free", text: "A thought", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: 2 },
+    );
+    const before = JSON.stringify(ctx.record.notes);
+    const out = (await runStandupTool("readback", {}, ctx)) as string;
+    expect(out).toContain("Guidance for ENG-12: Keep it small (id note_1)");
+    expect(out).toContain("Note: A thought (id note_2)");
+    expect(JSON.stringify(ctx.record.notes)).toBe(before);
+  });
+
+  it("says so when there is nothing to read back", async () => {
+    expect(await runStandupTool("readback", {}, context())).toContain("No notes");
+  });
+
+  it("ends the stand-up through the injected callback and returns the last-reply flag", async () => {
+    const endStandup = vi.fn(async (ids: string[]) => ({ output: `Applied ${ids.length}.`, applied: ids, skipped: [] }));
+    const out = await runStandupTool("end_standup", { ids: ["note_1", "note_2"] }, context({ endStandup }));
+    expect(out).toEqual({ output: "Applied 2.", last: true });
+    expect(endStandup).toHaveBeenCalledWith(["note_1", "note_2"]);
+  });
+
+  it("requires an array of ids for end_standup", async () => {
+    await expect(runStandupTool("end_standup", {}, context())).rejects.toThrow(/must be an array/u);
+  });
+
+  it("passes a busy end_standup outcome through as last: false", async () => {
+    const endStandup = vi.fn(async () => ({ output: "Retry.", applied: [], skipped: [], last: false }));
+    const out = await runStandupTool("end_standup", { ids: ["note_1"] }, context({ endStandup }));
+    expect(out).toEqual({ output: "Retry.", last: false });
   });
 
   it("takes and retracts notes, touching only the stand-up record", async () => {
@@ -255,6 +290,15 @@ describe("buildStandupInstructions (BB-300)", () => {
 
   it("says the beginning when there is no previous stand-up", () => {
     expect(buildStandupInstructions(briefing({ since: 0 }), "Acme", 10_000)).toContain("since the beginning");
+  });
+
+  it("tells the model to greet and lead, and to close only after a readback and a clear yes", () => {
+    const text = buildStandupInstructions(briefing(), "Acme", 10_000);
+    expect(text).toContain("Greet the owner briefly and begin immediately");
+    expect(text).toContain("nothing is waiting on the owner and nothing is stuck");
+    expect(text).toContain("call readback and read every line aloud");
+    expect(text).toContain("Never end without a readback");
+    expect(text).toContain("merge gate item is never applied by end_standup");
   });
 
   it("keeps a huge briefing under the voice plugin's instruction cap, ranked", () => {

@@ -1711,6 +1711,93 @@ describe("the Stand-up button (BB-300)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("shows what a voice-ended stand-up applied and keeps the unconfirmed readback", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            standup: { available: true, message: null },
+          },
+        }),
+        stewardsStandupRecord: () => ({
+          standup: {
+            id: "sup_2",
+            projectId: "p1",
+            startedAt: 1,
+            endedAt: 2,
+            endedBy: "voice",
+            notes: [
+              { id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, createdAt: 1, readback: "Guidance for ENG-12: Keep it small", confirmed: true, confirmedBy: "voice" },
+              { id: "note_2", type: "guidance", text: "And add a test", binding: "ENG-12", escalation: null, action: null, createdAt: 2, readback: "Guidance for ENG-12: And add a test", confirmed: false, confirmedBy: null },
+            ],
+            confirmed: ["note_1"],
+          },
+        }),
+        stewardsStandupConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
+        stewardsStandupEnd: () => ({ ok: true, message: "Stand-up ended." }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Applied by voice")).toBeTruthy());
+    expect(slot.getByText(/Ended by voice\./u)).toBeTruthy();
+    expect(slot.getByText("Guidance for ENG-12: And add a test")).toBeTruthy();
+    // The unconfirmed note keeps its Confirm button; an ended stand-up has no Done.
+    expect(slot.getAllByRole("button", { name: "Confirm" })).toHaveLength(1);
+    expect(slot.queryByRole("button", { name: "Done" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("hides an ended stand-up that has nothing to show", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            standup: { available: true, message: null },
+          },
+        }),
+        stewardsStandupRecord: () => ({ standup: { id: "sup_3", projectId: "p1", startedAt: 1, endedAt: 2, endedBy: "voice", notes: [], confirmed: [], confirmedBy: null } }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Waiting on you")).toBeTruthy());
+    expect(slot.queryByText("Stand-up readback")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   it("shows no readback when there is no open stand-up", async () => {
     const captured = await loadApp();
     const panel = captured.navPanels[0]!;
