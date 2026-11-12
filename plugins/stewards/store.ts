@@ -1323,6 +1323,12 @@ export type StandupTranscriptEntry = {
   noteId: string | null;
   /** The words carried, for a note and its confirmation; empty for a retract and the end. */
   text: string;
+  /**
+   * How a confirmation or the end happened: the page's button, a spoken
+   * `end_standup`/close, or a new start that superseded an abandoned record.
+   * Null on entries written before this field existed.
+   */
+  via?: "page" | "voice" | "start" | null;
 };
 
 /** A durable stand-up record (BB-300 slice 4): the session, its notes and what the owner confirmed. */
@@ -1971,7 +1977,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     needLabel: z.string().nullable().default(null),
     createdAt: z.number(),
   });
-  const standupTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string() });
+  const standupTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string(), via: z.enum(["page", "voice", "start"]).nullable().default(null) });
   const toStandup = (r: Record<string, unknown>): StandupRow => ({
     id: String(r.id),
     projectId: String(r.project_id),

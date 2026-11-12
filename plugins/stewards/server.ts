@@ -94,7 +94,7 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
-import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, type StandupNote, type StandupNoteType, type StandupRecord } from "./standup.js";
+import { STANDUP_TOOLS, buildStandupInstructions, readbackLine, runStandupTool, type StandupEndOutcome, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolReply } from "./standup.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, scrubCredentials, ticketResolved, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -979,9 +979,10 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean(), sessionId: z.string().nullable(), standupId: z.string().nullable(), message: z.string() }),
   },
   // BB-300: the one method the voice plugin forwards the model's tool calls to.
-  // It reads state, or takes and retracts notes; it never acts on a steward.
-  // The output is the text itself, so the voice plugin wraps it once for the
-  // model's data channel.
+  // It reads state, or takes and retracts notes; only `end_standup` applies the
+  // owner's confirmed notes and ends the stand-up. The output is the text the
+  // model reads, or an object with a `last` flag so the overlay closes after
+  // the model's goodbye (BB-301).
   stewardsStandupTool: {
     input: z.object({
       sessionId: z.string().min(1).max(200),
@@ -989,7 +990,7 @@ export const rpcContract = defineRpcContract({
       name: z.string().min(1).max(64),
       arguments: z.string().max(20_000),
     }),
-    output: z.string(),
+    output: z.union([z.string(), z.object({ output: z.string(), last: z.boolean().optional() })]),
   },
   // BB-300 slice 4: the durable stand-up record, read back for the Stewards page.
   // The readback lines are rendered from the stored notes, never composed by
@@ -1016,9 +1017,17 @@ export const rpcContract = defineRpcContract({
               readback: z.string(),
               /** True once the owner confirmed this note; nothing unconfirmed is applied. */
               confirmed: z.boolean(),
+              /**
+               * How it was confirmed: "voice" for a spoken end_standup, "page"
+               * for the Confirm button, null when it is not confirmed. Lets the
+               * page mark a misheard yes as applied by voice (BB-301).
+               */
+              confirmedBy: z.enum(["voice", "page"]).nullable(),
             }),
           ),
           confirmed: z.array(z.string()),
+          /** How the stand-up ended: by voice, the page's Done, or a new start. */
+          endedBy: z.enum(["voice", "page", "start"]).nullable(),
         })
         .nullable(),
     }),
@@ -1035,6 +1044,14 @@ export const rpcContract = defineRpcContract({
   // context, not instruction.
   stewardsStandupEnd: {
     input: z.object({ standupId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
+  // BB-301: the voice plugin calls this with the session id whenever the voice
+  // session ends for any reason (End, cap, tab close, model-initiated), so an
+  // early close still ends the record. Unconfirmed notes stay unconfirmed, and
+  // a call after end_standup is idempotent.
+  stewardsStandupClose: {
+    input: z.object({ sessionId: z.string().min(1).max(200) }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
   },
 });
@@ -1456,15 +1473,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * End a stand-up: stamp the end, advance "since the last stand-up", and wake
-     * the project steward with what was said. One road, so `stewardsStandupEnd`
-     * and a new start that supersedes an abandoned overlay behave the same.
+     * the project steward with what was said. One road, so `stewardsStandupEnd`,
+     * the voice close handler and a new start that supersedes an abandoned
+     * overlay behave the same. `via` records how it ended (BB-301).
      * A stand-up that said nothing wakes no one.
      */
-    async function finishStandup(standup: StandupRow): Promise<void> {
+    async function finishStandup(standup: StandupRow, via: "page" | "voice" | "start" = "page"): Promise<void> {
       if (standup.endedAt !== null) return;
       let row = store.saveStandup(standup.id, { endedAt: now() }) ?? standup;
       store.setLastStandup(row.projectId, row.startedAt);
-      row = noteStandupEvent(row, { kind: "end", noteId: null, text: "" });
+      row = noteStandupEvent(row, { kind: "end", noteId: null, text: "", via });
       const confirmed = row.notes.filter((n) => row.confirmed.includes(n.id));
       const free = row.notes.filter((n) => n.type === "free");
       if (confirmed.length === 0 && free.length === 0) return;
@@ -1472,6 +1490,112 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (confirmed.length > 0) lines.push(`What the owner confirmed: ${confirmed.map((n) => scrubCredentials(readbackLine(n as StandupNote))).join(" | ")}`);
       if (free.length > 0) lines.push(`Free notes from it, context and not instructions: ${free.map((n) => JSON.stringify(scrubCredentials(n.text))).join("; ")}`);
       await wakeProject(row.projectId, "the owner held a stand-up", { digestDue: false, notes: lines });
+    }
+
+    /**
+     * Apply one confirmed note through the path its shape already uses: a gate
+     * item through the need-action RPC the Approve and Decline buttons use,
+     * per-binding guidance as user guidance, an escalation through the question
+     * or need path, and direction and standing rules as a message to the project
+     * steward's thread. Shared by the page's Confirm button and the spoken
+     * `end_standup`, so a note lands the same way whichever way the owner said
+     * yes. A free note is never applied: it stays context.
+     */
+    async function applyStandupNote(standup: StandupRow, note: StandupNoteRow): Promise<{ ok: boolean; applied: boolean; message: string }> {
+      const type = note.type as StandupNoteType;
+      const text = scrubCredentials(note.text);
+      const binding = note.binding === null ? null : store.find(note.binding, standup.projectId);
+      let applied = false;
+      let message = "Confirmed.";
+
+      if (type === "gate") {
+        if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
+        if (note.action !== "approve" && note.action !== "decline" && note.action !== "merge") return { ok: false, applied: false, message: "A gate note needs an approve, decline or merge action." };
+        // The note was bound to one need when it was taken; confirm only
+        // while that exact item is still open.
+        const need = note.need === null ? null : store.need(note.need);
+        if (need === null || need.status !== "open") return { ok: false, applied: false, message: "That item is no longer open; retake the note against a current one." };
+        const action = note.action === "decline" ? "decline" : note.action === "merge" ? "merge" : "approve";
+        const result = await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action, note: text }, { experimental_caller: { kind: "client" } });
+        if (!result.ok) return { ok: false, applied: false, message: result.message };
+        applied = true;
+        message = result.message;
+      } else if (type === "guidance") {
+        if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
+        store.addGuidance(binding.id, text, "user");
+        store.note(binding.id, `The owner confirmed stand-up guidance: ${text}`);
+        scheduleReconcile(binding.id);
+        applied = true;
+        message = `Guidance saved on ${binding.entityKey}.`;
+      } else if (type === "resolve-escalation") {
+        const escalation = note.escalation === null ? null : store.escalation(note.escalation);
+        if (escalation === null || escalation.status !== "open") return { ok: false, applied: false, message: "That escalation is not open." };
+        // An approval or a secret has its own button; a stand-up sentence
+        // must not stand in for the value.
+        if (escalation.kind === "approval") return { ok: false, applied: false, message: "That is an approval; use the Approve or Decline button, not the stand-up." };
+        if (escalation.resolutionKind === "secret") return { ok: false, applied: false, message: "That needs a secret; use the Provide button, not the stand-up." };
+        // A route-`user` escalation is the page's own item, with the
+        // escalation id as its need id; answer it through the same RPC the
+        // page uses, so the closure, corrections and parent wake happen.
+        const need = store.need(escalation.id);
+        if (need !== null && need.status === "open") {
+          const choice = needChoices(need).find((c) => c === text) ?? null;
+          const result =
+            choice === null
+              ? await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action: "done", note: text }, { experimental_caller: { kind: "client" } })
+              : await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action: "choose", choice, note: null }, { experimental_caller: { kind: "client" } });
+          if (!result.ok) return { ok: false, applied: false, message: result.message };
+          message = result.message;
+        } else {
+          const question = store.openQuestions(standup.projectId).find((q) => q.escalationId === escalation.id);
+          if (question !== undefined) {
+            const result = await rawRpcHandlers.stewardsAnswerQuestion({ questionId: question.id, answer: text }, { experimental_caller: { kind: "client" } });
+            if (!result.ok) return { ok: false, applied: false, message: result.message };
+            message = result.message;
+          } else {
+            // The escalation's own binding, never the model's guess.
+            const from = store.binding(escalation.bindingId);
+            store.answerEscalation(escalation.id, text, "user");
+            countCorrections(escalation, text);
+            if (from !== null) {
+              store.addGuidance(from.id, text, "user");
+              store.note(from.id, `Escalation ${escalation.id} resolved from a stand-up: ${text}`);
+              scheduleReconcile(from.id);
+            }
+            await wakeProject(standup.projectId, "an escalation was resolved in a stand-up", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a stand-up with: ${JSON.stringify(text)}`] });
+            message = `Escalation ${escalation.id} resolved.`;
+          }
+        }
+        applied = true;
+      } else if (type === "direction" || type === "standing-rule") {
+        const label = type === "direction" ? "direction" : "standing rule";
+        const cue = type === "standing-rule" ? " A standing rule is the cue to open the playbook pull request." : "";
+        await wakeProject(standup.projectId, `the owner's ${label} from a stand-up`, { digestDue: false, notes: [`The owner held a stand-up and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
+        applied = true;
+        message = `${type === "direction" ? "Direction" : "Standing rule"} sent to the project steward.`;
+      } else {
+        // A free note is context, never an action: it is left unconfirmed
+        // for the project steward's next wake.
+        return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the stand-up ends." };
+      }
+
+      return { ok: true, applied, message };
+    }
+
+    /**
+     * Apply a note and, when it applied, mark it confirmed in the record with
+     * how it was confirmed. Re-reads the row so a note taken or retracted while
+     * the apply awaited is not dropped, and so the confirmed list is current.
+     */
+    async function confirmStandupNote(standup: StandupRow, note: StandupNoteRow, via: "page" | "voice"): Promise<{ ok: boolean; applied: boolean; message: string }> {
+      const result = await applyStandupNote(standup, note);
+      if (!result.ok || !result.applied) return result;
+      const fresh = store.standup(standup.id) ?? standup;
+      store.saveStandup(fresh.id, {
+        confirmed: [...fresh.confirmed, note.id],
+        transcript: [...fresh.transcript, { at: now(), kind: "confirm", noteId: note.id, text: scrubCredentials(note.text), via }],
+      });
+      return result;
     }
 
     /** A base URL with no trailing slash, so the comparison matches the voice plugin's. */
@@ -9129,13 +9253,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // survives a server restart that empties the map.
           for (const [sid, hid] of standupSessions) if (store.standup(hid)?.projectId === projectId) standupSessions.delete(sid);
           const open = store.latestStandup(projectId);
-          if (open !== null && open.endedAt === null) await finishStandup(open);
+          if (open !== null && open.endedAt === null) await finishStandup(open, "start");
           // The record is opened before the voice session, so a tool call that
           // arrives immediately finds it.
           const record = store.createStandup({ id: newId("sup"), projectId, startedAt: now() });
           let opened: { sessionId: string; maxDurationMs: number };
           try {
-            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", { instructions, tools: STANDUP_TOOLS, toolHandler: { method: "stewardsStandupTool" }, client: client ?? null }, realtimeOpenOutput);
+            opened = await rpc(VOICE_PLUGIN_ID, "realtime.open", {
+              instructions,
+              tools: STANDUP_TOOLS,
+              toolHandler: { method: "stewardsStandupTool" },
+              client: client ?? null,
+              // The agent greets and leads (BB-301), and the voice plugin tells
+              // us when the session ends so an early close still ends the record.
+              onClose: { method: "stewardsStandupClose" },
+              speaksFirst: true,
+            }, realtimeOpenOutput);
           } catch (error) {
             // The session never opened; end the empty record so it is not read
             // back as the project's stand-up.
@@ -9168,7 +9301,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // touches are saved to the durable row afterwards.
         const standupProjectId = standup.projectId;
         const record: StandupRecord = { projectId: standupProjectId, startedAt: standup.startedAt, notes: [...standup.notes] as StandupNote[], connected: standup.connected };
-        const output = await runStandupTool(name, args, {
+        const result = await runStandupTool(name, args, {
           projectId: standupProjectId,
           now,
           binding: (key) => store.find(key, standupProjectId),
@@ -9180,6 +9313,57 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           needs: (bindingId) => store.openNeeds(bindingId),
           confirmed: standup.confirmed,
           record,
+          // BB-301: the one tool that acts outside the record. It applies only
+          // typed notes of this stand-up's own record, skipping free notes, a
+          // merge (the page's Confirm keeps that), ids that are not here, and
+          // ids already confirmed, and reports what it skipped.
+          endStandup: async (ids): Promise<StandupEndOutcome> => {
+            const row = store.standup(standupId);
+            if (row === null) return { output: "That stand-up has already ended.", applied: [], skipped: ids.map((id) => ({ id, reason: "the stand-up is gone" })) };
+            if (confirmingStandups.has(standupId)) return { output: "Another item in this stand-up is being confirmed; try again in a moment.", applied: [], skipped: [] };
+            confirmingStandups.add(standupId);
+            try {
+              const applied: string[] = [];
+              const skipped: Array<{ id: string; reason: string }> = [];
+              const seen = new Set<string>();
+              for (const id of ids) {
+                if (seen.has(id)) {
+                  skipped.push({ id, reason: "listed twice" });
+                  continue;
+                }
+                seen.add(id);
+                const note = row.notes.find((n) => n.id === id);
+                if (note === undefined) {
+                  skipped.push({ id, reason: "not in this stand-up" });
+                  continue;
+                }
+                if (row.confirmed.includes(id)) {
+                  skipped.push({ id, reason: "already confirmed" });
+                  continue;
+                }
+                if (note.type === "free") {
+                  skipped.push({ id, reason: "a free note is context, not applied" });
+                  continue;
+                }
+                if (note.type === "gate" && note.action === "merge") {
+                  skipped.push({ id, reason: "a merge stays for the page's Confirm button" });
+                  continue;
+                }
+                const outcome = await confirmStandupNote(row, note, "voice");
+                if (outcome.ok && outcome.applied) applied.push(id);
+                else skipped.push({ id, reason: outcome.message });
+              }
+              await finishStandup(row, "voice");
+              const parts = [
+                applied.length === 0 ? "Nothing was applied." : `Applied ${applied.length} confirmed item${applied.length === 1 ? "" : "s"}.`,
+              ];
+              if (skipped.length > 0) parts.push(`Skipped: ${skipped.map((entry) => `${entry.id} (${entry.reason})`).join("; ")}.`);
+              parts.push("The stand-up is ending. Say a brief goodbye.");
+              return { output: parts.join(" "), applied, skipped };
+            } finally {
+              confirmingStandups.delete(standupId);
+            }
+          },
         });
         // Persist the note record when a writer touched it, and log the event in
         // the transcript so the readback has a history.
@@ -9192,32 +9376,52 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           standup = store.saveStandup(standup.id, { notes: record.notes as StandupNoteRow[] }) ?? standup;
           if (removed !== undefined) standup = noteStandupEvent(standup, { kind: "retract", noteId: removed.id, text: removed.text });
         }
-        // A tool result goes to OpenAI too, so it passes the same scrub.
-        return scrubCredentials(output);
+        // A tool result goes to OpenAI too, so it passes the same scrub. The
+        // `last` flag survives the scrub, so the overlay closes after the
+        // model's goodbye.
+        const reply: StandupToolReply = typeof result === "string" ? { output: result } : result;
+        const scrubbed = scrubCredentials(reply.output);
+        return reply.last === true ? { output: scrubbed, last: true } : scrubbed;
       },
       async stewardsStandupRecord({ projectId }) {
         // The readback is rendered here from the stored notes, never composed by
-        // the model; the page only displays these lines.
+        // the model; the page only displays these lines. The transcript says how
+        // each note was confirmed and how the stand-up ended, so a spoken yes
+        // is distinguishable from a click (BB-301).
         const standup = store.latestStandup(projectId);
         if (standup === null) return { standup: null };
+        const confirmedBy = new Map<string, "voice" | "page">();
+        for (const entry of standup.transcript) {
+          if (entry.kind === "confirm" && entry.noteId !== null && (entry.via === "voice" || entry.via === "page")) {
+            confirmedBy.set(entry.noteId, entry.via);
+          }
+        }
+        const endEntry = [...standup.transcript].reverse().find((entry) => entry.kind === "end");
         return {
           standup: {
             id: standup.id,
             projectId: standup.projectId,
             startedAt: standup.startedAt,
             endedAt: standup.endedAt,
-            notes: standup.notes.map((n) => ({
-              id: n.id,
-              type: n.type,
-              text: n.text,
-              binding: n.binding,
-              escalation: n.escalation,
-              action: n.action,
-              createdAt: n.createdAt,
-              readback: readbackLine(n as StandupNote),
-              confirmed: standup.confirmed.includes(n.id),
-            })),
+            notes: standup.notes.map((n) => {
+              const confirmed = standup.confirmed.includes(n.id);
+              return {
+                id: n.id,
+                type: n.type,
+                text: n.text,
+                binding: n.binding,
+                escalation: n.escalation,
+                action: n.action,
+                createdAt: n.createdAt,
+                readback: readbackLine(n as StandupNote),
+                confirmed,
+                // A confirmed note written before the transcript carried `via`
+                // is the page's, the only way it could have been confirmed.
+                confirmedBy: confirmed ? (confirmedBy.get(n.id) ?? "page") : null,
+              };
+            }),
             confirmed: standup.confirmed,
+            endedBy: endEntry?.via ?? null,
           },
         };
       },
@@ -9239,88 +9443,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const note = standup.notes.find((n) => n.id === noteId);
           if (note === undefined) return { ok: false, applied: false, message: "That note is not in this stand-up." };
           if (standup.confirmed.includes(noteId)) return { ok: true, applied: true, message: "Already confirmed." };
-          const type = note.type as StandupNoteType;
-          const text = scrubCredentials(note.text);
-          const binding = note.binding === null ? null : store.find(note.binding, standup.projectId);
-          let applied = false;
-          let message = "Confirmed.";
-
-          if (type === "gate") {
-            if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
-            if (note.action !== "approve" && note.action !== "decline" && note.action !== "merge") return { ok: false, applied: false, message: "A gate note needs an approve, decline or merge action." };
-            // The note was bound to one need when it was taken; confirm only
-            // while that exact item is still open.
-            const need = note.need === null ? null : store.need(note.need);
-            if (need === null || need.status !== "open") return { ok: false, applied: false, message: "That item is no longer open; retake the note against a current one." };
-            const action = note.action === "decline" ? "decline" : note.action === "merge" ? "merge" : "approve";
-            const result = await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action, note: text }, { experimental_caller: { kind: "client" } });
-            if (!result.ok) return { ok: false, applied: false, message: result.message };
-            applied = true;
-            message = result.message;
-          } else if (type === "guidance") {
-            if (binding === null) return { ok: false, applied: false, message: `No steward for ${note.binding ?? "that binding"} in this project.` };
-            store.addGuidance(binding.id, text, "user");
-            store.note(binding.id, `The owner confirmed stand-up guidance: ${text}`);
-            scheduleReconcile(binding.id);
-            applied = true;
-            message = `Guidance saved on ${binding.entityKey}.`;
-          } else if (type === "resolve-escalation") {
-            const escalation = note.escalation === null ? null : store.escalation(note.escalation);
-            if (escalation === null || escalation.status !== "open") return { ok: false, applied: false, message: "That escalation is not open." };
-            // An approval or a secret has its own button; a stand-up sentence
-            // must not stand in for the value.
-            if (escalation.kind === "approval") return { ok: false, applied: false, message: "That is an approval; use the Approve or Decline button, not the stand-up." };
-            if (escalation.resolutionKind === "secret") return { ok: false, applied: false, message: "That needs a secret; use the Provide button, not the stand-up." };
-            // A route-`user` escalation is the page's own item, with the
-            // escalation id as its need id; answer it through the same RPC the
-            // page uses, so the closure, corrections and parent wake happen.
-            const need = store.need(escalation.id);
-            if (need !== null && need.status === "open") {
-              const choice = needChoices(need).find((c) => c === text) ?? null;
-              const result =
-                choice === null
-                  ? await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action: "done", note: text }, { experimental_caller: { kind: "client" } })
-                  : await rawRpcHandlers.stewardsNeedAction({ needId: need.id, action: "choose", choice, note: null }, { experimental_caller: { kind: "client" } });
-              if (!result.ok) return { ok: false, applied: false, message: result.message };
-              message = result.message;
-            } else {
-              const question = store.openQuestions(standup.projectId).find((q) => q.escalationId === escalation.id);
-              if (question !== undefined) {
-                const result = await rawRpcHandlers.stewardsAnswerQuestion({ questionId: question.id, answer: text }, { experimental_caller: { kind: "client" } });
-                if (!result.ok) return { ok: false, applied: false, message: result.message };
-                message = result.message;
-              } else {
-                // The escalation's own binding, never the model's guess.
-                const from = store.binding(escalation.bindingId);
-                store.answerEscalation(escalation.id, text, "user");
-                countCorrections(escalation, text);
-                if (from !== null) {
-                  store.addGuidance(from.id, text, "user");
-                  store.note(from.id, `Escalation ${escalation.id} resolved from a stand-up: ${text}`);
-                  scheduleReconcile(from.id);
-                }
-                await wakeProject(standup.projectId, "an escalation was resolved in a stand-up", { digestDue: false, notes: [`The owner resolved escalation ${escalation.id} in a stand-up with: ${JSON.stringify(text)}`] });
-                message = `Escalation ${escalation.id} resolved.`;
-              }
-            }
-            applied = true;
-          } else if (type === "direction" || type === "standing-rule") {
-            const label = type === "direction" ? "direction" : "standing rule";
-            const cue = type === "standing-rule" ? " A standing rule is the cue to open the playbook pull request." : "";
-            await wakeProject(standup.projectId, `the owner's ${label} from a stand-up`, { digestDue: false, notes: [`The owner held a stand-up and gave this ${label}: ${JSON.stringify(text)}${cue}`] });
-            applied = true;
-            message = `${type === "direction" ? "Direction" : "Standing rule"} sent to the project steward.`;
-          } else {
-            // A free note is context, never an action: it is left unconfirmed
-            // for the project steward's next wake.
-            return { ok: true, applied: false, message: "Free notes are context; they reach the project steward when the stand-up ends." };
-          }
-
-          // Re-read the row: a take_note or retract_note may have landed while
-          // the apply above awaited, and neither may be dropped.
-          const fresh = store.standup(standup.id) ?? standup;
-          store.saveStandup(fresh.id, { confirmed: [...fresh.confirmed, noteId], transcript: [...fresh.transcript, { at: now(), kind: "confirm", noteId, text }] });
-          return { ok: true, applied, message };
+          return await confirmStandupNote(standup, note, "page");
         } finally {
           confirmingStandups.delete(standupId);
         }
@@ -9333,7 +9456,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const standup = store.standup(standupId);
         if (standup === null) return { ok: false, message: "That stand-up is gone." };
         if (standup.endedAt !== null) return { ok: true, message: "Already ended." };
-        await finishStandup(standup);
+        await finishStandup(standup, "page");
+        return { ok: true, message: "Stand-up ended." };
+      },
+      // BB-301: the voice plugin calls this when the session ends for any
+      // reason (End, cap, tab close, model-initiated), so an early close still
+      // ends the record. Only the voice plugin, and only a session this server
+      // opened, may call it; a call after end_standup is idempotent.
+      async stewardsStandupClose({ sessionId }, { experimental_caller: caller }) {
+        if (caller.kind !== "plugin" || caller.pluginId !== VOICE_PLUGIN_ID) throw new Error("only the voice-transcription plugin ends a stand-up session");
+        const standupId = standupSessions.get(sessionId);
+        if (standupId === undefined) return { ok: true, message: "That stand-up has already ended." };
+        standupSessions.delete(sessionId);
+        const standup = store.standup(standupId);
+        if (standup === null) return { ok: true, message: "That stand-up is gone." };
+        // Unconfirmed notes stay unconfirmed; finishStandup only stamps the end.
+        await finishStandup(standup, "voice");
         return { ok: true, message: "Stand-up ended." };
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {

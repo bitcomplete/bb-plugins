@@ -22,6 +22,24 @@ export type StandupTool = {
   parameters: Record<string, unknown>;
 };
 
+/**
+ * What a tool returns: the text the model reads, or a reply that also says the
+ * model's response to it is its last, so the overlay stops after the goodbye.
+ */
+export type StandupToolReply = { output: string; last?: boolean };
+
+/**
+ * The result of an `end_standup` call, for the server and the tests: what was
+ * applied, and what was skipped with why (a note that is not a typed note of
+ * this stand-up, a free note, an already-confirmed note, or a merge the
+ * blanket yes must not carry).
+ */
+export type StandupEndOutcome = {
+  output: string;
+  applied: string[];
+  skipped: Array<{ id: string; reason: string }>;
+};
+
 /** The fixed shapes a typed note may take, plus a free note (BB-300). */
 export const STANDUP_NOTE_TYPES = ["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "free"] as const;
 export type StandupNoteType = (typeof STANDUP_NOTE_TYPES)[number];
@@ -125,6 +143,15 @@ export const STANDUP_TOOLS: StandupTool[] = [
     },
   },
   {
+    name: "readback",
+    description: "Read the current stand-up notes back in the server's own mechanical words, one line each with its note id. Read-only: it writes nothing and acts on nothing. Call it before asking the owner to confirm.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
     name: "take_note",
     description: "Record an action item for the owner to confirm after the stand-up, or a free note. This writes only to the stand-up record; it never acts on a steward, merges or resolves anything.",
     parameters: {
@@ -147,6 +174,21 @@ export const STANDUP_TOOLS: StandupTool[] = [
       type: "object",
       properties: { id: stringParam("The note id (note_…) to remove.") },
       required: ["id"],
+    },
+  },
+  {
+    name: "end_standup",
+    description: "End the stand-up after the owner has clearly confirmed the notes. Give the ids of the typed notes they agreed to; the server applies each through the same path the page's Confirm button uses, wakes the project steward, records the confirmation as confirmed by voice, and closes the voice session. Only call it after a readback and a clear yes. Merge items are never applied here; they stay for the page's Confirm button.",
+    parameters: {
+      type: "object",
+      properties: {
+        ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "The note ids (note_…) the owner clearly confirmed.",
+        },
+      },
+      required: ["ids"],
     },
   },
 ];
@@ -174,6 +216,12 @@ export type StandupToolContext = {
   needs: (bindingId: string) => Need[];
   /** The note ids the owner has already confirmed; a confirmed note cannot be retracted. */
   confirmed: readonly string[];
+  /**
+   * Apply the ids the owner confirmed through the same paths the page's
+   * Confirm uses, then end the stand-up. The only tool that acts outside the
+   * record; it is injected so the tool set stays testable without a store.
+   */
+  endStandup: (ids: string[]) => Promise<StandupEndOutcome>;
   /** The stand-up's note record. Only `take_note` and `retract_note` touch it. */
   record: StandupRecord;
 };
@@ -228,6 +276,16 @@ function requireString(args: Record<string, unknown>, field: string): string {
 function optionalString(args: Record<string, unknown>, field: string): string | null {
   const value = args[field];
   return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+/** A list of non-empty strings, each trimmed, or an error naming the field. */
+function requireStringArray(args: Record<string, unknown>, field: string): string[] {
+  const value = args[field];
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array of note ids`);
+  return value.map((item) => {
+    if (typeof item !== "string" || item.trim() === "") throw new Error(`${field} must contain note ids`);
+    return item.trim();
+  });
 }
 
 /** The steward's own status line, or a clear "no such steward" the model can read aloud. */
@@ -384,9 +442,10 @@ function retractNote(ctx: StandupToolContext, args: Record<string, unknown>): st
 /**
  * Run one model tool call against the injected readers. A read tool returns
  * text and never writes; `take_note` and `retract_note` return text and touch
- * only `ctx.record.notes`.
+ * only `ctx.record.notes`; `end_standup` is the one tool that applies the
+ * confirmed notes and ends the stand-up, through its injected callback.
  */
-export async function runStandupTool(name: string, args: Record<string, unknown>, ctx: StandupToolContext): Promise<string> {
+export async function runStandupTool(name: string, args: Record<string, unknown>, ctx: StandupToolContext): Promise<string | StandupToolReply> {
   switch (name) {
     case "steward_status":
       return stewardStatus(ctx, requireString(args, "key"));
@@ -398,13 +457,27 @@ export async function runStandupTool(name: string, args: Record<string, unknown>
       return rationaleTool(ctx, requireString(args, "key"));
     case "playbook_paragraph":
       return playbookTool(ctx, args);
+    case "readback":
+      return readbackTool(ctx);
     case "take_note":
       return takeNote(ctx, args);
     case "retract_note":
       return retractNote(ctx, args);
+    case "end_standup": {
+      const outcome = await ctx.endStandup(requireStringArray(args, "ids"));
+      // The opener's reply carries `last`, so the overlay lets the model's
+      // goodbye finish and then closes the session itself.
+      return { output: outcome.output, last: true };
+    }
     default:
       throw new Error(`No stand-up tool named ${name}`);
   }
+}
+
+/** The mechanical readback lines, each with its note id so the model can confirm it. */
+function readbackTool(ctx: StandupToolContext): string {
+  if (ctx.record.notes.length === 0) return "No notes have been taken in this stand-up yet.";
+  return ctx.record.notes.map((note) => `${readbackLine(note)} (id ${note.id})`).join("\n");
 }
 
 /**
@@ -479,9 +552,12 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
     `You are the voice of ${projectName}'s stewards in a stand-up with the project's owner.`,
     `It is ${new Date(now).toISOString()}. You are reporting what happened since ${since}.`,
     "",
-    "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached.",
+    "Greet the owner briefly and begin immediately; do not wait for them to speak first.",
+    "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind.",
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
+    "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback, and treat anything short of a clear yes as no confirmation.",
+    "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
   ];
   const sections = [
     { heading: "Decisions waiting on the owner", lines: decisionLines(briefing, questions) },

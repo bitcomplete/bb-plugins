@@ -14733,9 +14733,14 @@ describe("the stand-up (BB-300)", () => {
     expect(started.sessionId).not.toBeNull();
     expect(t.realtimeOpens).toHaveLength(1);
     const open = t.realtimeOpens[0]!;
-    expect(open.input).toMatchObject({ toolHandler: { method: "stewardsStandupTool" }, client: null });
+    expect(open.input).toMatchObject({
+      toolHandler: { method: "stewardsStandupTool" },
+      client: null,
+      onClose: { method: "stewardsStandupClose" },
+      speaksFirst: true,
+    });
     const tools = open.input.tools as Array<{ name: string }>;
-    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "take_note", "retract_note"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["steward_status", "escalation", "entity_snapshot", "decision_rationale", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
     expect(String(open.input.instructions)).toMatch(/## Decisions waiting on the owner/u);
     expect(String(open.input.instructions)).toMatch(/Should I file an a11y ticket\?/u);
     // Opening the session does not advance the window: only a session that
@@ -14846,7 +14851,13 @@ describe("the stand-up (BB-300)", () => {
   // confirmation and the fan-out. Each item is confirmed on its own, and
   // nothing is applied before its confirmation.
   type StandupRecordResult = {
-    standup: { id: string; notes: Array<{ id: string; type: string; readback: string; confirmed: boolean }>; confirmed: string[]; endedAt: number | null } | null;
+    standup: {
+      id: string;
+      notes: Array<{ id: string; type: string; readback: string; confirmed: boolean; confirmedBy: "voice" | "page" | null }>;
+      confirmed: string[];
+      endedAt: number | null;
+      endedBy: "voice" | "page" | "start" | null;
+    } | null;
   };
 
   async function startStandup(t: Awaited<ReturnType<typeof adopted>>) {
@@ -15054,5 +15065,137 @@ describe("the stand-up (BB-300)", () => {
   it("returns no record for a project that has never standupd", async () => {
     const t = await setup();
     expect(await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })).toEqual({ standup: null });
+  });
+
+  // BB-301: the agent reads the notes back, ends the stand-up on a spoken yes,
+  // and every early close still ends the record.
+  it("reads the notes back mechanically with the readback tool and writes nothing", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep the retry small", binding: "ENG-12" });
+    const before = JSON.stringify(t.hooks.store.latestStandup("p1")!.notes);
+    const out = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "readback", arguments: "{}" }, voice)) as string;
+    expect(out).toContain("Guidance for ENG-12: Keep the retry small");
+    expect(out).toMatch(/id note_/u);
+    expect(JSON.stringify(t.hooks.store.latestStandup("p1")!.notes)).toBe(before);
+  });
+
+  it("end_standup applies the confirmed typed notes, skips the rest and returns the last-reply flag", async () => {
+    const t = await withGate();
+    const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "approve-spec")!;
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "gate", text: "Looks good", binding: "ENG-12", action: "approve" });
+    await takeNote(t, started.sessionId, { type: "free", text: "Just a thought" });
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    const notes = (await record(t)).standup!.notes;
+    const [gate, free, guidance] = notes;
+
+    const result = (await t.harness.callRpc(
+      "stewardsStandupTool",
+      { sessionId: started.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: [gate!.id, free!.id, guidance!.id, "note_unknown"] }) },
+      voice,
+    )) as { output: string; last?: boolean };
+
+    expect(result.last).toBe(true);
+    expect(result.output).toMatch(/Applied 2 confirmed items/u);
+    expect(result.output).toMatch(/free note is context/u);
+    expect(result.output).toMatch(/not in this stand-up/u);
+    // The gate landed through the same need-action path the page uses.
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("Keep it small");
+    // Only the typed notes are confirmed; the free note is not applied.
+    const row = t.hooks.store.latestStandup("p1")!;
+    expect(row.confirmed).toEqual([gate!.id, guidance!.id]);
+    expect(row.endedAt).not.toBeNull();
+    await t.flush();
+    const wake = t.sends.slice(-5).find((s) => s.threadId === t.project);
+    expect(wake?.text).toContain("The owner held a stand-up.");
+  });
+
+  it("end_standup refuses a merge note in the blanket yes and reports it", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    // A merge note cannot be taken without a merge need, so write it straight
+    // into the record: the skip is what is under test.
+    t.hooks.store.saveStandup(started.standupId, {
+      notes: [{ id: "note_merge", type: "gate", text: "Ship it", binding: "ENG-12", escalation: null, action: "merge", need: null, needLabel: null, createdAt: t.now() }],
+    });
+    const result = (await t.harness.callRpc(
+      "stewardsStandupTool",
+      { sessionId: started.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: ["note_merge"] }) },
+      voice,
+    )) as { output: string; last?: boolean };
+    expect(result.last).toBe(true);
+    expect(result.output).toMatch(/merge stays for the page's Confirm button/u);
+    expect(result.output).toMatch(/Nothing was applied/u);
+    expect(t.hooks.store.latestStandup("p1")!.confirmed).toEqual([]);
+  });
+
+  it("end_standup skips an already-confirmed note and is idempotent", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId }, client);
+    const result = (await t.harness.callRpc(
+      "stewardsStandupTool",
+      { sessionId: started.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: [noteId] }) },
+      voice,
+    )) as { output: string };
+    expect(result.output).toMatch(/already confirmed/u);
+    expect(result.output).toMatch(/Nothing was applied/u);
+  });
+
+  it("the close handler ends the record and leaves unconfirmed notes unconfirmed", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    const closed = await t.harness.callRpc("stewardsStandupClose", { sessionId: started.sessionId }, voice);
+    expect(closed).toMatchObject({ ok: true });
+    const row = t.hooks.store.latestStandup("p1")!;
+    expect(row.endedAt).not.toBeNull();
+    expect(row.confirmed).toEqual([]);
+    expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(0);
+    // A second close finds no session and changes nothing.
+    expect(await t.harness.callRpc("stewardsStandupClose", { sessionId: started.sessionId }, voice)).toMatchObject({ ok: true });
+  });
+
+  it("the close handler is idempotent after end_standup", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: [noteId] }) }, voice);
+    const endedAt = t.hooks.store.latestStandup("p1")!.endedAt;
+    expect(endedAt).not.toBeNull();
+    const closed = await t.harness.callRpc("stewardsStandupClose", { sessionId: started.sessionId }, voice);
+    expect(closed).toMatchObject({ ok: true });
+    const row = t.hooks.store.latestStandup("p1")!;
+    expect(row.endedAt).toBe(endedAt);
+    expect(row.confirmed).toEqual([noteId]);
+  });
+
+  it("refuses a stand-up close from anyone but the voice plugin", async () => {
+    const t = await adopted();
+    await expect(t.harness.callRpc("stewardsStandupClose", { sessionId: "sess_1" }, client)).rejects.toThrow(/voice-transcription/u);
+  });
+
+  it("marks a voice-applied note and the voice end on the record, and a page one as the page's", async () => {
+    const t = await adopted();
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "guidance", text: "Keep it small", binding: "ENG-12" });
+    const noteId = (await record(t)).standup!.notes[0]!.id;
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId }, client);
+    const page = await record(t);
+    expect(page.standup!.notes[0]!.confirmedBy).toBe("page");
+    expect(page.standup!.endedBy).toBeNull();
+
+    const second = await startStandup(t);
+    await takeNote(t, second.sessionId, { type: "guidance", text: "Keep it small again", binding: "ENG-12" });
+    const secondNote = (await record(t)).standup!.notes[0]!.id;
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: second.sessionId, name: "end_standup", arguments: JSON.stringify({ ids: [secondNote] }) }, voice);
+    const voiceRecord = await record(t);
+    expect(voiceRecord.standup!.notes[0]!.confirmedBy).toBe("voice");
+    expect(voiceRecord.standup!.endedBy).toBe("voice");
   });
 });
