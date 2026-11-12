@@ -3,8 +3,10 @@
 // readers are injected, so the whole surface is unit-tested.
 import { describe, expect, it, vi } from "vitest";
 import {
+  STANDUP_CONTEXT_MAX_CHARS,
   STANDUP_MAX_INSTRUCTIONS_CHARS,
   STANDUP_NOTE_TYPES,
+  STANDUP_STALE_DAYS,
   STANDUP_TOOL_NAMES,
   STANDUP_TOOLS,
   STANDUP_WRITE_TOOLS,
@@ -19,7 +21,7 @@ import {
 import type { Briefing } from "./nightly.js";
 import type { Binding, Escalation, Lesson } from "./store.js";
 import type { GuidanceUnit } from "./guidance.js";
-import { issue } from "./fixtures.js";
+import { comment, issue } from "./fixtures.js";
 
 const binding = (over: Partial<Binding> = {}): Binding =>
   ({
@@ -38,6 +40,7 @@ const binding = (over: Partial<Binding> = {}): Binding =>
     hold: null,
     holdBehind: [],
     lastSnapshot: { entity: issue(), pulls: [] },
+    createdAt: 1,
     ...over,
   }) as unknown as Binding;
 
@@ -140,6 +143,25 @@ describe("runStandupTool (BB-300)", () => {
     expect(out).toContain("Todo");
   });
 
+  it("shows the last comments, linked pull requests and children from the snapshot (BB-306)", async () => {
+    const ctx = context({
+      snapshot: async () =>
+        issue({
+          comments: [
+            comment({ id: "c1", author: "Sam", did: "commented", body: "Can we also cover SSO?", createdAt: "2026-10-02T00:00:00Z" }),
+            comment({ id: "c2", author: "Jane", did: "approved", body: "Looks good to me.", createdAt: "2026-10-03T00:00:00Z" }),
+          ],
+          linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }],
+          children: [{ id: "acme/web#13", key: "acme/web#13", title: "Sub-task", state: "open", stateType: null, labels: [] }],
+        }),
+    });
+    const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
+    expect(out).toContain("2026-10-02T00:00:00Z Sam commented: Can we also cover SSO?");
+    expect(out).toContain("2026-10-03T00:00:00Z Jane approved: Looks good to me.");
+    expect(out).toContain("Linked pull requests: acme/web#7");
+    expect(out).toContain("Children: acme/web#13 Sub-task (open)");
+  });
+
   it("reads the lessons behind a decision", async () => {
     const out = await runStandupTool("decision_rationale", { key: "ENG-12" }, context());
     expect(out).toContain("Prefer the smaller change.");
@@ -239,7 +261,7 @@ const briefing = (over: Partial<Briefing> = {}): Briefing => ({
   since: 500,
   previous: null,
   notes: [],
-  decisions: { needs: [{ need: { what: "Approve the spec", kind: "approve-spec" } as never, binding: binding({ entityKey: "ENG-12" }) }], withUser: [] },
+  decisions: { needs: [{ need: { what: "Approve the spec", kind: "approve-spec", createdAt: 1 } as never, binding: binding({ entityKey: "ENG-12" }) }], withUser: [] },
   escalations: [{ escalation: escalation({ question: "A project question" }), from: binding({ entityKey: "ENG-13" }) }],
   stuck: { stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked on CI" }), from: binding({ entityKey: "ENG-14" }) }], held: [binding({ entityKey: "ENG-15", hold: "behind ENG-16", holdBehind: ["ENG-16"] })], noWakeSource: [], stall: [], datedWaits: [] },
   done: { moved: [binding({ entityKey: "ENG-17" })], ended: [binding({ entityKey: "ENG-18", endReason: "merged" })], answered: [] },
@@ -313,6 +335,54 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(text).toContain("## Escalations with the project steward");
     expect(text).toContain("## Stuck or held");
     expect(text).toContain("Approve the spec");
+  });
+
+  it("dates an open question, marks it stale past the threshold and clips its context (BB-306)", () => {
+    const createdAt = Date.parse("2026-11-02T00:00:00Z");
+    const now = createdAt + (STANDUP_STALE_DAYS + 7) * 86_400_000; // 10 days later
+    const longContext = "x".repeat(STANDUP_CONTEXT_MAX_CHARS + 50);
+    const text = buildStandupInstructions(briefing(), "Acme", now, [{ key: "ENG-12", question: "Are the builds still stalling?", choices: ["Yes", "No"], createdAt, context: longContext }]);
+    expect(text).toContain("Are the builds still stalling?");
+    expect(text).toContain("open since 2026-11-02T00:00:00.000Z");
+    expect(text).toContain("open 10 days; a claim this old may be out of date — verify before repeating it");
+    // The context is rendered under its line, indented and clipped to the constant.
+    expect(text).toContain(`  ${"x".repeat(STANDUP_CONTEXT_MAX_CHARS - 1)}…`);
+    expect(text).not.toContain("x".repeat(STANDUP_CONTEXT_MAX_CHARS + 1));
+  });
+
+  it("says no digest yet, and the last digest date once there is one (BB-306)", () => {
+    expect(buildStandupInstructions(briefing(), "Acme", 10_000)).toContain("has not filed a digest yet");
+    const at = Date.parse("2026-11-10T00:00:00Z");
+    const text = buildStandupInstructions(briefing({ previous: { text: "A digest body", at } }), "Acme", 10_000);
+    expect(text).toContain("The project steward's last digest was 2026-11-10T00:00:00.000Z.");
+    // The digest text itself is not injected, only its date.
+    expect(text).not.toContain("A digest body");
+  });
+
+  it("stays under the instruction cap with the added age lines and still omits sections to fit (BB-306)", () => {
+    const createdAt = Date.parse("2026-11-02T00:00:00Z");
+    const now = createdAt + (STANDUP_STALE_DAYS + 7) * 86_400_000; // 10 days later
+    const long = (label: string, i: number): string => `${label}-${i}: ${"x".repeat(180)}`;
+    const needs = Array.from({ length: 35 }, (_, i) => ({ need: { what: long("need", i), kind: "approve-spec", createdAt } as never, binding: binding({ entityKey: `ENG-${i}`, createdAt }) }));
+    const escalations = Array.from({ length: 35 }, (_, i) => ({ escalation: escalation({ question: long("esc", i), createdAt }), from: binding({ entityKey: `ENG-${i}`, createdAt }) }));
+    const stuck = Array.from({ length: 35 }, (_, i) => ({ escalation: escalation({ kind: "stuck", question: long("stuck", i), createdAt }), from: binding({ entityKey: `ENG-${i}`, createdAt }) }));
+    const moved = Array.from({ length: 35 }, (_, i) => binding({ entityKey: `ENG-${i}`, createdAt, status: { summary: long("moved", i) } as never }));
+    const assumptions = Array.from({ length: 35 }, (_, i) => ({ assumption: { text: long("assume", i) } as never, binding: binding({ entityKey: `ENG-${i}`, createdAt }) }));
+    const text = buildStandupInstructions(
+      briefing({
+        decisions: { needs, withUser: [] },
+        escalations,
+        stuck: { stuck, held: [], noWakeSource: [], stall: [], datedWaits: [] },
+        done: { moved, ended: [], answered: [] },
+        assumptions,
+      }),
+      "Acme",
+      now,
+    );
+    expect(text.length).toBeLessThanOrEqual(STANDUP_MAX_INSTRUCTIONS_CHARS);
+    expect(text).toContain("(omitted to fit the briefing limit)");
+    // A stale age renders on the lines that survive.
+    expect(text).toContain("open 10 days; a claim this old may be out of date");
   });
 
   it("keeps a huge briefing under the voice plugin's instruction cap, ranked", () => {

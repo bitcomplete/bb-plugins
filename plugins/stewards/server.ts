@@ -9323,7 +9323,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const questions = store
             .openQuestions(targetProjectId)
             .filter((q) => scoped === null || q.bindingId === scoped.id)
-            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices }));
+            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
           const scopeKey = scoped?.entityKey ?? null;
           // The briefing goes to OpenAI, so a token pasted into a ticket, an
           // escalation or a note is scrubbed first.
