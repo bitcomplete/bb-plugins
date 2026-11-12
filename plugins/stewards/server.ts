@@ -1884,15 +1884,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function followUpBriefLines(standup: StandupRow, key: string): Promise<string[]> {
       try {
         const projectId = standup.projectId;
-        const scoped = store.find(key, projectId);
+        // The brief that was spoken is the one the stand-up opened with: the
+        // project-wide tiered brief, or the scoped builder for a BB-303
+        // stand-up. The note's key only picks which of its lines to carry.
+        const scope = standup.binding === null ? null : store.find(standup.binding, projectId);
         const since = store.lastStandup(projectId) ?? store.project(projectId).digestAt ?? 0;
-        const brief = briefing(projectId, since, scoped?.id);
+        const brief = briefing(projectId, since, scope?.id);
         const config = await loadConfig(projectId);
         const all = store.all(projectId);
-        const questions = store.openQuestions(projectId).map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
+        const questions = store
+          .openQuestions(projectId)
+          .filter((q) => scope === null || q.bindingId === scope.id)
+          .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
         const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
         let text: string;
-        if (scoped === null) {
+        if (scope === null) {
           // No entity reads here: the `lookup` above already carried the key's
           // facts, and the brief lines only need to name the key.
           const closedLimit = config?.file.standup.closedLimit ?? 10;
@@ -1900,13 +1906,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const lastCompletedAt = store.lastCompletedStandup(projectId);
           text = buildStandupBrief(brief, all, new Map(), name, now(), questions, { closedLimit, closedDays, lastCompletedAt });
         } else {
-          text = buildStandupInstructions(brief, name, now(), questions, scoped.entityKey);
+          text = buildStandupInstructions(brief, name, now(), questions, scope.entityKey);
         }
         // Match the key as a whole token, so a follow-up about ENG-1 does not
         // pick up the brief lines for ENG-12 or ENG-100.
         const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
         const pattern = new RegExp(`(?<![\\w-])${escaped}(?!\\d)`, "u");
-        return text.split("\n").filter((line) => pattern.test(line));
+        // The brief lines carry other people's text, so they are scrubbed like
+        // the lookup rendering before they go into the follow-up opener.
+        return text
+          .split("\n")
+          .filter((line) => pattern.test(line))
+          .map((line) => scrubCredentials(line));
       } catch (error) {
         bb.log.warn(`stewards: follow-up brief lines for ${key} failed: ${errorMessage(error)}`);
         return [];

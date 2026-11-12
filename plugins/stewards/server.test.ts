@@ -15442,6 +15442,23 @@ describe("the stand-up (BB-300)", () => {
     expect(read.standup!.notes[0]!.thread).toBeDefined();
   });
 
+  it("scrubs a credential from the brief lines a follow-up opener carries (BB-313)", async () => {
+    const t = await adopted();
+    // A project note that names the binding lands in the brief's open-tier line
+    // and in the follow-up opener's brief lines, but not in the `lookup`
+    // rendering, so this isolates the brief-lines scrub.
+    t.hooks.store.noteProject("p1", "ENG-12: the deploy uses token: abc123");
+    const started = await startStandup(t);
+    await takeNote(t, started.sessionId, { type: "follow-up", text: "Look into it", binding: "ENG-12" });
+    const note = (await record(t)).standup!.notes[0]!;
+    await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: note.id }, client);
+    const spawned = t.spawns.find((s) => (s.pluginMetadata as Record<string, unknown> | undefined)?.role === "follow-up")!;
+    const prompt = String(spawned.prompt);
+    expect(prompt).toContain("Brief lines that named ENG-12:");
+    expect(prompt).toContain("token: [redacted]");
+    expect(prompt).not.toContain("abc123");
+  });
+
   it("confirming a follow-up note twice opens one thread (BB-313)", async () => {
     const t = await adopted();
     const started = await startStandup(t);
