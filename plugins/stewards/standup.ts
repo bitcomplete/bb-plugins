@@ -1019,6 +1019,13 @@ function closedStewardItem(binding: Binding, facts: StandupEntityFacts | null): 
  * the line, not a separate section) and "Recently closed". The tail gives way
  * first: closed before open before agenda. The scoped stand-up (BB-303) keeps
  * `buildStandupInstructions`; this is the project-wide brief.
+ *
+ * BB-315: a quiet ops monitor (`kind === "ops"` and `source === "ops"`, no flag
+ * from `openFlags`) is left out of the open tier and only named with its key in
+ * the header, so a never-ending watch whose last look found nothing is not read
+ * out at every stand-up. A flagged monitor stays listed, and an ops binding with
+ * an open need, a user-routed escalation or an open question still lands in
+ * "Needs your input" through the agenda path.
  */
 export function buildStandupBrief(
   briefing: Briefing,
@@ -1050,7 +1057,14 @@ export function buildStandupBrief(
     agendaLines.push(agendaQuestionItem(q, binding, binding === null ? null : factsFor(binding), briefing.notes, now));
   }
   const open = bindings.filter((b) => b.endedAt === null);
-  const openLines = open.filter((b) => !agendaBindingIds.has(b.id)).map((b) => openStewardItem(b, briefing, now));
+  // BB-315: an ops monitor that carries no flag is quiet, so it is left out of
+  // the open tier and only counted in the header. A flagged monitor is a broken
+  // monitor and stays listed; an ops binding on the agenda is already handled
+  // above and is not an omission.
+  const isQuietOpsMonitor = (b: Binding): boolean => b.kind === "ops" && b.source === "ops" && openFlags(b, briefing, now).length === 0;
+  const notOnAgenda = open.filter((b) => !agendaBindingIds.has(b.id));
+  const quietMonitors = notOnAgenda.filter(isQuietOpsMonitor);
+  const openLines = notOnAgenda.filter((b) => !isQuietOpsMonitor(b)).map((b) => openStewardItem(b, briefing, now));
   // The clamp: the later of the 3-day (or configured) window and the last
   // completed stand-up. A completed stand-up resets the window; an interrupted
   // one does not move it.
@@ -1068,6 +1082,9 @@ export function buildStandupBrief(
     "",
     "Greet the owner briefly and begin immediately; do not wait for them to speak first.",
     "Lead with the agenda, \"Needs your input\": those are the things only the owner can unblock. Then the other open stewards, then what closed recently.",
+    ...(quietMonitors.length === 0
+      ? []
+      : [`${quietMonitors.length} monitor${quietMonitors.length === 1 ? "" : "s"} ${quietMonitors.length === 1 ? "is" : "are"} quiet and not listed (${quietMonitors.map((b) => b.entityKey).join(", ")}).`]),
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
     "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, a standing rule, or a follow-up) and read it back in their words. A remark that is not a decision is a free note.",
     "When the owner wants something looked into that the brief and lookup cannot settle, or wants to think about it later, take a follow-up note; it becomes a visible thread they can open after the stand-up.",

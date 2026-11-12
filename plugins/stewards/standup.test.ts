@@ -698,6 +698,53 @@ describe("buildStandupBrief (BB-312)", () => {
   });
 });
 
+describe("quiet ops monitors in the stand-up brief (BB-315)", () => {
+  const opsBinding = (over: Partial<Binding> = {}): Binding => binding({ kind: "ops", source: "ops", phase: "watching", ...over });
+  const section = (text: string, heading: string): string => {
+    const start = text.indexOf(`## ${heading}`);
+    const end = text.indexOf("\n## ", start + 1);
+    return text.slice(start, end === -1 ? undefined : end);
+  };
+
+  it("leaves a quiet ops monitor out of the open tier and names the omitted count in the header", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-1", title: "Agenda" });
+    const quiet = opsBinding({ id: "b-quiet", entityKey: "sentry-project/acme/web", title: "Sentry watch" });
+    const text = buildStandupBrief(tierBriefing(agenda), [agenda, quiet], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(section(text, "Other open stewards")).not.toContain(quiet.entityKey);
+    // The header names the count and the keys of the omitted quiet monitors, so the voice can mention them.
+    expect(text).toContain("1 monitor is quiet and not listed (sentry-project/acme/web).");
+  });
+
+  it("keeps a stuck ops monitor in the open tier", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-1" });
+    const stuck = opsBinding({ id: "b-stuck", entityKey: "sentry-project/acme/web", title: "Stuck watch" });
+    const brief = tierBriefing(agenda, {
+      stuck: { stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked" }), from: stuck }], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+    });
+    const text = buildStandupBrief(brief, [agenda, stuck], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(section(text, "Other open stewards")).toContain(stuck.entityKey);
+    expect(section(text, "Other open stewards")).toContain("stuck");
+    // A flagged monitor is not an omission, so no count is named.
+    expect(text).not.toContain("quiet and not listed");
+  });
+
+  it("keeps an ops binding with a need in Needs your input", () => {
+    const withNeed = opsBinding({ id: "b-need", entityKey: "k8s-namespace/prod", title: "Prod watch" });
+    const text = buildStandupBrief(tierBriefing(withNeed), [withNeed], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(section(text, "Needs your input")).toContain(withNeed.entityKey);
+    expect(section(text, "Needs your input")).toContain("Approve the spec");
+    // It is on the agenda, not omitted as quiet.
+    expect(text).not.toContain("quiet and not listed");
+  });
+
+  it("counts several quiet monitors in the plural", () => {
+    const agenda = binding({ id: "b-agenda", entityKey: "ENG-1" });
+    const quiet = ["a", "b", "c"].map((n) => opsBinding({ id: `b-${n}`, entityKey: `dependabot/acme/${n}`, title: `Watch ${n}` }));
+    const text = buildStandupBrief(tierBriefing(agenda), [agenda, ...quiet], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(text).toContain("3 monitors are quiet and not listed (dependabot/acme/a, dependabot/acme/b, dependabot/acme/c).");
+  });
+});
+
 describe("the entity read tools (BB-312)", () => {
   it("renders a stewardless key through the entity reader", async () => {
     const ctx = context({ binding: () => null, entity: async (key) => ({ entity: issue({ key, title: "Stewardless" }), pulls: [] }) });
