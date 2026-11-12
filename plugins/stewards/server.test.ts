@@ -14894,6 +14894,20 @@ describe("the stand-up (BB-300)", () => {
     expect(fresh.hooks.store.lastStandup("p1")).toBeNull();
   });
 
+  it("refuses a scoped start while a connected stand-up is live and keeps it open", async () => {
+    const t = await adopted();
+    const live = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { standupId: string; sessionId: string };
+    // The first tool call marks the overlay connected, so it is live.
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: live.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    const refused = await t.harness.callRpc("stewardsStandupStart", { projectId: "p1", binding: "ENG-12" }, client);
+    expect(refused).toMatchObject({ ok: false, sessionId: null });
+    expect((refused as { message: string }).message).toMatch(/already starting/u);
+    // The live record stays open and its session still answers tool calls.
+    expect(t.hooks.store.standup(live.standupId)!.endedAt).toBeNull();
+    await t.harness.callRpc("stewardsStandupTool", { sessionId: live.sessionId, name: "steward_status", arguments: JSON.stringify({ key: "ENG-12" }) }, voice);
+    expect(t.realtimeOpens).toHaveLength(1);
+  });
+
   it("reports a steward's thread and starts the same scoped stand-up from the thread id alone", async () => {
     const t = await adopted();
     const stewardThread = t.hooks.store.find("ENG-12")!.threadId!;

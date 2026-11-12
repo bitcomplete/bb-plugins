@@ -9336,10 +9336,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // reach the project steward and the window still advances. The open
           // record is found in the store, not the in-memory session map, so it
           // survives a server restart that empties the map. One stand-up at a
-          // time per project, scoped or not.
-          for (const [sid, hid] of standupSessions) if (store.standup(hid)?.projectId === targetProjectId) standupSessions.delete(sid);
+          // time per project: a scoped start while a connected stand-up's
+          // session is still open is refused with the existing message rather
+          // than ending the owner's stand-up, which may be open in another tab.
+          // A project start keeps superseding, as it did before, and a scoped
+          // start supersedes a record whose overlay never connected (a restart,
+          // a closed tab).
           const open = store.latestStandup(targetProjectId);
-          if (open !== null && open.endedAt === null) await finishStandup(open, "start");
+          if (open !== null && open.endedAt === null) {
+            const live = open.connected && [...standupSessions.values()].some((hid) => hid === open.id);
+            if (scoped !== null && live) return { ok: false, sessionId: null, standupId: null, message: "A stand-up for this project is already starting." };
+            await finishStandup(open, "start");
+          }
+          // Drop this project's stale sessions (a superseded record, a closed
+          // overlay, a server restart) so a late tool call cannot find them.
+          for (const [sid, hid] of standupSessions) {
+            const row = store.standup(hid);
+            if (row === null || row.projectId === targetProjectId) standupSessions.delete(sid);
+          }
           // The record is opened before the voice session, so a tool call that
           // arrives immediately finds it.
           const record = store.createStandup({ id: newId("sup"), projectId: targetProjectId, startedAt: now(), binding: scopeKey });

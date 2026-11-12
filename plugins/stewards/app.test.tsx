@@ -1700,12 +1700,17 @@ describe("the Stand-up button (BB-300)", () => {
     const registration = captured.threadActions.find((a) => a.id === "standup")!;
     expect(registration).toMatchObject({ title: "Stand-up", group: "2_organize" });
     const thread = { id: "thr_steward", projectId: "p1", parentThreadId: null, archivedAt: null, pinnedAt: null, sectionId: null, isUnread: false, status: "idle", environment: null } as never;
-    const start = async () => ({ ok: true, message: "" });
-    const data = { threads: new Map([["thr_steward", { projectId: "p1", binding: "ENG-12", available: true }]]), start };
-    expect(registration.item({ thread, data, sdk: {} as never, navigate: {} as never })).toMatchObject({ label: "Stand-up", detail: "About ENG-12 only" });
+    const start = () => {};
+    const starts = new Map();
+    const base = { threads: new Map([["thr_steward", { projectId: "p1", binding: "ENG-12", available: true }]]), starts, start };
+    expect(registration.item({ thread, data: base, sdk: {} as never, navigate: {} as never })).toMatchObject({ label: "Stand-up", detail: "About ENG-12 only" });
+    // While the start is in flight the label says so and the action is disabled.
+    expect(registration.item({ thread, data: { ...base, starts: new Map([["thr_steward", { status: "starting" }]]) }, sdk: {} as never, navigate: {} as never })).toMatchObject({ label: "Starting…", disabled: true });
+    // A refusal is the action's detail, so the menu and a pinned button show it.
+    expect(registration.item({ thread, data: { ...base, starts: new Map([["thr_steward", { status: "error", message: "A stand-up for this project is already starting." }]]) }, sdk: {} as never, navigate: {} as never })).toMatchObject({ label: "Stand-up", detail: "A stand-up for this project is already starting." });
     // Not a steward's thread, or no stand-up available, offers nothing.
-    expect(registration.item({ thread, data: { threads: new Map(), start }, sdk: {} as never, navigate: {} as never })).toBeNull();
-    expect(registration.item({ thread, data: { threads: new Map([["thr_steward", { projectId: "p1", binding: "ENG-12", available: false }]]), start }, sdk: {} as never, navigate: {} as never })).toBeNull();
+    expect(registration.item({ thread, data: { threads: new Map(), starts, start }, sdk: {} as never, navigate: {} as never })).toBeNull();
+    expect(registration.item({ thread, data: { threads: new Map([["thr_steward", { projectId: "p1", binding: "ENG-12", available: false }]]), starts, start }, sdk: {} as never, navigate: {} as never })).toBeNull();
   });
 
   it("titles a scoped stand-up readback with its binding (BB-303)", async () => {

@@ -835,15 +835,19 @@ function StandupButton({ projectId, binding = null, onStarted, waiting = 0, erro
  * the project from the thread, never from anything the client sends.
  */
 type StandupThreadInfo = { projectId: string; binding: string; available: boolean };
+/** What one thread's start is doing, so `item` can show it in the host's menu. */
+type StandupStartState = { status: "idle" } | { status: "starting" } | { status: "error"; message: string };
 type StandupActionData = {
   threads: ReadonlyMap<string, StandupThreadInfo>;
-  start: (threadId: string) => Promise<{ ok: boolean; message: string }>;
+  starts: ReadonlyMap<string, StandupStartState>;
+  start: (threadId: string) => void;
 };
 
 function useStandupActionData({ threadIds }: PluginThreadActionDataInput): StandupActionData {
   const rpc = useRpc<typeof rpcContract>();
   const ids = useMemo(() => [...threadIds], [threadIds.join("\n")]);
   const [threads, setThreads] = useState<ReadonlyMap<string, StandupThreadInfo>>(new Map());
+  const [starts, setStarts] = useState<ReadonlyMap<string, StandupStartState>>(new Map());
   useEffect(() => {
     if (ids.length === 0) {
       setThreads(new Map());
@@ -862,34 +866,44 @@ function useStandupActionData({ threadIds }: PluginThreadActionDataInput): Stand
       live = false;
     };
   }, [rpc, ids]);
+  const setStart = useCallback((threadId: string, state: StandupStartState) => {
+    setStarts((prev) => new Map(prev).set(threadId, state));
+  }, []);
   const start = useCallback(
-    async (threadId: string) => {
-      const result = await rpc.call("stewardsStandupStart", { threadId, client: voiceClientId() });
-      return { ok: result.ok, message: result.message };
+    (threadId: string) => {
+      // The host's menus do not surface an error thrown from `run`, so the
+      // start's state lives here and `item` reads it: "Starting…" while it
+      // runs, and the server's refusal as the action's detail afterwards.
+      setStart(threadId, { status: "starting" });
+      rpc.call("stewardsStandupStart", { threadId, client: voiceClientId() }).then(
+        (result) => setStart(threadId, result.ok ? { status: "idle" } : { status: "error", message: result.message }),
+        (e: unknown) => setStart(threadId, { status: "error", message: message(e) }),
+      );
     },
-    [rpc],
+    [rpc, setStart],
   );
-  return useMemo(() => ({ threads, start }), [threads, start]);
+  return useMemo(() => ({ threads, starts, start }), [threads, starts, start]);
 }
 
 /**
  * The `Stand-up` action for one thread, or null when it is not an open
- * steward's thread or the project's stand-up is not available. Its `run`
- * starts the scoped stand-up and throws the server's refusal, so the host's
- * menu reports it; the plugin's own sidebar hover button renders the same call
- * with a visible "Starting…" and the refusal (BB-303).
+ * steward's thread or the project's stand-up is not available. The start's
+ * state rides in `useData`, so the host's menu and a pinned quick action show
+ * "Starting…" while it runs and the server's refusal afterwards, exactly like
+ * `StandupButton`.
  */
 function standupThreadAction(thread: PluginThreadActionTarget, data: StandupActionData): PluginThreadAction | null {
   const info = data.threads.get(thread.id);
   if (info === undefined || !info.available) return null;
+  const state = data.starts.get(thread.id);
+  if (state?.status === "starting") {
+    return { label: "Starting…", detail: `About ${info.binding} only`, icon: "Mic", disabled: true, run: () => {} };
+  }
   return {
     label: "Stand-up",
-    detail: `About ${info.binding} only`,
+    detail: state?.status === "error" ? state.message : `About ${info.binding} only`,
     icon: "Mic",
-    run: async () => {
-      const result = await data.start(thread.id);
-      if (!result.ok) throw new Error(result.message);
-    },
+    run: () => data.start(thread.id),
   };
 }
 
@@ -1403,7 +1417,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
         ) : (
           <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
             {orphans.map((item) => (
-              <NeedsYouOrphanCard key={needsYouItemKey(item)} entry={item} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} projectId={b.projectId} standupAvailable={b.standup?.available === true} />
+              <NeedsYouOrphanCard key={needsYouItemKey(item)} entry={item} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
             ))}
           </ul>
         )}
@@ -1663,7 +1677,7 @@ function LessonsList({ lessons, now, className = "rounded-lg border border-borde
  * A needs-you item with no open binding (a project-level question, or one whose
  * binding has ended): its own card at the top of Blocked (BB-78).
  */
-function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId, projectId, standupAvailable }: { entry: NeedsYouItem; now: number; onChanged: () => void; projectStewardThreadId: string | null; projectId: string; standupAvailable: boolean }) {
+function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId }: { entry: NeedsYouItem; now: number; onChanged: () => void; projectStewardThreadId: string | null }) {
   const key = needsYouKey(entry);
   const url = entry.type === "question" ? entry.question.url : entry.type === "withUser" ? entry.withUser.url : (entry.need.entityUrl ?? entry.need.url);
   return (
@@ -1671,10 +1685,6 @@ function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId, pro
       {key !== null ? <EntityLink entityKey={key} url={url} /> : null}
       <NeedsYouPrompt entry={entry} now={now} />
       <NeedsYouControls entry={entry} onChanged={onChanged} projectStewardThreadId={projectStewardThreadId} />
-      {/* BB-303: a scoped stand-up for the binding this item names; the server
-          refuses a binding that has ended, so the action is still offered here
-          and reports the refusal rather than starting one. */}
-      {key !== null && standupAvailable ? <StandupButton projectId={projectId} binding={key} /> : null}
     </li>
   );
 }
