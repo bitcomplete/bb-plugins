@@ -1326,7 +1326,9 @@ describe("the stand-up completion marker (BB-312)", () => {
     expect(s.lastCompletedStandup("p1")).toBe(100);
     s.saveStandup(second.id, { completed: true });
     expect(s.lastCompletedStandup("p1")).toBe(200);
-    // A scoped stand-up's completion is recorded but the marker is project-wide.
-    expect(s.standup(second.id)?.completed).toBe(true);
+    // A scoped stand-up (BB-303) completes but does not move the project clamp.
+    const scoped = s.createStandup({ id: "sup_3", projectId: "p1", startedAt: 300, binding: "ENG-12" });
+    s.saveStandup(scoped.id, { endedAt: 350, completed: true });
+    expect(s.lastCompletedStandup("p1")).toBe(200);
   });
 });

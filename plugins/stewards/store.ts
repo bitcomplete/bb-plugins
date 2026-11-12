@@ -1797,7 +1797,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const insertStandupStmt = lazy<[Record<string, unknown>], unknown>("INSERT INTO standups (id, project_id, started_at, ended_at, connected, transcript, notes, confirmed, binding, delegations, completed) VALUES (@id, @project_id, @started_at, @ended_at, @connected, @transcript, @notes, @confirmed, @binding, @delegations, @completed)");
   const getStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE id = ?");
   const latestStandupStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM standups WHERE project_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1");
-  const lastCompletedStandupStmt = lazy<[string], { started_at: number }>("SELECT started_at FROM standups WHERE project_id = ? AND completed = 1 ORDER BY started_at DESC, rowid DESC LIMIT 1");
+  // BB-312: a scoped stand-up (BB-303) is about one steward and, like the
+  // "since" cursor, must not reset the project's "Recently closed" window, so
+  // the marker counts project stand-ups only.
+  const lastCompletedStandupStmt = lazy<[string], { started_at: number }>("SELECT started_at FROM standups WHERE project_id = ? AND completed = 1 AND binding IS NULL ORDER BY started_at DESC, rowid DESC LIMIT 1");
   const updateStandupStmt = lazy<[Record<string, unknown>], unknown>("UPDATE standups SET ended_at = @ended_at, connected = @connected, transcript = @transcript, notes = @notes, confirmed = @confirmed, delegations = @delegations, completed = @completed WHERE id = @id");
   const divergencesAllStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessment_divergences ORDER BY last_seen_at DESC, surface");
   const divergencesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessment_divergences WHERE binding_id = ? ORDER BY last_seen_at DESC, surface");
@@ -3303,9 +3306,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return r === undefined ? null : toStandup(r);
     },
     /**
-     * BB-312: when the project last completed a stand-up (the voice
+     * BB-312: when the project last completed a project stand-up (the voice
      * `end_standup` or the page's end), or null when none has. An interrupted
-     * stand-up does not move this.
+     * stand-up does not move this, and a scoped stand-up (BB-303) never does.
      */
     lastCompletedStandup(projectId: string): number | null {
       const r = lastCompletedStandupStmt().get(projectId);

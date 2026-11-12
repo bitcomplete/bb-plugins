@@ -14835,8 +14835,12 @@ describe("the stand-up (BB-300)", () => {
 
   it("scrubs a pasted credential from a tool result before it reaches the model", async () => {
     const t = await adopted();
-    // A ticket body can carry a pasted token; it must not reach OpenAI.
+    // A ticket body can carry a pasted token; it must not reach OpenAI. The
+    // read goes through the entity cache, so the token is in the stored
+    // snapshot the cache serves.
     t.entities.set("uuid-12", issue({ description: "Please use token: abc123 in the call." }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
     const started = (await t.harness.callRpc("stewardsStandupStart", { projectId: "p1" }, client)) as { sessionId: string };
     const output = (await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "entity_snapshot", arguments: JSON.stringify({ key: "ENG-12" }) }, voice)) as string;
     expect(output).toContain("token: [redacted]");
@@ -15612,6 +15616,17 @@ describe("the stand-up (BB-300)", () => {
       await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name, arguments: JSON.stringify(args) }, voice);
     }
     expect(JSON.stringify(t.hooks.store.find("ENG-12"))).toBe(before);
+  });
+
+  it("does not read the open tier's entities at open, so a cold source cannot hold the greeting (BB-312)", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    // A stale stored snapshot and an empty cache: an open-tier read would hit the source.
+    t.hooks.store.patch(b.id, { lastSnapshot: { ...b.lastSnapshot!, at: 0 } });
+    t.hooks.entityCache.clear("p1");
+    t.rpcCalls.length = 0;
+    await startStandup(t);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceSnapshot" && c.input.id === "uuid-12")).toHaveLength(0);
   });
 
   it("scrubs a 'token: abc' comment from the brief and the read tools (BB-312)", async () => {

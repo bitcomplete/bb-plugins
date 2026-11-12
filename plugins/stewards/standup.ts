@@ -300,8 +300,6 @@ export type StandupToolContext = {
   lessons: (bindingId: string) => Lesson[];
   /** The hand-written guidance at `.bb` HEAD. */
   guidance: () => Promise<GuidanceUnit[]>;
-  /** The entity snapshot for a binding, read fresh when the source answers. */
-  snapshot: (binding: Binding) => Promise<EntitySnapshot | null>;
   /**
    * BB-312: the merged entity record for any key in the project, with or
    * without a steward, through the one cache path. Null when nothing has it.
@@ -478,21 +476,20 @@ async function entityTool(ctx: StandupToolContext, key: string): Promise<string>
   // not it names a steward; the brief and the tools read only this project.
   if (!ctx.inScope(key)) return `${key} is not in this project's teams or repos.`;
   const b = ctx.binding(key);
-  // BB-312: a key with no steward still answers, through the same entity path.
-  if (b === null) {
-    const record = await ctx.entity(key).catch(() => null);
-    if (record === null) return `No snapshot is available for ${key}.`;
-    return renderEntity(record.entity, null);
-  }
   // BB-309: a pull-request key resolves to the ticket binding that holds its
   // gate need. Render that pull's own snapshot from what the binding already
   // holds, never the ticket's snapshot or a "No steward" line. The binding's
   // own key is the entity even when it parses as a pull reference (a GitHub
   // issue key has the same shape).
-  const linked = key === b.entityKey ? null : pullFromKey(b, key);
-  const entity = linked ?? (await ctx.snapshot(b).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
-  if (entity === null) return `No snapshot is available for ${key}.`;
-  return renderEntity(entity, b);
+  if (b !== null) {
+    const linked = key === b.entityKey ? null : pullFromKey(b, key);
+    if (linked !== null) return renderEntity(linked, b);
+  }
+  // BB-312: every other key, stewarded or not, answers through the one entity
+  // cache path, so the tool is fast and the binding's snapshot is never written.
+  const record = await ctx.entity(key).catch(() => null);
+  if (record === null) return `No snapshot is available for ${key}.`;
+  return renderEntity(record.entity, b);
 }
 
 /** BB-312: search the project's own tickets through the source contract. */
@@ -501,8 +498,9 @@ async function searchTicketsTool(ctx: StandupToolContext, args: Record<string, u
   const rawLimit = args["limit"];
   const limit = typeof rawLimit === "number" && Number.isFinite(rawLimit) ? Math.max(1, Math.min(STANDUP_SEARCH_MAX, Math.floor(rawLimit))) : STANDUP_SEARCH_MAX;
   const results = await ctx.searchIssues(query, limit);
-  // BB-312: a result outside the project's units is dropped, never shown.
-  const scoped = results.filter((issue) => ctx.inScope(issue.key));
+  // BB-312: a result outside the project's units is dropped, never shown. Both
+  // sources may answer, so the caller's limit is applied once more here.
+  const scoped = results.filter((issue) => ctx.inScope(issue.key)).slice(0, limit);
   if (scoped.length === 0) return `No ticket in this project matches ${JSON.stringify(query)}.`;
   return scoped.map((issue) => `${issue.key}: ${issue.title ?? "(no title)"} — ${issue.state}${issue.assignee === null ? "" : `, assigned to ${issue.assignee}`}`).join("\n");
 }
@@ -979,21 +977,25 @@ function openFlags(binding: Binding, briefing: Briefing, now: number): string[] 
   return flags;
 }
 
-/** One comprehensive agenda item for a need, clipped to its per-item budget. */
-function agendaNeedItem(need: Need, binding: Binding, facts: StandupEntityFacts | null, now: number): string {
-  const head = `${binding.entityKey}: ${binding.title ?? "(no title)"} — ${binding.kind}${binding.phase === null ? "" : `, phase ${binding.phase}`}`;
-  const lines = [`Needs you: ${need.what} (${need.kind})`];
-  if (need.how !== null && need.how.trim() !== "") lines.push(`How: ${clipText(need.how, STANDUP_CONTEXT_MAX_CHARS)}`);
-  const pull = factsPull(facts, need.url);
-  if (pull !== null) {
-    lines.push(`PR "${pull.title ?? "(no title)"}" (${pull.state ?? "unknown"})`);
-    const marker = latestReviewMarker(pull.comments);
-    if (marker !== null) lines.push(`Review: ${marker.verdict}${marker.lane === null ? "" : `, lane ${marker.lane}`}${marker.approver === undefined ? "" : `, approver ${marker.approver}`}`);
-    if (pull.pull !== null && pull.pull.checks !== null) lines.push(`Checks: ${pull.pull.checks.state}`);
+/** The pull facts a line carries: title, state, the last review verdict and the checks. */
+function pullFactsLines(pull: EntitySnapshot | null): string[] {
+  if (pull === null) return [];
+  const lines = [`PR "${pull.title ?? "(no title)"}" (${pull.state ?? "unknown"})`];
+  const marker = latestReviewMarker(pull.comments);
+  if (marker !== null) lines.push(`Review: ${marker.verdict}${marker.lane === null ? "" : `, lane ${marker.lane}`}${marker.approver === undefined ? "" : `, approver ${marker.approver}`}`);
+  if (pull.pull !== null && pull.pull.checks !== null) lines.push(`Checks: ${pull.pull.checks.state}`);
+  return lines;
+}
+
+/** The binding's own context lines: description, status, deployment, guidance and comments. */
+function agendaBindingLines(binding: Binding, facts: StandupEntityFacts | null): string[] {
+  const lines: string[] = [];
+  if (facts !== null && facts.entity.description !== null && facts.entity.description.trim() !== "") {
+    lines.push(`Description: ${clipText(facts.entity.description, STANDUP_CONTEXT_MAX_CHARS)}`);
   }
   if (binding.status !== null) {
     if (binding.status.summary.trim() !== "") lines.push(`Steward summary: ${clipText(binding.status.summary, STANDUP_CONTEXT_MAX_CHARS)}`);
-    if (binding.status.waitingOn !== null && binding.status.waitingOn.trim() !== "") lines.push(`Waiting on: ${clipText(binding.status.waitingOn, STANDUP_CONTEXT_MAX_CHARS)}`);
+    if (binding.status.waitingOn !== null && binding.status.waitingOn !== undefined && binding.status.waitingOn.trim() !== "") lines.push(`Waiting on: ${clipText(binding.status.waitingOn, STANDUP_CONTEXT_MAX_CHARS)}`);
   }
   const deploy = deployStateText(binding);
   if (deploy !== null) lines.push(deploy);
@@ -1001,30 +1003,60 @@ function agendaNeedItem(need: Need, binding: Binding, facts: StandupEntityFacts 
   if (facts !== null && facts.entity.comments.length > 0) {
     lines.push(`Comments: ${facts.entity.comments.slice(-3).map((c) => `${c.author}: ${clipText(c.body, 160)}`).join(" | ")}`);
   }
+  return lines;
+}
+
+/** A queued project note that names this binding, as a flag, or null. */
+function noteFlag(binding: Binding, notes: readonly string[]): string | null {
+  const note = notes.find((n) => n.includes(binding.entityKey));
+  return note === undefined ? null : `project note: ${clipText(note, 160)}`;
+}
+
+/** One comprehensive agenda item for a need, clipped to its per-item budget. */
+function agendaNeedItem(need: Need, binding: Binding, facts: StandupEntityFacts | null, notes: readonly string[], now: number): string {
+  const head = `${binding.entityKey}: ${binding.title ?? "(no title)"} — ${binding.kind}${binding.phase === null ? "" : `, phase ${binding.phase}`}`;
+  const lines = [`Needs you: ${need.what} (${need.kind})`];
+  if (need.how !== null && need.how.trim() !== "") lines.push(`How: ${clipText(need.how, STANDUP_CONTEXT_MAX_CHARS)}`);
+  lines.push(...pullFactsLines(factsPull(facts, need.url)));
+  lines.push(...agendaBindingLines(binding, facts));
+  const note = noteFlag(binding, notes);
+  if (note !== null) lines.push(note);
   const age = openSince(now, need.createdAt);
   if (age !== null) lines.push(age);
   return clipBlock(`${head}\n  ${lines.join("\n  ")}`, STANDUP_AGENDA_ITEM_CHARS);
 }
 
 /** One comprehensive agenda item for a user-routed escalation. */
-function agendaEscalationItem(escalation: Escalation, from: Binding, now: number): string {
+function agendaEscalationItem(escalation: Escalation, from: Binding, facts: StandupEntityFacts | null, notes: readonly string[], now: number): string {
   const head = `${from.entityKey}: ${from.title ?? "(no title)"} — ${from.kind}${from.phase === null ? "" : `, phase ${from.phase}`}`;
   const lines = [`Needs you: ${escalation.question}`];
   if (escalation.context !== null && escalation.context.trim() !== "") lines.push(`Context: ${clipText(escalation.context, STANDUP_CONTEXT_MAX_CHARS)}`);
   if (escalation.choices.length > 0) lines.push(`Choices: ${escalation.choices.join(" / ")}`);
   if (escalation.meanwhile !== "") lines.push(`Meanwhile: ${escalation.meanwhile}`);
   if (escalation.recommendation !== null) lines.push(`Recommendation: ${escalation.recommendation}`);
+  // The binding's own context and its newest linked pull, so the item can be
+  // discussed without a tool call.
+  lines.push(...pullFactsLines(facts?.pulls[0] ?? null));
+  lines.push(...agendaBindingLines(from, facts));
+  const note = noteFlag(from, notes);
+  if (note !== null) lines.push(note);
   const age = openSince(now, escalation.createdAt);
   if (age !== null) lines.push(age);
   return clipBlock(`${head}\n  ${lines.join("\n  ")}`, STANDUP_AGENDA_ITEM_CHARS);
 }
 
 /** One comprehensive agenda item for an open question. */
-function agendaQuestionItem(q: StandupOpenQuestion, now: number): string {
+function agendaQuestionItem(q: StandupOpenQuestion, binding: Binding | null, facts: StandupEntityFacts | null, notes: readonly string[], now: number): string {
   const head = `${q.key ?? "the project"}: ${q.question}`;
   const lines: string[] = [];
   if (q.choices.length > 0) lines.push(`Choices: ${q.choices.join(" / ")}`);
   if (q.context !== null && q.context.trim() !== "") lines.push(`Context: ${clipText(q.context, STANDUP_CONTEXT_MAX_CHARS)}`);
+  if (binding !== null) {
+    lines.push(...pullFactsLines(facts?.pulls[0] ?? null));
+    lines.push(...agendaBindingLines(binding, facts));
+    const note = noteFlag(binding, notes);
+    if (note !== null) lines.push(note);
+  }
   const age = openSince(now, q.createdAt);
   if (age !== null) lines.push(age);
   return lines.length === 0 ? head : clipBlock(`${head}\n  ${lines.join("\n  ")}`, STANDUP_AGENDA_ITEM_CHARS);
@@ -1037,6 +1069,8 @@ function openStewardItem(binding: Binding, briefing: Briefing, now: number): str
   const summary = binding.status === null || binding.status.summary.trim() === "" ? "no status summary" : clipText(binding.status.summary, STANDUP_OPEN_ITEM_CHARS);
   const waiting = binding.status !== null && binding.status.waitingOn !== null && binding.status.waitingOn !== undefined && binding.status.waitingOn.trim() !== "" ? `; waiting on ${binding.status.waitingOn}` : "";
   const flags = openFlags(binding, briefing, now);
+  const note = noteFlag(binding, briefing.notes);
+  if (note !== null) flags.push(note);
   const second = `${summary}${waiting}${flags.length === 0 ? "" : `; ${flags.join(", ")}`}`;
   return clipBlock(`${head}\n  ${second}`, STANDUP_OPEN_ITEM_CHARS);
 }
@@ -1076,17 +1110,17 @@ export function buildStandupBrief(
   const agendaBindingIds = new Set<string>();
   for (const { need, binding } of briefing.decisions.needs) {
     agendaBindingIds.add(binding.id);
-    agendaLines.push(agendaNeedItem(need, binding, factsFor(binding), now));
+    agendaLines.push(agendaNeedItem(need, binding, factsFor(binding), briefing.notes, now));
   }
   for (const { escalation, from } of briefing.decisions.withUser) {
     agendaBindingIds.add(from.id);
-    agendaLines.push(agendaEscalationItem(escalation, from, now));
+    agendaLines.push(agendaEscalationItem(escalation, from, factsFor(from), briefing.notes, now));
   }
   const byKey = new Map(bindings.map((b) => [b.entityKey, b] as const));
   for (const q of questions) {
     const binding = q.key === null ? null : (byKey.get(q.key) ?? null);
     if (binding !== null) agendaBindingIds.add(binding.id);
-    agendaLines.push(agendaQuestionItem(q, now));
+    agendaLines.push(agendaQuestionItem(q, binding, binding === null ? null : factsFor(binding), briefing.notes, now));
   }
   const open = bindings.filter((b) => b.endedAt === null);
   const openLines = open.filter((b) => !agendaBindingIds.has(b.id)).map((b) => openStewardItem(b, briefing, now));

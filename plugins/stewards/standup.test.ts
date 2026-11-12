@@ -95,7 +95,6 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
     escalation: (id) => (id === "esc_1" ? escalation() : null),
     lessons: () => [lesson()],
     guidance: async () => [unit()],
-    snapshot: async () => issue(),
     entity: async (key) => ({ entity: issue({ key }), pulls: [] }),
     inScope: () => true,
     searchIssues: async () => [],
@@ -156,8 +155,9 @@ describe("runStandupTool (BB-300)", () => {
 
   it("shows the last comments, linked pull requests and children from the snapshot (BB-306)", async () => {
     const ctx = context({
-      snapshot: async () =>
-        issue({
+      entity: async (key) => ({
+        entity: issue({
+          key,
           comments: [
             comment({ id: "c1", author: "Sam", did: "commented", body: "Can we also cover SSO?", createdAt: "2026-10-02T00:00:00Z" }),
             comment({ id: "c2", author: "Jane", did: "approved", body: "Looks good to me.", createdAt: "2026-10-03T00:00:00Z" }),
@@ -165,6 +165,8 @@ describe("runStandupTool (BB-300)", () => {
           linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }],
           children: [{ id: "acme/web#13", key: "acme/web#13", title: "Sub-task", state: "open", stateType: null, labels: [] }],
         }),
+        pulls: [],
+      }),
     });
     const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
     expect(out).toContain("2026-10-02T00:00:00Z Sam commented: Can we also cover SSO?");
@@ -186,7 +188,7 @@ describe("runStandupTool (BB-300)", () => {
     });
     const ticketEntity = issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] });
     const b = binding({ lastSnapshot: { entity: ticketEntity, pulls: [linked] } });
-    const ctx = context({ snapshot: async () => ticketEntity, binding: (key) => (key === "ENG-12" || key === "acme/web#7" || key === "https://github.com/acme/web/pull/7" ? b : null) });
+    const ctx = context({ entity: async () => ({ entity: ticketEntity, pulls: [linked] }), binding: (key) => (key === "ENG-12" || key === "acme/web#7" || key === "https://github.com/acme/web/pull/7" ? b : null) });
     // The ticket lists the linked pull with the title and state the binding holds.
     const ticket = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
     expect(ticket).toContain("Linked pull requests: acme/web#7 Add login retry (open)");
@@ -219,7 +221,7 @@ describe("runStandupTool (BB-300)", () => {
     const long = "z".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50);
     const entity = issue({ description: long });
     const b = binding({ lastSnapshot: { entity, pulls: [] } });
-    const ctx = context({ snapshot: async () => entity, binding: (key) => (key === "ENG-12" ? b : null) });
+    const ctx = context({ entity: async () => ({ entity, pulls: [] }), binding: (key) => (key === "ENG-12" ? b : null) });
     const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
     expect(out).toContain(long);
   });
@@ -769,5 +771,40 @@ describe("the entity read tools (BB-312)", () => {
     expect(searchIssues).toHaveBeenCalledWith("login", 5);
     expect(out).toContain("ENG-1");
     expect(out).not.toContain("OTHER-2");
+  });
+});
+
+describe("the enriched agenda items (BB-312)", () => {
+  it("carries the binding's description, status and newest pull on an escalation item", () => {
+    const from = binding({ id: "b-esc", entityKey: "ENG-5", title: "Escalated", status: { summary: "In review", waitingOn: "the approval" } as never });
+    const brief = briefing({
+      decisions: { needs: [], withUser: [{ escalation: escalation({ question: "Ship it?" }), from }] },
+      escalations: [],
+      stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+      done: { moved: [], ended: [], answered: [] },
+      assumptions: [],
+    });
+    const linked = pull({ key: "acme/web#9", title: "Ship the fix", state: "open", comments: [comment({ body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->" })] });
+    const facts = new Map([[from.id, { entity: issue({ description: "The bug is real." }), pulls: [linked] }]]);
+    const text = buildStandupBrief(brief, [from], facts, "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(text).toContain("Ship it?");
+    expect(text).toContain("The bug is real.");
+    expect(text).toContain("Ship the fix");
+    expect(text).toContain("In review");
+  });
+
+  it("renders a queued project note as a flag on the steward it names", () => {
+    const b = binding({ id: "b-note", entityKey: "ENG-6" });
+    const brief = briefing({
+      notes: ["The owner asked about ENG-6"],
+      decisions: { needs: [], withUser: [] },
+      escalations: [],
+      stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+      done: { moved: [], ended: [], answered: [] },
+      assumptions: [],
+    });
+    const text = buildStandupBrief(brief, [b], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
+    expect(text).toContain("project note:");
+    expect(text).toContain("ENG-6");
   });
 });

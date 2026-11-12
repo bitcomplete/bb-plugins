@@ -1503,6 +1503,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const ENTITY_CACHE_MAX_CONCURRENT = 4;
     const ENTITY_CACHE_TTL_MS = 3_600_000;
     const ENTITY_AGENDA_TIMEOUT_MS = 1_500;
+    const ENTITY_CLOSED_TIMEOUT_MS = 1_500;
 
     /** The source a key belongs to, from the project's own teams and repos, or null when it is out of scope. */
     function sourceForKey(projectId: string, key: string): Source | null {
@@ -1556,16 +1557,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       entityCache.invalidateKey(id);
     }
 
-    /** The merged entity facts for a set of bindings, in parallel, through the cache. */
-    async function readBriefEntities(projectId: string, bindings: readonly Binding[], agendaIds: ReadonlySet<string>, ttlMs: number): Promise<Map<string, StandupEntityFacts>> {
+    /**
+     * The merged entity facts the brief renders from, through the cache. The
+     * agenda bindings read first, with TTL 0 and a short timeout, so a fresh
+     * read answers the greeting; the closed bindings read next, from cache or
+     * stored with a timeout, so a cold source never holds the open. The open
+     * tier renders only from the binding, so it reads nothing.
+     */
+    async function readBriefEntities(projectId: string, agendaBindings: readonly Binding[], closedBindings: readonly Binding[], ttlMs: number): Promise<Map<string, StandupEntityFacts>> {
       const entities = new Map<string, StandupEntityFacts>();
-      await Promise.all(
-        bindings.map(async (b) => {
-          const options = agendaIds.has(b.id) ? { ttlMs: 0, timeoutMs: ENTITY_AGENDA_TIMEOUT_MS } : { ttlMs };
-          const read = await entityCache.read(projectId, b.entityKey, options);
-          if (read !== null) entities.set(b.id, { entity: read.record.entity, pulls: read.record.pulls });
-        }),
-      );
+      const read = async (b: Binding, options: { ttlMs: number; timeoutMs: number }): Promise<void> => {
+        const result = await entityCache.read(projectId, b.entityKey, options);
+        if (result !== null) entities.set(b.id, { entity: result.record.entity, pulls: result.record.pulls });
+      };
+      await Promise.all(agendaBindings.map((b) => read(b, { ttlMs: 0, timeoutMs: ENTITY_AGENDA_TIMEOUT_MS })));
+      await Promise.all(closedBindings.map((b) => read(b, { ttlMs, timeoutMs: ENTITY_CLOSED_TIMEOUT_MS })));
       return entities;
     }
 
@@ -9689,9 +9695,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               .filter((b): b is Binding & { endedAt: number } => b.endedAt !== null && b.endedAt >= clampStart)
               .sort((a, b) => b.endedAt - a.endedAt)
               .slice(0, closedLimit);
-            const tierIds = new Set<string>([...all.filter((b) => b.endedAt === null).map((b) => b.id), ...agendaIds, ...closed.map((b) => b.id)]);
             const ttlMs = (standupConfig?.file.standup.cacheTtl ?? 3_600) * 1_000;
-            const entities = await readBriefEntities(targetProjectId, all.filter((b) => tierIds.has(b.id)), agendaIds, ttlMs);
+            const entities = await readBriefEntities(targetProjectId, all.filter((b) => agendaIds.has(b.id)), closed, ttlMs);
             instructions = buildStandupBrief(brief, all, entities, name, now(), questions, { closedLimit, closedDays, lastCompletedAt });
           } else {
             instructions = buildStandupInstructions(brief, name, now(), questions, scopeKey);
@@ -9790,7 +9795,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           escalation: (id) => store.escalation(id),
           lessons: (bindingId) => store.allLessons(standupProjectId).filter((l) => l.bindingId === bindingId),
           guidance: () => guidanceUnits(standupProjectId),
-          snapshot: (b) => (b.source === "ops" ? Promise.resolve(b.lastSnapshot?.entity ?? null) : snapshot(b.source, b.entityId)),
           entity: async (key) => {
             const read = await entityCache.read(standupProjectId, key, { ttlMs: toolTtlMs });
             return read === null ? null : { entity: read.record.entity, pulls: read.record.pulls };
