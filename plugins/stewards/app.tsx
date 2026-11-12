@@ -988,7 +988,7 @@ function StandupHomepageSection({ projectId }: PluginHomepageSectionProps) {
 }
 
 /** The typed note shapes that carry an action; a free note is context only. */
-const STANDUP_ACTION_TYPES: ReadonlySet<string> = new Set(["resolve-escalation", "gate", "guidance", "direction", "standing-rule"]);
+const STANDUP_ACTION_TYPES: ReadonlySet<string> = new Set(["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "follow-up"]);
 
 /**
  * BB-300 slice 4: the mechanical readback of a project's stand-up. The page
@@ -1089,7 +1089,16 @@ function StandupReadback({ projectId, refreshKey, onChanged }: { projectId: stri
             <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
               {typed.map((n) => (
                 <li key={n.id} className="flex items-start justify-between gap-3 p-3">
-                  <span className={n.confirmed ? "text-muted-foreground" : undefined}>{n.readback}</span>
+                  <span className={n.confirmed ? "text-muted-foreground" : undefined}>
+                    {n.readback}
+                    {n.thread !== null && n.thread !== undefined ? (
+                      <span className="ml-2 text-xs">
+                        <ThreadLink threadId={n.thread}>Open the follow-up thread</ThreadLink>
+                      </span>
+                    ) : n.threadError !== null && n.threadError !== undefined ? (
+                      <span className="ml-2 text-xs text-destructive">{n.threadError}</span>
+                    ) : null}
+                  </span>
                   {n.confirmed ? <Badge>{n.confirmedBy === "voice" ? "Applied by voice" : "Confirmed"}</Badge> : <button type="button" className={button} disabled={busy !== null} onClick={() => confirm(n.id)}>{busy === n.id ? "Confirming…" : "Confirm"}</button>}
                 </li>
               ))}

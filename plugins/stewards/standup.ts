@@ -16,7 +16,6 @@ import type { EntitySnapshot, SearchIssue } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
 import { parsePullRef } from "./github.js";
 import { latestReviewMarker } from "./gate.js";
-import { redactLine } from "./ops.js";
 
 /** One function tool, shaped the way the Realtime API's `realtime.open` expects. */
 export type StandupTool = {
@@ -48,8 +47,8 @@ export type StandupEndOutcome = {
   last?: boolean;
 };
 
-/** The fixed shapes a typed note may take, plus a free note (BB-300). */
-export const STANDUP_NOTE_TYPES = ["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "free"] as const;
+/** The fixed shapes a typed note may take, plus a free note (BB-300, BB-313). */
+export const STANDUP_NOTE_TYPES = ["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "follow-up", "free"] as const;
 export type StandupNoteType = (typeof STANDUP_NOTE_TYPES)[number];
 
 /** What one note in the stand-up record is: an action item in a typed shape, or a free note. */
@@ -72,6 +71,18 @@ export type StandupNote = {
   need: string | null;
   /** The bound need's own description, for the readback line. */
   needLabel: string | null;
+  /**
+   * BB-313: the visible follow-up thread this note opened, or null. A note
+   * with either this or `threadError` set is never spawned again.
+   */
+  thread: string | null;
+  /** BB-313: why the follow-up spawn failed, or null. */
+  threadError: string | null;
+  /**
+   * BB-313: true while a follow-up spawn is in flight. Persisted before the
+   * spawn so a restart mid-confirm never opens a second thread for the note.
+   */
+  threadPending: boolean;
   createdAt: number;
 };
 
@@ -82,7 +93,7 @@ export type StandupRecord = {
   notes: StandupNote[];
   /** True once the overlay has connected and the model has called a tool. */
   connected: boolean;
-  /** BB-307: every `ask_a_thread` delegation, for the log on the stand-up page. */
+  /** BB-307: every `ask_a_thread` delegation, kept so old rows still render; nothing writes a new entry. */
   delegations: StandupDelegation[];
 };
 
@@ -92,11 +103,9 @@ export const STANDUP_MAX_INSTRUCTIONS_CHARS = 20_000;
 export const STANDUP_SECTION_MAX = 40;
 /** The most days an open item may sit before the brief calls it stale (BB-306). */
 export const STANDUP_STALE_DAYS = 3;
-/** BB-307: how much of a delegate's answer is kept, after `redactLine`'s credential scrub. */
-export const STANDUP_DELEGATE_ANSWER_MAX_CHARS = 2_000;
 /** How much of a question's context the brief carries (BB-306). */
 export const STANDUP_CONTEXT_MAX_CHARS = 300;
-/** The most comments `entity_snapshot` renders, newest last (BB-306). */
+/** The most comments `lookup` renders, newest last (BB-306). */
 export const STANDUP_ENTITY_COMMENTS_MAX = 5;
 /** BB-312: the per-item character budget for one agenda tier item. */
 export const STANDUP_AGENDA_ITEM_CHARS = 1_500;
@@ -118,9 +127,11 @@ const DAY_MS = 86_400_000;
 export const STANDUP_WRITE_TOOLS: ReadonlySet<string> = new Set(["take_note", "retract_note"]);
 
 /**
- * BB-307: one `ask_a_thread` delegation, as the stand-up record logs it. The
+ * BB-307: one `ask_a_thread` delegation, as the stand-up record logged it. The
  * answer is the delegate's own words, scrubbed and capped; a timeout or an
  * error leaves it null and carries why. It is a log, not state any tool acts on.
+ * BB-313 removed the tool: this type stays so a stored row still reads and the
+ * page still renders its log, but no new entry is ever written.
  */
 export type StandupDelegation = {
   question: string;
@@ -129,23 +140,10 @@ export type StandupDelegation = {
   startedAt: number;
   finishedAt: number;
   elapsedMs: number;
-  /** The delegate's answer, after `redactLine`'s scrub and the length cap. */
+  /** The delegate's answer, after the credential scrub and the length cap. */
   answer: string | null;
   outcome: "success" | "timeout" | "error";
   /** The failure's message for an error, null otherwise. */
-  error: string | null;
-};
-
-/**
- * What the injected `askThread` returns to the tool. `busy` means a lookup was
- * already in flight for this stand-up; it is a line, not a logged delegation.
- * The answer is raw: the tool scrubs and caps it before it is logged or read.
- */
-export type StandupAskOutcome = {
-  outcome: "success" | "timeout" | "error" | "busy";
-  answer: string | null;
-  startedAt: number;
-  finishedAt: number;
   error: string | null;
 };
 
@@ -157,29 +155,9 @@ const stringParam = (description: string): Record<string, unknown> => ({ type: "
  */
 export const STANDUP_TOOLS: StandupTool[] = [
   {
-    name: "steward_status",
-    description: "The status of one steward, by its ticket or pull-request key (for example ENG-12 or owner/repo#34): phase, what it waits on, the guidance it carries, its open escalation and its recent notes.",
-    parameters: {
-      type: "object",
-      properties: { key: stringParam("The steward's ticket or pull-request key.") },
-      required: ["key"],
-    },
-  },
-  {
-    name: "escalation",
-    description: "One escalation in full: its question, context, fixed choices, what happens meanwhile and the project steward's recommendation. Give a binding key to list that steward's open escalations, or an escalation id.",
-    parameters: {
-      type: "object",
-      properties: {
-        key: stringParam("A ticket or pull-request key whose open escalations to read."),
-        escalationId: stringParam("An escalation id (esc_…) to read directly."),
-      },
-      required: [],
-    },
-  },
-  {
-    name: "entity_snapshot",
-    description: "The ticket or pull request itself, through the source snapshot the stewards already read: title, state, labels, author, body, the last few comments with their dates, linked pull requests and children. Fast, and free to call for any key in this project's teams and repos, with or without a steward.",
+    name: "lookup",
+    description:
+      "Everything the stand-up knows about one key in this project, in one call: the ticket or pull request (title, state, assignee, description, last comments, children and linked pull requests), each pull request's review verdict, checks, merge commit and deploy state, the steward's phase, status summary and what it waits on, the guidance it carries, every open escalation in full, the lessons behind its decisions, and its recent notes. Fast, and free to call for any key in this project's teams and repos, with or without a steward; call it freely, even before the owner has finished asking.",
     parameters: {
       type: "object",
       properties: { key: stringParam("The ticket or pull-request key.") },
@@ -199,15 +177,6 @@ export const STANDUP_TOOLS: StandupTool[] = [
     },
   },
   {
-    name: "decision_rationale",
-    description: "The reasoning behind decisions about one steward: the lessons recorded from its escalations, with the resolution and citations that produced them.",
-    parameters: {
-      type: "object",
-      properties: { key: stringParam("The ticket or pull-request key.") },
-      required: ["key"],
-    },
-  },
-  {
     name: "playbook_paragraph",
     description: "A paragraph of the project's playbooks or AGENTS.md, exactly as written. Give a query to search the text, or a file (such as AGENTS.md or stewards/linear-tickets.md) to read that file's paragraphs.",
     parameters: {
@@ -217,19 +186,6 @@ export const STANDUP_TOOLS: StandupTool[] = [
         file: stringParam("A .bb-relative file to read, such as AGENTS.md."),
       },
       required: [],
-    },
-  },
-  {
-    name: "ask_a_thread",
-    description:
-      "Hand one question to a hidden, read-only delegate thread and read its answer back. Use it only for a fact the brief and the other read tools cannot give you, such as whether a build or run is still failing, a ticket that has no steward, or what a file or recent history says. Try steward_status, escalation, entity_snapshot and playbook_paragraph first. The lookup takes up to a minute or two and the owner waits in silence, so ask only when it is warranted.",
-    parameters: {
-      type: "object",
-      properties: {
-        question: stringParam("The question to put to the delegate, in full."),
-        key: stringParam("The ticket or pull-request key the question is about, when there is one; its steward status is prepended for the delegate."),
-      },
-      required: ["question"],
     },
   },
   {
@@ -243,13 +199,13 @@ export const STANDUP_TOOLS: StandupTool[] = [
   },
   {
     name: "take_note",
-    description: "Record an action item for the owner to confirm after the stand-up, or a free note. This writes only to the stand-up record; it never acts on a steward, merges or resolves anything.",
+    description: "Record an action item for the owner to confirm after the stand-up, or a free note. This writes only to the stand-up record; it never acts on a steward, merges or resolves anything. A follow-up note becomes a visible thread the owner can open after the stand-up.",
     parameters: {
       type: "object",
       properties: {
-        type: { type: "string", enum: [...STANDUP_NOTE_TYPES], description: "resolve-escalation, gate, guidance, direction, standing-rule, or free." },
+        type: { type: "string", enum: [...STANDUP_NOTE_TYPES], description: "resolve-escalation, gate, guidance, direction, standing-rule, follow-up, or free." },
         text: stringParam("The note, in the owner's words."),
-        binding: stringParam("The ticket or pull-request key a gate or guidance note is about."),
+        binding: stringParam("The ticket or pull-request key a gate, guidance or follow-up note is about."),
         escalationId: stringParam("The escalation id a resolve-escalation note answers."),
         action: { type: "string", enum: ["approve", "decline", "merge"], description: "For a gate note: the action the owner wants taken." },
         need: stringParam("For a gate note: the need id or the pull request URL of the exact item to act on. Required when the binding has more than one open item of that kind."),
@@ -324,13 +280,6 @@ export type StandupToolContext = {
   endStandup: (ids: string[]) => Promise<StandupEndOutcome>;
   /** The stand-up's note record. Only `take_note` and `retract_note` touch it. */
   record: StandupRecord;
-  /**
-   * BB-307: hand a question to the stand-up's delegate and resolve with its
-   * answer, a timeout or an error. The one tool that reaches outside the
-   * record besides `end_standup`; it is injected so the tool set stays
-   * testable without a server, a thread or a network.
-   */
-  askThread: (question: string, key: string | null) => Promise<StandupAskOutcome>;
 };
 
 /** One line for a note's kind, so a note reads back unambiguously. */
@@ -340,6 +289,7 @@ const NOTE_LABEL: Record<StandupNoteType, string> = {
   guidance: "guidance for a binding",
   direction: "direction for the project",
   "standing-rule": "a standing rule",
+  "follow-up": "a follow-up thread",
   free: "a note",
 };
 
@@ -364,6 +314,8 @@ export function readbackLine(note: StandupNote): string {
       return `Project direction: ${note.text}`;
     case "standing-rule":
       return `Standing rule: ${note.text}`;
+    case "follow-up":
+      return `Follow up in a thread: ${note.text}${note.binding === null ? "" : ` (about ${note.binding})`}`;
     default:
       return `Note: ${note.text}`;
   }
@@ -395,16 +347,11 @@ function requireStringArray(args: Record<string, unknown>, field: string): strin
   });
 }
 
-/** The steward's own status line, or a clear "no such steward" the model can read aloud. */
-function stewardStatus(ctx: StandupToolContext, key: string): string {
-  const b = ctx.binding(key);
-  if (b === null) return `No steward for ${key} in this project.`;
-  const lines = [`${b.entityKey}: ${b.title ?? "(no title)"} — ${b.kind}${b.phase === null ? "" : `, phase ${b.phase}`}.`];
+/** The steward's own status lines, or a clear "no such steward" the model can read aloud. */
+function stewardStatusText(ctx: StandupToolContext, b: Binding): string {
+  const lines = [`Steward: ${b.entityKey} — ${b.kind}${b.phase === null ? "" : `, phase ${b.phase}`}.`];
+  lines.push(`Status: ${b.status?.summary ?? "(no summary)"}`);
   lines.push(`Waiting on: ${b.status?.waitingOn ?? (b.hold === null ? "nothing the plugin tracks" : `hold: ${b.hold}`)}`);
-  lines.push(`Guidance carried: ${b.guidance.length === 0 ? "none" : b.guidance.slice(-5).map((g) => g.text).join(" | ")}`);
-  const open = ctx.openEscalations(b.id);
-  lines.push(`Open escalation: ${open.length === 0 ? "none" : open.map((x) => `${x.kind}: ${x.question}`).join(" | ")}`);
-  lines.push(`Recent notes: ${b.pending.length === 0 ? "none" : b.pending.slice(-5).map((n) => n.text).join(" | ")}`);
   return lines.join("\n");
 }
 
@@ -418,20 +365,19 @@ function escalationText(x: Escalation): string {
   return lines.join("\n");
 }
 
-/** The escalation tool: by id, or every open escalation for one binding key. */
-function escalationTool(ctx: StandupToolContext, args: Record<string, unknown>): string {
-  const id = optionalString(args, "escalationId");
-  if (id !== null) {
-    const x = ctx.escalation(id);
-    return x === null ? `No escalation ${id} in this project.` : escalationText(x);
-  }
-  const key = optionalString(args, "key");
-  if (key === null) throw new Error("Give a binding key or an escalationId");
-  const b = ctx.binding(key);
-  if (b === null) return `No steward for ${key} in this project.`;
-  const open = ctx.openEscalations(b.id);
-  if (open.length === 0) return `${b.entityKey} has no open escalation.`;
-  return open.map(escalationText).join("\n\n");
+/**
+ * BB-313: one pull request's substance: its review verdict, checks, merge
+ * commit and, when the binding holds it, the deployment state.
+ */
+function renderPull(p: EntitySnapshot, binding: Binding | null): string {
+  const lines = [`Pull request ${p.key}: ${p.title ?? "(no title)"} — ${p.state ?? "unknown"}`];
+  const marker = latestReviewMarker(p.comments);
+  lines.push(marker === null ? "Review: none" : `Review: ${marker.verdict}${marker.lane === null ? "" : `, lane ${marker.lane}`}${marker.approver === undefined ? "" : `, approver ${marker.approver}`}`);
+  lines.push(p.pull !== null && p.pull.checks !== null ? `Checks: ${p.pull.checks.state}${p.pull.checks.failing.length === 0 ? "" : ` (failing: ${p.pull.checks.failing.join(", ")})`}` : "Checks: none");
+  if (p.pull !== null && p.pull.mergeCommit !== null) lines.push(`Merge commit: ${p.pull.mergeCommit}`);
+  const deploy = binding === null ? null : deployStateText(binding);
+  if (deploy !== null) lines.push(deploy);
+  return lines.join("\n");
 }
 
 /** Render one entity snapshot as the spoken answer, with the binding's linked pulls when there is one. */
@@ -439,9 +385,10 @@ function renderEntity(entity: EntitySnapshot, binding: Binding | null): string {
   const lines = [`${entity.key}: ${entity.title ?? "(no title)"}`];
   lines.push(`State: ${entity.state ?? "unknown"}${entity.labels.length === 0 ? "" : ` · labels: ${entity.labels.join(", ")}`}`);
   if (entity.author !== null) lines.push(`Author: ${entity.author}`);
-  // BB-309: a pull request's body is clipped for the spoken answer; a ticket's
-  // body is rendered as written, as before.
-  if (entity.description !== null && entity.description.trim() !== "") lines.push(entity.kind === "pull" ? clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS) : entity.description.trim());
+  if (entity.assignees.length > 0) lines.push(`Assignees: ${entity.assignees.join(", ")}`);
+  // BB-313: the entity body is clipped to the spoken-answer budget for both a
+  // ticket and a pull request, so a long description cannot crowd the record.
+  if (entity.description !== null && entity.description.trim() !== "") lines.push(clipBlock(entity.description, STANDUP_ENTITY_DESCRIPTION_MAX_CHARS));
   // BB-306: the snapshot already fetched these; render them so the model does
   // not have to spend a lookup on what the tool already has.
   const comments = entity.comments.slice(-STANDUP_ENTITY_COMMENTS_MAX);
@@ -470,26 +417,53 @@ function renderEntity(entity: EntitySnapshot, binding: Binding | null): string {
   return lines.join("\n");
 }
 
-/** The entity tool: the source snapshot, or the last one the steward kept, for any key in scope. */
-async function entityTool(ctx: StandupToolContext, key: string): Promise<string> {
+/**
+ * BB-313: the one read tool. It renders the whole entity record for a key:
+ * the entity and its pulls, and, when the key has a steward, its phase, status,
+ * escalations, lessons, guidance and recent notes.
+ */
+async function lookupTool(ctx: StandupToolContext, key: string): Promise<string> {
   // BB-312: a key outside the project's teams and repos is refused, whether or
   // not it names a steward; the brief and the tools read only this project.
   if (!ctx.inScope(key)) return `${key} is not in this project's teams or repos.`;
   const b = ctx.binding(key);
+  // BB-312: a key with no steward still answers, through the same entity path.
+  if (b === null) {
+    const record = await ctx.entity(key).catch(() => null);
+    if (record === null) return `No snapshot is available for ${key}.`;
+    const parts = [renderEntity(record.entity, null)];
+    // BB-313: a pull request key renders its own verdict, checks, merge and deploy state too.
+    if (record.entity.kind === "pull") parts.push(renderPull(record.entity, null));
+    else for (const p of record.pulls) parts.push(renderPull(p, null));
+    return parts.join("\n\n");
+  }
   // BB-309: a pull-request key resolves to the ticket binding that holds its
   // gate need. Render that pull's own snapshot from what the binding already
   // holds, never the ticket's snapshot or a "No steward" line. The binding's
   // own key is the entity even when it parses as a pull reference (a GitHub
   // issue key has the same shape).
-  if (b !== null) {
-    const linked = key === b.entityKey ? null : pullFromKey(b, key);
-    if (linked !== null) return renderEntity(linked, b);
-  }
+  const linked = key === b.entityKey ? null : pullFromKey(b, key);
   // BB-312: every other key, stewarded or not, answers through the one entity
   // cache path, so the tool is fast and the binding's snapshot is never written.
-  const record = await ctx.entity(key).catch(() => null);
-  if (record === null) return `No snapshot is available for ${key}.`;
-  return renderEntity(record.entity, b);
+  const record = linked !== null ? null : await ctx.entity(key).catch(() => null);
+  const entity = linked ?? record?.entity ?? null;
+  if (entity === null) return `No snapshot is available for ${key}.`;
+  const pulls = linked !== null ? [linked] : (record?.pulls ?? []);
+  const parts: string[] = [renderEntity(entity, b)];
+  // Every pull the entity carries, each with its own verdict, checks, merge and deploy state.
+  // BB-313: a pull request that is the entity itself (a stewardless PR, or a PR
+  // steward's own PR) renders its details too; its `pulls` list is empty.
+  if (entity.kind === "pull") parts.push(renderPull(entity, b));
+  else for (const p of pulls) parts.push(renderPull(p, b));
+  parts.push(stewardStatusText(ctx, b));
+  const open = ctx.openEscalations(b.id);
+  parts.push(open.length === 0 ? "Open escalations: none." : `Open escalations:\n${open.map(escalationText).join("\n\n")}`);
+  const lessons = ctx.lessons(b.id);
+  parts.push(lessons.length === 0 ? "Lessons: none." : `Lessons:\n${lessons.map((l) => `${l.id} (${l.scope}, ${l.tier}): ${l.text}`).join("\n")}`);
+  // The binding's guidance is the owner's own reasoning carried forward.
+  parts.push(`Guidance carried: ${b.guidance.length === 0 ? "none" : b.guidance.slice(-5).map((g) => `${g.text} (${g.by})`).join(" | ")}`);
+  parts.push(`Recent notes: ${b.pending.length === 0 ? "none" : b.pending.slice(-5).map((n) => n.text).join(" | ")}`);
+  return parts.join("\n\n");
 }
 
 /** BB-312: search the project's own tickets through the source contract. */
@@ -503,19 +477,6 @@ async function searchTicketsTool(ctx: StandupToolContext, args: Record<string, u
   const scoped = results.filter((issue) => ctx.inScope(issue.key)).slice(0, limit);
   if (scoped.length === 0) return `No ticket in this project matches ${JSON.stringify(query)}.`;
   return scoped.map((issue) => `${issue.key}: ${issue.title ?? "(no title)"} — ${issue.state}${issue.assignee === null ? "" : `, assigned to ${issue.assignee}`}`).join("\n");
-}
-
-/** The rationale tool: the lessons and resolutions behind a binding's decisions. */
-function rationaleTool(ctx: StandupToolContext, key: string): string {
-  const b = ctx.binding(key);
-  if (b === null) return `No steward for ${key} in this project.`;
-  const lessons = ctx.lessons(b.id);
-  const parts: string[] = [];
-  if (lessons.length === 0) parts.push(`No lesson is recorded for ${b.entityKey}.`);
-  else parts.push(lessons.map((l) => `${l.id} (${l.scope}, ${l.tier}): ${l.text}`).join("\n"));
-  // The binding's guidance is the owner's own reasoning carried forward.
-  if (b.guidance.length > 0) parts.push(`Guidance carried: ${b.guidance.map((g) => `${g.text} (${g.by})`).join(" | ")}`);
-  return parts.join("\n");
 }
 
 /** The playbook tool: the guidance paragraphs, filtered by file or query. */
@@ -599,6 +560,9 @@ function takeNote(ctx: StandupToolContext, args: Record<string, unknown>): strin
     action: action as StandupNote["action"],
     need,
     needLabel,
+    thread: null,
+    threadError: null,
+    threadPending: false,
     createdAt: ctx.now(),
   };
   ctx.record.notes.push(note);
@@ -623,20 +587,12 @@ function retractNote(ctx: StandupToolContext, args: Record<string, unknown>): st
  */
 export async function runStandupTool(name: string, args: Record<string, unknown>, ctx: StandupToolContext): Promise<string | StandupToolReply> {
   switch (name) {
-    case "steward_status":
-      return stewardStatus(ctx, requireString(args, "key"));
-    case "escalation":
-      return escalationTool(ctx, args);
-    case "entity_snapshot":
-      return entityTool(ctx, requireString(args, "key"));
+    case "lookup":
+      return lookupTool(ctx, requireString(args, "key"));
     case "search_tickets":
       return searchTicketsTool(ctx, args);
-    case "decision_rationale":
-      return rationaleTool(ctx, requireString(args, "key"));
     case "playbook_paragraph":
       return playbookTool(ctx, args);
-    case "ask_a_thread":
-      return askThreadTool(ctx, args);
     case "readback":
       return readbackTool(ctx);
     case "take_note":
@@ -659,38 +615,6 @@ export async function runStandupTool(name: string, args: Record<string, unknown>
 function readbackTool(ctx: StandupToolContext): string {
   if (ctx.record.notes.length === 0) return "No notes have been taken in this stand-up yet.";
   return ctx.record.notes.map((note) => `${readbackLine(note)} (id ${note.id})`).join("\n");
-}
-
-/**
- * BB-307: hand one question to the injected delegate and log the delegation.
- * The answer is scrubbed with `redactLine`'s SECRET pattern and capped before
- * it is written to the record or returned to the model, so a token in the
- * delegate's words reaches neither OpenAI nor the durable log. A lookup already
- * in flight for this stand-up is refused with a line and logs nothing; a
- * timeout returns the "did not finish" line, and the server logs a late answer
- * on the record without delivering it.
- */
-async function askThreadTool(ctx: StandupToolContext, args: Record<string, unknown>): Promise<string> {
-  const question = requireString(args, "question");
-  const key = optionalString(args, "key");
-  const result = await ctx.askThread(question, key);
-  if (result.outcome === "busy") return "A lookup is already running for this stand-up; wait for it to finish before asking again.";
-  // BB-309: the answer is read aloud, so strip the Markdown a model reaches
-  // for anyway; `redactLine` scrubs credentials and caps the length first.
-  const answer = result.answer === null ? null : stripMarkdown(redactLine(result.answer, STANDUP_DELEGATE_ANSWER_MAX_CHARS));
-  ctx.record.delegations.push({
-    question,
-    key,
-    startedAt: result.startedAt,
-    finishedAt: result.finishedAt,
-    elapsedMs: Math.max(0, result.finishedAt - result.startedAt),
-    answer,
-    outcome: result.outcome,
-    error: result.error,
-  });
-  if (result.outcome === "success" && answer !== null) return answer;
-  if (result.outcome === "timeout") return "The lookup did not finish in time; the answer will be logged if it arrives, but it is not available now.";
-  return `The lookup failed: ${result.error ?? "unknown error"}`;
 }
 
 /**
@@ -890,13 +814,14 @@ export function buildStandupInstructions(briefing: Briefing, projectName: string
       ? "Lead with the things only the owner can unblock, then what is stuck, then what got done and how it was approached. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind."
       : "Lead with the things only the owner can unblock for this steward, then what is stuck or held. If nothing is waiting on the owner and nothing is stuck, say so plainly and ask what is on their mind.",
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
-    "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
+    "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, a standing rule, or a follow-up) and read it back in their words. A remark that is not a decision is a free note.",
+    "When the owner wants something looked into that the brief and lookup cannot settle, or wants to think about it later, take a follow-up note; it becomes a visible thread they can open after the stand-up.",
     "For a gate note, the binding is the ticket key before the colon on the brief line, and need is the pull request named on it (for example owner/repo#34).",
     "For a gate note on a pull request, binding may also be the pull request key itself (owner/repo#34) when the brief names it that way.",
     "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback, and treat anything short of a clear yes as no confirmation.",
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",
     "An item's text is what was true when it was raised, not what is true now; its age says how much to trust it, so verify a stale claim before repeating it.",
-    "When the owner questions a claim in the brief, or a claim is more than a few days old, treat that as not having the information: verify it with ask_a_thread rather than repeating it.",
+    "When the owner questions a claim in the brief, or a claim is more than a few days old, treat that as not having the information: verify it with lookup rather than repeating it.",
     "A brief acknowledgement from the owner (\"okay\", \"yes\", \"nice\", \"mm-hmm\") is not an interruption and needs no reply; after a real interruption, resume from where the reply was cut off and never start the briefing over.",
   ];
   const allSections = [
@@ -1144,7 +1069,8 @@ export function buildStandupBrief(
     "Greet the owner briefly and begin immediately; do not wait for them to speak first.",
     "Lead with the agenda, \"Needs your input\": those are the things only the owner can unblock. Then the other open stewards, then what closed recently.",
     "You may read state with the tools you have been given, and you may take or retract notes. You cannot act on a steward, merge, resolve or change anything; the owner confirms notes after the stand-up.",
-    "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, or a standing rule) and read it back in their words. A remark that is not a decision is a free note.",
+    "When the owner decides something, take a note in the matching shape (resolve an escalation, a gate item, guidance for a binding, direction for the project, a standing rule, or a follow-up) and read it back in their words. A remark that is not a decision is a free note.",
+    "When the owner wants something looked into that the brief and lookup cannot settle, or wants to think about it later, take a follow-up note; it becomes a visible thread they can open after the stand-up.",
     "For a gate note, the binding is the ticket key before the colon on the brief line, and need is the pull request named on it (for example owner/repo#34).",
     "To close: call readback and read every line aloud in the server's own words, then ask the owner to confirm. Retract any note they reject, read the changed list back again, and only then call end_standup with the ids they clearly agreed to. Never end without a readback.",
     "A merge gate item is never applied by end_standup: read it aloud on its own and tell the owner it stays for the page's Confirm button.",

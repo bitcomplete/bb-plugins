@@ -1340,6 +1340,18 @@ export type StandupNoteRow = {
   need: string | null;
   /** The bound need's own description, for the readback. */
   needLabel: string | null;
+  /**
+   * BB-313: the visible follow-up thread this note opened, or null. A note
+   * with either this or `threadError` set is never spawned again.
+   */
+  thread: string | null;
+  /** BB-313: why the follow-up spawn failed, or null. */
+  threadError: string | null;
+  /**
+   * BB-313: true while a follow-up spawn is in flight. Persisted before the
+   * spawn so a restart mid-confirm never opens a second thread for the note.
+   */
+  threadPending: boolean;
   createdAt: number;
 };
 
@@ -2036,6 +2048,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
     action: z.string().nullable().default(null),
     need: z.string().nullable().default(null),
     needLabel: z.string().nullable().default(null),
+    thread: z.string().nullable().default(null),
+    threadError: z.string().nullable().default(null),
+    threadPending: z.boolean().default(false),
     createdAt: z.number(),
   });
   const standupTranscriptSchema = z.object({ at: z.number(), kind: z.enum(["note", "retract", "confirm", "end"]), noteId: z.string().nullable().default(null), text: z.string(), via: z.enum(["page", "voice", "start"]).nullable().default(null) });

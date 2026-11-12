@@ -1833,6 +1833,54 @@ describe("the Stand-up button (BB-300)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("lists a follow-up note's thread under the note with a link (BB-313)", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled: true,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+            standup: { available: true, message: null },
+          },
+        }),
+        stewardsStandupRecord: () => ({
+          standup: {
+            id: "sup_1",
+            projectId: "p1",
+            startedAt: 1,
+            endedAt: null,
+            binding: null,
+            notes: [{ id: "note_1", type: "follow-up", text: "Check the cache eviction", binding: "ENG-12", escalation: null, action: null, createdAt: 1, readback: "Follow up in a thread: Check the cache eviction (about ENG-12)", confirmed: true, confirmedBy: "page", thread: "thr_follow", threadError: null }],
+            confirmed: ["note_1"],
+            delegations: [],
+          },
+        }),
+        stewardsStandupConfirm: () => ({ ok: true, applied: true, message: "Confirmed." }),
+        stewardsStandupEnd: () => ({ ok: true, message: "Stand-up ended." }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Open the follow-up thread")).toBeTruthy());
+    fireEvent.click(slot.getByText("Open the follow-up thread"));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_follow" }));
+    slot.lifecycle.unmount();
+  });
+
   it("shows what a voice-ended stand-up applied and keeps the unconfirmed readback", async () => {
     const captured = await loadApp();
     const panel = captured.navPanels[0]!;

@@ -4,7 +4,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   STANDUP_CONTEXT_MAX_CHARS,
-  STANDUP_DELEGATE_ANSWER_MAX_CHARS,
   STANDUP_ENTITY_DESCRIPTION_MAX_CHARS,
   STANDUP_MAX_INSTRUCTIONS_CHARS,
   STANDUP_NOTE_TYPES,
@@ -101,15 +100,14 @@ function context(over: Partial<StandupToolContext> = {}): StandupToolContext {
     needs: () => [],
     confirmed: [],
     endStandup: async (ids) => ({ output: `end ${ids.join(",")}`, applied: ids, skipped: [] }),
-    askThread: async (question) => ({ outcome: "success", answer: `answer to ${question}`, startedAt: 1, finishedAt: 2, error: null }),
     record,
     ...over,
   };
 }
 
 describe("the stand-up tool set (BB-300)", () => {
-  it("declares the fixed, small tool set", () => {
-    expect(STANDUP_TOOL_NAMES).toEqual(["steward_status", "escalation", "entity_snapshot", "search_tickets", "decision_rationale", "playbook_paragraph", "ask_a_thread", "readback", "take_note", "retract_note", "end_standup"]);
+  it("declares the fixed, small tool set (BB-313)", () => {
+    expect(STANDUP_TOOL_NAMES).toEqual(["lookup", "search_tickets", "playbook_paragraph", "readback", "take_note", "retract_note", "end_standup"]);
     // Every declaration carries the shape the Realtime API needs.
     for (const tool of STANDUP_TOOLS) {
       expect(tool.name).toMatch(/^[a-z_]+$/u);
@@ -123,34 +121,60 @@ describe("the stand-up tool set (BB-300)", () => {
     for (const name of STANDUP_WRITE_TOOLS) expect(STANDUP_TOOL_NAMES).toContain(name);
   });
 
-  it("offers every typed note shape plus a free note", () => {
-    expect(STANDUP_NOTE_TYPES).toEqual(["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "free"]);
+  it("offers every typed note shape plus a free note (BB-313)", () => {
+    expect(STANDUP_NOTE_TYPES).toEqual(["resolve-escalation", "gate", "guidance", "direction", "standing-rule", "follow-up", "free"]);
   });
 });
 
 describe("runStandupTool (BB-300)", () => {
-  it("reads a steward's status without touching the record", async () => {
+  it("reads the whole record for a stewarded key in one lookup (BB-313)", async () => {
     const ctx = context();
-    const out = await runStandupTool("steward_status", { key: "ENG-12" }, ctx);
-    expect(out).toContain("ENG-12");
-    expect(out).toContain("phase build");
-    expect(out).toContain("the review");
-    expect(out).toContain("Merge or close?");
-    expect(ctx.record.notes).toHaveLength(0);
-  });
-
-  it("reads an escalation in full", async () => {
-    const out = await runStandupTool("escalation", { escalationId: "esc_1" }, context());
+    const out = (await runStandupTool("lookup", { key: "ENG-12" }, ctx)) as string;
+    expect(out).toContain("Fix login");
+    expect(out).toContain("State: Todo");
+    expect(out).toContain("Steward: ENG-12 — ticket, phase build");
+    expect(out).toContain("In review");
+    expect(out).toContain("Waiting on: the review");
     expect(out).toContain("Merge or close?");
     expect(out).toContain("Choices: Merge / Close");
     expect(out).toContain("Meanwhile: Waiting.");
     expect(out).toContain("recommends: Merge it.");
+    expect(out).toContain("Prefer the smaller change.");
+    expect(ctx.record.notes).toHaveLength(0);
   });
 
-  it("reads the entity through the source snapshot", async () => {
-    const out = await runStandupTool("entity_snapshot", { key: "ENG-12" }, context());
-    expect(out).toContain("Fix login");
-    expect(out).toContain("Todo");
+  it("renders each pull request's verdict, checks, merge commit and deploy state (BB-313)", async () => {
+    const linked = pull(
+      {
+        id: "acme/web#7",
+        key: "acme/web#7",
+        url: "https://github.com/acme/web/pull/7",
+        title: "Add login retry",
+        state: "open",
+        author: "sam",
+        description: "Retries login.",
+        comments: [comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->", createdAt: "2026-10-03T00:00:00Z" })],
+      },
+      { checks: { state: "success", failing: [] }, mergeCommit: "abcdef1" },
+    );
+    const ticketEntity = issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] });
+    const b = binding({ lastSnapshot: { entity: ticketEntity, pulls: [linked] }, deployments: { d1: { state: "deployed" } } as never });
+    const ctx = context({ entity: async () => ({ entity: ticketEntity, pulls: [linked] }), binding: (key) => (key === "ENG-12" || key === "acme/web#7" || key === "https://github.com/acme/web/pull/7" ? b : null) });
+    // The ticket lists the linked pull with the title and state the binding holds.
+    const ticket = (await runStandupTool("lookup", { key: "ENG-12" }, ctx)) as string;
+    expect(ticket).toContain("Linked pull requests: acme/web#7 Add login retry (open)");
+    expect(ticket).toContain("Pull request acme/web#7: Add login retry — open");
+    expect(ticket).toContain("Review: approved, lane owner-reviewed, approver owner");
+    expect(ticket).toContain("Checks: success");
+    expect(ticket).toContain("Merge commit: abcdef1");
+    expect(ticket).toContain("Deploy: 1/1 confirmed");
+    // A pull key that resolves to the ticket renders the pull, not the ticket.
+    const pr = (await runStandupTool("lookup", { key: "acme/web#7" }, ctx)) as string;
+    expect(pr).toContain("acme/web#7: Add login retry");
+    expect(pr).not.toContain("No steward");
+    // A pull URL resolves the same way.
+    const byUrl = (await runStandupTool("lookup", { key: "https://github.com/acme/web/pull/7" }, ctx)) as string;
+    expect(byUrl).toContain("acme/web#7: Add login retry");
   });
 
   it("shows the last comments, linked pull requests and children from the snapshot (BB-306)", async () => {
@@ -168,48 +192,18 @@ describe("runStandupTool (BB-300)", () => {
         pulls: [],
       }),
     });
-    const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
+    const out = (await runStandupTool("lookup", { key: "ENG-12" }, ctx)) as string;
     expect(out).toContain("2026-10-02T00:00:00Z Sam commented: Can we also cover SSO?");
     expect(out).toContain("2026-10-03T00:00:00Z Jane approved: Looks good to me.");
     expect(out).toContain("Linked pull requests: acme/web#7");
     expect(out).toContain("Children: acme/web#13 Sub-task (open)");
   });
 
-  it("renders a linked pull request with its title and state, and a pull key's own snapshot (BB-309)", async () => {
-    const linked = pull({
-      id: "acme/web#7",
-      key: "acme/web#7",
-      url: "https://github.com/acme/web/pull/7",
-      title: "Add login retry",
-      state: "open",
-      author: "sam",
-      description: "Retries login.",
-      comments: [comment({ id: "c1", author: "Jane", did: "approved", body: "Looks good to me.", createdAt: "2026-10-03T00:00:00Z" })],
-    });
-    const ticketEntity = issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] });
-    const b = binding({ lastSnapshot: { entity: ticketEntity, pulls: [linked] } });
-    const ctx = context({ entity: async () => ({ entity: ticketEntity, pulls: [linked] }), binding: (key) => (key === "ENG-12" || key === "acme/web#7" || key === "https://github.com/acme/web/pull/7" ? b : null) });
-    // The ticket lists the linked pull with the title and state the binding holds.
-    const ticket = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
-    expect(ticket).toContain("Linked pull requests: acme/web#7 Add login retry (open)");
-    // A pull key that resolves to the ticket renders the pull, not the ticket.
-    const pr = (await runStandupTool("entity_snapshot", { key: "acme/web#7" }, ctx)) as string;
-    expect(pr).toContain("acme/web#7: Add login retry");
-    expect(pr).toContain("State: open");
-    expect(pr).toContain("Author: sam");
-    expect(pr).toContain("Retries login.");
-    expect(pr).toContain("2026-10-03T00:00:00Z Jane approved: Looks good to me.");
-    expect(pr).not.toContain("No steward");
-    // A pull URL resolves the same way.
-    const byUrl = (await runStandupTool("entity_snapshot", { key: "https://github.com/acme/web/pull/7" }, ctx)) as string;
-    expect(byUrl).toContain("acme/web#7: Add login retry");
-  });
-
-  it("clips a long entity body without flattening it (BB-309)", async () => {
+  it("clips a long pull body without flattening it (BB-309)", async () => {
     const long = pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", description: `first line\n\n${"y".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50)}` });
     const b = binding({ lastSnapshot: { entity: issue(), pulls: [long] } });
     const ctx = context({ binding: (key) => (key === "acme/web#8" ? b : null) });
-    const out = (await runStandupTool("entity_snapshot", { key: "acme/web#8" }, ctx)) as string;
+    const out = (await runStandupTool("lookup", { key: "acme/web#8" }, ctx)) as string;
     expect(out).toContain("first line");
     // The body keeps its line breaks and is clipped at the cap.
     expect(out).toContain("first line\n\ny");
@@ -217,18 +211,41 @@ describe("runStandupTool (BB-300)", () => {
     expect(out).toContain("…");
   });
 
-  it("renders a ticket body as written, without the pull clip (BB-309)", async () => {
+  it("clips a ticket body to the spoken-answer budget (BB-313)", async () => {
     const long = "z".repeat(STANDUP_ENTITY_DESCRIPTION_MAX_CHARS + 50);
     const entity = issue({ description: long });
     const b = binding({ lastSnapshot: { entity, pulls: [] } });
     const ctx = context({ entity: async () => ({ entity, pulls: [] }), binding: (key) => (key === "ENG-12" ? b : null) });
-    const out = (await runStandupTool("entity_snapshot", { key: "ENG-12" }, ctx)) as string;
-    expect(out).toContain(long);
+    const out = (await runStandupTool("lookup", { key: "ENG-12" }, ctx)) as string;
+    expect(out).not.toContain(long);
+    expect(out).toContain("…");
   });
 
-  it("reads the lessons behind a decision", async () => {
-    const out = await runStandupTool("decision_rationale", { key: "ENG-12" }, context());
-    expect(out).toContain("Prefer the smaller change.");
+  it("renders a pull request's own verdict, checks, merge and deploy when it is the entity (BB-313)", async () => {
+    const linked = pull(
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Add login retry", comments: [comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->" })] },
+      { checks: { state: "failure", failing: ["test"] }, mergeCommit: "abcdef1" },
+    );
+    // A PR steward's own PR: the binding's key is the entity.
+    const b = binding({ kind: "pr", entityKey: "acme/web#7", lastSnapshot: { entity: linked, pulls: [] }, deployments: { d1: { state: "deployed" } } as never });
+    const ctx = context({ binding: (key) => (key === "acme/web#7" ? b : null), entity: async () => ({ entity: linked, pulls: [] }) });
+    const out = (await runStandupTool("lookup", { key: "acme/web#7" }, ctx)) as string;
+    expect(out).toContain("Review: approved, lane owner-reviewed, approver owner");
+    expect(out).toContain("Checks: failure (failing: test)");
+    expect(out).toContain("Merge commit: abcdef1");
+    expect(out).toContain("Deploy: 1/1 confirmed");
+    // A stewardless PR key answers the same way, with no deploy state.
+    const noSteward = context({ binding: () => null, entity: async () => ({ entity: linked, pulls: [] }) });
+    const out2 = (await runStandupTool("lookup", { key: "acme/web#7" }, noSteward)) as string;
+    expect(out2).toContain("Review: approved");
+    expect(out2).toContain("Checks: failure (failing: test)");
+    expect(out2).toContain("Merge commit: abcdef1");
+  });
+
+  it("rejects the removed tool names as unknown (BB-313)", async () => {
+    for (const name of ["steward_status", "escalation", "decision_rationale", "entity_snapshot", "ask_a_thread"]) {
+      await expect(runStandupTool(name, {}, context())).rejects.toThrow(/No stand-up tool/u);
+    }
   });
 
   it("reads a playbook paragraph as written, and filters by file and query", async () => {
@@ -245,8 +262,8 @@ describe("runStandupTool (BB-300)", () => {
   it("reads the mechanical readback lines, with note ids, and writes nothing", async () => {
     const ctx = context();
     ctx.record.notes.push(
-      { id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, need: null, needLabel: null, createdAt: 1 },
-      { id: "note_2", type: "free", text: "A thought", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: 2 },
+      { id: "note_1", type: "guidance", text: "Keep it small", binding: "ENG-12", escalation: null, action: null, need: null, needLabel: null, thread: null, threadError: null, threadPending: false, createdAt: 1 },
+      { id: "note_2", type: "free", text: "A thought", binding: null, escalation: null, action: null, need: null, needLabel: null, thread: null, threadError: null, threadPending: false, createdAt: 2 },
     );
     const before = JSON.stringify(ctx.record.notes);
     const out = (await runStandupTool("readback", {}, ctx)) as string;
@@ -302,7 +319,7 @@ describe("runStandupTool (BB-300)", () => {
 
   it("refuses to retract a note the owner already confirmed", async () => {
     const ctx = context({ confirmed: ["note_1"] });
-    ctx.record.notes.push({ id: "note_1", type: "guidance", text: "Keep it", binding: "ENG-12", escalation: null, action: null, need: null, needLabel: null, createdAt: 1 });
+    ctx.record.notes.push({ id: "note_1", type: "guidance", text: "Keep it", binding: "ENG-12", escalation: null, action: null, need: null, needLabel: null, thread: null, threadError: null, threadPending: false, createdAt: 1 });
     const out = await runStandupTool("retract_note", { id: "note_1" }, ctx);
     expect(out).toContain("already been applied");
     expect(ctx.record.notes).toHaveLength(1);
@@ -356,77 +373,6 @@ describe("runStandupTool (BB-300)", () => {
   });
 });
 
-describe("ask_a_thread (BB-307)", () => {
-  it("declares the tool and leaves STANDUP_WRITE_TOOLS alone", () => {
-    expect(STANDUP_TOOL_NAMES).toContain("ask_a_thread");
-    // The tool writes only to the log, not to the notes, so the write set is unchanged.
-    expect([...STANDUP_WRITE_TOOLS].sort()).toEqual(["retract_note", "take_note"]);
-  });
-
-  it("returns the delegate's answer and logs the delegation", async () => {
-    const askThread = vi.fn(async () => ({ outcome: "success" as const, answer: "Yes, the builds are still stalling.", startedAt: 10, finishedAt: 40, error: null }));
-    const ctx = context({ askThread });
-    const out = await runStandupTool("ask_a_thread", { question: "Are the builds stalling?", key: "ENG-12" }, ctx);
-    expect(out).toBe("Yes, the builds are still stalling.");
-    expect(askThread).toHaveBeenCalledWith("Are the builds stalling?", "ENG-12");
-    expect(ctx.record.delegations).toHaveLength(1);
-    expect(ctx.record.delegations[0]).toMatchObject({ question: "Are the builds stalling?", key: "ENG-12", startedAt: 10, finishedAt: 40, elapsedMs: 30, outcome: "success", answer: "Yes, the builds are still stalling.", error: null });
-  });
-
-  it("scrubs a secret from the answer and caps it in both the reply and the log (BB-307 approval)", async () => {
-    const long = `token: abc ${"x".repeat(STANDUP_DELEGATE_ANSWER_MAX_CHARS)}`;
-    const ctx = context({ askThread: async () => ({ outcome: "success", answer: long, startedAt: 1, finishedAt: 2, error: null }) });
-    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
-    // The credential is gone from both places, and neither carries the raw answer.
-    expect(out).toContain("token: [redacted]");
-    expect(out).not.toContain("abc");
-    expect(ctx.record.delegations[0]!.answer).toContain("token: [redacted]");
-    expect(ctx.record.delegations[0]!.answer).not.toContain("abc");
-    // `redactLine` caps at the constant and appends a single ellipsis.
-    expect(out.length).toBeLessThanOrEqual(STANDUP_DELEGATE_ANSWER_MAX_CHARS + 1);
-    expect(ctx.record.delegations[0]!.answer!.length).toBeLessThanOrEqual(STANDUP_DELEGATE_ANSWER_MAX_CHARS + 1);
-  });
-
-  it("logs a timeout and returns the did-not-finish line", async () => {
-    const ctx = context({ askThread: async () => ({ outcome: "timeout", answer: null, startedAt: 1, finishedAt: 2, error: null }) });
-    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
-    expect(out).toContain("did not finish");
-    expect(ctx.record.delegations[0]).toMatchObject({ outcome: "timeout", answer: null, elapsedMs: 1 });
-  });
-
-  it("logs an error and returns its message", async () => {
-    const ctx = context({ askThread: async () => ({ outcome: "error", answer: null, startedAt: 1, finishedAt: 2, error: "the delegate could not start" }) });
-    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
-    expect(out).toContain("the delegate could not start");
-    expect(ctx.record.delegations[0]).toMatchObject({ outcome: "error", answer: null, error: "the delegate could not start" });
-  });
-
-  it("refuses a second call while one is in flight and logs nothing", async () => {
-    const ctx = context({ askThread: async () => ({ outcome: "busy", answer: null, startedAt: 1, finishedAt: 2, error: null }) });
-    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
-    expect(out).toContain("already running");
-    expect(ctx.record.delegations).toHaveLength(0);
-  });
-
-  it("requires a question", async () => {
-    await expect(runStandupTool("ask_a_thread", {}, context())).rejects.toThrow(/question is required/u);
-  });
-
-  it("strips Markdown from a delegate answer before logging or returning it (BB-309)", async () => {
-    const answer = "**Verdict:** the build is fine.\n\n# Details\n\n- item one\n- item two\n\nUse `retry`.";
-    const ctx = context({ askThread: async () => ({ outcome: "success", answer, startedAt: 1, finishedAt: 2, error: null }) });
-    const out = (await runStandupTool("ask_a_thread", { question: "q" }, ctx)) as string;
-    expect(out).toContain("Verdict: the build is fine.");
-    expect(out).toContain("item one");
-    expect(out).not.toContain("**");
-    expect(out).not.toMatch(/^#/mu);
-    expect(out).not.toMatch(/^- /mu);
-    expect(out).not.toContain("`");
-    // The logged answer is the stripped one, so the record carries no markers either.
-    expect(ctx.record.delegations[0]!.answer).toBe(out);
-  });
-});
-
 const briefing = (over: Partial<Briefing> = {}): Briefing => ({
   since: 500,
   previous: null,
@@ -440,7 +386,7 @@ const briefing = (over: Partial<Briefing> = {}): Briefing => ({
 });
 
 describe("the mechanical readback (BB-300 slice 4)", () => {
-  const note = (over: Partial<StandupNote> = {}): StandupNote => ({ id: "note_1", type: "free", text: "Something", binding: null, escalation: null, action: null, need: null, needLabel: null, createdAt: 1, ...over });
+  const note = (over: Partial<StandupNote> = {}): StandupNote => ({ id: "note_1", type: "free", text: "Something", binding: null, escalation: null, action: null, need: null, needLabel: null, thread: null, threadError: null, threadPending: false, createdAt: 1, ...over });
 
   it("renders one line per typed shape from the stored note, not the model", () => {
     expect(readbackLine(note({ type: "resolve-escalation", escalation: "esc_1", text: "Merge it" }))).toBe("Resolve escalation esc_1 with: Merge it");
@@ -450,6 +396,8 @@ describe("the mechanical readback (BB-300 slice 4)", () => {
     expect(readbackLine(note({ type: "guidance", binding: "ENG-12", text: "Keep it small" }))).toBe("Guidance for ENG-12: Keep it small");
     expect(readbackLine(note({ type: "direction", text: "Prioritise the migration" }))).toBe("Project direction: Prioritise the migration");
     expect(readbackLine(note({ type: "standing-rule", text: "Never merge red checks" }))).toBe("Standing rule: Never merge red checks");
+    expect(readbackLine(note({ type: "follow-up", text: "Check the cache eviction" }))).toBe("Follow up in a thread: Check the cache eviction");
+    expect(readbackLine(note({ type: "follow-up", binding: "ENG-12", text: "Check the cache eviction" }))).toBe("Follow up in a thread: Check the cache eviction (about ENG-12)");
     expect(readbackLine(note({ type: "free", text: "A thought" }))).toBe("Note: A thought");
   });
 
@@ -478,6 +426,9 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(text).toContain("the schema is stable");
     // The write boundary is stated to the model, and the tools are separate.
     expect(text).toContain("cannot act on a steward, merge, resolve or change anything");
+    // BB-313: the stale-claim line points at lookup, and the follow-up note is offered.
+    expect(text).toContain("verify it with lookup");
+    expect(text).toContain("take a follow-up note");
   });
 
   it("says the beginning when there is no previous stand-up", () => {
@@ -750,14 +701,14 @@ describe("buildStandupBrief (BB-312)", () => {
 describe("the entity read tools (BB-312)", () => {
   it("renders a stewardless key through the entity reader", async () => {
     const ctx = context({ binding: () => null, entity: async (key) => ({ entity: issue({ key, title: "Stewardless" }), pulls: [] }) });
-    const out = (await runStandupTool("entity_snapshot", { key: "ENG-99" }, ctx)) as string;
+    const out = (await runStandupTool("lookup", { key: "ENG-99" }, ctx)) as string;
     expect(out).toContain("Stewardless");
     expect(out).toContain("ENG-99");
   });
 
   it("refuses a key outside the project's teams and repos", async () => {
     const ctx = context({ inScope: () => false });
-    expect(await runStandupTool("entity_snapshot", { key: "OTHER-1" }, ctx)).toContain("not in this project");
+    expect(await runStandupTool("lookup", { key: "OTHER-1" }, ctx)).toContain("not in this project");
     expect(await runStandupTool("search_tickets", { query: "anything" }, ctx)).toContain("No ticket");
   });
 
