@@ -305,10 +305,10 @@ describe("what stewards reads", () => {
     },
     attachments: {
       nodes: [
-        { url: "https://github.com/Acme/web/pull/42", sourceType: "github" },
-        { url: "https://github.com/Acme/web/pull/42", sourceType: "github" },
-        { url: "https://github.com/acme/web/issues/7", sourceType: "github" },
-        { url: "https://sentry.io/x", sourceType: "sentry" },
+        { url: "https://github.com/Acme/web/pull/42", sourceType: "github", createdAt: "2026-10-01T03:00:00Z" },
+        { url: "https://github.com/Acme/web/pull/42", sourceType: "github", createdAt: "2026-10-01T03:00:00Z" },
+        { url: "https://github.com/acme/web/issues/7", sourceType: "github", createdAt: "2026-10-01T04:00:00Z" },
+        { url: "https://sentry.io/x", sourceType: "sentry", createdAt: "2026-10-01T05:00:00Z" },
       ],
     },
   };
@@ -347,6 +347,25 @@ describe("what stewards reads", () => {
       viewer: "jane",
     });
     expect(parseSnapshotIssue({ data: { issue: null } })).toBeNull();
+  });
+
+  it("orders linked pulls by attachment createdAt descending, regardless of the API's order (BB-316)", () => {
+    const attachments = {
+      nodes: [
+        { url: "https://github.com/Acme/web/pull/1", sourceType: "github", createdAt: "2026-10-01T00:00:00Z" },
+        { url: "https://github.com/Acme/web/pull/3", sourceType: "github", createdAt: "2026-10-01T02:00:00Z" },
+        { url: "https://github.com/Acme/web/pull/2", sourceType: "github", createdAt: "2026-10-01T01:00:00Z" },
+        // A duplicate keeps the first (newest) occurrence, and a non-PR contributes nothing.
+        { url: "https://github.com/Acme/web/pull/1", sourceType: "github", createdAt: "2026-09-01T00:00:00Z" },
+        { url: "https://sentry.io/x", sourceType: "sentry", createdAt: "2026-10-01T03:00:00Z" },
+      ],
+    };
+    const snapshot = snapshotOfIssue(parseSnapshotIssue({ data: { issue: { ...raw, attachments } } })!, null);
+    expect(snapshot.linkedPulls).toEqual([
+      { url: "https://github.com/Acme/web/pull/3", key: "Acme/web#3" },
+      { url: "https://github.com/Acme/web/pull/2", key: "Acme/web#2" },
+      { url: "https://github.com/Acme/web/pull/1", key: "Acme/web#1" },
+    ]);
   });
 
   it("maps completedAt and canceledAt for a resolved issue (BB-136)", () => {

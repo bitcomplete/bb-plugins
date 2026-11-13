@@ -53,7 +53,7 @@ export const pull = (over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNu
   // The head follows the worker branch convention and names ENG-12, so a
   // ticket-linked pull request belongs to the ticket rather than merely
   // mentioning it (BB-239).
-  pull: { draft: false, merged: false, base: "main", head: "bb/eng-12-retry", headSha: "aaaaaaa1", headAuthor: "sam", reviewDecision: null, requestedReviewers: ["jane"], reviews: [], checks: { state: "pending", failing: [] }, mergeCommit: null, files: [], ...pullOver },
+  pull: { draft: false, merged: false, base: "main", head: "bb/eng-12-retry", headSha: "aaaaaaa1", headAuthor: "sam", reviewDecision: null, requestedReviewers: ["jane"], reviews: [], checks: { state: "pending", failing: [] }, mergeCommit: null, mergedAt: null, files: [], ...pullOver },
   ...over,
 });
 

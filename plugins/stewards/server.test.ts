@@ -2820,31 +2820,81 @@ describe("pull requests", () => {
     expect(t.hooks.store.binding(b.id)!.pending.some((n) => n.quiet === true && n.text.includes("Review:"))).toBe(true);
   });
 
-  it("BB-263: observes the newest linked pull request past the cap of five", async () => {
+  it("BB-316: observes the newest of eleven linked pull requests, listed newest first (BB-263's fixture corrected)", async () => {
     const t = await setup();
     const link = (n: number) => ({ key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` });
-    // Six linked pull requests in timeline order (oldest first). The cap keeps
-    // five, so the newest is the one at risk of being displaced.
-    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [link(1), link(2), link(3), link(4), link(5), link(6)] }));
-    for (const n of [1, 2, 3, 4, 5]) {
+    // Eleven linked pull requests newest first, as the contract sends them
+    // (BB-316). The newest is the one at risk of being displaced; BB-263's old
+    // fixture listed them oldest first, which hid the reversal dropping it.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1].map(link) }));
+    for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
       t.entities.set(`acme/web#${n}`, pull({ id: `acme/web#${n}`, key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}`, state: "merged" }, { merged: true }));
     }
-    // The sixth is open, owner-reviewed and approved with green checks.
+    // The eleventh is open, owner-reviewed and approved with green checks.
     const marker = comment({ id: "r8", author: "jane", did: "reviewed", body: `<!-- bb-review round=8 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
-    t.entities.set("acme/web#6", pull({ id: "acme/web#6", key: "acme/web#6", url: "https://github.com/acme/web/pull/6", author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#11", pull({ id: "acme/web#11", key: "acme/web#11", url: "https://github.com/acme/web/pull/11", author: "sam", comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     const b = t.hooks.store.find("ENG-12")!;
-    // The cap still holds (the oldest merged one is not read), but the sixth
-    // is observed and its approve-pr item is filed.
-    expect(b.lastSnapshot!.pulls.map((p) => p.key)).not.toContain("acme/web#1");
-    expect(b.lastSnapshot!.pulls.map((p) => p.key)).toContain("acme/web#6");
-    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toMatchObject({ url: "https://github.com/acme/web/pull/6" });
+    expect(b.lastSnapshot!.pulls.map((p) => p.key)).toContain("acme/web#11");
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toMatchObject({ url: "https://github.com/acme/web/pull/11" });
     // A steward report filing approve-pr for it is accepted, not refused as
     // unobserved.
-    const report = await t.tool("steward_report", { phase: "Review", summary: "Round 8 approved.", nextAction: "Wait for the owner.", actor: "user", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/6", what: "Approve acme/web#6" }] }, steward);
+    const report = await t.tool("steward_report", { phase: "Review", summary: "Round 8 approved.", nextAction: "Wait for the owner.", actor: "user", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/11", what: "Approve acme/web#11" }] }, steward);
     expect(report.error, report.text).toBe(false);
     expect(report.text).not.toMatch(/not been observed/u);
+  });
+
+  it("BB-316: carries a merged linked pull forward after the grace, re-reads a closed or open one", async () => {
+    const t = await setup();
+    const link = (n: number) => ({ key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` });
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [link(7), link(8), link(9)] }));
+    // #7 was merged at the first look's time; #8 is open; #9 is closed (which
+    // can be reopened, so it is always re-read).
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }, { merged: true, mergedAt: "2026-10-14T15:00:00Z" }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }));
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "closed" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const snapshotCalls = () => t.rpcCalls.filter((c) => c.method === "sourceSnapshot").map((c) => String(c.input.id));
+
+    // Half an hour after the merge, still inside the grace: the merged #7 is
+    // re-read, as are the open #8 and the closed #9.
+    t.advance(30 * 60_000);
+    t.rpcCalls.length = 0;
+    await t.hooks.reconcilePass("p1");
+    expect(snapshotCalls()).toContain("acme/web#7");
+    expect(snapshotCalls()).toContain("acme/web#8");
+    expect(snapshotCalls()).toContain("acme/web#9");
+
+    // Another 40 minutes (70 after the merge): #7 is carried forward without a
+    // read; #8 and #9 are still re-read.
+    t.advance(40 * 60_000);
+    t.rpcCalls.length = 0;
+    await t.hooks.reconcilePass("p1");
+    expect(snapshotCalls()).not.toContain("acme/web#7");
+    expect(snapshotCalls()).toContain("acme/web#8");
+    expect(snapshotCalls()).toContain("acme/web#9");
+    expect(t.hooks.store.find("ENG-12")!.lastSnapshot!.pulls.map((p) => p.key)).toContain("acme/web#7");
+  });
+
+  it("BB-316: reads at most the newest twenty linked pull requests", async () => {
+    const t = await setup();
+    // Newest first, as the contract sends them; the oldest five are beyond the ceiling.
+    const newestFirst = Array.from({ length: 25 }, (_, i) => 25 - i).map((n) => ({ key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` }));
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: newestFirst }));
+    for (let n = 1; n <= 25; n++) t.entities.set(`acme/web#${n}`, pull({ id: `acme/web#${n}`, key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const keys = b.lastSnapshot!.pulls.map((p) => p.key);
+    expect(keys).toHaveLength(20);
+    expect(keys[0]).toBe("acme/web#25");
+    expect(keys).toContain("acme/web#6");
+    expect(keys).not.toContain("acme/web#5");
+    const read = new Set(t.rpcCalls.filter((c) => c.method === "sourceSnapshot" && String(c.input.id).startsWith("acme/web#")).map((c) => String(c.input.id)));
+    expect(read.size).toBe(20);
+    expect(read.has("acme/web#25")).toBe(true);
+    expect(read.has("acme/web#5")).toBe(false);
   });
 
   it("leaves out repos the project file excludes, and says so in check", async () => {

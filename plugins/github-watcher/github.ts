@@ -151,7 +151,7 @@ const targetDocument = (issueRelations: string) => `query($owner: String!, $name
   ... on Issue { ${COMMON_FIELDS} state stateReason ${issueRelations}
     closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { number url repository { nameWithOwner } } }
     timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) { nodes { ... on CrossReferencedEvent { source { ... on PullRequest { number url repository { nameWithOwner } } } } } } }
-  ... on PullRequest { ${COMMON_FIELDS} state isDraft merged reviewDecision headRefName headRefOid baseRefName
+  ... on PullRequest { ${COMMON_FIELDS} state isDraft merged mergedAt reviewDecision headRefName headRefOid baseRefName
     mergeCommit { oid }
     files(first: 100) { nodes { path } }
     timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
@@ -231,6 +231,7 @@ const pullNode = z.object({
   state: z.string(),
   isDraft: z.boolean().nullish(),
   merged: z.boolean().nullish(),
+  mergedAt: z.string().nullish(),
   mergeCommit: z.object({ oid: z.string() }).nullish(),
   files: z.object({ nodes: z.array(z.object({ path: z.string() })) }).nullish(),
   timelineItems: z.object({ nodes: z.array(z.object({ createdAt: z.string().nullish() })).nullish() }).nullish(),
@@ -418,9 +419,11 @@ const sortComments = <C extends Comment>(comments: C[]): C[] => [...comments].so
 export const clipText = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 
 /**
- * An issue's linked pull requests: the ones that close it, plus the pull
- * requests cross-referenced in its timeline, deduped, each as its URL and
- * "owner/repo#n" when the number and repository are there (source-contract.ts).
+ * An issue's linked pull requests: the ones that close it first, then the
+ * pull requests cross-referenced in its timeline newest first, deduped, each
+ * as its URL and "owner/repo#n" when the number and repository are there
+ * (source-contract.ts). The timeline is read oldest first (`first: 100`), so
+ * it is walked from the end.
  */
 function linkedPullsOf(node: z.infer<typeof issueNode>): Array<{ url: string; key: string | null }> {
   const out: Array<{ url: string; key: string | null }> = [];
@@ -438,7 +441,8 @@ function linkedPullsOf(node: z.infer<typeof issueNode>): Array<{ url: string; ke
     out.push({ url, key });
   };
   for (const p of node.closedByPullRequestsReferences?.nodes ?? []) add(p);
-  for (const item of node.timelineItems?.nodes ?? []) add(item.source);
+  const timeline = node.timelineItems?.nodes ?? [];
+  for (let i = timeline.length - 1; i >= 0; i--) add(timeline[i]?.source);
   return out;
 }
 
@@ -561,6 +565,7 @@ export function parseSnapshot(payload: unknown, relationsUnread = false): Entity
       reviews,
       checks: p.checks,
       mergeCommit: node.mergeCommit?.oid ?? null,
+      mergedAt: node.mergedAt ?? null,
       files: (node.files?.nodes ?? []).map((f) => f.path).sort(),
     },
   };

@@ -195,6 +195,14 @@ export const snapshotPullSchema = z.object({
    */
   mergeCommit: z.string().nullable().default(null),
   /**
+   * When GitHub recorded the merge (its `mergedAt`). A consumer that carries a
+   * merged linked pull request forward from its last snapshot measures the
+   * grace from this, so a look that saw the merge more than the grace ago does
+   * not read it again; null (not merged, or the source could not read it) is
+   * re-read rather than trusted (BB-316).
+   */
+  mergedAt: z.string().nullable().default(null),
+  /**
    * The paths the pull request changed (up to GitHub's first 100), for
    * matching a deployment rule's `when.paths`. A pull request changing more
    * than 100 files can miss a rule whose path falls outside the first page.
@@ -266,9 +274,11 @@ export const entitySnapshotSchema = z.object({
    */
   relationsUnread: z.boolean().optional(),
   /**
-   * Pull requests linked to the entity, by URL; "owner/repo#12" when it
-   * parses. Linear: the issue's linked pull requests. GitHub: an issue's
-   * closing references and cross-references, populated from the issue.
+   * Pull requests linked to the entity, newest first, by URL; "owner/repo#12"
+   * when it parses. A consumer that caps keeps the head. Linear: the issue's
+   * linked pull requests, by attachment `createdAt` descending. GitHub: an
+   * issue's closing references first, then its timeline cross-references
+   * newest first.
    */
   linkedPulls: z.array(z.object({ url: z.string(), key: z.string().nullable() })),
   pull: snapshotPullSchema.nullable(),

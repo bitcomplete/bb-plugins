@@ -460,7 +460,7 @@ const SNAPSHOT_FIELDS =
   "labels { nodes { name } } parent { id identifier } " +
   "children { nodes { id identifier title state { name type } labels { nodes { name } } } } " +
   `comments(last: ${SNAPSHOT_COMMENTS_MAX}) { nodes { id body createdAt url user { name displayName email } } } ` +
-  "attachments { nodes { url sourceType } }";
+  "attachments { nodes { url sourceType createdAt } }";
 
 export const SNAPSHOT_QUERY = `query($id: String!) { issue(id: $id) { ${SNAPSHOT_FIELDS} } }`;
 /** An issue's UUID from its key; stewards may name an entity either way. */
@@ -510,7 +510,7 @@ const snapshotIssueSchema = z.object({
     })
     .nullish(),
   comments: z.object({ nodes: z.array(commentSchema.extend({ id: z.string() })) }).nullish(),
-  attachments: z.object({ nodes: z.array(z.object({ url: z.string().nullish(), sourceType: z.string().nullish() })) }).nullish(),
+  attachments: z.object({ nodes: z.array(z.object({ url: z.string().nullish(), sourceType: z.string().nullish(), createdAt: z.string().nullish() })) }).nullish(),
 });
 export type SnapshotIssue = z.infer<typeof snapshotIssueSchema>;
 
@@ -536,11 +536,17 @@ export function pullKey(url: string): string | null {
  */
 export function snapshotOfIssue(issue: SnapshotIssue, viewer: string | null): EntitySnapshot {
   const comments = [...(issue.comments?.nodes ?? [])].sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? "")).slice(-SNAPSHOT_COMMENTS_MAX);
-  const pulls = new Map<string, string>();
+  // Newest first, by the attachment's `createdAt` (BB-316): the contract says
+  // linked pulls are newest first, and Linear's own attachment order is not
+  // guaranteed.
+  const pulls = new Map<string, { url: string; key: string; createdAt: string }>();
   for (const a of issue.attachments?.nodes ?? []) {
-    const key = a.url === null || a.url === undefined ? null : pullKey(a.url);
-    if (key !== null && !pulls.has(a.url!)) pulls.set(a.url!, key);
+    const url = a.url ?? null;
+    const key = url === null ? null : pullKey(url);
+    if (url === null || key === null || pulls.has(url)) continue;
+    pulls.set(url, { url, key, createdAt: a.createdAt ?? "" });
   }
+  const linkedPulls = [...pulls.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(({ url, key }) => ({ url, key }));
   const assignee = personName(issue.assignee);
   return {
     source: "linear",
@@ -580,7 +586,7 @@ export function snapshotOfIssue(issue: SnapshotIssue, viewer: string | null): En
       stateType: c.state?.type ?? null,
       labels: (c.labels?.nodes ?? []).map((l) => l.name),
     })),
-    linkedPulls: [...pulls].map(([url, key]) => ({ url, key })),
+    linkedPulls,
     pull: null,
     viewer,
   };
