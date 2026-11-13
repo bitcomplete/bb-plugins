@@ -1616,11 +1616,19 @@ export interface StoreOptions {
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
   const getBinding = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE id = ?");
-  const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at LIMIT 1");
+  // BB-318: an entity can now have an open binding in one project and ended
+  // ones in others, so `byEntity` prefers the open binding and then the newest
+  // row (as `byKey` does). The old `created_at ASC` returned the oldest row,
+  // which after a move is the old project's ended binding, so rings, sessions
+  // and approvals acted on it instead of the project that owns the entity now.
+  const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC LIMIT 1");
   // BB-318: the one open binding an entity may have, across every project on
   // this server. `byEntity` returns a binding whatever its state, which an
   // ended one in another project must not use to block adoption.
   const openByEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE AND ended_at IS NULL ORDER BY created_at LIMIT 1");
+  // BB-318: every binding id for an entity, across projects, open and ended, so
+  // a ring can reconcile each one rather than only the row `byEntity` picks.
+  const bindingIdsForEntity = db.prepare<[string, string], { id: string }>("SELECT id FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at");
   const byKey = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
   const byThread = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1");
   const openForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? AND ended_at IS NULL ORDER BY created_at");
@@ -2441,6 +2449,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     openByEntity(source: BindingSource, entityId: string): Binding | null {
       const r = openByEntity.get(source, entityId);
       return r === undefined ? null : rowToBinding(r);
+    },
+    /** Every binding id for an entity, across projects, open and ended, for ringing each one (BB-318). */
+    bindingIdsForEntity(source: BindingSource, entityId: string): string[] {
+      return bindingIdsForEntity.all(source, entityId).map((r) => r.id);
     },
     /** By key (ENG-12, owner/repo#3) or binding id: open bindings first, then the newest. */
     /** A binding by id or entity key; with a project, only that project's. */

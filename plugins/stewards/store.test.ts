@@ -382,9 +382,21 @@ describe("adoption claims (BB-318)", () => {
     const second = s.createIfNoOpen(fields("p2"));
     expect(second).toMatchObject({ projectId: "p2", entityId: "uuid-318", endedAt: null });
     expect(s.openByEntity("linear", "uuid-318")?.id).toBe(second!.id);
-    // `byEntity` still returns the oldest binding, ended or not, for callers
-    // that need a binding whatever its state.
-    expect(s.byEntity("linear", "uuid-318")?.id).toBe(first.id);
+    // `byEntity` prefers the open binding, so rings, sessions and approvals
+    // act on the project that owns the entity now, not the old ended row.
+    expect(s.byEntity("linear", "uuid-318")?.id).toBe(second!.id);
+  });
+
+  it("byEntity prefers the open binding, and otherwise the newest ended one", () => {
+    const { s, advance } = store();
+    const older = s.create(fields("p1"));
+    s.patch(older.id, { endedAt: 2_000, endReason: "moved" });
+    advance(1_000);
+    const newer = s.create(fields("p2"));
+    s.patch(newer.id, { endedAt: 4_000, endReason: "moved" });
+    expect(s.byEntity("linear", "uuid-318")?.id).toBe(newer.id);
+    const open = s.createIfNoOpen(fields("p3"));
+    expect(s.byEntity("linear", "uuid-318")?.id).toBe(open!.id);
   });
 
   it("an ended binding in another project does not block adoption either", () => {

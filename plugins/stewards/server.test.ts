@@ -2547,8 +2547,17 @@ describe("a ticket that moves to another project's team", () => {
 
     // The new project adopts it on the next ring.
     await t.ring("linear", "uuid-12");
-    expect(t.hooks.store.find("BCP-12", "p2")).toMatchObject({ projectId: "p2", endedAt: null });
+    const p2 = t.hooks.store.find("BCP-12", "p2")!;
+    expect(p2).toMatchObject({ projectId: "p2", endedAt: null });
     expect(t.hooks.store.openByEntity("linear", "uuid-12")?.projectId).toBe("p2");
+    expect(t.hooks.store.byEntity("linear", "uuid-12")?.projectId).toBe("p2");
+
+    // A later ring reaches p2's open binding, not p1's ended one: `byEntity`
+    // prefers the open row and every binding of the entity is rung, so a state
+    // change on the new project's ticket is not lost.
+    t.entities.set("uuid-12", issue({ unit: "BCP", key: "BCP-12", url: "https://linear.app/acme/issue/BCP-12", state: "Done", stateType: "completed" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.binding(p2.id)).toMatchObject({ ending: "terminal", endedAt: null });
   });
 });
 

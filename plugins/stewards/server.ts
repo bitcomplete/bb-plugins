@@ -6777,10 +6777,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** A ring from a source: look at the binding(s) it concerns, or consider adopting. */
     async function onRing(source: Source, id: string): Promise<void> {
       const bound = store.byEntity(source, id);
-      // An ended binding still reconciles (it may reopen), but it no longer
-      // owns the entity: an open binding does, and only that one blocks
-      // adoption by another project (BB-318).
-      if (bound !== null) scheduleReconcile(bound.id);
+      // Ring every binding of the entity, not only the one `byEntity` picks:
+      // the open binding owns it and reconciles the doorbell, and an ended one
+      // in another project may reopen (BB-318). `byEntity` prefers the open
+      // binding, so `bound` below is it when one exists.
+      for (const bindingId of store.bindingIdsForEntity(source, id)) scheduleReconcile(bindingId);
       if (source === "github") {
         // BB-286: a repository ring (no `#`) comes from github-watcher's
         // reconnect sweep. Re-read every open binding whose playbook names a
