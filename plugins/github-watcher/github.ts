@@ -418,9 +418,11 @@ const sortComments = <C extends Comment>(comments: C[]): C[] => [...comments].so
 export const clipText = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 
 /**
- * An issue's linked pull requests: the ones that close it, plus the pull
- * requests cross-referenced in its timeline, deduped, each as its URL and
- * "owner/repo#n" when the number and repository are there (source-contract.ts).
+ * An issue's linked pull requests: the ones that close it first, then the
+ * pull requests cross-referenced in its timeline newest first, deduped, each
+ * as its URL and "owner/repo#n" when the number and repository are there
+ * (source-contract.ts). The timeline is read oldest first (`first: 100`), so
+ * it is walked from the end.
  */
 function linkedPullsOf(node: z.infer<typeof issueNode>): Array<{ url: string; key: string | null }> {
   const out: Array<{ url: string; key: string | null }> = [];
@@ -438,7 +440,8 @@ function linkedPullsOf(node: z.infer<typeof issueNode>): Array<{ url: string; ke
     out.push({ url, key });
   };
   for (const p of node.closedByPullRequestsReferences?.nodes ?? []) add(p);
-  for (const item of node.timelineItems?.nodes ?? []) add(item.source);
+  const timeline = node.timelineItems?.nodes ?? [];
+  for (let i = timeline.length - 1; i >= 0; i--) add(timeline[i]?.source);
   return out;
 }
 

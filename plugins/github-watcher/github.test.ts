@@ -298,14 +298,16 @@ describe("an issue as a stewards entity (BB-233)", () => {
     expect(parseSnapshot(issue({ state: "CLOSED", stateReason: "COMPLETED", labels: { nodes: [{ name: "status:done" }] } }))!.state).toBe("closed (completed)");
   });
 
-  it("reads linked pulls from closing references and timeline cross-references, deduped as owner/repo#n", () => {
+  it("reads linked pulls from closing references first, then timeline cross-references newest first, deduped as owner/repo#n (BB-316)", () => {
     const linked = parseSnapshot(
       issue({
         closedByPullRequestsReferences: { nodes: [{ number: 7, url: "https://github.com/Acme/Widgets/pull/7", repository: { nameWithOwner: "Acme/Widgets" } }] },
         timelineItems: {
+          // The timeline is read oldest first, so 11 is the newest cross-reference.
           nodes: [
             { source: { number: 7, url: "https://github.com/Acme/Widgets/pull/7", repository: { nameWithOwner: "Acme/Widgets" } } },
             { source: { number: 9, url: "https://github.com/Other/Repo/pull/9", repository: { nameWithOwner: "Other/Repo" } } },
+            { source: { number: 11, url: "https://github.com/Other/Repo/pull/11", repository: { nameWithOwner: "Other/Repo" } } },
             // A cross-reference from an issue, or a node GitHub returned no fields for, contributes nothing.
             { source: {} },
             {},
@@ -315,6 +317,7 @@ describe("an issue as a stewards entity (BB-233)", () => {
     )!;
     expect(linked.linkedPulls).toEqual([
       { url: "https://github.com/Acme/Widgets/pull/7", key: "Acme/Widgets#7" },
+      { url: "https://github.com/Other/Repo/pull/11", key: "Other/Repo#11" },
       { url: "https://github.com/Other/Repo/pull/9", key: "Other/Repo#9" },
     ]);
     // A pull request's linkedPulls stays empty.

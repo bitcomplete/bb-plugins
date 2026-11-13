@@ -266,9 +266,11 @@ export const entitySnapshotSchema = z.object({
    */
   relationsUnread: z.boolean().optional(),
   /**
-   * Pull requests linked to the entity, by URL; "owner/repo#12" when it
-   * parses. Linear: the issue's linked pull requests. GitHub: an issue's
-   * closing references and cross-references, populated from the issue.
+   * Pull requests linked to the entity, newest first, by URL; "owner/repo#12"
+   * when it parses. A consumer that caps keeps the head. Linear: the issue's
+   * linked pull requests, by attachment `createdAt` descending. GitHub: an
+   * issue's closing references first, then its timeline cross-references
+   * newest first.
    */
   linkedPulls: z.array(z.object({ url: z.string(), key: z.string().nullable() })),
   pull: snapshotPullSchema.nullable(),

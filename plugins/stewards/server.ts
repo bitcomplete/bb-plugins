@@ -1534,7 +1534,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (binding !== null && binding.source !== "ops") {
         const entity = await snapshot(binding.source, binding.entityId);
         if (entity === null) return null;
-        const pulls = binding.kind === "ticket" ? await linkedPulls(entity) : [];
+        const pulls = binding.kind === "ticket" ? await linkedPulls(entity, binding.lastSnapshot) : [];
         return { entity, pulls, at: now() };
       }
       const source = sourceForKey(projectId, key);
@@ -3035,39 +3035,66 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The linked pull request keys a look reads, at most five (the cap bounds
-     * GitHub reads per look, BB-263). The newest are kept: a ticket with more
-     * than five linked pull requests must still observe the one that still
-     * matters, so older merged ones never displace a newer open one. Today the
-     * snapshot contract carries only `url` and `key` (source-contract.ts), so
-     * the newest five in timeline order (the tail) are taken; if a source ever
-     * carries a per-link state, open and unmerged pull requests are preferred
-     * (newest first, then the newest of the rest).
+     * The safety ceiling on linked pull requests read in one look (BB-316): a
+     * ticket cross-referenced by very many pull requests must not turn one look
+     * into hundreds of GitHub reads. Applied after newest-first ordering, so it
+     * can never drop a newer open pull request in favour of an older merged one.
+     */
+    const LINKED_PULLS_MAX = 20;
+
+    /**
+     * How long after it was last read a merged linked pull request is read
+     * again before it is carried forward from the snapshot (BB-316): the
+     * worker's "Merged" comment can land just after the merge, so keep reading
+     * for about an hour, then stop. A closed pull request is never carried
+     * forward, because it can be reopened.
+     */
+    const LINKED_PULL_MERGED_GRACE_MS = 60 * 60_000;
+
+    /**
+     * The linked pull request keys a look reads, at most `LINKED_PULLS_MAX`
+     * (the ceiling bounds GitHub reads per look, BB-316). The contract sends
+     * them newest first (source-contract.ts), so the order is taken as sent;
+     * with newest-first order the ceiling can never drop a newer open pull
+     * request in favour of an older merged one. If a source ever carries a
+     * per-link state, open and unmerged pull requests are preferred (newest
+     * first, then the newest of the rest).
      */
     function linkedPullKeys(entity: EntitySnapshot): string[] {
       const seen = new Set<string>();
-      const linked: Array<{ key: string; state: string | null; index: number }> = [];
-      entity.linkedPulls.forEach((l, index) => {
+      const linked: Array<{ key: string; state: string | null }> = [];
+      entity.linkedPulls.forEach((l) => {
         if (l.key === null) return;
         const key = lc(l.key);
         if (seen.has(key)) return;
         seen.add(key);
         const state = (l as { state?: unknown }).state;
-        linked.push({ key: l.key, state: typeof state === "string" ? lc(state) : null, index });
+        linked.push({ key: l.key, state: typeof state === "string" ? lc(state) : null });
       });
-      // Timeline order is oldest first, so descending index is newest first.
-      const newestFirst = [...linked].sort((a, b) => b.index - a.index);
       const isMerged = (l: { state: string | null }) => l.state !== null && ["merged", "closed"].includes(l.state);
       const carriesState = linked.some((l) => l.state !== null);
-      const ordered = carriesState ? [...newestFirst.filter((l) => !isMerged(l)), ...newestFirst.filter(isMerged)] : newestFirst;
-      return ordered.slice(0, 5).map((l) => l.key);
+      const ordered = carriesState ? [...linked.filter((l) => !isMerged(l)), ...linked.filter(isMerged)] : linked;
+      return ordered.slice(0, LINKED_PULLS_MAX).map((l) => l.key);
     }
 
-    /** A ticket's linked pull requests, read from github. One that cannot be read is left out. */
-    async function linkedPulls(entity: EntitySnapshot): Promise<EntitySnapshot[]> {
+    /**
+     * A ticket's linked pull requests, read from github. `prev` is the
+     * binding's last snapshot, when there is one: a pull request the last
+     * snapshot saw merged and last read more than `LINKED_PULL_MERGED_GRACE_MS`
+     * ago is carried forward from that snapshot without a read (BB-316), so a
+     * ticket with many merged links does not re-read them forever. An open or
+     * never-seen pull request is always read, and a closed one is always read
+     * because it can be reopened. One that cannot be read is left out.
+     */
+    async function linkedPulls(entity: EntitySnapshot, prev: Observed | null = null): Promise<EntitySnapshot[]> {
       const keys = linkedPullKeys(entity);
       const pulls: EntitySnapshot[] = [];
       for (const key of keys) {
+        const previous = prev?.pulls.find((p) => lc(p.key) === lc(key)) ?? null;
+        if (previous !== null && previous.pull?.merged === true && prev !== null && prev.at !== undefined && now() - prev.at > LINKED_PULL_MERGED_GRACE_MS) {
+          pulls.push(previous);
+          continue;
+        }
         try {
           const pull = await snapshot("github", key);
           if (pull !== null) pulls.push(pull);
@@ -3093,7 +3120,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
       if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now() }, complete: true };
       const keys = linkedPullKeys(entity);
-      const pulls = await linkedPulls(entity);
+      const pulls = await linkedPulls(entity, b.lastSnapshot);
       return { observed: { entity, pulls, at: now() }, complete: pulls.length >= keys.length };
     }
 
@@ -4631,7 +4658,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       // An unread relation keeps the last known parent and children (BB-244).
       entity = keepRelations(b.lastSnapshot?.entity ?? null, entity);
-      const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [], at: now() };
+      const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity, b.lastSnapshot) : [], at: now() };
       const prev = b.lastSnapshot;
 
       // BB-53: a merged pull request whose playbook names a deployment target
@@ -7711,7 +7738,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       shortSha,
       scheduleReconcile,
       snapshot,
-      linkedPulls,
+      // The page's approve/decline path calls `linkedPulls` with only the
+      // entity (approvals.ts), so bind the binding's last snapshot here to give
+      // it the same merged-pull carry-forward as every other caller (BB-316).
+      linkedPulls: (entity) => linkedPulls(entity, store.byEntity(entity.source, entity.id)?.lastSnapshot ?? null),
       threadInfo,
       sendTo,
       wakeProject,
@@ -10295,7 +10325,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const freshPull = async (): Promise<EntitySnapshot | null> => {
           const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
           if (entity === null) return null;
-          const pulls = b.kind === "ticket" ? await linkedPulls(entity) : [];
+          const pulls = b.kind === "ticket" ? await linkedPulls(entity, b.lastSnapshot) : [];
           return [entity, ...pulls].find((e) => (e.url ?? e.key) === need.url || e.key === need.url) ?? (entity.pull === null ? null : entity);
         };
 
