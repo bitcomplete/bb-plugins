@@ -3080,20 +3080,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * A ticket's linked pull requests, read from github. `prev` is the
      * binding's last snapshot, when there is one: a pull request the last
-     * snapshot saw merged and last read more than `LINKED_PULL_MERGED_GRACE_MS`
-     * ago is carried forward from that snapshot without a read (BB-316), so a
-     * ticket with many merged links does not re-read them forever. An open or
-     * never-seen pull request is always read, and a closed one is always read
-     * because it can be reopened. One that cannot be read is left out.
+     * snapshot saw merged and whose `mergedAt` is more than
+     * `LINKED_PULL_MERGED_GRACE_MS` ago is carried forward from that snapshot
+     * without a read (BB-316), so a ticket with many merged links does not
+     * re-read them forever. An open or never-seen pull request is always read,
+     * a merged one with no `mergedAt` is re-read, and a closed one is always
+     * read because it can be reopened. One that cannot be read is left out.
      */
     async function linkedPulls(entity: EntitySnapshot, prev: Observed | null = null): Promise<EntitySnapshot[]> {
       const keys = linkedPullKeys(entity);
       const pulls: EntitySnapshot[] = [];
       for (const key of keys) {
         const previous = prev?.pulls.find((p) => lc(p.key) === lc(key)) ?? null;
-        if (previous !== null && previous.pull?.merged === true && prev !== null && prev.at !== undefined && now() - prev.at > LINKED_PULL_MERGED_GRACE_MS) {
-          pulls.push(previous);
-          continue;
+        const mergedAt = previous !== null && previous.pull?.merged === true ? previous.pull.mergedAt : null;
+        if (previous !== null && mergedAt !== null && mergedAt !== undefined) {
+          const mergedAtMs = Date.parse(mergedAt);
+          if (!Number.isNaN(mergedAtMs) && now() - mergedAtMs > LINKED_PULL_MERGED_GRACE_MS) {
+            pulls.push(previous);
+            continue;
+          }
         }
         try {
           const pull = await snapshot("github", key);

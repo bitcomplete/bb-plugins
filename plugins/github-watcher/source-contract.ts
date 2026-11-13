@@ -195,6 +195,14 @@ export const snapshotPullSchema = z.object({
    */
   mergeCommit: z.string().nullable().default(null),
   /**
+   * When GitHub recorded the merge (its `mergedAt`). A consumer that carries a
+   * merged linked pull request forward from its last snapshot measures the
+   * grace from this, so a look that saw the merge more than the grace ago does
+   * not read it again; null (not merged, or the source could not read it) is
+   * re-read rather than trusted (BB-316).
+   */
+  mergedAt: z.string().nullable().default(null),
+  /**
    * The paths the pull request changed (up to GitHub's first 100), for
    * matching a deployment rule's `when.paths`. A pull request changing more
    * than 100 files can miss a rule whose path falls outside the first page.

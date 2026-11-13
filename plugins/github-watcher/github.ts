@@ -151,7 +151,7 @@ const targetDocument = (issueRelations: string) => `query($owner: String!, $name
   ... on Issue { ${COMMON_FIELDS} state stateReason ${issueRelations}
     closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { number url repository { nameWithOwner } } }
     timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) { nodes { ... on CrossReferencedEvent { source { ... on PullRequest { number url repository { nameWithOwner } } } } } } }
-  ... on PullRequest { ${COMMON_FIELDS} state isDraft merged reviewDecision headRefName headRefOid baseRefName
+  ... on PullRequest { ${COMMON_FIELDS} state isDraft merged mergedAt reviewDecision headRefName headRefOid baseRefName
     mergeCommit { oid }
     files(first: 100) { nodes { path } }
     timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
@@ -231,6 +231,7 @@ const pullNode = z.object({
   state: z.string(),
   isDraft: z.boolean().nullish(),
   merged: z.boolean().nullish(),
+  mergedAt: z.string().nullish(),
   mergeCommit: z.object({ oid: z.string() }).nullish(),
   files: z.object({ nodes: z.array(z.object({ path: z.string() })) }).nullish(),
   timelineItems: z.object({ nodes: z.array(z.object({ createdAt: z.string().nullish() })).nullish() }).nullish(),
@@ -564,6 +565,7 @@ export function parseSnapshot(payload: unknown, relationsUnread = false): Entity
       reviews,
       checks: p.checks,
       mergeCommit: node.mergeCommit?.oid ?? null,
+      mergedAt: node.mergedAt ?? null,
       files: (node.files?.nodes ?? []).map((f) => f.path).sort(),
     },
   };
