@@ -212,13 +212,15 @@ function fit(head: string[], middle: string[], tail: string[], maxChars = WAKE_M
 }
 
 /** Why this wake: an ordinary reconcile, or a lifecycle turn with its own instructions. */
-export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "disabled" | "reassigned" | "reopen";
+export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "disabled" | "reassigned" | "moved" | "reopen";
 
 const LIFECYCLE_INSTRUCTIONS: Partial<Record<WakeReason, string>> = {
   detach:
     "The label was removed, so this binding is detached. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying the work is done here. Adding the label back brings this thread back.",
   reassigned:
     "The ticket's assignee no longer includes this server's login, so this binding is ending. Take no new actions on the entity and start no workers; running workers have been stopped. The new assignee's server adopts the ticket on its next doorbell or sweep. End with steward_report, saying where the work stands. Assigning the ticket back to this server resumes this thread.",
+  moved:
+    "The ticket's team is no longer one this project watches, so this binding is ending. Take no new actions on the entity and start no workers; running workers have been stopped. The project that watches the team now adopts the ticket on its next doorbell or sweep. End with steward_report, saying where the work stands. If the team is watched here again, this thread resumes.",
   disabled:
     "Stewards for this project were switched off on this server, so this binding is ending. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying where the work stands. Switching the project back on resumes this thread.",
   reopen: "The entity came back from a terminal or detached state and this binding has resumed. Re-read everything below as if new.",

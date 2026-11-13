@@ -4802,7 +4802,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // failed never reaches here, so a partial or rate-limited read keeps the
       // binding.
       const owner = entity.source === "github" ? config.githubLogin : config.linearLogin;
-      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner });
+      // BB-318: whether this binding's project still watches the entity's
+      // Linear team. Only a Linear ticket is checked; a GitHub repo is in one
+      // project, so the same bug does not arise there.
+      const projectWatches = entity.source === "linear" ? config.file.linear.teams.some((t) => lc(t) === lc(entity.unit)) : undefined;
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner, ...(projectWatches === undefined ? {} : { projectWatches }) });
       // A binding with no steward thread is still awaiting adoption: a first
       // wake lost to a transient read is retried on the next reconcile, as the
       // ops, deps and sentry paths already do (BB-92).
@@ -4814,6 +4818,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (life.kind === "reopen") {
+        // Another project already holds this entity open: reopening here would
+        // be a second open binding for it, so this ended one stays ended
+        // (BB-318).
+        const other = store.openByEntity(b.source, b.entityId);
+        if (other !== null && other.id !== b.id) {
+          signalNeedActionability(b, observed);
+          store.patch(b.id, { lastSnapshot: observed });
+          return;
+        }
         b = await reopen(b, life.why);
         reason = "reopen";
       }
@@ -4821,7 +4834,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // only one that has not begun ending: one already following through (a
       // ticket Done with its pull request still open) must keep falling
       // through to the wake, so the deployment is not swallowed.
-      if ((life.kind === "terminal" || life.kind === "detach" || life.kind === "reassigned") && !(life.kind === "terminal" && awaitingDeploy && b.ending === null)) {
+      if ((life.kind === "terminal" || life.kind === "detach" || life.kind === "reassigned" || life.kind === "moved") && !(life.kind === "terminal" && awaitingDeploy && b.ending === null)) {
         if (b.ending === null) {
           await beginEnding(b, config, playbook, life.kind, observed);
           return;
@@ -6243,15 +6256,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const TERMINAL_WORKER_REPORT_MS = 15 * 60_000;
 
     /**
-     * The one wrap-up (terminal) or stop (detach, disabled, reassigned) turn
-     * before the binding ends. A detach stops the workers now: someone took
-     * the label off; a reassignment or an unassignment releases the binding
-     * the same way. A terminal state leaves them running through the wrap-up
-     * turn, in which the steward may keep the binding open to follow through
-     * (a deploy to watch, production to verify); they are stopped when it
-     * ends.
+     * The one wrap-up (terminal) or stop (detach, disabled, reassigned,
+     * moved) turn before the binding ends. A detach stops the workers now:
+     * someone took the label off; a reassignment, an unassignment or a move to
+     * another project's team releases the binding the same way. A terminal
+     * state leaves them running through the wrap-up turn, in which the steward
+     * may keep the binding open to follow through (a deploy to watch,
+     * production to verify); they are stopped when it ends.
      */
-    async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach" | "disabled" | "reassigned", observed: Observed): Promise<void> {
+    async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach" | "disabled" | "reassigned" | "moved", observed: Observed): Promise<void> {
       // BB-52 rule 4: the steward's own last report already named the terminal
       // state, or a worker's final message says it moved the entity there, so
       // the binding's own last turn set it and said the work is done. End from
@@ -6267,9 +6280,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       signalNeedActionability(b, observed);
       b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
-      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : "was detached");
+      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : kind === "moved" ? `moved to the ${observed.entity.unit} team, which this project does not watch` : "was detached");
       if (kind !== "terminal") await stopWorkers(b);
-      bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "is ending because its project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : "was detached"}; one last turn`);
+      bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "is ending because its project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : kind === "moved" ? `moved to the ${observed.entity.unit} team, which this project does not watch` : "was detached"}; one last turn`);
       if (b.threadId === null) {
         await finishEnding(b, kind);
         return;
@@ -6284,7 +6297,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await finishEnding(b, "terminal");
         return;
       }
-      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : kind === "reassigned" ? `Reassigned: ${observed.entity.assignees.join(", ") || "no assignee"}` : `The ${config.file.label} label was removed`], kind);
+      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : kind === "reassigned" ? `Reassigned: ${observed.entity.assignees.join(", ") || "no assignee"}` : kind === "moved" ? `Moved: ${observed.entity.unit} is not a team this project watches` : `The ${config.file.label} label was removed`], kind);
     }
 
     /**
@@ -6590,7 +6603,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if ((await settings.get()).paused) return null;
       const config = projectFor(projects, entity);
       if (config === null) return null;
-      if (store.byEntity(entity.source, entity.id) !== null) return null;
+      // Only an open binding claims the entity. An ended binding in another
+      // project (its team moved away) must not block adoption here (BB-318).
+      if (store.openByEntity(entity.source, entity.id) !== null) return null;
       const full = { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [], title: entity.title, branch: entity.pull?.head ?? null, files: entity.pull?.files };
       const kind = adoptionKind(config, full, entity.viewer);
       if (kind === null) return null;
@@ -6606,7 +6621,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const { phase, stage } = phaseAndStage(playbook, entity.state, entity.labels);
       let b: Binding;
       try {
-        b = store.create({
+        // Check-and-insert in one transaction, so two projects cannot both
+        // adopt the entity at once (BB-318).
+        const created = store.createIfNoOpen({
           projectId: config.projectId,
           source: entity.source,
           entityId: entity.id,
@@ -6621,6 +6638,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           phase,
           stage,
         });
+        if (created === null) return null; // an open binding already claims it
+        b = created;
       } catch {
         return null; // adopted concurrently
       }
@@ -6758,7 +6777,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** A ring from a source: look at the binding(s) it concerns, or consider adopting. */
     async function onRing(source: Source, id: string): Promise<void> {
       const bound = store.byEntity(source, id);
-      if (bound !== null) scheduleReconcile(bound.id);
+      // Ring every binding of the entity, not only the one `byEntity` picks:
+      // the open binding owns it and reconciles the doorbell, and an ended one
+      // in another project may reopen (BB-318). `byEntity` prefers the open
+      // binding, so `bound` below is it when one exists.
+      for (const bindingId of store.bindingIdsForEntity(source, id)) scheduleReconcile(bindingId);
       if (source === "github") {
         // BB-286: a repository ring (no `#`) comes from github-watcher's
         // reconnect sweep. Re-read every open binding whose playbook names a
@@ -6787,7 +6810,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id))) scheduleReconcile(t.id);
         }
       }
-      if (bound !== null) return;
+      if (bound !== null && bound.endedAt === null) return;
       const projects = await stewardedProjects();
       if (projects.length === 0) return;
       const entity = await snapshot(source, id);
@@ -6813,7 +6836,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const out = await sourceRpc(source, "sourceAdoptable", { units, label: config.file.label, limit: 300 }, sourceContract.sourceAdoptable.output);
           for (const e of out.errors) bb.log.warn(`stewards: ${source} adoption list: ${e}`);
           for (const e of out.entities) {
-            if (store.byEntity(source, e.id) !== null) continue;
+            if (store.openByEntity(source, e.id) !== null) continue;
             if (adoptionKind(config, { source, ...e }, out.viewer) === null) continue;
             candidates.push({ source, id: e.id, createdAt: e.createdAt ?? "" });
           }

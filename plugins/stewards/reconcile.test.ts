@@ -525,6 +525,25 @@ describe("lifecycle", () => {
     expect(lifecycle({ ...open, endedAt: 1, endReason: "reassigned" }, tickets, issue({ assignees: ["jane"] }), "bb-managed", { owner }).kind).toBe("reopen");
     expect(lifecycle({ ...open, endedAt: 1, endReason: "reassigned" }, tickets, issue({ assignees: ["sam"] }), "bb-managed", { owner }).kind).toBe("stay-ended");
   });
+
+  it("releases a ticket whose team this project no longer watches, and reopens it when the team returns (BB-318)", () => {
+    // The issue's team (ENG) is not in this project's linear.teams any more.
+    expect(lifecycle(open, tickets, issue(), "bb-managed", { projectWatches: false }).kind).toBe("moved");
+    // Watched here again: an open binding carries on.
+    expect(lifecycle(open, tickets, issue(), "bb-managed", { projectWatches: true }).kind).toBe("continue");
+    // A moved binding stays ended while the team is not watched here, and
+    // resumes once it is.
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "moved" }, tickets, issue(), "bb-managed", { projectWatches: false }).kind).toBe("stay-ended");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "moved" }, tickets, issue(), "bb-managed", { projectWatches: true }).kind).toBe("reopen");
+    // Any ended binding stays ended when the team has left, whatever its end
+    // reason: the project that watches the team now owns the entity.
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "detach" }, tickets, issue(), "bb-managed", { projectWatches: false }).kind).toBe("stay-ended");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "terminal" }, tickets, issue({ state: "Todo" }), "bb-managed", { projectWatches: false }).kind).toBe("stay-ended");
+    // Without the option (a GitHub ticket, or a caller that did not check) the
+    // existing reopen behaviour is unchanged.
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "detach" }, tickets, issue(), "bb-managed").kind).toBe("reopen");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "moved" }, tickets, issue(), "bb-managed").kind).toBe("reopen");
+  });
 });
 
 // BB-243: an initiative is a ticket routed to the `initiative` playbook. All three endings
