@@ -354,6 +354,57 @@ describe("the sweep's narrow binding reads (BB-295)", () => {
   });
 });
 
+// BB-318: adoption keys on the one open binding for an entity, across every
+// project on the server. An ended binding in one project must not block
+// another project, and no two open bindings may claim the same entity.
+describe("adoption claims (BB-318)", () => {
+  const fields = (projectId: string) => ({
+    projectId,
+    source: "linear" as const,
+    entityId: "uuid-318",
+    entityKey: "ENG-318",
+    url: null,
+    title: "Move me",
+    kind: "ticket" as const,
+    playbook: "linear-tickets",
+    playbookVersion: "v1",
+    parentBindingId: null,
+    phase: "Todo",
+    stage: "spec" as const,
+  });
+
+  it("an issue moved between teams is adopted by the new project: an ended binding does not block it", () => {
+    const { s } = store();
+    const first = s.create(fields("p1"));
+    s.patch(first.id, { endedAt: 2_000, endReason: "moved" });
+    // The ended binding no longer answers the open-claims lookup, so p2 adopts.
+    expect(s.openByEntity("linear", "uuid-318")).toBeNull();
+    const second = s.createIfNoOpen(fields("p2"));
+    expect(second).toMatchObject({ projectId: "p2", entityId: "uuid-318", endedAt: null });
+    expect(s.openByEntity("linear", "uuid-318")?.id).toBe(second!.id);
+    // `byEntity` still returns the oldest binding, ended or not, for callers
+    // that need a binding whatever its state.
+    expect(s.byEntity("linear", "uuid-318")?.id).toBe(first.id);
+  });
+
+  it("an ended binding in another project does not block adoption either", () => {
+    const { s } = store();
+    const old = s.create(fields("p2"));
+    s.patch(old.id, { endedAt: 3_000, endReason: "detach" });
+    expect(s.createIfNoOpen(fields("p1"))).not.toBeNull();
+  });
+
+  it("two live bindings for one entity are still refused", () => {
+    const { s } = store();
+    const first = s.create(fields("p1"));
+    expect(s.openByEntity("linear", "uuid-318")?.id).toBe(first.id);
+    // A second project cannot claim an entity another project already holds
+    // open, and the refused call writes no row.
+    expect(s.createIfNoOpen(fields("p2"))).toBeNull();
+    expect(s.all().filter((b) => b.entityId === "uuid-318" && b.endedAt === null)).toHaveLength(1);
+  });
+});
+
 describe("lessons", () => {
   it("are recorded pending with their source, and resolved once", () => {
     const { s, binding, advance } = store();

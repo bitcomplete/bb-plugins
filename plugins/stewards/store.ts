@@ -1617,6 +1617,10 @@ export interface StoreOptions {
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
   const getBinding = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE id = ?");
   const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at LIMIT 1");
+  // BB-318: the one open binding an entity may have, across every project on
+  // this server. `byEntity` returns a binding whatever its state, which an
+  // ended one in another project must not use to block adoption.
+  const openByEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE AND ended_at IS NULL ORDER BY created_at LIMIT 1");
   const byKey = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
   const byThread = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1");
   const openForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? AND ended_at IS NULL ORDER BY created_at");
@@ -2330,6 +2334,29 @@ export function createStore(db: Database.Database, now: () => number, options: S
     if (deliver && x.origin.threadId !== null && x.origin.threadId !== "") insertDelivery.run(newId("dlv"), x.id, x.origin.threadId, originBindingId === "" ? null : originBindingId, resolution, by, now());
   }
 
+  /** Insert one binding row and read it back. Shared by `create` and `createIfNoOpen`. */
+  function insertBindingRow(fields: NewBinding): Binding {
+    const id = newId("bnd");
+    insertBinding.run({
+      id,
+      project_id: fields.projectId,
+      source: fields.source,
+      entity_id: fields.entityId,
+      entity_key: fields.entityKey,
+      url: fields.url,
+      title: fields.title,
+      kind: fields.kind,
+      playbook: fields.playbook,
+      playbook_version: fields.playbookVersion,
+      adopted_by: fields.adoptedBy ?? null,
+      parent_binding_id: fields.parentBindingId,
+      phase: fields.phase,
+      stage: fields.stage,
+      created_at: now(),
+    });
+    return rowToBinding(getBinding.get(id)!);
+  }
+
   /** Write the given columns and return the raw row, with no realtime signal. */
   function writeBinding(id: string, fields: BindingPatch): BindingRow {
     const entries = Object.entries(fields).filter(([, v]) => v !== undefined) as Array<[keyof typeof COLUMNS, unknown]>;
@@ -2408,6 +2435,11 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     byEntity(source: BindingSource, entityId: string): Binding | null {
       const r = byEntity.get(source, entityId);
+      return r === undefined ? null : rowToBinding(r);
+    },
+    /** The open binding for an entity, or null. An ended binding in another project does not answer here (BB-318). */
+    openByEntity(source: BindingSource, entityId: string): Binding | null {
+      const r = openByEntity.get(source, entityId);
       return r === undefined ? null : rowToBinding(r);
     },
     /** By key (ENG-12, owner/repo#3) or binding id: open bindings first, then the newest. */
@@ -2496,25 +2528,22 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return dueRequeue.all(now()).map(rowToBinding);
     },
     create(fields: NewBinding): Binding {
-      const id = newId("bnd");
-      insertBinding.run({
-        id,
-        project_id: fields.projectId,
-        source: fields.source,
-        entity_id: fields.entityId,
-        entity_key: fields.entityKey,
-        url: fields.url,
-        title: fields.title,
-        kind: fields.kind,
-        playbook: fields.playbook,
-        playbook_version: fields.playbookVersion,
-        adopted_by: fields.adoptedBy ?? null,
-        parent_binding_id: fields.parentBindingId,
-        phase: fields.phase,
-        stage: fields.stage,
-        created_at: now(),
-      });
-      return rowToBinding(getBinding.get(id)!);
+      return insertBindingRow(fields);
+    },
+    /**
+     * Create a binding only while no open binding already claims the entity,
+     * whatever project it is in (BB-318). Returns null instead of inserting a
+     * second open binding, so two projects cannot adopt the same entity at
+     * once; the check and the insert are one transaction. An ended binding is
+     * ignored here: another project may adopt an entity whose earlier binding
+     * has ended. The per-project UNIQUE constraint still refuses a second row
+     * for the same project.
+     */
+    createIfNoOpen(fields: NewBinding): Binding | null {
+      return db.transaction(() => {
+        if (openByEntity.get(fields.source, fields.entityId) !== undefined) return null;
+        return insertBindingRow(fields);
+      })();
     },
     patch,
     /**

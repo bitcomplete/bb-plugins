@@ -813,6 +813,7 @@ export type Lifecycle =
   | { kind: "terminal" }
   | { kind: "detach" }
   | { kind: "reassigned" }
+  | { kind: "moved" }
   | { kind: "reopen"; why: string }
   | { kind: "stay-ended" };
 
@@ -840,8 +841,14 @@ const assignedTo = (entity: EntitySnapshot, owner: string | null): boolean =>
  * this server's Linear login, and is passed only when the snapshot that
  * carries `assignees` was read successfully; a read that failed never
  * reaches here, so a partial or rate-limited read never ends a binding.
+ *
+ * `opts.projectWatches` is whether the binding's project still watches the
+ * entity's team (a Linear ticket's `unit`). False releases the ticket to the
+ * project that watches it now, with the `moved` end reason, and keeps an
+ * ended binding ended here so it cannot reopen into a second open binding
+ * while the new project holds it (BB-318).
  */
-export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean; owner?: string | null } = {}): Lifecycle {
+export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean; owner?: string | null; projectWatches?: boolean } = {}): Lifecycle {
   const terminal = isTerminal(playbook, entity.state);
   // A review binding is not labelled; a binding the plugin adopts itself (a
   // dependency bot's pull request) has no label to hold it, so its label is
@@ -850,14 +857,25 @@ export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason
   const mine = assignedTo(entity, opts.owner ?? null);
   if (binding.endedAt !== null) {
     if (terminal || !labelled || binding.manualDetach) return { kind: "stay-ended" };
+    // The team left this project, so an ended binding stays ended here even if
+    // its end reason would otherwise reopen: the project that watches the
+    // team now owns the entity (BB-318).
+    if (opts.projectWatches === false) return { kind: "stay-ended" };
     if (binding.endReason === "terminal") return { kind: "reopen", why: `reopened: now ${entity.state}` };
     if (binding.endReason === "detach") return { kind: "reopen", why: `the ${label} label is back` };
     // A ticket released on reassignment comes back when it is assigned here
     // again; one still assigned elsewhere stays ended.
     if (binding.endReason === "reassigned") return mine ? { kind: "reopen", why: "reassigned to this server" } : { kind: "stay-ended" };
+    // A ticket released because its team left comes back when the team is
+    // watched here again.
+    if (binding.endReason === "moved") return { kind: "reopen", why: `the ${entity.unit} team is watched here again` };
     return { kind: "stay-ended" };
   }
   if (terminal) return { kind: "terminal" };
+  // A ticket whose team this project no longer watches is released to the
+  // project that watches it now (BB-318). Checked before the assignee release,
+  // so a moved ticket ends as `moved` even if it was also reassigned.
+  if (binding.kind === "ticket" && opts.projectWatches === false) return { kind: "moved" };
   // Only a ticket follows the assignee; a review binding is held by the
   // requested-reviewer check at adoption, and a pr binding by its label.
   // Checked before the follow-through reopen, so a ticket moved back to a

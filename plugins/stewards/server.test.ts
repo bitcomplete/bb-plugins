@@ -2509,6 +2509,49 @@ describe("a deleted project", () => {
   });
 });
 
+// BB-318: a ticket bound in one project is released when its team moves to a
+// team only another project watches, and the new project adopts it.
+describe("a ticket that moves to another project's team", () => {
+  it("ends the old binding with a stop turn and lets the new project adopt it", async () => {
+    const t = await setup();
+    const p2File = JSON.stringify({ ...(JSON.parse(t.files[PROJECT_FILE] ?? "{}") as Record<string, unknown>), linear: { teams: ["BCP"] } });
+    t.projectList.push({ id: "p2", name: "Beta" });
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "multi-repo" && args.method === "readProjectFiles" && (args.input as { projectId?: string } | undefined)?.projectId === "p2") {
+        const paths = (args.input as { paths: string[] }).paths;
+        return args.outputSchema.parse({ projectSourcePath: "/p2/.bb", head: "abc", files: paths.map((path) => ({ path, content: path === PROJECT_FILE ? p2File : (t.files[path] ?? null) })), error: null });
+      }
+      return original(args);
+    });
+    t.hooks.forgetConfigs();
+    await t.hooks.setProjectEnabled("p2", true);
+
+    // p1 watches ENG and adopts the ticket.
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const p1 = t.hooks.store.find("ENG-12", "p1")!;
+    const steward = p1.threadId!;
+    expect(p1).toMatchObject({ endedAt: null, ending: null });
+
+    // The owner moves the issue to BCP, which only p2 watches.
+    t.entities.set("uuid-12", issue({ unit: "BCP", key: "BCP-12", url: "https://linear.app/acme/issue/BCP-12" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.binding(p1.id)).toMatchObject({ endedAt: null, ending: "moved" });
+    expect(t.sends.some((s) => s.text.includes("team is no longer one this project watches"))).toBe(true);
+
+    // The stop turn ends: the binding ends with reason moved and stops blocking.
+    await t.idle(steward, "Stopped.");
+    expect(t.hooks.store.binding(p1.id)).toMatchObject({ endedAt: expect.any(Number), endReason: "moved" });
+    expect(t.hooks.store.openByEntity("linear", "uuid-12")).toBeNull();
+
+    // The new project adopts it on the next ring.
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("BCP-12", "p2")).toMatchObject({ projectId: "p2", endedAt: null });
+    expect(t.hooks.store.openByEntity("linear", "uuid-12")?.projectId).toBe("p2");
+  });
+});
+
 describe("the per-project switch", () => {
   /** An adopted ticket with a running worker, the shape most switch-off paths need. */
   async function working() {
