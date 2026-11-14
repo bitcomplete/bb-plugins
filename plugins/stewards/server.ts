@@ -88,7 +88,7 @@ import {
   type RolesFile,
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
@@ -101,7 +101,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
@@ -135,7 +135,7 @@ import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter,
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
-import { advanceStall, hasLiveWakeSource, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
+import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
@@ -3222,7 +3222,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     function liveWakeSourceFor(b: Binding, ownPulls: ReadonlySet<string>): boolean {
-      return hasLiveWakeSource(wakeSourcesFor(b, ownPulls));
+      return assessLiveWakeSource(wakeSourcesFor(b, ownPulls));
     }
 
     /**
@@ -4947,7 +4947,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         changes.push({ text: `Approved in ${sourceLabel} (now ${entity.state})`, actionable: true });
       }
       const workers = store.workers(b.id);
-      const workerInFlight = anyWorkerInFlight(workers);
       // Rule 0: which linked pull requests are the worker's own. Read the
       // branches and reported URLs whether or not a worker is in flight: the
       // diff only quiets them while one is, and the idle rule (BB-83) needs the
@@ -4964,6 +4963,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       } catch (error) {
         bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
       }
+      // BB-329: one worker-busy predicate. Every surface reads the assessment's
+      // worker state (assessment.ts `assessWorker`); the old `anyWorkerInFlight`
+      // / `runningWorkerReason` call sites are gone. `inFlight` is still
+      // running-or-parked today, so this is the same answer.
+      const workerInFlight = assessment?.worker.inFlight ?? assessWorker(workers).inFlight;
       // BB-285: which of the binding's own pull requests are gate-met. A
       // gate-met own pull request is the plugin's to act on, so it does not
       // suppress the idle wake (BB-83) the way an open one otherwise does.
@@ -4987,7 +4991,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // later of the last worker's end, the last own pull request's close and
       // the last wake; a worker finish asks for the look at once, without the
       // grace. An idle wake ends the period until one of those happens again.
-      const idle = idleInActiveStage(
+      // BB-329: the idle answer is derived in assessment.ts (`assessIdle`), so
+      // the surface and the stored assessment share one derivation.
+      const idle = assessIdle(
         { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, gateMetPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id), requeueUntil: b.requeueUntil },
         observed,
         now(),
@@ -5149,7 +5155,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const startStillDue =
           b.stage === "spec" &&
           gateState(playbook, b.ready, currentSpec).passed &&
-          !anyWorkerInFlight(store.workers(b.id)) &&
+          !assessWorker(store.workers(b.id)).inFlight &&
           b.hold === null &&
           !store.openEscalations(b.id).some((x) => x.kind === "approval" || x.kind === "schedule");
         if (!startStillDue) {
@@ -8356,7 +8362,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
-          } else if (runningWorkerReason(store.workers(b.id)) !== null) {
+          } else if (assessWorker(store.workers(b.id)).reason !== null) {
             // A worker's turn is in progress: it merges or handles the pull
             // request, so the plugin files nothing and merges nothing. A
             // `finished` (parked) worker is not running (BB-266).
@@ -8450,7 +8456,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // nor waiting on a person; after the window it is stuck. A retarget
           // episode is criterion 4's, not this one.
           if (mergedBase === null && !mergeHeld && !mergedThisLook && gateMetStuckMs > 0) {
-            const unattended = runningWorkerReason(store.workers(b.id)) === null && store.openNeeds(b.id).length === 0;
+            const unattended = assessWorker(store.workers(b.id)).reason === null && store.openNeeds(b.id).length === 0;
             if (unattended) {
               pullStuckState.set(lc(pull.key), "gate-met");
               const since = gateMetSince(pull, g);
@@ -9583,7 +9589,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // merge` cannot disagree.
       const gate = assessedGate(store, b, pull, now());
       if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
-      const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
+      const busy = assessWorker(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId)).reason;
       if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
       // BB-257/BB-279: only the repository's default branch is merged. A read of
       // the default branch that fails is not the default (fail closed), so the
@@ -12309,7 +12315,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // BB-175: only a running turn can race a push; a `finished` worker
           // is a pause, and a steward-filed merge item exists because it
           // could not merge, so it must not keep the item not actionable.
-          const busy = runningWorkerReason(store.workers(b.id));
+          const busy = assessWorker(store.workers(b.id)).reason;
           actionable = (gate?.gateMet ?? false) && busy === null;
           why = actionable ? null : busy ?? (gate?.missing ?? "the pull request has not been observed yet");
         }

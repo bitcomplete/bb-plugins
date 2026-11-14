@@ -169,6 +169,23 @@ export function assessWorker(workers: readonly Worker[]): AssessedWorker {
   return { state, inFlight: anyWorkerInFlight(workers), running, parked, reason: runningWorkerReason(workers) };
 }
 
+/**
+ * The idle answer (BB-83), in one place: `assess` and the reconcile's idle
+ * wake both call it, so no surface calls `idleInActiveStage` directly.
+ */
+export function assessIdle(idleBinding: IdleBinding, observed: Observed, now: number = Date.now()): boolean {
+  return idleInActiveStage(idleBinding, observed, now);
+}
+
+/**
+ * The live-wake-source answer (BB-154), in one place: `assess` and the report
+ * path's `liveWakeSourceFor` both call it, so no surface calls
+ * `hasLiveWakeSource` directly.
+ */
+export function assessLiveWakeSource(sources: WakeSourceInput): boolean {
+  return hasLiveWakeSource(sources);
+}
+
 /** Derive the one assessment for a binding from the rows the reconcile already read. */
 export function assess(input: AssessmentInput): Assessment {
   const { binding, observed, ownPulls, decisions, projectApprovals, workers, escalations, needs, sources, playbook, currentSpecHash, now } = input;
@@ -203,7 +220,7 @@ export function assess(input: AssessmentInput): Assessment {
     escalations,
     needs,
   };
-  const live = hasLiveWakeSource(sources);
+  const live = assessLiveWakeSource(sources);
   return {
     bindingId: binding.id,
     entityKey: binding.entityKey,
@@ -217,7 +234,7 @@ export function assess(input: AssessmentInput): Assessment {
     worker: assessWorker(workers),
     liveness: {
       live,
-      idle: idleInActiveStage(idleBinding, observed, now),
+      idle: assessIdle(idleBinding, observed, now),
       stuck: stuckDue(binding, playbook, [...escalations], now) !== null,
       stalled: observedStall(binding, live, now),
       reportedNoWakeSource: binding.noWakeSource,
