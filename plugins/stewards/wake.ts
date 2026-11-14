@@ -11,6 +11,7 @@ import type { GuidanceUnit } from "./guidance.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts, type BacklogDigest } from "./nightly.js";
+import { sortedNonActions, type NonActions } from "./non-actions.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { ADOPTION_CHOICES, adoptionHow, dueDate } from "./deps.js";
@@ -1796,6 +1797,8 @@ export type DigestRecords = {
   datedWaits?: Binding[];
   /** Open bindings on hold. */
   held: Binding[];
+  /** BB-335: open bindings with recorded non-actions, for the digest's Non-actions section. */
+  nonActions?: Array<{ binding: Binding; nonActions: NonActions }>;
   /**
    * BB-334: one backlog report per backlog binding, from its stored look and
    * the previous digest's snapshot. Empty or absent when no role carries a
@@ -1920,6 +1923,14 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.stall.map(({ escalation: x, from }) => `- ${from.entityKey}: stall escalation ${x.id} with the project steward, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
   ];
   out.push("### Waiting with no wake source", "", ...capped(noWake, "Nothing."), "");
+
+  // BB-335: why a binding was not acted on, information only. It is never a
+  // need, a button or a count, and it wakes no one; the section is rendered
+  // from the same digest read as every other section.
+  const nonActionLines = (r.nonActions ?? []).flatMap(({ binding, nonActions }) =>
+    sortedNonActions(nonActions).map((n) => `- ${binding.entityKey} (${binding.kind}, ${binding.phase ?? "?"}): ${n.text}`),
+  );
+  if (nonActionLines.length > 0) out.push("### Non-actions", "", ...capped(nonActionLines, "Nothing."), "");
   return out;
 }
 

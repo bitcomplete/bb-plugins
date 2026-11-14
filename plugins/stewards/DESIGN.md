@@ -697,6 +697,31 @@ assessment will replace and returns every disagreement.
   consumer is added only after the comparison has run clean in production for
   several days. The log's `inputs` hold only ids, shas, states and timestamps.
 
+### Non-action reasons (BB-335)
+
+Criterion 3 of BB-291: every branch in `syncNeeds` and `reconcileOnce` that
+declines to act records why. `non-actions.ts` is the closed table of reason
+codes, one short text each, rendered with the day it was recorded. The two
+named cases are `binding-ended-closed` (`finishEnding` resolving an ended
+binding's open items, no wake queued) and `needs-decline-closed` (`syncNeeds`
+withdrawing a spec-approval item the user declined).
+
+- A declining branch calls `decline(b, code, detail)`, which merges the reason
+  into the `non_actions` JSON object on the binding's `assessments` row. The
+  merge is a single read-free SQLite `json_set` upsert whose `WHERE` skips a
+  code already recorded with the same day and text, so a tick that declines the
+  same way writes nothing and no reconcile or wake adds a store read. The
+  store method is `recordNonAction`; `recordAssessment` writes the same column
+  when a reconcile passes reasons with it.
+- The reason is joined into every full binding read, so the binding card in
+  `app.tsx`, `bb stewards show` and the digest's **Non-actions** section render
+  it from the rows they already hold, with no extra read and no extra page
+  load. The digest section is built from the same `digestRecords`/`briefing`
+  read as every other section.
+- A non-action is information only. It is never a need, a button, an open item
+  or a Blocked/needs-you count, and it wakes no one; recording it changes no
+  branch's decision.
+
 ## 7. The ready gate
 
 No ticket reaches implementation until it is fully specified, and no

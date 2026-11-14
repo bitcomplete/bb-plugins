@@ -17,6 +17,7 @@ import { backlogLookSchema, backlogSnapshotSchema, opsLookSchema, type BacklogLo
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import { waitSchema, type Wait } from "./wait.js";
+import { nonActionsSchema, nonActionDay, nonActionText, type NonActionCode, type NonActions } from "./non-actions.js";
 import type { GuidanceCitation } from "./guidance.js";
 import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
@@ -771,7 +772,14 @@ export const BACKLOG_SNAPSHOT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN bac
 // it; nothing derives from it yet.
 export const TYPED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS];
+// BB-335: the reasons a declining branch records, one JSON object keyed by the
+// closed reason code, on the existing `assessments` row. Additive and nullable
+// with a default: an old row reads as no non-actions, and a pre-migration
+// build never reads the column. Appended after every group already shipped,
+// including BB-333's typed wait column, so no recorded index moves.
+export const NON_ACTION_MIGRATIONS = [`ALTER TABLE assessments ADD COLUMN non_actions TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1009,6 +1017,8 @@ export type Binding = {
   backlogSnapshot: BacklogSnapshot | null;
   /** The typed wait from the last `steward_report` (BB-333), or null; the free-text `waitingOn` stays on the status record. */
   wait: Wait | null;
+  /** The latest reason per declining branch (BB-335), keyed by code; empty with none. Rides on the assessment row and is joined into the binding read, so no surface adds a store read. */
+  nonActions: NonActions;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
   deployments: Deployments;
   /** When the binding became idle in an active stage, or null (BB-83). */
@@ -1107,6 +1117,7 @@ function rowToBinding(r: BindingRow): Binding {
     backlogLook: json(backlogLookSchema.nullable(), str("backlog_look"), null),
     backlogSnapshot: json(backlogSnapshotSchema.nullable(), str("backlog_snapshot"), null),
     wait: json(waitSchema.nullable(), str("wait"), null),
+    nonActions: json(nonActionsSchema, str("assessment_non_actions"), {}),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
     idleWokenAt: num("idle_woken_at"),
@@ -1602,10 +1613,11 @@ export type KindBindingRow = { id: string; entityId: string; endedAt: number | n
 
 /**
  * BB-293: the latest shadow assessment stored for a binding. The three answers
- * are kept as JSON so the shape can grow without another migration; nothing
- * reads them to decide or render.
+ * are kept as JSON so the shape can grow without another migration; the
+ * non-actions (BB-335) ride on the same row and are rendered, but the three
+ * answers themselves are not read to decide.
  */
-export type AssessmentRow = { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown };
+export type AssessmentRow = { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown; nonActions: NonActions };
 
 /** One place the shadow assessment and the predicate it will replace disagree. */
 export type DivergenceRow = {
@@ -1674,26 +1686,37 @@ export interface StoreOptions {
 }
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
-  const getBinding = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE id = ?");
+  // BB-335: the non-actions live on the `assessments` row (BB-293). Join them
+  // into every full binding read so a card, `bb stewards show` and the digest
+  // get them without a second store read. A store from before the assessment
+  // table or the non-actions column has neither, so the join is used only when
+  // the column exists; the binding then reads as no non-actions, exactly as a
+  // pre-migration build would. This is a create-time probe, outside any
+  // measured reconcile or wake.
+  const hasNonActions = db.prepare("SELECT 1 AS one FROM pragma_table_info('assessments') WHERE name = 'non_actions'").get() !== undefined;
+  const BINDING_SELECT = hasNonActions
+    ? "SELECT b.*, a.non_actions AS assessment_non_actions FROM bindings b LEFT JOIN assessments a ON a.binding_id = b.id"
+    : "SELECT * FROM bindings";
+  const getBinding = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE id = ?");
   // BB-318: an entity can now have an open binding in one project and ended
   // ones in others, so `byEntity` prefers the open binding and then the newest
   // row (as `byKey` does). The old `created_at ASC` returned the oldest row,
   // which after a move is the old project's ended binding, so rings, sessions
   // and approvals acted on it instead of the project that owns the entity now.
-  const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC LIMIT 1");
+  const byEntity = db.prepare<[string, string], BindingRow>(BINDING_SELECT + " WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC LIMIT 1");
   // BB-318: the one open binding an entity may have, across every project on
   // this server. `byEntity` returns a binding whatever its state, which an
   // ended one in another project must not use to block adoption.
-  const openByEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE AND ended_at IS NULL ORDER BY created_at LIMIT 1");
+  const openByEntity = db.prepare<[string, string], BindingRow>(BINDING_SELECT + " WHERE source = ? AND entity_id = ? COLLATE NOCASE AND ended_at IS NULL ORDER BY created_at LIMIT 1");
   // BB-318: every binding id for an entity, across projects, open and ended, so
   // a ring can reconcile each one rather than only the row `byEntity` picks.
   const bindingIdsForEntity = db.prepare<[string, string], { id: string }>("SELECT id FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at");
-  const byKey = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
-  const byThread = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1");
-  const openForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? AND ended_at IS NULL ORDER BY created_at");
-  const allForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? ORDER BY created_at");
-  const allOpen = db.prepare<[], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL ORDER BY created_at");
-  const all = db.prepare<[], BindingRow>("SELECT * FROM bindings ORDER BY created_at");
+  const byKey = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
+  const byThread = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1");
+  const openForProject = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE project_id = ? AND ended_at IS NULL ORDER BY created_at");
+  const allForProject = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE project_id = ? ORDER BY created_at");
+  const allOpen = db.prepare<[], BindingRow>(BINDING_SELECT + " WHERE ended_at IS NULL ORDER BY created_at");
+  const all = db.prepare<[], BindingRow>(BINDING_SELECT + " ORDER BY created_at");
   // BB-296: the picker's claimed-thread set, grouped by project in one query:
   // each project steward, each binding's steward thread, and every worker's
   // thread. The set spans every binding ever held, so it must not parse a
@@ -1785,8 +1808,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
        OR EXISTS (SELECT 1 FROM escalations q WHERE q.binding_id = b.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret', 'done')))
      )`,
   );
-  const children = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE parent_binding_id = ? AND ended_at IS NULL ORDER BY created_at");
-  const dueRequeue = db.prepare<[number], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL AND requeue_at IS NOT NULL AND requeue_at <= ? ORDER BY requeue_at");
+  const children = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE parent_binding_id = ? AND ended_at IS NULL ORDER BY created_at");
+  const dueRequeue = db.prepare<[number], BindingRow>(BINDING_SELECT + " WHERE ended_at IS NULL AND requeue_at IS NOT NULL AND requeue_at <= ? ORDER BY requeue_at");
   const insertBinding = db.prepare(
     `INSERT INTO bindings (id, project_id, source, entity_id, entity_key, url, title, kind, playbook, playbook_version, adopted_by, parent_binding_id, phase, stage, created_at)
      VALUES (@id, @project_id, @source, @entity_id, @entity_key, @url, @title, @kind, @playbook, @playbook_version, @adopted_by, @parent_binding_id, @phase, @stage, @created_at)`,
@@ -1900,6 +1923,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
   );
   const getAssessmentStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessments WHERE binding_id = ?");
   const allAssessmentsStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessments ORDER BY at DESC");
+  // BB-335: merge one non-action reason into the assessment's `non_actions`
+  // object. Read-free (a `.run`, and its WHERE compares the old value in
+  // SQLite, not in JS), and a no-op when the code was already recorded with
+  // the same day and text, so a tick that declines the same way writes
+  // nothing. If no assessment row exists yet it is created with empty
+  // gate/worker/liveness, which the next successful reconcile replaces.
+  const mergeNonActionStmt = lazy<[string, number, string, string, string, string, string, string], unknown>(
+    "INSERT INTO assessments (binding_id, at, gate, worker, liveness, non_actions) VALUES (?, ?, '{}', '{}', '{}', json_object(?, json(?))) " +
+      "ON CONFLICT (binding_id) DO UPDATE SET non_actions = json_set(COALESCE(assessments.non_actions, '{}'), '$.' || ?, json(?)) " +
+      "WHERE COALESCE(assessments.non_actions, '{}') IS NOT json_set(COALESCE(assessments.non_actions, '{}'), '$.' || ?, json(?))",
+  );
+  const mergeNonAction = (bindingId: string, code: NonActionCode, detail: string | null, at: number): void => {
+    const entry = JSON.stringify({ date: nonActionDay(at), text: nonActionText(code, detail, at) });
+    mergeNonActionStmt().run(bindingId, at, code, entry, code, entry, code, entry);
+  };
   const insertDivergenceStmt = lazy<[string, string, string, string, string, string, number, number], unknown>(
     "INSERT INTO assessment_divergences (id, binding_id, surface, old, new, inputs, first_seen_at, last_seen_at, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1) ON CONFLICT (binding_id, surface, old, new) DO UPDATE SET last_seen_at = excluded.last_seen_at, inputs = excluded.inputs, count = count + 1",
   );
@@ -2141,6 +2179,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     gate: parseJson(r.gate),
     worker: parseJson(r.worker),
     liveness: parseJson(r.liveness),
+    nonActions: nonActionsSchema.parse(parseJson(r.non_actions) ?? {}),
   });
   const standupNoteRowSchema = z.object({
     id: z.string(),
@@ -3536,9 +3575,19 @@ export function createStore(db: Database.Database, now: () => number, options: S
 
     // BB-293: the shadow assessment and its divergence log. The reconcile
     // writes them; the `bb stewards divergences` command reads them.
-    /** Store the latest shadow assessment for a binding, replacing any earlier one. */
-    recordAssessment(fields: { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown }): void {
+    /** Store the latest shadow assessment for a binding, replacing any earlier one, and merge any non-action reasons (BB-335). */
+    recordAssessment(fields: { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown; nonActions?: ReadonlyArray<{ code: NonActionCode; detail?: string | null }> }): void {
       upsertAssessmentStmt().run(fields.bindingId, fields.at, JSON.stringify(fields.gate), JSON.stringify(fields.worker), JSON.stringify(fields.liveness));
+      for (const n of fields.nonActions ?? []) mergeNonAction(fields.bindingId, n.code, n.detail ?? null, fields.at);
+    },
+    /**
+     * Record one non-action reason on a binding's assessment row (BB-335). The
+     * read-free incremental form of `recordAssessment`'s non-action write, for
+     * a declining branch that returns before the assessment is computed. Writes
+     * only when the code's day or text changed.
+     */
+    recordNonAction(bindingId: string, code: NonActionCode, detail: string | null = null, at = now()): void {
+      mergeNonAction(bindingId, code, detail, at);
     },
     /** The latest shadow assessment for a binding, or null. */
     assessment(bindingId: string): AssessmentRow | null {

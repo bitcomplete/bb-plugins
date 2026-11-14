@@ -483,6 +483,15 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   nightly wake lists them, with the previous digest, what moved, what waits
   on you and what is stuck, all read from the store, so the digest does not
   depend on the project steward's memory.
+- **Non-actions** (BB-335): every branch in `syncNeeds` and `reconcileOnce`
+  that declines to act records a reason from a closed table
+  ([non-actions.ts](non-actions.ts)) on its binding's `assessments` row: a
+  short text and the day. The two named cases are the close of open items
+  when a binding ends (`binding-ended-closed`) and the withdrawal of a
+  spec-approval item the user declined (`needs-decline-closed`). The binding
+  card, `bb stewards show` and the digest's **Non-actions** section render
+  them. They are information only — never a need, a button, an open item or
+  a Blocked/needs-you count — and they wake no one.
 - **The settings page** (Settings → Plugins → Stewards, [app.tsx](app.tsx))
   shows each stewarded project's configuration, problems, project steward
   and nightly pass, runs `bb stewards check` on a button, and lists every

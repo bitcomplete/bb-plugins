@@ -90,6 +90,7 @@ import {
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
+import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
@@ -665,6 +666,7 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** The typed wait from the last report (BB-333), or null; rendered on the card. */
               wait: waitSchema.nullable(),
+              nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
@@ -798,6 +800,7 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** The typed wait from the last report (BB-333), or null; rendered on the card. */
               wait: waitSchema.nullable(),
+              nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
@@ -910,6 +913,7 @@ export const rpcContract = defineRpcContract({
           waitingUntil: z.number().nullable(),
           /** The typed wait from the last report (BB-333), or null; the sidebar row carries it for a later render. */
           wait: waitSchema.nullable(),
+          nonActions: nonActionsSchema,
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
           /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
@@ -4737,6 +4741,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
     }
 
+    /**
+     * BB-335: record why a declining branch did not act, on the binding's
+     * assessment row. Read-free (the store merges the reason in SQL) and a
+     * no-op when the reason's day and text are unchanged, so a tick that
+     * declines the same way writes nothing. Recording changes no decision.
+     */
+    function decline(b: Binding, code: NonActionCode, detail: string | null = null): void {
+      store.recordNonAction(b.id, code, detail, now());
+    }
+
     async function reconcileOnce(bindingId: string, force: WakeReason | null): Promise<void> {
       let b = store.binding(bindingId);
       if (b === null) return;
@@ -4747,12 +4761,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the next sweep to retry, which the wake-reason fallback below makes
         // sure it does (BB-92).
         bb.log.debug(`stewards: could not read the configuration of project ${b.projectId} while reconciling ${b.entityKey}; leaving it for the next sweep`);
+        decline(b, "config-unreadable");
         return;
       }
       // A project switched off on this server wakes nobody: a binding the
       // upgrade left open, or one whose stop turn is still running, is not
       // woken by a requeue, a doorbell or the Sentry sweep.
-      if (!config.enabled) return;
+      if (!config.enabled) {
+        decline(b, "project-disabled");
+        return;
+      }
       const playbook = bindingPlaybook(config, b);
       if (playbook === null) {
         // A pull request or ticket a watch adopted runs under its watch's
@@ -4760,9 +4778,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // falling back to a different playbook the watch did not name.
         const watchAdopted = (b.kind === "pr" && adoptedByWatch(config, b) !== null) || (b.kind === "ticket" && b.adoptedBy !== null);
         if (watchAdopted && b.endedAt === null) await finishEnding(b, "unconfigured");
+        else decline(b, "no-playbook");
         return;
       }
       if (b.source === "ops") {
+        decline(b, "routed-to-ops");
         await reconcileOps(b, config, playbook, force);
         return;
       }
@@ -4772,10 +4792,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         entity = await snapshot(b.source, b.entityId);
       } catch (error) {
         bb.log.warn(`stewards: could not read ${b.entityKey}: ${errorMessage(error)}`);
+        decline(b, "entity-unreadable");
         return;
       }
       if (entity === null) {
         if (b.endedAt === null) await finishEnding(b, "gone");
+        else decline(b, "entity-gone");
         return;
       }
       // An unread relation keeps the last known parent and children (BB-244).
@@ -4932,6 +4954,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const labelled = b.kind === "review" || adoptedByWatch(config, b) !== null || hasLabel(entity, config.file.label);
         signalNeedActionability(b, observed);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
+        decline(b, "stay-ended");
         return;
       }
       if (life.kind === "reopen") {
@@ -4942,6 +4965,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (other !== null && other.id !== b.id) {
           signalNeedActionability(b, observed);
           store.patch(b.id, { lastSnapshot: observed });
+          decline(b, "other-binding-open");
           return;
         }
         b = await reopen(b, life.why);
@@ -4954,6 +4978,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if ((life.kind === "terminal" || life.kind === "detach" || life.kind === "reassigned" || life.kind === "moved") && !(life.kind === "terminal" && awaitingDeploy && b.ending === null)) {
         if (b.ending === null) {
           await beginEnding(b, config, playbook, life.kind, observed);
+          decline(b, "ending-in-progress", life.kind);
           return;
         }
         // Following through, the steward is woken as before; otherwise its
@@ -4961,15 +4986,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (life.kind !== "terminal" || !followingThrough(b)) {
           signalNeedActionability(b, observed);
           store.patch(b.id, { lastSnapshot: observed });
+          decline(b, "ending-in-progress", life.kind);
           return;
         }
         if (b.followThroughUntil !== null && now() >= b.followThroughUntil) {
           await followThroughRanOut(b);
+          decline(b, "follow-through-ran-out");
           return;
         }
       } else if (b.ending !== null) {
         signalNeedActionability(b, observed);
         store.patch(b.id, { lastSnapshot: observed });
+        decline(b, "ending-in-progress", b.ending);
         return;
       }
 
@@ -5225,6 +5253,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const approvalAsked = !b.awaitingReport && (await syncApprovalRequest(readyGateCtx, b, playbook)) !== null;
         const asked = [approvalAsked ? `approval requested for ${b.entityKey}` : null, scheduling === null ? null : `scheduling requested for ${b.entityKey}`].filter((r) => r !== null);
         if (asked.length > 0) await wakeProject(b.projectId, asked.join(" and "), { digestDue: false });
+        decline(b, "nothing-to-do");
         return;
       }
       if (scheduling !== null) await wakeProject(b.projectId, `scheduling requested for ${b.entityKey}`, { digestDue: false });
@@ -5237,6 +5266,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (deferred || (info !== null && busy(info.status))) {
         keep(changes);
         if (reason !== null && reason !== "changed") store.note(b.id, `Due: ${reason}`);
+        decline(b, deferred ? "deferred" : "worker-busy");
         return;
       }
       // The steward now has the workers' reports: archive the finished ones
@@ -6594,6 +6624,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const x of openBefore) store.resolve(x.id, "The binding ended.", "plugin", false);
       const closed = openBefore.filter((x) => x.route === "user" || x.isQuestion).map(closedItemLine);
       if (closed.length > 0) noteEndingReport(b, `closed ${closed.join("; ")}.`);
+      // BB-335: the binding-ended close is one of the owner's two named
+      // non-actions. Record it on the ended binding's row, with the end reason
+      // and day, whenever the ending closed something; no wake is queued for
+      // it, exactly as before.
+      if (openBefore.length > 0) decline(b, "binding-ended-closed", reason);
       await releaseBehind(b, `ended (${reason})`);
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
@@ -8305,6 +8340,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       } else {
         const why = gate.passed ? "The spec is approved." : !gate.checklistMet ? "Withdrawn: the ready checklist is no longer met." : !gate.approvalNeeded ? "Withdrawn: the ticket is not substantial." : "Withdrawn.";
         store.closeNeeds(b.id, "approve-spec", why);
+        // BB-335: the spec-decline close is the owner's other named
+        // non-action. The user declined the spec, so `syncNeeds` withdraws the
+        // approval item and records why; no wake is queued for it.
+        if (b.ready.declinedSpecHash === current) decline(b, "needs-decline-closed");
         // The gate no longer waits, so a forwarded request is withdrawn with
         // it rather than left open for the page's raw-escalation prose row.
         if (forwarded !== null) store.resolve(forwarded.id, why);
@@ -8389,6 +8428,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           store.closeNeedByKey(b.id, "merge", url, "The pull request belongs to another ticket.");
           const esc = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
           if (esc !== null) store.resolve(esc.id, "The pull request belongs to another ticket.");
+          decline(b, "pull-foreign-owner", pull.key);
           continue;
         }
         const hadApprove = store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url);
@@ -8422,6 +8462,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               recoveredBefore.add(lc(pull.key));
             }
           }
+          decline(b, "pull-closed", pull.key);
           continue;
         }
         // BB-287: what is stacked on this open pull request. The binding whose
@@ -8469,6 +8510,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (foreignOwner) {
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) store.closeNeed(open.id, "A teammate's pull request: its author merges after the owner's approval.");
+            decline(b, "pull-foreign-owner", pull.key);
           } else if (mergeHeld) {
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) {
@@ -8476,6 +8518,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const held = [...userMergeBehind, ...(openBase === null ? [] : [openBase.key])];
               store.closeNeed(open.id, `held behind ${(keys.length > 0 ? keys : held).join(", ")}`);
             }
+            decline(b, "merge-held", pull.key);
           } else if (mergedBase !== null) {
             // BB-264: GitHub does not retarget a stacked pull request when its
             // base merges (the branch survives), so the base is the head of a
@@ -8486,6 +8529,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // old one are still green.
             const open = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
             if (open !== undefined) store.closeNeed(open.id, `The base ${mergedBase.key} has merged; retarget to the default branch.`);
+            decline(b, "retarget-needed", pull.key);
             // BB-285: a retarget wake nobody answered. Once the wake has been
             // sent (recorded in retargetPulls) and the pull request is still
             // based on the merged branch after the window, escalate `stuck`.
@@ -8504,15 +8548,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A steward-filed Merge item is a hand-off to a person (a worker
             // whose permission system refused the merge, or a refused plugin
             // merge): leave it alone and do not merge over it (BB-170/BB-257).
+            decline(b, "merge-steward-filed", pull.key);
           } else if (assessWorker(store.workers(b.id)).reason !== null) {
             // A worker's turn is in progress: it merges or handles the pull
             // request, so the plugin files nothing and merges nothing. A
             // `finished` (parked) worker is not running (BB-266).
+            decline(b, "worker-running", pull.key);
           } else {
             // Pause stewards is the kill switch: while it is on, the plugin
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
             if (parkedWorkerOwnsAnother) {
+              decline(b, "parked-owns-another", pull.key);
               // BB-279: a gate-met pull request with a parked worker is never
               // deferred silently. The plugin files the Merge item so "Needs
               // you" shows it, and wakes the parked worker with the approval
@@ -8573,15 +8620,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   // A push landed between the look and the merge. GitHub
                   // refused it with 409; the next look judges the new head.
                   bb.log.warn(`stewards: plugin merge of ${pull.key} raced a push; waiting for the next look`);
+                  decline(b, "head-moved", pull.key);
                 } else if (result.message.startsWith("GitHub refused the merge:")) {
                   await raiseMergeRefusal(b, pull, g, result.message, changes);
+                  decline(b, "merge-refused", pull.key);
                 } else {
                   // The gate or a worker changed between the look and the
                   // merge: file nothing and let the next look decide.
                   bb.log.warn(`stewards: plugin merge of ${pull.key} not attempted: ${result.message}`);
+                  decline(b, "merge-refused", pull.key);
                 }
+              } else {
+                decline(b, "merge-refused", pull.key);
               }
             } else {
+              decline(b, paused ? "merge-paused" : "base-not-default", pull.key);
               store.fileNeed({
                 bindingId: b.id,
                 kind: "merge",
@@ -8612,6 +8665,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
+          decline(b, "gate-not-met", pull.key);
         }
       }
       // BB-264: keep the derived stacked-PR holds in `mergeBehind` so the wake
@@ -9932,6 +9986,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               workers: store.workers(b.id).filter((w) => w.status === "running").length,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              nonActions: b.nonActions,
               escalations: store.openEscalations(b.id).map((x) => ({ kind: x.kind, route: x.route, question: x.question })),
             })),
           };
@@ -10038,6 +10093,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              nonActions: b.nonActions,
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
             })),
@@ -10147,6 +10203,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              nonActions: b.nonActions,
               workers,
             };
           });
@@ -12734,6 +12791,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       for (const line of deploymentLines(b.deployments)) lines.push(`Deployment ${line}`);
       for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
+      // BB-335: the binding's recorded non-actions, newest day first. Information only: they never become a need, a button or a count.
+      for (const n of sortedNonActions(b.nonActions)) lines.push(`Non-action ${n.date}: ${n.text}`);
       for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
       for (const x of store.escalations(b.id)) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
       for (const a of store.assumptions(b.id)) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
@@ -14444,12 +14503,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, alertmanagerDoorbell: onAlertmanagerDoorbell, alertmanagerLeases, readCounts, reconcilePass });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, alertmanagerDoorbell: onAlertmanagerDoorbell, alertmanagerLeases, readCounts, reconcilePass, specHashFor });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; alertmanagerDoorbell(id: string, unit: string | null, action: string | null): void; alertmanagerLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; alertmanagerDoorbell(id: string, unit: string | null, action: string | null): void; alertmanagerLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void>; specHashFor(b: Binding, entity: EntitySnapshot): string }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

@@ -41,6 +41,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { PROJECT_CHANGED } from "./channels.js";
+import { sortedNonActions, type NonActions } from "./non-actions.js";
 import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { setStewardsSidebarCommand, getStewardsSidebarCommand } from "./sidebar-command.js";
@@ -646,8 +647,12 @@ function StewardHeader({ state, phrase, kind, phase, entityKey, url, title, extr
   );
 }
 
-/** The rules' inputs from a `stewardsOverview` steward, so its row derives the same state and phrase as the page and sidebar. */
-function overviewEffortStatus(s: Steward): EffortStatus {
+/** BB-335: a binding's recorded non-actions, one line each, newest day first. Information only: never a need, a button or a count. */
+function nonActionLines(nonActions: NonActions | undefined): string[] {
+  return nonActions === undefined ? [] : sortedNonActions(nonActions).map((n) => n.text);
+}
+
+/** The rules' inputs from a `stewardsOverview` steward, so its row derives the same state and phrase as the page and sidebar. */function overviewEffortStatus(s: Steward): EffortStatus {
   return {
     busy: false,
     runningWorkers: s.workers,
@@ -666,8 +671,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
   };
 }
 
-function StewardsSection() {
-  const { overview, error } = useOverview();
+function StewardsSection() {  const { overview, error } = useOverview();
   // Called before the early return, so the hook order stays stable (BB-205).
   const now = useNow();
   if (overview === null) return <Loading error={error} />;
@@ -727,6 +731,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
       )}
       {s.waitingOn !== null && (s.waitingUntil === null || s.waitingUntil === undefined) ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
       {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
+      {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
       {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
         <p key={i} className={x.route === "user" ? "text-destructive" : "text-muted-foreground"}>
@@ -1562,6 +1567,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           </p>
           {s.waitingOn !== null && (s.waitingUntil === null || s.waitingUntil === undefined) ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
           {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
+          {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}

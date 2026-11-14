@@ -15581,9 +15581,11 @@ describe("bb stewards divergences (BB-293)", () => {
   it("swallows a failure inside the assessment and keeps reconciling", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
-    // Force the assessment write to fail: the lazy prepared statement throws
-    // "no such table: assessments", which the reconcile must swallow and log.
-    t.hooks.db.prepare("DROP TABLE assessments").run();
+    // Force the assessment write to fail: the lazy prepared divergence
+    // statement throws "no such table: assessment_divergences", which the
+    // reconcile must swallow and log. The `assessments` table itself must
+    // stay, because BB-335's binding reads join it.
+    t.hooks.db.prepare("DROP TABLE assessment_divergences").run();
     await t.ring("linear", "uuid-12");
     await t.flush();
     // The reconcile completed past the failure: the binding's snapshot was
