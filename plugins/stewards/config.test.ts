@@ -16,6 +16,7 @@ import {
   playbookLabels,
   playbookNameFor,
   playbookStates,
+  roleBacklogTargets,
   sentryTargets,
   ticketWatchId,
   ticketWatchProblems,
@@ -42,6 +43,7 @@ import {
   usesKind,
   watchProblems,
 } from "./roles.js";
+import { opsTargetKey, parseOpsTargetKey } from "./ops.js";
 import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
@@ -104,6 +106,34 @@ describe("the project file", () => {
     const repo = parseProjectFile(JSON.stringify({ version: 1, github: { exclude: ["https://github.com/acme/web"] } }));
     if (!repo.ok) expect(repo.error).toMatch(/github\.exclude\.0: a repo such as acme\/web/u);
     else expect.fail("a URL is not owner/repo");
+  });
+
+  it("parses the optional backlog block with its defaults, and refuses unknown keys, non-positive numbers and a bad team (BB-334)", () => {
+    const absent = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!absent.ok) throw new Error(absent.error);
+    expect(absent.value.backlog).toBeUndefined();
+
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, backlog: { team: " bb ", wipLimit: 3, staleDays: 21, commentsPerWeek: 2 } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(explicit.value.backlog).toEqual({ team: "BB", wipLimit: 3, staleDays: 21, commentsPerWeek: 2 });
+
+    const defaults = parseProjectFile(JSON.stringify({ version: 1, backlog: {} }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.backlog).toEqual({ wipLimit: 5, staleDays: 14, commentsPerWeek: 1 });
+
+    expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { bogus: true } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { wipLimit: 0 } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { staleDays: -1 } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { commentsPerWeek: 0 } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { team: "bad key" } }))).toMatchObject({ ok: false });
+  });
+
+  it("reads a role's backlog team as a target, and round-trips its key (BB-334)", () => {
+    expect(roleBacklogTargets({ ops: { backlog: { team: "BB" } } })).toEqual([{ kind: "backlog", team: "BB" }]);
+    expect(roleBacklogTargets({ ops: {} })).toEqual([]);
+    expect(roleBacklogTargets(null)).toEqual([]);
+    expect(opsTargetKey({ kind: "backlog", team: "BB" })).toBe("backlog/BB");
+    expect(parseOpsTargetKey("backlog/BB")).toEqual({ kind: "backlog", team: "BB" });
   });
 
   it("fills the dependency watch's SLA, batch and autoAdopt defaults, and takes explicit values", () => {
@@ -574,7 +604,10 @@ describe("the ops playbook", () => {
     const phased = OPS_WATCH.replace("may:", "phases:\n  open: {}\nmay:");
     expect(parsePlaybook(phased, "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook has no phases/u) });
     expect(parsePlaybook(OPS_WATCH.replace("may:", "terminal: [Done]\nmay:"), "ops-watch")).toMatchObject({ ok: false });
-    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook watches k8s, sentry, alertmanager or github/u) });
+    // BB-334: an ops playbook may read linear too (the backlog binding); an
+    // unknown source is still refused.
+    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: true });
+    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: bogus"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/source: Invalid option/u) });
     expect(parsePlaybook(GITHUB_PRS.replace("terminal: [merged, closed]\n", ""), "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/terminal: name at least one state/u) });
     // A ticket, pr or review playbook still needs its phases, as before ops.
     const noPhases = GITHUB_PRS.replace(/phases:\n(?: {2}.*\n)+/u, "");

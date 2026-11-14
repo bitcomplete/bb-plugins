@@ -13,7 +13,7 @@ import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
 import { deploymentsSchema, type Deployments } from "./deploy.js";
-import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
+import { backlogLookSchema, opsLookSchema, type BacklogLook, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import type { GuidanceCitation } from "./guidance.js";
@@ -733,7 +733,13 @@ export const STANDUP_COMPLETED_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN co
 // a store from before the step reads back exactly as before.
 export const ALERTMANAGER_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN alertmanager_look TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS];
+// BB-334: a backlog binding's last read of its Linear team's whole open backlog.
+// Additive and nullable: an old row reads as no look, and a pre-migration build
+// never reads the column. It is appended after every group already shipped,
+// including BB-329's worker park column, so no recorded index moves.
+export const BACKLOG_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN backlog_look TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -965,6 +971,8 @@ export type Binding = {
   sentryLook: SentryLook | null;
   /** An Alertmanager namespace binding's last look; null for every other kind. */
   alertmanagerLook: AlertmanagerLook | null;
+  /** A backlog binding's last read of its Linear team's whole open backlog; null for every other kind. */
+  backlogLook: BacklogLook | null;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
   deployments: Deployments;
   /** When the binding became idle in an active stage, or null (BB-83). */
@@ -1060,6 +1068,7 @@ function rowToBinding(r: BindingRow): Binding {
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
     alertmanagerLook: json(alertmanagerLookSchema.nullable(), str("alertmanager_look"), null),
+    backlogLook: json(backlogLookSchema.nullable(), str("backlog_look"), null),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
     idleWokenAt: num("idle_woken_at"),
@@ -1133,6 +1142,7 @@ const COLUMNS = {
   depsLook: "deps_look",
   sentryLook: "sentry_look",
   alertmanagerLook: "alertmanager_look",
+  backlogLook: "backlog_look",
   deployments: "deployments",
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",
