@@ -5195,6 +5195,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function reconcilePass(projectId: string): Promise<void> {
       const open = store.open(projectId);
       readCounts.beginReconcilePass(open.length);
+      // BB-325: the project-wide one-time close runs inside the measured pass,
+      // as it does in the sweep, so the fixture counts the read it adds.
+      closeItemsOnEndedBindings(projectId);
       for (const b of open) await serial(`b:${b.id}`, () => reconcileBinding(b.id, null));
     }
 
@@ -6421,12 +6424,76 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * is still open. A thread still running (an ending that timed out) is left
      * in the sidebar rather than archived mid-turn.
      */
+    /** BB-325: one line naming an escalation or question an ending closed. */
+    function closedItemLine(x: Escalation): string {
+      return `${x.isQuestion ? "question" : `${x.kind} escalation`} ${x.id} (${JSON.stringify(x.question)})`;
+    }
+
+    /**
+     * BB-325: carry what an ending left, or a late report from a steward whose
+     * binding ended, into the project steward's next digest as one note per
+     * binding. It starts no turn and folds with anything already queued for
+     * the same binding, so several late reports are one line.
+     */
+    function noteEndingReport(b: Pick<Binding, "projectId" | "entityKey" | "endReason" | "endedAt">, text: string): void {
+      if (b.endedAt === null) return;
+      store.noteProjectFolded(b.projectId, `late report from ended binding ${b.entityKey} (${b.endReason ?? "ended"}, ${iso(b.endedAt)}): `, text);
+    }
+
+    /**
+     * BB-325: an ended binding is closed to new writes. The refusal names the
+     * end and the two alternatives, so a project steward does not file a
+     * question on a Done ticket again (BCP-154). Only new writes are refused;
+     * resolving an existing item and reopening still work.
+     */
+    function endedBindingRefusal(b: Binding): string {
+      return `${b.entityKey} ended (${b.endReason ?? "ended"})${b.endedAt === null ? "" : ` on ${iso(b.endedAt)}`}: an ended binding takes no new question, forward, hold or priority change. Ask at project scope by omitting binding, or reopen the entity first so its steward resumes.`;
+    }
+
+    /**
+     * BB-325: the content of a report or escalation that arrived after its
+     * binding ended, carried to the project steward as one note. Nothing is
+     * written to the binding.
+     */
+    function lateReportText(input: { phase: string; summary: string; nextAction: string; actor: string; waitingOn?: string; escalate?: { kind: string; question: string; context?: string; meanwhile: string }; needs?: Array<{ kind: string; what: string }> }): string {
+      const parts = [`${input.phase}: ${input.summary} Next: ${input.nextAction} (${input.actor})`];
+      if (input.waitingOn !== undefined && input.waitingOn !== "") parts.push(`waiting on ${input.waitingOn}`);
+      if (input.escalate !== undefined) parts.push(`escalation (${input.escalate.kind}): ${input.escalate.question}${input.escalate.context === undefined ? "" : ` — ${input.escalate.context}`} (meanwhile: ${input.escalate.meanwhile})`);
+      if ((input.needs ?? []).length > 0) parts.push(`needs: ${input.needs!.map((n) => `${n.kind} ${n.what}`).join("; ")}`);
+      return parts.join("; ");
+    }
+
+    /**
+     * BB-325: close any open question or escalation still attached to an ended
+     * binding (the BCP-154 case, a question filed after its binding ended) and
+     * report it once. The close is mechanical and the resolution is the record,
+     * so the next pass finds nothing open and reports nothing again.
+     */
+    function closeItemsOnEndedBindings(projectId: string): void {
+      const byBinding = new Map<string, { b: Pick<Binding, "projectId" | "entityKey" | "endReason" | "endedAt">; closed: string[] }>();
+      for (const row of store.openOnEndedBindings(projectId)) {
+        let entry = byBinding.get(row.escalation.bindingId);
+        if (entry === undefined) {
+          entry = { b: { projectId, entityKey: row.entityKey, endReason: row.endReason, endedAt: row.endedAt }, closed: [] };
+          byBinding.set(row.escalation.bindingId, entry);
+        }
+        entry.closed.push(closedItemLine(row.escalation));
+        store.resolve(row.escalation.id, "The binding ended.", "plugin", false);
+      }
+      for (const { b, closed } of byBinding.values()) noteEndingReport(b, `closed ${closed.join("; ")}.`);
+    }
+
     async function finishEnding(b: Binding, reason: string): Promise<void> {
       b = store.patch(b.id, { ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
       // Mechanical cleanup, not a decision: the origin binding has ended, so
       // resolve its escalations without queuing a wake it would never read
-      // (BB-60).
-      for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.", "plugin", false);
+      // (BB-60). BB-325: the route-user ones (and questions) are carried into
+      // the project steward's next digest, since nobody else can see them; the
+      // resolution itself is the record, so a later pass finds nothing open.
+      const openBefore = store.openEscalations(b.id);
+      for (const x of openBefore) store.resolve(x.id, "The binding ended.", "plugin", false);
+      const closed = openBefore.filter((x) => x.route === "user" || x.isQuestion).map(closedItemLine);
+      if (closed.length > 0) noteEndingReport(b, `closed ${closed.join("; ")}.`);
       await releaseBehind(b, `ended (${reason})`);
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
@@ -11010,6 +11077,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // normalised here and the stored value is always `user`.
           const actor: (typeof ACTORS)[number] = input.actor === "me" ? "user" : input.actor;
           if (input.actor === "me") bb.log.info(`stewards: steward_report actor "me" is renamed to "user"; recording this report as user (thread ${threadId}).`);
+          const ended = store.byThread(threadId);
+          if (ended !== null && ended.endedAt !== null) {
+            // BB-325: the binding ended while this turn was running, or the
+            // plugin's own stop turn reported after it. Write nothing to the
+            // binding; carry the report to the project steward's next digest.
+            noteEndingReport(ended, lateReportText(input));
+            return `Reported after ${ended.entityKey} ended (${ended.endReason ?? "ended"}, ${iso(ended.endedAt)}): nothing was written to the binding, and the project steward's next wake carries it. End the turn now.`;
+          }
           let b = ownBinding(threadId);
           // Validate the input that does not depend on which pull request the
           // binding is on before a replacement moves it: a wrap-up report that
@@ -11762,6 +11837,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             return `${written.join("; ")}.`;
           }
           if (input.ask !== undefined && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
+          // BB-325: an ended binding takes no new question, forward, hold or
+          // priority change. The checks below still run for everything else:
+          // resolving an existing escalation, question or assumption,
+          // confirming, a lesson, or reopening keeps working.
+          if (target.endedAt !== null && (input.ask !== undefined || input.forward !== undefined || input.priority !== undefined || input.hold !== undefined)) {
+            return toolError(new Error(endedBindingRefusal(target)));
+          }
           const self = target.threadId === threadId;
 
           const forwarding = input.forward === undefined ? null : store.escalation(input.forward);
@@ -12538,6 +12620,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await reconcileLessons(config);
       applyLessonTransitions(config);
       applyRationaleClustering(config);
+      // BB-325: close any open item left on an ended binding, once.
+      closeItemsOnEndedBindings(config.projectId);
       for (const b of store.open(config.projectId)) {
         if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
         const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -13638,6 +13722,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const context = input.options.context === undefined || input.options.context.trim() === "" ? null : input.options.context.trim();
               if (context !== null && context.length > 3000) throw new PluginCliError("context is at most 3000 characters.", { code: "context_too_long" });
               const meanwhile = input.options.meanwhile === "continue" ? "continue" : "wait";
+              if (b.endedAt !== null) {
+                // BB-325: the worker's binding ended while this turn was
+                // running. Write nothing to it; carry the escalation to the
+                // project steward's next digest.
+                noteEndingReport(b, `escalation: ${question}${context === null ? "" : ` — ${context}`} (meanwhile: ${meanwhile})`);
+                return { exitCode: 0, stdout: `Not filed: ${b.entityKey} ended (${b.endReason ?? "ended"}, ${iso(b.endedAt)}); the project steward's next wake carries it.` };
+              }
               const x = store.escalate({
                 bindingId: b.id,
                 kind: "decision",

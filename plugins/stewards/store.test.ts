@@ -52,6 +52,34 @@ describe("questions to the user", () => {
     expect(s.resolve(second.x.id, "late")).toBe(false);
     expect(s.openQuestions("p1")).toEqual([]);
   });
+
+  // BB-325: a question whose binding has ended is not open with the user; the
+  // one-time close still finds it, closes it, and finds nothing the next time.
+  it("hides a question on an ended binding, and lists it for the one-time close", () => {
+    const { s, binding } = store();
+    const q = s.ask({ projectId: "p1", bindingId: binding.id, escalationId: null, question: "Why did you skip the delivery lookup?", context: null });
+    const unbound = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
+    s.patch(binding.id, { endedAt: 2_000, endReason: "terminal" });
+    // The ended binding's question is not open; the project-scope one still is.
+    expect(s.openQuestions("p1").map((x) => x.id)).toEqual([unbound.id]);
+    expect(s.openOnEndedBindings("p1")).toMatchObject([{ escalation: { id: q.id, bindingId: binding.id }, entityKey: "ENG-12", endReason: "terminal", endedAt: 2_000 }]);
+    // Once closed, it is never found open again.
+    expect(s.resolve(q.id, "The binding ended.", "plugin", false)).toBe(true);
+    expect(s.openOnEndedBindings("p1")).toEqual([]);
+    expect(s.question(q.id)).toMatchObject({ status: "answered", answer: "The binding ended." });
+  });
+
+  // BB-325: several late reports from one ending are one note, not one each.
+  it("folds a silent project note per binding", () => {
+    const { s } = store();
+    s.noteProjectFolded("p1", "late report from ended binding ENG-12 (terminal, 2026-01-01T00:00:00Z): ", "closed question qst_1.");
+    s.noteProjectFolded("p1", "late report from ended binding ENG-12 (terminal, 2026-01-01T00:00:00Z): ", "escalation: Include SSO?");
+    s.noteProjectFolded("p1", "late report from ended binding ENG-13 (gone, 2026-01-02T00:00:00Z): ", "escalation: Gone?");
+    expect(s.peekProjectNotes("p1")).toEqual([
+      "late report from ended binding ENG-12 (terminal, 2026-01-01T00:00:00Z): closed question qst_1. escalation: Include SSO?",
+      "late report from ended binding ENG-13 (gone, 2026-01-02T00:00:00Z): escalation: Gone?",
+    ]);
+  });
 });
 
 describe("the fingerprint map", () => {
