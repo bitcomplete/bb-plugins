@@ -234,7 +234,7 @@ function syncContext(existing: Array<Record<string, unknown>> = [], remembered: 
     rememberPullRequesters,
     closeNeedByKey,
     openNeeds: () => [],
-    fileNeed: vi.fn(),
+    fileNeed,
     openEscalations: () => existing as never[],
     escalate,
     resolve,
@@ -319,6 +319,17 @@ describe("a requested reviewer is the owner's delegation (BB-327)", () => {
     expect(isDelegateWait({ kind: "approval", route: "user" })).toBe(false);
     expect(isDelegateWait({ kind: "approval", route: "project" })).toBe(false);
     expect(isDelegateWait({ kind: "stuck", route: "steward" })).toBe(false);
+  });
+
+  it("moves a withdrawn delegation's escalation back to the owner text (round 2 suggestion)", async () => {
+    const esc = { id: "esc1", kind: "approval", url: delegateUrl, resolutionKind: "approve-decline", route: "steward", headSha: head, recommendation: null };
+    const { ctx, b, reroute, setEscalationMeanwhile, escalate, fileNeed } = syncContext([esc], ["arashout"]);
+    const entity = delegatePull([]);
+    await syncPullApproval(ctx, b, entity, [], () => prGate(entity));
+    expect(escalate).not.toHaveBeenCalled();
+    expect(reroute).toHaveBeenCalledWith("esc1", "user", null);
+    expect(setEscalationMeanwhile).toHaveBeenCalledWith("esc1", "Waiting: the owner approves on GitHub from the Stewards page.");
+    expect(fileNeed).toHaveBeenCalled();
   });
 
   it("names the delegate's review in approvalRef (criterion 3)", () => {

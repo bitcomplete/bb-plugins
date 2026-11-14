@@ -438,7 +438,13 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing, g.reason);
     } else {
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route !== "user") ctx.store.reroute(approvalEsc.id, "user", approvalEsc.recommendation);
+      if (approvalEsc.route !== "user") {
+        ctx.store.reroute(approvalEsc.id, "user", approvalEsc.recommendation);
+        // A delegation that ended moves the wait back to the owner: drop the
+        // delegate's `meanwhile` so the escalation does not keep naming them
+        // (BB-327).
+        ctx.store.setEscalationMeanwhile(approvalEsc.id, "Waiting: the owner approves on GitHub from the Stewards page.");
+      }
       fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
     }
   } else if (g.delegatePending) {
