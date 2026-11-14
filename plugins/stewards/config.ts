@@ -128,7 +128,7 @@ function validTimezone(tz: string): boolean {
   }
 }
 
-const teamKey = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase());
+export const teamKey = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase());
 
 /**
  * A filing target (BB-235): where an ops or dependency watch files its

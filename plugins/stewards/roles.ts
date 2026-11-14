@@ -9,7 +9,7 @@ import { z } from "zod";
 import { globError } from "./decisions.js";
 import { opsTargetKey, type AlertmanagerTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { REPO_NAME } from "./source-contract.js";
-import { alertmanagerTargets, DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, roleAlertmanagerSchema, sentrySlug, sentryTargets, STEWARDS_DIR, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
+import { alertmanagerTargets, DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, roleAlertmanagerSchema, sentrySlug, sentryTargets, STEWARDS_DIR, teamKey, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
 
 /** The per-person roles: which watches and the project stewardship a GitHub login's server runs. */
 export const ROLES_FILE = `${STEWARDS_DIR}/roles.json`;
@@ -88,6 +88,8 @@ export const roleOpsSchema = z
     dependabot: z.union([z.literal("all"), z.array(dependabotRepoSchema).max(200)]).optional(),
     /** Pull requests this role's server adopts by shape, under a playbook, with no label (BB-164). */
     pulls: z.array(pullWatchSchema).max(50).default([]),
+    /** The Linear team whose backlog this role's steward watches (BB-332); the backlog binding (a later Stage 1 PR) enforces one holder per team. */
+    backlog: z.object({ team: teamKey }).strict().optional(),
   })
   .strict();
 export type RoleOps = z.infer<typeof roleOpsSchema>;
@@ -169,6 +171,8 @@ const rolesFileV2RawSchema = z
  * The merge of a holder's role definitions, in the order the holder lists
  * them. List fields are unioned; `context` and `team` take the first defined
  * value (a disagreement is a `check` problem, never a runtime change);
+ * `backlog` takes the first defined value too, and the backlog binding (a
+ * later Stage 1 PR) adds its own conflict and one-holder checks;
  * `dependabot: "all"` wins over an explicit list.
  */
 function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
@@ -181,6 +185,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
   let dependabotAll = false;
   let context: string | undefined;
   let team: string | undefined;
+  let backlog: RoleOps["backlog"];
   let resolveOnDone = false;
   for (const def of defs) {
     for (const name of def.k8sNamespaces) if (!k8sNamespaces.includes(name)) k8sNamespaces.push(name);
@@ -189,6 +194,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
     for (const namespace of def.alertmanager.namespaces) if (!alertmanagerNamespaces.includes(namespace)) alertmanagerNamespaces.push(namespace);
     if (def.context !== undefined && context === undefined) context = def.context;
     if (def.team !== undefined && team === undefined) team = def.team;
+    if (def.backlog !== undefined && backlog === undefined) backlog = def.backlog;
     if (def.sentry.resolveOnDone) resolveOnDone = true;
     if (def.dependabot === "all") dependabotAll = true;
     else if (Array.isArray(def.dependabot)) for (const repo of def.dependabot) if (!dependabot.includes(repo)) dependabot.push(repo);
@@ -197,6 +203,7 @@ function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
   const ops: RoleOps = { k8sNamespaces, autoAdopt, sentry: { projects, resolveOnDone }, alertmanager: { namespaces: alertmanagerNamespaces }, pulls };
   if (context !== undefined) ops.context = context;
   if (team !== undefined) ops.team = team;
+  if (backlog !== undefined) ops.backlog = backlog;
   if (dependabotAll) ops.dependabot = "all";
   else if (dependabot.length > 0) ops.dependabot = dependabot;
   return ops;
