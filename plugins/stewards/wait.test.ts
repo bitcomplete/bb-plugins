@@ -70,9 +70,10 @@ describe("the typed wait: the closed kind set", () => {
 });
 
 describe("the typed wait: the downgrade to external", () => {
-  it("downgrades a pull or review ref that is the binding's own", () => {
+  it("downgrades a pull ref that is the binding's own, but not a review ref", () => {
     expect(v("pull", "acme/web#7", { isOwnPull: () => true })).toMatchObject({ ok: true, wait: { kind: "external", ref: "acme/web#7" }, downgraded: "reference_is_self" });
-    expect(v("review", "acme/web#7", { isOwnPull: () => true })).toMatchObject({ downgraded: "reference_is_self" });
+    // A `review` wait on the same own pull is valid and live while unreviewed (the BB-333 design's bb-plugins#294 note).
+    expect(v("review", "acme/web#7", { isOwnPull: () => true })).toMatchObject({ ok: true, wait: { kind: "review", ref: "acme/web#7" }, downgraded: null });
   });
 
   it("downgrades a well-formed ref the plugin cannot resolve", () => {

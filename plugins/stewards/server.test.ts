@@ -14680,6 +14680,39 @@ describe("a typed wait (BB-333)", () => {
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "pull", ref: "acme/web#9" });
   });
 
+  it("accepts a review wait on the binding's own pull", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#7" } }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("acme/web#7")!.wait).toEqual({ kind: "review", ref: "acme/web#7" });
+  });
+
+  it("accepts a deployment wait whose named-target watch is keyed by target", async () => {
+    const { t, b, steward } = await ticket();
+    // A named-target watch is keyed `pullKey::target`, so the ref must match the watch's own key (BB-132).
+    t.hooks.store.patch(b.id, {
+      deployments: {
+        "acme/web#7::bb-gate": { key: "acme/web#7", state: "deploying", mergeSha: null, target: "bb-gate", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: t.now(), deadlineAt: null, note: null, workflowRuns: [] },
+      },
+    });
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the bb-gate deploy", wait: { kind: "deployment", ref: "acme/web#7" } }, steward);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "deployment", ref: "acme/web#7" });
+  });
+
+  it("a wait skips the user-naming waitingOn refusal; the same report without one is refused", async () => {
+    const { t, steward } = await ticket();
+    const withWait = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval", wait: { kind: "external", ref: "the owner's approval" } }, steward);
+    expect(withWait.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "the owner's approval" });
+    const without = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval" }, steward);
+    expect(without.error).toBe(true);
+    expect(without.text).toMatch(/names the user, the owner or a human/u);
+  });
+
   // BB-266: a ticket with a gate-met own pull, a parked `finished` worker and a
   // second open own pull, waiting on the plugin auto-merge. The typed ref is
   // the own gate-met pull, so it is recorded as external (reference_is_self).

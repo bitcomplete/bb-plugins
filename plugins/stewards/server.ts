@@ -11186,7 +11186,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         wait: waitInputSchema
           .optional()
           .describe(
-            "The typed form of the wait: a closed kind (pull, review, deployment, worker, binding, date, person, external) and a ref. `pull`/`review` name a pull request (owner/repo#N); `deployment` a deployment-watch key; `worker` a worker thread id (thr_…); `binding` another binding's entity key; `date` an ISO date or datetime; `person` a page item id (need_…, esc_…, qst_…); `external` any free text. A pull or review ref that is the binding's own, or a well-formed ref the plugin cannot resolve, is recorded as `external`. Omit it for today's free-text `waitingOn`.",
+            "The typed form of the wait: a closed kind (pull, review, deployment, worker, binding, date, person, external) and a ref. `pull`/`review` name a pull request (owner/repo#N); `deployment` a deployment-watch key; `worker` a worker thread id (thr_…); `binding` another binding's entity key; `date` an ISO date or datetime; `person` a page item id (need_…, esc_…, qst_…); `external` any free text. A `pull` ref that is the binding's own, or a well-formed ref the plugin cannot resolve, is recorded as `external`; a `review` wait on the binding's own pull is valid. Omit it for today's free-text `waitingOn`.",
           ),
         conditions: z.array(z.string().trim().min(1).max(200)).max(10).optional().describe("Anything else a reader of the status should know at a glance."),
         ready: z
@@ -11480,7 +11480,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // A missing config leaves the repo check open rather than
               // downgrading a ref the plugin simply could not read.
               isWatchedRepo: (repo) => config === null || config.repos.some((r) => lc(r) === lc(repo)),
-              hasDeployment: (key) => Object.keys(b.deployments).some((k) => lc(k) === lc(key)),
+              // The map is keyed by watch id (`pullKey::<target>` when the target is named or there are several), so match the watch's own pull key (BB-132).
+              hasDeployment: (key) => Object.values(b.deployments).some((w) => lc(w.key) === lc(key)),
               hasOpenBinding: (key) => {
                 const other = store.find(key, b.projectId);
                 return other !== null && other.endedAt === null;

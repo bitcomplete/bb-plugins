@@ -77,7 +77,7 @@ export const WAIT_REFUSAL_MESSAGE: Record<WaitRefusal, string> = {
   missing_reference: "missing_reference: a typed wait needs a non-empty ref.",
   malformed_reference: "malformed_reference: the ref does not parse for the kind.",
   date_wait_without_date: "date_wait_without_date: a date wait needs a parseable date in ref, or an until.",
-  reference_is_self: "reference_is_self: a pull or review wait cannot name the binding's own pull request; recorded as external.",
+  reference_is_self: "reference_is_self: a pull wait cannot name the binding's own pull request; recorded as external.",
   unvalidatable_reference: "unvalidatable_reference: the ref does not resolve to a live source; recorded as external.",
 };
 
@@ -118,12 +118,19 @@ export function validateWait(input: WaitInput, until: string | undefined, ctx: W
   }
   let downgraded: WaitRefusal | null = null;
   switch (kind) {
-    case "pull":
-    case "review": {
+    case "pull": {
       const parsed = parsePullRef(ref)!;
       const key = `${parsed.repo}#${parsed.number}`;
       if (ctx.isOwnPull(key)) downgraded = "reference_is_self";
       else if (!ctx.isWatchedRepo(parsed.repo)) downgraded = "unvalidatable_reference";
+      break;
+    }
+    case "review": {
+      // A review wait on the binding's own pull is valid: the steward is
+      // waiting for its review, not for the plugin's own merge action. Only a
+      // pull wait on the binding's own pull is unobservable (BB-333 design).
+      const parsed = parsePullRef(ref)!;
+      if (!ctx.isWatchedRepo(parsed.repo)) downgraded = "unvalidatable_reference";
       break;
     }
     case "deployment": {
