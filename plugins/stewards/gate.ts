@@ -225,6 +225,105 @@ export function ownerApproval(entity: EntitySnapshot): OwnerApproval {
   return { approved: true, at: bestAt, id: bestId, url: bestUrl, kind: bestKind };
 }
 
+// ---- delegate approvals (BB-327) ------------------------------------------------------
+
+/**
+ * A GitHub App or bot login, which is never a delegate. GitHub Apps' logins
+ * end in `[bot]`; a few bare names are also bots (the dependency watch's own
+ * matcher, BB-164).
+ */
+const BOT_LOGIN = /\[bot\]$/iu;
+const KNOWN_BOTS = new Set(["dependabot", "renovate", "github-actions", "copilot"]);
+
+/** Whether a requested-reviewer entry is a bot account rather than a person. */
+export function isBotLogin(login: string): boolean {
+  const l = login.trim().toLowerCase();
+  return l !== "" && (BOT_LOGIN.test(l) || KNOWN_BOTS.has(l));
+}
+
+/**
+ * Whether a requested-reviewer entry can be a GitHub user login rather than a
+ * team's display name. GitHub logins are letters, digits and single hyphens; a
+ * team's display name may contain spaces or other characters. A team name that
+ * happens to look like a login is indistinguishable in the snapshot, and a
+ * membership lookup is out of scope (BB-327): such a name is never an approval
+ * because a team cannot submit a review, and the outstanding-delegate state
+ * only names entries this test accepts.
+ */
+const USER_LOGIN = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}$/iu;
+export function isUserLogin(login: string): boolean {
+  return USER_LOGIN.test(login.trim());
+}
+
+/** The delegate login a requested-reviewer entry names, or null when it is the viewer, a bot or a team. */
+function delegateLogin(entry: string, viewer: string | null): string | null {
+  const login = entry.trim();
+  if (login === "" || (viewer !== null && login.toLowerCase() === viewer)) return null;
+  if (isBotLogin(login) || !isUserLogin(login)) return null;
+  return login;
+}
+
+/**
+ * The delegates a pull request carries (BB-327): the requested reviewers that
+ * are users other than the viewer. `outstanding` are those still to approve,
+ * in the order seen; `approval` is the newest delegate APPROVED review, if
+ * any. A delegate's later "changes requested" revokes their approval, so each
+ * login is read by its latest review state. The remembered set is read too, so
+ * an APPROVED review still counts after GitHub drops the reviewer from the
+ * live list; a remembered login with no review was removed from the request
+ * list, so that delegation ended and it is not outstanding.
+ */
+export type DelegateState = {
+  outstanding: string[];
+  approval: { by: string; at: string; id: string | null; url: string | null } | null;
+  /**
+   * Delegates whose latest review is "changes requested", with the commit
+   * they reviewed. The re-solicit rule fires only when a later head is
+   * approved, so the commit is what tells a new head from the reviewed one
+   * (BB-327).
+   */
+  changesRequested: Array<{ login: string; commit: string | null }>;
+};
+
+export function delegateState(entity: EntitySnapshot, remembered: readonly string[] = []): DelegateState {
+  const viewer = entity.viewer === null ? null : entity.viewer.toLowerCase();
+  const candidates = new Map<string, { login: string; live: boolean }>();
+  for (const entry of entity.pull?.requestedReviewers ?? []) {
+    const login = delegateLogin(entry, viewer);
+    if (login !== null) candidates.set(login.toLowerCase(), { login, live: true });
+  }
+  for (const entry of remembered) {
+    const login = delegateLogin(entry, viewer);
+    if (login === null) continue;
+    const lower = login.toLowerCase();
+    if (!candidates.has(lower)) candidates.set(lower, { login, live: false });
+  }
+  const latest = new Map<string, { state: string; at: string; commit: string | null }>();
+  for (const r of entity.pull?.reviews ?? []) {
+    const lower = r.author.toLowerCase();
+    if (!candidates.has(lower)) continue;
+    const at = r.submittedAt ?? "";
+    const prev = latest.get(lower);
+    if (prev === undefined || at >= prev.at) latest.set(lower, { state: r.state.toLowerCase(), at, commit: r.commit });
+  }
+  let approval: DelegateState["approval"] = null;
+  const outstanding: string[] = [];
+  const changesRequested: Array<{ login: string; commit: string | null }> = [];
+  for (const [lower, c] of candidates) {
+    const review = latest.get(lower) ?? null;
+    if (review !== null && review.state === "approved") {
+      if (approval === null || review.at > approval.at) {
+        const flat = entity.comments.find((x) => x.author.toLowerCase() === lower && x.createdAt === review.at && x.did.toLowerCase() === "approved");
+        approval = { by: c.login, at: review.at, id: flat?.id ?? null, url: flat?.url ?? null };
+      }
+      continue;
+    }
+    if (c.live || review !== null) outstanding.push(c.login);
+    if (review !== null && review.state === "changes requested") changesRequested.push({ login: c.login, commit: review.commit });
+  }
+  return { outstanding, approval, changesRequested };
+}
+
 // ---- the project steward's approval marker --------------------------------------------
 
 /**
@@ -336,6 +435,23 @@ export type PrGate = {
   ownerApprovalId: string | null;
   ownerApprovalUrl: string | null;
   ownerApprovalKind: "comment" | "review" | null;
+  /** The requested reviewers still to approve: the owner delegated the review to them (BB-327). */
+  delegates: string[];
+  /** Whether the owner lane is waiting on a requested reviewer rather than the owner (BB-327). */
+  delegatePending: boolean;
+  /** Whether a requested reviewer's APPROVED review satisfies the owner lane (BB-327). */
+  delegateApproved: boolean;
+  /** The delegate whose review approved, and its review, for the resolution text. */
+  delegateApprovalBy: string | null;
+  delegateApprovalAt: string | null;
+  delegateApprovalId: string | null;
+  delegateApprovalUrl: string | null;
+  /** Delegates whose latest review is "changes requested" (BB-327). */
+  delegateChangesRequested: string[];
+  /** Delegates already re-requested for the current head (BB-327). */
+  delegateReRequested: string[];
+  /** Delegates to re-solicit now: changes-requested, an approved marker at this head, green checks, not yet re-requested (BB-327). */
+  delegatesToReRequest: string[];
   /** The project-steward marker that approved, when that is the gate. */
   projectApprovalId: string | null;
   projectApprovalUrl: string | null;
@@ -412,6 +528,19 @@ export type PrGateOptions = {
    * fails closed only when the base changed after the approval.
    */
   headMergeBaseIsDefaultTip?: boolean | null;
+  /**
+   * Every login the store has seen in this pull request's requested-reviewers
+   * list (BB-327). GitHub drops a reviewer from the live list once they
+   * submit, so a delegate's later APPROVED review is counted against this
+   * remembered set as well as the live one.
+   */
+  rememberedRequesters?: readonly string[];
+  /**
+   * The delegates the plugin has already re-requested for the current head
+   * (BB-327). A delegate whose latest review is changes-requested is
+   * re-solicited once per head, once the reviewer marker approves it.
+   */
+  reRequestedDelegates?: readonly string[];
 };
 
 export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate {
@@ -422,6 +551,11 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   const checksState = pull?.checks?.state ?? null;
   const checksGreen = pull !== null && (pull.checks === null || pull.checks.state === "success");
   const owner = ownerApproval(entity);
+  // BB-327: a requested reviewer is the owner's delegation. `delegates` are
+  // those still to approve; a delegate's APPROVED review meets the owner lane
+  // the same way the owner's own approval does. Identity stays the viewer's:
+  // only the viewer's comments and reviews are read for a signature.
+  const delegate = delegateState(entity, opts.rememberedRequesters ?? []);
   const markerApproved = marker !== null && marker.verdict === "approved";
   // BB-207: a substantial pull request with no approved spec on a referenced
   // ticket is the owner's, whatever lane the reviewer assigned, and a
@@ -468,17 +602,33 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // based on the default branch throughout that is merely behind keeps its
   // approval, because the base never changed. The approval time is the one the
   // gate is using: the project steward's marker or the owner's approval.
-  const approvalAt = decision === "project" ? (approval?.comment.createdAt ?? null) : owner.at;
+  // BB-327: the BB-279 base-change rule uses the approval's time whichever
+  // approver gave it; with both, the newest approval is the one the gate uses.
+  const approvalAt = decision === "project" ? (approval?.comment.createdAt ?? null) : owner.at === null ? (delegate.approval?.at ?? null) : delegate.approval === null ? owner.at : owner.at > delegate.approval.at ? owner.at : delegate.approval.at;
   const baseChangedAt = pull?.baseChangedAt ?? null;
   const baseChangedSinceApproval = opts.baseChangedSinceApproval ?? (baseChangedAt !== null && approvalAt !== null && baseChangedAt > approvalAt);
   const headOnDefaultTip = opts.headMergeBaseIsDefaultTip ?? pull?.headMergeBaseIsDefaultTip ?? null;
   const baseStale = baseChangedSinceApproval && headOnDefaultTip !== true;
-  const approved = (decision === "project" ? projectApproved : owner.approved) && !baseStale;
+  const approved = (decision === "project" ? projectApproved : owner.approved || delegate.approval !== null) && !baseStale;
   // A stale approval is not a request for another approval: the head must be
   // rebased onto the default branch first, and a fresh approval would only let
   // the un-rebased head merge. So neither approval is asked for while
   // `baseStale`, and `missing` names the rebase.
   const approvalNeeded = ownerLane && markerApproved && checksGreen && !approved && !baseStale;
+  // BB-327: while a requested reviewer is outstanding, the owner is not asked:
+  // the lane waits on the delegate, and `needsOwnerApproval` is false. The
+  // viewer's own approval is still an override, so this holds only until one
+  // approval (the viewer's or a delegate's) lands.
+  const delegatePending = approvalNeeded && decision === "user" && delegate.outstanding.length > 0;
+  // BB-327: a delegate whose latest review is changes-requested is re-solicited
+  // once per head, only once the independent reviewer's marker approves that
+  // head with green checks. The record stops a repeated look re-requesting.
+  const reRequested = new Set((opts.reRequestedDelegates ?? []).map((l) => l.toLowerCase()));
+  const delegateReRequested = delegate.outstanding.filter((login) => reRequested.has(login.toLowerCase()));
+  const delegatesToReRequest =
+    approvalNeeded && decision === "user" && marker !== null && marker.sha === headSha
+      ? delegate.changesRequested.filter((c) => c.commit !== null && c.commit !== headSha && !reRequested.has(c.login.toLowerCase())).map((c) => c.login)
+      : [];
   const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || approved);
   const missing = gateMet
     ? null
@@ -493,13 +643,15 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
             : ownerLane && !approved
               ? baseStale
                 ? "rebase the head onto the default branch: the base changed since the approval"
-                : product
-                  ? "owner approval needed (product)"
-                  : escalated
-                    ? "owner approval needed (the reviewer escalated it)"
-                    : decision === "project"
-                      ? "project steward approval needed"
-                      : "owner approval needed"
+                : decision === "user" && delegate.outstanding.length > 0
+                  ? `approval needed from ${delegate.outstanding.join(", ")}${delegateReRequested.length > 0 ? ` (re-requested for this head: ${delegateReRequested.join(", ")})` : ""}`
+                  : product
+                    ? "owner approval needed (product)"
+                    : escalated
+                      ? "owner approval needed (the reviewer escalated it)"
+                      : decision === "project"
+                        ? "project steward approval needed"
+                        : "owner approval needed"
               : "not met";
   return {
     headSha,
@@ -516,7 +668,17 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     projectApprovalUrl: approval?.comment.url ?? null,
     gateMet,
     missing,
-    needsOwnerApproval: approvalNeeded && decision === "user",
+    delegates: delegate.outstanding,
+    delegatePending,
+    delegateApproved: delegate.approval !== null,
+    delegateApprovalBy: delegate.approval?.by ?? null,
+    delegateApprovalAt: delegate.approval?.at ?? null,
+    delegateApprovalId: delegate.approval?.id ?? null,
+    delegateApprovalUrl: delegate.approval?.url ?? null,
+    delegateChangesRequested: delegate.changesRequested.map((c) => c.login),
+    delegateReRequested,
+    delegatesToReRequest,
+    needsOwnerApproval: approvalNeeded && decision === "user" && !delegatePending,
     needsProjectApproval: approvalNeeded && decision === "project",
     baseStale,
     decision,

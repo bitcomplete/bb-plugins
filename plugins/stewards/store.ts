@@ -17,7 +17,7 @@ import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import type { GuidanceCitation } from "./guidance.js";
-import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore } from "./approvals-store.js";
+import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
 
 /**
@@ -471,7 +471,7 @@ export const IDLE_MIGRATIONS = [
 
 // BB-77: the project-steward approval marker's migration group lives with the
 // table it alters, in approvals-store.ts, so the gate's own files can be named.
-export { APPROVAL_MARKER_MIGRATIONS } from "./approvals-store.js";
+export { APPROVAL_MARKER_MIGRATIONS, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 
 // BB-97: the status report's actor `me` is renamed `user`, so all three values
 // name a party rather than a pronoun. A stored row keeps its meaning: this
@@ -726,7 +726,7 @@ export const STANDUP_COMPLETED_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN co
 // a store from before the step reads back exactly as before.
 export const ALERTMANAGER_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN alertmanager_look TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS];
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -2756,6 +2756,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
     setEscalationHead(id: string, headSha: string | null): void {
       db.prepare("UPDATE escalations SET head_sha = ? WHERE id = ?").run(headSha, id);
+    },
+    /** Replace an open escalation's `meanwhile` text, so a wait can name who it now waits on (BB-327). */
+    setEscalationMeanwhile(id: string, meanwhile: string): void {
+      db.prepare("UPDATE escalations SET meanwhile = ? WHERE id = ?").run(meanwhile, id);
     },
     /** Record a forwarding hop on the escalation's chain, keeping its rewording. */
     addHop(id: string, hop: { threadId: string; bindingId: string | null; rewording: string | null }): void {

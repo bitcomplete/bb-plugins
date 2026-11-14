@@ -4637,6 +4637,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // no extra GitHub read. Everything else is a row already in hand.
       const decisions = new Map<string, "project" | "user">();
       for (const e of ownPullEntities(observed, gatePulls)) decisions.set(lc(e.key), decideForPull(e.pull?.files ?? null, config.file.bigDecisions));
+      // BB-327: the logins the store remembers as requested reviewers, so a
+      // delegate's APPROVED review still counts after GitHub drops them.
+      const rememberedRequesters = new Map<string, readonly string[]>();
+      const reRequestedDelegates = new Map<string, readonly string[]>();
+      for (const e of ownPullEntities(observed, gatePulls)) {
+        const remembered = store.pullRequesters(b.id, e.url ?? e.key);
+        if (remembered.length > 0) {
+          rememberedRequesters.set(lc(e.key), remembered);
+          if (e.url !== null) rememberedRequesters.set(lc(e.url), remembered);
+        }
+        const reRequested = store.reviewerRequests(b.id, e.url ?? e.key, e.pull?.headSha ?? "");
+        if (reRequested.length > 0) {
+          reRequestedDelegates.set(lc(e.key), reRequested);
+          if (e.url !== null) reRequestedDelegates.set(lc(e.url), reRequested);
+        }
+      }
       const input: AssessmentInput = {
         binding: b,
         observed,
@@ -4644,6 +4660,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         gatePulls,
         decisions,
         projectApprovals: projectApprovalsFor(b),
+        rememberedRequesters,
+        reRequestedDelegates,
         workers,
         escalations: store.openEscalations(b.id),
         needs: store.openNeeds(b.id),
@@ -9187,7 +9205,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       lane: string | null;
       marker: { round: number; sha: string; verdict: string } | null;
       decision: { entry: string | null; decide: "project" | "user"; why: string; listing: string; selfWidening: string[] };
-      approval: { kind: "owner-comment" | "owner-review" | "project-marker"; sha: string | null; at: string | null } | null;
+      approval: { kind: "owner-comment" | "owner-review" | "delegate-review" | "project-marker"; sha: string | null; at: string | null; by?: string | null } | null;
       checks: { state: string | null; green: boolean };
       openItems: string[];
       /** Whether the reviewer's marker escalated the pull request to the owner (BB-192). */
@@ -9215,6 +9233,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const recorded = new Set(projectApprovalsFor(b).filter((r) => r.commentId !== null).map((r) => r.commentId!));
         const marker = latestProjectApprovalMarker(pull.comments, recorded);
         if (marker !== null) return { kind: "project-marker", sha: marker.marker.sha === "" ? null : marker.marker.sha, at: marker.comment.createdAt };
+      }
+      if (gate.delegateApproved) {
+        const at = gate.delegateApprovalAt;
+        const review = at === null ? undefined : (pull.pull?.reviews ?? []).find((r) => (r.submittedAt ?? "") === at && r.author.toLowerCase() === (gate.delegateApprovalBy ?? "").toLowerCase() && r.state.toLowerCase() === "approved");
+        return { kind: "delegate-review", sha: review?.commit ?? null, at, by: gate.delegateApprovalBy };
       }
       if (gate.ownerApproved) {
         const at = gate.ownerApprovalAt;
@@ -9272,7 +9295,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const marker = r.marker === null ? "none" : `round ${r.marker.round} at ${shortSha(r.marker.sha)} (${r.marker.verdict})`;
       const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}: ${r.decision.why})` : `"${r.decision.entry}" (${r.decision.decide})`;
       const listing = r.decision.listing.split("\n").map((l) => `  ${l}`).join("\n");
-      const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}`;
+      const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}${r.approval.by === null || r.approval.by === undefined ? "" : ` by ${r.approval.by}`}`;
       // The reviewer's owner call is printed beside the decide-list winner: the
       // decide list may still name a `project` entry, but the escalation binds
       // the gate to the owner's approval (BB-192).
@@ -9295,7 +9318,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function mergeSummary(gate: ReturnType<typeof prGate>): string {
       const lane = gate.lane ?? "no-review";
       const approved = gate.marker?.sha ?? gate.headSha;
-      const by = gate.projectApproved ? ", approved by the project steward" : gate.ownerApproved ? ", approved by the owner" : "";
+      const by = gate.projectApproved
+        ? ", approved by the project steward"
+        : gate.delegateApproved
+          ? `, approved by the requested reviewer ${gate.delegateApprovalBy ?? ""}`.trimEnd()
+          : gate.ownerApproved
+            ? ", approved by the owner"
+            : "";
       const escalation = gate.reason === "product" ? ", the owner acked the product" : gate.escalated ? ", escalated by the reviewer to the owner" : "";
       return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}${escalation}.`;
     }

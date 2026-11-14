@@ -78,6 +78,12 @@ export interface GithubWriter {
    */
   review(repo: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string): Promise<void>;
   /**
+   * Request reviews from the given logins as the connected user (BB-327),
+   * the API equivalent of `gh pr edit --add-reviewer`. Used to re-solicit a
+   * delegate after they requested changes and a new head is approved.
+   */
+  requestReviewers(repo: string, number: number, logins: readonly string[]): Promise<void>;
+  /**
    * Squash-merge the pull request, with the given commit title and message;
    * returns the merge commit sha when GitHub reports one. `sha` is the head
    * the caller judged: GitHub refuses with 409 "Head branch was modified"
@@ -183,6 +189,10 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
     },
     async review(repo, number, event, body) {
       await request("POST", `/repos/${repo}/pulls/${number}/reviews`, { event, body });
+    },
+    async requestReviewers(repo, number, logins) {
+      if (logins.length === 0) return;
+      await request("POST", `/repos/${repo}/pulls/${number}/requested_reviewers`, { reviewers: logins });
     },
     async squashMerge(repo, number, title, body, headSha) {
       const response = await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body, ...(headSha === undefined || headSha === null || headSha === "" ? {} : { sha: headSha }) });

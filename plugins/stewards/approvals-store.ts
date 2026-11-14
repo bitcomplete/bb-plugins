@@ -37,6 +37,37 @@ export const APPROVAL_MARKER_MIGRATIONS = [
   `ALTER TABLE project_approvals ADD COLUMN verdict TEXT NOT NULL DEFAULT 'approved'`,
 ];
 
+// BB-327: every login seen in a pull request's requested-reviewers list, for
+// the binding and URL. GitHub drops a reviewer from the live list once they
+// submit a review, and the snapshot carries no request history, so the gate
+// remembers the logins it has seen and counts a delegate's later APPROVED
+// review against this set as well as the live list. A new table, so a store
+// from before this step reads back exactly as before.
+export const PULL_REQUESTER_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS pull_requesters (
+     binding_id TEXT NOT NULL,
+     url TEXT NOT NULL,
+     login TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY (binding_id, url, login)
+   )`,
+];
+
+// BB-327: the (delegate, head) pairs the plugin has re-requested review from
+// after a changes-requested review, so a repeated look does not re-request and
+// the status can say the delegate was re-solicited for the current head. A new
+// table, so a store from before this step reads back exactly as before.
+export const REVIEWER_REQUEST_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS reviewer_requests (
+     binding_id TEXT NOT NULL,
+     url TEXT NOT NULL,
+     login TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY (binding_id, url, login, head_sha)
+   )`,
+];
+
 /**
  * A project steward's approval (or decline) of an owner-reviewed pull request,
  * bound to its head sha. `commentId` is the GitHub comment id of the
@@ -69,6 +100,16 @@ export function createApprovalsStore(db: Database.Database, now: () => number) {
   const getProjectApproval = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
   const projectApprovalsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? ORDER BY created_at");
   const deleteProjectApproval = db.prepare("DELETE FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
+  // Prepared on first use: the migration tests open stores on partial schemas
+  // from before this group, and `pull_requesters` is the newest table.
+  const lazy = <P extends unknown[], R>(sql: string): (() => Database.Statement<P, R>) => {
+    let prepared: Database.Statement<P, R> | null = null;
+    return () => (prepared ??= db.prepare<P, R>(sql));
+  };
+  const insertPullRequester = lazy<[string, string, string, number], unknown>("INSERT OR IGNORE INTO pull_requesters (binding_id, url, login, created_at) VALUES (?, ?, ?, ?)");
+  const pullRequestersFor = lazy<[string, string], Record<string, unknown>>("SELECT login FROM pull_requesters WHERE binding_id = ? AND url = ? ORDER BY created_at, login");
+  const insertReviewerRequest = lazy<[string, string, string, string, number], unknown>("INSERT OR IGNORE INTO reviewer_requests (binding_id, url, login, head_sha, created_at) VALUES (?, ?, ?, ?, ?)");
+  const reviewerRequestsFor = lazy<[string, string, string], Record<string, unknown>>("SELECT login FROM reviewer_requests WHERE binding_id = ? AND url = ? AND head_sha = ? ORDER BY created_at, login");
 
   const toProjectApproval = (r: Record<string, unknown>): ProjectApproval => ({
     bindingId: String(r.binding_id),
@@ -108,6 +149,33 @@ export function createApprovalsStore(db: Database.Database, now: () => number) {
     /** Drop a recorded approval (a new push voids it by sha; this is for an explicit retraction). */
     clearProjectApproval(bindingId: string, headSha: string): boolean {
       return deleteProjectApproval.run(bindingId, headSha).changes > 0;
+    },
+    // requested reviewers remembered for the delegate rule (BB-327)
+    /**
+     * Remember every login seen in a pull request's requested-reviewers list,
+     * for the binding and URL (BB-327). GitHub drops a reviewer from the live
+     * list once they submit, so the gate reads this set to count a delegate's
+     * later APPROVED review.
+     */
+    rememberPullRequesters(bindingId: string, url: string, logins: readonly string[]): void {
+      const at = now();
+      for (const raw of logins) {
+        const login = raw.trim().toLowerCase();
+        if (login === "") continue;
+        insertPullRequester().run(bindingId, url, login, at);
+      }
+    },
+    /** The logins remembered as requested reviewers for a binding and URL (BB-327). */
+    pullRequesters(bindingId: string, url: string): string[] {
+      return pullRequestersFor().all(bindingId, url).map((r) => String(r.login));
+    },
+    /** Record that a delegate was re-requested for a head, so a repeated look does not re-request (BB-327). */
+    recordReviewerRequest(bindingId: string, url: string, login: string, headSha: string): void {
+      insertReviewerRequest().run(bindingId, url, login.trim().toLowerCase(), headSha, now());
+    },
+    /** The delegates already re-requested for a binding, URL and head (BB-327). */
+    reviewerRequests(bindingId: string, url: string, headSha: string): string[] {
+      return reviewerRequestsFor().all(bindingId, url, headSha).map((r) => String(r.login));
     },
   };
 }

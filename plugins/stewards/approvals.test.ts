@@ -6,8 +6,9 @@
 // BB-279: an owner's page approval and the project steward's decision deliver
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
-import { approvePrPageAction, deliverApproval, deliverProjectApproval, isUserThread, recordProjectDecision, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approvalRef, approvePrPageAction, deliverApproval, deliverProjectApproval, isUserThread, recordProjectDecision, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { isSelfWidening } from "./decisions.js";
+import { prGate } from "./gate.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
 import type { Binding, Need } from "./store.js";
 
@@ -26,7 +27,7 @@ const marker = (approver?: string) =>
 function context() {
   const githubComment = vi.fn().mockResolvedValue("IC_1");
   const recordProjectApproval = vi.fn();
-  const ctx = { github: { comment: githubComment }, now: () => 0, store: { recordProjectApproval, assessment: () => null, recordAssessment: vi.fn(), projectApprovals: () => [] } } as unknown as ApprovalsContext;
+  const ctx = { github: { comment: githubComment }, now: () => 0, store: { recordProjectApproval, assessment: () => null, recordAssessment: vi.fn(), projectApprovals: () => [], pullRequesters: () => [], reviewerRequests: () => [] } } as unknown as ApprovalsContext;
   return { ctx, githubComment, recordProjectApproval };
 }
 
@@ -86,6 +87,8 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
         assessment: () => null,
         recordAssessment: vi.fn(),
         projectApprovals: () => [],
+        pullRequesters: () => [],
+        reviewerRequests: () => [],
       },
       github: { comment: githubComment, review: githubReview },
       now: () => 0,
@@ -197,6 +200,124 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(githubComment).not.toHaveBeenCalled();
     expect(githubReview).not.toHaveBeenCalled();
     expect(sendTo).not.toHaveBeenCalled();
+  });
+});
+
+// BB-327: a requested reviewer is the owner's delegation. The sync files no
+// approve-pr need and routes no user escalation while one is outstanding; the
+// delegate's APPROVED review meets the lane; a changes-requested delegate is
+// re-solicited once per approved head.
+const delegateLaneMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+const delegateReview = (author: string, state: string, at: string, commit: string | null = head) => ({
+  reviews: [{ author, state, submittedAt: at, commit }],
+  comments: [comment({ id: `rev-${author}-${state}`, author, did: state === "approved" ? "approved" : "requested changes", body: "", createdAt: at, signedBy: null })],
+});
+const delegatePull = (reviewers: string[], extra: { comments?: ReturnType<typeof comment>[]; reviews?: { author: string; state: string; submittedAt: string; commit: string | null }[] } = {}) =>
+  pull({ comments: [delegateLaneMarker, ...(extra.comments ?? [])] }, { ...green, requestedReviewers: reviewers, ...(extra.reviews === undefined ? {} : { reviews: extra.reviews }) });
+const delegateUrl = "https://github.com/acme/web/pull/7";
+
+/** A context whose store records what `syncPullApproval` does to it. */
+function syncContext(existing: Array<Record<string, unknown>> = []) {
+  const fileNeed = vi.fn();
+  const escalate = vi.fn(() => ({ id: "esc_new" }));
+  const closeNeedByKey = vi.fn();
+  const resolve = vi.fn();
+  const setEscalationHead = vi.fn();
+  const reroute = vi.fn();
+  const setEscalationMeanwhile = vi.fn();
+  const note = vi.fn();
+  const rememberPullRequesters = vi.fn();
+  const recordReviewerRequest = vi.fn();
+  const requestReviewers = vi.fn().mockResolvedValue(undefined);
+  const store = {
+    rememberPullRequesters,
+    closeNeedByKey,
+    openEscalations: () => existing as never[],
+    escalate,
+    resolve,
+    setEscalationHead,
+    reroute,
+    setEscalationMeanwhile,
+    note,
+    recordReviewerRequest,
+    assessment: () => null,
+    recordAssessment: vi.fn(),
+    projectApprovals: () => [],
+    pullRequesters: () => [],
+    reviewerRequests: () => [],
+  };
+  const ctx = {
+    store,
+    github: { comment: vi.fn(), review: vi.fn(), requestReviewers },
+    now: () => 0,
+    shortSha: (sha: string | null | undefined) => (sha ?? "").slice(0, 7),
+    scheduleReconcile: vi.fn(),
+    snapshot: vi.fn().mockResolvedValue(null),
+    linkedPulls: vi.fn().mockResolvedValue([]),
+    threadInfo: vi.fn().mockResolvedValue(null),
+    sendTo: vi.fn(),
+    wakeProject: vi.fn(),
+    pullChangedFiles: vi.fn().mockResolvedValue([]),
+    loadDecisions: vi.fn().mockResolvedValue([]),
+    observedPulls: vi.fn().mockReturnValue([]),
+    mechanicalStatus: vi.fn(),
+  } as unknown as ApprovalsContext;
+  const b = { id: "b1", projectId: "p1", entityKey: "acme/web#7", source: "ops", kind: "pr", entityId: "acme/web#7", url: delegateUrl, lastSnapshot: null } as unknown as Binding;
+  return { ctx, b, fileNeed, escalate, closeNeedByKey, resolve, setEscalationHead, reroute, setEscalationMeanwhile, note, rememberPullRequesters, recordReviewerRequest, requestReviewers };
+}
+
+describe("a requested reviewer is the owner's delegation (BB-327)", () => {
+  it("files no approve-pr need and routes no user escalation while one is outstanding (criterion 2)", async () => {
+    const { ctx, b, fileNeed, escalate, closeNeedByKey, rememberPullRequesters } = syncContext();
+    const entity = delegatePull(["arashout"]);
+    const result = await syncPullApproval(ctx, b, entity, [], () => prGate(entity));
+    expect(result.gate.delegatePending).toBe(true);
+    // The request list is remembered for the delegate set.
+    expect(rememberPullRequesters).toHaveBeenCalledWith("b1", delegateUrl, ["arashout"]);
+    // No page item, and the escalation waits on the delegate, not the user.
+    expect(fileNeed).not.toHaveBeenCalled();
+    expect(escalate).toHaveBeenCalledTimes(1);
+    const fields = (escalate.mock.calls as unknown as Array<[{ route: string; meanwhile: string }]>)[0]![0];
+    expect(fields.route).toBe("steward");
+    expect(fields.meanwhile).toContain("arashout");
+    expect(closeNeedByKey).toHaveBeenCalledWith("b1", "approve-pr", delegateUrl, expect.stringContaining("arashout"));
+  });
+
+  it("reroutes an existing owner escalation to the steward and names the delegate (criterion 2)", async () => {
+    const esc = { id: "esc1", kind: "approval", url: delegateUrl, resolutionKind: "approve-decline", route: "user", headSha: head, recommendation: null };
+    const { ctx, b, fileNeed, escalate, reroute, setEscalationMeanwhile } = syncContext([esc]);
+    const entity = delegatePull(["arashout"]);
+    await syncPullApproval(ctx, b, entity, [], () => prGate(entity));
+    expect(fileNeed).not.toHaveBeenCalled();
+    expect(escalate).not.toHaveBeenCalled();
+    expect(reroute).toHaveBeenCalledWith("esc1", "steward", null);
+    expect(setEscalationMeanwhile).toHaveBeenCalledWith("esc1", expect.stringContaining("arashout"));
+  });
+
+  it("names the delegate's review in approvalRef (criterion 3)", () => {
+    const review = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const entity = delegatePull(["arashout"], review);
+    const g = prGate(entity);
+    expect(g.gateMet).toBe(true);
+    expect(approvalRef(g)).toBe("review rev-arashout-approved");
+  });
+
+  it("re-requests a changes-requested delegate once per approved head (criterion 7)", async () => {
+    const { ctx, b, requestReviewers, recordReviewerRequest } = syncContext();
+    const review = delegateReview("arashout", "changes requested", "2026-10-14T17:00:00Z", "bbbbbbb2");
+    const entity = delegatePull(["arashout"], review);
+    await syncPullApproval(ctx, b, entity, [], () => prGate(entity));
+    expect(requestReviewers).toHaveBeenCalledTimes(1);
+    expect(requestReviewers).toHaveBeenCalledWith("acme/web", 7, ["arashout"]);
+    expect(recordReviewerRequest).toHaveBeenCalledWith("b1", delegateUrl, "arashout", head);
+  });
+
+  it("does not re-request a delegate already re-requested for the head (criterion 7)", async () => {
+    const { ctx, b, requestReviewers } = syncContext();
+    const review = delegateReview("arashout", "changes requested", "2026-10-14T17:00:00Z", "bbbbbbb2");
+    const entity = delegatePull(["arashout"], review);
+    await syncPullApproval(ctx, b, entity, [], () => prGate(entity, { reRequestedDelegates: ["arashout"] }));
+    expect(requestReviewers).not.toHaveBeenCalled();
   });
 });
 
