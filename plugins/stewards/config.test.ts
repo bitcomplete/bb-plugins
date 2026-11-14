@@ -850,6 +850,34 @@ describe("roles.json version 2 (BB-163)", () => {
   });
 });
 
+describe("roles.json backlog role (BB-332)", () => {
+  const backlog = (role: Record<string, unknown>) => parseRolesFile(JSON.stringify({ version: 2, roles: { backlog: role }, holders: { trotterdylan: ["backlog"] } }));
+
+  it("parses a backlog role's team, folded to upper case, on the definition and the effective role", () => {
+    const parsed = backlog({ backlog: { team: " bb " } });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.definitions.backlog).toMatchObject({ backlog: { team: "BB" } });
+    expect(parsed.value.roles["trotterdylan"]!.ops?.backlog).toEqual({ team: "BB" });
+    // The example entry the design must accept, through the roles file schema.
+    const example = parseRolesFile(JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { trotterdylan: ["backlog"] } }));
+    if (!example.ok) throw new Error(example.error);
+    expect(example.value.roles["trotterdylan"]!.ops?.backlog).toEqual({ team: "BB" });
+  });
+
+  it("rejects an empty backlog, a missing or bad team, and an unknown key inside it", () => {
+    expect(backlog({ backlog: {} })).toMatchObject({ ok: false, error: expect.stringMatching(/roles\.backlog\.backlog\.team/u) });
+    expect(backlog({ backlog: { team: "" } })).toMatchObject({ ok: false });
+    expect(backlog({ backlog: { team: "Bad Key" } })).toMatchObject({ ok: false });
+    expect(backlog({ backlog: { team: "BB", bogus: true } })).toMatchObject({ ok: false });
+  });
+
+  it("leaves a role without backlog exactly as before", () => {
+    const parsed = backlog({ k8sNamespaces: ["prod"] });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.roles["trotterdylan"]!.ops).toEqual({ k8sNamespaces: ["prod"], autoAdopt: [], sentry: { projects: [], resolveOnDone: false }, alertmanager: { namespaces: [] }, pulls: [] });
+  });
+});
+
 describe("role pull watches (BB-164)", () => {
   const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => parseRolesFile(JSON.stringify({ version: 2, roles: definitions, holders }));
   const playbooks = () => {
