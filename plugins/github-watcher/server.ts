@@ -767,6 +767,13 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { issues: issues.slice(0, limit), unsupported: false, errors };
       },
 
+      // A team's whole backlog is a Linear read; GitHub has no such notion.
+      // Stewards tells "this source cannot do it" apart from an empty list
+      // and from a read error, so this is a typed answer, not a throw.
+      async sourceBacklog() {
+        return { issues: [], unsupported: true, truncated: false, errors: [] };
+      },
+
       // A repository's Dependabot alerts, read with the token through the
       // REST API. Each repository the token cannot read (no alert access,
       // alerts disabled, not visible) is named in `errors`; the rest are
