@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { decideEntrySchema, defaultDecideList, globError } from "./decisions.js";
-import { ALERTMANAGER_NAMESPACE, SENTRY_SLUG, type AlertmanagerTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
+import { ALERTMANAGER_NAMESPACE, SENTRY_SLUG, type AlertmanagerTarget, type BacklogTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
@@ -330,6 +330,26 @@ export type TicketWatch = z.infer<typeof ticketWatchSchema>;
  */
 export const ticketWatchId = (watch: Pick<TicketWatch, "playbook">): string => `${watch.playbook}@ticket`;
 
+/**
+ * The backlog steward's block (BB-334): the Linear team whose whole open
+ * backlog is reported, and the limits the report uses. `team` is optional;
+ * the role's `backlog.team` decides which binding exists, and a `team` here
+ * that names a different team is one `check` problem, never a silent pick.
+ * Every number is a positive integer; the defaults are the design's.
+ */
+export const backlogSchema = z
+  .object({
+    team: teamKey.optional(),
+    /** Stage 3's Todo + In Progress ceiling. */
+    wipLimit: z.number().int().positive().max(1000).default(5),
+    /** A ticket untouched for this long is stale. */
+    staleDays: z.number().int().positive().max(3650).default(14),
+    /** Stage 2's comment budget: at most this many comments per ticket per week. */
+    commentsPerWeek: z.number().int().positive().max(7).default(1),
+  })
+  .strict();
+export type BacklogConfig = z.infer<typeof backlogSchema>;
+
 export const projectFileSchema = z
   .object({
     version: z.literal(1),
@@ -434,6 +454,8 @@ export const projectFileSchema = z
       .default({ targets: [], autoAdopt: [], sentry: { resolveOnDone: false } }),
     /** The dependency watch: per-severity SLA, the batch window, and what auto-adopts. */
     deps: depsSchema,
+    /** The backlog steward's block (BB-334); absent, the feature is off exactly as before. */
+    backlog: backlogSchema.optional(),
     /** The mechanical lesson lifecycle's thresholds and caps (BB-35 step 3). */
     lessons: lessonRulesSchema,
     /**
@@ -487,6 +509,14 @@ export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string
   project.playbooks[kind] ?? (kind === "ticket" && project.linear.teams.length === 0 ? DEFAULT_GITHUB_TICKET_PLAYBOOK : DEFAULT_PLAYBOOKS[kind]);
 
 export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.targets;
+
+/**
+ * The backlog targets a server's role watches (BB-334): one per declared
+ * `backlog.team`. It reads the role's parsed shape; roles.ts itself is not
+ * changed, and the role's team is what decides which binding exists.
+ */
+export const roleBacklogTargets = (role: { ops?: { backlog?: { team: string } } } | null | undefined): BacklogTarget[] =>
+  role?.ops?.backlog === undefined ? [] : [{ kind: "backlog", team: role.ops.backlog.team }];
 
 /** The k8s namespaces to watch, which are read with kubectl. */
 export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.targets.filter((t): t is K8sTarget => t.kind === "k8s-namespace");
@@ -739,7 +769,7 @@ export const deploymentsFieldSchema = z
   });
 
 export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry", "alertmanager"] as const;
-const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry", "alertmanager"] };
+const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry", "alertmanager", "linear"] };
 
 export const frontMatterSchema = z
   .object({
@@ -847,16 +877,13 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   if (!parsed.success) return { ok: false, error: `${file}: ${zodMessage(parsed.error)}` };
   const fm = parsed.data;
   if (fm.name !== expectedName) return { ok: false, error: `${file} names itself ${JSON.stringify(fm.name)}; the file name says ${JSON.stringify(expectedName)}` };
+  // An ops binding watches a target, not an entity in a source plugin: a
+  // Kubernetes namespace reads k8s, a Dependabot alert target reads github, a
+  // Sentry project reads sentry, an Alertmanager namespace reads alertmanager,
+  // and a backlog binding (BB-334) reads linear. The playbook says which so
+  // its sections can be about the right thing; any listed source is valid.
   const expectedSources = SOURCES_OF[fm.kind];
-  if (fm.kind === "ops") {
-    // An ops binding watches a target, not an entity in a source plugin: a
-    // Kubernetes namespace reads k8s, a Dependabot alert target reads
-    // github, a Sentry project reads sentry, and an Alertmanager namespace
-    // reads alertmanager. The playbook says which so its sections can be
-    // about the right thing; any is valid, and the ops-watch playbook serves
-    // k8s, Sentry and Alertmanager targets alike.
-    if (fm.source === "linear") return { ok: false, error: `${file}: an ops playbook watches k8s, sentry, alertmanager or github, not ${fm.source}` };
-  } else if (!expectedSources.includes(fm.source)) {
+  if (!expectedSources.includes(fm.source)) {
     return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSources.join(" or ")}, not ${fm.source}` };
   }
   if (fm.kind === "ops") {

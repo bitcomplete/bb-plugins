@@ -49,6 +49,7 @@ import {
   playbookNameFor,
   playbookPath,
   playbookStates,
+  roleBacklogTargets,
   STAGES,
   ticketWatchId,
   ticketWatchProblems,
@@ -98,7 +99,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
 import { STANDUP_TOOLS, buildStandupBrief, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, type StandupDelegation, type StandupEndOutcome, type StandupEntityFacts, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolContext, type StandupToolReply } from "./standup.js";
 import { EntityCache, type EntityRecord } from "./entity-cache.js";
-import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
@@ -2319,6 +2320,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether a kind is in use, with BB-334's backlog role counted as an ops
+     * watch. `usesKind` reads roles.ts's ops targets, which do not include the
+     * `backlog` field a role carries, so it is added here rather than by
+     * changing roles.ts.
+     */
+    const usesKindFor = (file: ProjectFile, kind: BindingKind, role: StewardRole | null): boolean =>
+      kind === "ops" && role?.ops?.backlog !== undefined ? true : usesKind(file, kind, role);
+
+    /**
      * The project's stewards configuration, or null when the project has none.
      * A file that fails to parse falls back to the last good copy, kept in kv,
      * and the failure is reported as a problem rather than stopping anything.
@@ -2450,8 +2460,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // legacy ops no longer runs once roles.json wins, but the watch is not
       // moved until the project file drops it.
       if (legacyOpsPresent(file)) problems.push(`ops now belongs in ${ROLES_FILE}`);
+      // BB-334: the project's backlog block must name a team a role actually
+      // watches. A block with no matching role, or a `team` naming a different
+      // team, is one problem line; the binding never silently picks one.
+      if (file.backlog !== undefined) {
+        const backlogTeams = [...new Set(Object.values(roles?.roles ?? {}).flatMap((r) => (r.ops?.backlog === undefined ? [] : [r.ops.backlog.team])))];
+        if (backlogTeams.length === 0) problems.push(`${PROJECT_FILE}: backlog is configured but no role watches a backlog; add a backlog role or remove the block`);
+        else if (file.backlog.team !== undefined && !backlogTeams.includes(file.backlog.team)) problems.push(`${PROJECT_FILE}: backlog.team is ${file.backlog.team} but no role watches that team (${backlogTeams.join(", ")}); they must name the same team`);
+      }
 
-      const kinds = KINDS.filter((k) => usesKind(file, k, role));
+      const kinds = KINDS.filter((k) => usesKindFor(file, k, role));
       const names = new Map(kinds.filter((k) => k !== "ticket").map((k) => [k, playbookNameFor(file, k)] as const));
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
@@ -5334,8 +5352,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The login a filing target files under: this server's GitHub login for a repo, its Linear login for a team. */
     const filingLogin = (target: FilingTarget | null, config: ProjectConfig): string | null => (target?.source === "github" ? config.githubLogin : config.linearLogin);
 
-    /** Every ops target a project watches: the k8s namespaces, the Sentry projects, the Alertmanager namespaces and the Dependabot repositories. */
-    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...roleK8sTargets(config.role), ...roleSentryTargets(config.role), ...roleAlertmanagerTargets(config.role), ...roleDepsTargets(config.role, config.repos)];
+    /** Every ops target a project watches: the k8s namespaces, the Sentry projects, the Alertmanager namespaces, the Dependabot repositories and the role's backlog teams. */
+    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...roleK8sTargets(config.role), ...roleSentryTargets(config.role), ...roleAlertmanagerTargets(config.role), ...roleDepsTargets(config.role, config.repos), ...roleBacklogTargets(config.role)];
 
     /** One look at an ops binding's target, its problems entered in the fingerprint map and classified against it. */
     async function lookAt(b: Binding, config: ProjectConfig, target: K8sTarget, playbook: Playbook): Promise<OpsLook> {
@@ -5679,6 +5697,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await reconcileAlertmanager(b, config, playbook, target, force);
         return;
       }
+      if (target.kind === "backlog") {
+        await reconcileBacklog(b, config, playbook, target);
+        return;
+      }
       const before = b.opsLook;
       const look = await lookAt(b, config, target, playbook);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
@@ -5736,6 +5758,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
+    }
+
+    /**
+     * One read of a backlog binding's Linear team through `sourceBacklog`
+     * (BB-334). It is read-only: no Linear write is ever made on this path.
+     * An unsupported capability or a read error is an `error` look, never an
+     * empty one; `issues: []` with a null `error` is the only empty report.
+     */
+    async function lookAtBacklog(target: BacklogTarget): Promise<BacklogLook> {
+      const at = now();
+      try {
+        const out = await sourceRpc("linear", "sourceBacklog", { team: target.team }, sourceContract.sourceBacklog.output);
+        const error = out.unsupported ? "the linear source does not support sourceBacklog" : out.errors.length > 0 ? out.errors.join("; ") : null;
+        return { at, target: opsTargetKey(target), team: target.team, error, issues: out.issues, unsupported: out.unsupported, truncated: out.truncated };
+      } catch (error) {
+        return { at, target: opsTargetKey(target), team: target.team, error: errorMessage(error), issues: [], unsupported: false, truncated: false };
+      }
+    }
+
+    /**
+     * The backlog binding's look: read the team's whole backlog and keep it for
+     * the digest. It wakes no steward thread in Stage 1, and writes nothing to
+     * Linear. A failure is logged once and queued as a project note, so the
+     * project steward sees a problem line rather than an empty report.
+     */
+    async function reconcileBacklog(b: Binding, config: ProjectConfig, playbook: Playbook, target: BacklogTarget): Promise<void> {
+      const before = b.backlogLook;
+      const look = await lookAtBacklog(target);
+      store.patch(b.id, { backlogLook: look, playbookVersion: playbook.version, requeueAt: now() + playbook.requeueDefaultMs });
+      if (look.error !== null) {
+        if (before?.error !== look.error) {
+          bb.log.warn(`stewards: cannot read the backlog of ${target.team}: ${look.error}`);
+          store.noteProject(b.projectId, `Backlog ${target.team} could not be read: ${look.error}`);
+        }
+        return;
+      }
+      if (look.truncated) bb.log.warn(`stewards: the backlog of ${target.team} was truncated by the source's hard cap`);
     }
 
     /** The same turn for a Dependabot alert target: re-list the open alerts and wake on what changed. */
@@ -6280,6 +6339,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const wanted = new Map<string, { target: OpsTarget; playbook: Playbook }>();
       const opsPlaybook = playbookFor(config, "ops");
       if (opsPlaybook !== null) for (const target of roleOpsTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
+      if (opsPlaybook !== null) for (const target of roleBacklogTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
       if (config.depsAlerts !== null) for (const target of roleDepsTargets(config.role, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
       // BB-295: only this project's ops bindings, open and ended, read narrow.
       // `store.all(config.projectId).filter(kind === "ops")` parsed every
@@ -6300,7 +6360,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const b = existing.find((x) => x.entityId === key);
         if (b === undefined) {
           let created: Binding;
-          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : target.kind === "dependabot" ? `Deps watch: ${target.repo}` : target.kind === "alertmanager" ? `Alertmanager watch: ${target.namespace}` : `Sentry watch: ${target.org}/${target.project}`;
+          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : target.kind === "dependabot" ? `Deps watch: ${target.repo}` : target.kind === "alertmanager" ? `Alertmanager watch: ${target.namespace}` : target.kind === "backlog" ? `Backlog watch: ${target.team}` : `Sentry watch: ${target.org}/${target.project}`;
           try {
             created = store.create({ projectId: config.projectId, source: "ops", entityId: key, entityKey: key, url: null, title, kind: "ops", playbook: playbook.name, playbookVersion: playbook.version, parentBindingId: null, phase: "watching", stage: null });
           } catch {
@@ -6957,6 +7017,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         for (const t of store.open()) {
           if (t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id))) scheduleReconcile(t.id);
+        }
+      }
+      // BB-334: a Linear issue doorbell also wakes the backlog binding of the
+      // issue's team, so a new or moved ticket reaches the backlog report
+      // between nightly passes. The ring carries only the issue id, so the
+      // team is read from its snapshot.
+      if (source === "linear") {
+        const backlogs = store.open().filter((b) => b.kind === "ops" && parseOpsTargetKey(b.entityId)?.kind === "backlog");
+        if (backlogs.length > 0) {
+          const entity = await snapshot(source, id);
+          const team = entity === null ? null : entity.unit.toUpperCase();
+          for (const b of backlogs) {
+            const target = parseOpsTargetKey(b.entityId);
+            if (target?.kind === "backlog" && (team === null || target.team === team)) scheduleReconcile(b.id);
+          }
         }
       }
       if (bound !== null && bound.endedAt === null) return;
@@ -9730,7 +9805,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const overviewPlaybooks = (config: ProjectConfig | null): Array<{ kind: BindingKind; name: string; version: string | null; source: Source | null }> => {
           if (config === null) return [];
           const out: Array<{ kind: BindingKind; name: string; version: string | null; source: Source | null }> = [];
-          for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
+          for (const kind of KINDS.filter((k) => usesKindFor(config.file, k, config.role))) {
             if (kind !== "ticket") {
               out.push({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null, source: null });
               continue;
@@ -13090,7 +13165,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const githubTicket = config.ticketPlaybooks.github ?? null;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
       lines.push(`roles: ${roleSummary(config)}`);
-      for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
+      for (const kind of KINDS.filter((k) => usesKindFor(config.file, k, config.role))) {
         if (kind === "ticket") {
           // BB-234: name each source's ticket playbook, so a project that
           // carries both does not hide the GitHub one behind the Linear one.
@@ -13179,7 +13254,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket), linearTicket === null ? [] : playbookLabels(linearTicket));
       await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket), githubTicket === null ? [] : playbookLabels(githubTicket));
       if (filingGithub !== null && priorityLabels.length > 0) await validate("github", [filingGithub], priorityLabels);
-      if (usesKind(config.file, "ops", config.role)) {
+      if (usesKindFor(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];
         const context = config.role?.ops?.context;
         lines.push(`ops: tickets filed in ${filing === null ? "(no target)" : `${filing.target} (${filing.source})`}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);

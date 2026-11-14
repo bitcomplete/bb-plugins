@@ -11958,6 +11958,102 @@ describe("Alertmanager stewards (BB-314)", () => {
   });
 });
 
+describe("the backlog watch (BB-334)", () => {
+  const backlogIssue = (over: Record<string, unknown> = {}) => ({
+    id: "uuid-1",
+    key: "BB-1",
+    title: "Fix login",
+    state: "Backlog",
+    stateType: "backlog",
+    unit: "BB",
+    labels: [],
+    assignees: [],
+    priority: null,
+    estimate: null,
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-01T00:00:00Z",
+    ...over,
+  });
+
+  /** A project with one backlog role, one ops playbook and one read of team BB. */
+  async function watching(options: { roleTeam?: string; projectTeam?: string; noBlock?: boolean; issues?: Array<Record<string, unknown>> } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, ...(options.noBlock === true ? {} : { backlog: { ...(options.projectTeam === undefined ? {} : { team: options.projectTeam }) } }) });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: options.roleTeam ?? "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog(options.issues ?? [backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = () => t.hooks.store.byEntity("ops", "backlog/BB");
+    return { t, binding };
+  }
+
+  it("creates exactly one ops binding for the role's team and reads the whole backlog through sourceBacklog", async () => {
+    const { t, binding } = await watching();
+    expect(binding()).toMatchObject({ kind: "ops", entityKey: "backlog/BB", title: "Backlog watch: BB", threadId: null, endedAt: null });
+    expect(t.hooks.store.openOfKind("p1", "ops").filter((b) => b.entityId === "backlog/BB")).toHaveLength(1);
+    expect(t.hooks.store.binding(binding()!.id)!.backlogLook).toMatchObject({ team: "BB", error: null, unsupported: false, issues: [expect.objectContaining({ key: "BB-1" })] });
+  });
+
+  it("reads only: the backlog path makes no Linear write call", async () => {
+    const { t } = await watching();
+    t.rpcCalls.length = 0;
+    await t.hooks.sweep();
+    await t.flush();
+    const methods = t.rpcCalls.filter((c) => c.pluginId === "linear").map((c) => c.method);
+    expect(methods).toContain("sourceBacklog");
+    expect(methods).not.toContain("sourceEnsureLabel");
+    // Every linear call the path makes is a read (or the lease interest).
+    expect(methods.every((m) => ["sourceBacklog", "sourceSnapshot", "sourceSearchIssues", "sourceAdoptable", "sourceValidate", "sourceSetInterest"].includes(m))).toBe(true);
+  });
+
+  it("shows an unsupported sourceBacklog as a problem line, not an empty backlog", async () => {
+    const { t, binding } = await watching();
+    t.setBacklogUnsupported(true);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.binding(binding()!.id)!.backlogLook).toMatchObject({ error: expect.stringMatching(/does not support sourceBacklog/u), unsupported: true, issues: [] });
+    expect(t.hooks.store.peekProjectNotes("p1")).toEqual(expect.arrayContaining([expect.stringMatching(/Backlog BB could not be read/u)]));
+  });
+
+  it("shows a sourceBacklog read error as a problem line, not an empty backlog", async () => {
+    const { t, binding } = await watching();
+    t.setBacklogError("Linear rate limited the read");
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.binding(binding()!.id)!.backlogLook).toMatchObject({ error: "Linear rate limited the read", issues: [] });
+  });
+
+  it("wakes the binding on a Linear doorbell for its team", async () => {
+    const { t, binding } = await watching();
+    const before = t.hooks.store.binding(binding()!.id)!.backlogLook!.at;
+    t.advance(60_000);
+    t.entities.set("uuid-9", issue({ id: "uuid-9", key: "BB-9", unit: "BB", labels: [] }));
+    await t.ring("linear", "uuid-9");
+    expect(t.hooks.store.binding(binding()!.id)!.backlogLook!.at).toBeGreaterThan(before);
+  });
+
+  it("reports a block no role watches as one problem, and never picks a team", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { team: "BB" } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { ops: { k8sNamespaces: ["prod"] } }, holders: { jane: ["ops"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.flush();
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog"))).toEqual(["problem: stewards/project.json: backlog is configured but no role watches a backlog; add a backlog role or remove the block"]);
+  });
+
+  it("reports a backlog.team no role watches as one problem", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB", "OPS"] }, backlog: { team: "OPS" } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.flush();
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog.team"))).toEqual(["problem: stewards/project.json: backlog.team is OPS but no role watches that team (BB); they must name the same team"]);
+  });
+});
+
 describe("the dotenv a requester imports", () => {
   it("reads the named variable, quoted or not, and strips a trailing comment", () => {
     expect(parseDotenvValue("OTHER='x'\nSENTRY_TOKEN='s3cr3t'\n", "SENTRY_TOKEN")).toBe("s3cr3t");

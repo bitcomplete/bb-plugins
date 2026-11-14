@@ -9,6 +9,7 @@
 // container, and an error signature built from the container's status, never
 // from log text, which changes on every line.
 import { z } from "zod";
+import { backlogIssueSchema } from "./source-contract.js";
 import type { Change } from "./reconcile.js";
 
 export type K8sTarget = { kind: "k8s-namespace"; name: string };
@@ -17,11 +18,21 @@ export type DependabotTarget = { kind: "dependabot"; repo: string };
 export type SentryTarget = { kind: "sentry-project"; org: string; project: string };
 /** A Kubernetes namespace watched for Prometheus Alertmanager alerts, read with no token through the plugin's Alertmanager URL (alertmanager.ts). */
 export type AlertmanagerTarget = { kind: "alertmanager"; namespace: string };
-export type OpsTarget = K8sTarget | DependabotTarget | SentryTarget | AlertmanagerTarget;
+/** A Linear team's whole open backlog, read through `sourceBacklog` (BB-334); read-only. */
+export type BacklogTarget = { kind: "backlog"; team: string };
+export type OpsTarget = K8sTarget | DependabotTarget | SentryTarget | AlertmanagerTarget | BacklogTarget;
 
-/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production", "dependabot/acme/web", "sentry-project/acme/web" or "alertmanager/bb-gate-production". */
+/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production", "dependabot/acme/web", "sentry-project/acme/web", "alertmanager/bb-gate-production" or "backlog/BB". */
 export const opsTargetKey = (t: OpsTarget): string =>
-  t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "alertmanager" ? `${t.kind}/${t.namespace}` : t.kind === "dependabot" ? `${t.kind}/${t.repo}` : `${t.kind}/${t.org}/${t.project}`;
+  t.kind === "k8s-namespace"
+    ? `${t.kind}/${t.name}`
+    : t.kind === "alertmanager"
+      ? `${t.kind}/${t.namespace}`
+      : t.kind === "dependabot"
+        ? `${t.kind}/${t.repo}`
+        : t.kind === "backlog"
+          ? `${t.kind}/${t.team}`
+          : `${t.kind}/${t.org}/${t.project}`;
 
 /** A Kubernetes namespace name, as the Alertmanager target's id: an RFC 1123 label. */
 export const ALERTMANAGER_NAMESPACE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
@@ -36,6 +47,8 @@ export function parseOpsTargetKey(key: string): OpsTarget | null {
   if (dep !== null) return { kind: "dependabot", repo: dep[2]! };
   const alertmanager = /^(alertmanager)\/([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$/u.exec(key);
   if (alertmanager !== null) return { kind: "alertmanager", namespace: alertmanager[2]! };
+  const backlog = /^(backlog)\/([A-Za-z][A-Za-z0-9]*)$/u.exec(key);
+  if (backlog !== null) return { kind: "backlog", team: backlog[2]!.toUpperCase() };
   const sentry = /^(sentry-project)\/([a-z0-9][a-z0-9._-]*)\/([a-z0-9][a-z0-9._-]*)$/u.exec(key);
   return sentry === null ? null : { kind: "sentry-project", org: sentry[2]!, project: sentry[3]! };
 }
@@ -328,6 +341,28 @@ export type OpsLook = z.infer<typeof opsLookSchema>;
 
 /** What a reader returns for one target, before the fingerprint map. */
 export type RawLook = Omit<OpsLook, "at" | "target" | "error" | "findings"> & { sightings: Sighting[] };
+
+/**
+ * One read of a Linear team's whole open backlog (BB-334), stored on the
+ * binding so the digest can report it without a second read. `error` is set
+ * when the read failed, the capability is unsupported, or the source reported
+ * errors; an empty `issues` with a null `error` is a genuinely empty backlog,
+ * never a failure. Nothing here writes to Linear.
+ */
+export const backlogLookSchema = z.object({
+  at: z.number(),
+  target: z.string(),
+  /** The team key read, as the binding names it. */
+  team: z.string(),
+  /** Set when the read failed, was unsupported, or reported errors; the issues are then empty. */
+  error: z.string().nullable(),
+  issues: z.array(backlogIssueSchema),
+  /** Set when the source does not offer `sourceBacklog` at all. */
+  unsupported: z.boolean().default(false),
+  /** True when the source's hard cap cut the list short. */
+  truncated: z.boolean().default(false),
+});
+export type BacklogLook = z.infer<typeof backlogLookSchema>;
 
 /** A fingerprint map row, as classification needs it. */
 export type FingerprintRow = { fingerprint: string; ticketKey: string | null; firstSeenAt: number; lastCommentedAt: number | null; filedByThread?: string | null };
