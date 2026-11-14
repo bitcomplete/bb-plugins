@@ -12009,6 +12009,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // (BB-135).
               const before = new Set(store.openNeeds(target.id).map((n) => n.id));
               await fileForwardedApprovePrNeed(approvalsCtx, target, forwarding);
+              // BB-322 round 2: the forward makes a `project`-entry pull the
+              // owner's immediately, not only at the next reconcile. Refresh
+              // the stored assessment's gate for it with the owner's mark, so
+              // the page item the owner was just pushed is actionable now.
+              const forwardedPull = target.lastSnapshot === null ? undefined : observedPulls(target, target.lastSnapshot).find((p) => (p.url ?? p.key) === forwarding.url);
+              if (forwardedPull !== undefined) assessedGate(store, target, forwardedPull, now(), [], "user");
               await pushNewGateNeeds(target, before);
             }
             // BB-213: a forward that reaches the user files the real item, so

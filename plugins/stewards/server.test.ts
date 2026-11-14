@@ -8211,9 +8211,8 @@ describe("needs you items", () => {
     expect(esc.route).toBe("project");
     const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, project);
     expect(forwarded.error, forwarded.text).toBe(false);
-    // The next look reads the forward: the gate is the owner's, the item is
-    // actionable, and the page approves as the owner.
-    await t.ring("linear", "uuid-12");
+    // The forward itself makes the gate the owner's: the item is actionable and
+    // the page approves as the owner, with no reconcile in between.
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toBeDefined();
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; actionable: boolean; why: string | null }> } };
@@ -8234,8 +8233,6 @@ describe("needs you items", () => {
     expect(b.kind).toBe("review");
     expect(t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")).toMatchObject({ route: "project" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
-    // The assessment holds the pull, so the steward's wake names the gate
-    // instead of the not-available fallback.
     // The assessment holds the pull, so the steward's wake names the gate
     // instead of the not-available fallback.
     const wake = t.spawns.find((s) => s.id === b.threadId)?.prompt ?? "";

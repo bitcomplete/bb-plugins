@@ -213,10 +213,10 @@ describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
 });
 
 describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
-  // BB-322: the approvals.pageRefusal divergence is retired with the page's
-  // prGate caller; the page reads the stored assessment, so `compare` records
-  // no page-refusal row.
-  it("no longer records an approvals.pageRefusal divergence (BB-322 retires the surface)", () => {
+  // DIVERGENCE: the page action's refusal falls through to its `??` fallback on
+  // a met no-review gate, so it says "the pull request has not been observed
+  // yet" while the gate answers met.
+  it("records the approvals.pageRefusal divergence on a met no-review gate", () => {
     const first = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");
     const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
     const i = input({

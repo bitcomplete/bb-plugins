@@ -104,12 +104,15 @@ export function currentStoredGate(gate: unknown, pull: EntitySnapshot): StoredGa
  * decide-list mark is the one the last assessment recorded (a head that moved
  * keeps its lane) and, when the pull request was never assessed, the mark its
  * snapshot's changed files give under the binding's decide list (`bigDecisions`,
- * empty means the owner's, fail closed).
+ * empty means the owner's, fail closed). `forceMark` is the caller's own mark
+ * for a fact the stored assessment predates: the forward path passes `user`
+ * when the project steward has just forwarded a `project`-entry approval to
+ * the owner (BB-322 round 2), so the key changes and the read refreshes.
  */
-export function assessedGate(store: AssessmentStore, binding: Binding, pull: EntitySnapshot, at: number, bigDecisions: readonly BigDecision[] = []): PrGate {
+export function assessedGate(store: AssessmentStore, binding: Binding, pull: EntitySnapshot, at: number, bigDecisions: readonly BigDecision[] = [], forceMark?: DecideMark): PrGate {
   const row = store.assessment(binding.id);
   const known = storedPullGate(row?.gate, pull);
-  const mark: DecideMark = known?.decision ?? decideForPull(pull.pull?.files ?? null, bigDecisions);
+  const mark: DecideMark = forceMark ?? known?.decision ?? decideForPull(pull.pull?.files ?? null, bigDecisions);
   const projectApprovals = store.projectApprovals(binding.id);
   const key = gateInputKey(binding, pull, mark, projectApprovals);
   // Reuse the stored answer only when it is for this pull request's current
