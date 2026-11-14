@@ -4735,6 +4735,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       const waitedPulls = await readWaitedPulls(b, observed);
+      // The look already holds the binding's needs and escalations; a `person`
+      // wait resolves from those, and only a `qst_` ref reads the project's
+      // questions (BB-333).
+      const needs = store.openNeeds(b.id);
+      const escalations = store.openEscalations(b.id);
       const input: AssessmentInput = {
         binding: b,
         observed,
@@ -4745,8 +4750,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         rememberedRequesters,
         reRequestedDelegates,
         workers,
-        escalations: store.openEscalations(b.id),
-        needs: store.openNeeds(b.id),
+        escalations,
+        needs,
         sources: wakeSourcesFor(b, ownPulls),
         playbook,
         currentSpecHash,
@@ -4756,7 +4761,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const other = store.find(key, b.projectId);
           return other !== null && other.endedAt === null && (other.lastSnapshot === null || !finished(other, other.lastSnapshot));
         },
-        hasOpenItem: (id) => store.openNeeds(b.id).some((n) => n.id === id) || store.openEscalations(b.id).some((x) => x.id === id) || store.openQuestions(b.projectId).some((q) => q.id === id),
+        hasOpenItem: (id) => needs.some((n) => n.id === id) || escalations.some((x) => x.id === id) || (id.startsWith("qst_") && store.openQuestions(b.projectId).some((q) => q.id === id)),
       };
       const assessment = assess(input);
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
@@ -4802,13 +4807,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // reconcile. Its totals land in the current pass `bb stewards stats`
       // reports.
       await readCounts.runReconcile(async () => {
+        // BB-333: a `pull`/`review` typed wait joins the github lease beside the
+        // linked pulls, so a change to either is what the interest set compares.
+        const interest = (b: Binding): string => [...leasedPulls(b), ...waitedPullKeys(b)].sort().join(" ");
         const before = store.binding(bindingId);
-        const leased = before === null ? "" : leasedPulls(before).join(" ");
+        const leased = before === null ? "" : interest(before);
         try {
           await reconcileOnce(bindingId, force);
         } finally {
           const after = store.binding(bindingId);
-          if (after !== null && leasedPulls(after).join(" ") !== leased) pushInterest();
+          if (after !== null && interest(after) !== leased) pushInterest();
         }
       });
     }
@@ -7139,8 +7147,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (deps !== null && deps.endedAt === null) scheduleReconcile(deps.id);
         }
         for (const t of store.open()) {
-          if (t.kind !== "ticket") continue;
-          const linked = (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id));
+          const linked = t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id));
           const waited = waitedPullKeys(t).some((k) => lc(k) === lc(id));
           if (linked || waited) scheduleReconcile(t.id);
         }
@@ -11728,6 +11735,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const maxWaitMs = playbook?.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
           const noteBeyondMaxWait = untilAt !== null && untilAt - now() > maxWaitMs && b.requeueUntilNoted !== untilAt;
           if (noteBeyondMaxWait) untilNote += ` The date is beyond the playbook's max-wait (${formatDuration(maxWaitMs)}); the project steward is told once.`;
+          const waitBefore = b.wait;
           b = store.patch(b.id, {
             status,
             statusAt: now(),
@@ -11758,6 +11766,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(mergeBehind === undefined ? {} : { mergeBehind }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
+          // BB-333: a changed typed wait changes the github lease (a `pull`/
+          // `review` ref joins or leaves it). This report may not run a
+          // reconcile that notices, so push the interest set here.
+          if ((waitBefore?.kind ?? null) !== (wait?.kind ?? null) || (waitBefore?.ref ?? null) !== (wait?.ref ?? null)) pushInterest();
           // BB-255: the report supersedes any retry the plugin had pending,
           // deleting its queued row too.
           if (b.threadId !== null) await clearWakeRetry(b.threadId);

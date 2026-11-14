@@ -411,6 +411,17 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
     const dated = assess(input({ binding: binding({ status: status("the vendor"), requeueUntil: 2_000_000, noWakeSource: false }) }));
     expect(dated.liveness.stalled).toBe(false);
   });
+
+  it("keeps the idleInActiveStage divergence on the unadjusted idle when a typed wait is live", () => {
+    const base = bb266(false);
+    const i: AssessmentInput = { ...base, binding: { ...base.binding, wait: { kind: "pull", ref: "acme/web#9" } }, waitedPulls: waited(openPull("acme/web#9")) };
+    const a = assess(i);
+    // The consumer's idle (idleBase) is true, the typed-wait-adjusted idle is not.
+    expect(a.liveness.idleBase).toBe(true);
+    expect(a.liveness.idle).toBe(false);
+    // The parked-worker surface still compares the consumer's idle.
+    expect(compare(i, a).find((x) => x.surface === "idleInActiveStage")).toMatchObject({ old: "idle", new: "parked" });
+  });
 });
 
 describe("the typed-wait divergence store (BB-333)", () => {
@@ -422,23 +433,28 @@ describe("the typed-wait divergence store (BB-333)", () => {
     return { s, advance: (ms: number) => (now += ms) };
   }
 
-  it("writes a noWakeSource row only when the disagreement starts or stops", () => {
+  it("writes a noWakeSource row only when the disagreement starts", () => {
     const { s } = store();
     // The first observation disagrees: a start row.
     expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000)).toBe(true);
-    // The same disagreement again: no row, no write.
+    // The same disagreement again: no new row, but the open row is kept fresh.
     expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 2_000)).toBe(false);
-    expect(s.divergences({ bindingId: "b1" })).toHaveLength(1);
-    // It stops disagreeing: a stop row.
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 3_000)).toBe(true);
-    expect(s.divergences({ bindingId: "b1" })).toHaveLength(2);
+    let rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ old: "source-or-no-wait", new: "no-wake-source", firstSeenAt: 1_000, lastSeenAt: 2_000, count: 1 });
+    expect(rows[0]!.inputs).toMatchObject({ transition: "ongoing" });
+    // It stops disagreeing: noted on the same row, never a row of its own.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 3_000)).toBe(false);
+    rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.inputs).toMatchObject({ transition: "stop" });
     // It starts again: the same (old, new) row bumps its count rather than adding a row.
     expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 4_000)).toBe(true);
-    const rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(2);
-    expect(rows.find((r) => r.old === "source-or-no-wait" && r.new === "no-wake-source")?.count).toBe(2);
+    rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.count).toBe(2);
     // The surface filter still reads it as `noWakeSource`.
-    expect(s.divergences({ surface: "noWakeSource" })).toHaveLength(2);
+    expect(s.divergences({ surface: "noWakeSource" })).toHaveLength(1);
     // A first observation that agrees is a baseline, not a transition.
     expect(s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 5_000)).toBe(false);
     expect(s.divergences({ bindingId: "b2" })).toHaveLength(0);

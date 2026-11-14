@@ -769,21 +769,8 @@ export const BACKLOG_SNAPSHOT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN bac
 // wait, and a pre-migration build never reads the column. Appended after every
 // group already shipped, including BB-334's backlog columns and BB-328's
 // check-findings table, so no recorded index moves. PR 1 stores and renders
-// it; PR 2 derives from it in shadow, and `wait_divergence_state` remembers the
-// last derived-vs-flag state per binding so the `noWakeSource` divergence row
-// is written only when it starts or stops disagreeing (BB-333).
-export const TYPED_WAIT_MIGRATIONS = [
-  `ALTER TABLE bindings ADD COLUMN wait TEXT`,
-  `CREATE TABLE IF NOT EXISTS wait_divergence_state (
-     binding_id TEXT PRIMARY KEY,
-     derived INTEGER NOT NULL,
-     reported INTEGER NOT NULL,
-     at INTEGER NOT NULL
-   )`,
-];
-
-/** The most `noWakeSource` divergence rows kept per binding (BB-333): a transition log, newest kept. */
-export const WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING = 20;
+// it; PR 2 derives from it in shadow.
+export const TYPED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait TEXT`];
 
 // BB-335: the reasons a declining branch records, one JSON object keyed by the
 // closed reason code, on the existing `assessments` row. Additive and nullable
@@ -792,7 +779,20 @@ export const WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING = 20;
 // including BB-333's typed wait column, so no recorded index moves.
 export const NON_ACTION_MIGRATIONS = [`ALTER TABLE assessments ADD COLUMN non_actions TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS];
+// BB-333 PR 2: the last derived-vs-flag state per binding, so the
+// `noWakeSource` divergence row is written only when the disagreement starts.
+// A new table appended after BB-335's non-action column, so no recorded index
+// moves.
+export const WAIT_DIVERGENCE_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS wait_divergence_state (
+     binding_id TEXT PRIMARY KEY,
+     derived INTEGER NOT NULL,
+     reported INTEGER NOT NULL,
+     at INTEGER NOT NULL
+   )`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1977,14 +1977,19 @@ export function createStore(db: Database.Database, now: () => number, options: S
     "DELETE FROM assessment_divergences WHERE id NOT IN (SELECT id FROM assessment_divergences ORDER BY last_seen_at DESC, id LIMIT ?)",
   );
   // BB-333: the last derived-vs-flag state per binding, so a typed-wait
-  // divergence row is written only when the disagreement starts or stops.
-  // Prepared lazily: a store from before this group has no table yet.
+  // divergence row is written only when the disagreement starts. The
+  // `(binding_id, surface, old, new)` unique constraint caps the rows at two
+  // per binding, so no separate per-binding prune is needed. Prepared lazily: a
+  // store from before this group has no table yet.
   const getWaitDivergenceStateStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ?");
   const upsertWaitDivergenceStateStmt = lazy<[string, number, number, number], unknown>(
     "INSERT INTO wait_divergence_state (binding_id, derived, reported, at) VALUES (?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET derived = excluded.derived, reported = excluded.reported, at = excluded.at",
   );
-  const pruneWaitDivergencesForBindingStmt = lazy<[string, string, number], unknown>(
-    "DELETE FROM assessment_divergences WHERE binding_id = ? AND surface = 'noWakeSource' AND id NOT IN (SELECT id FROM assessment_divergences WHERE binding_id = ? AND surface = 'noWakeSource' ORDER BY last_seen_at DESC, id DESC LIMIT ?)",
+  // Keep the open row's `last_seen_at` fresh while the disagreement stands, so
+  // the age prune cannot drop it and leave the state table saying "disagree"
+  // with no row to show for it.
+  const touchWaitDivergenceStmt = lazy<[number, string, string], unknown>(
+    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource'",
   );
 
   // BB-251: assumptions, prepared lazily for the same reason: a store from
@@ -3656,12 +3661,12 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     /**
      * Record a typed-wait divergence from the report-time `noWakeSource` flag
-     * (BB-333). One `noWakeSource` row is written only when the derived result
-     * starts or stops disagreeing with the flag; an unchanged state writes
-     * nothing, so a steady tick is not re-logged. `wait_divergence_state`
-     * remembers the last state per binding, and the binding's `noWakeSource`
-     * rows are capped at `WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING`. Returns whether
-     * a divergence row was written.
+     * (BB-333). A `noWakeSource` row is written only when the disagreement
+     * starts; while it stands the open row's `last_seen_at` is refreshed so the
+     * age prune cannot drop it, and when it stops the row is noted and the
+     * state cleared without adding a row that would read as a divergence. The
+     * `(binding_id, surface, old, new)` unique constraint caps the rows at two
+     * per binding. Returns whether a divergence row was written.
      */
     recordWaitDivergence(fields: { bindingId: string; derived: boolean; reported: boolean; waitKind: string | null; waitLive: boolean; inputs: Record<string, unknown> }, at = now()): boolean {
       const derived = fields.derived ? 1 : 0;
@@ -3669,22 +3674,31 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const disagree = derived !== reported;
       const prev = getWaitDivergenceStateStmt().get(fields.bindingId);
       const prevDisagree = prev === undefined ? null : Number(prev.derived) !== Number(prev.reported);
-      if (prevDisagree !== null && prevDisagree === disagree) return false;
+      if (prevDisagree === disagree) {
+        // No transition. An ongoing disagreement keeps its open row fresh so
+        // the age prune cannot drop it; an agreement writes nothing.
+        if (disagree) touchWaitDivergenceStmt().run(at, JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: "ongoing" }), fields.bindingId);
+        return false;
+      }
       upsertWaitDivergenceStateStmt().run(fields.bindingId, derived, reported, at);
-      // The first observation of an agreeing binding is the baseline, not a
-      // transition, so it writes no row.
-      if (prevDisagree === null && !disagree) return false;
+      if (!disagree) {
+        // The disagreement stopped: note it on the open row, never as a row of
+        // its own (its `old` would equal its `new`).
+        if (prevDisagree === true) touchWaitDivergenceStmt().run(at, JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: "stop" }), fields.bindingId);
+        return false;
+      }
+      // A start: the first observation, or a move from agreement to
+      // disagreement.
       insertDivergenceStmt().run(
         newId("dvg"),
         fields.bindingId,
         "noWakeSource",
         reported ? "no-wake-source" : "source-or-no-wait",
         derived ? "no-wake-source" : "source-or-no-wait",
-        JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: disagree ? "start" : "stop" }),
+        JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: "start" }),
         at,
         at,
       );
-      pruneWaitDivergencesForBindingStmt().run(fields.bindingId, fields.bindingId, WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING);
       return true;
     },
     /**

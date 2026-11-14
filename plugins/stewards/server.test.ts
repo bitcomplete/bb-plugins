@@ -14869,6 +14869,40 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     await t.hooks.reconcilePass("p1");
     expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: true });
   });
+
+  it("leases a waited pull ref on the report and drops it when the wait clears", async () => {
+    const { t, steward } = await ticket();
+    t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
+    const github = () => t.rpcCalls.filter((c) => c.pluginId === "github-watcher" && c.method === "sourceSetInterest").at(-1)!.input as { entities: string[] };
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
+    await t.flush();
+    expect(github().entities).toContain("acme/web#430");
+    // A report without the wait clears it, and the lease drops the ref.
+    await t.tool("steward_report", { ...base, waitingOn: "the vendor" }, steward);
+    await t.flush();
+    expect(github().entities).not.toContain("acme/web#430");
+  });
+
+  it("a ring on a waited ref looks, sends no wake, and touches no snapshot or resource", async () => {
+    const { t, steward } = await ticket();
+    t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    const before = t.hooks.store.find("ENG-12")!;
+    const wakesBefore = t.sends.filter((s) => s.threadId === steward).length;
+    const pullsBefore = JSON.stringify(before.lastSnapshot?.pulls ?? []);
+    t.rpcCalls.length = 0;
+    // The waited pull changes; the doorbell rings it.
+    t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open", title: "changed" }));
+    await t.ring("github", "acme/web#430");
+    await t.flush();
+    // The waiting ticket looked (it read the waited ref) but the change woke nobody.
+    expect(t.rpcCalls.some((c) => c.method === "sourceSnapshot" && c.input.id === "acme/web#430")).toBe(true);
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBe(wakesBefore);
+    const after = t.hooks.store.find("ENG-12")!;
+    expect(JSON.stringify(after.lastSnapshot?.pulls ?? [])).toBe(pullsBefore);
+    expect(after.status?.resources.pullRequests ?? []).not.toContain("acme/web#430");
+  });
 });
 
 // BB-203: the plugin writes the binding's status from events it observed

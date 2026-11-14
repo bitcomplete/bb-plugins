@@ -63,6 +63,8 @@ export type AssessedLiveness = {
   live: boolean;
   /** The stored typed wait's own liveness (BB-333); null when the binding has no typed wait. */
   waitLive: boolean | null;
+  /** `idleInActiveStage` before the typed wait is applied: what the consumer's idle wake reads (BB-333). */
+  idleBase: boolean;
   /** `idleInActiveStage`. */
   idle: boolean;
   /** `stuckDue`: the phase backstop. */
@@ -315,6 +317,7 @@ export function assess(input: AssessmentInput): Assessment {
     liveness: {
       live,
       waitLive,
+      idleBase,
       // A live typed wait is something the plugin waits on, so it suppresses
       // the idle wake; a stalled or external one does not (BB-333).
       idle: wait !== null && waitLive === true ? false : idleBase,
@@ -371,7 +374,7 @@ export function compare(input: AssessmentInput, assessment: Assessment): Diverge
   if (assessment.worker.parked) {
     if (anyWorkerInFlight(workers)) add("workerInFlight", "in-flight", "parked", workerInputs);
     if (runningWorkerReason(workers) === null) add("runningWorkerReason", "not-mid-turn", "parked", workerInputs);
-    if (assessment.liveness.idle) add("idleInActiveStage", "idle", "parked", workerInputs);
+    if (assessment.liveness.idleBase) add("idleInActiveStage", "idle", "parked", workerInputs);
     if (!assessment.liveness.live) add("hasLiveWakeSource", "no-live-source", "parked", workerInputs);
   }
 
