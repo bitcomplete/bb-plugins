@@ -8196,7 +8196,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // cross-repo ticket lands the consumed repo first), so the plugin must
       // not merge out of order or retire the worker that owns the rest.
       const openOwnPulls = observedPulls(b, observed).filter((p) => (ownPulls === null || pullBelongsToTicket(b, p, ownPulls)) && p.pull?.merged !== true && lc(p.state) !== "closed");
-      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && assessWorker(store.workers(b.id)).parked;
+      // BB-329: left inline for the behaviour PR, not routed through `assessWorker`.
+      // `assessWorker(…).parked` is `!running && some(finished)`, while this
+      // captures `some(finished)` before the loop's awaits; a running worker that
+      // ends its turn inside that window would flip the answer, which is a merge
+      // path behaviour change. The explicit `parked` state in the behaviour PR
+      // reshapes it.
+      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && store.workers(b.id).some((w) => w.status === "finished");
       // BB-264: the steward's own merge holds name open bindings in this
       // project, or a stacked base pull request by its key; the plugin's
       // derived stacked-PR holds are recomputed from the base pull requests on
