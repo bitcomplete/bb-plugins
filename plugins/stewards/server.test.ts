@@ -237,7 +237,7 @@ describe("a Linear ticket steward", () => {
     await expect(t.harness.callRpc("stewardsRing", { source: "linear", id: "u1" }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } })).rejects.toThrow(/each for its own source/u);
   });
 
-  it("wakes only for actionable changes, and gives two tools to stewards only", async () => {
+  it("wakes only for actionable changes, and gives the steward tools and a worker only worker_park", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -247,6 +247,9 @@ describe("a Linear ticket steward", () => {
     expect(await tools(steward!)).toEqual(["steward_report", "steward_update"]);
     expect(await tools(project!)).toEqual(["steward_update"]);
     expect(await tools("thr_other")).toEqual([]);
+    // BB-329: a worker gets exactly one plugin tool, its own park call.
+    await t.created("thr_w1", steward!, "ENG-12: Implement");
+    expect(await tools("thr_w1")).toEqual(["worker_park"]);
 
     const report = await t.tool("steward_report", { phase: "Todo", summary: "Specifying.", nextAction: "Post acceptance criteria", actor: "steward", requeueAfter: "1d" }, steward!);
     expect(report.error).toBe(false);
@@ -848,12 +851,14 @@ describe("a Linear ticket steward", () => {
 
     await t.created("thr_w1", steward, "ENG-12: Implement");
     expect(t.sends).toEqual([]);
-    // BB-52 rule 3: a worker ending its turn waiting is a quiet note, not a wake.
+    // BB-329: the worker parks with the tool; its final text alone does not.
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
+    // BB-52 rule 3: a worker ending its turn parked is a quiet note, not a wake.
     await t.idle("thr_w1", "Opened acme/web#7; waiting on the reviewer.");
     expect(t.sends).toEqual([]);
-    // BB-152: the finish note carries the worker's final message.
+    // BB-152/BB-329: the finish note names the park and carries the final message.
     expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ quiet: true }]);
-    expect(t.hooks.store.open("p1")[0]!.pending[0]!.text).toBe('Worker "ENG-12: Implement" finished its turn. Its final message: Opened acme/web#7; waiting on the reviewer.');
+    expect(t.hooks.store.open("p1")[0]!.pending[0]!.text).toBe('Worker "ENG-12: Implement" finished its turn. It parked, waiting on the reviewer. Its final message: Opened acme/web#7; waiting on the reviewer.');
 
     // A question wakes it, with the worker's words.
     await t.idle("thr_w1", "Should I bring the reviewer back once it finishes?");
@@ -862,28 +867,65 @@ describe("a Linear ticket steward", () => {
     expect(wake).toMatch(/Should I bring the reviewer back once it finishes\?/u);
   });
 
-  it("wakes when a worker ends its turn with an error report, and lists a quiet finish in bb stewards show", async () => {
+  it("keeps a parked finish quiet and treats a plain finish as done, whatever its text (BB-329)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
 
-    // A waiting finish is kept as a quiet note, and show lists it with the next wake.
+    // A parked finish is a quiet note, and show lists it with the next wake.
     await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the reviewer.");
     const show = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
     expect(show).toMatch(/Pending \(quiet\): Worker "ENG-12: Implement" finished its turn\./u);
 
-    // An error report is not waiting: it wakes the steward.
-    const sent = t.sends.length;
-    await t.idle("thr_w1", "Error: the provider timed out before I could push.");
-    expect(t.sends).toHaveLength(sent + 1);
-    expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+    // BB-329 retires the error-report regex: a plain finish that says "Error:"
+    // is a plain finish, not a park, whatever its text. The worker did not
+    // call worker_park, so the finish note is a plain one (no "It parked"); a
+    // hard failure still comes through thread.failed.
+    t.hooks.store.patch(t.hooks.store.find("ENG-12", "p1")!.id, { pending: [] });
+    await t.created("thr_w2", steward, "ENG-12: Implement 2");
+    await t.idle("thr_w2", "Error: the provider timed out before I could push.");
+    const wake = t.sends.at(-1)!.text;
+    expect(wake).toMatch(/Error: the provider timed out/u);
+    expect(wake).not.toMatch(/It parked, waiting on/u);
+    expect(t.hooks.store.worker("thr_w2")!.parkedWaitingOn).toBeNull();
+  });
 
-    // A line that merely names an error count is not an error report.
-    const afterError = t.sends.length;
-    await t.idle("thr_w1", "Errors: 0. Failed tests: none.");
-    expect(t.sends).toHaveLength(afterError);
+  it("worker_park sets the calling worker's own state, refuses a non-worker or an ended binding, and the next turn clears it (BB-329)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+
+    // A non-worker thread is refused, never a silent no-op.
+    const refused = await t.tool("worker_park", { waitingOn: "the reviewer" }, steward);
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(/not a worker/u);
+
+    // The worker's own park: it files nothing for the user and meets no gate.
+    const needsBefore = t.hooks.store.openNeeds(b.id).length;
+    const escalationsBefore = t.hooks.store.openEscalations(b.id).length;
+    expect((await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1")).error).toBe(false);
+    expect(t.hooks.store.worker("thr_w1")!.parkedWaitingOn).toBe("the reviewer");
+    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(needsBefore);
+    expect(t.hooks.store.openEscalations(b.id)).toHaveLength(escalationsBefore);
+
+    // The worker's next turn clears the park.
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "finished", parkedWaitingOn: "the reviewer" });
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    expect(t.hooks.store.worker("thr_w1")!.parkedWaitingOn).toBeNull();
+
+    // An ended binding is refused.
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
+    t.hooks.store.patch(b.id, { endedAt: t.now(), endReason: "done" });
+    const ended = await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
+    expect(ended.error).toBe(true);
+    expect(ended.text).toMatch(/has ended/u);
   });
 
   // BB-72: a worker is normally a child of its steward, but a worker spawned
@@ -6692,9 +6734,12 @@ describe("needs you items", () => {
    * gate-met tests run this variant so a parked worker is exercised, not only
    * a running one.
    */
-  function parkWorker(t: { hooks: { store: { setWorker: (threadId: string, status: "finished", result: string | null) => void } } }, threadId: string, over: Partial<ReturnType<typeof parkedWorker>> = {}): ReturnType<typeof parkedWorker> {
+  function parkWorker(t: { hooks: { store: { setWorker: (threadId: string, status: "finished", result: string | null) => void; parkWorker: (threadId: string, waitingOn: string) => void } } }, threadId: string, over: Partial<ReturnType<typeof parkedWorker>> = {}): ReturnType<typeof parkedWorker> {
     const w = parkedWorker({ threadId, ...over });
     t.hooks.store.setWorker(w.threadId, "finished", w.result);
+    // BB-329: `finished` alone is a plain finish; the explicit park is what
+    // keeps the worker unarchived.
+    t.hooks.store.parkWorker(w.threadId, w.parkedWaitingOn ?? "the review");
     return w;
   }
 
@@ -7142,6 +7187,7 @@ describe("needs you items", () => {
     const parked = await withPull([marker]);
     await parked.created("thr_w1", parked.steward, "ENG-12: Implement");
     parked.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    parked.hooks.store.parkWorker("thr_w1", "the owner's approval");
     parked.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await parked.ring("linear", "uuid-12");
     expect(parked.githubMerges).toHaveLength(1);
@@ -7151,6 +7197,7 @@ describe("needs you items", () => {
     const rereport = await withPull([marker]);
     await rereport.created("thr_w1", rereport.steward, "ENG-12: Implement");
     rereport.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    rereport.hooks.store.parkWorker("thr_w1", "the owner's approval");
     rereport.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await rereport.tool("steward_report", { phase: "In Progress", summary: "Watching the pull request.", nextAction: "Wait", actor: "steward" }, rereport.steward);
     expect(rereport.githubMerges).toHaveLength(1);
@@ -7171,6 +7218,7 @@ describe("needs you items", () => {
     const b = t.binding();
     await t.created("thr_parked", t.steward, "ENG-12: Implement");
     t.hooks.store.setWorker("thr_parked", "finished", "Waiting on the owner's approval.");
+    t.hooks.store.parkWorker("thr_parked", "the owner's approval");
     // A finished worker's turn is over: its thread is idle, not active.
     t.threads.get("thr_parked")!.status = "idle";
     // A finished worker with an open question for the steward is left alone.
@@ -7232,6 +7280,44 @@ describe("needs you items", () => {
     expect(t.githubMerges).toHaveLength(1);
     expect(t.githubMerges[0]).toMatchObject({ repo: "acme/api", number: 8 });
     expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+  });
+
+  it("a plain finish, whatever its text, does not own the landing order: it is archived and the plugin merges (BB-329)", async () => {
+    const t = await setup();
+    const noReview = comment({ id: "nr", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review substantial=no spec=no -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("uuid-12", issue({ linkedPulls: [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/api#8", url: "https://github.com/acme/api/pull/8" },
+    ] }));
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/api#8", pull({ id: "acme/api#8", key: "acme/api#8", url: "https://github.com/acme/api/pull/8", title: "Add api retry (ENG-12)" }, { head: "bb/eng-12-api", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement both");
+    // The final text says it is waiting, but the worker did not call
+    // worker_park. #7 is gate-met and #8 is open, so only an explicit park
+    // would defer the merge.
+    await t.idle("thr_w1", "Waiting on the owner's approval of acme/web#7 and acme/api#8.");
+    await t.flush();
+    // A plain finish is done: the plugin archives it, so its pull-request
+    // activity is no longer quieted by it, and merges #7 out of order.
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+    expect(t.githubMerges).toHaveLength(1);
+    expect(t.githubMerges[0]).toMatchObject({ repo: "acme/web", number: 7 });
+  });
+
+  it("a worker that calls worker_park stays unarchived even when its final text does not say it waits (BB-329)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    // The explicit park keeps it, though the old WAITING regex would have
+    // archived this final message.
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
+    await t.idle("thr_w1", "Done and verified.");
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "finished", parkedWaitingOn: "the reviewer" });
   });
 
   it("a gate-met no-review pull request with a parked worker wakes it naming the gate, not an approver (BB-279)", async () => {
@@ -7600,6 +7686,7 @@ describe("needs you items", () => {
     t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "the owner's approval" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the owner's approval.");
     const before = t.sends.filter((s) => s.threadId === "thr_w1").length;
     const b = t.binding();
@@ -7638,6 +7725,7 @@ describe("needs you items", () => {
     t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "the project steward's decision" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the project steward.");
     const b = t.binding();
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
@@ -13004,7 +13092,8 @@ describe("a steward idle in an active stage (BB-83)", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement");
-    // A waiting finish is quiet now; the idle rule catches it after the grace.
+    // A parked finish is quiet now; the idle rule catches it after the grace.
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the reviewer.");
     const before = t.sends.length;
 
@@ -13040,6 +13129,7 @@ describe("a steward idle in an active stage (BB-83)", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the reviewer.");
     const before = t.sends.length;
     t.advance(16 * 60_000);
@@ -13060,6 +13150,7 @@ describe("a steward idle in an active stage (BB-83)", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "the vendor's decision" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the vendor.");
     await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's decision", until: "2026-12-01" }, steward);
     const before = t.sends.length;
@@ -13084,6 +13175,7 @@ describe("a steward idle in an active stage (BB-83)", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "the reviewer" }, "thr_w1");
     await t.idle("thr_w1", "Waiting on the reviewer.");
     const before = t.sends.length;
     t.advance(16 * 60_000);

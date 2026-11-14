@@ -96,7 +96,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   that to the worker's own pull request — its head branch is one of the
   binding's worker threads' branches, or a worker named its URL — and quiets
   three more causes: a state move between the build and review stages, a
-  worker turn ending to wait (only a question, an error report or a gone
+  worker turn ending parked with `worker_park` (only a question or a gone
   thread wakes), and a terminal state the steward's own last report already
   named (the binding ends from the mechanical tier). A foreign pull request
   wakes on its link and keeps its activity actionable. Everything not

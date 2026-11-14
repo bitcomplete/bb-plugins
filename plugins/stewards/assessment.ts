@@ -41,12 +41,14 @@ export type AssessedGate = PrGate & {
 };
 
 /**
- * The binding's worker state. `parked` is a `finished` worker between turns:
- * still in flight, not running, and the state the boolean predicates collapse
- * to either "busy" (`workerInFlight`) or "not mid-turn" (`runningWorkerReason`).
+ * The binding's worker state. `parked` is explicit: a worker that called its
+ * own `worker_park` tool and finished its turn, so it is kept unarchived until
+ * its next turn clears the park. A `finished` worker that did not park is a
+ * plain finish. `inFlight` is still running-or-finished (the wake quieting and
+ * lifecycle answer) and `reason` is `runningWorkerReason`'s text.
  */
 export type AssessedWorker = {
-  state: "running" | "parked" | "failed" | "stopped" | "none";
+  state: "running" | "parked" | "finished" | "failed" | "stopped" | "none";
   inFlight: boolean;
   running: boolean;
   parked: boolean;
@@ -160,12 +162,17 @@ export function ownPullEntities(observed: Observed, own: ReadonlySet<string>): E
   return [observed.entity, ...observed.pulls].filter((e) => e.pull !== null && isOwn(e, own));
 }
 
-/** The worker state, with a parked `finished` worker distinct from a running one. */
+/**
+ * The worker state. `parked` is driven by the worker's own `worker_park` call
+ * (BB-329): a `finished` worker that did not park is a plain finish, whatever
+ * its final text says, and is named `finished` rather than `parked`.
+ */
 export function assessWorker(workers: readonly Worker[]): AssessedWorker {
   const running = workers.some((w) => w.status === "running");
-  const parked = !running && workers.some((w) => w.status === "finished");
-  const failed = !running && !parked && workers.some((w) => w.status === "failed");
-  const state: AssessedWorker["state"] = running ? "running" : parked ? "parked" : workers.length === 0 ? "none" : failed ? "failed" : "stopped";
+  const finished = !running && workers.some((w) => w.status === "finished");
+  const parked = !running && workers.some((w) => w.status === "finished" && w.parkedWaitingOn !== null);
+  const failed = !running && !finished && workers.some((w) => w.status === "failed");
+  const state: AssessedWorker["state"] = running ? "running" : parked ? "parked" : workers.length === 0 ? "none" : finished ? "finished" : failed ? "failed" : "stopped";
   return { state, inFlight: anyWorkerInFlight(workers), running, parked, reason: runningWorkerReason(workers) };
 }
 

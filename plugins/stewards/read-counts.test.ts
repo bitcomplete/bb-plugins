@@ -128,6 +128,9 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", state: "open" }, { head: "bb/eng-12-retry" }));
     t.hooks.store.addWorker("thr_w1", b1.id, "ENG-12: implement");
     t.hooks.store.setWorker("thr_w1", "finished", "Watching acme/web#7 and acme/web#8 for the review.");
+    // BB-329: the parked worker is explicit (its own `worker_park` call), so
+    // the merge gate treats it as owning the landing order.
+    t.hooks.store.parkWorker("thr_w1", "the review");
 
     // Binding 2: a deployment watch. The merged own pull request opens the
     // watch and the look reads GitHub for its deployment.
@@ -174,7 +177,10 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     // pull requests (web#7, web#8, web#9), two store reads each, and
     // `syncPullApproval` reads the remembered set once per pull to forget a
     // requester the owner withdrew without a review.
-    expect(reconcile).toEqual({ storeReads: 194, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    // BB-329 lowered them 194 → 193: the merge gate's `parkedWorkerOwnsAnother`
+    // now reads the parked state from the one assessment the reconcile already
+    // built, instead of calling `store.workers(b.id)` a second time.
+    expect(reconcile).toEqual({ storeReads: 193, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 

@@ -459,8 +459,11 @@ Plugin code. No model turn.
    `review` stages (In Progress ↔ In Review) is the worker's own loop, a
    quiet note; a move to any other stage, or a terminal state, still wakes. A
    worker's turn ending is a quiet note unless its final message asks a
-   question, reports an error, or its thread is gone (a binding following
-   through still hears the worker, since it waits on that result). And a
+   question or its thread is gone (a binding following through still hears
+   the worker, since it waits on that result). BB-329: a worker says it is
+   waiting with the `worker_park` tool, not with prose; a finish without that
+   call is a plain finish, archived like any other, whatever its final text
+   says. And a
    terminal state the steward's own last report already named ends the
    binding from the mechanical tier, with the wrap-up written from that
    report and no wrap-up wake; a terminal state someone else set still wakes.
@@ -478,8 +481,8 @@ Plugin code. No model turn.
    grace. A worker finish that leaves such a
    binding is loud at once, without the grace, because the worker's final
    message is what the steward must read; a finish that leaves an open pull
-   request, a pending deployment or a message that says it is waiting stays
-   quiet as before. The wake fires once per idle period, not once per grace: a
+   request, a pending deployment or a worker that parked with `worker_park`
+   stays quiet as before. The wake fires once per idle period, not once per grace: a
    worker ending, an own pull request closing or a deployment watch changing
    starts a new period, and a steward that waits on something the plugin
    cannot observe is not woken every fifteen minutes. `idleInActiveStage` in

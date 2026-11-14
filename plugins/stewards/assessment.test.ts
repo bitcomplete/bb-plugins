@@ -143,6 +143,15 @@ describe("the shadow assessment: the worker state (BB-266)", () => {
     expect(assess(input({ workers: [{ ...parkedWorker(), status: "failed" }] })).worker.state).toBe("failed");
     expect(assess(input({ workers: [{ ...parkedWorker(), status: "stopped" }] })).worker.state).toBe("stopped");
   });
+
+  // BB-329: `parked` is driven by the worker's own `worker_park` call. A
+  // finished worker that did not park is a plain finish, whatever its text.
+  it("names a finished worker that did not call worker_park `finished`, not `parked`", () => {
+    const plain = assess(input({ workers: [{ ...parkedWorker(), parkedWaitingOn: null, result: "Waiting on the owner's approval of acme/web#7." }] })).worker;
+    expect(plain).toMatchObject({ state: "finished", parked: false, running: false });
+    const parked = assess(input({ workers: [parkedWorker()] })).worker;
+    expect(parked).toMatchObject({ state: "parked", parked: true });
+  });
 });
 
 describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
