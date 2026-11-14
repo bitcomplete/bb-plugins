@@ -3136,7 +3136,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * same read the judgement used.
      */
     async function atWorkWithRead(b: Binding): Promise<{ atWork: boolean; observed: Observed; complete: boolean } | null> {
-      const running = store.workers(b.id).some((w) => w.status === "running");
+      const running = assessWorker(store.workers(b.id)).running;
       const fresh = await freshObserved(b);
       if (fresh === null) return null;
       // An incomplete read cannot prove the work is finished (a linked pull
@@ -3156,7 +3156,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const conflicts: Array<Conflict & { observed: Observed | null; complete: boolean }> = [];
       for (const c of overlapping(b, store.open(b.projectId))) {
         const read = await atWorkWithRead(c.with);
-        if (read === null ? atWork(c.with, { runningWorker: store.workers(c.with.id).some((w) => w.status === "running") }) : read.atWork) {
+        if (read === null ? atWork(c.with, { runningWorker: assessWorker(store.workers(c.with.id)).running }) : read.atWork) {
           conflicts.push({ ...c, observed: read?.observed ?? null, complete: read?.complete ?? false });
         }
       }
@@ -7712,7 +7712,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.", false);
       // Finished work is not scheduled against anything: there is nothing left to start.
       if (b.lastSnapshot !== null && finished(b, b.lastSnapshot)) return withdraw("Withdrawn: the work is finished.", false);
-      if (b.stage === "review" || store.workers(b.id).some((w) => w.status === "running")) return withdraw("Withdrawn: the work has started.", true);
+      if (b.stage === "review" || assessWorker(store.workers(b.id)).running) return withdraw("Withdrawn: the work has started.", true);
       const conflicts = await conflictsFresh(b);
       if (conflicts.length === 0) return withdraw("Withdrawn: nothing in flight overlaps it now.", true);
       const keys = conflicts.map((c) => c.with.entityKey);
@@ -8196,7 +8196,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // cross-repo ticket lands the consumed repo first), so the plugin must
       // not merge out of order or retire the worker that owns the rest.
       const openOwnPulls = observedPulls(b, observed).filter((p) => (ownPulls === null || pullBelongsToTicket(b, p, ownPulls)) && p.pull?.merged !== true && lc(p.state) !== "closed");
-      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && store.workers(b.id).some((w) => w.status === "finished");
+      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && assessWorker(store.workers(b.id)).parked;
       // BB-264: the steward's own merge holds name open bindings in this
       // project, or a stacked base pull request by its key; the plugin's
       // derived stacked-PR holds are recomputed from the base pull requests on
@@ -11599,7 +11599,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             b.endedAt === null &&
             b.ending === null &&
             b.stage === "spec" &&
-            !store.workers(b.id).some((w) => w.status === "running") &&
+            !assessWorker(store.workers(b.id)).running &&
             nothingPending;
           if (startDue) {
             store.note(b.id, START_WORKER_WAKE, false);
