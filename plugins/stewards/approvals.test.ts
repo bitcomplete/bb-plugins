@@ -26,7 +26,7 @@ const marker = (approver?: string) =>
 function context() {
   const githubComment = vi.fn().mockResolvedValue("IC_1");
   const recordProjectApproval = vi.fn();
-  const ctx = { github: { comment: githubComment }, store: { recordProjectApproval } } as unknown as ApprovalsContext;
+  const ctx = { github: { comment: githubComment }, now: () => 0, store: { recordProjectApproval, assessment: () => null, recordAssessment: vi.fn(), projectApprovals: () => [] } } as unknown as ApprovalsContext;
   return { ctx, githubComment, recordProjectApproval };
 }
 
@@ -83,6 +83,9 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
         closeNeedByKey,
         addGuidance,
         patch: vi.fn(),
+        assessment: () => null,
+        recordAssessment: vi.fn(),
+        projectApprovals: () => [],
       },
       github: { comment: githubComment, review: githubReview },
       now: () => 0,

@@ -7,6 +7,7 @@ import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { gateState } from "./ready-gate.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
+import { assessedPullGate } from "./assessed-gate.js";
 import { STANDING_RULES, BRIEF_PREFIX, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, initiativeProgress, initiativeProgressFlag, spawnCommand, WAKE_MAX_CHARS, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 import { BRIEF_MAX_CHARS } from "./server.js";
 import type { OpsFinding } from "./ops.js";
@@ -33,11 +34,19 @@ function wakeInput(over: Partial<WakeInput> = {}): WakeInput {
   const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
   if (!parsed.ok) throw new Error(parsed.error);
   const playbook = parsed.value;
+  const observed = over.observed ?? { entity: issue(), pulls: [] };
+  // BB-322: the wake reads the stored per-pull gates. A test that does not
+  // hand them in gets them from the one gate computation the plugin uses.
+  const assessedGates = over.assessedGates ?? [observed.entity, ...observed.pulls].filter((e) => e.pull !== null).map((e) => {
+    const g = assessedPullGate(binding, e, "user", []);
+    return { ...g, pull: e.key, met: g.gateMet, key: "test" };
+  });
   return {
     reason: "changed",
     binding,
     playbook,
-    observed: { entity: issue(), pulls: [] },
+    observed,
+    assessedGates,
     gate: gateState(playbook, binding.ready, ""),
     escalations: [],
     routedToMe: [],

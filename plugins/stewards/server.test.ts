@@ -8196,6 +8196,50 @@ describe("needs you items", () => {
     expect(t2.hooks.store.openNeeds(b2.id).some((n) => n.kind === "approve-pr")).toBe(true);
   });
 
+  // BB-322 blocker 1: a project-entry pull the project steward forwards to the
+  // owner (BB-192) is the owner's from the forward on, so the page's Approve
+  // acts. The assessment keys on the open user-routed approval escalation.
+  it("lets the owner approve a project-entry pull the project steward forwarded (BB-322 blocker 1)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const project = t.spawns[0]!.id;
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(esc.route).toBe("project");
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, project);
+    expect(forwarded.error, forwarded.text).toBe(false);
+    // The forward itself makes the gate the owner's: the item is actionable and
+    // the page approves as the owner, with no reconcile in between.
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(need).toBeDefined();
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; actionable: boolean; why: string | null }> } };
+    expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ actionable: true, why: null });
+    const approved = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
+    expect(approved).toMatchObject({ ok: true });
+  });
+
+  // BB-322 blocker 2: a review binding's own entity is a pull request, not a
+  // linked one. It must be gated, or the project entry routes to the owner and
+  // every wake says the assessment is not available.
+  it("gates a review binding's own pull request, so a project entry routes to the project steward (BB-322 blocker 2)", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    expect(t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")).toMatchObject({ route: "project" });
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    // The assessment holds the pull, so the steward's wake names the gate
+    // instead of the not-available fallback.
+    const wake = t.spawns.find((s) => s.id === b.threadId)?.prompt ?? "";
+    expect(wake).toContain("Lane gate:");
+    expect(wake).not.toContain("the assessment is not available for this head");
+  });
+
   // BB-51 criterion 5: one list feeds the standing rules and the refusal.
   it("derives the needs a steward may file from one list, so the rules and the refusal cannot drift (BB-51)", async () => {
     expect([...ESCALATED_NEED_KINDS, ...STEWARD_NEED_KINDS].sort()).toEqual([...NEEDS_KINDS].sort());
@@ -14896,7 +14940,7 @@ describe("bb stewards divergences (BB-293)", () => {
     expect(rows.find((r) => r.surface === "workerInFlight")).toMatchObject({ old: "in-flight", new: "parked", count: 1 });
   });
 
-  it("swallows a failure inside the shadow assessment and keeps reconciling", async () => {
+  it("swallows a failure inside the assessment and keeps reconciling", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     // Force the assessment write to fail: the lazy prepared statement throws
@@ -14905,9 +14949,9 @@ describe("bb stewards divergences (BB-293)", () => {
     await t.ring("linear", "uuid-12");
     await t.flush();
     // The reconcile completed past the failure: the binding's snapshot was
-    // stored and the warning names the shadow assessment.
+    // stored and the warning names the assessment.
     expect(t.hooks.store.find("ENG-12")!.lastSnapshot).not.toBeNull();
-    expect(t.harness.logEntries.some((e) => e.level === "warn" && e.message.includes("shadow assessment failed"))).toBe(true);
+    expect(t.harness.logEntries.some((e) => e.level === "warn" && e.message.includes("assessment failed"))).toBe(true);
   });
 });
 

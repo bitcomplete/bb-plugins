@@ -264,7 +264,13 @@ export function world() {
     else if (args.method === "repoSet") out = { repos, primary, layout, error: null };
     else if (args.method === "sourceSnapshot") {
       if (snapshotErrors.has(String(input.id))) throw new Error("Linear rate limited the read");
-      out = { snapshot: entities.get(String(input.id)) ?? null };
+      const entity = entities.get(String(input.id)) ?? null;
+      // BB-322: the real source's snapshot carries the pull request's changed
+      // files; the test world keeps them beside the entity. Merge them so the
+      // assessment's decide-list mark reads the same files `pullChangedFiles`
+      // returns, exactly as production does.
+      const files = entity !== null && entity.pull !== null ? githubFiles.get(entity.key) : undefined;
+      out = { snapshot: entity === null || entity.pull === null || files === undefined ? entity : { ...entity, pull: { ...entity.pull, files } } };
     }
     else if (args.method === "sourceSetInterest") out = { ok: true };
     else if (args.method === "sourceAdoptable") {

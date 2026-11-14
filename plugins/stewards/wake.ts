@@ -16,9 +16,9 @@ import type { DepsFinding, DepsLook } from "./deps.js";
 import { ADOPTION_CHOICES, adoptionHow, dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
 import type { AlertmanagerFinding, AlertmanagerLook, AlertmanagerReason } from "./alertmanager.js";
-import { newHumanComments, productGateOptions, unheardWait } from "./reconcile.js";
+import { newHumanComments, unheardWait } from "./reconcile.js";
 import { reportedItem, type GateState } from "./ready-gate.js";
-import { prGate, type ProjectApprovalRecord } from "./gate.js";
+import { currentStoredGate, type StoredGate } from "./assessed-gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
@@ -322,8 +322,8 @@ export type WakeInput = {
   needs?: Need[];
   /** The steward's thread and its workers': their comments are not news. */
   own: ReadonlySet<string>;
-  /** The plugin's own project-steward approval records, so the lane gate reads the same as the button. */
-  projectApprovals?: readonly ProjectApprovalRecord[];
+  /** The stored per-pull gates from the binding's assessment (BB-322), so the wake reads the one gate. */
+  assessedGates?: readonly StoredGate[];
   /** The project's adoption label. */
   label: string;
   /** Per-pull-request deployment state (BB-53); empty when the playbook names no deployment target. */
@@ -349,7 +349,7 @@ function commentLines(comments: SnapshotComment[]): string[] {
   return lines;
 }
 
-function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovals?: readonly ProjectApprovalRecord[], product?: { substantial: boolean | null; ticketApprovedSpec: boolean }): string[] {
+function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, assessedGates?: readonly StoredGate[]): string[] {
   const lines = [`### ${heading}`, ""];
   lines.push(`- ${e.key}: ${e.title ?? "(untitled)"}${e.url === null ? "" : ` — ${e.url}`}`);
   lines.push(`- State: ${e.state}${e.stateType === null ? "" : ` (${e.stateType})`}`);
@@ -361,15 +361,19 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
-    const gate = prGate(e, { projectApprovals, ...(product ?? {}) });
-    const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
-    if (gate.gateMet) {
-      const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
-      const head = gate.headSha === null ? "?" : gate.headSha.slice(0, 7);
-      const detail = [`reviewer approved ${approved}`, ...(approved === head ? [] : [`head ${head}`]), "checks green", ...(lane === "" ? [] : [lane])];
-      lines.push(`- Lane gate: met (${detail.join(", ")})`);
+    const gate = currentStoredGate({ pulls: assessedGates }, e);
+    if (gate === null) {
+      lines.push(`- Lane gate: not met — the assessment is not available for this head; the plugin recomputes it on the next look.`);
     } else {
-      lines.push(`- Lane gate: not met — ${gate.missing}${lane === "" ? "" : ` (${lane})`}`);
+      const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
+      if (gate.gateMet) {
+        const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
+        const head = gate.headSha === null ? "?" : gate.headSha.slice(0, 7);
+        const detail = [`reviewer approved ${approved}`, ...(approved === head ? [] : [`head ${head}`]), "checks green", ...(lane === "" ? [] : [lane])];
+        lines.push(`- Lane gate: met (${detail.join(", ")})`);
+      } else {
+        lines.push(`- Lane gate: not met — ${gate.missing}${lane === "" ? "" : ` (${lane})`}`);
+      }
     }
     const latest = new Map<string, string>();
     for (const r of p.reviews) latest.set(r.author, `${r.state}${r.commit === null ? "" : ` at ${r.commit.slice(0, 7)}`}`);
@@ -655,8 +659,8 @@ export function formatWake(input: WakeInput): string {
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
-  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovals, productGateOptions(binding, e)));
-  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovals, productGateOptions(binding, pull)));
+  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.assessedGates));
+  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.assessedGates));
   if (input.workers.length > 0) {
     out.push("", "### Workers", "");
     for (const w of input.workers) {

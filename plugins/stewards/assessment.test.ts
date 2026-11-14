@@ -67,7 +67,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     binding: binding(),
     observed: { entity: issue({ state: "In Progress" }), pulls: [] },
     ownPulls: new Set<string>(),
-    gateMetPulls: new Set<string>(),
     decisions: new Map(),
     projectApprovals: [],
     workers: [],
@@ -94,7 +93,6 @@ function bb266(secondOpen: boolean): AssessmentInput {
   return input({
     observed: { entity: issue({ state: "In Progress" }), pulls },
     ownPulls: own(...pulls),
-    gateMetPulls: new Set(["acme/web#7"]),
     decisions: new Map(pulls.map((p) => [p.key.toLowerCase(), "user" as const])),
     workers: [parkedWorker({ result: "Waiting on the owner's approval of acme/web#7." })],
     sources: { ...noSources },
@@ -224,7 +222,6 @@ describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
     const i = input({
       observed: { entity: issue({ state: "In Progress" }), pulls: [first, second] },
       ownPulls: own(first, second),
-      gateMetPulls: new Set(["acme/web#7"]),
       decisions: new Map([
         ["acme/web#7", "user"],
         ["acme/web#8", "user"],

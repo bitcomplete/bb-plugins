@@ -9,7 +9,8 @@
 // closure, so nothing here reads the plugin's config or snapshots on its own.
 import { type BigDecision, decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type DecideMark } from "./decisions.js";
 import type { ApprovalMode } from "./config.js";
-import { approvalMarkerLine, classifyApproval, ESCALATED_APPROVAL_REFUSAL, prGate, productReason, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
+import { approvalMarkerLine, classifyApproval, ESCALATED_APPROVAL_REFUSAL, productReason, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
+import { assessedGate } from "./assessed-gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
 import { isSpecComment, productGateOptions, workerInFlight, type MechanicalEvent } from "./reconcile.js";
 import { signatureLine, type EntitySnapshot, type Source } from "./source-contract.js";
@@ -143,7 +144,7 @@ export async function deliverProjectApproval(ctx: ApprovalsContext, b: Binding, 
  * decide list matched (BB-192).
  */
 export async function recordProjectDecision(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, threadId: string, fields: { headSha: string; entry: string | null; verdict: "approved" | "declined"; reasoning: string }): Promise<{ commentId: string }> {
-  const g = prGate(pull, productGateOptions(b, pull));
+  const g = assessedGate(ctx.store, b, pull, ctx.now());
   if (g.escalated) throw new Error(g.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL);
   const commentId = await postApprovalMarker(ctx, pull, threadId, fields);
   ctx.store.recordProjectApproval({ bindingId: b.id, headSha: fields.headSha, entry: fields.entry, byThread: threadId, commentId, verdict: fields.verdict });
@@ -240,7 +241,7 @@ export async function approveOwnerReviewedPull(ctx: ApprovalsContext, b: Binding
   // A reviewer's owner call in the marker is binding: the project steward does
   // not decide it, whatever entry the decide list matched, and never posts a
   // `bb-approval` on it (BB-192). The product reason (BB-207) binds it the same way.
-  const approvalGate = pull === null ? null : prGate(pull, { projectApprovals: ctx.store.projectApprovals(b.id), ...productGateOptions(b, pull) });
+  const approvalGate = pull === null ? null : assessedGate(ctx.store, b, pull, ctx.now(), decisions);
   if (approvalGate !== null && approvalGate.escalated) return { ok: false, error: approvalGate.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL };
   const files = pull === null ? null : await ctx.pullChangedFiles(pull);
   const decision = decideFor(files, fields.entry, decisions);
@@ -365,22 +366,20 @@ export type PullApprovalResult = { gate: PrGate; closed: boolean; approvalRaised
  * once by the caller. The merge item is the caller's; this returns the gate so
  * it can file it.
  */
-export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, decisions: readonly BigDecision[]): Promise<PullApprovalResult> {
+export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, decisions: readonly BigDecision[], gateFor?: (pull: EntitySnapshot) => PrGate | null): Promise<PullApprovalResult> {
   const url = pull.url ?? pull.key;
-  // The decide list places the pull request: a `project` entry whose paths
-  // the change touches is the project steward's, and everything else is
-  // the user's, filed on the page at once (BB-51). The files are read only
-  // when the lane actually waits on an approval.
-  const preliminary = prGate(pull, { projectApprovals: ctx.store.projectApprovals(b.id), ...productGateOptions(b, pull) });
-  let g = preliminary;
+  // BB-322: the gate comes from the stored assessment (the reconcile passes
+  // its in-memory copy through `gateFor`; otherwise the single `assessedGate`
+  // site reads or refreshes it). The decide-list placement is already in it,
+  // so this no longer builds a second gate from the changed files. The files
+  // are still read for the listing the approval item carries (BB-135).
+  let g = gateFor?.(pull) ?? assessedGate(ctx.store, b, pull, ctx.now(), decisions);
   // The decide-list listing is fetched once, with the changed files, and
   // passed to whichever surface asks for the approval (BB-135).
   let listing: string | null = null;
-  if (preliminary.lane !== "no-review" && preliminary.marker?.verdict === "approved" && preliminary.checksGreen && !preliminary.ownerApproved && !preliminary.projectApproved) {
+  if (g.lane !== "no-review" && g.marker?.verdict === "approved" && g.checksGreen && !g.ownerApproved && !g.projectApproved) {
     const files = await ctx.pullChangedFiles(pull);
-    const explanation = explainDecision(files, decisions);
-    listing = formatDecisionListing(explanation);
-    g = prGate(pull, { decision: explanation.mark, projectApprovals: ctx.store.projectApprovals(b.id), ...productGateOptions(b, pull) });
+    listing = formatDecisionListing(explainDecision(files, decisions));
   }
   const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
   const approvalEsc = ctx.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
@@ -480,7 +479,7 @@ export async function approvePrPageAction(ctx: ApprovalsContext, b: Binding, nee
   const ref = parsePullRef(need.url);
   if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
   const pull = await freshPull(ctx, b, need.url);
-  const gate = pull === null ? null : prGate(pull, productGateOptions(b, pull));
+  const gate = pull === null ? null : assessedGate(ctx.store, b, pull, ctx.now());
   if (pull === null || gate === null || !gate.needsOwnerApproval) return { ok: false, message: `Not now: ${gate?.missing ?? "the pull request has not been observed yet"}.` };
   const foreign = isForeignPull(pull);
   const after = (closure: string): void => {
