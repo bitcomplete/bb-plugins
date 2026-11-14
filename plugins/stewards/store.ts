@@ -17,7 +17,7 @@ import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import type { GuidanceCitation } from "./guidance.js";
-import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore } from "./approvals-store.js";
+import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
 
 /**
@@ -471,7 +471,7 @@ export const IDLE_MIGRATIONS = [
 
 // BB-77: the project-steward approval marker's migration group lives with the
 // table it alters, in approvals-store.ts, so the gate's own files can be named.
-export { APPROVAL_MARKER_MIGRATIONS } from "./approvals-store.js";
+export { APPROVAL_MARKER_MIGRATIONS, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 
 // BB-97: the status report's actor `me` is renamed `user`, so all three values
 // name a party rather than a pronoun. A stored row keeps its meaning: this
@@ -726,7 +726,7 @@ export const STANDUP_COMPLETED_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN co
 // a store from before the step reads back exactly as before.
 export const ALERTMANAGER_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN alertmanager_look TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS];
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1654,6 +1654,12 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const openEscalationsForProjectStmt = db.prepare<[string], Record<string, unknown>>(
     "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND b.ended_at IS NULL AND e.status = 'open' ORDER BY e.created_at",
   );
+  // BB-325: a project's open escalations (questions included) still attached to
+  // an ended binding, with that binding's end. The one-time close reads this:
+  // a question filed after its binding ended (BCP-154) is the case.
+  const openOnEndedBindingsStmt = db.prepare<[string], Record<string, unknown>>(
+    "SELECT e.*, b.entity_key AS binding_key, b.end_reason AS binding_end_reason, b.ended_at AS binding_ended_at FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND b.ended_at IS NOT NULL AND e.status = 'open' ORDER BY b.ended_at, e.created_at",
+  );
   // BB-296: a project's open bindings' workers in one query, grouped by binding
   // in the caller.
   const workersForProjectStmt = db.prepare<[string], Record<string, unknown>>(
@@ -1747,7 +1753,13 @@ export function createStore(db: Database.Database, now: () => number, options: S
     "INSERT INTO escalations (id, project_id, binding_id, forwarded_from, question, context, choices, meanwhile, route, status, created_at, resolution_kind, url, data, is_question, kind, origin) VALUES (@id, @project_id, @binding_id, @forwarded_from, @question, @context, @choices, 'wait', 'user', 'open', @created_at, @resolution_kind, @url, @data, 1, 'decision', @origin)",
   );
   const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ? AND is_question = 1");
-  const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY created_at");
+  // BB-325: a question whose binding has ended is not open with the user, so it
+  // is left out here exactly as `openEscalationsForProject` leaves out an ended
+  // binding's escalations. A question about no single binding (binding_id '')
+  // still shows; it has no binding to end.
+  const openQuestions = db.prepare<[string], Record<string, unknown>>(
+    "SELECT e.* FROM escalations e LEFT JOIN bindings b ON b.id = e.binding_id WHERE e.project_id = ? AND e.is_question = 1 AND e.status = 'open' AND (e.resolution_kind IS NULL OR e.resolution_kind NOT IN ('secret','done')) AND (e.binding_id IS NULL OR e.binding_id = '' OR b.ended_at IS NULL) ORDER BY e.created_at",
+  );
   const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'resolved' AND resolved_at >= ? AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY resolved_at");
   const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'user' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) AND (is_question = 1 OR NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = escalations.id AND q.is_question = 1)) ORDER BY created_at");
   // A route-`user` escalation a question or a need already covers is not listed
@@ -2496,6 +2508,19 @@ export function createStore(db: Database.Database, now: () => number, options: S
     openEscalationsForProject(projectId: string): Escalation[] {
       return openEscalationsForProjectStmt.all(projectId).map(toEscalation);
     },
+    /**
+     * BB-325: a project's open escalations and questions on ended bindings,
+     * each with its binding's key, end reason and end date. The one-time close
+     * reads it; once it has resolved them, the next pass finds nothing open.
+     */
+    openOnEndedBindings(projectId: string): Array<{ escalation: Escalation; entityKey: string; endReason: string | null; endedAt: number }> {
+      return openOnEndedBindingsStmt.all(projectId).map((r) => ({
+        escalation: toEscalation(r),
+        entityKey: String(r.binding_key),
+        endReason: r.binding_end_reason === null || r.binding_end_reason === undefined ? null : String(r.binding_end_reason),
+        endedAt: Number(r.binding_ended_at),
+      }));
+    },
     /** A project's open bindings' workers, one query (BB-296). */
     workersForProject(projectId: string): Worker[] {
       return workersForProjectStmt.all(projectId).map(toWorker);
@@ -2731,6 +2756,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
     setEscalationHead(id: string, headSha: string | null): void {
       db.prepare("UPDATE escalations SET head_sha = ? WHERE id = ?").run(headSha, id);
+    },
+    /** Replace an open escalation's `meanwhile` text, so a wait can name who it now waits on (BB-327). */
+    setEscalationMeanwhile(id: string, meanwhile: string): void {
+      db.prepare("UPDATE escalations SET meanwhile = ? WHERE id = ?").run(meanwhile, id);
     },
     /** Record a forwarding hop on the escalation's chain, keeping its rewording. */
     addHop(id: string, hop: { threadId: string; bindingId: string | null; rewording: string | null }): void {
@@ -3470,6 +3499,20 @@ export function createStore(db: Database.Database, now: () => number, options: S
       upsertProject.run(projectId);
       const row = toProject(getProject.get(projectId)!);
       db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run(JSON.stringify([...row.pendingNotes, text]), projectId);
+    },
+    /**
+     * BB-325: queue a silent note, folded into the one already queued whose text
+     * starts with `prefix`. Several late reports from one ending, or the items
+     * one ending closed, are one line in the next digest, not one per call.
+     */
+    noteProjectFolded(projectId: string, prefix: string, text: string): void {
+      upsertProject.run(projectId);
+      const row = toProject(getProject.get(projectId)!);
+      const index = row.pendingNotes.findIndex((n) => n.startsWith(prefix));
+      const notes = [...row.pendingNotes];
+      if (index >= 0) notes[index] = `${notes[index]} ${text}`;
+      else notes.push(`${prefix}${text}`);
+      db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run(JSON.stringify(notes), projectId);
     },
     /** The queued digest notes, without clearing them: a failed digest send must not lose them. */
     peekProjectNotes(projectId: string): string[] {

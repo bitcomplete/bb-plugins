@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, HUDDLE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_REQUESTER_MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -51,6 +51,34 @@ describe("questions to the user", () => {
     expect(s.escalation(second.x.id)).toMatchObject({ status: "resolved", resolution: "No SSO." });
     expect(s.resolve(second.x.id, "late")).toBe(false);
     expect(s.openQuestions("p1")).toEqual([]);
+  });
+
+  // BB-325: a question whose binding has ended is not open with the user; the
+  // one-time close still finds it, closes it, and finds nothing the next time.
+  it("hides a question on an ended binding, and lists it for the one-time close", () => {
+    const { s, binding } = store();
+    const q = s.ask({ projectId: "p1", bindingId: binding.id, escalationId: null, question: "Why did you skip the delivery lookup?", context: null });
+    const unbound = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
+    s.patch(binding.id, { endedAt: 2_000, endReason: "terminal" });
+    // The ended binding's question is not open; the project-scope one still is.
+    expect(s.openQuestions("p1").map((x) => x.id)).toEqual([unbound.id]);
+    expect(s.openOnEndedBindings("p1")).toMatchObject([{ escalation: { id: q.id, bindingId: binding.id }, entityKey: "ENG-12", endReason: "terminal", endedAt: 2_000 }]);
+    // Once closed, it is never found open again.
+    expect(s.resolve(q.id, "The binding ended.", "plugin", false)).toBe(true);
+    expect(s.openOnEndedBindings("p1")).toEqual([]);
+    expect(s.question(q.id)).toMatchObject({ status: "answered", answer: "The binding ended." });
+  });
+
+  // BB-325: several late reports from one ending are one note, not one each.
+  it("folds a silent project note per binding", () => {
+    const { s } = store();
+    s.noteProjectFolded("p1", "late report from ended binding ENG-12 (terminal, 2026-01-01T00:00:00Z): ", "closed question qst_1.");
+    s.noteProjectFolded("p1", "late report from ended binding ENG-12 (terminal, 2026-01-01T00:00:00Z): ", "escalation: Include SSO?");
+    s.noteProjectFolded("p1", "late report from ended binding ENG-13 (gone, 2026-01-02T00:00:00Z): ", "escalation: Gone?");
+    expect(s.peekProjectNotes("p1")).toEqual([
+      "late report from ended binding ENG-12 (terminal, 2026-01-01T00:00:00Z): closed question qst_1. escalation: Include SSO?",
+      "late report from ended binding ENG-13 (gone, 2026-01-02T00:00:00Z): escalation: Gone?",
+    ]);
   });
 });
 
@@ -711,9 +739,10 @@ describe("the actor rename migration (BB-97)", () => {
     // ended-read index after that, BB-300 slice 4 appended the stand-up table
     // after that, its rename follows, BB-303 appended the scope column
     // after that, BB-307 appended the delegation log after that, BB-312
-    // appended the completed flag after that, and BB-314 appended the
-    // Alertmanager look column after that.
-    const groups = [ALERTMANAGER_LOOK_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // appended the completed flag after that, BB-314 appended the
+    // Alertmanager look column after that, and BB-327 appended the delegate-set
+    // and reviewer-request tables after that.
+    const groups = [REVIEWER_REQUEST_MIGRATIONS, PULL_REQUESTER_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -807,9 +836,14 @@ describe("the escalation route rename migration (BB-209)", () => {
     // ended-read index after that, BB-300 slice 4's huddle table after that,
     // its rename to the stand-up table after that, BB-303's scope column
     // after that, BB-307's delegation log after that, BB-312's completed
-    // flag after that, and BB-314's Alertmanager look column after that.
-    const withoutAlertmanagerLook = MIGRATIONS.slice(0, -ALERTMANAGER_LOOK_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-ALERTMANAGER_LOOK_MIGRATIONS.length)).toEqual([...ALERTMANAGER_LOOK_MIGRATIONS]);
+    // flag after that, BB-314's Alertmanager look column after that, and
+    // BB-327's delegate-set and reviewer-request tables after that.
+    const withoutReviewerRequests = MIGRATIONS.slice(0, -REVIEWER_REQUEST_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-REVIEWER_REQUEST_MIGRATIONS.length)).toEqual([...REVIEWER_REQUEST_MIGRATIONS]);
+    const withoutPullRequesters = withoutReviewerRequests.slice(0, -PULL_REQUESTER_MIGRATIONS.length);
+    expect(withoutReviewerRequests.slice(-PULL_REQUESTER_MIGRATIONS.length)).toEqual([...PULL_REQUESTER_MIGRATIONS]);
+    const withoutAlertmanagerLook = withoutPullRequesters.slice(0, -ALERTMANAGER_LOOK_MIGRATIONS.length);
+    expect(withoutPullRequesters.slice(-ALERTMANAGER_LOOK_MIGRATIONS.length)).toEqual([...ALERTMANAGER_LOOK_MIGRATIONS]);
     const withoutCompleted = withoutAlertmanagerLook.slice(0, -STANDUP_COMPLETED_MIGRATIONS.length);
     expect(withoutAlertmanagerLook.slice(-STANDUP_COMPLETED_MIGRATIONS.length)).toEqual([...STANDUP_COMPLETED_MIGRATIONS]);
     const withoutDelegations = withoutCompleted.slice(0, -STANDUP_DELEGATION_MIGRATIONS.length);

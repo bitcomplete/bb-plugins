@@ -155,7 +155,7 @@ const targetDocument = (issueRelations: string) => `query($owner: String!, $name
     mergeCommit { oid }
     files(first: 100) { nodes { path } }
     timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
-    reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { name } ... on Bot { login } ... on Mannequin { login } } } }
+    reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { combinedSlug } ... on Bot { login } ... on Mannequin { login } } } }
     latestReviews(first: 50) { nodes { author ${ACTOR} state } }
     reviews(last: 50) { nodes { id author ${ACTOR} state body createdAt submittedAt url commit { oid } comments(first: 50) { nodes { ${COMMENT_FIELDS} path } } } }
     commits(last: 1) { nodes { commit { oid author { user { login } } statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } } } } } }`;
@@ -239,7 +239,7 @@ const pullNode = z.object({
   headRefName: z.string().nullish(),
   headRefOid: z.string().nullish(),
   baseRefName: z.string().nullish(),
-  reviewRequests: z.object({ nodes: z.array(z.object({ requestedReviewer: z.object({ __typename: z.string(), login: z.string().nullish(), name: z.string().nullish() }).nullish() })) }).nullish(),
+  reviewRequests: z.object({ nodes: z.array(z.object({ requestedReviewer: z.object({ __typename: z.string(), login: z.string().nullish(), combinedSlug: z.string().nullish(), name: z.string().nullish() }).nullish() })) }).nullish(),
   latestReviews: z.object({ nodes: z.array(z.object({ author: actor, state: z.string() })) }).nullish(),
   reviews: z.object({ nodes: z.array(reviewNode) }).nullish(),
   commits: z.object({ nodes: z.array(z.object({ commit: z.object({ oid: z.string(), author: z.object({ user: actor }).nullish(), statusCheckRollup: z.object({ state: z.string(), contexts: z.object({ nodes: z.array(contextNode) }).nullish() }).nullish() }) })) }).nullish(),
@@ -395,7 +395,10 @@ function targetOf({ repo, node }: TargetRead, comments: Comment[]): Target {
       head: node.headRefName ?? null,
       headSha: commit?.oid ?? node.headRefOid ?? null,
       reviewDecision: lower(node.reviewDecision),
-      requestedReviewers: (node.reviewRequests?.nodes ?? []).map((r) => r.requestedReviewer?.login ?? r.requestedReviewer?.name ?? "").filter((s) => s !== "").sort(),
+      // A user (and a bot or mannequin) is its login; a team is its
+      // `combinedSlug` (`org/slug`), which a login-shape test rejects so a team
+      // request is never read as a delegate (BB-327).
+      requestedReviewers: (node.reviewRequests?.nodes ?? []).map((r) => r.requestedReviewer?.login ?? r.requestedReviewer?.combinedSlug ?? r.requestedReviewer?.name ?? "").filter((s) => s !== "").sort(),
       reviews: (node.latestReviews?.nodes ?? [])
         .filter((r) => r.state !== "PENDING")
         .map((r) => `${r.author?.login ?? "someone"}: ${lower(r.state)}`)

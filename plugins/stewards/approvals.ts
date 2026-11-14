@@ -339,6 +339,13 @@ export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Bindi
   });
 }
 
+/**
+ * Whether an open approval escalation is the plugin's delegate wait (BB-327):
+ * routed to the binding's steward and closed only by the delegate's review or
+ * a withdrawn request, never decided by the steward itself.
+ */
+export const isDelegateWait = (x: { kind: string; route: string }): boolean => x.kind === "approval" && x.route === "steward";
+
 /** A reviewer marker's identity: a new round on the same head is a new marker (BB-51). */
 export const markerKey = (m: { round: number; sha: string } | null): string | null => (m === null ? null : `${m.round}:${m.sha}`);
 
@@ -349,10 +356,12 @@ export const markerKey = (m: { round: number; sha: string } | null): string | nu
  * what closed it (BB-151).
  */
 export function approvalRef(g: PrGate): string {
-  const id = g.projectApproved ? g.projectApprovalId : g.ownerApprovalId;
+  // A delegate's approval is a real GitHub review, so it names the review's id
+  // and URL (BB-327).
+  const id = g.projectApproved ? g.projectApprovalId : g.delegateApproved ? g.delegateApprovalId : g.ownerApprovalId;
   if (id === null) return "";
-  const url = g.projectApproved ? g.projectApprovalUrl : g.ownerApprovalUrl;
-  const kind = g.projectApproved ? "comment" : (g.ownerApprovalKind ?? "comment");
+  const url = g.projectApproved ? g.projectApprovalUrl : g.delegateApproved ? g.delegateApprovalUrl : g.ownerApprovalUrl;
+  const kind = g.projectApproved ? "comment" : g.delegateApproved ? "review" : (g.ownerApprovalKind ?? "comment");
   return url === null ? `${kind} ${id}` : `${kind} ${id}, ${url}`;
 }
 
@@ -368,6 +377,14 @@ export type PullApprovalResult = { gate: PrGate; closed: boolean; approvalRaised
  */
 export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, decisions: readonly BigDecision[], gateFor?: (pull: EntitySnapshot) => PrGate | null): Promise<PullApprovalResult> {
   const url = pull.url ?? pull.key;
+  // BB-327: remember every login seen in the request list, so a delegate's
+  // APPROVED review still counts after GitHub drops them from the live list.
+  ctx.store.rememberPullRequesters(b.id, url, pull.pull?.requestedReviewers ?? []);
+  // The owner ends a delegation by removing a requested reviewer who never
+  // reviewed; a delegate who submitted a review stays a delegate (BB-327).
+  const live = new Set((pull.pull?.requestedReviewers ?? []).map((l) => l.toLowerCase()));
+  const reviewed = new Set((pull.pull?.reviews ?? []).map((r) => r.author.toLowerCase()));
+  for (const login of ctx.store.pullRequesters(b.id, url)) if (!live.has(login) && !reviewed.has(login)) ctx.store.forgetPullRequester(b.id, url, login);
   // BB-322: the gate comes from the stored assessment (the reconcile passes
   // its in-memory copy through `gateFor`; otherwise the single `assessedGate`
   // site reads or refreshes it). The decide-list placement is already in it,
@@ -390,6 +407,22 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
     if (approvalEsc !== null) ctx.store.resolve(approvalEsc.id, "The pull request is closed.");
     return { gate: g, closed: true, approvalRaised: false };
   }
+  // BB-327: a delegate who asked for changes is re-solicited once the
+  // independent reviewer approves the new head. The (delegate, head) record
+  // makes it once per head; the gate offers it only with an approved marker
+  // at this head and green checks, so an unreviewed push is never paged.
+  if (g.delegatesToReRequest.length > 0) {
+    const ref = parsePullRef(url);
+    if (ref !== null) {
+      try {
+        await ctx.github.requestReviewers(ref.repo, ref.number, g.delegatesToReRequest);
+        for (const login of g.delegatesToReRequest) ctx.store.recordReviewerRequest(b.id, url, login, g.headSha ?? "");
+        ctx.store.note(b.id, `Re-requested review from ${g.delegatesToReRequest.join(", ")} on ${pull.key} for the approved head ${ctx.shortSha(g.headSha)}.`, true);
+      } catch (error) {
+        ctx.store.note(b.id, `Could not re-request review from ${g.delegatesToReRequest.join(", ")} on ${pull.key}: ${errorMessage(error)}`, false);
+      }
+    }
+  }
   if (g.needsOwnerApproval) {
     // The user's lane: the page item is filed as soon as the reviewer's
     // marker is approved and checks are green, with no project-steward
@@ -405,8 +438,30 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing, g.reason);
     } else {
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route !== "user") ctx.store.reroute(approvalEsc.id, "user", approvalEsc.recommendation);
+      if (approvalEsc.route !== "user") {
+        ctx.store.reroute(approvalEsc.id, "user", approvalEsc.recommendation);
+        // A delegation that ended moves the wait back to the owner: drop the
+        // delegate's `meanwhile` so the escalation does not keep naming them
+        // (BB-327).
+        ctx.store.setEscalationMeanwhile(approvalEsc.id, "Waiting: the owner approves on GitHub from the Stewards page.");
+      }
       fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
+    }
+  } else if (g.delegatePending) {
+    // BB-327: the owner delegated the review by requesting one. No page item
+    // is filed and the owner is not asked; one escalation stays open, routed
+    // to the binding's steward, whose `meanwhile` names the delegate. It
+    // resolves when the delegate's APPROVED review lands, or the request is
+    // withdrawn and the ordinary owner lane returns.
+    const names = g.delegates.join(", ");
+    ctx.store.closeNeedByKey(b.id, "approve-pr", url, `Waiting on the requested reviewer ${names}.`);
+    const meanwhile = `Waiting: approval from ${names} (a requested reviewer), not the owner.`;
+    if (approvalEsc === null) {
+      ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile, route: "steward", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
+    } else {
+      if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
+      if (approvalEsc.route !== "steward") ctx.store.reroute(approvalEsc.id, "steward", approvalEsc.recommendation);
+      ctx.store.setEscalationMeanwhile(approvalEsc.id, meanwhile);
     }
   } else if (g.needsProjectApproval) {
     // The project steward's lane: one escalation, no page item.
@@ -440,13 +495,14 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       const why = g.missing ?? "Rebase the head onto the default branch.";
       ctx.store.closeNeedByKey(b.id, "approve-pr", url, why);
       ctx.store.resolve(approvalEsc.id, why);
-    } else if (g.ownerApproved || g.projectApproved) {
+    } else if (g.ownerApproved || g.projectApproved || g.delegateApproved) {
       // The resolution names what approved, so a closed item can always
       // be traced to the comment or review that closed it (BB-151).
       const ref = approvalRef(g);
       const suffix = ref === "" ? "" : ` (${ref})`;
+      const who = g.projectApproved ? "the project steward" : g.delegateApproved ? `the requested reviewer ${g.delegateApprovalBy ?? ""}`.trimEnd() : "the owner";
       ctx.store.closeNeedByKey(b.id, "approve-pr", url, `Approval is present${suffix}.`);
-      ctx.store.resolve(approvalEsc.id, `Approved by ${g.projectApproved ? "the project steward" : "the owner"}${suffix}.`);
+      ctx.store.resolve(approvalEsc.id, `Approved by ${who}${suffix}.`);
     } else {
       // The marker is no longer approved (or gone): withdraw the request
       // with the gate's words, never "Approved.".

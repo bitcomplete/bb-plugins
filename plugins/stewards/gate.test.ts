@@ -88,3 +88,128 @@ describe("the merge gate's base-ref retarget rule (BB-279)", () => {
     expect(prGate(entity, { decision: "project", projectApprovals }).gateMet).toBe(true);
   });
 });
+
+// BB-327: a requested reviewer on an owner-lane pull request is the owner's
+// delegation. While they are outstanding the owner is not asked; their
+// APPROVED review meets the lane; the viewer's own approval stays an override;
+// a changes-requested delegate is re-solicited once per approved head.
+const ownerLaneMarker = (verdict = "approved", sha = head) =>
+  comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+const pageApproval = comment({ id: "o1", author: "jane", did: "commented", body: `Approved ${head} from the Stewards page`, signedBy: null, createdAt: "2026-10-14T16:30:00Z" });
+/** A delegate's review, as both the flattened comment and the `pull.reviews` entry the gate reads. */
+const delegateReview = (author: string, state: string, at: string, commit: string | null = head) => ({
+  reviews: [{ author, state, submittedAt: at, commit }],
+  comments: [comment({ id: `rev-${author}-${state}`, author, did: state === "approved" ? "approved" : "requested changes", body: "", createdAt: at, signedBy: null })],
+});
+
+const delegatePull = (reviewers: string[], extra: { comments?: ReturnType<typeof comment>[]; reviews?: { author: string; state: string; submittedAt: string; commit: string | null }[] } = {}) =>
+  pull({ comments: [ownerLaneMarker(), ...(extra.comments ?? [])] }, { ...green, requestedReviewers: reviewers, ...(extra.reviews === undefined ? {} : { reviews: extra.reviews }) });
+
+describe("a requested reviewer is the owner's delegation (BB-327)", () => {
+  it("does not ask the owner while a requested reviewer is outstanding, and names them (criterion 1)", () => {
+    const g = prGate(delegatePull(["arashout"]));
+    expect(g.gateMet).toBe(false);
+    expect(g.needsOwnerApproval).toBe(false);
+    expect(g.delegatePending).toBe(true);
+    expect(g.delegates).toEqual(["arashout"]);
+    expect(g.missing).toBe("approval needed from arashout");
+  });
+
+  it("meets the owner lane on the delegate's APPROVED review (criterion 3)", () => {
+    const review = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const g = prGate(delegatePull(["arashout"], review));
+    expect(g.gateMet).toBe(true);
+    expect(g.delegateApproved).toBe(true);
+    expect(g.delegateApprovalBy).toBe("arashout");
+    expect(g.delegateApprovalId).toBe("rev-arashout-approved");
+    expect(g.needsOwnerApproval).toBe(false);
+  });
+
+  it("still accepts the viewer's own unsigned approval as an override (criterion 4)", () => {
+    const g = prGate(delegatePull(["arashout"], { comments: [pageApproval] }));
+    expect(g.gateMet).toBe(true);
+    expect(g.ownerApproved).toBe(true);
+    expect(g.needsOwnerApproval).toBe(false);
+  });
+
+  it("revokes a delegate's approval on their later changes-requested, and keeps not asking (criterion 5)", () => {
+    const approved = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const changed = delegateReview("arashout", "changes requested", "2026-10-14T18:00:00Z", "bbbbbbb2");
+    const g = prGate(delegatePull(["arashout"], { comments: [...approved.comments, ...changed.comments], reviews: [...approved.reviews, ...changed.reviews] }));
+    expect(g.gateMet).toBe(false);
+    expect(g.needsOwnerApproval).toBe(false);
+    expect(g.delegates).toEqual(["arashout"]);
+    // The delegate stays in the delegate set even after GitHub drops them from
+    // the live list, because they have submitted a review.
+    const remembered = prGate(delegatePull([], { comments: [...approved.comments, ...changed.comments], reviews: [...approved.reviews, ...changed.reviews] }), { rememberedRequesters: ["arashout"] });
+    expect(remembered.needsOwnerApproval).toBe(false);
+  });
+
+  it("keeps a delegate's approval across a later COMMENTED review (criterion 3)", () => {
+    const approved = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const commented = {
+      reviews: [{ author: "arashout", state: "commented", submittedAt: "2026-10-14T17:30:00Z", commit: head }],
+      comments: [comment({ id: "rev-arashout-commented", author: "arashout", did: "reviewed", body: "answered", createdAt: "2026-10-14T17:30:00Z", signedBy: null })],
+    };
+    const g = prGate(delegatePull(["arashout"], { comments: [...approved.comments, ...commented.comments], reviews: [...approved.reviews, ...commented.reviews] }));
+    expect(g.gateMet).toBe(true);
+    expect(g.delegateApproved).toBe(true);
+  });
+
+  it("does not merge one delegate's approval over another's changes requested (criterion 5)", () => {
+    const approved = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const changed = delegateReview("bob", "changes requested", "2026-10-14T17:30:00Z", "bbbbbbb2");
+    const g = prGate(delegatePull(["arashout", "bob"], { comments: [...approved.comments, ...changed.comments], reviews: [...approved.reviews, ...changed.reviews] }));
+    expect(g.gateMet).toBe(false);
+    expect(g.needsOwnerApproval).toBe(false);
+    expect(g.delegates).toEqual(["bob"]);
+  });
+
+  it("finds a delegate's approval after GitHub dropped them from the live list (criterion 6)", () => {
+    const review = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const entity = delegatePull([], review);
+    // The live list is empty, so only the remembered set can find the approval.
+    expect(prGate(entity).gateMet).toBe(false);
+    expect(prGate(entity, { rememberedRequesters: ["arashout"] }).gateMet).toBe(true);
+  });
+
+  it("offers a changes-requested delegate for one re-request per approved head (criterion 7)", () => {
+    // The delegate reviewed an earlier head; the current head is new.
+    const changed = delegateReview("arashout", "changes requested", "2026-10-14T17:00:00Z", "bbbbbbb2");
+    const entity = delegatePull(["arashout"], changed);
+    expect(prGate(entity).delegatesToReRequest).toEqual(["arashout"]);
+    // A repeated look with the record does not re-request.
+    expect(prGate(entity, { reRequestedDelegates: ["arashout"] }).delegatesToReRequest).toEqual([]);
+    // A further push without a new approved marker at that head causes none.
+    const moved = pull({ comments: [ownerLaneMarker()] }, { ...green, requestedReviewers: ["arashout"], reviews: changed.reviews, headSha: "ccccccc3" });
+    expect(prGate(moved).delegatesToReRequest).toEqual([]);
+    // A head the independent reviewer has not approved causes none.
+    const unapproved = pull({ comments: [ownerLaneMarker("changes-requested")] }, { ...green, requestedReviewers: ["arashout"], reviews: changed.reviews });
+    expect(prGate(unapproved).delegatesToReRequest).toEqual([]);
+  });
+
+  it("names the re-request in the missing reason for the current head (criterion 10)", () => {
+    const changed = delegateReview("arashout", "changes requested", "2026-10-14T17:00:00Z", "bbbbbbb2");
+    expect(prGate(delegatePull(["arashout"], changed), { reRequestedDelegates: ["arashout"] }).missing).toContain("re-requested for this head");
+  });
+
+  it("does not treat bots, teams or the viewer as delegates (criterion 8)", () => {
+    // A team is `org/slug` as the source now emits it; a bot or the viewer is
+    // never a delegate either.
+    for (const reviewers of [["dependabot[bot]"], ["bitcomplete/backend"], ["Platform Team"], ["jane"]]) {
+      const g = prGate(delegatePull(reviewers));
+      expect(g.delegates).toEqual([]);
+      expect(g.needsOwnerApproval).toBe(true);
+      expect(g.missing).toContain("owner approval needed");
+    }
+  });
+
+  it("behaves exactly as today with no review requests (criterion 9)", () => {
+    const g = prGate(delegatePull([]));
+    expect(g.delegates).toEqual([]);
+    expect(g.delegatePending).toBe(false);
+    expect(g.delegateApproved).toBe(false);
+    expect(g.needsOwnerApproval).toBe(true);
+    expect(g.missing).toContain("owner approval needed");
+  });
+});

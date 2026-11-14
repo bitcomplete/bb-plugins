@@ -2423,6 +2423,115 @@ describe("terminal states and follow-through", () => {
   });
 });
 
+// BB-325: an ended binding (BCP-154) takes no new question, forward, hold or
+// priority change; a late report or escalation is carried to the project
+// steward instead of being stored on the binding, and a question left on an
+// ended binding is closed once and reported once.
+describe("an ended binding takes no new writes (BB-325)", () => {
+  /** A bound ticket with its steward thread, ended mechanically. */
+  async function ended() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const b = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(b.id, { endedAt: t.now(), endReason: "terminal" });
+    return { ...t, project, steward, b: t.hooks.store.find("ENG-12")! };
+  }
+
+  it("refuses ask and forward on an ended binding, naming the end and the alternatives, and stores nothing", async () => {
+    const t = await ended();
+    const ask = await t.tool("steward_update", { binding: "ENG-12", ask: { question: "Why did you skip the delivery lookup?" } }, t.project);
+    expect(ask.error).toBe(true);
+    expect(ask.text).toMatch(/ENG-12 ended \(terminal\) on \d{4}-\d{2}-\d{2}T[\d:]+Z: an ended binding takes no new question, forward, hold or priority change\./u);
+    expect(ask.text).toMatch(/Ask at project scope by omitting binding, or reopen the entity first so its steward resumes\./u);
+    expect(t.hooks.store.openQuestions("p1")).toEqual([]);
+
+    // An escalation left open on the ended binding (a race) is not forwarded either.
+    const x = t.hooks.store.escalate({ bindingId: t.b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1", origin: { threadId: null, bindingId: t.b.id, chain: [] } });
+    const fwd = await t.tool("steward_update", { binding: "ENG-12", forward: x.id, resolution: "text" }, t.project);
+    expect(fwd.error).toBe(true);
+    expect(fwd.text).toMatch(/ENG-12 ended \(terminal\)/u);
+    expect(t.hooks.store.escalation(x.id)!.status).toBe("open");
+
+    // A hold or priority change is refused with the same error; resolving an existing question still works.
+    expect((await t.tool("steward_update", { binding: "ENG-12", hold: "stop" }, t.project)).error).toBe(true);
+    expect((await t.tool("steward_update", { binding: "ENG-12", priority: "high" }, t.project)).error).toBe(true);
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: t.b.id, escalationId: null, question: "Keep the old page?", context: null });
+    const resolved = await t.tool("steward_update", { binding: "ENG-12", resolve: q.id, answer: "No." }, t.project);
+    expect(resolved.error).toBe(false);
+    expect(t.hooks.store.question(q.id)).toMatchObject({ status: "answered", answer: "No." });
+  });
+
+  it("carries a steward_report from an ended binding to the project steward and writes nothing to the binding", async () => {
+    const t = await ended();
+    const before = t.hooks.store.find("ENG-12")!;
+    const sends = t.sends.length;
+    const reported = await t.tool("steward_report", { phase: "In Progress", summary: "Still building.", nextAction: "Wait", actor: "steward", waitingOn: "the review", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Waiting." } }, t.steward);
+    expect(reported.error).toBe(false);
+    expect(reported.text).toMatch(/Reported after ENG-12 ended \(terminal,/u);
+    const after = t.hooks.store.find("ENG-12")!;
+    expect(after.status).toEqual(before.status);
+    expect(after.requeueAt).toEqual(before.requeueAt);
+    expect(t.hooks.store.openEscalations(after.id)).toEqual([]);
+    const notes = () => t.hooks.store.peekProjectNotes("p1").filter((n) => n.startsWith("late report from ended binding ENG-12 (terminal,"));
+    expect(notes()).toHaveLength(1);
+    expect(notes()[0]).toMatch(/Still building\. Next: Wait \(steward\)/u);
+    expect(notes()[0]).toMatch(/waiting on the review/u);
+    expect(notes()[0]).toMatch(/escalation \(decision\): Include SSO\?/u);
+    // A second late report folds into the one note; it starts no turn.
+    await t.tool("steward_report", { phase: "Done", summary: "Finished anyway.", nextAction: "Nothing", actor: "steward" }, t.steward);
+    expect(notes()).toHaveLength(1);
+    expect(notes()[0]).toMatch(/Finished anyway\./u);
+    expect(t.sends).toHaveLength(sends);
+  });
+
+  it("carries a worker's bb stewards escalate from an ended binding and files nothing", async () => {
+    const t = await ended();
+    t.hooks.store.addWorker("thr_w1", t.b.id, "ENG-12: Implement");
+    const out = await t.harness.behavior.runCli(["escalate", "Which API version?", "--context", "v1 is still used.", "--meanwhile", "continue"], { threadId: "thr_w1", projectId: "p1" });
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toMatch(/Not filed: ENG-12 ended \(terminal,/u);
+    expect(t.hooks.store.openEscalations(t.b.id)).toEqual([]);
+    const note = t.hooks.store.peekProjectNotes("p1").find((n) => n.startsWith("late report from ended binding ENG-12 (terminal,"));
+    expect(note).toMatch(/escalation: Which API version\? — v1 is still used\. \(meanwhile: continue\)/u);
+  });
+
+  it("closes a pre-existing question on an ended binding once and reports it once", async () => {
+    const t = await ended();
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: t.b.id, escalationId: null, question: "Why did you skip the delivery lookup?", context: null });
+    expect(t.hooks.store.openQuestions("p1")).toEqual([]);
+    // The production path: the sweep's one-time close, not a test-only hook.
+    await t.hooks.sweep();
+    expect(t.hooks.store.question(q.id)).toMatchObject({ status: "answered", answer: "The binding ended." });
+    const notes = () => t.hooks.store.peekProjectNotes("p1").filter((n) => n.startsWith("late report from ended binding ENG-12 (terminal,"));
+    expect(notes()).toHaveLength(1);
+    expect(notes()[0]).toMatch(/question qst_\S+ \("Why did you skip the delivery lookup\?"\)/u);
+    // Once: a second sweep closes nothing and adds no note.
+    t.hooks.store.clearProjectNotes("p1");
+    await t.hooks.sweep();
+    expect(notes()).toHaveLength(0);
+  });
+
+  it("lists each route-user escalation and question finishEnding closes in the project steward's next digest", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1", origin: { threadId: null, bindingId: b.id, chain: [] } });
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: x.id, question: "Include SSO?", context: null });
+    // A terminal ending whose follow-through ran out: finishEnding runs.
+    t.hooks.store.patch(b.id, { ending: "terminal", endingAt: 0, followThrough: "watch", followThroughUntil: 0 });
+    await t.hooks.sweep();
+    expect(t.hooks.store.find("ENG-12")!.endedAt).not.toBeNull();
+    expect(t.hooks.store.escalation(x.id)).toMatchObject({ status: "resolved", resolution: "The binding ended." });
+    expect(t.hooks.store.question(q.id)).toMatchObject({ status: "answered", answer: "The binding ended." });
+    const note = t.hooks.store.peekProjectNotes("p1").find((n) => n.startsWith("late report from ended binding ENG-12 (terminal,"));
+    expect(note).toMatch(new RegExp(`decision escalation ${x.id}`, "u"));
+    expect(note).toMatch(new RegExp(`question ${q.id}`, "u"));
+  });
+});
+
 describe("the project steward", () => {
   it("is renamed to its project and tagged for thread-briefs when it predates both", async () => {
     const t = await setup();
@@ -13608,6 +13717,25 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     return { ...t, project, steward, key, binding: () => t.hooks.store.find("ENG-12")! };
   }
+
+  it("waits on a requested reviewer: blocked in the sidebar and not decidable by the steward (BB-327)", async () => {
+    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { pullOver: { requestedReviewers: ["arashout"] } });
+    const binding = t.binding();
+    const esc = t.hooks.store.openEscalations(binding.id).find((x) => x.kind === "approval")!;
+    // The escalation waits on the delegate, and no owner item is filed.
+    expect(esc.route).toBe("steward");
+    expect(esc.meanwhile).toContain("arashout");
+    expect(t.hooks.store.openNeeds(binding.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    // The sidebar row reads blocked, not "needs you".
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; stuck: boolean; needsUser: boolean }> };
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, needsUser: false });
+    // The ticket steward cannot resolve the delegate wait into a decline.
+    const refused = await t.tool("steward_update", { binding: "ENG-12", guidance: "no", resolve: esc.id }, t.steward);
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(/waits on the requested reviewer/u);
+    // The escalation is still open.
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
+  });
 
   it("prints the reviewer spawn command from models.reviewer, and errors clearly with none", async () => {
     const t = await setup();

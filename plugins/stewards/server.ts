@@ -103,7 +103,7 @@ import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPE
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -4637,6 +4637,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // no extra GitHub read. Everything else is a row already in hand.
       const decisions = new Map<string, "project" | "user">();
       for (const e of ownPullEntities(observed, gatePulls)) decisions.set(lc(e.key), decideForPull(e.pull?.files ?? null, config.file.bigDecisions));
+      // BB-327: the logins the store remembers as requested reviewers, so a
+      // delegate's APPROVED review still counts after GitHub drops them.
+      const rememberedRequesters = new Map<string, readonly string[]>();
+      const reRequestedDelegates = new Map<string, readonly string[]>();
+      for (const e of ownPullEntities(observed, gatePulls)) {
+        const remembered = store.pullRequesters(b.id, e.url ?? e.key);
+        if (remembered.length > 0) {
+          rememberedRequesters.set(lc(e.key), remembered);
+          if (e.url !== null) rememberedRequesters.set(lc(e.url), remembered);
+        }
+        const reRequested = store.reviewerRequests(b.id, e.url ?? e.key, e.pull?.headSha ?? "");
+        if (reRequested.length > 0) {
+          reRequestedDelegates.set(lc(e.key), reRequested);
+          if (e.url !== null) reRequestedDelegates.set(lc(e.url), reRequested);
+        }
+      }
       const input: AssessmentInput = {
         binding: b,
         observed,
@@ -4644,6 +4660,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         gatePulls,
         decisions,
         projectApprovals: projectApprovalsFor(b),
+        rememberedRequesters,
+        reRequestedDelegates,
         workers,
         escalations: store.openEscalations(b.id),
         needs: store.openNeeds(b.id),
@@ -6421,12 +6439,76 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * is still open. A thread still running (an ending that timed out) is left
      * in the sidebar rather than archived mid-turn.
      */
+    /** BB-325: one line naming an escalation or question an ending closed. */
+    function closedItemLine(x: Escalation): string {
+      return `${x.isQuestion ? "question" : `${x.kind} escalation`} ${x.id} (${JSON.stringify(x.question)})`;
+    }
+
+    /**
+     * BB-325: carry what an ending left, or a late report from a steward whose
+     * binding ended, into the project steward's next digest as one note per
+     * binding. It starts no turn and folds with anything already queued for
+     * the same binding, so several late reports are one line.
+     */
+    function noteEndingReport(b: Pick<Binding, "projectId" | "entityKey" | "endReason" | "endedAt">, text: string): void {
+      if (b.endedAt === null) return;
+      store.noteProjectFolded(b.projectId, `late report from ended binding ${b.entityKey} (${b.endReason ?? "ended"}, ${iso(b.endedAt)}): `, text);
+    }
+
+    /**
+     * BB-325: an ended binding is closed to new writes. The refusal names the
+     * end and the two alternatives, so a project steward does not file a
+     * question on a Done ticket again (BCP-154). Only new writes are refused;
+     * resolving an existing item and reopening still work.
+     */
+    function endedBindingRefusal(b: Binding): string {
+      return `${b.entityKey} ended (${b.endReason ?? "ended"})${b.endedAt === null ? "" : ` on ${iso(b.endedAt)}`}: an ended binding takes no new question, forward, hold or priority change. Ask at project scope by omitting binding, or reopen the entity first so its steward resumes.`;
+    }
+
+    /**
+     * BB-325: the content of a report or escalation that arrived after its
+     * binding ended, carried to the project steward as one note. Nothing is
+     * written to the binding.
+     */
+    function lateReportText(input: { phase: string; summary: string; nextAction: string; actor: string; waitingOn?: string; escalate?: { kind: string; question: string; context?: string; meanwhile: string }; needs?: Array<{ kind: string; what: string }> }): string {
+      const parts = [`${input.phase}: ${input.summary} Next: ${input.nextAction} (${input.actor})`];
+      if (input.waitingOn !== undefined && input.waitingOn !== "") parts.push(`waiting on ${input.waitingOn}`);
+      if (input.escalate !== undefined) parts.push(`escalation (${input.escalate.kind}): ${input.escalate.question}${input.escalate.context === undefined ? "" : ` — ${input.escalate.context}`} (meanwhile: ${input.escalate.meanwhile})`);
+      if ((input.needs ?? []).length > 0) parts.push(`needs: ${input.needs!.map((n) => `${n.kind} ${n.what}`).join("; ")}`);
+      return parts.join("; ");
+    }
+
+    /**
+     * BB-325: close any open question or escalation still attached to an ended
+     * binding (the BCP-154 case, a question filed after its binding ended) and
+     * report it once. The close is mechanical and the resolution is the record,
+     * so the next pass finds nothing open and reports nothing again.
+     */
+    function closeItemsOnEndedBindings(projectId: string): void {
+      const byBinding = new Map<string, { b: Pick<Binding, "projectId" | "entityKey" | "endReason" | "endedAt">; closed: string[] }>();
+      for (const row of store.openOnEndedBindings(projectId)) {
+        let entry = byBinding.get(row.escalation.bindingId);
+        if (entry === undefined) {
+          entry = { b: { projectId, entityKey: row.entityKey, endReason: row.endReason, endedAt: row.endedAt }, closed: [] };
+          byBinding.set(row.escalation.bindingId, entry);
+        }
+        entry.closed.push(closedItemLine(row.escalation));
+        store.resolve(row.escalation.id, "The binding ended.", "plugin", false);
+      }
+      for (const { b, closed } of byBinding.values()) noteEndingReport(b, `closed ${closed.join("; ")}.`);
+    }
+
     async function finishEnding(b: Binding, reason: string): Promise<void> {
       b = store.patch(b.id, { ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
       // Mechanical cleanup, not a decision: the origin binding has ended, so
       // resolve its escalations without queuing a wake it would never read
-      // (BB-60).
-      for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.", "plugin", false);
+      // (BB-60). BB-325: the route-user ones (and questions) are carried into
+      // the project steward's next digest, since nobody else can see them; the
+      // resolution itself is the record, so a later pass finds nothing open.
+      const openBefore = store.openEscalations(b.id);
+      for (const x of openBefore) store.resolve(x.id, "The binding ended.", "plugin", false);
+      const closed = openBefore.filter((x) => x.route === "user" || x.isQuestion).map(closedItemLine);
+      if (closed.length > 0) noteEndingReport(b, `closed ${closed.join("; ")}.`);
       await releaseBehind(b, `ended (${reason})`);
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
@@ -9123,7 +9205,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       lane: string | null;
       marker: { round: number; sha: string; verdict: string } | null;
       decision: { entry: string | null; decide: "project" | "user"; why: string; listing: string; selfWidening: string[] };
-      approval: { kind: "owner-comment" | "owner-review" | "project-marker"; sha: string | null; at: string | null } | null;
+      approval: { kind: "owner-comment" | "owner-review" | "delegate-review" | "project-marker"; sha: string | null; at: string | null; by?: string | null } | null;
       checks: { state: string | null; green: boolean };
       openItems: string[];
       /** Whether the reviewer's marker escalated the pull request to the owner (BB-192). */
@@ -9151,6 +9233,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const recorded = new Set(projectApprovalsFor(b).filter((r) => r.commentId !== null).map((r) => r.commentId!));
         const marker = latestProjectApprovalMarker(pull.comments, recorded);
         if (marker !== null) return { kind: "project-marker", sha: marker.marker.sha === "" ? null : marker.marker.sha, at: marker.comment.createdAt };
+      }
+      if (gate.delegateApproved) {
+        const at = gate.delegateApprovalAt;
+        const review = at === null ? undefined : (pull.pull?.reviews ?? []).find((r) => (r.submittedAt ?? "") === at && r.author.toLowerCase() === (gate.delegateApprovalBy ?? "").toLowerCase() && r.state.toLowerCase() === "approved");
+        return { kind: "delegate-review", sha: review?.commit ?? null, at, by: gate.delegateApprovalBy };
       }
       if (gate.ownerApproved) {
         const at = gate.ownerApprovalAt;
@@ -9208,7 +9295,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const marker = r.marker === null ? "none" : `round ${r.marker.round} at ${shortSha(r.marker.sha)} (${r.marker.verdict})`;
       const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}: ${r.decision.why})` : `"${r.decision.entry}" (${r.decision.decide})`;
       const listing = r.decision.listing.split("\n").map((l) => `  ${l}`).join("\n");
-      const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}`;
+      const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}${r.approval.by === null || r.approval.by === undefined ? "" : ` by ${r.approval.by}`}`;
       // The reviewer's owner call is printed beside the decide-list winner: the
       // decide list may still name a `project` entry, but the escalation binds
       // the gate to the owner's approval (BB-192).
@@ -9231,8 +9318,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function mergeSummary(gate: ReturnType<typeof prGate>): string {
       const lane = gate.lane ?? "no-review";
       const approved = gate.marker?.sha ?? gate.headSha;
-      const by = gate.projectApproved ? ", approved by the project steward" : gate.ownerApproved ? ", approved by the owner" : "";
-      const escalation = gate.reason === "product" ? ", the owner acked the product" : gate.escalated ? ", escalated by the reviewer to the owner" : "";
+      const by = gate.projectApproved
+        ? ", approved by the project steward"
+        : gate.delegateApproved
+          ? `, approved by the requested reviewer ${gate.delegateApprovalBy ?? ""}`.trimEnd()
+          : gate.ownerApproved
+            ? ", approved by the owner"
+            : "";
+      // BB-327: a delegate's approval is not the owner's, so the product and
+      // escalation clauses only credit the owner when the owner approved.
+      const escalation = gate.reason === "product"
+        ? gate.ownerApproved ? ", the owner acked the product" : ""
+        : gate.escalated && gate.ownerApproved ? ", escalated by the reviewer to the owner" : "";
       return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}${escalation}.`;
     }
 
@@ -9673,7 +9770,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
-              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
               requeueAt: b.requeueAt,
@@ -9726,6 +9823,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const { questions, withUser, needs } = needsYou(projectId, open, projectQuestions);
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
+          ...store.openEscalations(b.id).filter(isDelegateWait).map((x) => ({ b, why: `Waiting on the requested reviewer: ${x.meanwhile}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = store.endedSince(projectId, now() - ENDED_ON_BOARD_MS, 30);
@@ -9775,7 +9873,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
-              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
               // The newest deployment watch, whatever its state; `merged` reads as deploying.
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
@@ -11010,6 +11108,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // normalised here and the stored value is always `user`.
           const actor: (typeof ACTORS)[number] = input.actor === "me" ? "user" : input.actor;
           if (input.actor === "me") bb.log.info(`stewards: steward_report actor "me" is renamed to "user"; recording this report as user (thread ${threadId}).`);
+          const ended = store.byThread(threadId);
+          if (ended !== null && ended.endedAt !== null) {
+            // BB-325: the binding ended while this turn was running, or the
+            // plugin's own stop turn reported after it. Write nothing to the
+            // binding; carry the report to the project steward's next digest.
+            noteEndingReport(ended, lateReportText(input));
+            return `Reported after ${ended.entityKey} ended (${ended.endReason ?? "ended"}, ${iso(ended.endedAt)}): nothing was written to the binding, and the project steward's next wake carries it. End the turn now.`;
+          }
           let b = ownBinding(threadId);
           // Validate the input that does not depend on which pull request the
           // binding is on before a replacement moves it: a wrap-up report that
@@ -11762,6 +11868,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             return `${written.join("; ")}.`;
           }
           if (input.ask !== undefined && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
+          // BB-325: an ended binding takes no new question, forward, hold or
+          // priority change. The checks below still run for everything else:
+          // resolving an existing escalation, question or assumption,
+          // confirming, a lesson, or reopening keeps working.
+          if (target.endedAt !== null && (input.ask !== undefined || input.forward !== undefined || input.priority !== undefined || input.hold !== undefined)) {
+            return toolError(new Error(endedBindingRefusal(target)));
+          }
           const self = target.threadId === threadId;
 
           const forwarding = input.forward === undefined ? null : store.escalation(input.forward);
@@ -11873,6 +11986,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
               resolving = store.escalation(resolve);
               if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
+              // BB-327: the delegate wait is the plugin's, not the steward's to
+              // decide; it closes when the delegate approves or the request is
+              // withdrawn.
+              if (isDelegateWait(resolving)) return toolError(new Error(`The approval of ${resolving.question.replace(/^Approve\s+/u, "")} waits on the requested reviewer, not you (${resolving.meanwhile}). It closes when they approve, or when the request is withdrawn; do not resolve it.`));
               // Criterion 2: the project steward's approving words are the
               // approval; approve: true is no longer needed as well. Only the
               // approver the gate names may do it, as with approve: true: the
@@ -12257,7 +12374,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-296: the `stuck` flag shares the same grouped escalations, so the
       // sidebar and board do not re-query them per binding.
       const stuck = new Set<string>();
-      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck")) stuck.add(bindingId);
+      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck" || isDelegateWait(x))) stuck.add(bindingId);
       return { questions: questionViews, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds, needsUser, stuck };
     }
 
@@ -12538,6 +12655,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await reconcileLessons(config);
       applyLessonTransitions(config);
       applyRationaleClustering(config);
+      // BB-325: close any open item left on an ended binding, once.
+      closeItemsOnEndedBindings(config.projectId);
       for (const b of store.open(config.projectId)) {
         if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
         const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -13638,6 +13757,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const context = input.options.context === undefined || input.options.context.trim() === "" ? null : input.options.context.trim();
               if (context !== null && context.length > 3000) throw new PluginCliError("context is at most 3000 characters.", { code: "context_too_long" });
               const meanwhile = input.options.meanwhile === "continue" ? "continue" : "wait";
+              if (b.endedAt !== null) {
+                // BB-325: the worker's binding ended while this turn was
+                // running. Write nothing to it; carry the escalation to the
+                // project steward's next digest.
+                noteEndingReport(b, `escalation: ${question}${context === null ? "" : ` — ${context}`} (meanwhile: ${meanwhile})`);
+                return { exitCode: 0, stdout: `Not filed: ${b.entityKey} ended (${b.endReason ?? "ended"}, ${iso(b.endedAt)}); the project steward's next wake carries it.` };
+              }
               const x = store.escalate({
                 bindingId: b.id,
                 kind: "decision",
