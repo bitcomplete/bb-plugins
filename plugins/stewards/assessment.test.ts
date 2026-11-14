@@ -146,10 +146,12 @@ describe("the shadow assessment: the worker state (BB-266)", () => {
 });
 
 describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
-  // BB-322: the approvals.gate divergence is retired. approvals.ts now reads
-  // the stored assessment, so there is no second gate to compare against and
-  // `compare` records no gate row.
-  it("no longer records an approvals.gate divergence (BB-322 retires the surface)", () => {
+  // DIVERGENCE: approvals.ts builds the gate with `prGate(pull,
+  // productGateOptions(b, pull))`, omitting `decision` and the recorded project
+  // approvals; the full gate (server.ts, wake.ts, `bb stewards gate`) passes
+  // both. On a project entry whose recorded `bb-approval` is on the pull
+  // request the full gate is met and the approvals.ts path still asks the owner.
+  it("records the approvals.gate divergence: the full gate is met, the approvals.ts gate asks the owner", () => {
     const entity = pull({ comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: head, ...green });
     const i = input({
       binding: binding({ kind: "review" }),
@@ -162,7 +164,10 @@ describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
     });
     const a = assess(i);
     expect(a.gate.pulls[0]).toMatchObject({ met: true, decision: "project", projectApproved: true, lane: "owner-reviewed" });
-    expect(compare(i, a).find((x) => x.surface === "approvals.gate")).toBeUndefined();
+    const d = compare(i, a);
+    expect(d.find((x) => x.surface === "approvals.gate")).toMatchObject({ old: "owner approval needed", new: "met" });
+    // The inputs are the ids and shas, never a comment body.
+    expect(d.find((x) => x.surface === "approvals.gate")!.inputs).toEqual({ binding: "b1", pull: "acme/web#7", headSha: head, decision: "project", recordedApprovals: 1 });
   });
 
   it("agrees when the recorded project approval is absent from the gate inputs", () => {
@@ -225,7 +230,8 @@ describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
     });
     const a = assess(i);
     expect(a.gate.pulls[0].met).toBe(true);
-    expect(compare(i, a).find((x) => x.surface === "approvals.pageRefusal")).toBeUndefined();
+    const d = compare(i, a);
+    expect(d.find((x) => x.surface === "approvals.pageRefusal")).toMatchObject({ old: "the pull request has not been observed yet", new: "met" });
   });
 });
 

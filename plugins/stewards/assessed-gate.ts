@@ -7,7 +7,7 @@
 // stores it rather than falling back to a surface's own predicate. A missing
 // or stale assessment therefore never counts as met (fail closed).
 import { createHash } from "node:crypto";
-import type { DecideMark } from "./decisions.js";
+import { decideForPull, type BigDecision, type DecideMark } from "./decisions.js";
 import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } from "./gate.js";
 import { productGateOptions } from "./reconcile.js";
 import type { EntitySnapshot } from "./source-contract.js";
@@ -102,13 +102,14 @@ export function currentStoredGate(gate: unknown, pull: EntitySnapshot): StoredGa
  * and storing it when there is none for the pull's current head sha. This is
  * the single read/refresh site every merge-gate surface goes through; the
  * decide-list mark is the one the last assessment recorded (a head that moved
- * keeps its lane) and `user` (the owner's, fail closed) when the pull request
- * was never assessed.
+ * keeps its lane) and, when the pull request was never assessed, the mark its
+ * snapshot's changed files give under the binding's decide list (`bigDecisions`,
+ * empty means the owner's, fail closed).
  */
-export function assessedGate(store: AssessmentStore, binding: Binding, pull: EntitySnapshot, at: number): PrGate {
+export function assessedGate(store: AssessmentStore, binding: Binding, pull: EntitySnapshot, at: number, bigDecisions: readonly BigDecision[] = []): PrGate {
   const row = store.assessment(binding.id);
   const known = storedPullGate(row?.gate, pull);
-  const mark: DecideMark = known?.decision ?? "user";
+  const mark: DecideMark = known?.decision ?? decideForPull(pull.pull?.files ?? null, bigDecisions);
   const projectApprovals = store.projectApprovals(binding.id);
   const key = gateInputKey(binding, pull, mark, projectApprovals);
   // Reuse the stored answer only when it is for this pull request's current

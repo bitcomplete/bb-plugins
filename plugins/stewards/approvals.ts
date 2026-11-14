@@ -241,7 +241,7 @@ export async function approveOwnerReviewedPull(ctx: ApprovalsContext, b: Binding
   // A reviewer's owner call in the marker is binding: the project steward does
   // not decide it, whatever entry the decide list matched, and never posts a
   // `bb-approval` on it (BB-192). The product reason (BB-207) binds it the same way.
-  const approvalGate = pull === null ? null : assessedGate(ctx.store, b, pull, ctx.now());
+  const approvalGate = pull === null ? null : assessedGate(ctx.store, b, pull, ctx.now(), decisions);
   if (approvalGate !== null && approvalGate.escalated) return { ok: false, error: approvalGate.reason === "product" ? PRODUCT_APPROVAL_REFUSAL : ESCALATED_APPROVAL_REFUSAL };
   const files = pull === null ? null : await ctx.pullChangedFiles(pull);
   const decision = decideFor(files, fields.entry, decisions);
@@ -373,7 +373,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
   // site reads or refreshes it). The decide-list placement is already in it,
   // so this no longer builds a second gate from the changed files. The files
   // are still read for the listing the approval item carries (BB-135).
-  let g = gateFor?.(pull) ?? assessedGate(ctx.store, b, pull, ctx.now());
+  let g = gateFor?.(pull) ?? assessedGate(ctx.store, b, pull, ctx.now(), decisions);
   // The decide-list listing is fetched once, with the changed files, and
   // passed to whichever surface asks for the approval (BB-135).
   let listing: string | null = null;

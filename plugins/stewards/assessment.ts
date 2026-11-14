@@ -10,10 +10,10 @@
 // over the same rows and returns every place the old answer and the assessment
 // disagree, so the divergence log can be read for several days before any
 // consumer reads the assessment.
-import { assessedPullGate, gateInputKey } from "./assessed-gate.js";
+import { assessedPullGate, gateInputKey, pullGate } from "./assessed-gate.js";
 import type { PrGate, ProjectApprovalRecord } from "./gate.js";
 import { gateState } from "./ready-gate.js";
-import { anyWorkerInFlight, idleInActiveStage, observedStall, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
+import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
 import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import type { Playbook } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
@@ -124,6 +124,17 @@ const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
 const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
   (e.key !== "" && own.has(lc(e.key))) || (e.url !== null && e.url !== "" && own.has(lc(e.url)));
 
+/**
+ * Whether the project steward forwarded this pull request's approval escalation
+ * to the owner (BB-192): an open `approval` escalation for the pull, routed to
+ * the user with `resolutionKind: "approve-decline"`. A `project`-entry pull is
+ * the owner's from the forward on (BB-322 blocker 1).
+ */
+function forwardedToOwner(escalations: readonly Escalation[], e: EntitySnapshot): boolean {
+  const url = lc(e.url ?? e.key);
+  return escalations.some((x) => x.status === "open" && x.kind === "approval" && x.route === "user" && x.resolutionKind === "approve-decline" && lc(x.url) === url);
+}
+
 /** Every own pull request the binding's workers opened, the binding's own entity first. */
 export function ownPullEntities(observed: Observed, own: ReadonlySet<string>): EntitySnapshot[] {
   return [observed.entity, ...observed.pulls].filter((e) => e.pull !== null && isOwn(e, own));
@@ -144,9 +155,17 @@ export function assess(input: AssessmentInput): Assessment {
   const pulls: AssessedGate[] = [];
   const gatePulls = input.gatePulls ?? ownPulls;
   for (const e of ownPullEntities(observed, gatePulls)) {
-    const mark = decisions.get(lc(e.key)) ?? "user";
+    // BB-322 blocker 1: a `project` entry the project steward forwarded to the
+    // owner (BB-192) is the owner's from the moment of the forward, not only
+    // after they approve. The forward is an open `approval` escalation routed
+    // to the user with the pull's url and `resolutionKind: "approve-decline"`
+    // (a normal owner-lane approval is the same shape but the mark is already
+    // `user`). Without this the gate says `project`, the page refuses the
+    // owner's approval and the reconcile reroutes the escalation back.
+    const decideMark = decisions.get(lc(e.key)) ?? "user";
+    const mark: DecideMark = decideMark === "project" && forwardedToOwner(escalations, e) ? "user" : decideMark;
     const g = assessedPullGate(binding, e, mark, projectApprovals);
-    pulls.push({ ...g, pull: e.key, met: g.gateMet, key: gateInputKey(binding, e, mark, projectApprovals) });
+    pulls.push({ ...g, pull: e.key, met: g.gateMet, key: gateInputKey(binding, e, g.decision, projectApprovals) });
   }
   const idleBinding: IdleBinding = {
     stage: binding.stage,
@@ -197,6 +216,8 @@ export type Divergence = {
   inputs: Record<string, string | number | boolean | null>;
 };
 
+const verdict = (met: boolean, missing: string | null): string => (met ? "met" : (missing ?? "unmet"));
+
 /**
  * Every place the predicates the assessment will retire answer differently
  * from it, over the same rows. The surfaces:
@@ -204,15 +225,19 @@ export type Divergence = {
  * - `workerInFlight`, `runningWorkerReason`, `idleInActiveStage`,
  *   `hasLiveWakeSource`: a parked `finished` worker is in flight to the first
  *   and not mid-turn, idle and not a live source to the others (BB-292 #1).
+ * - `approvals.gate`: the old surface gate, built without the decide mark or
+ *   the recorded project approvals, against the assessment (BB-292 #2).
+ * - `approvals.pageRefusal`: the page action's refusal on a met gate (BB-292 #3).
  * - `noWakeSource`: the report-time flag against the stall recomputed from
  *   the observable rows.
  *
- * The `approvals.gate` and `approvals.pageRefusal` comparisons were retired
- * by BB-322: `approvals.ts` now reads the stored assessment, so there is no
- * second gate to compare against and the log records no gate row.
+ * BB-322 keeps the gate comparison as the soak's evidence that the consumer's
+ * answer still matches the predicate it retired; a new `approvals.gate` row is
+ * a real difference, not a fixture. It is read through `pullGate`, the same
+ * single `prGate` site, so no second call site appears.
  */
 export function compare(input: AssessmentInput, assessment: Assessment): Divergence[] {
-  const { binding, workers } = input;
+  const { binding, observed, ownPulls, projectApprovals, workers } = input;
   const out: Divergence[] = [];
   const add = (surface: string, old: string, next: string, inputs: Divergence["inputs"]): void => {
     if (old !== next) out.push({ bindingId: binding.id, surface, old, new: next, inputs });
@@ -228,7 +253,26 @@ export function compare(input: AssessmentInput, assessment: Assessment): Diverge
     if (!assessment.liveness.live) add("hasLiveWakeSource", "no-live-source", "parked", workerInputs);
   }
 
-  // (2) The report-time no-wake-source flag against the stall recomputed from
+  // (2) The gate inputs, and (3) the page's refusal text.
+  for (const e of ownPullEntities(observed, ownPulls)) {
+    const assessed = assessment.gate.pulls.find((p) => lc(p.pull) === lc(e.key));
+    if (assessed === undefined) continue;
+    const oldGate = pullGate(e, productGateOptions(binding, e));
+    const gateInputs: Divergence["inputs"] = {
+      binding: binding.id,
+      pull: e.key,
+      headSha: e.pull?.headSha ?? null,
+      decision: assessed.decision,
+      recordedApprovals: projectApprovals.length,
+    };
+    if (oldGate.gateMet !== assessed.met) add("approvals.gate", verdict(oldGate.gateMet, oldGate.missing), verdict(assessed.met, assessed.missing), gateInputs);
+    // The page acts only while `needsOwnerApproval` is true; on a met gate it
+    // falls to the `??` fallback, whose words this records.
+    const pageRefusal = oldGate.needsOwnerApproval ? null : (oldGate.missing ?? "the pull request has not been observed yet");
+    if (pageRefusal !== null && assessed.met) add("approvals.pageRefusal", pageRefusal, "met", gateInputs);
+  }
+
+  // (4) The report-time no-wake-source flag against the stall recomputed from
   // the rows. `hasLiveWakeSource`, `idleInActiveStage` and `stuckDue` are the
   // assessment's own derivation, so they are compared by construction; only
   // the flag and the observed stall can disagree.

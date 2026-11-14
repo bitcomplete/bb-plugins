@@ -4584,6 +4584,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // before a worker reports it, and the old surfaces computed its gate
       // anyway; the assessment must hold it so they read it here.
       const gatePulls = new Set(ownPulls);
+      // BB-322 blocker 2: a `pr`/`review` binding's own entity is a pull
+      // request, not a linked one, so `pullBelongsToTicket` never matches it.
+      // Gate it too, or the assessment holds no entry for it and the approval
+      // sync falls back to the owner's mark, changing the routing.
+      if (observed.entity.pull !== null) {
+        gatePulls.add(lc(observed.entity.key));
+        if (observed.entity.url !== null) gatePulls.add(lc(observed.entity.url));
+      }
       for (const e of [observed.entity, ...observed.pulls]) {
         if (e.pull === null || !pullBelongsToTicket(b, e, ownPulls)) continue;
         gatePulls.add(lc(e.key));
@@ -6923,7 +6931,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A reviewer's owner call makes the approval the owner's, whatever
             // the decide list matched, so the wake says so and the project
             // steward forwards rather than approves (BB-192).
-            escalated: assessedGate(store, r.from, pull, now()).escalated,
+            escalated: assessedGate(store, r.from, pull, now(), config.file.bigDecisions).escalated,
           };
         }),
       );
@@ -9133,7 +9141,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The verdict is `prGate` with the project's approvals, exactly as the
       // page's Merge item and the wake compute it; the decide-list entry above
       // is what the plugin asks the owner or project steward for (BB-133).
-      const gate = assessedGate(store, b, pull, now());
+      const gate = assessedGate(store, b, pull, now(), decisions);
       return {
         ref: `${ref.repo}#${ref.number}`,
         binding: b.entityKey,
@@ -11281,7 +11289,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
-              const gate = pull === undefined ? null : assessedGate(store, b, pull, now());
+              const gate = pull === undefined ? null : assessedGate(store, b, pull, now(), config?.file.bigDecisions ?? []);
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
                 refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
