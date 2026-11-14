@@ -127,7 +127,7 @@ import {
   type WorkflowRun,
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
-import { evaluateCarries, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
+import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
@@ -4903,7 +4903,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         let isDefaultBase: ((prRepo: string, base: string | null) => boolean) | undefined;
         if (wantsLive) {
           const branches = new Map<string, string | null>();
-          for (const p of mergedPulls(observed)) {
+          // BB-337: a watch whose pull has left the current snapshot keeps its
+          // base in the last snapshot, so the default-branch check reads that
+          // repo too. The read is once per repo, as before.
+          for (const p of [...mergedPulls(observed), ...(prev === null ? [] : mergedPulls(prev))]) {
             if (branches.has(p.unit)) continue;
             branches.set(p.unit, await github.defaultBranch(p.unit).catch(() => null));
           }
@@ -4969,17 +4972,46 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           b = store.note(b.id, [line, ...evaluated.notes].join("; "), !evaluated.wake);
           if (evaluated.wake) bb.log.info(`stewards: deployment ${applied.deployment.id} (${state}) on ${target.repo} ${target.environment} concerns ${applied.changed.join(", ")} (read)`);
         }
-        // BB-132/BB-204: a watch left `deploying` by an earlier pass is
-        // re-evaluated, so a transient read failure is retried, a playbook
-        // that adds a rule settles a no-rule watch, and a re-resolved merge
-        // commit is picked up. A watch the read just evaluated is skipped, and
-        // a missing rule already noted does not wake again.
+        // BB-132/BB-204/BB-337: a watch left `merged` or `deploying` by an
+        // earlier pass is re-evaluated, so a transient read failure is
+        // retried, a playbook that adds a rule settles a no-rule watch, a
+        // re-resolved merge commit is picked up, and a rule that became
+        // `live-at-merge` settles a watch with no deployment to compare. The
+        // rule is matched from the watch's own stored `prRepo` and `files`,
+        // so a watch whose pull is no longer in the snapshot is re-matched
+        // too. A watch the read just evaluated is skipped, a free-text rule
+        // stays with the steward, a terminal watch is never touched, and a
+        // missing rule already noted does not wake again.
         const reader = carriesReader();
+        const liveSettled: string[] = [];
         for (const [id, watch] of Object.entries(deployments)) {
-          if (watch.state !== "deploying") continue;
+          if (watch.state !== "merged" && watch.state !== "deploying") continue;
           if (evaluatedIds.has(id)) continue;
           const target = deployTargets.find((t) => (watch.target === "" ? matchesTarget(t, watch.repo, watch.environment) : targetKeyOf(t) === watch.target));
           if (target === undefined || typeof target.carries === "string") continue;
+          // BB-337: a `merged` watch is re-matched against the rule from its
+          // stored `prRepo` and `files`. A `live-at-merge` rule settles it
+          // `deployed` with the live note and no deadline, without a read,
+          // exactly as `recordMerged` does for a pull still in the snapshot.
+          // A non-live rule has no final deployment to compare here, so the
+          // watch is left as it was (the deployment read below moves it to
+          // `deploying` when one settles). A merge whose known base is not the
+          // default is stacked and stays awaiting, as `recordMerged` leaves it.
+          if (watch.state === "merged") {
+            const matched = matchCarriesRule(target.carries, watch.prRepo, watch.files);
+            const live = matched === null ? null : liveAtMergeVerdict(matched);
+            if (live === null) continue;
+            const knownPull = mergedPulls(observed).find((p) => lc(p.key) === lc(watch.key)) ?? (prev === null ? undefined : mergedPulls(prev).find((p) => lc(p.key) === lc(watch.key)));
+            // BB-260: a base the read could not name is not treated as default.
+            // A pull in neither the snapshot nor the last one leaves the watch
+            // awaiting rather than settling it on an unknown base.
+            if (knownPull === undefined || isDefaultBase === undefined || !isDefaultBase(watch.prRepo, knownPull.pull?.base ?? null)) continue;
+            deployments = { ...deployments, [id]: { ...watch, state: "deployed", at: now(), deadlineAt: null, note: live.note } };
+            b = store.patch(b.id, { deployments });
+            liveSettled.push(`${watch.key}${target.name === undefined ? "" : ` (${target.name})`} — ${live.note}`);
+            bb.log.info(`stewards: carries deployed for ${watch.key}: ${live.note}`);
+            continue;
+          }
           const verdict = await evaluateCarries(target, { merge: watch.mergeSha, prRepo: watch.prRepo, files: watch.files, ref: watch.ref }, reader);
           if (verdict === null) continue;
           const label = `${watch.key}${target.name === undefined ? "" : ` (${target.name})`}`;
@@ -4997,6 +5029,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             b = store.note(b.id, `Carries not decided for ${label}: ${verdict.note}`, false);
           }
         }
+        if (liveSettled.length > 0) deploymentChanges.push({ text: `Deployed at merge: ${liveSettled.join("; ")}`, actionable: true });
         const late = timeoutsDue(deployments, now());
         if (late.length > 0) {
           const labels = late.map((id) => (deployments[id] === undefined ? id : `${deployments[id]!.key}${deployments[id]!.target === "" ? "" : ` (${deployments[id]!.target})`}`));
