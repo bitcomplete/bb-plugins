@@ -459,4 +459,28 @@ describe("the typed-wait divergence store (BB-333)", () => {
     expect(s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 5_000)).toBe(false);
     expect(s.divergences({ bindingId: "b2" })).toHaveLength(0);
   });
+
+  it("keeps the two directions' rows apart and treats a flip as a stop plus a start", () => {
+    const { s } = store();
+    // start A, stop A, start B, ongoing B.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000)).toBe(true);
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 2_000)).toBe(false);
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 3_000)).toBe(true);
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 4_000)).toBe(false);
+    let rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(2);
+    const a = rows.find((r) => r.new === "no-wake-source")!;
+    const b = rows.find((r) => r.old === "no-wake-source")!;
+    // The stop touched A, and ongoing B did not touch A again.
+    expect(a.inputs).toMatchObject({ transition: "stop" });
+    expect(a.lastSeenAt).toBe(2_000);
+    expect(b.inputs).toMatchObject({ transition: "ongoing" });
+    expect(b.lastSeenAt).toBe(4_000);
+    // A flip B → A is a stop on B plus a start on A (bumping A's count).
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 5_000)).toBe(true);
+    rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.new === "no-wake-source")!.count).toBe(2);
+    expect(rows.find((r) => r.old === "no-wake-source")!.inputs).toMatchObject({ transition: "stop" });
+  });
 });

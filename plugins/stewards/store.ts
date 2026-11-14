@@ -1987,9 +1987,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   );
   // Keep the open row's `last_seen_at` fresh while the disagreement stands, so
   // the age prune cannot drop it and leave the state table saying "disagree"
-  // with no row to show for it.
-  const touchWaitDivergenceStmt = lazy<[number, string, string], unknown>(
-    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource'",
+  // with no row to show for it. Scoped to the state table's pair, so a second
+  // (other-direction) row for the same binding is not touched.
+  const touchWaitDivergenceStmt = lazy<[number, string, string, string, string], unknown>(
+    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
   );
 
   // BB-251: assumptions, prepared lazily for the same reason: a store from
@@ -3673,29 +3674,37 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const reported = fields.reported ? 1 : 0;
       const disagree = derived !== reported;
       const prev = getWaitDivergenceStateStmt().get(fields.bindingId);
-      const prevDisagree = prev === undefined ? null : Number(prev.derived) !== Number(prev.reported);
-      if (prevDisagree === disagree) {
+      const prevDerived = prev === undefined ? null : Number(prev.derived);
+      const prevReported = prev === undefined ? null : Number(prev.reported);
+      const prevDisagree = prevDerived === null ? null : prevDerived !== prevReported;
+      const old = (v: number): string => (v === 1 ? "no-wake-source" : "source-or-no-wait");
+      const note = (transition: string): string => JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition });
+      const touch = (transition: string, d: number, r: number): void => {
+        touchWaitDivergenceStmt().run(at, note(transition), fields.bindingId, old(r), old(d));
+      };
+      const pairChanged = prevDerived !== derived || prevReported !== reported;
+      if (!pairChanged) {
         // No transition. An ongoing disagreement keeps its open row fresh so
         // the age prune cannot drop it; an agreement writes nothing.
-        if (disagree) touchWaitDivergenceStmt().run(at, JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: "ongoing" }), fields.bindingId);
+        if (disagree) touch("ongoing", prevDerived!, prevReported!);
         return false;
       }
+      // The pair changed. If the previous pair disagreed, that disagreement
+      // stopped: note it on the old row, never as a row of its own (its `old`
+      // would equal its `new`). A change from one disagreement to the other is
+      // that stop plus a new start.
+      if (prevDisagree === true) touch("stop", prevDerived!, prevReported!);
       upsertWaitDivergenceStateStmt().run(fields.bindingId, derived, reported, at);
-      if (!disagree) {
-        // The disagreement stopped: note it on the open row, never as a row of
-        // its own (its `old` would equal its `new`).
-        if (prevDisagree === true) touchWaitDivergenceStmt().run(at, JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: "stop" }), fields.bindingId);
-        return false;
-      }
-      // A start: the first observation, or a move from agreement to
-      // disagreement.
+      if (!disagree) return false;
+      // A start: the first observation of a disagreement, a move from
+      // agreement to disagreement, or a flip to the other direction.
       insertDivergenceStmt().run(
         newId("dvg"),
         fields.bindingId,
         "noWakeSource",
-        reported ? "no-wake-source" : "source-or-no-wait",
-        derived ? "no-wake-source" : "source-or-no-wait",
-        JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: "start" }),
+        old(reported),
+        old(derived),
+        note("start"),
         at,
         at,
       );
