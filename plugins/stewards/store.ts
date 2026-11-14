@@ -769,7 +769,7 @@ export const BACKLOG_SNAPSHOT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN bac
 // wait, and a pre-migration build never reads the column. Appended after every
 // group already shipped, including BB-334's backlog columns and BB-328's
 // check-findings table, so no recorded index moves. PR 1 stores and renders
-// it; nothing derives from it yet.
+// it; PR 2 derives from it in shadow.
 export const TYPED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait TEXT`];
 
 // BB-335: the reasons a declining branch records, one JSON object keyed by the
@@ -779,7 +779,20 @@ export const TYPED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait TEXT
 // including BB-333's typed wait column, so no recorded index moves.
 export const NON_ACTION_MIGRATIONS = [`ALTER TABLE assessments ADD COLUMN non_actions TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS];
+// BB-333 PR 2: the last derived-vs-flag state per binding, so the
+// `noWakeSource` divergence row is written only when the disagreement starts.
+// A new table appended after BB-335's non-action column, so no recorded index
+// moves.
+export const WAIT_DIVERGENCE_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS wait_divergence_state (
+     binding_id TEXT PRIMARY KEY,
+     derived INTEGER NOT NULL,
+     reported INTEGER NOT NULL,
+     at INTEGER NOT NULL
+   )`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1962,6 +1975,22 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const pruneDivergencesByAgeStmt = lazy<[number], unknown>("DELETE FROM assessment_divergences WHERE last_seen_at < ?");
   const pruneDivergencesByCountStmt = lazy<[number], unknown>(
     "DELETE FROM assessment_divergences WHERE id NOT IN (SELECT id FROM assessment_divergences ORDER BY last_seen_at DESC, id LIMIT ?)",
+  );
+  // BB-333: the last derived-vs-flag state per binding, so a typed-wait
+  // divergence row is written only when the disagreement starts. The
+  // `(binding_id, surface, old, new)` unique constraint caps the rows at two
+  // per binding, so no separate per-binding prune is needed. Prepared lazily: a
+  // store from before this group has no table yet.
+  const getWaitDivergenceStateStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ?");
+  const upsertWaitDivergenceStateStmt = lazy<[string, number, number, number], unknown>(
+    "INSERT INTO wait_divergence_state (binding_id, derived, reported, at) VALUES (?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET derived = excluded.derived, reported = excluded.reported, at = excluded.at",
+  );
+  // Keep the open row's `last_seen_at` fresh while the disagreement stands, so
+  // the age prune cannot drop it and leave the state table saying "disagree"
+  // with no row to show for it. Scoped to the state table's pair, so a second
+  // (other-direction) row for the same binding is not touched.
+  const touchWaitDivergenceStmt = lazy<[number, string, string, string, string], unknown>(
+    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
   );
 
   // BB-251: assumptions, prepared lazily for the same reason: a store from
@@ -3632,6 +3661,56 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return removed;
     },
     /**
+     * Record a typed-wait divergence from the report-time `noWakeSource` flag
+     * (BB-333). A `noWakeSource` row is written only when the disagreement
+     * starts; while it stands the open row's `last_seen_at` is refreshed so the
+     * age prune cannot drop it, and when it stops the row is noted and the
+     * state cleared without adding a row that would read as a divergence. The
+     * `(binding_id, surface, old, new)` unique constraint caps the rows at two
+     * per binding. Returns whether a divergence row was written.
+     */
+    recordWaitDivergence(fields: { bindingId: string; derived: boolean; reported: boolean; waitKind: string | null; waitLive: boolean; inputs: Record<string, unknown> }, at = now()): boolean {
+      const derived = fields.derived ? 1 : 0;
+      const reported = fields.reported ? 1 : 0;
+      const disagree = derived !== reported;
+      const prev = getWaitDivergenceStateStmt().get(fields.bindingId);
+      const prevDerived = prev === undefined ? null : Number(prev.derived);
+      const prevReported = prev === undefined ? null : Number(prev.reported);
+      const prevDisagree = prevDerived === null ? null : prevDerived !== prevReported;
+      const old = (v: number): string => (v === 1 ? "no-wake-source" : "source-or-no-wait");
+      const note = (transition: string): string => JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition });
+      const touch = (transition: string, d: number, r: number): void => {
+        touchWaitDivergenceStmt().run(at, note(transition), fields.bindingId, old(r), old(d));
+      };
+      const pairChanged = prevDerived !== derived || prevReported !== reported;
+      if (!pairChanged) {
+        // No transition. An ongoing disagreement keeps its open row fresh so
+        // the age prune cannot drop it; an agreement writes nothing.
+        if (disagree) touch("ongoing", prevDerived!, prevReported!);
+        return false;
+      }
+      // The pair changed. If the previous pair disagreed, that disagreement
+      // stopped: note it on the old row, never as a row of its own (its `old`
+      // would equal its `new`). A change from one disagreement to the other is
+      // that stop plus a new start.
+      if (prevDisagree === true) touch("stop", prevDerived!, prevReported!);
+      upsertWaitDivergenceStateStmt().run(fields.bindingId, derived, reported, at);
+      if (!disagree) return false;
+      // A start: the first observation of a disagreement, a move from
+      // agreement to disagreement, or a flip to the other direction.
+      insertDivergenceStmt().run(
+        newId("dvg"),
+        fields.bindingId,
+        "noWakeSource",
+        old(reported),
+        old(derived),
+        note("start"),
+        at,
+        at,
+      );
+      return true;
+    },
+    /**
      * Forget a deleted project: its bindings and everything keyed by them
      * (escalations, workers, needs, approvals, fingerprints, queued answers),
      * its lessons, guidance citations and project-steward row.
@@ -3644,7 +3723,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         const ids = db.prepare<[string], { id: string }>("SELECT id FROM bindings WHERE project_id = ?").all(projectId).map((r) => r.id);
         const byBinding = "SELECT id FROM bindings WHERE project_id = ?";
         db.prepare(`DELETE FROM secret_requesters WHERE thread_id IN (SELECT thread_id FROM workers WHERE binding_id IN (${byBinding}))`).run(projectId);
-        for (const table of ["escalations", "workers", "needs", "project_approvals", "assessments", "assessment_divergences"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
+        for (const table of ["escalations", "workers", "needs", "project_approvals", "assessments", "assessment_divergences", "wait_divergence_state"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
         db.prepare(`DELETE FROM pending_deliveries WHERE origin_binding_id IN (${byBinding})`).run(projectId);
         for (const table of ["ops_fingerprints", "deps_decisions", "lessons", "guidance_citations", "assumptions", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
         options.onProjectChange?.(projectId, ["purged"]);

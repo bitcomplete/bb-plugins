@@ -337,3 +337,150 @@ describe("the divergence store", () => {
     expect(formatDivergences([])).toBe("No divergences recorded.");
   });
 });
+
+// BB-333 (criterion 4 of BB-291): the typed-wait shadow derivation. `waitLive`
+// is resolved from the stored kind on every reconcile, never from the
+// report-time flag; a typed wait is judged by its own kind, a no-kind report
+// keeps the free-text rule exactly.
+describe("the shadow assessment: the typed wait (BB-333)", () => {
+  const openPull = (key: string, pullOver: Partial<NonNullable<EntitySnapshot["pull"]>> = {}) => {
+    const [repo, number] = key.split("#") as [string, string];
+    return pull({ key, url: `https://github.com/${repo}/pull/${number}`, state: "open" }, pullOver);
+  };
+  const waited = (e: EntitySnapshot) => new Map([[e.key.toLowerCase(), e]]);
+  const withWait = (wait: NonNullable<AssessmentInput["binding"]["wait"]>, over: Partial<AssessmentInput> = {}) => input({ binding: binding({ wait }), ...over });
+
+  it("derives a live pull wait from the freshly read pull, and suppresses idle", () => {
+    const a = assess(withWait({ kind: "pull", ref: "acme/web#9" }, { waitedPulls: waited(openPull("acme/web#9")) }));
+    expect(a.liveness.waitLive).toBe(true);
+    expect(a.liveness.stalled).toBe(false);
+    // The base idle rule is true (build stage, no source), and a live typed wait suppresses it.
+    expect(a.liveness.idle).toBe(false);
+  });
+
+  it("derives a stalled external wait even when an unrelated source is live", () => {
+    const a = assess(withWait({ kind: "external", ref: "the vendor" }, { sources: { ...noSources, pullRequestWatch: true } }));
+    expect(a.liveness.waitLive).toBe(false);
+    expect(a.liveness.stalled).toBe(true);
+  });
+
+  it("derives a review wait live only until the review is given", () => {
+    const live = assess(withWait({ kind: "review", ref: "acme/web#9" }, { waitedPulls: waited(openPull("acme/web#9")) }));
+    expect(live.liveness.waitLive).toBe(true);
+    const reviewed = assess(withWait({ kind: "review", ref: "acme/web#9" }, { waitedPulls: waited(openPull("acme/web#9", { reviewDecision: "APPROVED" })) }));
+    expect(reviewed.liveness.waitLive).toBe(false);
+    expect(reviewed.liveness.stalled).toBe(true);
+  });
+
+  it("derives a deployment wait live while the watch is merged or deploying", () => {
+    const watch = { key: "acme/web#9", state: "deploying" as const, mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: 1, deadlineAt: null, note: null, workflowRuns: [] };
+    const a = assess(input({ binding: binding({ wait: { kind: "deployment", ref: "acme/web#9" }, deployments: { "acme/web#9": watch } }) }));
+    expect(a.liveness.waitLive).toBe(true);
+  });
+
+  it("derives a worker wait live only while the worker runs", () => {
+    const running = assess(withWait({ kind: "worker", ref: "thr_w1" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] }));
+    expect(running.liveness.waitLive).toBe(true);
+    const finished = assess(withWait({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1" })] }));
+    expect(finished.liveness.waitLive).toBe(false);
+  });
+
+  it("derives a binding and a person wait from the lookups the reconcile holds", () => {
+    const open = assess(withWait({ kind: "binding", ref: "ENG-13" }, { hasOpenBinding: () => true }));
+    expect(open.liveness.waitLive).toBe(true);
+    const closed = assess(withWait({ kind: "binding", ref: "ENG-13" }, { hasOpenBinding: () => false }));
+    expect(closed.liveness.waitLive).toBe(false);
+    const person = assess(withWait({ kind: "person", ref: "need_1" }, { hasOpenItem: () => true }));
+    expect(person.liveness.waitLive).toBe(true);
+  });
+
+  it("derives a date wait live while the date is ahead", () => {
+    const now = Date.UTC(2026, 5, 1);
+    const ahead = assess(withWait({ kind: "date", ref: "2026-12-01" }, { now }));
+    expect(ahead.liveness.waitLive).toBe(true);
+    expect(ahead.liveness.stalled).toBe(false);
+    const past = assess(withWait({ kind: "date", ref: "2000-01-01" }, { now }));
+    expect(past.liveness.waitLive).toBe(false);
+    expect(past.liveness.stalled).toBe(true);
+  });
+
+  it("keeps the free-text rule exactly for a report with no typed wait", () => {
+    const stalled = assess(input({ binding: binding({ status: status("the vendor"), noWakeSource: false }) }));
+    expect(stalled.liveness.waitLive).toBeNull();
+    expect(stalled.liveness.stalled).toBe(true);
+    const dated = assess(input({ binding: binding({ status: status("the vendor"), requeueUntil: 2_000_000, noWakeSource: false }) }));
+    expect(dated.liveness.stalled).toBe(false);
+  });
+
+  it("keeps the idleInActiveStage divergence on the unadjusted idle when a typed wait is live", () => {
+    const base = bb266(false);
+    const i: AssessmentInput = { ...base, binding: { ...base.binding, wait: { kind: "pull", ref: "acme/web#9" } }, waitedPulls: waited(openPull("acme/web#9")) };
+    const a = assess(i);
+    // The consumer's idle (idleBase) is true, the typed-wait-adjusted idle is not.
+    expect(a.liveness.idleBase).toBe(true);
+    expect(a.liveness.idle).toBe(false);
+    // The parked-worker surface still compares the consumer's idle.
+    expect(compare(i, a).find((x) => x.surface === "idleInActiveStage")).toMatchObject({ old: "idle", new: "parked" });
+  });
+});
+
+describe("the typed-wait divergence store (BB-333)", () => {
+  function store() {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS) db.exec(sql);
+    let now = 1_000;
+    const s = createStore(db, () => now);
+    return { s, advance: (ms: number) => (now += ms) };
+  }
+
+  it("writes a noWakeSource row only when the disagreement starts", () => {
+    const { s } = store();
+    // The first observation disagrees: a start row.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000)).toBe(true);
+    // The same disagreement again: no new row, but the open row is kept fresh.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 2_000)).toBe(false);
+    let rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ old: "source-or-no-wait", new: "no-wake-source", firstSeenAt: 1_000, lastSeenAt: 2_000, count: 1 });
+    expect(rows[0]!.inputs).toMatchObject({ transition: "ongoing" });
+    // It stops disagreeing: noted on the same row, never a row of its own.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 3_000)).toBe(false);
+    rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.inputs).toMatchObject({ transition: "stop" });
+    // It starts again: the same (old, new) row bumps its count rather than adding a row.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 4_000)).toBe(true);
+    rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.count).toBe(2);
+    // The surface filter still reads it as `noWakeSource`.
+    expect(s.divergences({ surface: "noWakeSource" })).toHaveLength(1);
+    // A first observation that agrees is a baseline, not a transition.
+    expect(s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 5_000)).toBe(false);
+    expect(s.divergences({ bindingId: "b2" })).toHaveLength(0);
+  });
+
+  it("keeps the two directions' rows apart and treats a flip as a stop plus a start", () => {
+    const { s } = store();
+    // start A, stop A, start B, ongoing B.
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000)).toBe(true);
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 2_000)).toBe(false);
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 3_000)).toBe(true);
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 4_000)).toBe(false);
+    let rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(2);
+    const a = rows.find((r) => r.new === "no-wake-source")!;
+    const b = rows.find((r) => r.old === "no-wake-source")!;
+    // The stop touched A, and ongoing B did not touch A again.
+    expect(a.inputs).toMatchObject({ transition: "stop" });
+    expect(a.lastSeenAt).toBe(2_000);
+    expect(b.inputs).toMatchObject({ transition: "ongoing" });
+    expect(b.lastSeenAt).toBe(4_000);
+    // A flip B → A is a stop on B plus a start on A (bumping A's count).
+    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 5_000)).toBe(true);
+    rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.new === "no-wake-source")!.count).toBe(2);
+    expect(rows.find((r) => r.old === "no-wake-source")!.inputs).toMatchObject({ transition: "stop" });
+  });
+});
