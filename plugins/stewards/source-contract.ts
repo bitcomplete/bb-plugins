@@ -301,6 +301,32 @@ export const adoptableEntitySchema = z.object({
 export type AdoptableEntity = z.infer<typeof adoptableEntitySchema>;
 
 /**
+ * One issue in a team's open backlog, for a backlog read rather than an
+ * adoption pass. `adoptableEntitySchema` is the labelled, adoptable set and
+ * lacks what a backlog report needs: `assignees`, `stateType`, `priority`,
+ * `estimate` and `updatedAt`. `assignees` is a list even though Linear has
+ * one assignee and GitHub none, so a source that grows more does not change
+ * the shape. `priority` is the source's own label (Linear's priority label),
+ * and `stateType` is Linear's state type; null on GitHub.
+ */
+export const backlogIssueSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  title: z.string().nullable(),
+  state: z.string(),
+  stateType: z.string().nullable(),
+  /** The team key, or "owner/repo" on GitHub. */
+  unit: z.string(),
+  labels: z.array(z.string()),
+  assignees: z.array(z.string()),
+  priority: z.string().nullable(),
+  estimate: z.number().nullable(),
+  createdAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+});
+export type BacklogIssue = z.infer<typeof backlogIssueSchema>;
+
+/**
  * One issue a source's search returned, with the description the caller
  * matches an exact `Fingerprint:` line in.
  */
@@ -424,6 +450,27 @@ export const sourceContract = {
     output: z.object({
       viewer: z.string().nullable(),
       entities: z.array(adoptableEntitySchema),
+      errors: z.array(z.string()),
+    }),
+  },
+  /**
+   * A team's whole open backlog, read-only: every open issue, unlabelled and
+   * unassigned included. One team per call -- there is no all-teams mode --
+   * and the source pages with a fixed page size up to a hard cap. When the
+   * cap cut the list, `truncated` is true rather than the list silently
+   * stopping. A source that does not offer the capability answers
+   * `unsupported: true`; an older source without the method at all is a
+   * missing RPC. A caller tells either from an empty backlog (`issues: []`,
+   * both flags false) and from a read error (`errors`).
+   */
+  sourceBacklog: {
+    input: z.object({ team: z.string().min(1).max(200) }),
+    output: z.object({
+      issues: z.array(backlogIssueSchema),
+      /** Set when the source does not offer the capability at all. */
+      unsupported: z.boolean().default(false),
+      /** True when the source's hard cap cut the list short. */
+      truncated: z.boolean().default(false),
       errors: z.array(z.string()),
     }),
   },

@@ -1265,6 +1265,77 @@ describe("the source contract", () => {
     });
   });
 
+  it("sourceBacklog reads one team's whole open backlog, unlabelled and unassigned included (BB-331)", async () => {
+    const node = (id: string, over: Record<string, unknown> = {}) => ({
+      id,
+      identifier: `ENG-${id}`,
+      title: `Issue ${id}`,
+      state: { name: "Backlog", type: "backlog" },
+      team: { key: "ENG" },
+      labels: { nodes: [] },
+      assignee: null,
+      priorityLabel: null,
+      estimate: null,
+      createdAt: "2026-10-01T00:00:00Z",
+      updatedAt: "2026-10-02T00:00:00Z",
+      ...over,
+    });
+    const { harness, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
+          const filter = body.variables!.filter as { and?: Array<{ state?: { type?: { nin?: string[] } } }> };
+          const all = [
+            node("1"),
+            node("2", { labels: { nodes: [{ name: "bug" }] }, assignee: { displayName: "jane" } }),
+            node("3", { state: { name: "Done", type: "completed" } }),
+            node("4", { state: { name: "Canceled", type: "canceled" } }),
+          ];
+          // Linear's own open-state filter: only what it excludes comes back.
+          const nin = filter.and?.find((f) => f.state !== undefined)?.state?.type?.nin ?? [];
+          const nodes = all.filter((n) => !nin.includes(n.state.type));
+          return { data: { issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } };
+        },
+      },
+    });
+    const out = (await harness.callRpc("sourceBacklog", { team: "eng" })) as { issues: Array<Record<string, unknown>>; unsupported: boolean; truncated: boolean; errors: string[] };
+    expect(out.unsupported).toBe(false);
+    expect(out.truncated).toBe(false);
+    expect(out.errors).toEqual([]);
+    // The unlabelled, unassigned open issue is returned with every field the backlog read needs.
+    expect(out.issues[0]).toEqual({ id: "1", key: "ENG-1", title: "Issue 1", state: "Backlog", stateType: "backlog", unit: "ENG", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z" });
+    expect(out.issues[1]).toMatchObject({ key: "ENG-2", labels: ["bug"], assignees: ["jane"] });
+    // The completed and canceled issues are gone, and the read asked Linear for exactly that.
+    expect(out.issues.map((i) => i.key)).toEqual(["ENG-1", "ENG-2"]);
+    expect(linear.calls.find((c) => c.body?.query.startsWith("query($filter: IssueFilter"))!.body!.variables).toEqual({
+      filter: { and: [{ team: { key: { eq: "ENG" } } }, { state: { type: { nin: ["completed", "canceled"] } } }] },
+      first: 250,
+      after: null,
+    });
+  });
+
+  it("sourceBacklog caps a large backlog and says it was truncated (BB-331)", async () => {
+    const { harness, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
+          const page = body.variables!.after === null ? 0 : Number(body.variables!.after);
+          const nodes = Array.from({ length: 250 }, (_, i) => ({ id: `${page}-${i}`, identifier: `ENG-${page}-${i}`, title: null, state: { name: "Backlog", type: "backlog" }, team: { key: "ENG" }, labels: { nodes: [] }, assignee: null, priorityLabel: null, estimate: null, createdAt: null, updatedAt: null }));
+          const next = page < 4 ? String(page + 1) : null;
+          return { data: { issues: { nodes, pageInfo: { hasNextPage: next !== null, endCursor: next } } } };
+        },
+      },
+    });
+    const out = (await harness.callRpc("sourceBacklog", { team: "ENG" })) as { issues: unknown[]; unsupported: boolean; truncated: boolean; errors: string[] };
+    expect(out.unsupported).toBe(false);
+    expect(out.truncated).toBe(true);
+    expect(out.issues).toHaveLength(1000);
+    // The read stopped at the cap instead of asking for a fifth page.
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("query($filter: IssueFilter"))).toHaveLength(4);
+  });
+
   it("sourceSetInterest is for stewards only", async () => {
     const { harness, bb } = await setup({ token: "at-0" });
     await expect(harness.callRpc("sourceSetInterest", { units: [], entities: [] })).rejects.toThrow(/stewards plugin only/u);

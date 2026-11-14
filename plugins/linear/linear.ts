@@ -9,6 +9,7 @@ import {
   SNAPSHOT_DESCRIPTION_CHARS,
   signedBy,
   type AdoptableEntity,
+  type BacklogIssue,
   type EntitySnapshot,
 } from "./source-contract.js";
 
@@ -477,6 +478,12 @@ export const ADOPTABLE_QUERY =
   "nodes { id identifier createdAt state { name type } team { key } creator { name displayName email } labels { nodes { name } } } " +
   "pageInfo { hasNextPage endCursor } } }";
 
+/** A team's whole open backlog, unlabelled and unassigned included, a page at a time. */
+export const BACKLOG_QUERY =
+  "query($filter: IssueFilter, $first: Int!, $after: String) { issues(filter: $filter, first: $first, after: $after) { " +
+  "nodes { id identifier title state { name type } team { key } labels { nodes { name } } assignee { name displayName email } priorityLabel estimate createdAt updatedAt } " +
+  "pageInfo { hasNextPage endCursor } } }";
+
 const snapshotIssueSchema = z.object({
   id: z.string(),
   identifier: z.string(),
@@ -653,6 +660,51 @@ export function parseAdoptablePage(payload: unknown): { entities: AdoptableEntit
       draft: false,
       createdAt: i.createdAt ?? null,
     })),
+    next: parsed.pageInfo?.hasNextPage === true ? (parsed.pageInfo.endCursor ?? null) : null,
+  };
+}
+
+/** One page of a team's open backlog, as the contract's `sourceBacklog` wants it. */
+export function parseBacklogPage(payload: unknown): { issues: BacklogIssue[]; next: string | null } {
+  const data = dataOf(payload);
+  const parsed = z
+    .object({
+      nodes: z.array(
+        z.object({
+          id: z.string(),
+          identifier: z.string(),
+          title: z.string().nullish(),
+          state: z.object({ name: z.string(), type: z.string().nullish() }).nullish(),
+          team: z.object({ key: z.string() }),
+          labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+          assignee: person,
+          priorityLabel: z.string().nullish(),
+          estimate: z.number().nullish(),
+          createdAt: z.string().nullish(),
+          updatedAt: z.string().nullish(),
+        }),
+      ),
+      pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullish() }).nullish(),
+    })
+    .parse(data.issues);
+  return {
+    issues: parsed.nodes.map((i) => {
+      const assignee = personName(i.assignee);
+      return {
+        id: i.id,
+        key: i.identifier,
+        title: i.title ?? null,
+        state: i.state?.name ?? "",
+        stateType: i.state?.type ?? null,
+        unit: i.team.key,
+        labels: (i.labels?.nodes ?? []).map((l) => l.name),
+        assignees: assignee === null ? [] : [assignee],
+        priority: i.priorityLabel ?? null,
+        estimate: i.estimate ?? null,
+        createdAt: i.createdAt ?? null,
+        updatedAt: i.updatedAt ?? null,
+      };
+    }),
     next: parsed.pageInfo?.hasNextPage === true ? (parsed.pageInfo.endCursor ?? null) : null,
   };
 }

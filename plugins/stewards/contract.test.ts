@@ -39,6 +39,31 @@ describe("source-contract.ts", () => {
     expect(sourceContract.sourceEnsureLabel.output.safeParse({ results: [{ unit: "ENG", status: "failed" }] }).success).toBe(false);
   });
 
+  it("parses sourceBacklog, telling a capped read, an empty backlog and an unsupported source apart (BB-331)", () => {
+    const issue = {
+      id: "uuid-1",
+      key: "ENG-1",
+      title: "Fix login",
+      state: "Backlog",
+      stateType: "backlog",
+      unit: "ENG",
+      labels: [],
+      assignees: [],
+      priority: null,
+      estimate: null,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-02T00:00:00Z",
+    };
+    expect(sourceContract.sourceBacklog.input.parse({ team: "ENG" })).toEqual({ team: "ENG" });
+    expect(sourceContract.sourceBacklog.input.safeParse({ team: "" }).success).toBe(false);
+    // One team, and the read is capped: a truncated list says so rather than silently stopping.
+    expect(sourceContract.sourceBacklog.output.parse({ issues: [issue], truncated: true, errors: [] })).toEqual({ issues: [issue], unsupported: false, truncated: true, errors: [] });
+    // An empty backlog, an unsupported source and a read error are three different answers.
+    expect(sourceContract.sourceBacklog.output.parse({ issues: [], errors: [] })).toEqual({ issues: [], unsupported: false, truncated: false, errors: [] });
+    expect(sourceContract.sourceBacklog.output.parse({ issues: [], unsupported: true, errors: [] })).toEqual({ issues: [], unsupported: true, truncated: false, errors: [] });
+    expect(sourceContract.sourceBacklog.output.parse({ issues: [], errors: ["ENG: rate limited"] })).toEqual({ issues: [], unsupported: false, truncated: false, errors: ["ENG: rate limited"] });
+  });
+
   it("parses the deployment-read RPCs and the merge commit on the pull snapshot (BB-132)", () => {
     expect(sourceContract.sourceFileAtRef.input.parse({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" })).toEqual({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" });
     expect(sourceContract.sourceFileAtRef.input.safeParse({ repo: "", path: "x", ref: "main" }).success).toBe(false);

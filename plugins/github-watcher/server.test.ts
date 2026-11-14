@@ -683,6 +683,11 @@ describe("stewards' source contract", () => {
     expect(w.github.calls.find((c) => typeof c.variables.q === "string")!.variables.q).toBe("repo:Acme/Widgets in:body abc123");
   });
 
+  it("answers sourceBacklog as unsupported, distinct from an empty backlog (BB-331)", async () => {
+    const w = await setup();
+    expect(await w.harness.callRpc("sourceBacklog", { team: "ENG" }, STEWARDS)).toEqual({ issues: [], unsupported: true, truncated: false, errors: [] });
+  });
+
   it("reads a repository's Dependabot alerts, naming a repository or a repo the token cannot read rather than failing", async () => {
     const w = await setup();
     w.github.state.dependabotAlerts = [

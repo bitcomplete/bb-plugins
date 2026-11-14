@@ -34,6 +34,7 @@ import type { Context } from "hono";
 import { z } from "zod";
 import {
   ADOPTABLE_QUERY,
+  BACKLOG_QUERY,
   COMMENT_CREATE,
   ISSUE_CREATE,
   ISSUE_ID_QUERY,
@@ -68,6 +69,7 @@ import {
   isReadOnlyDocument,
   issueFilter,
   parseAdoptablePage,
+  parseBacklogPage,
   parseCommentCreate,
   parseIssue,
   parseIssueCreate,
@@ -118,7 +120,7 @@ import {
   type Account,
 } from "./accounts.js";
 import { createHooksLoop, HooksRequestError, HOOKS_URL_ENV, REPLY_BODY_MAX_BYTES, REPLY_KINDS, type IdentifyResponse, type Lease, type Rejection, type ReplyKind, type SessionEvent } from "./hooks-client.js";
-import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type SearchIssue, type SessionWake } from "./source-contract.js";
+import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type BacklogIssue, type SearchIssue, type SessionWake } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signed, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
@@ -615,6 +617,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       sourceValidate: (input) => sourceValidate(input),
       sourceEnsureLabel: (input) => sourceEnsureLabel(input),
       sourceAdoptable: (input) => sourceAdoptable(input),
+      sourceBacklog: (input) => sourceBacklog(input),
       sourceSearchIssues: (input) => sourceSearchIssues(input),
       // Dependabot alerts are a GitHub thing; linear has none. Stewards only
       // asks github, so this is a plain answer rather than a throw.
@@ -1484,6 +1487,44 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
       entities.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
       return { viewer, entities: entities.slice(0, input.limit), errors };
+    }
+
+    /** One page holds at most this many issues, and one call returns at most this many in all. */
+    const BACKLOG_PAGE = 250;
+    const BACKLOG_MAX = 1000;
+
+    // One team's whole open backlog, unlabelled and unassigned included. The
+    // team is resolved the same way adoption resolves it, so an unknown or
+    // ambiguous team is an error rather than a read of the default workspace.
+    // The open-state filter is Linear's: completed and canceled issues never
+    // come back. Pages stop at the cap, and `truncated` says the cap cut the
+    // list rather than the list having ended.
+    async function sourceBacklog(input: { team: string }) {
+      if (!(await isConnected())) return { issues: [], unsupported: false, truncated: false, errors: [NOT_CONNECTED] };
+      const key = input.team.trim().toUpperCase();
+      try {
+        const all = await accounts();
+        await ensureTeams([key], checkSignal());
+        const having = accountsWithTeam(all, (a) => teamMaps.get(a), key);
+        if (having.length === 0) return { issues: [], unsupported: false, truncated: false, errors: [`${key}: no such Linear team, or it is not visible to the connected user`] };
+        if (having.length > 1) {
+          return { issues: [], unsupported: false, truncated: false, errors: [`${key}: a team with this key is in more than one connected Linear workspace (${listAccounts(having)}); none of its issues were read`] };
+        }
+        const account = having[0]!;
+        const filter = issueFilter({ team: key, openOnly: true });
+        const issues: BacklogIssue[] = [];
+        let after: string | null = null;
+        do {
+          const page = parseBacklogPage(await query(account.key, BACKLOG_QUERY, { filter, first: BACKLOG_PAGE, after }, checkSignal()));
+          issues.push(...page.issues);
+          await learnEntityAccounts(page.issues.map((i) => i.id), account.key);
+          after = page.next;
+        } while (after !== null && issues.length < BACKLOG_MAX);
+        const truncated = after !== null || issues.length > BACKLOG_MAX;
+        return { issues: issues.slice(0, BACKLOG_MAX), unsupported: false, truncated, errors: [] };
+      } catch (error) {
+        return { issues: [], unsupported: false, truncated: false, errors: [`${key}: ${errorMessage(error)}`] };
+      }
     }
 
     /** An issue as the search contract wants it: the description the caller matches the fingerprint line in. */
