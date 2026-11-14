@@ -54,7 +54,7 @@ const pull = (over: Record<string, unknown> = {}) => ({
         headRefName: "feature/widgets",
         headRefOid: "0123456789abcdef",
         baseRefName: "main",
-        reviewRequests: { nodes: [{ requestedReviewer: { __typename: "User", login: "carol" } }, { requestedReviewer: { __typename: "Team", name: "backend" } }, { requestedReviewer: null }] },
+        reviewRequests: { nodes: [{ requestedReviewer: { __typename: "User", login: "carol" } }, { requestedReviewer: { __typename: "Team", combinedSlug: "acme/backend" } }, { requestedReviewer: null }] },
         latestReviews: { nodes: [{ author: { login: "bob" }, state: "COMMENTED" }, { author: { login: "jane" }, state: "PENDING" }] },
         reviews: {
           nodes: [
@@ -109,7 +109,7 @@ describe("parseTarget", () => {
       head: "feature/widgets",
       headSha: "0123456789abcdef",
       reviewDecision: "review required",
-      requestedReviewers: ["backend", "carol"],
+      requestedReviewers: ["acme/backend", "carol"],
       reviews: ["bob: commented"],
       checks: { state: "failure", failing: ["ci/deploy (https://ci/deploy)", "test (https://ci/test)"] },
     });
@@ -201,7 +201,7 @@ describe("parseSnapshot", () => {
       headSha: "0123456789abcdef",
       headAuthor: "jane",
       reviewDecision: "review required",
-      requestedReviewers: ["backend", "carol"],
+      requestedReviewers: ["acme/backend", "carol"],
       reviews: [
         { author: "bob", state: "commented", submittedAt: "2026-10-09T08:30:00Z", commit: "aaaa" },
         { author: "carol", state: "approved", submittedAt: "2026-10-09T10:00:00Z", commit: "bbbb" },

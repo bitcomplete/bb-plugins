@@ -339,6 +339,13 @@ export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Bindi
   });
 }
 
+/**
+ * Whether an open approval escalation is the plugin's delegate wait (BB-327):
+ * routed to the binding's steward and closed only by the delegate's review or
+ * a withdrawn request, never decided by the steward itself.
+ */
+export const isDelegateWait = (x: { kind: string; route: string }): boolean => x.kind === "approval" && x.route === "steward";
+
 /** A reviewer marker's identity: a new round on the same head is a new marker (BB-51). */
 export const markerKey = (m: { round: number; sha: string } | null): string | null => (m === null ? null : `${m.round}:${m.sha}`);
 
@@ -373,6 +380,11 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
   // BB-327: remember every login seen in the request list, so a delegate's
   // APPROVED review still counts after GitHub drops them from the live list.
   ctx.store.rememberPullRequesters(b.id, url, pull.pull?.requestedReviewers ?? []);
+  // The owner ends a delegation by removing a requested reviewer who never
+  // reviewed; a delegate who submitted a review stays a delegate (BB-327).
+  const live = new Set((pull.pull?.requestedReviewers ?? []).map((l) => l.toLowerCase()));
+  const reviewed = new Set((pull.pull?.reviews ?? []).map((r) => r.author.toLowerCase()));
+  for (const login of ctx.store.pullRequesters(b.id, url)) if (!live.has(login) && !reviewed.has(login)) ctx.store.forgetPullRequester(b.id, url, login);
   // BB-322: the gate comes from the stored assessment (the reconcile passes
   // its in-memory copy through `gateFor`; otherwise the single `assessedGate`
   // site reads or refreshes it). The decide-list placement is already in it,

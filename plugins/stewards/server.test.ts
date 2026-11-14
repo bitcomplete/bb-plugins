@@ -13718,6 +13718,25 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     return { ...t, project, steward, key, binding: () => t.hooks.store.find("ENG-12")! };
   }
 
+  it("waits on a requested reviewer: blocked in the sidebar and not decidable by the steward (BB-327)", async () => {
+    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { pullOver: { requestedReviewers: ["arashout"] } });
+    const binding = t.binding();
+    const esc = t.hooks.store.openEscalations(binding.id).find((x) => x.kind === "approval")!;
+    // The escalation waits on the delegate, and no owner item is filed.
+    expect(esc.route).toBe("steward");
+    expect(esc.meanwhile).toContain("arashout");
+    expect(t.hooks.store.openNeeds(binding.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    // The sidebar row reads blocked, not "needs you".
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; stuck: boolean; needsUser: boolean }> };
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, needsUser: false });
+    // The ticket steward cannot resolve the delegate wait into a decline.
+    const refused = await t.tool("steward_update", { binding: "ENG-12", guidance: "no", resolve: esc.id }, t.steward);
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(/waits on the requested reviewer/u);
+    // The escalation is still open.
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("open");
+  });
+
   it("prints the reviewer spawn command from models.reviewer, and errors clearly with none", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());

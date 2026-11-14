@@ -108,6 +108,7 @@ export function createApprovalsStore(db: Database.Database, now: () => number) {
   };
   const insertPullRequester = lazy<[string, string, string, number], unknown>("INSERT OR IGNORE INTO pull_requesters (binding_id, url, login, created_at) VALUES (?, ?, ?, ?)");
   const pullRequestersFor = lazy<[string, string], Record<string, unknown>>("SELECT login FROM pull_requesters WHERE binding_id = ? AND url = ? ORDER BY created_at, login");
+  const deletePullRequester = lazy<[string, string, string], unknown>("DELETE FROM pull_requesters WHERE binding_id = ? AND url = ? AND login = ?");
   const insertReviewerRequest = lazy<[string, string, string, string, number], unknown>("INSERT OR IGNORE INTO reviewer_requests (binding_id, url, login, head_sha, created_at) VALUES (?, ?, ?, ?, ?)");
   const reviewerRequestsFor = lazy<[string, string, string], Record<string, unknown>>("SELECT login FROM reviewer_requests WHERE binding_id = ? AND url = ? AND head_sha = ? ORDER BY created_at, login");
 
@@ -168,6 +169,10 @@ export function createApprovalsStore(db: Database.Database, now: () => number) {
     /** The logins remembered as requested reviewers for a binding and URL (BB-327). */
     pullRequesters(bindingId: string, url: string): string[] {
       return pullRequestersFor().all(bindingId, url).map((r) => String(r.login));
+    },
+    /** Forget a remembered requester the owner removed while they had no review, ending that delegation (BB-327). */
+    forgetPullRequester(bindingId: string, url: string, login: string): void {
+      deletePullRequester().run(bindingId, url, login.trim().toLowerCase());
     },
     /** Record that a delegate was re-requested for a head, so a repeated look does not re-request (BB-327). */
     recordReviewerRequest(bindingId: string, url: string, login: string, headSha: string): void {

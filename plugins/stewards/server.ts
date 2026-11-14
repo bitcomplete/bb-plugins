@@ -103,7 +103,7 @@ import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPE
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -9325,7 +9325,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           : gate.ownerApproved
             ? ", approved by the owner"
             : "";
-      const escalation = gate.reason === "product" ? ", the owner acked the product" : gate.escalated ? ", escalated by the reviewer to the owner" : "";
+      // BB-327: a delegate's approval is not the owner's, so the product and
+      // escalation clauses only credit the owner when the owner approved.
+      const escalation = gate.reason === "product"
+        ? gate.ownerApproved ? ", the owner acked the product" : ""
+        : gate.escalated && gate.ownerApproved ? ", escalated by the reviewer to the owner" : "";
       return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}${escalation}.`;
     }
 
@@ -9766,7 +9770,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
-              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
               requeueAt: b.requeueAt,
@@ -9819,6 +9823,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const { questions, withUser, needs } = needsYou(projectId, open, projectQuestions);
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
+          ...store.openEscalations(b.id).filter(isDelegateWait).map((x) => ({ b, why: `Waiting on the requested reviewer: ${x.meanwhile}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = store.endedSince(projectId, now() - ENDED_ON_BOARD_MS, 30);
@@ -9868,7 +9873,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
-              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
               // The newest deployment watch, whatever its state; `merged` reads as deploying.
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
@@ -11981,6 +11986,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
               resolving = store.escalation(resolve);
               if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
+              // BB-327: the delegate wait is the plugin's, not the steward's to
+              // decide; it closes when the delegate approves or the request is
+              // withdrawn.
+              if (isDelegateWait(resolving)) return toolError(new Error(`The approval of ${resolving.question.replace(/^Approve\s+/u, "")} waits on the requested reviewer, not you (${resolving.meanwhile}). It closes when they approve, or when the request is withdrawn; do not resolve it.`));
               // Criterion 2: the project steward's approving words are the
               // approval; approve: true is no longer needed as well. Only the
               // approver the gate names may do it, as with approve: true: the
@@ -12365,7 +12374,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-296: the `stuck` flag shares the same grouped escalations, so the
       // sidebar and board do not re-query them per binding.
       const stuck = new Set<string>();
-      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck")) stuck.add(bindingId);
+      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck" || isDelegateWait(x))) stuck.add(bindingId);
       return { questions: questionViews, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds, needsUser, stuck };
     }
 

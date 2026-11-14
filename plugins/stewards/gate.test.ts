@@ -145,6 +145,26 @@ describe("a requested reviewer is the owner's delegation (BB-327)", () => {
     expect(remembered.needsOwnerApproval).toBe(false);
   });
 
+  it("keeps a delegate's approval across a later COMMENTED review (criterion 3)", () => {
+    const approved = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const commented = {
+      reviews: [{ author: "arashout", state: "commented", submittedAt: "2026-10-14T17:30:00Z", commit: head }],
+      comments: [comment({ id: "rev-arashout-commented", author: "arashout", did: "reviewed", body: "answered", createdAt: "2026-10-14T17:30:00Z", signedBy: null })],
+    };
+    const g = prGate(delegatePull(["arashout"], { comments: [...approved.comments, ...commented.comments], reviews: [...approved.reviews, ...commented.reviews] }));
+    expect(g.gateMet).toBe(true);
+    expect(g.delegateApproved).toBe(true);
+  });
+
+  it("does not merge one delegate's approval over another's changes requested (criterion 5)", () => {
+    const approved = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
+    const changed = delegateReview("bob", "changes requested", "2026-10-14T17:30:00Z", "bbbbbbb2");
+    const g = prGate(delegatePull(["arashout", "bob"], { comments: [...approved.comments, ...changed.comments], reviews: [...approved.reviews, ...changed.reviews] }));
+    expect(g.gateMet).toBe(false);
+    expect(g.needsOwnerApproval).toBe(false);
+    expect(g.delegates).toEqual(["bob"]);
+  });
+
   it("finds a delegate's approval after GitHub dropped them from the live list (criterion 6)", () => {
     const review = delegateReview("arashout", "approved", "2026-10-14T17:00:00Z");
     const entity = delegatePull([], review);
@@ -174,7 +194,9 @@ describe("a requested reviewer is the owner's delegation (BB-327)", () => {
   });
 
   it("does not treat bots, teams or the viewer as delegates (criterion 8)", () => {
-    for (const reviewers of [["dependabot[bot]"], ["Platform Team"], ["jane"]]) {
+    // A team is `org/slug` as the source now emits it; a bot or the viewer is
+    // never a delegate either.
+    for (const reviewers of [["dependabot[bot]"], ["bitcomplete/backend"], ["Platform Team"], ["jane"]]) {
       const g = prGate(delegatePull(reviewers));
       expect(g.delegates).toEqual([]);
       expect(g.needsOwnerApproval).toBe(true);

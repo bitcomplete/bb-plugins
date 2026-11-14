@@ -298,13 +298,18 @@ export function delegateState(entity: EntitySnapshot, remembered: readonly strin
     const lower = login.toLowerCase();
     if (!candidates.has(lower)) candidates.set(lower, { login, live: false });
   }
+  // A COMMENTED review is GitHub's reply-thread review, not an opinion; a
+  // delegate who approves and then answers an inline comment keeps the
+  // approval, as GitHub's own `latestOpinionatedReviews` does (BB-327).
   const latest = new Map<string, { state: string; at: string; commit: string | null }>();
   for (const r of entity.pull?.reviews ?? []) {
     const lower = r.author.toLowerCase();
     if (!candidates.has(lower)) continue;
+    const state = r.state.toLowerCase();
+    if (state === "commented") continue;
     const at = r.submittedAt ?? "";
     const prev = latest.get(lower);
-    if (prev === undefined || at >= prev.at) latest.set(lower, { state: r.state.toLowerCase(), at, commit: r.commit });
+    if (prev === undefined || at >= prev.at) latest.set(lower, { state, at, commit: r.commit });
   }
   let approval: DelegateState["approval"] = null;
   const outstanding: string[] = [];
@@ -609,7 +614,12 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   const baseChangedSinceApproval = opts.baseChangedSinceApproval ?? (baseChangedAt !== null && approvalAt !== null && baseChangedAt > approvalAt);
   const headOnDefaultTip = opts.headMergeBaseIsDefaultTip ?? pull?.headMergeBaseIsDefaultTip ?? null;
   const baseStale = baseChangedSinceApproval && headOnDefaultTip !== true;
-  const approved = (decision === "project" ? projectApproved : owner.approved || delegate.approval !== null) && !baseStale;
+  // BB-327: a delegate approval meets the lane only while no delegate has an
+  // open changes-requested. Latest-wins is per delegate, so one delegate's
+  // approval does not merge over another's outstanding changes request; the
+  // viewer's own approval is still the override.
+  const delegateApproved = delegate.approval !== null && delegate.changesRequested.length === 0;
+  const approved = (decision === "project" ? projectApproved : owner.approved || delegateApproved) && !baseStale;
   // A stale approval is not a request for another approval: the head must be
   // rebased onto the default branch first, and a fresh approval would only let
   // the un-rebased head merge. So neither approval is asked for while
@@ -670,7 +680,7 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     missing,
     delegates: delegate.outstanding,
     delegatePending,
-    delegateApproved: delegate.approval !== null,
+    delegateApproved,
     delegateApprovalBy: delegate.approval?.by ?? null,
     delegateApprovalAt: delegate.approval?.at ?? null,
     delegateApprovalId: delegate.approval?.id ?? null,
