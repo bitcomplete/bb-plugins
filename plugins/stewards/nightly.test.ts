@@ -133,6 +133,7 @@ describe("briefing", () => {
       stall: [{ escalation: f.store.escalation(f.stallEsc.id)!, from: f.store.binding(f.noWake.id)! }],
       datedWaits: [f.store.binding(f.dated.id)!],
       held: [f.store.binding(f.held.id)!],
+      nonActions: [],
     });
     // `formatRecords` is untouched, so rendering the extracted record is the
     // nightly's byte-identical digest record.

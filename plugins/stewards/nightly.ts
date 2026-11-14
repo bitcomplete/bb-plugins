@@ -13,6 +13,7 @@
 // the nightly's rendering byte-identical while the briefing carries the four
 // sections the stand-up needs.
 import type { Assumption, Binding, Escalation, Need, Question, Store } from "./store.js";
+import type { NonActions } from "./non-actions.js";
 import type { BacklogIssue } from "./source-contract.js";
 import type { BacklogLook, BacklogSnapshot } from "./ops.js";
 import type { DigestRecords } from "./wake.js";
@@ -115,6 +116,8 @@ export type Briefing = {
   };
   /** Open recorded assumptions (BB-251), one `Assuming:` line each; binding is null for a project-level one. */
   assumptions: Array<{ assumption: Assumption; binding: Binding | null }>;
+  /** BB-335: the open bindings that recorded a non-action, for the digest's Non-actions section. */
+  nonActions?: Array<{ binding: Binding; nonActions: NonActions }>;
 };
 
 /**
@@ -178,6 +181,13 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
               .openAssumptionsForProject(projectId)
               .filter((assumption) => assumption.bindingId === scoped.id)
               .map((assumption) => ({ assumption, binding: scoped })),
+      nonActions: [
+        ...open.filter((b) => Object.keys(b.nonActions).length > 0),
+        // BB-335: the binding-ended close sits on an ended binding, so the
+        // digest also carries the ended bindings in this window that recorded
+        // one. `bb stewards show` renders it from the binding row directly.
+        ...(scoped === null ? all.filter((b) => b.endedAt !== null && b.endedAt >= since && Object.keys(b.nonActions).length > 0) : []),
+      ].map((binding) => ({ binding, nonActions: binding.nonActions })),
     };
   };
 }
@@ -204,6 +214,7 @@ export function toDigestRecords(briefing: Briefing): DigestRecords {
     stall: briefing.stuck.stall,
     datedWaits: briefing.stuck.datedWaits,
     held: briefing.stuck.held,
+    nonActions: briefing.nonActions,
   };
 }
 

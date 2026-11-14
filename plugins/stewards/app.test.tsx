@@ -153,6 +153,92 @@ afterEach(() => {
   setStewardsSidebarCommand(null);
 });
 
+// BB-335: the binding card shows the recorded non-actions, information only.
+describe("the binding card's non-actions (BB-335)", () => {
+  const steward = (over: Record<string, unknown> = {}) => ({
+    key: "ENG-12",
+    url: null,
+    title: "Fix login",
+    kind: "ticket",
+    phase: "In Progress",
+    threadId: null,
+    summary: null,
+    nextAction: null,
+    actor: null,
+    waitingOn: null,
+    waitingUntil: null,
+    wait: null,
+    nonActions: { "gate-not-met": { date: "2026-11-14", text: "The merge gate for acme/web#7 is not met" } },
+    noWakeSource: false,
+    wakeFailure: null,
+    priority: null,
+    hold: null,
+    holdBehind: [],
+    holdStack: [],
+    needsUser: false,
+    stuck: false,
+    deployment: null,
+    pending: [],
+    requeueAt: null,
+    ending: null,
+    statusAt: null,
+    createdAt: 1_000,
+    workers: 0,
+    escalations: [],
+    ...over,
+  });
+  const project = (over: Record<string, unknown> = {}) => ({
+    projectId: "p1",
+    name: "Acme",
+    configured: true,
+    onboard: false,
+    enabled: true,
+    source: "multi-repo",
+    label: "bb-managed",
+    linearTeams: ["ENG"],
+    repos: ["acme/web"],
+    excludedRepos: [],
+    playbooks: [],
+    problems: [],
+    nightly: null,
+    lastNight: null,
+    projectStewardThreadId: null,
+    digestAt: null,
+    endedCount: 0,
+    stewards: [steward()],
+    ...over,
+  });
+
+  it("shows the recorded non-actions on the card, with the date", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[1]!;
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => ({ paused: false, lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} }, projects: [project()] }),
+        stewardsSetProjectEnabled: () => ({ ok: true, message: "on", enabled: true }),
+        stewardsCheck: () => ({ ok: true, lines: [] }),
+      },
+    } as never);
+    await waitFor(() => expect(slot.getByText(/Non-actions: The merge gate for acme\/web#7 is not met \(2026-11-14\)/u)).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("shows no non-actions line when none are recorded", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[1]!;
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => ({ paused: false, lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} }, projects: [project({ stewards: [steward({ nonActions: {} })] })] }),
+        stewardsSetProjectEnabled: () => ({ ok: true, message: "on", enabled: true }),
+        stewardsCheck: () => ({ ok: true, lines: [] }),
+      },
+    } as never);
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(slot.queryByText(/Non-actions:/u)).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});
+
 describe("the Stewards page's decide items and questions (BB-20)", () => {
   it("shows a button per choice and Other…, not Done, for a decide item with choices", async () => {
     const slot = await renderBoard([need({ choices: ["Merge", "Close", "Verify first"] })], []);
@@ -1160,6 +1246,15 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     await waitFor(() => expect(unknown.getByText(/No effort/u)).toBeTruthy());
     expect(unknown.getByText("ENG-404")).toBeTruthy();
     unknown.lifecycle.unmount();
+  });
+
+  it("shows an ended effort's recorded non-actions on its card (BB-335)", async () => {
+    const ended = await renderBoardWith({
+      subPath: "p1/ENG-0",
+      ended: [{ key: "ENG-0", url: null, title: "Old work", kind: "ticket", endReason: "terminal", endedAt: 1_000, threadId: null, nonActions: { "binding-ended-closed": { date: "2026-11-14", text: "Closed because the binding ended (terminal)" } } }],
+    });
+    await waitFor(() => expect(ended.getByText(/Non-actions: Closed because the binding ended \(terminal\) \(2026-11-14\)/u)).toBeTruthy());
+    ended.lifecycle.unmount();
   });
 
   it("resolves a pull-request key that keeps its own slash", async () => {
