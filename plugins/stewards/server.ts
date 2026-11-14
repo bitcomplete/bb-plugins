@@ -7111,7 +7111,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // project steward asking them in its own thread; thread-briefs shows that
     // thread as waiting on them, so nothing here asks for attention itself.
 
-    async function wakeProject(projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[]; checkFindings?: CheckFinding[] }): Promise<void> {
+    async function wakeProject(projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[]; checkFindings?: CheckFinding[]; onSent?: () => void }): Promise<void> {
       const config = await loadConfig(projectId);
       if (config === null) return;
       const threadId = await ensureProjectSteward(config);
@@ -7164,7 +7164,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
       // The notes were only peeked at, so a failed or skipped send leaves them
       // queued for the next digest rather than losing them.
-      else if (opts.digestDue) store.clearProjectNotes(projectId);
+      else {
+        // BB-328: let the caller record a finding only once its digest really
+        // went out, so a failed send says it on the next pass.
+        opts.onSent?.();
+        if (opts.digestDue) store.clearProjectNotes(projectId);
+      }
     }
 
     /** What the digest is written from, since the last one (or a day back): read from the tables, never from the project steward's memory. */
@@ -12910,30 +12915,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Mark only once the wake is really sent, so a disposed pass leaves
           // the follow-up for the next one.
           for (const x of followUps) store.markEscalationRationaleAsked(x.id);
-          // BB-328: run the live half of `check` (teams, states, labels, repos,
-          // target readability, hooks leases) and record its warnings and
-          // problems in the digest, deduplicated by fingerprint so an unchanged
-          // finding is said once and repeated only when it changes. `check` is
-          // read-only: it creates no label and needs no credential. A read that
-          // throws is logged, never allowed to skip the digest.
-          let liveFindings: CheckFinding[] = [];
-          try {
-            liveFindings = (await check(config.projectId)).findings;
-          } catch (error) {
-            bb.log.warn(`stewards: nightly check for ${config.projectId}: ${errorMessage(error)}`);
+          // BB-328: the live half of `check` (teams, states, labels, repos,
+          // target readability, hooks leases) runs on the project steward's
+          // server only, whose digest is the only place its findings are read.
+          // `check` is read-only and needs no credential, and a read that
+          // throws is logged, never allowed to skip the digest. The findings
+          // are recorded only once the digest is really sent, so a skipped or
+          // failed send leaves them to be said on the next pass.
+          let freshFindings: CheckFinding[] = [];
+          let nextFindings: Array<{ fingerprint: string; level: "warning" | "problem"; text: string }> | null = null;
+          if (config.role?.projectSteward === true) {
+            let liveFindings: CheckFinding[] = [];
+            try {
+              liveFindings = (await check(config.projectId)).findings;
+            } catch (error) {
+              bb.log.warn(`stewards: nightly check for ${config.projectId}: ${errorMessage(error)}`);
+            }
+            const current: CheckFinding[] = [...config.warnings.map((text): CheckFinding => ({ level: "warning", text })), ...liveFindings];
+            const diff = freshCheckFindings(current, store.checkFindings(config.projectId));
+            freshFindings = diff.fresh;
+            nextFindings = diff.next;
           }
-          const current: CheckFinding[] = [...config.warnings.map((text): CheckFinding => ({ level: "warning", text })), ...liveFindings];
-          const { fresh, next } = freshCheckFindings(current, store.checkFindings(config.projectId));
-          store.setCheckFindings(config.projectId, next, now());
+          let digestSent = false;
           await wakeProject(config.projectId, `nightly pass ${night}`, {
             digestDue: true,
-            checkFindings: fresh,
+            checkFindings: freshFindings,
+            onSent: () => {
+              digestSent = true;
+            },
             notes: [
               `${woken.length} binding(s) had a turn tonight.`,
               ...adoption.unassigned.map((t) => `labelled, no assignee: ${t.key}${t.title === null ? "" : ` ${t.title}`}${t.url === null ? "" : ` — ${t.url}`}. Assign it in Linear to the server that should own it; this one does not adopt it.`),
               ...followUps.map((x) => `The user's answer on ${x.id} went against your recommendation. Ask them once, in this thread, why — one follow-up — then record their reasoning as a lesson candidate with steward_update { lesson: { text, file, scope } }.`),
             ],
           });
+          if (digestSent && nextFindings !== null) store.setCheckFindings(config.projectId, nextFindings, now());
         }
       } finally {
         running.delete(config.projectId);
@@ -13714,9 +13730,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             positionals: [{ name: "name", description: "The template name (a PLAYBOOK_TEMPLATES key)", required: true }],
             async run(input) {
               const name = input.positionals.name ?? "";
-              const text = PLAYBOOK_TEMPLATES[name];
-              if (text === undefined) return { exitCode: 1, stdout: `Unknown template ${JSON.stringify(name)}. Valid names: ${Object.keys(PLAYBOOK_TEMPLATES).join(", ")}` };
-              return { exitCode: 0, stdout: text };
+              if (!Object.hasOwn(PLAYBOOK_TEMPLATES, name)) return { exitCode: 1, stdout: `Unknown template ${JSON.stringify(name)}. Valid names: ${Object.keys(PLAYBOOK_TEMPLATES).join(", ")}` };
+              return { exitCode: 0, stdout: PLAYBOOK_TEMPLATES[name]! };
             },
           }),
 

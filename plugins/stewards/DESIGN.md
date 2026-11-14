@@ -656,10 +656,12 @@ At the project file's time, 01:00 US Eastern by default:
 
 1. Every open binding gets one judgment turn whether or not anything changed,
    staggered and capped per night.
-2. The live half of `bb stewards check` runs: the reads against Linear, GitHub
-   and the ops targets and the hooks leases (not the parse half, which every
-   wake already carries under "Configuration problems"). Its `warning:` and
-   `problem:` lines are recorded per project and compared with the last pass
+2. The live half of `bb stewards check` runs — the reads against Linear,
+   GitHub and the ops targets and the hooks leases — and its `warning:` and
+   `problem:` lines are recorded per project, together with the parse half's
+   `warning:` lines (the template lag and unknown-origin warnings, which no
+   wake otherwise carries; its `problem:` lines already appear on every wake
+   under "Configuration problems"). They are compared with the last pass
    by fingerprint; the findings new or changed since then ride in the digest
    and the project steward's wake, so an unchanged finding is said once and
    again only when it changes, or clears and returns (BB-328). `check` and

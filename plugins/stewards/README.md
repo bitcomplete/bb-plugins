@@ -674,7 +674,8 @@ stamp naming a template that no longer exists is a warning too. A refresh is
 never a mechanical overwrite: `bb stewards template <name>` prints the
 current shipped text, and an unknown name lists the valid names and exits
 non-zero. The nightly pass runs the live half of `check` and records its
-warnings and problems in the morning digest and the project steward's wake,
+warnings and problems — plus the parse half's warnings, which no wake
+otherwise carries — in the morning digest and the project steward's wake,
 deduplicated by fingerprint so an unchanged finding is said once and again
 only when it changes (or clears and returns). `check` and the nightly pass
 are read-only and need no new credential.

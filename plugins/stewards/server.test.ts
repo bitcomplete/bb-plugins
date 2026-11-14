@@ -16381,6 +16381,10 @@ describe("template stamps and the nightly live check (BB-328)", () => {
     expect(unknown.exitCode).toBe(1);
     expect(unknown.stdout).toContain('Unknown template "nope"');
     expect(unknown.stdout).toContain("ops-watch");
+    // A name on Object's prototype is not a template either.
+    const proto = await t.harness.behavior.runCli(["template", "toString"]);
+    expect(proto.exitCode).toBe(1);
+    expect(proto.stdout).toContain('Unknown template "toString"');
   });
 
   it("runs the live check nightly and records a finding once, repeating only when it changes", async () => {
@@ -16404,5 +16408,27 @@ describe("template stamps and the nightly live check (BB-328)", () => {
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     expect(texts().slice(before2).join("\n")).toContain("linear: ENG has no state Todo, In Progress");
+  });
+
+  it("records a finding only once the digest is delivered, so a failed send says it next pass", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    // A first, clean pass spawns the project steward.
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const thread = t.hooks.store.project("p1").threadId!;
+    // The next digest cannot be delivered.
+    t.threads.get(thread)!.sendError = { code: "internal", status: 500, message: "boom" };
+    t.setMissingStates("linear", "ENG", ["Todo"]);
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    // It was never said, so it is not recorded as said.
+    expect(t.hooks.store.checkFindings("p1").some((f) => f.text.includes("ENG has no state Todo"))).toBe(false);
+    // The send works again: the finding is said.
+    t.threads.get(thread)!.sendError = undefined;
+    const before = t.sends.filter((s) => s.threadId === thread).length;
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === thread).slice(before).map((s) => s.text).join("\n")).toContain("ENG has no state Todo");
+    expect(t.hooks.store.checkFindings("p1").some((f) => f.text.includes("ENG has no state Todo"))).toBe(true);
   });
 });
