@@ -96,7 +96,7 @@ import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
-import { createBriefing, freshCheckFindings, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
+import { backlogDigest, createBriefing, freshCheckFindings, nightlyDue, stillNight, toDigestRecords, type BacklogDigest } from "./nightly.js";
 import { STANDUP_TOOLS, buildStandupBrief, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, type StandupDelegation, type StandupEndOutcome, type StandupEntityFacts, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolContext, type StandupToolReply } from "./standup.js";
 import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
@@ -7117,6 +7117,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const threadId = await ensureProjectSteward(config);
       if (threadId === null) return;
       const records = opts.digestDue ? digestRecords(projectId) : undefined;
+      // BB-334: one backlog report per backlog binding, from its stored look
+      // and the previous digest's snapshot. Empty without a backlog role. The
+      // ids are the ones the report was computed from, written only after the
+      // send, so a look that moves in between does not move the snapshot.
+      const backlog = records === undefined ? null : backlogReports(projectId, config);
+      if (records !== undefined && backlog !== null) records.backlog = backlog.digests;
       // BB-328: the live-check findings new or changed since the last nightly
       // pass ride in the digest record, so the project steward reads them once.
       if (records !== undefined && opts.checkFindings !== undefined && opts.checkFindings.length > 0) records.checkFindings = opts.checkFindings;
@@ -7168,7 +7174,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-328: let the caller record a finding only once its digest really
         // went out, so a failed send says it on the next pass.
         opts.onSent?.();
-        if (opts.digestDue) store.clearProjectNotes(projectId);
+        if (opts.digestDue) {
+          store.clearProjectNotes(projectId);
+          if (backlog !== null) recordBacklogSnapshots(backlog.snapshots, now());
+        }
       }
     }
 
@@ -7177,6 +7186,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const row = store.project(projectId);
       const since = row.digestAt ?? now() - 86_400_000;
       return toDigestRecords(briefing(projectId, since));
+    }
+
+    /** The backlog reports for a digest, and the issue ids each was computed from (BB-334). */
+    function backlogReports(projectId: string, config: ProjectConfig): { digests: BacklogDigest[]; snapshots: Array<{ bindingId: string; ids: string[] }> } {
+      const staleDays = config.file.backlog?.staleDays ?? 14;
+      const at = now();
+      const digests: BacklogDigest[] = [];
+      const snapshots: Array<{ bindingId: string; ids: string[] }> = [];
+      for (const b of store.open(projectId)) {
+        if (b.kind !== "ops" || b.backlogLook === null || parseOpsTargetKey(b.entityId)?.kind !== "backlog") continue;
+        digests.push(backlogDigest(b.backlogLook, b.backlogSnapshot, { staleDays }, at));
+        // A failed read keeps the previous snapshot: the next digest still
+        // compares against the last good one.
+        if (b.backlogLook.error === null) snapshots.push({ bindingId: b.id, ids: b.backlogLook.issues.map((i) => i.id) });
+      }
+      return { digests, snapshots };
+    }
+
+    /** Record the ids the digest reported, once it really went out (BB-334). */
+    function recordBacklogSnapshots(snapshots: ReadonlyArray<{ bindingId: string; ids: string[] }>, at: number): void {
+      for (const { bindingId, ids } of snapshots) {
+        const b = store.binding(bindingId);
+        if (b === null || b.endedAt !== null) continue;
+        store.patch(b.id, { backlogSnapshot: { at, ids } });
+      }
     }
 
     // ---- lessons -------------------------------------------------------------------------------

@@ -13,6 +13,8 @@
 // the nightly's rendering byte-identical while the briefing carries the four
 // sections the stand-up needs.
 import type { Assumption, Binding, Escalation, Need, Question, Store } from "./store.js";
+import type { BacklogIssue } from "./source-contract.js";
+import type { BacklogLook, BacklogSnapshot } from "./ops.js";
 import type { DigestRecords } from "./wake.js";
 import { createHash } from "node:crypto";
 import type { CheckFinding } from "./template-stamp.js";
@@ -202,5 +204,172 @@ export function toDigestRecords(briefing: Briefing): DigestRecords {
     stall: briefing.stuck.stall,
     datedWaits: briefing.stuck.datedWaits,
     held: briefing.stuck.held,
+  };
+}
+
+// ---- the backlog report (BB-334) ---------------------------------------------------
+
+/**
+ * The age buckets the backlog report uses, oldest last. A ticket is counted in
+ * the first bucket whose `maxDays` its age is under, so the buckets partition
+ * every ticket with a readable `createdAt`.
+ */
+export const BACKLOG_AGE_BUCKETS = [
+  { label: "<1w", maxDays: 7 },
+  { label: "1-4w", maxDays: 30 },
+  { label: "1-3m", maxDays: 90 },
+  { label: ">3m", maxDays: Number.POSITIVE_INFINITY },
+] as const;
+
+export type BacklogAgeBucket = { label: string; count: number };
+/** A group of tickets whose normalised titles are similar; flagged only, never merged. */
+export type BacklogDuplicate = { keys: string[]; title: string };
+export type BacklogStale = { key: string; days: number };
+export type BacklogNext = { key: string; reason: string };
+
+/**
+ * One team's backlog report, computed from a stored read and the previous
+ * digest's snapshot. It is pure: the caller passes the clock, and nothing here
+ * reads the store or a source. An `error` report carries no metrics, so a
+ * failed read is a problem line rather than an empty backlog.
+ */
+export type BacklogDigest = {
+  team: string;
+  error: string | null;
+  truncated: boolean;
+  size: number;
+  ages: BacklogAgeBucket[];
+  /** The previous digest's time, or null before the first report. */
+  since: number | null;
+  /** Issue ids present now and not at the previous digest; 0 before the first. */
+  inflow: number;
+  /** Issue ids present at the previous digest and not now; 0 before the first. */
+  outflow: number;
+  duplicates: BacklogDuplicate[];
+  stale: BacklogStale[];
+  next: BacklogNext[];
+};
+
+const daysSince = (from: string | null, now: number): number | null => {
+  if (from === null) return null;
+  const t = Date.parse(from);
+  return Number.isNaN(t) ? null : Math.max(0, Math.floor((now - t) / 86_400_000));
+};
+
+/** A title folded for duplicate detection: lower case, punctuation to spaces, collapsed. */
+export const normalizeBacklogTitle = (title: string | null): string =>
+  (title ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+
+/** The Jaccard similarity of two normalised titles' word sets; 0 when either is empty. */
+export function titleSimilarity(a: string, b: string): number {
+  if (a === "" || b === "") return 0;
+  if (a === b) return 1;
+  const left = new Set(a.split(" ").filter((t) => t !== ""));
+  const right = new Set(b.split(" ").filter((t) => t !== ""));
+  let shared = 0;
+  for (const token of left) if (right.has(token)) shared += 1;
+  return shared / (left.size + right.size - shared);
+}
+
+/** Titles at or above this similarity are flagged as likely duplicates. */
+export const BACKLOG_DUPLICATE_SIMILARITY = 0.6;
+
+/** Groups of tickets whose normalised titles are similar (BB-334). Flagged only, never merged. */
+export function duplicateBacklog(issues: readonly BacklogIssue[]): BacklogDuplicate[] {
+  const parent = new Map(issues.map((i) => [i.id, i.id]));
+  const find = (x: string): string => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root)!;
+    while (parent.get(x) !== root) {
+      const next = parent.get(x)!;
+      parent.set(x, root);
+      x = next;
+    }
+    return root;
+  };
+  const union = (a: string, b: string): void => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+  const normalised = issues.map((i) => ({ id: i.id, title: normalizeBacklogTitle(i.title) }));
+  for (let i = 0; i < normalised.length; i += 1) {
+    for (let j = i + 1; j < normalised.length; j += 1) {
+      if (titleSimilarity(normalised[i]!.title, normalised[j]!.title) >= BACKLOG_DUPLICATE_SIMILARITY) union(normalised[i]!.id, normalised[j]!.id);
+    }
+  }
+  const byRoot = new Map<string, BacklogIssue[]>();
+  for (const issue of issues) {
+    const root = find(issue.id);
+    byRoot.set(root, [...(byRoot.get(root) ?? []), issue]);
+  }
+  return [...byRoot.values()]
+    .filter((group) => group.length > 1)
+    .map((group) => ({ keys: group.map((i) => i.key).sort(), title: group[0]!.title ?? "" }));
+}
+
+/** Tickets whose `updatedAt` is at least `staleDays` old, oldest first. */
+export function staleBacklog(issues: readonly BacklogIssue[], staleDays: number, now: number): BacklogStale[] {
+  return issues
+    .map((issue) => ({ key: issue.key, days: daysSince(issue.updatedAt, now) }))
+    .filter((x): x is { key: string; days: number } => x.days !== null && x.days >= staleDays)
+    .sort((a, b) => b.days - a.days || a.key.localeCompare(b.key));
+}
+
+const BACKLOG_PRIORITY_RANK: Record<string, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
+
+/**
+ * The next tickets to work, by priority then age, each with one line of
+ * reasoning. A ticket already `started` is being built, so it is never
+ * proposed as next; it still counts in size, ages and stale.
+ */
+export function nextBacklog(issues: readonly BacklogIssue[], now: number, limit = 3): BacklogNext[] {
+  const created = (i: BacklogIssue): number => {
+    const t = i.createdAt === null ? Number.NaN : Date.parse(i.createdAt);
+    return Number.isNaN(t) ? Number.POSITIVE_INFINITY : t;
+  };
+  // The source sends Linear's label unchanged ("Urgent", "High", …, "No priority"), so match ignoring case; anything else is unranked.
+  const rank = (i: BacklogIssue): number => BACKLOG_PRIORITY_RANK[(i.priority ?? "").toLowerCase()] ?? 4;
+  return [...issues]
+    .filter((i) => (i.stateType ?? "").toLowerCase() !== "started")
+    .sort((a, b) => rank(a) - rank(b) || created(a) - created(b) || a.key.localeCompare(b.key))
+    .slice(0, limit)
+    .map((issue) => {
+      const age = daysSince(issue.createdAt, now);
+      const reason = [issue.priority ?? "no priority", age === null ? "age unknown" : `${age}d old`, ...(issue.estimate === null ? [] : [`estimate ${issue.estimate}`])].join(", ");
+      return { key: issue.key, reason };
+    });
+}
+
+/**
+ * One team's report from its stored look and the previous digest's snapshot.
+ * `previous` null is the first digest: inflow and outflow are 0 and `since` is
+ * null. The read's `error` is carried through, so the renderer shows a problem
+ * line and never an empty backlog.
+ */
+export function backlogDigest(look: BacklogLook, previous: BacklogSnapshot | null, opts: { staleDays: number }, now: number): BacklogDigest {
+  const issues = look.issues;
+  const previousIds = new Set(previous?.ids ?? []);
+  const currentIds = new Set(issues.map((i) => i.id));
+  const ages = BACKLOG_AGE_BUCKETS.map((bucket, index) => {
+    const min = index === 0 ? 0 : BACKLOG_AGE_BUCKETS[index - 1]!.maxDays;
+    return { label: bucket.label, count: issues.filter((i) => { const days = daysSince(i.createdAt, now); return days !== null && days >= min && days < bucket.maxDays; }).length };
+  });
+  return {
+    team: look.team,
+    error: look.error,
+    truncated: look.truncated,
+    size: issues.length,
+    ages,
+    since: previous?.at ?? null,
+    inflow: previous === null ? 0 : [...currentIds].filter((id) => !previousIds.has(id)).length,
+    outflow: previous === null ? 0 : [...previousIds].filter((id) => !currentIds.has(id)).length,
+    duplicates: duplicateBacklog(issues),
+    stale: staleBacklog(issues, opts.staleDays, now),
+    next: nextBacklog(issues, now),
   };
 }

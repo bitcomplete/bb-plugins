@@ -364,6 +364,15 @@ export const backlogLookSchema = z.object({
 });
 export type BacklogLook = z.infer<typeof backlogLookSchema>;
 
+/**
+ * The backlog as of the last digest that reported it (BB-334): the issue ids
+ * the next digest compares against for inflow and outflow. `at` is when that
+ * digest was sent. It is written only when a digest really went out, so a
+ * failed send compares against the same snapshot again.
+ */
+export const backlogSnapshotSchema = z.object({ at: z.number(), ids: z.array(z.string()) });
+export type BacklogSnapshot = z.infer<typeof backlogSnapshotSchema>;
+
 /** A fingerprint map row, as classification needs it. */
 export type FingerprintRow = { fingerprint: string; ticketKey: string | null; firstSeenAt: number; lastCommentedAt: number | null; filedByThread?: string | null };
 

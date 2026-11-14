@@ -10,7 +10,7 @@ import { landLessonInstruction } from "./lessons.js";
 import type { GuidanceUnit } from "./guidance.js";
 import type { BigDecision } from "./decisions.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
-import { localParts } from "./nightly.js";
+import { localParts, type BacklogDigest } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { ADOPTION_CHOICES, adoptionHow, dueDate } from "./deps.js";
@@ -1796,6 +1796,12 @@ export type DigestRecords = {
   datedWaits?: Binding[];
   /** Open bindings on hold. */
   held: Binding[];
+  /**
+   * BB-334: one backlog report per backlog binding, from its stored look and
+   * the previous digest's snapshot. Empty or absent when no role carries a
+   * backlog, so the digest is byte-identical for every project without one.
+   */
+  backlog?: BacklogDigest[];
   /** Silent notes queued for this digest (a hold that lifted on finished work), one line each. */
   notes?: string[];
   /**
@@ -1804,6 +1810,22 @@ export type DigestRecords = {
    */
   checkFindings?: CheckFinding[];
 };
+
+/**
+ * The digest's backlog block (BB-334): one heading line per team, then the
+ * likely duplicates, the stale tickets and the proposed next three. A failed
+ * read is one problem line, never an empty report.
+ */
+function backlogLines(b: BacklogDigest): string[] {
+  if (b.error !== null) return [`- ${b.team}: unavailable — ${b.error}`];
+  const ages = b.ages.map((a) => `${a.label} ${a.count}`).join(", ");
+  const window = b.since === null ? "first digest" : `inflow ${b.inflow}, outflow ${b.outflow} since ${iso(b.since)}`;
+  const out = [`- ${b.team}: ${b.size} open${b.truncated ? " (truncated by the source's cap)" : ""}; age ${ages}; ${window}`];
+  if (b.duplicates.length > 0) out.push(`  - Likely duplicates: ${b.duplicates.map((d) => d.keys.join(" / ")).join("; ")}`);
+  if (b.stale.length > 0) out.push(`  - Stale: ${b.stale.map((s) => `${s.key} (${s.days}d)`).join(", ")}`);
+  if (b.next.length > 0) out.push(`  - Proposed next: ${b.next.map((n) => `${n.key} (${n.reason})`).join("; ")}`);
+  return out;
+}
 
 function capped(lines: string[], none: string): string[] {
   if (lines.length === 0) return [none];
@@ -1855,6 +1877,11 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   // pass. Deduplicated by fingerprint, so an unchanged finding is said once.
   const checkFindings = r.checkFindings ?? [];
   if (checkFindings.length > 0) out.push("### Check findings", "", ...capped(checkFindings.map((f) => `- ${f.level}: ${f.text}`), "Nothing."), "");
+
+  // BB-334: the backlog report, omitted entirely when no role carries a
+  // backlog, so a project without one keeps the byte-identical digest.
+  const backlog = r.backlog ?? [];
+  if (backlog.length > 0) out.push("### Backlog", "", ...capped(backlog.flatMap((b) => backlogLines(b)), "Nothing."), "");
 
   // A question or a need covers the escalation it was made for: list the
   // question or the item, never the raw escalation too.
