@@ -11,7 +11,8 @@ import { guidanceUnitId } from "./guidance.js";
 import { needActions, parseDotenvValue, secretVariable } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
-import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
+import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
+import { parseTemplateStamp, templateHash } from "./template-stamp.js";
 import { DEFAULT_ALERTMANAGER_URL } from "./alertmanager.js";
 import { STANDING_RULES } from "./wake.js";
 import { setup } from "./test-world.js";
@@ -3876,7 +3877,9 @@ describe("project-level ticket watches (BB-246)", () => {
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ playbook: "initiatives", endedAt: null });
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
-    expect(check.stdout).not.toMatch(/initiatives/u);
+    // The removed watch is not a problem. (The playbook itself has no template
+    // stamp, so `check` does carry its one unknown-origin warning.)
+    expect(check.stdout).not.toMatch(/problem:.*initiatives/u);
     // With the playbook file gone too, and no last-good copy, it ends.
     delete t.files[playbookPath("initiatives")];
     await t.bb.storage.kv.delete("good/p1/playbook/initiatives");
@@ -16326,5 +16329,80 @@ describe("the stand-up (BB-300)", () => {
     t.advance(60_000);
     await startStandup(t);
     expect(t.hooks.store.lastCompletedStandup("p1")).toBe(t.now() - 120_000);
+  });
+});
+
+// BB-328: a playbook copied from a shipped template carries a stamp; `init`
+// writes it, `check` reports drift as a warning (never a problem), the
+// `template` command prints the shipped text, and the nightly pass runs the
+// live half of `check`, recording findings deduplicated by fingerprint.
+describe("template stamps and the nightly live check (BB-328)", () => {
+  it("init writes a stamp into each copied playbook, whose hash is of the shipped text", async () => {
+    const t = await setup();
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    const written = new Map([...t.writtenContent].filter(([p]) => p.startsWith("/w/.bb/")).map(([p, c]) => [p.slice("/w/.bb/".length), c]));
+    for (const [name, text] of Object.entries(PLAYBOOK_TEMPLATES)) {
+      if (name === "github-issues") continue;
+      const content = written.get(playbookPath(name));
+      expect(content, `${name} was written`).toBeDefined();
+      expect(content).toContain(`template: ${name}@${templateHash(text)}\n`);
+    }
+    // Editing the copy never changes the stamp's hash: it is of the shipped text.
+    const edited = written.get(playbookPath("linear-tickets"))!.replace("# What", "# edited");
+    expect(parseTemplateStamp(/template: (\S+)/u.exec(edited)![1]!)).toEqual({ name: "linear-tickets", hash: templateHash(LINEAR_TICKETS) });
+  });
+
+  it("check warns, without failing, on a lagging, unstamped or gone-template playbook", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    const plain = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(plain.exitCode).toBe(0);
+    expect(plain.stdout).toMatch(/warning: linear-tickets has no template stamp, so its origin is unknown/u);
+    expect(plain.stdout.match(/linear-tickets has no template stamp/gu)).toHaveLength(1);
+
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("name: linear-tickets", "name: linear-tickets\ntemplate: linear-tickets@deadbeef");
+    const lag = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(lag.exitCode).toBe(0);
+    expect(lag.stdout).toContain(`warning: linear-tickets was copied from template deadbeef; current is ${templateHash(LINEAR_TICKETS)}.`);
+
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("name: linear-tickets", "name: linear-tickets\ntemplate: gone@deadbeef");
+    const gone = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(gone.exitCode).toBe(0);
+    expect(gone.stdout).toMatch(/warning: linear-tickets was copied from template gone, which no longer exists/u);
+  });
+
+  it("prints a shipped template, and an unknown name lists the valid ones and exits non-zero", async () => {
+    const t = await setup();
+    const known = await t.harness.behavior.runCli(["template", "ops-watch"]);
+    expect(known.exitCode).toBe(0);
+    expect(known.stdout).toBe(OPS_WATCH);
+    const unknown = await t.harness.behavior.runCli(["template", "nope"]);
+    expect(unknown.exitCode).toBe(1);
+    expect(unknown.stdout).toContain('Unknown template "nope"');
+    expect(unknown.stdout).toContain("ops-watch");
+  });
+
+  it("runs the live check nightly and records a finding once, repeating only when it changes", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.setMissingStates("linear", "ENG", ["Todo"]);
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const thread = t.hooks.store.project("p1").threadId!;
+    const texts = () => t.sends.filter((s) => s.threadId === thread).map((s) => s.text);
+    expect(texts().some((x) => x.includes("problem: linear: ENG has no state Todo"))).toBe(true);
+
+    // Unchanged: not said again.
+    const before = texts().length;
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(texts().slice(before).join("\n")).not.toContain("ENG has no state Todo");
+
+    // Changed: said again with the new text.
+    t.setMissingStates("linear", "ENG", ["Todo", "In Progress"]);
+    const before2 = texts().length;
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(texts().slice(before2).join("\n")).toContain("linear: ENG has no state Todo, In Progress");
   });
 });

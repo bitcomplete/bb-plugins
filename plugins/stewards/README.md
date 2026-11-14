@@ -450,8 +450,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   stalls.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
-  binding a turn, then wakes the project steward for the morning digest.
-  A half-hourly mechanical sweep is the adoption and stuck backstop.
+  binding a turn, runs the live half of `bb stewards check` (teams, states,
+  labels, repos, target readability and hooks leases), then wakes the project
+  steward for the morning digest, which carries the check findings new or
+  changed since the last pass. A half-hourly mechanical sweep is the adoption
+  and stuck backstop.
 - **The Stewards page** (a nav panel, [app.tsx](app.tsx)) is no longer the
   list (BB-85). `board/<project>` is the project view: project name and
   project-steward link, **Waiting on you** (the needs-you items with no open
@@ -659,6 +662,22 @@ version. Project file fields beyond the design: `nightly.until`,
 `reviews.enabled`, `adoption.perPass`, `bigDecisions` (what reaches you;
 defaults in [config.ts](config.ts)) and `deps` (below). `project.json` holds
 conventions only; the watches that need an owner live in `roles.json`.
+
+**Template stamps and drift (BB-328).** `init` writes a
+`template: <name>@<hash>` front-matter line into each playbook it copies,
+where the hash is of the shipped template text, so a project's own edits
+leave it alone. `check` reports a copy whose stamp hash differs from the
+current template as a `warning:` (never a `problem:`, and never a changed
+exit status): `warning: ops-watch was copied from template <old>; current is
+<new>.` A playbook with no stamp gets one "unknown origin" warning, and a
+stamp naming a template that no longer exists is a warning too. A refresh is
+never a mechanical overwrite: `bb stewards template <name>` prints the
+current shipped text, and an unknown name lists the valid names and exits
+non-zero. The nightly pass runs the live half of `check` and records its
+warnings and problems in the morning digest and the project steward's wake,
+deduplicated by fingerprint so an unchanged finding is said once and again
+only when it changes (or clears and returns). `check` and the nightly pass
+are read-only and need no new credential.
 
 `roles.json` (BB-105, version 2 in BB-163) assigns what each person's server
 runs. Version 2 names each role once under `roles` and lists its holders

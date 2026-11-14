@@ -656,7 +656,15 @@ At the project file's time, 01:00 US Eastern by default:
 
 1. Every open binding gets one judgment turn whether or not anything changed,
    staggered and capped per night.
-2. The project steward's pass follows, over the fresh status records; its
+2. The live half of `bb stewards check` runs: the reads against Linear, GitHub
+   and the ops targets and the hooks leases (not the parse half, which every
+   wake already carries under "Configuration problems"). Its `warning:` and
+   `problem:` lines are recorded per project and compared with the last pass
+   by fingerprint; the findings new or changed since then ride in the digest
+   and the project steward's wake, so an unchanged finding is said once and
+   again only when it changes, or clears and returns (BB-328). `check` and
+   this pass are read-only and need no credential.
+3. The project steward's pass follows, over the fresh status records; its
    reply is kept as the morning digest.
 
 All of it must finish before 03:00, when bb-gate's quiet window restarts
@@ -981,6 +989,17 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 - **Phases are the entity's own states**, so the playbook needs no state
   machine. A ticket moved by hand is followed.
+- **A copied playbook carries a template stamp (BB-328).** `bb stewards init`
+  writes a `template: <name>@<hash>` front-matter line into each playbook it
+  copies, where the hash is of the shipped template text, so a project's own
+  edits leave it alone. `check` compares the stamp with the current template
+  and reports a lag as a `warning:` (never a `problem:`, and never a changed
+  exit status): `warning: ops-watch was copied from template <old>; current is
+  <new>.` A playbook with no stamp gets one "unknown origin" warning, and a
+  stamp naming a template that no longer exists is a warning too.
+  `bb stewards template <name>` prints the current shipped text, and an
+  unknown name lists the valid names and exits non-zero. A refresh is a
+  reviewed change, never a mechanical overwrite; Part 2 queues it.
 - **A phase may be keyed on a label too (BB-248).** A `label:<name>` key in
   `phases` matches a present label on the entity, ignoring case, and wins over
   the state-keyed phase; with no matching label the state decides as before.
@@ -1111,7 +1130,7 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 - **Threads:** spawning stewards, recognizing workers, building wake messages.
 - **Agent tools:** `steward_report` and `steward_update` (which also
   records and completes lessons, §20).
-- **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest | lessons | drop-lesson`.
+- **CLI:** `bb stewards init | check | template | list | show | needs | done | detach | pass | digest | lessons | drop-lesson`.
 - **UI:** the Stewards page, a nav panel (BB-85): `board/<project>` is the
   project view — the project name and project-steward link, **Waiting on you**
   (the needs-you items with no open binding: project-level questions and items

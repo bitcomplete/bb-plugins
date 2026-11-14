@@ -10,6 +10,7 @@ import { z } from "zod";
 import { decideEntrySchema, defaultDecideList, globError } from "./decisions.js";
 import { ALERTMANAGER_NAMESPACE, SENTRY_SLUG, type AlertmanagerTarget, type BacklogTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
+import { parseTemplateStamp, TEMPLATE_STAMP } from "./template-stamp.js";
 
 export const STEWARDS_DIR = "stewards";
 export const PROJECT_FILE = `${STEWARDS_DIR}/project.json`;
@@ -816,6 +817,13 @@ export const frontMatterSchema = z
     /** Reviews: pull request authors no review steward is made for (bots). */
     "skip-authors": z.array(z.string().trim().min(1).max(100)).default([]),
     /**
+     * BB-328: the shipped template this playbook was copied from, as
+     * `<name>@<hash>`. `init` writes it and a refresh updates it; a playbook
+     * with or without it parses and runs exactly as before. The name need not
+     * still exist: `check` reports a stamp naming a gone template as a warning.
+     */
+    template: z.string().trim().regex(TEMPLATE_STAMP, "a template stamp <name>@<hash>").optional(),
+    /**
      * Reviews: file the owner's Merge item on a teammate's pull request too
      * (BB-170). Off by default: the owner's approval is their last step and
      * the author merges. Set on the review playbook.
@@ -851,6 +859,8 @@ export type Playbook = {
   ownerMerges: boolean;
   /** Where a merge is confirmed live, or empty when the playbook names no deployment target. */
   deployments: DeploymentTarget[];
+  /** BB-328: the shipped template this playbook was copied from, or null when it carries no stamp. */
+  template: { name: string; hash: string } | null;
   /** Alias warnings the front matter raised, surfaced by `bb stewards check` (BB-209). */
   warnings: string[];
   /** The text before the first `## ` heading: instructions for every phase. */
@@ -932,6 +942,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       skipAuthors: fm["skip-authors"],
       ownerMerges: fm["owner-merges"],
       deployments: fm.deployment === undefined ? [] : Array.isArray(fm.deployment) ? fm.deployment : [fm.deployment],
+      template: fm.template === undefined ? null : parseTemplateStamp(fm.template),
       warnings,
       general,
       sections,

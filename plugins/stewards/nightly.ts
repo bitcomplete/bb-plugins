@@ -14,6 +14,32 @@
 // sections the stand-up needs.
 import type { Assumption, Binding, Escalation, Need, Question, Store } from "./store.js";
 import type { DigestRecords } from "./wake.js";
+import { createHash } from "node:crypto";
+import type { CheckFinding } from "./template-stamp.js";
+
+/** A finding as recorded, with the fingerprint that decides whether it was said before (BB-328). */
+export type StoredCheckFinding = CheckFinding & { fingerprint: string };
+
+/** The fingerprint of a finding: its level and text, so a changed finding has a new one. */
+export function checkFindingFingerprint(f: CheckFinding): string {
+  return createHash("sha256").update(`${f.level}\n${f.text}`).digest("hex").slice(0, 16);
+}
+
+/**
+ * The findings to say now, and the set to record. A finding not in `stored`
+ * (never seen, changed, or back after clearing) is fresh; one unchanged since
+ * the last pass is not. The caller persists `next` and reports `fresh`.
+ */
+export function freshCheckFindings(current: CheckFinding[], stored: StoredCheckFinding[]): { fresh: StoredCheckFinding[]; next: StoredCheckFinding[] } {
+  const byFingerprint = new Map<string, StoredCheckFinding>();
+  for (const f of current) {
+    const fingerprint = checkFindingFingerprint(f);
+    if (!byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, { ...f, fingerprint });
+  }
+  const next = [...byFingerprint.values()];
+  const known = new Set(stored.map((f) => f.fingerprint));
+  return { fresh: next.filter((f) => !known.has(f.fingerprint)), next };
+}
 
 const minutesOf = (clock: string): number => {
   const [h, m] = clock.split(":").map(Number);

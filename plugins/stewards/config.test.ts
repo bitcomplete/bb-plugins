@@ -44,7 +44,8 @@ import {
   watchProblems,
 } from "./roles.js";
 import { opsTargetKey, parseOpsTargetKey } from "./ops.js";
-import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
+import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
+import { parseTemplateStamp, templateHash, templateWarnings } from "./template-stamp.js";
 
 describe("the project file", () => {
   it("parses the template with defaults filled in", () => {
@@ -1026,5 +1027,52 @@ describe("project-level ticket watches (BB-246)", () => {
     const parsed = file([{ playbook: "initiative" }]);
     if (!parsed.ok) throw new Error(parsed.error);
     expect(parsed.value.tickets.map((w) => ticketWatchId(w))).toEqual(["initiative@ticket"]);
+  });
+});
+
+// BB-328: a playbook copied from a shipped template carries a
+// `template: <name>@<hash>` stamp. The parser tolerates it (with or without
+// one, a playbook parses and runs exactly as before), and `check` turns a
+// stamp into a lag warning rather than a problem.
+describe("template stamps (BB-328)", () => {
+  it("parses a playbook with or without a stamp the same way", () => {
+    const hash = templateHash(LINEAR_TICKETS);
+    const stamped = parsePlaybook(stampedTemplate("linear-tickets", LINEAR_TICKETS), "linear-tickets");
+    const plain = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!stamped.ok) throw new Error(stamped.error);
+    if (!plain.ok) throw new Error(plain.error);
+    expect(stamped.value.template).toEqual({ name: "linear-tickets", hash });
+    expect(plain.value.template).toBeNull();
+    // Everything but the stamp (and the text hash it changes) is identical.
+    expect({ ...stamped.value, template: null, version: plain.value.version }).toEqual(plain.value);
+  });
+
+  it("refuses a stamp that is not <name>@<hash>", () => {
+    expect(parsePlaybook(LINEAR_TICKETS.replace("name: linear-tickets", "name: linear-tickets\ntemplate: not-a-stamp"), "linear-tickets")).toMatchObject({ ok: false });
+  });
+
+  it("writes a stamp whose hash is of the shipped template, unchanged by edits to the copy", () => {
+    const stamped = stampedTemplate("ops-watch", OPS_WATCH);
+    const hash = templateHash(OPS_WATCH);
+    expect(stamped).toContain(`template: ops-watch@${hash}\n`);
+    // The hash is of the shipped text, never the project copy: editing the
+    // copy leaves the stamp's hash exactly where it was.
+    const edited = stamped.replace("# You watch one production target", "# edited by the project");
+    expect(parseTemplateStamp(/template: (\S+)/u.exec(edited)![1]!)).toEqual({ name: "ops-watch", hash });
+  });
+
+  it("warns on lag, unknown origin and a template that no longer exists, once per playbook", () => {
+    const hashes = new Map([["ops-watch", "aaaa"]]);
+    const p = (name: string, template: { name: string; hash: string } | null) => ({ name, template });
+    expect(templateWarnings([p("ops-watch", { name: "ops-watch", hash: "bbbb" })], hashes)).toEqual(["ops-watch was copied from template bbbb; current is aaaa."]);
+    expect(templateWarnings([p("ops-watch", null)], hashes)).toEqual(["ops-watch has no template stamp, so its origin is unknown"]);
+    expect(templateWarnings([p("ops-watch", { name: "gone", hash: "aaaa" })], hashes)).toEqual(["ops-watch was copied from template gone, which no longer exists"]);
+    expect(templateWarnings([p("ops-watch", null), p("ops-watch", null)], hashes)).toHaveLength(1);
+  });
+
+  it("has a current hash for every shipped template", () => {
+    const hashes = templateHashes();
+    expect([...hashes.keys()].sort()).toEqual(Object.keys(PLAYBOOK_TEMPLATES).sort());
+    for (const [name, hash] of hashes) expect(parseTemplateStamp(`${name}@${hash}`)).toEqual({ name, hash });
   });
 });

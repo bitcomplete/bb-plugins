@@ -22,6 +22,7 @@ import { currentStoredGate, type StoredGate } from "./assessed-gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
+import type { CheckFinding } from "./template-stamp.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -1797,6 +1798,11 @@ export type DigestRecords = {
   held: Binding[];
   /** Silent notes queued for this digest (a hold that lifted on finished work), one line each. */
   notes?: string[];
+  /**
+   * BB-328: the live-check findings new or changed since the last nightly
+   * pass, deduplicated by fingerprint. An unchanged finding is not repeated.
+   */
+  checkFindings?: CheckFinding[];
 };
 
 function capped(lines: string[], none: string): string[] {
@@ -1844,6 +1850,11 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   }
 
   if ((r.notes ?? []).length > 0) out.push("### Notes", "", ...capped((r.notes ?? []).map((n) => `- ${n}`), "Nothing."), "");
+
+  // BB-328: the live half of `check`, new or changed since the last nightly
+  // pass. Deduplicated by fingerprint, so an unchanged finding is said once.
+  const checkFindings = r.checkFindings ?? [];
+  if (checkFindings.length > 0) out.push("### Check findings", "", ...capped(checkFindings.map((f) => `- ${f.level}: ${f.text}`), "Nothing."), "");
 
   // A question or a need covers the escalation it was made for: list the
   // question or the item, never the raw escalation too.
