@@ -11504,7 +11504,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // An auto-filed need does not satisfy this: it is filed from prose,
           // not the item the user acts on, so a wait naming the user still
           // needs a real item or escalation (BB-213).
-          if (input.wait === undefined && waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
+          // Only a stored `person` wait — one that resolved to an open page item and was not downgraded — bypasses the guard: the item it names is itself what reaches the page. An `external` wait, or a `person` wait downgraded to `external`, still has to file the item.
+          const personWait = wait !== null && wait.kind === "person";
+          if (!personWait && waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
                 `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,

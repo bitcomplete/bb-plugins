@@ -14703,11 +14703,23 @@ describe("a typed wait (BB-333)", () => {
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "deployment", ref: "acme/web#7" });
   });
 
-  it("a wait skips the user-naming waitingOn refusal; the same report without one is refused", async () => {
-    const { t, steward } = await ticket();
-    const withWait = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval", wait: { kind: "external", ref: "the owner's approval" } }, steward);
-    expect(withWait.error).toBe(false);
-    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "the owner's approval" });
+  it("only a valid person wait skips the user-naming waitingOn refusal", async () => {
+    const { t, b, steward } = await ticket();
+    // A question is an open page item the person wait names, and is not an open
+    // need, so only the person-wait skip lets the user-naming report through.
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    const person = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval", wait: { kind: "person", ref: q.id } }, steward);
+    expect(person.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "person", ref: q.id });
+    // An external wait does not bypass the guard: the user is named with nothing filed.
+    const external = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval", wait: { kind: "external", ref: "the owner's approval" } }, steward);
+    expect(external.error).toBe(true);
+    expect(external.text).toMatch(/names the user, the owner or a human/u);
+    // A person wait that was downgraded to external does not bypass it either.
+    const downgraded = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval", wait: { kind: "person", ref: "need_closed" } }, steward);
+    expect(downgraded.error).toBe(true);
+    expect(downgraded.text).toMatch(/names the user, the owner or a human/u);
+    // And no wait at all is refused as today.
     const without = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval" }, steward);
     expect(without.error).toBe(true);
     expect(without.text).toMatch(/names the user, the owner or a human/u);
@@ -14770,7 +14782,9 @@ describe("a typed wait (BB-333)", () => {
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
-    const report = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
+    // `waitingOn` does not name the user: the person wait is the structured
+    // form of the owner's approval, and the guard is not the subject here.
+    const report = await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "need_approve" });
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
