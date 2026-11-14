@@ -1,0 +1,7 @@
+dist/
+node_modules/
+__pycache__/
+raw.json
+data.json
+board.html
+simple.html

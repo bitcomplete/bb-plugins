@@ -1,0 +1,3 @@
+{"gates":[{"id":"sage-migrations","label":"Sage migration numbering (V267–V272) and merge order unsettled","repo":"parsleyhealth/parsley-monorepo","prs":[419,557,561,565,582,587,627]},
+{"id":"claims-coverage-contract","label":"claims-service #201 and unified API must serve the coverage contract in staging and production","repo":"parsleyhealth/parsley-monorepo","prs":[627,628],"group":"Verified coverage saves (EPD-4369)"},
+{"id":"billing-staging-schema","label":"Staging must serve the billing document fields before CI can pass","repo":"parsleyhealth/parsley-monorepo","prs":[564]}]}

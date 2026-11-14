@@ -1,0 +1,2 @@
+## Stopping point: Prepare
+Commit your changes locally in your worktree and stop there. Do NOT push. Do not post, reply, resolve, approve or comment anything on GitHub, and do not request or re-request reviews. Instead, put the replies you would post in your report, one per review thread, so Matt can read them before anything goes out. Keep the worktree in place so the commits can be pushed later, and give its path in the report.
