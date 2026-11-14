@@ -112,7 +112,14 @@ export function currentStoredGate(gate: unknown, pull: EntitySnapshot): StoredGa
 export function assessedGate(store: AssessmentStore, binding: Binding, pull: EntitySnapshot, at: number, bigDecisions: readonly BigDecision[] = [], forceMark?: DecideMark): PrGate {
   const row = store.assessment(binding.id);
   const known = storedPullGate(row?.gate, pull);
-  const mark: DecideMark = forceMark ?? known?.decision ?? decideForPull(pull.pull?.files ?? null, bigDecisions);
+  // BB-322 owner review: the stored decide mark is reused only while the head
+  // is unchanged. A push can add a file that moves the pull between the owner's
+  // and the project steward's lane, so a moved head re-derives the mark from
+  // the snapshot's files. A caller without the decide list then gets the
+  // owner's mark (fail closed), never a stale `project` that a recorded project
+  // approval would let a merge path act on before the next reconcile.
+  const sameHead = known !== null && known.headSha === (pull.pull?.headSha ?? null);
+  const mark: DecideMark = forceMark ?? (sameHead ? known!.decision : decideForPull(pull.pull?.files ?? null, bigDecisions));
   const projectApprovals = store.projectApprovals(binding.id);
   const key = gateInputKey(binding, pull, mark, projectApprovals);
   // Reuse the stored answer only when it is for this pull request's current

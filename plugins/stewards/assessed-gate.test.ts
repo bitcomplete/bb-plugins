@@ -11,6 +11,7 @@ import { assessedGate, assessedPullGate } from "./assessed-gate.js";
 import { parsePlaybook, type Playbook } from "./config.js";
 import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { approvalMarkerLine, type PrGate } from "./gate.js";
+import type { BigDecision } from "./decisions.js";
 import { MIGRATIONS, createStore, readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import type { EntitySnapshot } from "./source-contract.js";
@@ -147,6 +148,35 @@ describe("the single stored-gate read (BB-322)", () => {
     // stale and must not count.
     const moved = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [noReviewMarker] }, { headSha: "ccccccc3", checks: { state: "pending", failing: [] } });
     expect(assessedGate(s, b, moved, i.now + 1)).toMatchObject({ gateMet: false, headSha: "ccccccc3" });
+  });
+
+  // BB-322 owner review: a push can add a file that moves the pull from the
+  // project steward's lane to the owner's. The stored mark must not survive the
+  // head move, or a recorded project approval would let a merge path act on a
+  // change the owner should approve.
+  it("re-derives the decide mark from the changed files when the head moves", () => {
+    const { s, b } = store();
+    const decisions: BigDecision[] = [
+      { text: "A user entry", decide: "user", paths: ["bb-gate/hooks/hooks.go"] },
+      { text: "A project entry", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    ];
+    const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: head, ...green, files: ["bb-gate/docs/hooks.md"] });
+    s.recordProjectApproval({ bindingId: b.id, headSha: head, entry: null, byThread: "thr_project", commentId: "pa1", verdict: "approved" });
+    const i = input({
+      binding: binding({ id: b.id, kind: "review" }),
+      observed: { entity: issue({ state: "In Progress" }), pulls: [entity] },
+      ownPulls: own(entity),
+      decisions: new Map([["acme/web#7", "project"]]),
+      projectApprovals: s.projectApprovals(b.id),
+      workers: [parkedWorker()],
+    });
+    storeAssessment(s, i);
+    expect(assessedGate(s, b, entity, i.now, decisions)).toMatchObject({ gateMet: true, decision: "project" });
+    // The head moves and the changed files now match a `user` entry: the mark
+    // is re-derived, the recorded project approval no longer counts, and the
+    // gate is not met.
+    const moved = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: "ccccccc3", ...green, files: ["bb-gate/hooks/hooks.go"] });
+    expect(assessedGate(s, b, moved, i.now + 1, decisions)).toMatchObject({ gateMet: false, decision: "user" });
   });
 
   it("covers a project-mark approved pull, with a parked worker and a second open own pull", () => {
