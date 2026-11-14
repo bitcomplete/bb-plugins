@@ -947,6 +947,53 @@ describe("a Linear ticket steward", () => {
     expect(result.bindings[0]!.reviewers).toBeUndefined();
   });
 
+  // BB-323: the printed reviewer command drops `--parent-self`, so a reviewer
+  // has no parent and names only its worker as lifecycle owner. It is
+  // recognized from that owner, tagged, superseded and never validated as a
+  // worker; a steward-owned or steward-parented thread is still validated.
+  it("recognizes a parentless reviewer by its lifecycle owner, never validates it, and supersedes it", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const binding = t.hooks.store.open("p1")[0]!.id;
+    const stopped = () => t.harness.sdk.callsTo("threads.stop").map(([args]) => (args as { threadId: string }).threadId);
+
+    await t.created("thr_w1", steward);
+    // The reviewer names only its lifecycle owner, with a model that
+    // validation would stop, so a missed recognition is visible.
+    await t.createdReviewer("thr_r1", "thr_w1", "Review round 1", { model: "claude-sonnet-5-5" });
+    expect(t.metadata.get("thr_r1")).toEqual({ threadBriefs: false });
+    expect(t.hooks.store.worker("thr_r1")).toBeNull();
+    expect(stopped()).not.toContain("thr_r1");
+
+    // A newer round supersedes the older parentless reviewer.
+    await t.createdReviewer("thr_r2", "thr_w1", "Review round 2");
+    expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
+    expect(t.threads.get("thr_r2")!.archivedAt).toBeNull();
+
+    // The parented form is unchanged: a newer child supersedes the parentless
+    // one, and is itself never validated.
+    await t.created("thr_r3", "thr_w1", "Review round 3", { model: "claude-sonnet-5-5" });
+    expect(t.threads.get("thr_r2")!.archivedAt).not.toBeNull();
+    expect(t.threads.get("thr_r3")!.archivedAt).toBeNull();
+    expect(t.hooks.store.worker("thr_r3")).toBeNull();
+
+    // A parentless thread whose lifecycle owner is a steward is still a worker,
+    // and a steward-parented thread on the wrong model is still stopped.
+    await t.createdOwned("thr_w2", steward);
+    expect(t.hooks.store.worker("thr_w2")).toMatchObject({ bindingId: binding, status: "running" });
+    await t.created("thr_bad", steward, "ENG-12: Implement", { model: "claude-sonnet-5-5" });
+    expect(t.hooks.store.worker("thr_bad")!.status).toBe("stopped");
+    expect(stopped()).toContain("thr_bad");
+
+    // A thread whose parent is a worker but whose lifecycle owner is the
+    // steward is still validated as a worker, not skipped as a reviewer.
+    await t.created("thr_weird", "thr_w1", "ENG-12: Implement", { lifecycleOwnerThreadId: steward, model: "claude-sonnet-5-5" });
+    expect(t.hooks.store.worker("thr_weird")!.status).toBe("stopped");
+    expect(stopped()).toContain("thr_weird");
+  });
+
   it("keeps a running worker's own pull request activity for the next turn instead of waking for it", async () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
@@ -4384,6 +4431,29 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     await t.created("thr_r2", "thr_w1", "Review round 2");
     expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
     expect(t.threads.get("thr_r2")!.archivedAt).toBeNull();
+  });
+
+  it("keeps a worker whose parentless reviewer is still unarchived, and archives it once the reviewer is (BB-323)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.createdReviewer("thr_r1", "thr_w1", "Review round 1");
+
+    // The worker ends its turn without a waiting phrase while its parentless
+    // reviewer still runs: the reviewer is not a descendant, but it keeps the
+    // worker unarchived (bb would archive its lifecycle tree with it).
+    t.threads.get("thr_r1")!.status = "active";
+    await t.idle("thr_w1", "Spawned the reviewer.");
+    expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+
+    // The reviewer is consumed, and the worker's next turn ends: both leave.
+    t.threads.get("thr_r1")!.status = "idle";
+    await t.idle("thr_w1", "Addressed the review and pushed.");
+    expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
   });
 
   it("archives a finished worker after the reconcile that consumed its report, unless it needs the user", async () => {
@@ -13549,11 +13619,12 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(missing.exitCode).toBe(1);
     expect(missing.stderr).toMatch(/No reviewer model/u);
 
-    // The worker default is unchanged.
+    // The worker default is unchanged, and keeps `--parent-self`.
     const worker = await t.harness.behavior.runCli(["spawn-flags", "ENG-12", "--project", "p1"]);
     expect(worker.stdout).toContain("--model claude-opus-5-5");
     expect(worker.stdout).not.toContain("--visibility hidden");
     expect(worker.stdout).not.toContain("--permission-mode");
+    expect(worker.stdout).toContain("--parent-self");
 
     // A playbook reviewer model, then a binding override, both read back.
     t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("  worker: claude/claude-opus-5-5/high", "  worker: claude/claude-opus-5-5/high\n  reviewer: pi/fireworks/accounts/fireworks/models/glm-5p3");
@@ -13563,6 +13634,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(reviewer.stdout).toContain("--visibility hidden --permission-mode full");
     expect(reviewer.stdout).toContain("--provider pi --model fireworks/accounts/fireworks/models/glm-5p3");
     expect(reviewer.stdout).toContain('--title "Review ENG-12: <task>"');
+    // BB-323: the reviewer keeps the worker as lifecycle owner and has no
+    // parent, so it can run from an active worker.
+    expect(reviewer.stdout).toContain('--lifecycle-owner-thread "$BB_THREAD_ID"');
+    expect(reviewer.stdout).not.toContain("--parent-self");
 
     const update = await t.tool("steward_update", { binding: "ENG-12", reviewerModel: "pi/fireworks/accounts/fireworks/models/other-reviewer" }, t.spawns[0]!.id);
     expect(update.error, update.text).toBe(false);
@@ -13594,6 +13669,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(out.exitCode).toBe(0);
     expect(out.stdout).toContain('--title "Review ENG-12: <task>"');
     expect(out.stdout).toContain("--visibility hidden --permission-mode full");
+    expect(out.stdout).not.toContain("--parent-self");
   });
 
   it("prints the gate verdict and exits 0 when met, 1 when not, with --json", async () => {

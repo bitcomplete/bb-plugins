@@ -3563,7 +3563,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * The binding a newly created thread belongs to: a worker's lifecycle owner
      * or parent when that is a steward, or the steward of the worker a reviewer
-     * is a child of. Null for a thread this plugin does not own. Local store
+     * follows. A reviewer names its worker as lifecycle owner (BB-323, no
+     * parent) or, from an older worker, as parent, so the same walk finds it
+     * either way. Null for a thread this plugin does not own. Local store
      * lookups only, so an unrelated thread costs nothing.
      */
     function spawnedOwner(thread: { lifecycleOwnerThreadId: string | null; parentThreadId: string | null }): Binding | null {
@@ -3696,26 +3698,53 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The worker a thread is a child of, if any. A reviewer is spawned with
-     * its worker as parent (`--parent-self`, what build-tickets uses). Null
-     * for a worker itself and for anything else.
+     * The worker a reviewer belongs to, if any. A reviewer is started from the
+     * worker thread it reviews for, which is its lifecycle owner (BB-323, the
+     * printed command, no parent) or, from an older worker, its parent
+     * (`--parent-self`). Recognized only from the store's own record: a
+     * parentless thread counts as a reviewer only when its lifecycle owner is a
+     * worker of an open binding, never from the missing parent alone. Null for
+     * a worker itself and for anything else.
      */
-    function reviewerOwner(thread: { parentThreadId: string | null }): Worker | null {
-      return thread.parentThreadId === null ? null : store.worker(thread.parentThreadId);
+    function reviewerOwner(thread: { lifecycleOwnerThreadId: string | null; parentThreadId: string | null }): Worker | null {
+      if (thread.parentThreadId !== null) {
+        const parent = store.worker(thread.parentThreadId);
+        if (parent !== null) return parent;
+      }
+      if (thread.parentThreadId !== null || thread.lifecycleOwnerThreadId === null) return null;
+      const owner = store.worker(thread.lifecycleOwnerThreadId);
+      if (owner === null) return null;
+      const binding = store.binding(owner.bindingId);
+      return binding !== null && binding.endedAt === null ? owner : null;
     }
 
     /**
-     * A worker's reviewer threads, as bb lists them: its children, hidden or
+     * A worker's reviewer threads, as bb lists them: its children and the
+     * parentless threads that name it as lifecycle owner (BB-323), hidden or
      * not, not archived. Null when bb could not be asked, so a caller that must
      * not guess — archiving a worker that might still have a reviewer — can
      * tell "none" from "unknown". Kept per worker for the two reconcile paths
-     * that need a reviewer's own status or its direct-children relationship;
-     * the batch paths use `descendantsOfMany` (BB-100).
+     * that need a reviewer's own status or its direct relationship; the batch
+     * paths use `descendantsOfMany` (BB-100).
      */
     async function reviewersOf(workerThreadId: string): Promise<Array<{ id: string; status: string }> | null> {
       try {
         const children = await bb.sdk.threads.list({ parentThreadId: workerThreadId, includeHidden: true });
-        return children.filter((c) => c.archivedAt === null).map((c) => ({ id: c.id, status: String(c.status) }));
+        // bb has no lifecycle-owner filter, so a parentless reviewer is found
+        // by reading the worker's project's root threads. A worker the store
+        // does not know owns no such reviewer and costs no second read.
+        const owner = store.worker(workerThreadId);
+        const binding = owner === null ? null : store.binding(owner.bindingId);
+        const roots = binding === null ? [] : await bb.sdk.threads.list({ projectId: binding.projectId, hasParent: false, includeHidden: true });
+        const seen = new Set<string>();
+        const out: Array<{ id: string; status: string }> = [];
+        for (const t of [...children, ...roots]) {
+          if (t.archivedAt !== null || seen.has(t.id)) continue;
+          if (t.parentThreadId !== workerThreadId && !(t.parentThreadId === null && t.lifecycleOwnerThreadId === workerThreadId)) continue;
+          seen.add(t.id);
+          out.push({ id: t.id, status: String(t.status) });
+        }
+        return out;
       } catch (error) {
         bb.log.warn(`stewards: could not list the reviewers of worker ${workerThreadId}: ${errorMessage(error)}`);
         return null;
@@ -3793,13 +3822,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * Archive the given finished workers unless one still has an unarchived
-     * child. A worker whose reviewer is still unarchived must stay: bb core
-     * releases a thread's unarchived children from it when it is archived,
-     * so archiving the worker would clear the reviewer's parent: it could
-     * no longer wake the worker, and no later pass could find it to archive
-     * it. One batched descendant lookup covers every candidate (BB-100); a
-     * listing that failed is "unknown", so all the workers wait rather than
-     * risking an orphan (BB-47).
+     * reviewer. A worker whose reviewer is still unarchived must stay: bb core
+     * archives a thread's whole lifecycle tree with it, and releases its
+     * unarchived children, so archiving the worker would take a parentless
+     * reviewer down with it and clear a parented reviewer's parent: neither
+     * could wake the worker, and no later pass could find it to archive it.
+     * One batched descendant lookup covers every candidate (BB-100), and a
+     * parentless reviewer is not a descendant, so the worker's live reviewers
+     * are read through `reviewersOf` as well; a listing that failed is
+     * "unknown", so all the workers wait rather than risking an orphan
+     * (BB-47).
      */
     async function archiveWorkers(candidates: readonly Worker[]): Promise<void> {
       if (candidates.length === 0) return;
@@ -3807,6 +3839,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (descendants === null) return;
       for (const w of candidates) {
         if ((descendants.get(w.threadId) ?? []).length > 0) continue;
+        // A reviewer with only a lifecycle owner is not a descendant (BB-323);
+        // a failed lookup is "unknown", so the worker waits too.
+        const reviewers = await reviewersOf(w.threadId);
+        if (reviewers === null || reviewers.length > 0) continue;
         const info = await threadInfo(w.threadId).catch(() => null);
         if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) continue;
         await quietly(`archive finished worker ${w.threadId}`, () => bb.sdk.threads.archive({ threadId: w.threadId }));
@@ -8444,7 +8480,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // recognized here through their lifecycle owner or their parent (the
     // steward) rather than a tool of their own. A worker an older steward left
     // with only the lifecycle owner is still recognized, and a nested worker
-    // is never taken for a reviewer: a reviewer's parent is a worker.
+    // is never taken for a reviewer: a reviewer follows a worker, as its
+    // lifecycle owner (BB-323) or its parent.
 
     /**
      * The post-spawn safety net: a worker whose provider, model, reasoning
@@ -8529,14 +8566,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Stewards this plugin spawned (a promoted child under its parent) are not workers.
       if (thread.originPluginId === bb.pluginId) return;
       // A worker (its lifecycle owner or parent is a steward) or a reviewer (a
-      // child of a worker) is tagged for thread-briefs here, whichever way the
-      // skill that spawned it built the command.
+      // worker as lifecycle owner or parent) is tagged for thread-briefs here,
+      // whichever way the skill that spawned it built the command.
       if (spawnedOwner(thread) !== null) await tagThread(thread.id, THREAD_BRIEFS_OFF);
-      // A reviewer is a child of a worker. The newest round supersedes the
-      // older ones, so they are archived as it is created (BB-47).
-      const reviewerOf = reviewerOwner(thread);
-      if (reviewerOf !== null) await supersedeOlderReviewers(reviewerOf.threadId, thread.id);
+      // A reviewer follows a worker, as its lifecycle owner (BB-323) or its
+      // parent. The newest round supersedes the older ones, so they are
+      // archived as it is created (BB-47).
       const owner = [thread.lifecycleOwnerThreadId, thread.parentThreadId].map((t) => (t === null ? null : store.byThread(t))).find((b) => b !== null && b !== undefined && b.endedAt === null);
+      const reviewerOf = reviewerOwner(thread);
+      if (reviewerOf !== null) {
+        await supersedeOlderReviewers(reviewerOf.threadId, thread.id);
+        // A reviewer is never a worker, unless its lifecycle owner or parent is
+        // an open binding's steward: then it is still filed and validated as a
+        // worker.
+        if (owner === undefined || owner === null) return;
+      }
       if (owner === undefined || owner === null || store.worker(thread.id) !== null) return;
       const limit = (await settings.get()).workerSpawnsPerHour;
       const runaway = store.spawnsSince(owner.id, now() - 3_600_000) >= limit;
@@ -13288,17 +13332,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           "spawn-flags": cliCommand({
             summary: "The full runnable `bb thread spawn` command for a steward's workers or a worker's reviewer, from the playbook's model and the project environment",
-            description: "Use these flags as they are: they are the playbook's, not the steward's to choose. Defaults to the binding of the invoking thread. `--role reviewer` is run from the worker thread that owns the pull request, so `--parent-self` makes the reviewer that worker's child; it needs `models.reviewer` in the playbook or a binding override.",
+            description: "Use these flags as they are: they are the playbook's, not the steward's to choose. Defaults to the binding of the invoking thread. `--role reviewer` is run from the worker thread that owns the pull request, with that worker as the reviewer's lifecycle owner and no parent (BB-323); it needs `models.reviewer` in the playbook or a binding override.",
             positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
             options: { project: PROJECT_OPTION, role: { type: "string", description: "worker (the default) or reviewer" } },
             async run(input, ctx) {
               const role = input.options.role ?? "worker";
               if (role !== "worker" && role !== "reviewer") throw new PluginCliError(`Unknown role ${JSON.stringify(role)}: worker or reviewer.`, { code: "bad_role" });
-              // A reviewer is spawned with `--parent-self` from the worker it
-              // reviews for, so the command only makes sense from that worker's
-              // thread; from a steward it would parent the reviewer to the
-              // steward and the plugin would stop it as a mis-spawned worker.
-              if (role === "reviewer" && ctx.threadId !== undefined && store.worker(ctx.threadId) === null) throw new PluginCliError("`--role reviewer` is run from the worker thread that owns the pull request, so the reviewer is that worker's child; run it there.", { code: "reviewer_not_from_worker" });
+              // A reviewer is started from the worker it reviews for and takes
+              // that worker as its lifecycle owner, so the command only makes
+              // sense from that worker's thread; from a steward the reviewer
+              // would follow the steward and the plugin would stop it as a
+              // mis-spawned worker.
+              if (role === "reviewer" && ctx.threadId !== undefined && store.worker(ctx.threadId) === null) throw new PluginCliError("`--role reviewer` is run from the worker thread that owns the pull request, so the reviewer follows that worker; run it there.", { code: "reviewer_not_from_worker" });
               const b = bindingFromCli(input.positionals.binding, input.options.project, ctx, { worker: true });
               const config = await loadConfig(b.projectId);
               const playbook = config === null ? null : bindingPlaybook(config, b);

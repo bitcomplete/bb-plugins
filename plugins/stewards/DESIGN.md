@@ -628,7 +628,8 @@ tuning it against the BB and bithub stewards is a follow-up, not this design.
 
 A worker is recognized by the `thread.created` handler by its lifecycle
 owner or its parent — whichever the skill that spawned it set — and never as
-a reviewer, which is a child of a worker. Before
+a reviewer, which follows a worker as its lifecycle owner (BB-323) or its
+parent. Before
 the runaway guard, the handler compares the worker's provider, model,
 reasoning level and environment provider with the playbook's `models.worker`
 (or the binding's override) and the project's environment. On a mismatch it
@@ -1059,7 +1060,10 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   --parent-self --parent-notifications off --lifecycle-owner-thread
   "$BB_THREAD_ID" …`; the plugin recognizes them by
   that owner or their parent, and a worker an older steward left with only the
-  owner is still recognized. `parentNotifications: off` keeps a worker's
+  owner is still recognized. A reviewer is started from its worker with that
+  worker as lifecycle owner and no parent (BB-323), because bb core refuses a
+  child for an active Pi parent; the plugin recognizes it by that owner or its
+  parent. `parentNotifications: off` keeps a worker's
   finish from waking the steward: its final message arrives in the next wake,
   which lists finished workers. The worker nests under its steward's row,
   because bb's list trees by parent thread. A finished worker's thread is archived once the reconcile that
