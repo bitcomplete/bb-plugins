@@ -41,8 +41,10 @@ export const WAIT_REFUSALS = ["unknown_kind", "missing_reference", "malformed_re
 export type WaitRefusal = (typeof WAIT_REFUSALS)[number];
 
 const LINEAR_KEY = /^[A-Za-z][A-Za-z0-9]*-\d+$/u;
-const WORKER_THREAD = /^thr_[A-Za-z0-9]+$/u;
-const PAGE_ITEM = /^(?:need|esc|qst)_[A-Za-z0-9]+$/u;
+// Plugin ids are `newId`: a prefix and 9 random bytes as base64url, so the
+// suffix may contain `-` and `_`.
+const WORKER_THREAD = /^thr_[A-Za-z0-9_-]+$/u;
+const PAGE_ITEM = /^(?:need|esc|qst)_[A-Za-z0-9_-]+$/u;
 
 /** Whether `ref` is a binding entity key: a Linear key (ENG-12) or a pull request key (owner/repo#N). */
 export function isEntityKey(ref: string): boolean {

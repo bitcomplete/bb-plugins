@@ -67,6 +67,13 @@ describe("the typed wait: the closed kind set", () => {
     expect(isEntityKey("acme/web#7")).toBe(true);
     expect(isEntityKey("not a key")).toBe(false);
   });
+
+  it("accepts a base64url page-item or worker id", () => {
+    // `newId` produces 9 random bytes as base64url, so the suffix can hold `-` and `_`.
+    expect(v("person", "qst_7bXtzENlTTc_")).toMatchObject({ ok: true, wait: { kind: "person", ref: "qst_7bXtzENlTTc_" } });
+    expect(v("person", "esc_WRoXHJxRrNPZ")).toMatchObject({ ok: true });
+    expect(v("worker", "thr_ab-cd_ef")).toMatchObject({ ok: true, wait: { kind: "worker", ref: "thr_ab-cd_ef" } });
+  });
 });
 
 describe("the typed wait: the downgrade to external", () => {
