@@ -141,7 +141,18 @@ export function assess(input: AssessmentInput): Assessment {
   const { binding, observed, ownPulls, decisions, projectApprovals, workers, escalations, needs, sources, playbook, currentSpecHash, now } = input;
   const pulls: AssessedGate[] = [];
   for (const e of ownPullEntities(observed, ownPulls)) {
-    const g = prGate(e, { decision: decisions.get(lc(e.key)) ?? "user", projectApprovals, ...productGateOptions(binding, e) });
+    const mark = decisions.get(lc(e.key)) ?? "user";
+    const options = { decision: mark, projectApprovals, ...productGateOptions(binding, e) };
+    const probe = prGate(e, options);
+    // BB-321: the decide list places the pull request, but the project steward
+    // may forward a `project` entry's approval escalation to the owner
+    // (BB-192). The owner's unsigned approval is then the gate, so a gate that
+    // still demanded a project-steward approval would be stricter than the
+    // lane rules. The escalation is resolved once the owner answers and is no
+    // longer in the rows the reconcile holds, so the approval it produced is
+    // the fact that remains. A recorded project-steward approval keeps the
+    // pull request the project steward's.
+    const g = mark === "project" && probe.ownerApproved && !probe.projectApproved ? prGate(e, { ...options, decision: "user" }) : probe;
     pulls.push({
       pull: e.key,
       met: g.gateMet,

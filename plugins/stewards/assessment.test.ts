@@ -29,6 +29,8 @@ const green = { checks: { state: "success", failing: [] } };
 const noReviewMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 const ownerMarker = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 const projectApprovalMarker = (id: string) => comment({ id, author: "trotterdylan", body: approvalMarkerLine({ sha: head, entry: null, verdict: "approved" }), signedBy: "thr_project", createdAt: "2026-10-14T16:10:00Z" });
+// The owner's unsigned approval, as the Stewards page posts it (BB-279).
+const ownerUnsignedApproval = comment({ id: "oa", author: "jane", body: `Approved ${head} from the Stewards page`, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
 
 const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
@@ -176,6 +178,38 @@ describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
     const a = assess(i);
     // No recorded approval, so the full gate is unmet too: no divergence.
     expect(a.gate.pulls[0].met).toBe(false);
+    expect(compare(i, a).find((x) => x.surface === "approvals.gate")).toBeUndefined();
+  });
+
+  // BB-321: bb-plugins#330 (BB-300). The decide list placed the huddle
+  // migration under the store-migration `project` entry, but the project
+  // steward forwarded the approval escalation to the owner (BB-192), who
+  // approved unsigned; the merge path counted that approval. The assessment
+  // must not demand a project-steward approval the owner already gave, or the
+  // shadow is stricter than the lane rules and logs a false divergence.
+  it("agrees when the owner approved a project-placed pull the project steward forwarded (BB-321)", () => {
+    const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, ownerUnsignedApproval] }, { headSha: head, ...green });
+    const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
+    const i = input({
+      observed: { entity: issue({ state: "In Progress" }), pulls: [entity, second] },
+      ownPulls: own(entity, second),
+      decisions: new Map([
+        [entity.key.toLowerCase(), "project"],
+        [second.key.toLowerCase(), "project"],
+      ]),
+      // The binding's three recorded project approvals are for the sibling
+      // pulls; none is a `bb-approval` on #330, which carries no marker.
+      projectApprovals: [
+        { commentId: "pa-327", verdict: "approved" },
+        { commentId: "pa-328", verdict: "approved" },
+        { commentId: "pa-329", verdict: "approved" },
+      ],
+      workers: [parkedWorker()],
+    });
+    const a = assess(i);
+    expect(a.gate.pulls[0]).toMatchObject({ pull: "acme/web#7", met: true, decision: "user", ownerApproved: true, projectApproved: false, lane: "owner-reviewed" });
+    // The old gate (no decide mark, no recorded approvals) also says met, so
+    // the anomalous `met → project steward approval needed` divergence is gone.
     expect(compare(i, a).find((x) => x.surface === "approvals.gate")).toBeUndefined();
   });
 });
