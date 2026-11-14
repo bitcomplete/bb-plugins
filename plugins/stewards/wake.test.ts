@@ -252,7 +252,7 @@ describe("a steward's wake", () => {
   it("names a worker's question ahead of every other change, with how to answer", () => {
     const wake = formatWake(
       wakeInput({
-        workers: [{ threadId: "thr_w1", bindingId: "b1", title: "Implement", status: "finished", result: "Should I bring the reviewer back?", startedAt: T, endedAt: T, modelCheckPending: false, stopReason: null }],
+        workers: [{ threadId: "thr_w1", bindingId: "b1", title: "Implement", status: "finished", result: "Should I bring the reviewer back?", startedAt: T, endedAt: T, modelCheckPending: false, stopReason: null, parkedWaitingOn: null }],
         workerQuestions: [{ threadId: "thr_w1", question: "Should I bring the reviewer back?", state: "live" }],
         changes: ["1 new comment from Sam"],
       }),
@@ -275,6 +275,13 @@ describe("the worker finish note (BB-152)", () => {
     expect(note.length).toBeLessThan(600);
     expect(note).toContain("line one line two");
     expect(note).toContain("…");
+  });
+
+  // BB-329: the park is the worker's own `worker_park` call, named on the note.
+  it("names the worker's explicit park, from the tool call and not its text", () => {
+    expect(workerFinishNote("ENG-12: Implement", "Done.", false, "the reviewer")).toBe('Worker "ENG-12: Implement" finished its turn. It parked, waiting on the reviewer. Its final message: Done.');
+    // The same final text without the park is a plain finish.
+    expect(workerFinishNote("ENG-12: Implement", "Waiting on the reviewer.", false)).toBe('Worker "ENG-12: Implement" finished its turn. Its final message: Waiting on the reviewer.');
   });
 
   it("prompts the steward when its waitingOn named the worker", () => {

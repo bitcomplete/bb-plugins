@@ -146,29 +146,6 @@ export function workerQuestion(result: string | null): string | null {
   return null;
 }
 
-/**
- * Whether a worker's final message reports an error the steward must see. A
- * turn that failed outright comes through `thread.failed`; this catches a
- * worker that ended its turn with an error it could not get past (BB-52 rule
- * 3). Only an explicit marker at the start of a line counts, so a normal
- * report that mentions an error it fixed is not one.
- */
-const ERROR_REPORT = /^\s*(?:error|failed|failure|exception|traceback)\b\s*[:—-]\s*\S|^\s*(?:I (?:could not|couldn't|was unable to)|Unable to)\b/imu;
-export function workerReportedError(result: string | null): boolean {
-  return result !== null && ERROR_REPORT.test(result);
-}
-
-/**
- * Whether a worker's final message says it is parked waiting on something
- * outside it (a reviewer, the owner, a build, a GitHub watch). Such a worker
- * is left in flight rather than archived: its watch can wake it again, and
- * its own pull request's activity stays quiet (BB-52 rule 3).
- */
-const WAITING = /\b(?:waiting|awaits?|awaiting|parked|standing by)\b/iu;
-export function workerWaiting(result: string | null): boolean {
-  return result !== null && WAITING.test(result);
-}
-
 /** How much of a worker's final message its finish note carries (BB-152). */
 export const FINISH_REPORT_CHARS = 500;
 
@@ -179,15 +156,18 @@ export const FINISH_REPORT_CHARS = 500;
  * the note is then the hand-off prompt, and the server queues it loud, so the
  * steward is woken at once and told to check whether what it waited on (a
  * merge, an apply) happened rather than to wait on the finished worker again.
+ * `parkedWaitingOn` is the worker's own `worker_park` note (BB-329): the wait
+ * is named from the tool call, never from the final text.
  */
-export function workerFinishNote(title: string, result: string | null, waitedOn: boolean): string {
+export function workerFinishNote(title: string, result: string | null, waitedOn: boolean, parkedWaitingOn: string | null = null): string {
   const report = result === null ? "" : oneLine(result, FINISH_REPORT_CHARS);
   const said = report === "" ? "" : ` Its final message: ${report}`;
-  if (!waitedOn) return `Worker "${title}" finished its turn.${said}`;
+  const parked = parkedWaitingOn === null ? "" : ` It parked, waiting on ${parkedWaitingOn}.`;
+  if (!waitedOn) return `Worker "${title}" finished its turn.${parked}${said}`;
   return (
     `Worker "${title}" finished its turn while you were waiting on it. ` +
     `Check whether what you waited on (a merge, an apply) happened; if not, do it yourself (post the gate on the pull request, then merge it with \`gh pr merge\`) or escalate. ` +
-    `Do not re-wait on this worker.${said}`
+    `Do not re-wait on this worker.${parked}${said}`
   );
 }
 

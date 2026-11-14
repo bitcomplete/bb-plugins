@@ -565,6 +565,13 @@ export const DEPS_DECISION_MIGRATIONS = [
 // archive case, and a pre-migration build never reads the column.
 export const WORKER_STOP_REASON_MIGRATIONS = [`ALTER TABLE workers ADD COLUMN stop_reason TEXT`];
 
+// BB-329: the worker's explicit parked state. `parked_waiting_on` is the
+// `waitingOn` the worker's own `worker_park` tool call recorded; null is not
+// parked. It is set only by that tool and cleared when the worker's next turn
+// starts (`setWorker` to `running`). Additive and nullable: an old row reads
+// as not parked, and a pre-migration build never reads the column.
+export const WORKER_PARK_MIGRATIONS = [`ALTER TABLE workers ADD COLUMN parked_waiting_on TEXT`];
+
 // BB-251: a recorded assumption. A steward that proceeds under a question the
 // guidance does not settle records it here instead of asking (which blocks) or
 // deciding silently (which is invisible). It is not a user item: it files no
@@ -726,7 +733,7 @@ export const STANDUP_COMPLETED_MIGRATIONS = [`ALTER TABLE standups ADD COLUMN co
 // a store from before the step reads back exactly as before.
 export const ALERTMANAGER_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN alertmanager_look TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS];
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1533,7 +1540,7 @@ export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
  * already-stopped worker is fixed by the upgrade.
  */
 export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | "misspawn";
-export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null };
+export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null; /** BB-329: the `waitingOn` the worker's own `worker_park` call recorded, or null when it did not park. Cleared when its next turn starts. */ parkedWaitingOn: string | null };
 
 /** The sidebar's ended-list row (BB-294): the columns it renders, never `lastSnapshot`. `url` is added for the board's ended list (BB-295). */
 export type EndedBindingRow = { key: string; url: string | null; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number };
@@ -1796,6 +1803,13 @@ export function createStore(db: Database.Database, now: () => number, options: S
   let setWorkerStmt: Database.Statement<[string, string | null, number | null, WorkerStopReason | null, string], unknown> | null = null;
   const setWorker = () => (setWorkerStmt ??= db.prepare<[string, string | null, number | null, WorkerStopReason | null, string], unknown>("UPDATE workers SET status = ?, result = ?, ended_at = ?, stop_reason = ? WHERE thread_id = ?"));
   const setWorkerModelCheckPending = db.prepare("UPDATE workers SET model_check_pending = ? WHERE thread_id = ?");
+  // BB-329: the worker's own park call, and the clear on its next turn. Both
+  // are prepared on first use so a legacy store without the column is opened
+  // by the migration tests before either runs.
+  let parkWorkerStmt: Database.Statement<[string, string], unknown> | null = null;
+  const setWorkerPark = () => (parkWorkerStmt ??= db.prepare<[string, string], unknown>("UPDATE workers SET parked_waiting_on = ? WHERE thread_id = ?"));
+  let clearWorkerParkStmt: Database.Statement<[string], unknown> | null = null;
+  const clearWorkerPark = () => (clearWorkerParkStmt ??= db.prepare<[string], unknown>("UPDATE workers SET parked_waiting_on = NULL WHERE thread_id = ?"));
   const insertSecretRequester = db.prepare("INSERT OR REPLACE INTO secret_requesters (thread_id, need_id, created_at) VALUES (?, ?, ?)");
   const getSecretRequester = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE thread_id = ?");
   const getSecretRequesterForNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE need_id = ? ORDER BY created_at DESC LIMIT 1");
@@ -2051,6 +2065,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     // A store from before the BB-242 column reads as no reason: the legacy
     // fallback treats it like `archived` when the binding is open.
     stopReason: r.stop_reason === null || r.stop_reason === undefined ? null : (String(r.stop_reason) as WorkerStopReason),
+    // A store from before the BB-329 column reads as not parked.
+    parkedWaitingOn: r.parked_waiting_on === null || r.parked_waiting_on === undefined ? null : String(r.parked_waiting_on),
   });
   const toSecretRequester = (r: Record<string, unknown>): SecretRequester => ({
     threadId: String(r.thread_id),
@@ -3007,6 +3023,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     setWorker(threadId: string, status: WorkerStatus, result: string | null, stopReason: WorkerStopReason | null = null): void {
       const before = getWorker.get(threadId);
       setWorker().run(status, result, status === "running" ? null : now(), stopReason, threadId);
+      // BB-329: a worker's next turn clears its park. `running` is written at
+      // the start of a turn (thread.active, a retry), never mid-turn, so this
+      // is the one clear site.
+      if (status === "running") clearWorkerPark().run(threadId);
       const w = getWorker.get(threadId);
       // A worker finishing or being stopped moves its row at once, but a repeat
       // write of the same status changes nothing visible and stays silent.
@@ -3015,6 +3035,17 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Whether the worker's model is still to be checked when its first turn is dispatched. */
     setWorkerModelCheckPending(threadId: string, pending: boolean): void {
       setWorkerModelCheckPending.run(pending ? 1 : 0, threadId);
+    },
+    /**
+     * BB-329: record the calling worker's own park. The caller (the
+     * `worker_park` tool) has already refused a non-worker thread and an ended
+     * binding; this writes only the column. A worker that parks moves its row
+     * at once, like any visible field.
+     */
+    parkWorker(threadId: string, waitingOn: string): void {
+      setWorkerPark().run(waitingOn, threadId);
+      const w = getWorker.get(threadId);
+      if (w !== undefined) projectChanged(projectIdForBinding(String(w.binding_id)), ["workers"]);
     },
 
     // provide-secret requester threads (BB-22)

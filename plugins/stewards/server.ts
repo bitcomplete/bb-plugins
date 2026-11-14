@@ -139,7 +139,7 @@ import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from 
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -3806,7 +3806,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function archiveFinishedWorkers(b: Binding): Promise<void> {
       const { questions, openIds } = needsUserInputs(b.projectId);
       if (needsUser(b, questions, openIds)) return;
-      await archiveWorkers(store.workers(b.id).filter((w) => w.status === "finished" && workerQuestion(w.result) === null && !workerWaiting(w.result)));
+      // BB-329: a plain finish (no `worker_park`) is done and archived; a
+      // parked worker is kept for its next turn, however its final text reads.
+      await archiveWorkers(store.workers(b.id).filter((w) => w.status === "finished" && w.parkedWaitingOn === null && workerQuestion(w.result) === null));
     }
 
     /**
@@ -3817,7 +3819,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * need nobody: the merge has settled their reason to stay.
      */
     async function archiveParkedWorkers(b: Binding): Promise<void> {
-      await archiveWorkers(store.workers(b.id).filter((w) => w.status === "finished" && workerQuestion(w.result) === null));
+      await archiveWorkers(store.workers(b.id).filter((w) => w.status === "finished" && w.parkedWaitingOn !== null && workerQuestion(w.result) === null));
     }
 
     /**
@@ -8196,13 +8198,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // cross-repo ticket lands the consumed repo first), so the plugin must
       // not merge out of order or retire the worker that owns the rest.
       const openOwnPulls = observedPulls(b, observed).filter((p) => (ownPulls === null || pullBelongsToTicket(b, p, ownPulls)) && p.pull?.merged !== true && lc(p.state) !== "closed");
-      // BB-329: left inline for the behaviour PR, not routed through `assessWorker`.
-      // `assessWorker(…).parked` is `!running && some(finished)`, while this
-      // captures `some(finished)` before the loop's awaits; a running worker that
-      // ends its turn inside that window would flip the answer, which is a merge
-      // path behaviour change. The explicit `parked` state in the behaviour PR
-      // reshapes it.
-      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && store.workers(b.id).some((w) => w.status === "finished");
+      // BB-329: only a worker that called `worker_park` is parked; a plain
+      // finish is done and does not own the landing order. The explicit park
+      // does not change during this look (a worker parks in its own turn, not
+      // the reconcile's awaits), so reading it from the assessment the
+      // reconcile already built is safe and saves the second `store.workers`
+      // read the refactor left inline.
+      const parkedWorkerOwnsAnother = openOwnPulls.length > 1 && (assessment?.worker.parked ?? assessWorker(store.workers(b.id)).parked);
       // BB-264: the steward's own merge holds name open bindings in this
       // project, or a stacked base pull request by its key; the plugin's
       // derived stacked-PR holds are recomputed from the base pull requests on
@@ -8707,14 +8709,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // happened and does it itself or escalates, never re-waiting on a
         // worker that is over.
         const waitedOn = finished !== null && waitingOnNamesWorker(finished.status?.waitingOn ?? null, worker);
-        // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
-        // the owner or a build is a quiet note. Only a question, an error
-        // report, a gone thread or a lost hand-off makes the turn due; a
-        // failed turn comes through thread.failed and wakes on its own. A
-        // binding following through is waiting on this worker's result, so its
-        // finish is news.
-        const needsSteward = finished !== null && (workerQuestion(result) !== null || workerReportedError(result) || followingThrough(finished) || waitedOn);
-        if (finished !== null && finished.endedAt === null) store.note(finished.id, workerFinishNote(worker.title, result, waitedOn), !needsSteward);
+        // BB-329: the park is the worker's own `worker_park` call, never a
+        // regex on its final text. A plain finish is done; a parked one is
+        // kept unarchived for its next turn.
+        const parked = worker.parkedWaitingOn !== null;
+        // BB-52 rule 3: a worker that ends its turn parked on its reviewer,
+        // the owner or a build is a quiet note. Only a question, a gone thread
+        // or a lost hand-off makes the turn due; a failed turn comes through
+        // thread.failed and wakes on its own. A binding following through is
+        // waiting on this worker's result, so its finish is news. BB-329: a
+        // final message that merely says "error" is a plain finish.
+        const needsSteward = finished !== null && (workerQuestion(result) !== null || followingThrough(finished) || waitedOn);
+        if (finished !== null && finished.endedAt === null) store.note(finished.id, workerFinishNote(worker.title, result, waitedOn, worker.parkedWaitingOn), !needsSteward);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited
         // on) have had their round consumed (BB-47).
@@ -8724,14 +8730,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // A quiet finish is consumed here, not by a wake: archive the worker
         // now (BB-47), keeping one that still has a question, a reviewer, or is
         // parked waiting on something that will wake it (BB-52 rule 3).
-        if (!needsSteward && !workerWaiting(result)) await archiveFinishedWorkers(b);
+        if (!needsSteward && !parked) await archiveFinishedWorkers(b);
         // BB-83: a worker finish asks the idle rule to look at once, without
         // the grace, since its final message is what the steward needs to read.
-        // A message that says it is waiting stays quiet as before; the idle
-        // rule still catches it after the grace if nothing else does. The
-        // reconcile evaluates the predicate on the fresh snapshot and clears
-        // this again when the binding is not idle in an active stage.
-        if (!workerWaiting(result)) store.patch(b.id, { idleWakeNow: true });
+        // A parked worker stays quiet as before; the idle rule still catches
+        // it after the grace if nothing else does. The reconcile evaluates the
+        // predicate on the fresh snapshot and clears this again when the
+        // binding is not idle in an active stage.
+        if (!parked) store.patch(b.id, { idleWakeNow: true });
         scheduleReconcile(b.id);
         return;
       }
@@ -10739,7 +10745,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // plugin set at spawn, before any binding lookup.
       if (context.pluginMetadata.role === "onboarding") return { tools: [], skills: ["onboarding"], instructions: ONBOARDING_INTRO };
       const role = roleOf(context.thread.id);
-      if (role === null) return { tools: [], skills: ["stewards"] };
+      if (role === null) {
+        // BB-329: a worker gets exactly one plugin tool, `worker_park`, so it
+        // can say it ended its turn waiting. A recorded worker, or a freshly
+        // spawned child of a steward whose `thread.created` record has not
+        // landed yet, counts; the tool itself refuses anything else.
+        const worker = store.worker(context.thread.id) !== null;
+        const parent = context.thread.parentThreadId !== null && store.byThread(context.thread.parentThreadId) !== null;
+        return worker || parent ? { tools: ["worker_park"], skills: ["stewards"] } : { tools: [], skills: ["stewards"] };
+      }
       if (role.kind === "project") {
         return {
           tools: ["steward_update"],
@@ -10986,6 +11000,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         notes: [`Assumption ${a.id} on ${where} was corrected: ${answer}. If the correction is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }.`],
       });
     }
+
+    /**
+     * BB-329: the worker's own park. One additive argument: the worker says
+     * what it ended its turn waiting on, and the plugin keeps its row
+     * unarchived and names it `parked` in the assessment. It files nothing for
+     * the user and meets no gate; the worker's next turn clears it. A
+     * non-worker thread or an ended binding is refused, never a silent no-op.
+     */
+    bb.agents.registerTool({
+      name: "worker_park",
+      description:
+        "End a worker's turn parked on something outside it: a reviewer's round, the approver, checks, a build, a deployment, the steward's answer. The plugin leaves this worker unarchived and wakes it when the thing you wait on happens. Call it as your last action before ending a turn you are not finishing; a turn that ends without it is a plain finish and the plugin treats the worker as done.",
+      presentation: { label: { pending: "Parking", completed: "Parked" } },
+      parameters: z.object({
+        waitingOn: z.string().trim().min(1).max(300).describe("What the turn waits on: a reviewer's round, the owner's approval, checks, a build, a deployment, the steward. Free text, shown on the finish note."),
+      }),
+      execute: store.coalescingTool(async (input, { threadId }) => {
+        const worker = store.worker(threadId);
+        if (worker === null) return toolError(new Error("worker_park is for a worker thread. This thread is not a worker of an open binding; a steward reports with steward_report."));
+        const b = store.binding(worker.bindingId);
+        if (b === null || b.endedAt !== null) return toolError(new Error(`${b?.entityKey ?? "This worker's binding"} has ended; there is nothing to park.`));
+        store.parkWorker(threadId, input.waitingOn);
+        return `Parked, waiting on ${input.waitingOn}. End the turn now; the plugin keeps this worker unarchived and wakes it when that happens.`;
+      }),
+    });
 
     bb.agents.registerTool({
       name: "steward_report",

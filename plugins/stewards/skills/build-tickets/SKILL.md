@@ -23,6 +23,15 @@ wait` by default). If that command is unavailable, comment the question on the
 ticket or pull request you were given and put it in your final message, then
 end the turn.
 
+**Ending a turn to wait.** When you end a turn waiting on something that will
+wake you — a reviewer's round, the approver, checks, a build, a deployment,
+the steward's answer — call `worker_park { waitingOn: "<what you wait on>" }`
+as your last action. The plugin then leaves this worker unarchived, shows it
+as parked, and wakes it when the thing happens. A turn that ends without the
+call is a plain finish: the plugin treats the worker as done and archives it,
+whatever its final message says. Do not rely on the words "waiting" or
+"parked" in your final message.
+
 The project-specific parts are the project's, not this skill's: which
 repos depend on which, each repo's test command, the restart note, the
 lane triggers and the decide list (`bigDecisions`), and the standing
@@ -278,8 +287,9 @@ Bounds: stop the loop after **six rounds** or **48 hours** without a merge.
 Comment on the ticket what is still open and the PR URL, leave the ticket
 In Review, and stop. A human can prompt the thread to continue.
 
-On an owner-reviewed PR, once the reviewer verdict is `approved`, end your
-turn with the PR waiting on the approver the decide list named: the owner,
+On an owner-reviewed PR, once the reviewer verdict is `approved`, park the
+turn (`worker_park { waitingOn: "the approver's review" }`) and end it with the
+PR waiting on the approver the decide list named: the owner,
 or the project steward when the matching entry is `decide: project`. When
 it is the owner's, the steward or a human wakes you when they review, and
 if 24 hours pass after the reviewer's approval with no human review, post
@@ -398,8 +408,9 @@ the hand-off in your final message: the PR URL and number, the lane, the
 approved sha, that the merge was refused, and that the PR is ready to merge.
 The plugin delivers that final message to the steward, and a steward whose
 `waitingOn` names you is woken at once; it merges with the same command.
-You do not merge it yourself later and you do not wait for the steward: end
-the turn after the comment and the report.
+You do not merge it yourself later and you do not wait for the steward: park
+the turn (`worker_park { waitingOn: "the steward's merge" }`), then end it
+after the comment and the report.
 
 Then stop the reviewer with `bb thread stop <reviewer-id>` and **end your
 turn**. You do not watch the release: no `gh run list`, `gh run watch` or

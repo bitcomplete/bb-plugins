@@ -98,7 +98,8 @@ export const comment = (over: Partial<SnapshotComment> = {}): SnapshotComment =>
 /**
  * A worker that has parked at the end of its turn, waiting on something that
  * will wake it (the build-tickets merge gate, a review round). `finished` is
- * the parked status, so it is still in flight for delivery (BB-279).
+ * the parked status and `parkedWaitingOn` is the explicit `worker_park` call
+ * (BB-329), so it is still in flight for delivery (BB-279).
  */
 export const parkedWorker = (over: Partial<Worker> = {}): Worker => ({
   threadId: "thr_worker",
@@ -110,6 +111,7 @@ export const parkedWorker = (over: Partial<Worker> = {}): Worker => ({
   endedAt: 2,
   modelCheckPending: false,
   stopReason: null,
+  parkedWaitingOn: "the review",
   ...over,
 });
 

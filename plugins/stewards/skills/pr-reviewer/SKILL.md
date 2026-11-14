@@ -454,3 +454,10 @@ After posting, end the turn with a one-line summary: round number,
 verdict, blocker count. The author reads the PR review, not your reply.
 If you are asked for a sixth round, review it, but add a line noting the
 loop is long and a human should look.
+
+A reviewer is not normally a worker: end the turn plainly. When the plugin
+does track this thread as a worker (a review steward spawned you), call
+`worker_park { waitingOn: "the author's next push" }` before ending, so the
+plugin keeps the thread unarchived for the next round instead of archiving
+it. An agent-authored PR's reviewer ends plainly; the author worker parks
+its own turn with `worker_park` while it waits on your verdict.

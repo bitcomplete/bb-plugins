@@ -36,7 +36,6 @@ import { isBusy } from "./sidebar.js";
 import { readyStateSchema, type Worker } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import { hasLiveWakeSource, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
-import { workerReportedError, workerWaiting } from "./wake.js";
 
 const tickets: Playbook = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -187,24 +186,6 @@ describe("the worker-busy predicates: workerInFlight vs runningWorkerReason", ()
   it("pins isBusy (BUSY) as the host thread's starting/active/stopping, and nothing else", () => {
     expect(["starting", "active", "stopping"].every(isBusy)).toBe(true);
     expect(["idle", "finished", "failed"].some(isBusy)).toBe(false);
-  });
-
-  it("pins WAITING: workerWaiting fires on waiting/awaits/awaiting/parked/standing by", () => {
-    expect(workerWaiting("Waiting on the reviewer.")).toBe(true);
-    expect(workerWaiting("It awaits the owner's approval.")).toBe(true);
-    expect(workerWaiting("Parked until the build lands.")).toBe(true);
-    expect(workerWaiting("Standing by.")).toBe(true);
-    expect(workerWaiting("Done and verified.")).toBe(false);
-    expect(workerWaiting(null)).toBe(false);
-  });
-
-  it("pins ERROR_REPORT: workerReportedError fires on a line-leading error marker, not a mention", () => {
-    expect(workerReportedError("Error: the build refused the push")).toBe(true);
-    expect(workerReportedError("Unable to reach GitHub")).toBe(true);
-    expect(workerReportedError("I could not merge it")).toBe(true);
-    expect(workerReportedError("Fixed the error: the retry now backs off")).toBe(false);
-    expect(workerReportedError("No errors here.")).toBe(false);
-    expect(workerReportedError(null)).toBe(false);
   });
 
   it("pins unheardWait: a wait on the project steward or the user with no open escalation or need", () => {
