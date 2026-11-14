@@ -14896,7 +14896,7 @@ describe("bb stewards divergences (BB-293)", () => {
     expect(rows.find((r) => r.surface === "workerInFlight")).toMatchObject({ old: "in-flight", new: "parked", count: 1 });
   });
 
-  it("swallows a failure inside the shadow assessment and keeps reconciling", async () => {
+  it("swallows a failure inside the assessment and keeps reconciling", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     // Force the assessment write to fail: the lazy prepared statement throws
@@ -14905,9 +14905,9 @@ describe("bb stewards divergences (BB-293)", () => {
     await t.ring("linear", "uuid-12");
     await t.flush();
     // The reconcile completed past the failure: the binding's snapshot was
-    // stored and the warning names the shadow assessment.
+    // stored and the warning names the assessment.
     expect(t.hooks.store.find("ENG-12")!.lastSnapshot).not.toBeNull();
-    expect(t.harness.logEntries.some((e) => e.level === "warn" && e.message.includes("shadow assessment failed"))).toBe(true);
+    expect(t.harness.logEntries.some((e) => e.level === "warn" && e.message.includes("assessment failed"))).toBe(true);
   });
 });
 

@@ -160,8 +160,13 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     expect(reconcile.sourceCalls).toBe(sourceRpcCalls() - beforeSourceRpc + githubCalls.length);
     // The pinned baseline. Update these numbers only in a child that explains
     // the change in its pull request body; never loosen them to inequalities.
-    expect(reconcile).toEqual({ storeReads: 190, sourceCalls: 12, reconciles: 4, bindings: 4 });
-    expect(wake).toEqual({ storeReads: 16, sourceCalls: 0, wakes: 1 });
+    // BB-322 lowered the reconcile reads 190 → 183: `syncPullApproval` no
+    // longer re-reads the recorded project approvals (and no longer computes a
+    // second gate) because the reconcile hands it the one assessment it just
+    // built. The wake fell 16 → 15 for the same reason: `wakeInner` reads the
+    // assessment the reconcile passed in, not `projectApprovals` again.
+    expect(reconcile).toEqual({ storeReads: 183, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 
   it("reports the pass in bb stewards stats, text and JSON (BB-297)", async () => {

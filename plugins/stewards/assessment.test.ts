@@ -67,7 +67,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     binding: binding(),
     observed: { entity: issue({ state: "In Progress" }), pulls: [] },
     ownPulls: new Set<string>(),
-    gateMetPulls: new Set<string>(),
     decisions: new Map(),
     projectApprovals: [],
     workers: [],
@@ -94,7 +93,6 @@ function bb266(secondOpen: boolean): AssessmentInput {
   return input({
     observed: { entity: issue({ state: "In Progress" }), pulls },
     ownPulls: own(...pulls),
-    gateMetPulls: new Set(["acme/web#7"]),
     decisions: new Map(pulls.map((p) => [p.key.toLowerCase(), "user" as const])),
     workers: [parkedWorker({ result: "Waiting on the owner's approval of acme/web#7." })],
     sources: { ...noSources },
@@ -148,12 +146,10 @@ describe("the shadow assessment: the worker state (BB-266)", () => {
 });
 
 describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
-  // DIVERGENCE: approvals.ts builds the gate with `prGate(pull,
-  // productGateOptions(b, pull))`, omitting `decision` and the recorded project
-  // approvals; the full gate (server.ts, wake.ts, `bb stewards gate`) passes
-  // both. On a project entry whose recorded `bb-approval` is on the pull
-  // request the full gate is met and the approvals.ts path still asks the owner.
-  it("records the approvals.gate divergence: the full gate is met, the approvals.ts gate asks the owner", () => {
+  // BB-322: the approvals.gate divergence is retired. approvals.ts now reads
+  // the stored assessment, so there is no second gate to compare against and
+  // `compare` records no gate row.
+  it("no longer records an approvals.gate divergence (BB-322 retires the surface)", () => {
     const entity = pull({ comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: head, ...green });
     const i = input({
       binding: binding({ kind: "review" }),
@@ -166,10 +162,7 @@ describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
     });
     const a = assess(i);
     expect(a.gate.pulls[0]).toMatchObject({ met: true, decision: "project", projectApproved: true, lane: "owner-reviewed" });
-    const d = compare(i, a);
-    expect(d.find((x) => x.surface === "approvals.gate")).toMatchObject({ old: "owner approval needed", new: "met" });
-    // The inputs are the ids and shas, never a comment body.
-    expect(d.find((x) => x.surface === "approvals.gate")!.inputs).toEqual({ binding: "b1", pull: "acme/web#7", headSha: head, decision: "project", recordedApprovals: 1 });
+    expect(compare(i, a).find((x) => x.surface === "approvals.gate")).toBeUndefined();
   });
 
   it("agrees when the recorded project approval is absent from the gate inputs", () => {
@@ -215,16 +208,15 @@ describe("the shadow assessment: the merge gate inputs (BB-292 #2)", () => {
 });
 
 describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
-  // DIVERGENCE: the page action's refusal falls through to its `??` fallback on
-  // a met no-review gate, so it says "the pull request has not been observed
-  // yet" while the gate answers met.
-  it("records the approvals.pageRefusal divergence on a met no-review gate", () => {
+  // BB-322: the approvals.pageRefusal divergence is retired with the page's
+  // prGate caller; the page reads the stored assessment, so `compare` records
+  // no page-refusal row.
+  it("no longer records an approvals.pageRefusal divergence (BB-322 retires the surface)", () => {
     const first = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");
     const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
     const i = input({
       observed: { entity: issue({ state: "In Progress" }), pulls: [first, second] },
       ownPulls: own(first, second),
-      gateMetPulls: new Set(["acme/web#7"]),
       decisions: new Map([
         ["acme/web#7", "user"],
         ["acme/web#8", "user"],
@@ -233,8 +225,7 @@ describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
     });
     const a = assess(i);
     expect(a.gate.pulls[0].met).toBe(true);
-    const d = compare(i, a);
-    expect(d.find((x) => x.surface === "approvals.pageRefusal")).toMatchObject({ old: "the pull request has not been observed yet", new: "met" });
+    expect(compare(i, a).find((x) => x.surface === "approvals.pageRefusal")).toBeUndefined();
   });
 });
 

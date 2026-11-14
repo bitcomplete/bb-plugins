@@ -88,7 +88,8 @@ import {
   type RolesFile,
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, type AssessmentInput } from "./assessment.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
+import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
@@ -102,7 +103,7 @@ import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPE
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, answerDiffers, anyWorkerInFlight, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, runningWorkerReason, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, placeReportedPull, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -3201,7 +3202,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         .filter((p): p is EntitySnapshot => p !== undefined && p.pull !== null && p.pull.merged !== true && lc(p.state) !== "closed")
         .filter((p) => pullBelongsToTicket(b, p, ownPulls));
       if (open.length === 0) return false;
-      const gateMet = open.every((p) => prGate(p, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, p) }).gateMet);
+      const gateMet = open.every((p) => assessedGate(store, b, p, now()).gateMet);
       return pullWatchCounts(b.kind, open.length, gateMet);
     }
 
@@ -4255,13 +4256,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** Wake the steward, spawning its thread on the first wake. */
-    async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<boolean> {
+    async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason, assessment: Assessment | null = null): Promise<boolean> {
       // BB-297: the wake's own store reads and source calls are counted
       // separately from the reconcile that may have triggered it.
-      return readCounts.runWake(() => wakeInner(b, config, playbook, observed, changes, reason));
+      return readCounts.runWake(() => wakeInner(b, config, playbook, observed, changes, reason, assessment));
     }
 
-    async function wakeInner(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<boolean> {
+    async function wakeInner(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason, assessment: Assessment | null = null): Promise<boolean> {
       const gate = gateState(playbook, b.ready, specHashFor(b, observed.entity));
       const workerQuestions = await collectWorkerQuestions(b);
       const text = formatWake({
@@ -4279,7 +4280,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         changes,
         needs: store.openNeeds(b.id),
         own: ownThreads(b),
-        projectApprovals: projectApprovalsFor(b),
+        // BB-322: the wake reads the one assessment. A reconcile that just
+        // computed it passes it in, so the wake adds no store read; any other
+        // caller reads the stored copy.
+        assessedGates: assessment !== null ? assessment.gate.pulls : storedGates(store.assessment(b.id)?.gate),
         label: config.file.label,
         conflicts: conflictsOf(b, store.open(b.projectId)),
         deployments: b.deployments,
@@ -4557,30 +4561,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * BB-293: the shadow assessment. Computed from the rows this reconcile has
-     * already read, stored beside the predicates it will replace, and compared
-     * with them. It decides nothing; the caller wraps the call in a try/catch,
-     * so a failure here can never change the reconcile's own result.
+     * BB-293/BB-322: the binding's assessment. Computed from the rows this
+     * reconcile has already read and stored for every merge-gate surface to
+     * read. BB-322 made it the consumer-facing source: the reconcile derives
+     * its own gate-met set from it and passes it to `syncNeeds`, and the
+     * page, CLI, wake and approvals read the stored copy. It is still wrapped
+     * in a try/catch by the caller so a failure cannot crash the reconcile;
+     * an absent assessment fails closed everywhere it is read.
      */
-    function recordShadowAssessment(
+    function assessBinding(
       b: Binding,
       observed: Observed,
       workers: readonly Worker[],
       ownPulls: ReadonlySet<string>,
-      gateMetPulls: ReadonlySet<string>,
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
-    ): void {
+    ): Assessment {
+      // BB-322: gate every pull request that belongs to the binding, the same
+      // set `syncNeeds` acts on, not only the worker-reported own ones. A
+      // linked pull request whose head names the ticket is the binding's even
+      // before a worker reports it, and the old surfaces computed its gate
+      // anyway; the assessment must hold it so they read it here.
+      const gatePulls = new Set(ownPulls);
+      for (const e of [observed.entity, ...observed.pulls]) {
+        if (e.pull === null || !pullBelongsToTicket(b, e, ownPulls)) continue;
+        gatePulls.add(lc(e.key));
+        if (e.url !== null) gatePulls.add(lc(e.url));
+      }
       // The decide-list mark comes from the files the snapshot already carries;
       // no extra GitHub read. Everything else is a row already in hand.
       const decisions = new Map<string, "project" | "user">();
-      for (const e of ownPullEntities(observed, ownPulls)) decisions.set(lc(e.key), decideForPull(e.pull?.files ?? null, config.file.bigDecisions));
+      for (const e of ownPullEntities(observed, gatePulls)) decisions.set(lc(e.key), decideForPull(e.pull?.files ?? null, config.file.bigDecisions));
       const input: AssessmentInput = {
         binding: b,
         observed,
         ownPulls,
-        gateMetPulls,
+        gatePulls,
         decisions,
         projectApprovals: projectApprovalsFor(b),
         workers,
@@ -4595,6 +4612,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
       store.recordDivergences(compare(input, assessment));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
+      return assessment;
     }
 
     /**
@@ -4873,24 +4891,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // diff only quiets them while one is, and the idle rule (BB-83) needs the
       // set for a binding whose worker has finished its turn.
       const ownPulls = await ownPullKeys(b, workers, observed);
+      // BB-293/BB-322: the binding's assessment, computed once from the rows
+      // above and stored. BB-322 made it the consumer-facing source: the
+      // gate-met set below and every later surface read it. A failure is
+      // logged and swallowed so the reconcile's own result never changes; an
+      // absent assessment fails closed.
+      let assessment: Assessment | null = null;
+      try {
+        assessment = assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
+      } catch (error) {
+        bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
+      }
       // BB-285: which of the binding's own pull requests are gate-met. A
       // gate-met own pull request is the plugin's to act on, so it does not
       // suppress the idle wake (BB-83) the way an open one otherwise does.
-      const gateMetPulls = new Set<string>();
-      for (const e of [observed.entity, ...observed.pulls]) {
-        if (e.pull === null) continue;
-        const own = ownPulls.has(lc(e.key)) || (e.url !== null && e.url !== "" && ownPulls.has(lc(e.url)));
-        if (!own) continue;
-        if (prGate(e, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, e) }).gateMet) gateMetPulls.add(e.key.toLowerCase());
-      }
-      // BB-293: the shadow assessment, computed from the rows above. It decides
-      // nothing; a failure is logged and swallowed so the reconcile's own
-      // result never changes.
-      try {
-        recordShadowAssessment(b, observed, workers, ownPulls, gateMetPulls, playbook, currentSpec, config);
-      } catch (error) {
-        bb.log.warn(`stewards: shadow assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
-      }
+      const gateMetPulls = new Set((assessment?.gate.pulls ?? []).filter((p) => p.met).map((p) => p.pull.toLowerCase()));
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
@@ -5001,7 +5016,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.scheduleAsked.length > 0) clear.scheduleAsked = [];
         if (Object.keys(clear).length > 0) b = store.patch(b.id, clear);
       }
-      const approvalEvents = await syncNeeds(b, observed, playbook, changes);
+      const approvalEvents = await syncNeeds(b, observed, playbook, changes, assessment);
       // BB-264: `syncNeeds` records a derived stacked-PR merge hold on the
       // binding; re-read it so the status below and the wake see the hold.
       b = store.binding(b.id) ?? b;
@@ -5125,7 +5140,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // An idle wake is a `changed` turn: there is no lifecycle instruction
       // for it, and the line under What changed is the whole wake (BB-83).
       const idleDue = lines.includes(IDLE_WAKE_TEXT);
-      if (await wake(b, config, playbook, observed, lines, reason ?? (idleDue ? "changed" : followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"))) await archiveFinishedWorkers(store.binding(b.id) ?? b);
+      if (await wake(b, config, playbook, observed, lines, reason ?? (idleDue ? "changed" : followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"), assessment)) await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     /**
@@ -6908,7 +6923,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A reviewer's owner call makes the approval the owner's, whatever
             // the decide list matched, so the wake says so and the project
             // steward forwards rather than approves (BB-192).
-            escalated: prGate(pull, { projectApprovals: projectApprovalsFor(r.from), ...productGateOptions(r.from, pull) }).escalated,
+            escalated: assessedGate(store, r.from, pull, now()).escalated,
           };
         }),
       );
@@ -8000,7 +8015,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * every look, so the page only offers a button while it is true. The
      * `approve-pr` half lives in approvals.ts (BB-153).
      */
-    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, changes: Change[] = []): Promise<MechanicalEvent[]> {
+    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, changes: Change[] = [], assessment: Assessment | null = null): Promise<MechanicalEvent[]> {
       // BB-203: an `approve-pr` item this call closes because an approval is
       // present is a mechanical status event. The page and project-steward
       // paths write it at once; this catches an approval observed on GitHub.
@@ -8085,6 +8100,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const stackedOnMe: string[] = [];
       const recoveredPulls = [...b.stackedRecovered];
       const recoveredBefore = new Set(recoveredPulls.map((k) => lc(k)));
+      // BB-322: the gate for a pull request from the assessment this reconcile
+      // just computed, so the approval sync reads the one assessment and never
+      // falls back to its own `prGate`. A pull request the assessment does not
+      // hold for its current head sha reads null and `syncPullApproval`
+      // refreshes it through the single `assessedGate` site.
+      const gateFor = (pull: EntitySnapshot) => currentStoredGate(assessment?.gate, pull);
       for (const pull of observedPulls(b, observed)) {
         const url = pull.url ?? pull.key;
         if (ownPulls !== null && !pullBelongsToTicket(b, pull, ownPulls)) {
@@ -8097,7 +8118,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           continue;
         }
         const hadApprove = store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url);
-        const { gate: g, closed, approvalRaised: raised } = await syncPullApproval(approvalsCtx, b, pull, decisions);
+        const { gate: g, closed, approvalRaised: raised } = await syncPullApproval(approvalsCtx, b, pull, decisions, gateFor);
         if (raised) approvalRaised = true;
         if (hadApprove && !closed && (g.ownerApproved || g.projectApproved) && !store.openNeeds(b.id).some((n) => n.kind === "approve-pr" && n.url === url)) {
           events.push({ kind: "approved", pull: pull.key });
@@ -9112,7 +9133,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The verdict is `prGate` with the project's approvals, exactly as the
       // page's Merge item and the wake compute it; the decide-list entry above
       // is what the plugin asks the owner or project steward for (BB-133).
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
+      const gate = assessedGate(store, b, pull, now());
       return {
         ref: `${ref.repo}#${ref.number}`,
         binding: b.entityKey,
@@ -9411,7 +9432,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The same `prGate` with the project's approvals the page's Merge item
       // and the wake use, so the page, `bb stewards gate` and `bb stewards
       // merge` cannot disagree.
-      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
+      const gate = assessedGate(store, b, pull, now());
       if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
       const busy = runningWorkerReason(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId));
       if (busy !== null) return { ok: false, message: `${busy.charAt(0).toUpperCase()}${busy.slice(1)} on this pull request.` };
@@ -11260,8 +11281,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
-              const decision = pull === undefined ? "user" : await placeReportedPull(approvalsCtx, pull, config?.file.bigDecisions ?? []);
-              const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, pull) });
+              const gate = pull === undefined ? null : assessedGate(store, b, pull, now());
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
                 refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
@@ -12106,7 +12126,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (n.kind === "approve-pr" || n.kind === "merge") {
         const observed = b.lastSnapshot;
         const target = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === n.url || e.key === n.url) ?? null;
-        const gate = target === null ? null : prGate(target, { projectApprovals: projectApprovalsFor(b), ...productGateOptions(b, target) });
+        const gate = target === null ? null : assessedGate(store, b, target, now());
         if (n.kind === "approve-pr") {
           actionable = gate?.needsOwnerApproval ?? false;
           why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
