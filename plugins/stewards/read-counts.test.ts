@@ -169,7 +169,12 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     // `reviewersOf` for a finished worker's live reviewers as well as its
     // descendants, so a parentless reviewer keeps the worker unarchived. That
     // is the worker row and its binding, two store reads.
-    expect(reconcile).toEqual({ storeReads: 185, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    // BB-327 raised them 185 → 194: `assessBinding` reads the remembered
+    // delegate set and the reviewer-request record for each of the three own
+    // pull requests (web#7, web#8, web#9), two store reads each, and
+    // `syncPullApproval` reads the remembered set once per pull to forget a
+    // requester the owner withdrew without a review.
+    expect(reconcile).toEqual({ storeReads: 194, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 

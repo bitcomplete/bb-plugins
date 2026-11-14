@@ -107,6 +107,20 @@ export type AssessmentInput = {
   decisions: ReadonlyMap<string, DecideMark>;
   /** The plugin's recorded project approvals for the binding. */
   projectApprovals: readonly ProjectApprovalRecord[];
+  /**
+   * The logins the store remembers as requested reviewers, keyed by a pull
+   * request's lowercased key and URL (BB-327). Read by the gate so a
+   * delegate's APPROVED review still counts after GitHub drops the reviewer
+   * from the live list; omitted reads as none, which leaves the live list in
+   * charge.
+   */
+  rememberedRequesters?: ReadonlyMap<string, readonly string[]>;
+  /**
+   * The delegates already re-requested for a pull request's current head,
+   * keyed by its lowercased key and URL (BB-327). The gate reads it so a
+   * repeated look does not re-request and the status can say it was done.
+   */
+  reRequestedDelegates?: ReadonlyMap<string, readonly string[]>;
   workers: readonly Worker[];
   escalations: readonly Escalation[];
   needs: readonly Need[];
@@ -119,6 +133,12 @@ export type AssessmentInput = {
 };
 
 const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
+
+/** The remembered requesters for one pull request, by its lowercased key or URL (BB-327). */
+function rememberedFor(map: ReadonlyMap<string, readonly string[]> | undefined, e: EntitySnapshot): readonly string[] {
+  if (map === undefined) return [];
+  return map.get(lc(e.key)) ?? (e.url === null ? [] : map.get(lc(e.url)) ?? []);
+}
 
 /** Whether an observed entity is one of the binding's own pull requests (BB-52 rule 0). */
 const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
@@ -164,8 +184,10 @@ export function assess(input: AssessmentInput): Assessment {
     // owner's approval and the reconcile reroutes the escalation back.
     const decideMark = decisions.get(lc(e.key)) ?? "user";
     const mark: DecideMark = decideMark === "project" && forwardedToOwner(escalations, e) ? "user" : decideMark;
-    const g = assessedPullGate(binding, e, mark, projectApprovals);
-    pulls.push({ ...g, pull: e.key, met: g.gateMet, key: gateInputKey(binding, e, g.decision, projectApprovals) });
+    const remembered = rememberedFor(input.rememberedRequesters, e);
+    const reRequested = rememberedFor(input.reRequestedDelegates, e);
+    const g = assessedPullGate(binding, e, mark, projectApprovals, remembered, reRequested);
+    pulls.push({ ...g, pull: e.key, met: g.gateMet, key: gateInputKey(binding, e, g.decision, projectApprovals, remembered, reRequested) });
   }
   const idleBinding: IdleBinding = {
     stage: binding.stage,

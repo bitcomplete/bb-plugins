@@ -18,9 +18,9 @@ export function pullGate(entity: EntitySnapshot, options: PrGateOptions = {}): P
   return prGate(entity, options);
 }
 
-/** The gate options for one own pull request: the decide-list mark and the product inputs. */
-function gateOptions(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[]): PrGateOptions {
-  return { decision: mark, projectApprovals, ...productGateOptions(binding, entity) };
+/** The gate options for one own pull request: the decide-list mark, the product inputs and the delegate records (BB-327). */
+function gateOptions(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[], rememberedRequesters: readonly string[] = [], reRequestedDelegates: readonly string[] = []): PrGateOptions {
+  return { decision: mark, projectApprovals, rememberedRequesters, reRequestedDelegates, ...productGateOptions(binding, entity) };
 }
 
 /**
@@ -29,8 +29,8 @@ function gateOptions(binding: Pick<Binding, "kind" | "ready">, entity: EntitySna
  * reviewer marker, an approval, a check result or the base state that changed
  * at the same head sha is never read as the old answer (BB-210).
  */
-export function gateInputKey(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[]): string {
-  return createHash("sha1").update(JSON.stringify({ entity, options: gateOptions(binding, entity, mark, projectApprovals) })).digest("hex");
+export function gateInputKey(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[], rememberedRequesters: readonly string[] = [], reRequestedDelegates: readonly string[] = []): string {
+  return createHash("sha1").update(JSON.stringify({ entity, options: gateOptions(binding, entity, mark, projectApprovals, rememberedRequesters, reRequestedDelegates) })).digest("hex");
 }
 
 /**
@@ -44,8 +44,8 @@ export function gateInputKey(binding: Pick<Binding, "kind" | "ready">, entity: E
  * fact that remains. A recorded project-steward approval keeps the pull
  * request the project steward's.
  */
-export function assessedPullGate(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[]): PrGate {
-  const options = gateOptions(binding, entity, mark, projectApprovals);
+export function assessedPullGate(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[], rememberedRequesters: readonly string[] = [], reRequestedDelegates: readonly string[] = []): PrGate {
+  const options = gateOptions(binding, entity, mark, projectApprovals, rememberedRequesters, reRequestedDelegates);
   const probe = pullGate(entity, options);
   return mark === "project" && probe.ownerApproved && !probe.projectApproved ? pullGate(entity, { ...options, decision: "user" }) : probe;
 }
@@ -67,6 +67,10 @@ export type AssessmentStore = {
   assessment(bindingId: string): { gate: unknown; worker: unknown; liveness: unknown } | null;
   recordAssessment(fields: { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown }): void;
   projectApprovals(bindingId: string): readonly ProjectApprovalRecord[];
+  /** The logins remembered as requested reviewers for a binding and URL (BB-327). */
+  pullRequesters(bindingId: string, url: string): readonly string[];
+  /** The delegates already re-requested for a binding, URL and head (BB-327). */
+  reviewerRequests(bindingId: string, url: string, headSha: string): readonly string[];
 };
 
 const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
@@ -121,13 +125,17 @@ export function assessedGate(store: AssessmentStore, binding: Binding, pull: Ent
   const sameHead = known !== null && known.headSha === (pull.pull?.headSha ?? null);
   const mark: DecideMark = forceMark ?? (sameHead ? known!.decision : decideForPull(pull.pull?.files ?? null, bigDecisions));
   const projectApprovals = store.projectApprovals(binding.id);
-  const key = gateInputKey(binding, pull, mark, projectApprovals);
+  // BB-327: the logins the store remembers as requested reviewers, so a
+  // delegate's APPROVED review still counts after GitHub drops them.
+  const rememberedRequesters = store.pullRequesters(binding.id, pull.url ?? pull.key);
+  const reRequestedDelegates = store.reviewerRequests(binding.id, pull.url ?? pull.key, pull.pull?.headSha ?? "");
+  const key = gateInputKey(binding, pull, mark, projectApprovals, rememberedRequesters, reRequestedDelegates);
   // Reuse the stored answer only when it is for this pull request's current
   // head sha and every gate input is unchanged; otherwise recompute through
   // the single site and store it (fail closed: a missing or stale assessment
   // never counts as met).
   if (known !== null && known.headSha === (pull.pull?.headSha ?? null) && known.key === key) return known;
-  const gate = assessedPullGate(binding, pull, mark, projectApprovals);
+  const gate = assessedPullGate(binding, pull, mark, projectApprovals, rememberedRequesters, reRequestedDelegates);
   const entry: StoredGate = { ...gate, pull: pull.key, met: gate.gateMet, key };
   const stored = (row?.gate as StoredAssessmentGate | null | undefined) ?? {};
   const pulls = Array.isArray(stored.pulls) ? [...stored.pulls] : [];
