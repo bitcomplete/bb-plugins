@@ -165,7 +165,11 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     // second gate) because the reconcile hands it the one assessment it just
     // built. The wake fell 16 → 15 for the same reason: `wakeInner` reads the
     // assessment the reconcile passed in, not `projectApprovals` again.
-    expect(reconcile).toEqual({ storeReads: 183, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    // BB-323 raised the reconcile reads 183 → 185: `archiveWorkers` asks
+    // `reviewersOf` for a finished worker's live reviewers as well as its
+    // descendants, so a parentless reviewer keeps the worker unarchived. That
+    // is the worker row and its binding, two store reads.
+    expect(reconcile).toEqual({ storeReads: 185, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 

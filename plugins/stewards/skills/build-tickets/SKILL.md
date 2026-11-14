@@ -178,10 +178,12 @@ wins and you correct the PR body.
 There is exactly one reviewer per PR. First check that there is none yet:
 no "Independent review running" comment on the PR
 (`gh pr view <n> --repo <repo> --json comments --jq '.comments[].body' | grep -F 'Independent review running'`)
-and no child thread
-(`bb thread list --parent-thread "$BB_THREAD_ID" --include-hidden --json`;
-children are hidden, so a list without `--include-hidden` is always
-empty). If either shows one, use it and skip to The review loop.
+and no reviewer thread of this worker
+(`bb thread list --project "$BB_PROJECT_ID" --include-hidden --json | jq '[.[] | select(.parentThreadId == null and .lifecycleOwnerThreadId == env.BB_THREAD_ID)]'`;
+the printed command starts the reviewer from this worker with this thread as
+its lifecycle owner and no parent, and a reviewer is hidden, so the list
+needs `--include-hidden`). If either shows one, use it and skip to The review
+loop.
 
 Otherwise write the review prompt (below). The reviewer follows the
 `pr-reviewer` skill and needs the project's environment so it can run
@@ -209,9 +211,9 @@ Author thread: @thread:$BB_THREAD_ID. After you post your review comment, end yo
 ```
 
 Run the spawn once. If you cannot read an id, look again with the
-`--include-hidden` list rather than spawning again: a second spawn is a
-second reviewer posting its own rounds. A new child may sit in `pending`
-behind the concurrency limit; that is normal. Comment on the PR once,
+lifecycle-owner query above (`--include-hidden`) rather than spawning again:
+a second spawn is a second reviewer posting its own rounds. A new reviewer
+may sit in `pending` behind the concurrency limit; that is normal. Comment on the PR once,
 right away: "Independent review running in bb thread @thread:<id>.",
 signed.
 

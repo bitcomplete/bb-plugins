@@ -695,7 +695,7 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
     id: string,
     parent: string,
     title = "Implement",
-    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; sectionId?: string | null; branchName?: string | null } = {},
+    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; sectionId?: string | null; branchName?: string | null; lifecycleOwnerThreadId?: string | null } = {},
   ) => {
     const providerId = over.providerId ?? "claude-code";
     const model = over.model === undefined ? "claude-opus-5-5" : over.model;
@@ -704,8 +704,9 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
     // The worker's workspace branch; the pull() fixture's head names ENG-12
     // (BB-239), so a worker owns it unless a test says otherwise (BB-52 rule 0).
     const branchName = over.branchName === undefined ? "bb/eng-12-retry" : over.branchName;
-    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, lifecycleOwnerThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName });
-    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
+    const lifecycleOwner = over.lifecycleOwnerThreadId === undefined ? parent : over.lifecycleOwnerThreadId;
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, lifecycleOwnerThreadId: lifecycleOwner, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: lifecycleOwner, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */

@@ -3822,13 +3822,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * Archive the given finished workers unless one still has an unarchived
-     * child. A worker whose reviewer is still unarchived must stay: bb core
-     * releases a thread's unarchived children from it when it is archived,
-     * so archiving the worker would clear the reviewer's parent: it could
-     * no longer wake the worker, and no later pass could find it to archive
-     * it. One batched descendant lookup covers every candidate (BB-100); a
-     * listing that failed is "unknown", so all the workers wait rather than
-     * risking an orphan (BB-47).
+     * reviewer. A worker whose reviewer is still unarchived must stay: bb core
+     * archives a thread's whole lifecycle tree with it, and releases its
+     * unarchived children, so archiving the worker would take a parentless
+     * reviewer down with it and clear a parented reviewer's parent: neither
+     * could wake the worker, and no later pass could find it to archive it.
+     * One batched descendant lookup covers every candidate (BB-100), and a
+     * parentless reviewer is not a descendant, so the worker's live reviewers
+     * are read through `reviewersOf` as well; a listing that failed is
+     * "unknown", so all the workers wait rather than risking an orphan
+     * (BB-47).
      */
     async function archiveWorkers(candidates: readonly Worker[]): Promise<void> {
       if (candidates.length === 0) return;
@@ -3836,6 +3839,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (descendants === null) return;
       for (const w of candidates) {
         if ((descendants.get(w.threadId) ?? []).length > 0) continue;
+        // A reviewer with only a lifecycle owner is not a descendant (BB-323);
+        // a failed lookup is "unknown", so the worker waits too.
+        const reviewers = await reviewersOf(w.threadId);
+        if (reviewers === null || reviewers.length > 0) continue;
         const info = await threadInfo(w.threadId).catch(() => null);
         if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) continue;
         await quietly(`archive finished worker ${w.threadId}`, () => bb.sdk.threads.archive({ threadId: w.threadId }));
@@ -8556,14 +8563,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (spawnedOwner(thread) !== null) await tagThread(thread.id, THREAD_BRIEFS_OFF);
       // A reviewer follows a worker, as its lifecycle owner (BB-323) or its
       // parent. The newest round supersedes the older ones, so they are
-      // archived as it is created (BB-47). A reviewer is never a worker: it is
-      // not filed in the worker table and never validated.
+      // archived as it is created (BB-47).
+      const owner = [thread.lifecycleOwnerThreadId, thread.parentThreadId].map((t) => (t === null ? null : store.byThread(t))).find((b) => b !== null && b !== undefined && b.endedAt === null);
       const reviewerOf = reviewerOwner(thread);
       if (reviewerOf !== null) {
         await supersedeOlderReviewers(reviewerOf.threadId, thread.id);
-        return;
+        // A reviewer is never a worker, unless its lifecycle owner or parent is
+        // an open binding's steward: then it is still filed and validated as a
+        // worker.
+        if (owner === undefined || owner === null) return;
       }
-      const owner = [thread.lifecycleOwnerThreadId, thread.parentThreadId].map((t) => (t === null ? null : store.byThread(t))).find((b) => b !== null && b !== undefined && b.endedAt === null);
       if (owner === undefined || owner === null || store.worker(thread.id) !== null) return;
       const limit = (await settings.get()).workerSpawnsPerHour;
       const runaway = store.spawnsSince(owner.id, now() - 3_600_000) >= limit;
