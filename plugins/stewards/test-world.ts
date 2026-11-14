@@ -63,7 +63,7 @@ export function world() {
   /** A plain thrown failure for `sourceEnsureLabel`, to tell it from unavailable (BB-236). */
   let labelEnsureThrow: string | null = null;
   const rpcCalls: Call[] = [];
-  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; projectId?: string; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null; environmentStatus?: string | null; environmentPhase?: string | null; sendError?: { code: string; status: number; message: string } }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; lifecycleOwnerThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; projectId?: string; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null; environmentStatus?: string | null; environmentPhase?: string | null; sendError?: { code: string; status: number; message: string } }>();
   /** Every `threads.delete` the plugin asked for; the plugin must only ever archive. */
   const deletes: string[] = [];
   const writes: Array<{ path: string; hostId?: string }> = [];
@@ -491,15 +491,17 @@ export function world() {
         if (t.model === undefined) return { model: "claude-fable-5-1", reasoningLevel: "medium", serviceTier: "default", permissionMode: "auto", source: "client/turn/requested" };
         return { model: t.model, reasoningLevel: t.reasoningLevel ?? "none", serviceTier: "default", permissionMode: "auto", source: "client/turn/requested" };
       },
-      list: async ({ sectionId, archived, parentThreadId }: { sectionId?: string; archived?: boolean; parentThreadId?: string }) =>
+      list: async ({ sectionId, archived, parentThreadId, projectId, hasParent }: { sectionId?: string; archived?: boolean; parentThreadId?: string; projectId?: string; hasParent?: boolean }) =>
         [...threads.entries()]
           .filter(
             ([, t]) =>
               (sectionId === undefined || t.sectionId === sectionId) &&
               (archived !== false || t.archivedAt === null) &&
-              (parentThreadId === undefined || (t.parentThreadId ?? null) === parentThreadId),
+              (parentThreadId === undefined || (t.parentThreadId ?? null) === parentThreadId) &&
+              (projectId === undefined || (t.projectId ?? "p1") === projectId) &&
+              (hasParent === undefined || ((t.parentThreadId ?? null) !== null) === hasParent),
           )
-          .map(([id, t]) => makeThreadResponse({ id, status: t.status as never, archivedAt: t.archivedAt, parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null })),
+          .map(([id, t]) => makeThreadResponse({ id, status: t.status as never, archivedAt: t.archivedAt, parentThreadId: t.parentThreadId ?? null, lifecycleOwnerThreadId: t.lifecycleOwnerThreadId ?? null, sectionId: t.sectionId ?? null })),
       experimental_listDescendants: async ({ threadIds, includeArchived, includeHidden }: { threadIds: string[]; includeArchived?: boolean; includeHidden?: boolean }) => {
         const descendants = (id: string): string[] => {
           const out: string[] = [];
@@ -702,14 +704,29 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
     // The worker's workspace branch; the pull() fixture's head names ENG-12
     // (BB-239), so a worker owns it unless a test says otherwise (BB-52 rule 0).
     const branchName = over.branchName === undefined ? "bb/eng-12-retry" : over.branchName;
-    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName });
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, lifecycleOwnerThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
   const createdOwned = async (id: string, owner: string, title = "Implement", sectionId: string | null = null) => {
-    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace", branchName: "bb/eng-12-retry" });
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, lifecycleOwnerThreadId: owner, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace", branchName: "bb/eng-12-retry" });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code", sectionId }) });
+    await flush();
+  };
+  /** A reviewer a worker started without `--parent-self` (BB-323): no parent, the worker as lifecycle owner. */
+  const createdReviewer = async (
+    id: string,
+    worker: string,
+    title = "Review",
+    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null } = {},
+  ) => {
+    const providerId = over.providerId ?? "claude-code";
+    const model = over.model === undefined ? "claude-opus-5-5" : over.model;
+    const reasoningLevel = over.reasoningLevel === undefined ? "high" : over.reasoningLevel;
+    const environmentProviderId = over.environmentProviderId === undefined ? "multi-repo-workspace" : over.environmentProviderId;
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "hidden", parentThreadId: null, lifecycleOwnerThreadId: worker, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName: "bb/eng-12-retry" });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: worker, title, originPluginId: null, providerId, sectionId: null }) });
     await flush();
   };
   /** A steward-filed escalation the project steward has forwarded to the user, for tests. */
@@ -738,5 +755,5 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
       },
     });
   };
-  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned, escalationNeed };
+  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned, createdReviewer, escalationNeed };
 }

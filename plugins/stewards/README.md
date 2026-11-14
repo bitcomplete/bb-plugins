@@ -232,10 +232,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   you is left unread.
 - **Workers** are children of their steward with their own checkout, one per
   bounded task, spawned with `--parent-self --parent-notifications off
-  --lifecycle-owner-thread`. A reviewer is a child of the worker that started
-  it, one per review round. A worker nests under its steward's row and a
-  reviewer under its worker's, because bb's list trees by parent thread; the
-  parent is not woken on a child's turn. The plugin only ever archives a
+  --lifecycle-owner-thread`. A reviewer is started from the worker that
+  started it with that worker as its lifecycle owner and no parent (BB-323),
+  one per review round. A worker nests under its steward's row and a reviewer
+  under its worker's, because the sidebar trees a thread under its parent, or
+  under its lifecycle owner when it has none; the parent is not woken on a
+  child's turn. The plugin only ever archives a
   steward, worker or reviewer, never deletes one: deleting a parent thread
   deletes every descendant, archived ones included (get-bb/bb#6129), so
   deleting the project steward row by hand takes every steward, worker and
@@ -316,8 +318,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   wins, then the playbook, then nothing. `bb stewards spawn-flags --role
   reviewer [<binding>]` prints the full `bb thread spawn` command for a
   reviewer — hidden, full permissions, the reviewer model, started from the
-  worker thread that owns the pull request so `--parent-self` makes it that
-  worker's child — and fails clearly when no reviewer model is configured.
+  worker thread that owns the pull request with that worker as its lifecycle
+  owner and no parent (BB-323) — and fails clearly when no reviewer model is
+  configured.
   The default role is `worker`, whose output is unchanged. `bb stewards gate
   <owner/repo#N> [--json]` reads the pull request fresh and prints the same
   verdict the page and the wake use (`prGate`): the lane, the latest

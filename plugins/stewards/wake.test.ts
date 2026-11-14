@@ -657,18 +657,17 @@ describe("the re-approval diff in the project wake (BB-249)", () => {
 describe("the spawn command (BB-133)", () => {
   const flags = "--environment-provider multi-repo-workspace --provider claude-code --model claude-opus-5-5";
 
-  it("is unchanged for the worker role, and adds the reviewer's hidden full-permission flags", () => {
+  it("is unchanged for the worker role, and drops --parent-self for the reviewer (BB-323)", () => {
     const worker = spawnCommand({ projectId: "p1", entityKey: "ENG-12", workerFlags: flags });
     expect(worker).toContain('bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --provider claude-code --model claude-opus-5-5 --title "ENG-12: <task>" --prompt-file -');
     expect(worker).not.toContain("--visibility hidden");
     expect(worker).not.toContain("--permission-mode");
 
     const reviewer = spawnCommand({ projectId: "p1", entityKey: "ENG-12", workerFlags: flags, role: "reviewer" });
-    expect(reviewer).toContain("--visibility hidden --permission-mode full");
-    expect(reviewer).toContain('--title "Review ENG-12: <task>"');
-    // The reviewer is started from the worker thread, so `--parent-self` makes
-    // it that worker's child, and the lifecycle owner stays the worker.
-    expect(reviewer).toContain("--parent-self --parent-notifications off --lifecycle-owner-thread \"$BB_THREAD_ID\"");
+    // BB-323: no `--parent-self` (bb core refuses a child for an active Pi
+    // parent); the worker stays the lifecycle owner.
+    expect(reviewer).toContain('bb thread spawn --project p1 --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --visibility hidden --permission-mode full --environment-provider multi-repo-workspace --provider claude-code --model claude-opus-5-5 --title "Review ENG-12: <task>" --prompt-file -');
+    expect(reviewer).not.toContain("--parent-self");
   });
 });
 
