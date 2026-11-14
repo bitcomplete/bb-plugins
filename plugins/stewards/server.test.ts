@@ -12465,6 +12465,40 @@ describe("deployment watching (BB-53)", () => {
   };
   const deployment = (over: Record<string, unknown> = {}) => ({ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/acme/bb-gate/actions/runs/9", ...over });
   const githubInterest = (t: Awaited<ReturnType<typeof setup>>) => t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!.input as { deployment: string[] };
+  /** A deployment watch fixture (BB-337), with the fields a re-match reads. */
+  const watchFixture = (now: number, over: Record<string, unknown> = {}) => ({
+    key: "acme/web#7",
+    state: "merged",
+    mergeSha: "aaaaaaa1",
+    target: "",
+    mergedAt: now,
+    prRepo: "acme/web",
+    files: [] as string[],
+    repo: "acme/bb-gate",
+    environment: "production",
+    deploymentId: null,
+    deploymentState: null,
+    ref: null,
+    sha: null,
+    url: null,
+    at: now,
+    deadlineAt: now + 3_600_000,
+    note: null,
+    workflowRuns: [] as string[],
+    ...over,
+  });
+  /** A ticket binding with no linked pull, seeded with one deployment watch (BB-337). */
+  const seededWatch = async (t: Awaited<ReturnType<typeof setup>>, watch: Record<string, unknown>, prevPull?: ReturnType<typeof pull>) => {
+    t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", stateType: "started" }));
+    const b = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "ENG-12", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "In Progress", stage: "build" });
+    t.hooks.store.patch(b.id, { threadId: "thr_steward" });
+    t.hooks.store.patch(b.id, { deployments: { "acme/web#7": watch as never } });
+    // The last snapshot keeps the watch's pull after a later read drops it, so
+    // the re-match can still name its base (BB-337).
+    if (prevPull !== undefined) t.hooks.store.patch(b.id, { lastSnapshot: { entity: t.entities.get("uuid-12")!, pulls: [prevPull], at: t.now() } as never });
+    return b;
+  };
 
   it("records a merge as awaiting deployment, leases the target repo, and shows the state in the wake", async () => {
     const t = await setup();
@@ -12742,6 +12776,176 @@ describe("deployment watching (BB-53)", () => {
     t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
     await t.ring("github", "acme/bb-gate");
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success" });
+  });
+
+  // BB-337: the re-match runs for a `merged` watch whose pull is no longer in
+  // the look's snapshot, using the watch's own stored `prRepo` and `files`.
+  // BB-286 covered the observed case; this is the gap.
+  it("re-matches a merged watch whose pull has left the snapshot (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    await seededWatch(t, watchFixture(t.now(), { files: [".bb/stewards/project.json"] }), pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", files: [".bb/stewards/project.json"] }));
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    // The verdict is announced, not only stored.
+    expect(t.sends.filter((s) => s.threadId === "thr_steward").at(-1)!.text).toMatch(/Deployed at merge: acme\/web#7/u);
+  });
+
+  // BB-337 review round 1: a stacked merge whose pull has left the snapshot
+  // must not be settled from an unknown base. Its last snapshot names the
+  // non-default base, so it stays awaiting.
+  it("leaves an unobserved stacked merged watch awaiting (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    await seededWatch(t, watchFixture(t.now(), { files: [".bb/AGENTS.md"] }), pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", base: "feature-base", files: [".bb/AGENTS.md"] }));
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+  });
+
+  // BB-337: a free-text `carries` is the steward's; the re-match never touches
+  // a watch under one.
+  it("leaves a free-text carries watch with the steward (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = deploymentPlaybook();
+    t.hooks.forgetConfigs();
+    await seededWatch(t, watchFixture(t.now(), { files: [".bb/stewards/project.json"] }));
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", note: null });
+  });
+
+  // BB-337: a `merged` watch with a non-final deployment's ref must not be
+  // settled by it; only a live-at-merge rule settles a `merged` watch in the
+  // re-match, and the deployment read moves it to `deploying` when one lands.
+  it("does not settle a merged watch from a non-final deployment's ref (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.hooks.forgetConfigs();
+    await seededWatch(t, watchFixture(t.now(), { ref: "main", deploymentId: 7, deploymentState: "in_progress" }));
+    // If the re-match compared this ref, it would read identical and settle.
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", deploymentState: "in_progress" });
+  });
+
+  // BB-337: the re-match covers a multi-target keyed watch and a legacy
+  // pull-only key, from their stored `prRepo` and `files`.
+  it("re-matches multi-target and legacy watch keys (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      [
+        "requeue-default: 2d",
+        "deployment:",
+        "  - name: bb-gate",
+        "    source: github",
+        "    repo: acme/bb-gate",
+        "    environment: production",
+        "    carries:",
+        "      - when: { repo: acme/web, paths: [.bb/**] }",
+        "        strategy: { kind: live-at-merge }",
+        "    timeout: 1h",
+        "  - name: devbox",
+        "    source: github",
+        "    repo: bitcomplete/devbox",
+        "    environment: production",
+        "    carries:",
+        "      - when: { repo: acme/web }",
+        "        strategy: { kind: ref-contains-merge }",
+        "    timeout: 1h",
+      ].join("\n"),
+    );
+    t.hooks.forgetConfigs();
+    t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", stateType: "started" }));
+    const b = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "ENG-12", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "In Progress", stage: "build" });
+    t.hooks.store.patch(b.id, { threadId: "thr_steward" });
+    t.hooks.store.patch(b.id, {
+      deployments: {
+        // A keyed watch on the live target, a legacy pull-only one on it, and
+        // a keyed watch on the target whose rule still needs a deployment.
+        "acme/web#7::bb-gate": watchFixture(t.now(), { target: "bb-gate", repo: "acme/bb-gate", files: [".bb/AGENTS.md"] }) as never,
+        "acme/web#7": watchFixture(t.now(), { target: "", repo: "acme/bb-gate", files: [".bb/AGENTS.md"] }) as never,
+        "acme/web#7::devbox": watchFixture(t.now(), { target: "devbox", repo: "bitcomplete/devbox", files: [".bb/AGENTS.md"] }) as never,
+      },
+    });
+    // The last snapshot keeps the pull, so the re-match can name its base.
+    t.hooks.store.patch(b.id, { lastSnapshot: { entity: t.entities.get("uuid-12")!, pulls: [pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", base: "main", files: [".bb/AGENTS.md"] })], at: t.now() } as never });
+    await t.hooks.reconcilePass("p1");
+    const d = t.hooks.store.find("ENG-12")!.deployments;
+    expect(d["acme/web#7::bb-gate"]).toMatchObject({ state: "deployed", note: "live-at-merge: nothing deploys .bb/**" });
+    expect(d["acme/web#7"]).toMatchObject({ state: "deployed", note: "live-at-merge: nothing deploys .bb/**" });
+    expect(d["acme/web#7::devbox"]).toMatchObject({ state: "merged" });
+  });
+
+  // BB-337: a terminal watch is never touched by the re-match.
+  it("never re-matches a terminal watch (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    const b = await seededWatch(t, watchFixture(t.now(), { files: [".bb/stewards/project.json"] }));
+    for (const state of ["deployed", "failed"] as const) {
+      t.hooks.store.patch(b.id, { deployments: { "acme/web#7": watchFixture(t.now(), { state, files: [".bb/stewards/project.json"], note: "settled" }) as never } });
+      await t.hooks.reconcilePass("p1");
+      expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state, note: "settled" });
+    }
+  });
+
+  // BB-337: a stacked merge is not on the default branch, so the re-match
+  // leaves it awaiting rather than settling it live.
+  it("leaves a stacked merged watch awaiting (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web, paths: [.bb/**] }\n      strategy: { kind: live-at-merge }');
+    t.hooks.forgetConfigs();
+    t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", stateType: "started", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", base: "feature-base", files: [".bb/AGENTS.md"] }));
+    const b = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "ENG-12", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "In Progress", stage: "build" });
+    t.hooks.store.patch(b.id, { threadId: "thr_steward" });
+    t.hooks.store.patch(b.id, { deployments: { "acme/web#7": watchFixture(t.now(), { files: [".bb/AGENTS.md"] }) as never } });
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+  });
+
+  // BB-337: a reconnect reads each open target once, with the source's own
+  // cap, and a steady-state look adds no source call once the watch settled.
+  it("reads each open target once on a reconnect and no source call in steady state (BB-337)", async () => {
+    const t = await setup();
+    merged(t);
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    const reads = () => t.rpcCalls.filter((c) => c.method === "sourceDeployments").length;
+    // The final deployment already exists at the source when the reconnect rings.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    const before = reads();
+    await t.ring("github", "acme/bb-gate");
+    expect(reads() - before).toBe(1);
+    const read = t.rpcCalls.filter((c) => c.method === "sourceDeployments").at(-1)!;
+    expect(read.input).toMatchObject({ repo: "acme/bb-gate", environment: "production", limit: 10 });
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    // Steady state: the watch is settled, so the next look reads nothing.
+    const settled = reads();
+    await t.hooks.reconcilePass("p1");
+    expect(reads()).toBe(settled);
+  });
+
+  // BB-337: the first reconcile after a plugin start reads each open target
+  // once, the same bounded read the reconnect triggers. `sweep()` is what a
+  // start runs.
+  it("reads each open target once on the first look after a start (BB-337)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.hooks.forgetConfigs();
+    await seededWatch(t, watchFixture(t.now()));
+    const reads = () => t.rpcCalls.filter((c) => c.method === "sourceDeployments").length;
+    const before = reads();
+    await t.hooks.sweep();
+    await t.flush();
+    expect(reads() - before).toBe(1);
   });
 
   // BB-204: a success whose image is behind the merge leaves the watch where
