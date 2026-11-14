@@ -5195,9 +5195,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function reconcilePass(projectId: string): Promise<void> {
       const open = store.open(projectId);
       readCounts.beginReconcilePass(open.length);
-      // BB-325: the project-wide one-time close runs inside the measured pass,
-      // as it does in the sweep, so the fixture counts the read it adds.
-      closeItemsOnEndedBindings(projectId);
       for (const b of open) await serial(`b:${b.id}`, () => reconcileBinding(b.id, null));
     }
 

@@ -2501,14 +2501,15 @@ describe("an ended binding takes no new writes (BB-325)", () => {
     const t = await ended();
     const q = t.hooks.store.ask({ projectId: "p1", bindingId: t.b.id, escalationId: null, question: "Why did you skip the delivery lookup?", context: null });
     expect(t.hooks.store.openQuestions("p1")).toEqual([]);
-    await t.hooks.reconcilePass("p1");
+    // The production path: the sweep's one-time close, not a test-only hook.
+    await t.hooks.sweep();
     expect(t.hooks.store.question(q.id)).toMatchObject({ status: "answered", answer: "The binding ended." });
     const notes = () => t.hooks.store.peekProjectNotes("p1").filter((n) => n.startsWith("late report from ended binding ENG-12 (terminal,"));
     expect(notes()).toHaveLength(1);
     expect(notes()[0]).toMatch(/question qst_\S+ \("Why did you skip the delivery lookup\?"\)/u);
-    // Once: a second pass closes nothing and adds no note.
+    // Once: a second sweep closes nothing and adds no note.
     t.hooks.store.clearProjectNotes("p1");
-    await t.hooks.reconcilePass("p1");
+    await t.hooks.sweep();
     expect(notes()).toHaveLength(0);
   });
 
