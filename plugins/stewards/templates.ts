@@ -3,6 +3,7 @@
 // and reviewed like any other change to `.bb`.
 import { DEFAULT_LABEL } from "./config.js";
 import { DEFAULT_BIG_DECISIONS, defaultDecideList } from "./decisions.js";
+import { templateHash } from "./template-stamp.js";
 
 /**
  * A credential a worker needs, in the linear-tickets build section. The worker
@@ -692,3 +693,18 @@ export const PLAYBOOK_TEMPLATES: Record<string, string> = {
   "deps-alerts": DEPS_ALERTS,
   "deps-prs": DEPS_PRS,
 };
+
+/** The current hash of every shipped template's text, so `check` can compare it with a stamp. */
+export const templateHashes = (): Map<string, string> => new Map(Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [name, templateHash(text)]));
+
+/**
+ * A template's text with the stamp `init` writes into the copy: a
+ * `template: <name>@<hash>` front-matter line after the opening fence. The
+ * hash is of the shipped text, so a project's own edits never change it.
+ */
+export function stampedTemplate(name: string, text: string): string {
+  const hash = templateHash(text);
+  const m = /^---\r?\n/u.exec(text);
+  if (m === null) return text;
+  return `${text.slice(0, m[0].length)}template: ${name}@${hash}\n${text.slice(m[0].length)}`;
+}

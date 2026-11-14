@@ -96,7 +96,7 @@ import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
-import { createBriefing, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
+import { createBriefing, freshCheckFindings, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
 import { STANDUP_TOOLS, buildStandupBrief, buildStandupInstructions, readbackLine, runStandupTool, samePullRef, type StandupDelegation, type StandupEndOutcome, type StandupEntityFacts, type StandupNote, type StandupNoteType, type StandupRecord, type StandupToolContext, type StandupToolReply } from "./standup.js";
 import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
@@ -138,7 +138,8 @@ import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 import { PROJECT_CHANGED } from "./channels.js";
-import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
+import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
+import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
@@ -2680,11 +2681,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // alias parses as `user`; surface one warning per playbook, however many
       // of the load paths reached it.
       const warnedPlaybooks = new Set<string>();
+      const loadedPlaybooks: Playbook[] = [];
       for (const p of [...Object.values(playbooks), depsAlerts, depsPrs, ...watchPlaybooks.values()]) {
-        if (p === undefined || p === null || warnedPlaybooks.has(p.name)) continue;
+        if (p === undefined || p === null) continue;
+        loadedPlaybooks.push(p);
+        if (warnedPlaybooks.has(p.name)) continue;
         warnedPlaybooks.add(p.name);
         for (const w of p.warnings) warnings.push(`${p.name}: ${w}`);
       }
+      // BB-328: a playbook copied from a shipped template carries a
+      // `template: <name>@<hash>` stamp. `check` reports one warning per
+      // playbook: lag behind the current template, a stamp naming a template
+      // that no longer exists, or no stamp at all (unknown origin). Warnings
+      // never fail the check; a binding keeps running exactly as before.
+      warnings.push(...templateWarnings(loadedPlaybooks, templateHashes()));
       return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, ticketPlaybooks, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
 
@@ -7101,12 +7111,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // project steward asking them in its own thread; thread-briefs shows that
     // thread as waiting on them, so nothing here asks for attention itself.
 
-    async function wakeProject(projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[] }): Promise<void> {
+    async function wakeProject(projectId: string, reason: string, opts: { digestDue: boolean; notes?: string[]; checkFindings?: CheckFinding[]; onSent?: () => void }): Promise<void> {
       const config = await loadConfig(projectId);
       if (config === null) return;
       const threadId = await ensureProjectSteward(config);
       if (threadId === null) return;
       const records = opts.digestDue ? digestRecords(projectId) : undefined;
+      // BB-328: the live-check findings new or changed since the last nightly
+      // pass ride in the digest record, so the project steward reads them once.
+      if (records !== undefined && opts.checkFindings !== undefined && opts.checkFindings.length > 0) records.checkFindings = opts.checkFindings;
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return;
@@ -7151,7 +7164,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
       // The notes were only peeked at, so a failed or skipped send leaves them
       // queued for the next digest rather than losing them.
-      else if (opts.digestDue) store.clearProjectNotes(projectId);
+      else {
+        // BB-328: let the caller record a finding only once its digest really
+        // went out, so a failed send says it on the next pass.
+        opts.onSent?.();
+        if (opts.digestDue) store.clearProjectNotes(projectId);
+      }
     }
 
     /** What the digest is written from, since the last one (or a day back): read from the tables, never from the project steward's memory. */
@@ -12897,14 +12915,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Mark only once the wake is really sent, so a disposed pass leaves
           // the follow-up for the next one.
           for (const x of followUps) store.markEscalationRationaleAsked(x.id);
+          // BB-328: the live half of `check` (teams, states, labels, repos,
+          // target readability, hooks leases) runs on the project steward's
+          // server only, whose digest is the only place its findings are read.
+          // `check` is read-only and needs no credential, and a read that
+          // throws is logged, never allowed to skip the digest. The findings
+          // are recorded only once the digest is really sent, so a skipped or
+          // failed send leaves them to be said on the next pass.
+          let freshFindings: CheckFinding[] = [];
+          let nextFindings: Array<{ fingerprint: string; level: "warning" | "problem"; text: string }> | null = null;
+          if (config.role?.projectSteward === true) {
+            let liveFindings: CheckFinding[] = [];
+            try {
+              liveFindings = (await check(config.projectId)).findings;
+            } catch (error) {
+              bb.log.warn(`stewards: nightly check for ${config.projectId}: ${errorMessage(error)}`);
+            }
+            const current: CheckFinding[] = [...config.warnings.map((text): CheckFinding => ({ level: "warning", text })), ...liveFindings];
+            const diff = freshCheckFindings(current, store.checkFindings(config.projectId));
+            freshFindings = diff.fresh;
+            nextFindings = diff.next;
+          }
+          let digestSent = false;
           await wakeProject(config.projectId, `nightly pass ${night}`, {
             digestDue: true,
+            checkFindings: freshFindings,
+            onSent: () => {
+              digestSent = true;
+            },
             notes: [
               `${woken.length} binding(s) had a turn tonight.`,
               ...adoption.unassigned.map((t) => `labelled, no assignee: ${t.key}${t.title === null ? "" : ` ${t.title}`}${t.url === null ? "" : ` — ${t.url}`}. Assign it in Linear to the server that should own it; this one does not adopt it.`),
               ...followUps.map((x) => `The user's answer on ${x.id} went against your recommendation. Ask them once, in this thread, why — one follow-up — then record their reasoning as a lesson candidate with steward_update { lesson: { text, file, scope } }.`),
             ],
           });
+          if (digestSent && nextFindings !== null) store.setCheckFindings(config.projectId, nextFindings, now());
         }
       } finally {
         running.delete(config.projectId);
@@ -13151,12 +13196,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[] }> {
+    async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[]; findings: Array<{ level: "warning" | "problem"; text: string }> }> {
       const config = await loadConfig(projectId, true);
       if (config === null) {
         const error = configErrors.get(projectId);
-        if (error !== undefined) return { ok: false, lines: [`problem: could not read the configuration: ${error}`] };
-        return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb. Run bb stewards init.`] };
+        if (error !== undefined) return { ok: false, lines: [`problem: could not read the configuration: ${error}`], findings: [] };
+        return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb. Run bb stewards init.`], findings: [] };
       }
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
       if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
@@ -13251,6 +13296,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         }
       };
+      // BB-328: everything from here on is the live half of `check` — the
+      // reads against Linear, GitHub, the ops targets and the hooks leases.
+      // The nightly pass records these lines (with `config.warnings`) as
+      // findings, deduplicated by fingerprint; `check` prints them all.
+      const liveStart = lines.length;
       await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket), linearTicket === null ? [] : playbookLabels(linearTicket));
       await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket), githubTicket === null ? [] : playbookLabels(githubTicket));
       if (filingGithub !== null && priorityLabels.length > 0) await validate("github", [filingGithub], priorityLabels);
@@ -13271,7 +13321,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const a = await sentryApi.access(target);
             lines.push(a.ok ? `sentry: ${key} is readable (${a.name})` : `problem: sentry: cannot read the target ${key}: ${a.error}`);
             const refused = sentryRefused.get(`project ${target.org}/${target.project}`);
-            if (refused !== undefined) lines.push(`sentry: ${key}: bb-gate-hooks refused its project lease (${refused}); only the periodic look sees it`);
+            if (refused !== undefined) lines.push(`warning: sentry: ${key}: bb-gate-hooks refused its project lease (${refused}); only the periodic look sees it`);
           }
           const status = sentryHooks.status();
           lines.push(hooksUrl === "" ? "sentry: no bb-gate-hooks here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only" : `sentry: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
@@ -13285,7 +13335,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const a = await alertmanagerApi.access(target);
             lines.push(a.ok ? `alertmanager: ${key} is readable (${a.name})` : `problem: alertmanager: cannot read the target ${key}: ${a.error}`);
             const refused = alertmanagerRefused.get(`namespace ${target.namespace}`);
-            if (refused !== undefined) lines.push(`alertmanager: ${key}: bb-gate-hooks refused its namespace lease (${refused}); only the periodic look sees it`);
+            if (refused !== undefined) lines.push(`warning: alertmanager: ${key}: bb-gate-hooks refused its namespace lease (${refused}); only the periodic look sees it`);
           }
           const status = alertmanagerHooks.status();
           if (hooksUrl === "") lines.push("alertmanager: no bb-gate-hooks here (BB_HOOKS_URL is not set), so alerts are seen by the periodic look only");
@@ -13332,7 +13382,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           lines.push(`problem: deps: could not read alerts: ${errorMessage(error)}`);
         }
       }
-      return { ok: !lines.some((l) => l.startsWith("problem:")), lines };
+      const findings = lines.slice(liveStart).flatMap((l): Array<{ level: "warning" | "problem"; text: string }> => {
+        if (l.startsWith("problem: ")) return [{ level: "problem", text: l.slice("problem: ".length) }];
+        if (l.startsWith("warning: ")) return [{ level: "warning", text: l.slice("warning: ".length) }];
+        return [];
+      });
+      return { ok: !lines.some((l) => l.startsWith("problem:")), lines, findings };
     }
 
     /** Whether a project file names a project steward in roles.json, so it needs no onboarding. */
@@ -13542,7 +13597,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // init writes the github-issues ticket playbook too. A project
               // with Linear teams keeps the Linear ticket playbook alone.
               const templates = Object.entries(PLAYBOOK_TEMPLATES).filter(([name]) => name !== DEFAULT_GITHUB_TICKET_PLAYBOOK || teams.length === 0);
-              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...templates.map(([name, text]) => [playbookPath(name), text] as [string, string])];
+              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...templates.map(([name, text]) => [playbookPath(name), stampedTemplate(name, text)] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {
                 const path = `${dir}/${rel}`;
@@ -13666,6 +13721,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const result = await check(projectOf(input.options.project, ctx), { createLabels: input.options["create-labels"] === true });
               return { exitCode: result.ok ? 0 : 1, stdout: [...result.lines, result.ok ? "OK" : "Problems found."].join("\n") };
+            },
+          }),
+
+          template: cliCommand({
+            summary: "Print the current shipped text of a playbook template",
+            description: "The text `bb stewards init` copies into a project's .bb, and the text a `template:` stamp's hash is taken from. A refresh is never a mechanical overwrite: this prints the template so a steward or a person can see what moved. An unknown name lists the valid names and exits non-zero.",
+            positionals: [{ name: "name", description: "The template name (a PLAYBOOK_TEMPLATES key)", required: true }],
+            async run(input) {
+              const name = input.positionals.name ?? "";
+              if (!Object.hasOwn(PLAYBOOK_TEMPLATES, name)) return { exitCode: 1, stdout: `Unknown template ${JSON.stringify(name)}. Valid names: ${Object.keys(PLAYBOOK_TEMPLATES).join(", ")}` };
+              return { exitCode: 0, stdout: PLAYBOOK_TEMPLATES[name]! };
             },
           }),
 

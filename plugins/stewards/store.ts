@@ -739,7 +739,24 @@ export const ALERTMANAGER_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN al
 // including BB-329's worker park column, so no recorded index moves.
 export const BACKLOG_LOOK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN backlog_look TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS];
+// BB-328: the live half of `check` recorded as findings, deduplicated by
+// fingerprint so an unchanged finding is said once and repeated only when it
+// changes (or clears and returns). A new table, so a store from before this
+// step reads back exactly as before. Appended after BB-334's backlog look
+// column, which merged first, so no recorded index moves.
+export const CHECK_FINDING_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS check_findings (
+     project_id TEXT NOT NULL,
+     fingerprint TEXT NOT NULL,
+     level TEXT NOT NULL,
+     text TEXT NOT NULL,
+     first_seen_at INTEGER NOT NULL,
+     last_seen_at INTEGER NOT NULL,
+     PRIMARY KEY (project_id, fingerprint)
+   )`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -3420,6 +3437,29 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Record when a project last held a stand-up (BB-300). */
     setLastStandup(projectId: string, at: number): void {
       db.prepare("INSERT INTO server_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(`stewards:last-standup:${projectId}`, String(at));
+    },
+
+    // BB-328: the live half of `check`, recorded per project as findings keyed
+    // by fingerprint, so the nightly pass says an unchanged finding once and
+    // again only when it changes (or clears and returns).
+    /** The check findings currently recorded for a project, by fingerprint. */
+    checkFindings(projectId: string): Array<{ fingerprint: string; level: "warning" | "problem"; text: string; firstSeenAt: number }> {
+      return db
+        .prepare<[string], { fingerprint: string; level: string; text: string; first_seen_at: number }>("SELECT fingerprint, level, text, first_seen_at FROM check_findings WHERE project_id = ?")
+        .all(projectId)
+        .map((r) => ({ fingerprint: r.fingerprint, level: r.level === "problem" ? "problem" : "warning", text: r.text, firstSeenAt: r.first_seen_at }));
+    },
+    /** Replace a project's recorded findings with the current set, keeping an unchanged finding's first-seen time. */
+    setCheckFindings(projectId: string, findings: ReadonlyArray<{ fingerprint: string; level: "warning" | "problem"; text: string }>, at: number): void {
+      const keep = new Set(findings.map((f) => f.fingerprint));
+      const existing = db.prepare<[string], { fingerprint: string }>("SELECT fingerprint FROM check_findings WHERE project_id = ?").all(projectId);
+      const remove = db.prepare("DELETE FROM check_findings WHERE project_id = ? AND fingerprint = ?");
+      const upsert = db.prepare(
+        `INSERT INTO check_findings (project_id, fingerprint, level, text, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, fingerprint) DO UPDATE SET level = excluded.level, text = excluded.text, last_seen_at = excluded.last_seen_at`,
+      );
+      for (const row of existing) if (!keep.has(row.fingerprint)) remove.run(projectId, row.fingerprint);
+      for (const f of findings) upsert.run(projectId, f.fingerprint, f.level, f.text, at, at);
     },
 
     // BB-300 slice 4: the durable stand-up record. The server opens one when a

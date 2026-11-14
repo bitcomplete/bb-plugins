@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { createBriefing, localParts, nightOf, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
+import { createBriefing, checkFindingFingerprint, freshCheckFindings, localParts, nightOf, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
 import { MIGRATIONS, createStore } from "./store.js";
 import { formatRecords, type DigestRecords } from "./wake.js";
 
@@ -146,5 +146,62 @@ describe("briefing", () => {
     expect(store.lastStandup("p2")).toBe(222);
     store.setLastStandup("p1", 333);
     expect(store.lastStandup("p1")).toBe(333);
+  });
+});
+
+// BB-328: the nightly pass runs the live half of `check` and records findings
+// deduplicated by fingerprint: an unchanged finding is said once, and again
+// only when it changes (or clears and returns).
+describe("check findings deduplicated by fingerprint (BB-328)", () => {
+  const problem = (text: string) => ({ level: "problem" as const, text });
+  const warning = (text: string) => ({ level: "warning" as const, text });
+
+  it("says an unchanged finding once, and a changed one again", () => {
+    const first = freshCheckFindings([problem("ENG is not visible"), warning("ops-watch lag")], []);
+    expect(first.fresh.map((f) => f.text)).toEqual(["ENG is not visible", "ops-watch lag"]);
+    expect(first.next.every((f) => f.fingerprint === checkFindingFingerprint(f))).toBe(true);
+
+    // The same two findings again: nothing fresh, the recorded set unchanged.
+    const second = freshCheckFindings([problem("ENG is not visible"), warning("ops-watch lag")], first.next);
+    expect(second.fresh).toEqual([]);
+    expect(second.next.map((f) => f.fingerprint).sort()).toEqual(first.next.map((f) => f.fingerprint).sort());
+
+    // One changed: only that one is fresh.
+    const third = freshCheckFindings([problem("ENG has no state Todo"), warning("ops-watch lag")], first.next);
+    expect(third.fresh.map((f) => f.text)).toEqual(["ENG has no state Todo"]);
+  });
+
+  it("says a finding again after it clears and returns", () => {
+    const first = freshCheckFindings([problem("ENG is not visible")], []);
+    const cleared = freshCheckFindings([], first.next);
+    expect(cleared.fresh).toEqual([]);
+    expect(cleared.next).toEqual([]);
+    const returned = freshCheckFindings([problem("ENG is not visible")], cleared.next);
+    expect(returned.fresh.map((f) => f.text)).toEqual(["ENG is not visible"]);
+  });
+
+  it("collapses duplicate findings within one pass", () => {
+    const pass = freshCheckFindings([problem("same"), problem("same")], []);
+    expect(pass.fresh).toHaveLength(1);
+    expect(pass.next).toHaveLength(1);
+  });
+
+  it("records the current set in the store and reads it back", () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS) db.exec(sql);
+    let clock = 1_000_000;
+    const store = createStore(db, () => clock);
+    const now = () => clock;
+    expect(store.checkFindings("p1")).toEqual([]);
+    const { next } = freshCheckFindings([problem("ENG is not visible")], []);
+    store.setCheckFindings("p1", next, now());
+    expect(store.checkFindings("p1")).toEqual([{ ...next[0]!, firstSeenAt: now() }]);
+    // Re-recording an unchanged finding keeps its first-seen time.
+    store.setCheckFindings("p1", next, now() + 1000);
+    expect(store.checkFindings("p1")[0]!.firstSeenAt).toBe(now());
+    // A finding that is gone is dropped, and one that returns is fresh again.
+    store.setCheckFindings("p1", [], now() + 2000);
+    expect(store.checkFindings("p1")).toEqual([]);
+    expect(freshCheckFindings([problem("ENG is not visible")], store.checkFindings("p1")).fresh).toHaveLength(1);
   });
 });
