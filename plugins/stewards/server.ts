@@ -3151,6 +3151,45 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The `pull`/`review` refs the binding's stored typed wait names, normalized
+     * to `owner/repo#N` (BB-333). They are leased and read beside the ticket's
+     * linked pulls, but never join `ownPulls`, the gate loop or the stored
+     * snapshot.
+     */
+    function waitedPullKeys(b: Pick<Binding, "wait">): string[] {
+      const wait = b.wait;
+      if (wait === null || (wait.kind !== "pull" && wait.kind !== "review")) return [];
+      const parsed = parsePullRef(wait.ref);
+      return parsed === null ? [] : [`${parsed.repo}#${parsed.number}`];
+    }
+
+    /**
+     * Read the binding's waited pull/review refs fresh, one source read each,
+     * under the linked-pull ceiling (BB-333). A ref already in the look's linked
+     * pulls is reused without a read, so it never adds one. Returns them keyed
+     * by lowercased `owner/repo#N`; a read that fails is left out, which reads
+     * as not-live.
+     */
+    async function readWaitedPulls(b: Binding, observed: Observed): Promise<Map<string, EntitySnapshot>> {
+      const out = new Map<string, EntitySnapshot>();
+      for (const key of waitedPullKeys(b)) {
+        const already = observed.pulls.find((p) => lc(p.key) === lc(key));
+        if (already !== undefined) {
+          out.set(lc(key), already);
+          continue;
+        }
+        if (observed.pulls.length + out.size >= LINKED_PULLS_MAX) break;
+        try {
+          const e = await snapshot("github", key);
+          if (e !== null) out.set(lc(key), e);
+        } catch (error) {
+          bb.log.warn(`stewards: could not read waited ${key} of ${b.entityKey}: ${errorMessage(error)}`);
+        }
+      }
+      return out;
+    }
+
+    /**
      * A binding's pull requests, re-read from GitHub rather than from its last
      * snapshot (BB-54): a schedule request must not ask about work that has
      * already merged. `complete` is false when the entity or any linked pull
@@ -3366,6 +3405,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...new Set([
               ...open.filter((b) => b.source === "github").map((b) => b.entityId),
               ...open.flatMap((b) => leasedPulls(b)),
+              ...open.flatMap((b) => waitedPullKeys(b)),
             ]),
           ].sort(),
           // Every repo the project watches for Dependabot alerts. A server
@@ -4646,7 +4686,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * in a try/catch by the caller so a failure cannot crash the reconcile;
      * an absent assessment fails closed everywhere it is read.
      */
-    function assessBinding(
+    async function assessBinding(
       b: Binding,
       observed: Observed,
       workers: readonly Worker[],
@@ -4654,7 +4694,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
-    ): Assessment {
+    ): Promise<Assessment> {
       // BB-322: gate every pull request that belongs to the binding, the same
       // set `syncNeeds` acts on, not only the worker-reported own ones. A
       // linked pull request whose head names the ticket is the binding's even
@@ -4694,6 +4734,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (e.url !== null) reRequestedDelegates.set(lc(e.url), reRequested);
         }
       }
+      const waitedPulls = await readWaitedPulls(b, observed);
       const input: AssessmentInput = {
         binding: b,
         observed,
@@ -4710,10 +4751,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         playbook,
         currentSpecHash,
         now: now(),
+        waitedPulls,
+        hasOpenBinding: (key) => {
+          const other = store.find(key, b.projectId);
+          return other !== null && other.endedAt === null && (other.lastSnapshot === null || !finished(other, other.lastSnapshot));
+        },
+        hasOpenItem: (id) => store.openNeeds(b.id).some((n) => n.id === id) || store.openEscalations(b.id).some((x) => x.id === id) || store.openQuestions(b.projectId).some((q) => q.id === id),
       };
       const assessment = assess(input);
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
-      store.recordDivergences(compare(input, assessment));
+      const divergences = compare(input, assessment);
+      // BB-333: a typed wait's divergence is written only when it starts or
+      // stops disagreeing, through the state table. A no-kind report keeps the
+      // existing deduped row, and a binding with no typed wait reads no state.
+      if (b.wait !== null) {
+        store.recordDivergences(divergences.filter((d) => d.surface !== "noWakeSource"));
+        store.recordWaitDivergence({
+          bindingId: b.id,
+          derived: assessment.liveness.stalled,
+          reported: b.noWakeSource,
+          waitKind: b.wait.kind,
+          waitLive: assessment.liveness.waitLive === true,
+          inputs: {
+            binding: b.id,
+            live: assessment.liveness.live,
+            idle: assessment.liveness.idle,
+            stuck: assessment.liveness.stuck,
+            readyPassed: assessment.gate.readyPassed,
+            requeueUntil: b.requeueUntil,
+            phase: b.phase,
+            hasWait: (b.status?.waitingOn ?? "").trim() !== "",
+          },
+        });
+      } else {
+        store.recordDivergences(divergences);
+      }
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
       return assessment;
     }
@@ -5023,7 +5095,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // absent assessment fails closed.
       let assessment: Assessment | null = null;
       try {
-        assessment = assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
+        assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
       } catch (error) {
         bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
       }
@@ -7067,7 +7139,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (deps !== null && deps.endedAt === null) scheduleReconcile(deps.id);
         }
         for (const t of store.open()) {
-          if (t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id))) scheduleReconcile(t.id);
+          if (t.kind !== "ticket") continue;
+          const linked = (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id));
+          const waited = waitedPullKeys(t).some((k) => lc(k) === lc(id));
+          if (linked || waited) scheduleReconcile(t.id);
         }
       }
       // BB-334: a Linear issue doorbell also wakes the backlog binding of the

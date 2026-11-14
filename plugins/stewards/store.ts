@@ -769,8 +769,21 @@ export const BACKLOG_SNAPSHOT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN bac
 // wait, and a pre-migration build never reads the column. Appended after every
 // group already shipped, including BB-334's backlog columns and BB-328's
 // check-findings table, so no recorded index moves. PR 1 stores and renders
-// it; nothing derives from it yet.
-export const TYPED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait TEXT`];
+// it; PR 2 derives from it in shadow, and `wait_divergence_state` remembers the
+// last derived-vs-flag state per binding so the `noWakeSource` divergence row
+// is written only when it starts or stops disagreeing (BB-333).
+export const TYPED_WAIT_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN wait TEXT`,
+  `CREATE TABLE IF NOT EXISTS wait_divergence_state (
+     binding_id TEXT PRIMARY KEY,
+     derived INTEGER NOT NULL,
+     reported INTEGER NOT NULL,
+     at INTEGER NOT NULL
+   )`,
+];
+
+/** The most `noWakeSource` divergence rows kept per binding (BB-333): a transition log, newest kept. */
+export const WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING = 20;
 
 // BB-335: the reasons a declining branch records, one JSON object keyed by the
 // closed reason code, on the existing `assessments` row. Additive and nullable
@@ -1962,6 +1975,16 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const pruneDivergencesByAgeStmt = lazy<[number], unknown>("DELETE FROM assessment_divergences WHERE last_seen_at < ?");
   const pruneDivergencesByCountStmt = lazy<[number], unknown>(
     "DELETE FROM assessment_divergences WHERE id NOT IN (SELECT id FROM assessment_divergences ORDER BY last_seen_at DESC, id LIMIT ?)",
+  );
+  // BB-333: the last derived-vs-flag state per binding, so a typed-wait
+  // divergence row is written only when the disagreement starts or stops.
+  // Prepared lazily: a store from before this group has no table yet.
+  const getWaitDivergenceStateStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ?");
+  const upsertWaitDivergenceStateStmt = lazy<[string, number, number, number], unknown>(
+    "INSERT INTO wait_divergence_state (binding_id, derived, reported, at) VALUES (?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET derived = excluded.derived, reported = excluded.reported, at = excluded.at",
+  );
+  const pruneWaitDivergencesForBindingStmt = lazy<[string, string, number], unknown>(
+    "DELETE FROM assessment_divergences WHERE binding_id = ? AND surface = 'noWakeSource' AND id NOT IN (SELECT id FROM assessment_divergences WHERE binding_id = ? AND surface = 'noWakeSource' ORDER BY last_seen_at DESC, id DESC LIMIT ?)",
   );
 
   // BB-251: assumptions, prepared lazily for the same reason: a store from
@@ -3632,6 +3655,39 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return removed;
     },
     /**
+     * Record a typed-wait divergence from the report-time `noWakeSource` flag
+     * (BB-333). One `noWakeSource` row is written only when the derived result
+     * starts or stops disagreeing with the flag; an unchanged state writes
+     * nothing, so a steady tick is not re-logged. `wait_divergence_state`
+     * remembers the last state per binding, and the binding's `noWakeSource`
+     * rows are capped at `WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING`. Returns whether
+     * a divergence row was written.
+     */
+    recordWaitDivergence(fields: { bindingId: string; derived: boolean; reported: boolean; waitKind: string | null; waitLive: boolean; inputs: Record<string, unknown> }, at = now()): boolean {
+      const derived = fields.derived ? 1 : 0;
+      const reported = fields.reported ? 1 : 0;
+      const disagree = derived !== reported;
+      const prev = getWaitDivergenceStateStmt().get(fields.bindingId);
+      const prevDisagree = prev === undefined ? null : Number(prev.derived) !== Number(prev.reported);
+      if (prevDisagree !== null && prevDisagree === disagree) return false;
+      upsertWaitDivergenceStateStmt().run(fields.bindingId, derived, reported, at);
+      // The first observation of an agreeing binding is the baseline, not a
+      // transition, so it writes no row.
+      if (prevDisagree === null && !disagree) return false;
+      insertDivergenceStmt().run(
+        newId("dvg"),
+        fields.bindingId,
+        "noWakeSource",
+        reported ? "no-wake-source" : "source-or-no-wait",
+        derived ? "no-wake-source" : "source-or-no-wait",
+        JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition: disagree ? "start" : "stop" }),
+        at,
+        at,
+      );
+      pruneWaitDivergencesForBindingStmt().run(fields.bindingId, fields.bindingId, WAIT_DIVERGENCE_MAX_ROWS_PER_BINDING);
+      return true;
+    },
+    /**
      * Forget a deleted project: its bindings and everything keyed by them
      * (escalations, workers, needs, approvals, fingerprints, queued answers),
      * its lessons, guidance citations and project-steward row.
@@ -3644,7 +3700,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         const ids = db.prepare<[string], { id: string }>("SELECT id FROM bindings WHERE project_id = ?").all(projectId).map((r) => r.id);
         const byBinding = "SELECT id FROM bindings WHERE project_id = ?";
         db.prepare(`DELETE FROM secret_requesters WHERE thread_id IN (SELECT thread_id FROM workers WHERE binding_id IN (${byBinding}))`).run(projectId);
-        for (const table of ["escalations", "workers", "needs", "project_approvals", "assessments", "assessment_divergences"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
+        for (const table of ["escalations", "workers", "needs", "project_approvals", "assessments", "assessment_divergences", "wait_divergence_state"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
         db.prepare(`DELETE FROM pending_deliveries WHERE origin_binding_id IN (${byBinding})`).run(projectId);
         for (const table of ["ops_fingerprints", "deps_decisions", "lessons", "guidance_citations", "assumptions", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
         options.onProjectChange?.(projectId, ["purged"]);

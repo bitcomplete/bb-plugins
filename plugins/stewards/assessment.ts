@@ -11,13 +11,15 @@
 // disagree, so the divergence log can be read for several days before any
 // consumer reads the assessment.
 import { assessedPullGate, gateInputKey, pullGate } from "./assessed-gate.js";
-import type { PrGate, ProjectApprovalRecord } from "./gate.js";
+import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
+import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
 import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
-import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
+import { hasLiveWakeSource, parseUntil, type WakeSourceInput } from "./wake-source.js";
 import type { Playbook } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
+import type { Wait } from "./wait.js";
 
 export type DecideMark = "project" | "user";
 
@@ -59,6 +61,8 @@ export type AssessedWorker = {
 export type AssessedLiveness = {
   /** `hasLiveWakeSource` over the observable rows. */
   live: boolean;
+  /** The stored typed wait's own liveness (BB-333); null when the binding has no typed wait. */
+  waitLive: boolean | null;
   /** `idleInActiveStage`. */
   idle: boolean;
   /** `stuckDue`: the phase backstop. */
@@ -94,7 +98,17 @@ export type AssessmentInput = {
   binding: Pick<
     Binding,
     "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "noWakeSource" | "status" | "createdAt" | "advancedAt" | "phase"
-  >;
+  > & { wait?: Binding["wait"] };
+  /**
+   * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
+   * keyed by lowercased `owner/repo#N`. Read by the look, never stored in the
+   * binding's snapshot.
+   */
+  waitedPulls?: ReadonlyMap<string, EntitySnapshot>;
+  /** Whether a binding with this entity key is open and unfinished, for a `binding` wait (BB-333). */
+  hasOpenBinding?: (key: string) => boolean;
+  /** Whether a page item with this id is open, for a `person` wait (BB-333). */
+  hasOpenItem?: (id: string) => boolean;
   /** The observation the reconcile just read. */
   observed: Observed;
   /** The binding's own pull keys and URLs, lowercased (BB-52 rule 0). */
@@ -145,6 +159,58 @@ function rememberedFor(map: ReadonlyMap<string, readonly string[]> | undefined, 
 /** Whether an observed entity is one of the binding's own pull requests (BB-52 rule 0). */
 const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
   (e.key !== "" && own.has(lc(e.key))) || (e.url !== null && e.url !== "" && own.has(lc(e.url)));
+
+/** A pull request the plugin can see is still open (not merged or closed). */
+const pullIsOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== "merged" && e.state !== "closed" && e.pull.merged !== true;
+
+/** Whether a pull request's review has been given: an approved review or marker at its head (BB-333). */
+function reviewGiven(e: EntitySnapshot): boolean {
+  if (e.pull === null) return false;
+  if (e.pull.reviewDecision === "APPROVED") return true;
+  const marker = latestReviewMarker(e.comments);
+  if (marker !== null && marker.verdict === "approved" && (marker.sha === "" || marker.sha === e.pull.headSha)) return true;
+  return e.pull.reviews.some((r) => r.state.toLowerCase() === "approved" && (r.commit === null || r.commit === e.pull?.headSha));
+}
+
+/** The lowercased `owner/repo#N` a stored `pull`/`review` ref names, or null when it does not parse. */
+function waitPullKey(ref: string): string | null {
+  const parsed = parsePullRef(ref);
+  return parsed === null ? null : `${parsed.repo}#${parsed.number}`.toLowerCase();
+}
+
+/**
+ * Whether the stored typed wait is live, resolved against the rows the look
+ * holds (BB-333): the freshly read waited pull, the deployment watches, the
+ * workers, the other bindings, the page items and the date. The typed wait is
+ * judged by its own kind, never by `hasLiveWakeSource`.
+ */
+function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
+  switch (wait.kind) {
+    case "pull":
+    case "review": {
+      const key = waitPullKey(wait.ref);
+      const e = key === null ? undefined : input.waitedPulls?.get(key);
+      if (e === undefined || !pullIsOpen(e)) return false;
+      return wait.kind === "pull" ? true : !reviewGiven(e);
+    }
+    case "deployment": {
+      const key = waitPullKey(wait.ref);
+      return key !== null && Object.values(input.binding.deployments).some((w) => lc(w.key) === key && (w.state === "merged" || w.state === "deploying"));
+    }
+    case "worker":
+      return input.workers.some((w) => w.threadId === wait.ref && w.status === "running");
+    case "binding":
+      return input.hasOpenBinding?.(wait.ref) ?? false;
+    case "date": {
+      const at = parseUntil(wait.ref) ?? input.binding.requeueUntil;
+      return at !== null && at > input.now;
+    }
+    case "person":
+      return input.hasOpenItem?.(wait.ref) ?? false;
+    case "external":
+      return false;
+  }
+}
 
 /**
  * Whether the project steward forwarded this pull request's approval escalation
@@ -228,6 +294,13 @@ export function assess(input: AssessmentInput): Assessment {
     needs,
   };
   const live = assessLiveWakeSource(sources);
+  // BB-333: the typed wait is judged by its own kind, on every reconcile,
+  // never from a flag stored at report time. A no-kind report keeps today's
+  // free-text rule exactly.
+  const wait = binding.wait ?? null;
+  const waitLive = wait === null ? null : typedWaitLive(wait, input);
+  const dateAhead = binding.requeueUntil !== null && binding.requeueUntil > now;
+  const idleBase = assessIdle(idleBinding, observed, now);
   return {
     bindingId: binding.id,
     entityKey: binding.entityKey,
@@ -241,9 +314,12 @@ export function assess(input: AssessmentInput): Assessment {
     worker: assessWorker(workers),
     liveness: {
       live,
-      idle: assessIdle(idleBinding, observed, now),
+      waitLive,
+      // A live typed wait is something the plugin waits on, so it suppresses
+      // the idle wake; a stalled or external one does not (BB-333).
+      idle: wait !== null && waitLive === true ? false : idleBase,
       stuck: stuckDue(binding, playbook, [...escalations], now) !== null,
-      stalled: observedStall(binding, live, now),
+      stalled: wait === null ? observedStall(binding, live, now) : waitLive !== true && !dateAhead,
       reportedNoWakeSource: binding.noWakeSource,
     },
   };
@@ -332,6 +408,8 @@ export function compare(input: AssessmentInput, assessment: Assessment): Diverge
     phase: binding.phase,
     // The row the predicates read, as a boolean, never the wait text.
     hasWait: (binding.status?.waitingOn ?? "").trim() !== "",
+    waitKind: binding.wait?.kind ?? null,
+    waitLive: assessment.liveness.waitLive === true,
   });
   return out;
 }
