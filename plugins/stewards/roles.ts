@@ -88,7 +88,7 @@ export const roleOpsSchema = z
     dependabot: z.union([z.literal("all"), z.array(dependabotRepoSchema).max(200)]).optional(),
     /** Pull requests this role's server adopts by shape, under a playbook, with no label (BB-164). */
     pulls: z.array(pullWatchSchema).max(50).default([]),
-    /** The Linear team whose backlog this role's steward watches (BB-332); one holder per team. */
+    /** The Linear team whose backlog this role's steward watches (BB-332); the backlog binding enforces one holder per team. */
     backlog: z.object({ team: teamKey }).strict().optional(),
   })
   .strict();
@@ -171,7 +171,9 @@ const rolesFileV2RawSchema = z
  * The merge of a holder's role definitions, in the order the holder lists
  * them. List fields are unioned; `context` and `team` take the first defined
  * value (a disagreement is a `check` problem, never a runtime change);
- * `dependabot: "all"` wins over an explicit list.
+ * `backlog` takes the first defined value too, and the backlog binding adds
+ * its own conflict and one-holder checks; `dependabot: "all"` wins over an
+ * explicit list.
  */
 function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {
   const k8sNamespaces: string[] = [];

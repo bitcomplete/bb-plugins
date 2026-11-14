@@ -874,7 +874,8 @@ describe("roles.json backlog role (BB-332)", () => {
   it("leaves a role without backlog exactly as before", () => {
     const parsed = backlog({ k8sNamespaces: ["prod"] });
     if (!parsed.ok) throw new Error(parsed.error);
-    expect(parsed.value.roles["trotterdylan"]!.ops).toEqual({ k8sNamespaces: ["prod"], autoAdopt: [], sentry: { projects: [], resolveOnDone: false }, alertmanager: { namespaces: [] }, pulls: [] });
+    expect(parsed.value.definitions.backlog).toStrictEqual({ k8sNamespaces: ["prod"], autoAdopt: [], sentry: { projects: [], resolveOnDone: false }, alertmanager: { namespaces: [] }, pulls: [] });
+    expect(parsed.value.roles["trotterdylan"]!.ops).toStrictEqual({ k8sNamespaces: ["prod"], autoAdopt: [], sentry: { projects: [], resolveOnDone: false }, alertmanager: { namespaces: [] }, pulls: [] });
   });
 });
 
