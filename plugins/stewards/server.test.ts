@@ -986,6 +986,12 @@ describe("a Linear ticket steward", () => {
     await t.created("thr_bad", steward, "ENG-12: Implement", { model: "claude-sonnet-5-5" });
     expect(t.hooks.store.worker("thr_bad")!.status).toBe("stopped");
     expect(stopped()).toContain("thr_bad");
+
+    // A thread whose parent is a worker but whose lifecycle owner is the
+    // steward is still validated as a worker, not skipped as a reviewer.
+    await t.created("thr_weird", "thr_w1", "ENG-12: Implement", { lifecycleOwnerThreadId: steward, model: "claude-sonnet-5-5" });
+    expect(t.hooks.store.worker("thr_weird")!.status).toBe("stopped");
+    expect(stopped()).toContain("thr_weird");
   });
 
   it("keeps a running worker's own pull request activity for the next turn instead of waking for it", async () => {
@@ -4425,6 +4431,29 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     await t.created("thr_r2", "thr_w1", "Review round 2");
     expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
     expect(t.threads.get("thr_r2")!.archivedAt).toBeNull();
+  });
+
+  it("keeps a worker whose parentless reviewer is still unarchived, and archives it once the reviewer is (BB-323)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.createdReviewer("thr_r1", "thr_w1", "Review round 1");
+
+    // The worker ends its turn without a waiting phrase while its parentless
+    // reviewer still runs: the reviewer is not a descendant, but it keeps the
+    // worker unarchived (bb would archive its lifecycle tree with it).
+    t.threads.get("thr_r1")!.status = "active";
+    await t.idle("thr_w1", "Spawned the reviewer.");
+    expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+
+    // The reviewer is consumed, and the worker's next turn ends: both leave.
+    t.threads.get("thr_r1")!.status = "idle";
+    await t.idle("thr_w1", "Addressed the review and pushed.");
+    expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
   });
 
   it("archives a finished worker after the reconcile that consumed its report, unless it needs the user", async () => {
