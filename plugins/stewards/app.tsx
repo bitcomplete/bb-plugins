@@ -647,12 +647,13 @@ function StewardHeader({ state, phrase, kind, phase, entityKey, url, title, extr
   );
 }
 
-/** BB-335: a binding's recorded non-actions, one line each, newest day first. Information only: never a need, a button or a count. */
+/** BB-335: a binding's recorded non-actions, one line each, newest day first, each with its date. Information only: never a need, a button or a count. */
 function nonActionLines(nonActions: NonActions | undefined): string[] {
-  return nonActions === undefined ? [] : sortedNonActions(nonActions).map((n) => n.text);
+  return nonActions === undefined ? [] : sortedNonActions(nonActions).map((n) => `${n.text} (${n.date})`);
 }
 
-/** The rules' inputs from a `stewardsOverview` steward, so its row derives the same state and phrase as the page and sidebar. */function overviewEffortStatus(s: Steward): EffortStatus {
+/** The rules' inputs from a `stewardsOverview` steward, so its row derives the same state and phrase as the page and sidebar. */
+function overviewEffortStatus(s: Steward): EffortStatus {
   return {
     busy: false,
     runningWorkers: s.workers,
@@ -671,7 +672,8 @@ function nonActionLines(nonActions: NonActions | undefined): string[] {
   };
 }
 
-function StewardsSection() {  const { overview, error } = useOverview();
+function StewardsSection() {
+  const { overview, error } = useOverview();
   // Called before the early return, so the hook order stays stable (BB-205).
   const now = useNow();
   if (overview === null) return <Loading error={error} />;
@@ -1665,6 +1667,7 @@ function EndedDetail({ board: b, ended, now }: { board: Board; ended: Board["end
           {ended.endReason === null ? null : <Badge>{ended.endReason}</Badge>}
         </div>
         <p className="text-xs text-muted-foreground">Ended {ago(ended.endedAt, now)}</p>
+        {nonActionLines(ended.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(ended.nonActions).join("; ")}</p> : null}
         {ended.threadId === null ? <p className="text-muted-foreground">Its thread is no longer available.</p> : <p><ThreadLink threadId={ended.threadId}>Open the archived thread</ThreadLink></p>}
       </div>
     </div>

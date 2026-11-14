@@ -839,7 +839,7 @@ export const rpcContract = defineRpcContract({
             }),
           ),
           stuck: z.array(z.object({ key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), why: z.string(), since: z.number().nullable() })),
-          ended: z.array(z.object({ key: z.string(), url: z.string().nullable(), title: z.string().nullable(), kind: z.string(), endReason: z.string().nullable(), endedAt: z.number(), threadId: z.string().nullable() })),
+          ended: z.array(z.object({ key: z.string(), url: z.string().nullable(), title: z.string().nullable(), kind: z.string(), endReason: z.string().nullable(), endedAt: z.number(), threadId: z.string().nullable(), nonActions: nonActionsSchema })),
         })
         .nullable(),
     }),
@@ -4782,7 +4782,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (b.source === "ops") {
-        decline(b, "routed-to-ops");
         await reconcileOps(b, config, playbook, force);
         return;
       }
@@ -8559,7 +8558,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // files the item a person can press but never merges (BB-257).
             const paused = (await settings.get()).paused;
             if (parkedWorkerOwnsAnother) {
-              decline(b, "parked-owns-another", pull.key);
               // BB-279: a gate-met pull request with a parked worker is never
               // deferred silently. The plugin files the Merge item so "Needs
               // you" shows it, and wakes the parked worker with the approval
@@ -8590,6 +8588,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   approver,
                 );
               }
+              decline(b, "parked-owns-another", pull.key);
             } else if (ref !== null && base !== null && base.kind === "default" && !paused) {
               // BB-257: only the repository's default branch is merged by the
               // plugin. A stacked pull request is held above, so it never
@@ -8634,7 +8633,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 decline(b, "merge-refused", pull.key);
               }
             } else {
-              decline(b, paused ? "merge-paused" : "base-not-default", pull.key);
               store.fileNeed({
                 bindingId: b.id,
                 kind: "merge",
@@ -8644,6 +8642,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 data: { sha: g.headSha },
                 filedBy: "plugin",
               });
+              decline(b, paused ? "merge-paused" : "base-not-default", pull.key);
             }
           }
           // BB-285: a gate-met pull request nobody acts on. No worker is
@@ -10098,7 +10097,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
             })),
             stuck: stuck.map(({ b, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, why, since })),
-            ended: ended.map((b) => ({ key: b.key, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt, threadId: b.threadId })),
+            ended: ended.map((b) => ({ key: b.key, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt, threadId: b.threadId, nonActions: b.nonActions })),
           },
         };
       },

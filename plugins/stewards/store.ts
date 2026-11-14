@@ -1606,7 +1606,7 @@ export type WorkerStopReason = "archived" | "stopped" | "runaway" | "deleted" | 
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean; stopReason: WorkerStopReason | null; /** BB-329: the `waitingOn` the worker's own `worker_park` call recorded, or null when it did not park. Cleared when its next turn starts. */ parkedWaitingOn: string | null };
 
 /** The sidebar's ended-list row (BB-294): the columns it renders, never `lastSnapshot`. `url` is added for the board's ended list (BB-295). */
-export type EndedBindingRow = { key: string; url: string | null; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number };
+export type EndedBindingRow = { key: string; url: string | null; kind: BindingKind; threadId: string | null; title: string | null; phase: string | null; endReason: string | null; endedAt: number; nonActions: NonActions };
 
 /** A binding's reconciliation columns, without its `lastSnapshot` (BB-295): what `syncOpsBindings` reads. */
 export type KindBindingRow = { id: string; entityId: string; endedAt: number | null; manualDetach: boolean };
@@ -1765,8 +1765,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // `last_snapshot` before the sort and limit apply. The columns are named for
   // the row type directly. `created_at ASC` breaks ties as the old in-memory
   // stable sort did.
-  const endedSinceForProject = db.prepare<[string, number, number], { entity_key: string; url: string | null; kind: string; thread_id: string | null; title: string | null; phase: string | null; end_reason: string | null; ended_at: number }>(
-    "SELECT entity_key, url, kind, thread_id, title, phase, end_reason, ended_at FROM bindings WHERE project_id = ? AND ended_at IS NOT NULL AND ended_at >= ? ORDER BY ended_at DESC, created_at ASC LIMIT ?",
+  const endedSinceForProject = db.prepare<[string, number, number], { entity_key: string; url: string | null; kind: string; thread_id: string | null; title: string | null; phase: string | null; end_reason: string | null; ended_at: number; assessment_non_actions: string | null }>(
+    hasNonActions
+      ? "SELECT b.entity_key, b.url, b.kind, b.thread_id, b.title, b.phase, b.end_reason, b.ended_at, a.non_actions AS assessment_non_actions FROM bindings b LEFT JOIN assessments a ON a.binding_id = b.id WHERE b.project_id = ? AND b.ended_at IS NOT NULL AND b.ended_at >= ? ORDER BY b.ended_at DESC, b.created_at ASC LIMIT ?"
+      : "SELECT entity_key, url, kind, thread_id, title, phase, end_reason, ended_at, NULL AS assessment_non_actions FROM bindings WHERE project_id = ? AND ended_at IS NOT NULL AND ended_at >= ? ORDER BY ended_at DESC, created_at ASC LIMIT ?",
   );
   // BB-295: the board and overview parse no ended binding, and the sweep's two
   // loops filter in SQL. `openOfKind` and `endedOfKind` return a project's
@@ -2643,7 +2645,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
      * `lastSnapshot` read.
      */
     endedSince(projectId: string, since: number, limit: number): EndedBindingRow[] {
-      return endedSinceForProject.all(projectId, since, limit).map((r) => ({ key: r.entity_key, url: r.url, kind: r.kind as BindingKind, threadId: r.thread_id, title: r.title, phase: r.phase, endReason: r.end_reason, endedAt: r.ended_at }));
+      return endedSinceForProject.all(projectId, since, limit).map((r) => ({ key: r.entity_key, url: r.url, kind: r.kind as BindingKind, threadId: r.thread_id, title: r.title, phase: r.phase, endReason: r.end_reason, endedAt: r.ended_at, nonActions: nonActionsSchema.parse(parseJson(r.assessment_non_actions) ?? {}) }));
     },
     /** A project's open bindings of one kind (BB-295), the same four columns as `endedOfKind`, never `lastSnapshot`. */
     openOfKind(projectId: string, kind: BindingKind): KindBindingRow[] {

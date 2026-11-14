@@ -181,7 +181,13 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
               .openAssumptionsForProject(projectId)
               .filter((assumption) => assumption.bindingId === scoped.id)
               .map((assumption) => ({ assumption, binding: scoped })),
-      nonActions: open.filter((b) => Object.keys(b.nonActions).length > 0).map((binding) => ({ binding, nonActions: binding.nonActions })),
+      nonActions: [
+        ...open.filter((b) => Object.keys(b.nonActions).length > 0),
+        // BB-335: the binding-ended close sits on an ended binding, so the
+        // digest also carries the ended bindings in this window that recorded
+        // one. `bb stewards show` renders it from the binding row directly.
+        ...(scoped === null ? all.filter((b) => b.endedAt !== null && b.endedAt >= since && Object.keys(b.nonActions).length > 0) : []),
+      ].map((binding) => ({ binding, nonActions: binding.nonActions })),
     };
   };
 }

@@ -1928,7 +1928,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   // need, a button or a count, and it wakes no one; the section is rendered
   // from the same digest read as every other section.
   const nonActionLines = (r.nonActions ?? []).flatMap(({ binding, nonActions }) =>
-    sortedNonActions(nonActions).map((n) => `- ${binding.entityKey} (${binding.kind}, ${binding.phase ?? "?"}): ${n.text}`),
+    sortedNonActions(nonActions).map((n) => `- ${binding.entityKey} (${binding.kind}, ${binding.phase ?? "?"}): ${n.text} (${n.date})`),
   );
   if (nonActionLines.length > 0) out.push("### Non-actions", "", ...capped(nonActionLines, "Nothing."), "");
   return out;

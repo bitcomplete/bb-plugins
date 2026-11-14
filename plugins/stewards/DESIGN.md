@@ -720,7 +720,10 @@ withdrawing a spec-approval item the user declined).
   read as every other section.
 - A non-action is information only. It is never a need, a button, an open item
   or a Blocked/needs-you count, and it wakes no one; recording it changes no
-  branch's decision.
+  branch's decision. `binding-ended-closed` is recorded only when the ending
+  actually closed an open item (an ending with nothing open is not a
+  non-action); `finishEnding` from a `gone` or `unconfigured` entity that closes
+  nothing is therefore silent, as it always was.
 
 ## 7. The ready gate
 
