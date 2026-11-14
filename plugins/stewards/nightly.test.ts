@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { createBriefing, checkFindingFingerprint, freshCheckFindings, localParts, nightOf, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
+import { backlogDigest, checkFindingFingerprint, createBriefing, duplicateBacklog, freshCheckFindings, localParts, nightOf, nightlyDue, stillNight, toDigestRecords } from "./nightly.js";
 import { MIGRATIONS, createStore } from "./store.js";
 import { formatRecords, type DigestRecords } from "./wake.js";
+import type { BacklogLook } from "./ops.js";
+import type { BacklogIssue } from "./source-contract.js";
 
 const NY = { at: "01:00", until: "02:45", timezone: "America/New_York" };
 // 2026-10-14 05:30Z is 01:30 in New York (EDT, UTC-4).
@@ -203,5 +205,107 @@ describe("check findings deduplicated by fingerprint (BB-328)", () => {
     store.setCheckFindings("p1", [], now() + 2000);
     expect(store.checkFindings("p1")).toEqual([]);
     expect(freshCheckFindings([problem("ENG is not visible")], store.checkFindings("p1")).fresh).toHaveLength(1);
+  });
+});
+
+// BB-334: the backlog report is pure — the stored look plus the previous
+// digest's snapshot in, the digest's metrics and lines out.
+describe("the backlog report (BB-334)", () => {
+  const NOW = at("2026-10-14T15:00:00Z");
+  const issue = (over: Partial<BacklogIssue> = {}): BacklogIssue => ({
+    id: "i1",
+    key: "BB-1",
+    title: "Fix login",
+    state: "Backlog",
+    stateType: "backlog",
+    unit: "BB",
+    labels: [],
+    assignees: [],
+    priority: null,
+    estimate: null,
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-01T00:00:00Z",
+    ...over,
+  });
+  const look = (issues: BacklogIssue[], over: Partial<BacklogLook> = {}): BacklogLook => ({ at: NOW, target: "backlog/BB", team: "BB", error: null, issues, unsupported: false, truncated: false, ...over });
+  const emptyRecords = (backlog: DigestRecords["backlog"]): DigestRecords => ({ previous: null, since: NOW, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [], backlog });
+
+  it("counts size, age buckets and inflow/outflow against the previous digest's snapshot", () => {
+    const issues = [
+      issue({ id: "a", key: "BB-1", createdAt: "2026-10-13T00:00:00Z" }),
+      issue({ id: "b", key: "BB-2", createdAt: "2026-10-01T00:00:00Z" }),
+      issue({ id: "c", key: "BB-3", createdAt: "2026-08-01T00:00:00Z" }),
+      issue({ id: "d", key: "BB-4", createdAt: "2026-01-01T00:00:00Z" }),
+    ];
+    const report = backlogDigest(look(issues), { at: NOW - 86_400_000, ids: ["a", "gone"] }, { staleDays: 14 }, NOW);
+    expect(report.size).toBe(4);
+    expect(report.ages).toEqual([
+      { label: "<1w", count: 1 },
+      { label: "1-4w", count: 1 },
+      { label: "1-3m", count: 1 },
+      { label: ">3m", count: 1 },
+    ]);
+    expect(report.inflow).toBe(3);
+    expect(report.outflow).toBe(1);
+    expect(report.since).toBe(NOW - 86_400_000);
+  });
+
+  it("reports the first digest with no inflow or outflow", () => {
+    expect(backlogDigest(look([issue()]), null, { staleDays: 14 }, NOW)).toMatchObject({ since: null, inflow: 0, outflow: 0 });
+  });
+
+  it("flags likely duplicates by normalised title, and never merges them", () => {
+    const groups = duplicateBacklog([issue({ id: "a", key: "BB-1", title: "Fix the login page" }), issue({ id: "b", key: "BB-2", title: "Fix login page!" }), issue({ id: "c", key: "BB-3", title: "Add SSO" })]);
+    expect(groups).toEqual([{ keys: ["BB-1", "BB-2"], title: "Fix the login page" }]);
+  });
+
+  it("lists stale tickets oldest first and proposes the next three with reasoning", () => {
+    const issues = [
+      issue({ id: "a", key: "BB-1", priority: "Low", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z" }),
+      issue({ id: "b", key: "BB-2", priority: "Urgent", createdAt: "2026-10-10T00:00:00Z", updatedAt: "2026-09-29T00:00:00Z", estimate: 3 }),
+      issue({ id: "c", key: "BB-3", priority: "High", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z" }),
+      issue({ id: "d", key: "BB-4", priority: "Medium", createdAt: "2026-08-01T00:00:00Z", updatedAt: "2026-08-01T00:00:00Z" }),
+    ];
+    const report = backlogDigest(look(issues), null, { staleDays: 14 }, NOW);
+    expect(report.stale).toEqual([
+      { key: "BB-4", days: 74 },
+      { key: "BB-3", days: 43 },
+      { key: "BB-2", days: 15 },
+    ]);
+    expect(report.next.map((n) => n.key)).toEqual(["BB-2", "BB-3", "BB-4"]);
+    expect(report.next[0]!.reason).toBe("Urgent, 4d old, estimate 3");
+  });
+
+  it("ranks Linear's priority label ignoring case and leaves a started ticket out of the proposal", () => {
+    const issues = [
+      issue({ id: "a", key: "BB-1", priority: "Medium", createdAt: "2026-01-01T00:00:00Z" }),
+      issue({ id: "b", key: "BB-2", priority: "Urgent", createdAt: "2026-10-13T00:00:00Z", stateType: "started" }),
+      issue({ id: "c", key: "BB-3", priority: "No priority", createdAt: "2026-09-01T00:00:00Z" }),
+    ];
+    const report = backlogDigest(look(issues), null, { staleDays: 14 }, NOW);
+    // The started ticket is proposed never, and the medium outranks the unranked one.
+    expect(report.next.map((n) => n.key)).toEqual(["BB-1", "BB-3"]);
+    expect(report.next[0]!.reason).toMatch(/^Medium, /u);
+    // It still counts in size and ages.
+    expect(report.size).toBe(3);
+    expect(report.ages.reduce((n, a) => n + a.count, 0)).toBe(3);
+  });
+
+  it("renders the section beside the record, and omits it when no role carries a backlog", () => {
+    const report = backlogDigest(look([issue({ title: "Fix login" })]), null, { staleDays: 14 }, NOW);
+    const withBacklog = formatRecords(emptyRecords([report]), []).join("\n");
+    expect(withBacklog).toContain("### Backlog");
+    expect(withBacklog).toContain("- BB: 1 open; age <1w 0, 1-4w 1, 1-3m 0, >3m 0; first digest");
+    expect(withBacklog).toContain("- Proposed next: BB-1 (no priority, 13d old)");
+    expect(formatRecords(emptyRecords([]), []).join("\n")).not.toContain("### Backlog");
+    expect(formatRecords(emptyRecords(undefined), []).join("\n")).not.toContain("### Backlog");
+  });
+
+  it("shows a failed read as one problem line, never an empty backlog", () => {
+    const failed = backlogDigest(look([], { error: "Linear rate limited the read" }), null, { staleDays: 14 }, NOW);
+    const text = formatRecords(emptyRecords([failed]), []).join("\n");
+    expect(text).toContain("### Backlog");
+    expect(text).toContain("- BB: unavailable — Linear rate limited the read");
+    expect(text).not.toContain("0 open");
   });
 });

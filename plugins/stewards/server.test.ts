@@ -12055,6 +12055,48 @@ describe("the backlog watch (BB-334)", () => {
     const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
     expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog.team"))).toEqual(["problem: stewards/project.json: backlog.team is OPS but no role watches that team (BB); they must name the same team"]);
   });
+
+  it("puts the backlog in the project steward's digest and snapshots the ids after the send (BB-334)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { staleDays: 14 } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog", "projectSteward"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue({ id: "i1", key: "BB-1" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.spawns[0]!.id;
+    const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(digest).toContain("### Backlog");
+    expect(digest).toContain("- BB: 1 open");
+    // The snapshot is recorded once the digest really went out, so the next
+    // digest can count inflow and outflow.
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    expect(t.hooks.store.binding(binding.id)!.backlogSnapshot).toMatchObject({ ids: ["i1"] });
+  });
+
+  it("snapshots the ids the digest reported, not a look that moved before the send (BB-334)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { staleDays: 14 } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog", "projectSteward"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue({ id: "i1", key: "BB-1" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    // A sweep stores a newer look while the digest is being assembled and sent.
+    const originalSend = t.sdk.threads.send;
+    t.harness.sdk.stub("threads.send", async (args: { threadId: string; input: Array<{ text: string }> }) => {
+      const current = t.hooks.store.binding(binding.id)!;
+      t.hooks.store.patch(binding.id, { backlogLook: { ...current.backlogLook!, issues: [...current.backlogLook!.issues, backlogIssue({ id: "i2", key: "BB-2" })] } });
+      return originalSend(args);
+    });
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    // The snapshot is the report's ids, so BB-2 is not silently counted as already seen.
+    expect(t.hooks.store.binding(binding.id)!.backlogSnapshot).toMatchObject({ ids: ["i1"] });
+  });
 });
 
 describe("the dotenv a requester imports", () => {
