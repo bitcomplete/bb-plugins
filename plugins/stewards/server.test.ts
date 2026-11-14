@@ -14603,6 +14603,160 @@ describe("a dated wait (BB-247)", () => {
   });
 });
 
+// BB-333 (criterion 4 of BB-291): the typed wait on `steward_report`. PR 1
+// validates, stores and renders it; it derives nothing, so `noWakeSource` is
+// exactly today's. The four fixtures (BB-266, bb-plugins#294, bc-prod#422/
+// BCP-157 and bc-prod#430/BCP-160) pin today's result here; PR 2 asserts the
+// typed derivation, which the comments name.
+describe("a typed wait (BB-333)", () => {
+  const base = { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const };
+  const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T15:00:00Z" });
+
+  async function ticket() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    return { t, steward: t.spawns[1]!.id, b: t.hooks.store.find("ENG-12")! };
+  }
+
+  it("stores a well-formed wait and renders it in `bb stewards show`", async () => {
+    const { t, steward } = await ticket();
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "external", ref: "the vendor's reply" } }, steward);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "the vendor's reply" });
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain("typed wait: external the vendor's reply");
+  });
+
+  it("a report with no wait is accepted unchanged, and a later one clears the stored wait", async () => {
+    const { t, steward } = await ticket();
+    await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "external", ref: "the vendor's reply" } }, steward);
+    expect(t.hooks.store.find("ENG-12")!.wait).not.toBeNull();
+    const plain = await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply" }, steward);
+    expect(plain.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toBeNull();
+  });
+
+  it("refuses an unknown kind, a missing ref, a malformed ref and a date with no date", async () => {
+    const { t, steward } = await ticket();
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ wait: { kind: "nope", ref: "acme/web#7" } }, /unknown_kind/u],
+      [{ wait: { kind: "pull" } }, /missing_reference/u],
+      [{ wait: { kind: "pull", ref: "acme/web" } }, /malformed_reference/u],
+      [{ wait: { kind: "date", ref: "next Tuesday" } }, /date_wait_without_date/u],
+    ];
+    for (const [extra, pattern] of cases) {
+      const r = await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", ...extra }, steward);
+      expect(r.error, JSON.stringify(extra)).toBe(true);
+      expect(r.text).toMatch(pattern);
+    }
+    expect(t.hooks.store.find("ENG-12")!.wait).toBeNull();
+  });
+
+  it("downgrades the binding's own pull to external", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("acme/web#7")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
+    expect(report.text).toMatch(/reference_is_self/u);
+  });
+
+  it("downgrades a well-formed ref the plugin cannot resolve to external", async () => {
+    const { t, steward } = await ticket();
+    // The test world watches acme/web only, so a repo it does not watch is unvalidatable.
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the sync PR checks", wait: { kind: "pull", ref: "bitcomplete/bc-prod#430" } }, steward);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "bitcomplete/bc-prod#430" });
+    expect(report.text).toMatch(/unvalidatable_reference/u);
+  });
+
+  it("accepts a well-formed pull ref in a watched repo and leaves it as sent", async () => {
+    const { t, steward } = await ticket();
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "pull", ref: "acme/web#9" });
+  });
+
+  // BB-266: a ticket with a gate-met own pull, a parked `finished` worker and a
+  // second open own pull, waiting on the plugin auto-merge. The typed ref is
+  // the own gate-met pull, so it is recorded as external (reference_is_self).
+  // TODAY the second open own pull is still a live source, so the wait is not
+  // marked; PR 2 derives the stall from the external wait despite it.
+  it("pins the BB-266 fixture: the second open own pull is a live source, so the wait is not marked", async () => {
+    const t = await setup();
+    t.entities.set(
+      "uuid-12",
+      issue({
+        state: "In Progress",
+        stateType: "started",
+        linkedPulls: [
+          { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+          { key: "acme/web#8", url: "https://github.com/acme/web/pull/8" },
+        ],
+      }),
+    );
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }));
+    await t.ring("linear", "uuid-12");
+    // The parked `finished` worker whose branch owns both pulls (BB-266).
+    await t.created("thr_w1", t.spawns[1]!.id, "ENG-12: Implement");
+    t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
+    t.hooks.store.parkWorker("thr_w1", "the owner's approval");
+    const b = t.hooks.store.find("ENG-12")!;
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+  });
+
+  // bb-plugins#294: a `pr` binding's own open pull with a free-text wait. The
+  // typed ref is its own pull, so external; a `pr` binding's own pull is never
+  // a source, so today and under PR 2 it stalls.
+  it("pins the bb-plugins#294 fixture: a pr binding's own open pull is not a source, so the wait is marked", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the dompurify fix on main", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("acme/web#7")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
+    expect(t.hooks.store.find("acme/web#7")!.noWakeSource).toBe(true);
+  });
+
+  // bc-prod#422 / BCP-157: a ticket waiting on the owner's approval, with no
+  // open approve-pr item, beside an open linked pull. The person ref is not an
+  // open page item, so it is recorded as external. TODAY the open pull watch is
+  // a live source and masks it; PR 2 derives the stall despite the mask.
+  it("pins the bc-prod#422/BCP-157 fixture: the open pull watch masks the person wait", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the owner's approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "need_approve" });
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+  });
+
+  // bc-prod#430 / BCP-160: a ticket waiting on a foreign pull's checks, not
+  // linked on the ticket. The ref is well-formed and in a watched repo, so it
+  // is accepted as `pull`. TODAY nothing leases it, so the wait is marked; PR 2
+  // leases it and derives it live, so it is not. The test world's one watched
+  // repo stands in for bc-prod.
+  it("pins the bc-prod#430/BCP-160 fixture: the foreign pull is not leased, so the wait is marked", async () => {
+    const { t, steward } = await ticket();
+    const report = await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "pull", ref: "acme/web#430" });
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+  });
+});
+
 // BB-203: the plugin writes the binding's status from events it observed
 // itself, before the steward's next turn, and quiets a running worker's own
 // pull request activity only while nothing the user must act on is open.

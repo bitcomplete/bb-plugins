@@ -16,6 +16,7 @@ import { deploymentsSchema, type Deployments } from "./deploy.js";
 import { backlogLookSchema, backlogSnapshotSchema, opsLookSchema, type BacklogLook, type BacklogSnapshot, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
+import { waitSchema, type Wait } from "./wait.js";
 import type { GuidanceCitation } from "./guidance.js";
 import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
@@ -762,7 +763,15 @@ export const CHECK_FINDING_MIGRATIONS = [
 // Appended after BB-328's check-findings table, the last shipped group.
 export const BACKLOG_SNAPSHOT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN backlog_snapshot TEXT`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS];
+// BB-333: a steward's typed wait (`{kind, ref}`), the structured form of the
+// free-text `waitingOn`. Additive and nullable: an old row reads as no typed
+// wait, and a pre-migration build never reads the column. Appended after every
+// group already shipped, including BB-334's backlog columns and BB-328's
+// check-findings table, so no recorded index moves. PR 1 stores and renders
+// it; nothing derives from it yet.
+export const TYPED_WAIT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait TEXT`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -998,6 +1007,8 @@ export type Binding = {
   backlogLook: BacklogLook | null;
   /** The issue ids as of the last digest that reported this backlog; null before the first. */
   backlogSnapshot: BacklogSnapshot | null;
+  /** The typed wait from the last `steward_report` (BB-333), or null; the free-text `waitingOn` stays on the status record. */
+  wait: Wait | null;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
   deployments: Deployments;
   /** When the binding became idle in an active stage, or null (BB-83). */
@@ -1095,6 +1106,7 @@ function rowToBinding(r: BindingRow): Binding {
     alertmanagerLook: json(alertmanagerLookSchema.nullable(), str("alertmanager_look"), null),
     backlogLook: json(backlogLookSchema.nullable(), str("backlog_look"), null),
     backlogSnapshot: json(backlogSnapshotSchema.nullable(), str("backlog_snapshot"), null),
+    wait: json(waitSchema.nullable(), str("wait"), null),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
     idleWokenAt: num("idle_woken_at"),
@@ -1170,6 +1182,7 @@ const COLUMNS = {
   alertmanagerLook: "alertmanager_look",
   backlogLook: "backlog_look",
   backlogSnapshot: "backlog_snapshot",
+  wait: "wait",
   deployments: "deployments",
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",
@@ -1221,6 +1234,8 @@ const VISIBLE_COLUMNS = [
   "no_wake_source",
   // BB-247: a dated wait changes line two's phrase too.
   "requeue_until",
+  // BB-333: the typed wait renders on the card and in `bb stewards show`.
+  "wait",
   // BB-255: a failed wake's phrase is the visible line two.
   "wake_failure",
 ] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;
