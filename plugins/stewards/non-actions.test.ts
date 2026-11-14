@@ -45,8 +45,8 @@ describe("the non-action reason table (BB-335)", () => {
     }
     // The two named cases carry the date, and the binding-ended one carries the
     // end reason too.
-    expect(nonActionText("binding-ended-closed", "terminal", NOW)).toBe("Closed because the binding ended (terminal, 2026-11-14)");
-    expect(nonActionText("needs-decline-closed", null, NOW)).toContain("2026-11-14");
+    expect(nonActionText("binding-ended-closed", "terminal", NOW)).toBe("Closed because the binding ended (terminal)");
+    expect(nonActionText("needs-decline-closed", null, NOW)).toContain("declined");
   });
 
   it("records a reason for every code, so each branch has a write path", () => {
@@ -459,11 +459,11 @@ describe("the non-action render surfaces (BB-335)", () => {
       noWakeSource: [],
       stall: [],
       held: [],
-      nonActions: [{ binding: { entityKey: "ENG-12", kind: "ticket", phase: "Done" } as never, nonActions: { "binding-ended-closed": { date: "2026-11-14", text: "Closed because the binding ended (terminal, 2026-11-14)" } } }],
+      nonActions: [{ binding: { entityKey: "ENG-12", kind: "ticket", phase: "Done" } as never, nonActions: { "binding-ended-closed": { date: "2026-11-14", text: "Closed because the binding ended (terminal)" } } }],
     };
     const text = formatRecords(records, []).join("\n");
     expect(text).toContain("### Non-actions");
-    expect(text).toContain("ENG-12 (ticket, Done): Closed because the binding ended (terminal, 2026-11-14) (2026-11-14)");
+    expect(text).toContain("ENG-12 (ticket, Done): Closed because the binding ended (terminal) (2026-11-14)");
   });
 
   it("does not render the digest section when there are no non-actions", () => {

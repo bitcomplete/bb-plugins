@@ -1251,9 +1251,9 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
   it("shows an ended effort's recorded non-actions on its card (BB-335)", async () => {
     const ended = await renderBoardWith({
       subPath: "p1/ENG-0",
-      ended: [{ key: "ENG-0", url: null, title: "Old work", kind: "ticket", endReason: "terminal", endedAt: 1_000, threadId: null, nonActions: { "binding-ended-closed": { date: "2026-11-14", text: "Closed because the binding ended (terminal, 2026-11-14)" } } }],
+      ended: [{ key: "ENG-0", url: null, title: "Old work", kind: "ticket", endReason: "terminal", endedAt: 1_000, threadId: null, nonActions: { "binding-ended-closed": { date: "2026-11-14", text: "Closed because the binding ended (terminal)" } } }],
     });
-    await waitFor(() => expect(ended.getByText(/Non-actions: Closed because the binding ended \(terminal, 2026-11-14\) \(2026-11-14\)/u)).toBeTruthy());
+    await waitFor(() => expect(ended.getByText(/Non-actions: Closed because the binding ended \(terminal\) \(2026-11-14\)/u)).toBeTruthy());
     ended.lifecycle.unmount();
   });
 

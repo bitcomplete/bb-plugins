@@ -90,8 +90,8 @@ const NON_ACTION_TEXT: Record<NonActionCode, (detail: string | null, day: string
   "merge-refused": (d) => `GitHub refused the merge${d === null ? "" : ` of ${d}`}`,
   "head-moved": (d) => `The head moved between the look and the merge${d === null ? "" : ` of ${d}`}`,
   "gate-not-met": (d) => `The merge gate${d === null ? "" : ` for ${d}`} is not met`,
-  "binding-ended-closed": (d, day) => `Closed because the binding ended (${d ?? "ended"}, ${day})`,
-  "needs-decline-closed": (d, day) => `Closed the spec approval because the spec was declined${d === null ? "" : ` (${d})`} (${day})`,
+  "binding-ended-closed": (d) => `Closed because the binding ended (${d ?? "ended"})`,
+  "needs-decline-closed": (d) => `Closed the spec approval because the spec was declined${d === null ? "" : ` (${d})`}`,
 };
 
 /** The UTC day (YYYY-MM-DD) a moment falls in, so a reason's date rolls at midnight UTC. */
