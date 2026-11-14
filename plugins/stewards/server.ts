@@ -137,6 +137,7 @@ import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPu
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
+import { WAIT_REFUSAL_MESSAGE, waitInputSchema, waitPhrase, waitSchema, validateWait, type Wait, type WaitContext } from "./wait.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
@@ -662,6 +663,8 @@ export const rpcContract = defineRpcContract({
               waitingOn: z.string().nullable(),
               /** When a dated wait parks the binding, for `waiting on <text> until <date>` (BB-247). */
               waitingUntil: z.number().nullable(),
+              /** The typed wait from the last report (BB-333), or null; rendered on the card. */
+              wait: waitSchema.nullable(),
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
@@ -793,6 +796,8 @@ export const rpcContract = defineRpcContract({
               waitingOn: z.string().nullable(),
               /** When a dated wait parks the binding, for `waiting on <text> until <date>` (BB-247). */
               waitingUntil: z.number().nullable(),
+              /** The typed wait from the last report (BB-333), or null; rendered on the card. */
+              wait: waitSchema.nullable(),
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
@@ -903,6 +908,8 @@ export const rpcContract = defineRpcContract({
           waitingOn: z.string().nullable(),
           /** When a dated wait parks the binding, for `waiting on <text> until <date>` (BB-247). */
           waitingUntil: z.number().nullable(),
+          /** The typed wait from the last report (BB-333), or null; the sidebar row carries it for a later render. */
+          wait: waitSchema.nullable(),
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
           /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
@@ -9924,6 +9931,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               createdAt: b.createdAt,
               workers: store.workers(b.id).filter((w) => w.status === "running").length,
               waitingUntil: b.requeueUntil,
+              wait: b.wait,
               escalations: store.openEscalations(b.id).map((x) => ({ kind: x.kind, route: x.route, question: x.question })),
             })),
           };
@@ -10029,6 +10037,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               wokeAt: b.wokeAt,
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
+              wait: b.wait,
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
             })),
@@ -10137,6 +10146,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               requeueAt: b.requeueAt,
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
+              wait: b.wait,
               workers,
             };
           });
@@ -11173,6 +11183,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(100)
           .optional()
           .describe('A dated wait: when the thing you wait on has a known end. A date ("2026-12-01", read as 00:00 UTC) or an ISO datetime. It requeues you then instead of requeueAfter, no stall is counted while it is ahead, and it needs waitingOn. A date in the past is ignored with a note. Beyond the playbook\'s `max-wait` (default 90d) it is accepted and noted once to the project steward.'),
+        wait: waitInputSchema
+          .optional()
+          .describe(
+            "The typed form of the wait: a closed kind (pull, review, deployment, worker, binding, date, person, external) and a ref. `pull`/`review` name a pull request (owner/repo#N); `deployment` a deployment-watch key; `worker` a worker thread id (thr_…); `binding` another binding's entity key; `date` an ISO date or datetime; `person` a page item id (need_…, esc_…, qst_…); `external` any free text. A `pull` ref that is the binding's own, or a well-formed ref the plugin cannot resolve, is recorded as `external`; a `review` wait on the binding's own pull is valid. Omit it for today's free-text `waitingOn`.",
+          ),
         conditions: z.array(z.string().trim().min(1).max(200)).max(10).optional().describe("Anything else a reader of the status should know at a glance."),
         ready: z
           .object({
@@ -11451,6 +11466,34 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               untilAt = parsed;
             }
           }
+          // BB-333: the typed wait. Validated only when a wait is sent, so a
+          // report with today's free-text `waitingOn` and no kind is unchanged.
+          // The four hard refusals write nothing; a self or unvalidatable ref is
+          // accepted and recorded as `external`. Nothing derives from it yet.
+          let wait: Wait | null = null;
+          let waitNote = "";
+          if (input.wait !== undefined) {
+            const ownPulls = b.lastSnapshot === null ? new Set<string>() : await ownPullKeys(b, store.workers(b.id), b.lastSnapshot);
+            const ownKey = lc(b.entityKey);
+            const waitContext: WaitContext = {
+              isOwnPull: (key) => lc(key) === ownKey || ownPulls.has(lc(key)),
+              // A missing config leaves the repo check open rather than
+              // downgrading a ref the plugin simply could not read.
+              isWatchedRepo: (repo) => config === null || config.repos.some((r) => lc(r) === lc(repo)),
+              // The map is keyed by watch id (`pullKey::<target>` when the target is named or there are several), so match the watch's own pull key (BB-132).
+              hasDeployment: (key) => Object.values(b.deployments).some((w) => lc(w.key) === lc(key)),
+              hasOpenBinding: (key) => {
+                const other = store.find(key, b.projectId);
+                return other !== null && other.endedAt === null;
+              },
+              hasWorker: (threadId) => store.worker(threadId) !== null,
+              hasOpenItem: (id) => store.openNeeds(b.id).some((n) => n.id === id) || store.openEscalations(b.id).some((x) => x.id === id) || store.openQuestions(b.projectId).some((q) => q.id === id),
+            };
+            const validation = validateWait(input.wait, input.until, waitContext);
+            if (!validation.ok) return toolError(new Error(validation.message));
+            wait = validation.wait;
+            if (validation.downgraded !== null) waitNote = ` ${WAIT_REFUSAL_MESSAGE[validation.downgraded]}`;
+          }
           // `until` wins over an explicit `requeueAfter` in the same report. The
           // deployment-deadline min below is untouched; a dated wait is not
           // capped by `requeue-default`.
@@ -11461,7 +11504,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // An auto-filed need does not satisfy this: it is filed from prose,
           // not the item the user acts on, so a wait naming the user still
           // needs a real item or escalation (BB-213).
-          if (waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
+          // Only a stored `person` wait — one that resolved to an open page item and was not downgraded — bypasses the guard: the item it names is itself what reaches the page. An `external` wait, or a `person` wait downgraded to `external`, still has to file the item.
+          const personWait = wait !== null && wait.kind === "person";
+          if (!personWait && waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
                 `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,
@@ -11563,6 +11608,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return deadline === null ? at : Math.min(at, deadline);
             })(),
             requeueUntil: untilAt,
+            // A report replaces the typed wait; a report without one clears it.
+            wait,
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
@@ -11783,14 +11830,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // correction: an unknown id is ignored and named, never a failure.
           const citesNote = input.cites === undefined ? "" : ` ${citationLines(await countCitations(b.projectId, b.id, input.cites)).join("; ")}.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${untilNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${untilNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}. End the turn now.`;
           }
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
-            return `Reported.${untilNote}${replacedNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
+            return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          return `Reported.${untilNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} You will be woken when something actionable changes, or ${requeuePhrase}. End the turn now.`;
+          return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} You will be woken when something actionable changes, or ${requeuePhrase}. End the turn now.`;
         } catch (error) {
           return toolError(error);
         }
@@ -12665,7 +12712,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     : `looked ${iso(alertmanager.at)}: ${alertmanager.findings.length === 0 ? "nothing to do" : `${alertmanager.findings.length} alert(s) new, rung or resolved`}`;
           const needs = store.openNeeds(b.id);
           const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
-          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
+          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
     }
