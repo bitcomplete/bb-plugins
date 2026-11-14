@@ -66,15 +66,17 @@ export const BRIEF_PREFIX =
  * The spawn command, shared by the wake, `bb stewards spawn-flags` and the
  * brief. A worker is the default and its output is unchanged; a reviewer
  * (BB-133) is hidden, runs with full permissions (Pi accepts only `full`) and
- * is started from the worker thread it reviews for, so `--parent-self` makes
- * it that worker's child and the lifecycle owner stays the worker.
+ * is started from the worker thread it reviews for, with that worker as its
+ * lifecycle owner and no parent (BB-323): bb core refuses a child for an
+ * active Pi parent, and a worker is active when it runs the command.
  */
 export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string; role?: "worker" | "reviewer" }): string {
   const reviewer = input.role === "reviewer";
+  const parent = reviewer ? "" : " --parent-self";
   const extra = reviewer ? " --visibility hidden --permission-mode full" : "";
   const title = reviewer ? `Review ${input.entityKey}: <task>` : `${input.entityKey}: <task>`;
   return [
-    `bb thread spawn --project ${input.projectId} --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${extra}${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${title}" --prompt-file - <<'EOF'`,
+    `bb thread spawn --project ${input.projectId}${parent} --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${extra}${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${title}" --prompt-file - <<'EOF'`,
     "<the whole task>",
     "EOF",
   ].join("\n");

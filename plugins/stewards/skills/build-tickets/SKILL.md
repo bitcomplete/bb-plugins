@@ -188,7 +188,8 @@ Otherwise write the review prompt (below). The reviewer follows the
 tests. Do not hand-roll its flags: `bb stewards spawn-flags --role reviewer`
 prints the full reviewer spawn command — hidden, full
 permissions, the project's reviewer model and environment, started from
-this worker thread so `--parent-self` makes it your child. Its output ends
+this worker thread with this thread as the reviewer's lifecycle owner and no
+parent. Its output ends
 in a heredoc whose body is the placeholder `<the whole task>`; run the
 command with your review prompt in place of that line, and the `<task>` in
 its title replaced by a short label. Add `--json` and keep the whole
