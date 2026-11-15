@@ -144,7 +144,7 @@ import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -431,6 +431,14 @@ const CREDENTIAL_VARIABLE = /\b[A-Z][A-Z0-9_]*_(?:API_KEY|SECRET|TOKEN|PASSWORD)
 /** Whether an escalation names a credential variable in its question or context. */
 const namesCredential = (escalation: Escalation): boolean =>
   CREDENTIAL_VARIABLE.test(escalation.question) || (escalation.context !== null && CREDENTIAL_VARIABLE.test(escalation.context));
+
+/**
+ * The entity keys a free-text wait names (BB-339): a Linear key (`KPL-126`) or
+ * a GitHub issue or pull request key (`owner/repo#N`). Used only to point the
+ * report reply at an open binding the steward could hold behind; the caller
+ * resolves each key through `store.find` before naming it.
+ */
+const waitEntityKeys = (text: string): string[] => [...new Set(text.match(/[A-Z][A-Z0-9]+-\d+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+/gu) ?? [])];
 
 // One row each in the board's "waiting on you" section. The sidebar reuses
 // these shapes, tagged, for its "Needs you" list, so the two surfaces cannot
@@ -12263,6 +12271,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // as a dated wait in the digest instead).
           const datedFuture = current.requeueUntil !== null && current.requeueUntil > now();
           const noWakeSource = waitingOn !== null && waitingOn.trim() !== "" && !liveSource && !datedFuture;
+          // BB-339: the open bindings the free text names, in the order they
+          // appeared, so the report reply can point the steward at the hold it
+          // can take in this turn. A key that resolves to nothing, to an ended
+          // binding, or to this binding itself is not named.
+          const namedOpenKeys = noWakeSource
+            ? waitEntityKeys(waitingOn ?? "").filter((key) => {
+                const target = store.find(key, b.projectId);
+                return target !== null && target.endedAt === null && target.id !== b.id;
+              })
+            : [];
           const stall = advanceStall(
             { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
             { reason: wakeReason, waitingOn, liveSource, now: now(), until: current.requeueUntil },
@@ -12374,13 +12392,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const citesNote = input.cites === undefined ? "" : ` ${citationLines(await countCitations(b.projectId, b.id, input.cites)).join("; ")}.`;
           if (b.ending === "terminal") {
             if (b.followThrough === null) return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}. End the turn now.`;
+            const followWake = noWakeSource
+              ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} You will still be woken only by requeue, ${requeuePhrase}.`
+              : `You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}.`;
+            return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. ${followWake} End the turn now.`;
           }
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
             return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} You will be woken when something actionable changes, or ${requeuePhrase}. End the turn now.`;
+          const wakeNote = noWakeSource
+            ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} You will still be woken only by requeue, ${requeuePhrase}.`
+            : `You will be woken when something actionable changes, or ${requeuePhrase}.`;
+          return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} ${wakeNote} End the turn now.`;
         } catch (error) {
           return toolError(error);
         }

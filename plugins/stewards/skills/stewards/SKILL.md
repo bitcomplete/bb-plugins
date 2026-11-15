@@ -274,9 +274,12 @@ Two tools are yours; everything else you do with the tools every thread has.
   need, a watched pull request. A free-text `waitingOn` beside them can name
   something nothing will ever deliver. When you report a wait and none of
   those sources is live, the binding is marked `noWakeSource`: the row and
-  `bb stewards list`/`show` read `waiting, no wake source`, and your next
-  wake says so and asks you to name what will deliver the wait (a binding to
-  hold behind, a pull request, a deployment target, a worker). Clear it by
+  `bb stewards list`/`show` read `waiting, no wake source`, and the report
+  reply itself flags it and tells you to name what will deliver the wait in
+  that same turn — a binding to hold behind (`steward_update { hold,
+  behind }`), a typed `wait`, or a dated `until` — not at the next wake. If
+  the free text names an open binding in the same project, the reply names
+  it and the exact `hold, behind` call. Clear the mark by
   adding a real source or clearing the wait. If you wake by `requeue` twice
   in a row with the same wait and no source, the plugin raises one `stall`
   escalation to the project steward naming the binding, the wait, when you

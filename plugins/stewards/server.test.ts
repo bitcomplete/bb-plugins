@@ -14711,6 +14711,74 @@ describe("a wait with no wake source (BB-154)", () => {
   });
 });
 
+// BB-339: the report reply itself tells a steward its wait has no wake source,
+// in the turn it can still act, and names an open binding the free text
+// mentions so the steward can hold behind it.
+describe("the report reply for a wait with no wake source (BB-339)", () => {
+  const waitReport = (waitingOn: string, over: Record<string, unknown> = {}) => ({ phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const, waitingOn, ...over });
+  const ringIssue = async (t: Awaited<ReturnType<typeof setup>>, id: string, key: string) => {
+    t.entities.set(id, issue({ id, key, title: key }));
+    await t.ring("linear", id);
+  };
+
+  async function bound() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    return { t, steward: t.spawns[1]!.id };
+  }
+
+  it("swaps the generic sentence for the no-wake one when a prose wait has no source", async () => {
+    const { t, steward } = await bound();
+    const res = await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    expect(res.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+    expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
+    expect(res.text).toContain("Name what will in this turn");
+    expect(res.text).not.toContain("You will be woken when something actionable changes");
+  });
+
+  it("names an open binding the free text mentions, with the exact hold call", async () => {
+    const { t, steward } = await bound();
+    await ringIssue(t, "uuid-kpl", "KPL-126");
+    const res = await t.tool("steward_report", waitReport("KPL-126 merged and deployed in kploy-production"), steward);
+    expect(res.error).toBe(false);
+    expect(res.text).toContain('KPL-126 is an open binding in this project; hold behind it with `steward_update { hold, behind: ["KPL-126"] }` so its finish wakes you.');
+  });
+
+  it("does not name a key that resolves to an ended binding, or to nothing", async () => {
+    const { t, steward } = await bound();
+    await ringIssue(t, "uuid-kpl", "KPL-126");
+    t.hooks.store.patch(t.hooks.store.find("KPL-126")!.id, { endedAt: t.now(), endReason: "terminal" });
+    const ended = await t.tool("steward_report", waitReport("KPL-126 merged"), steward);
+    expect(ended.text).toContain("Nothing the plugin tracks will deliver this wait");
+    expect(ended.text).not.toContain("KPL-126 is an open binding");
+
+    const missing = await t.tool("steward_report", waitReport("ZZZ-999 is merged"), steward);
+    expect(missing.text).toContain("Nothing the plugin tracks will deliver this wait");
+    expect(missing.text).not.toContain("ZZZ-999 is an open binding");
+  });
+
+  it("keeps today's sentence for a dated wait that is still ahead", async () => {
+    const { t, steward } = await bound();
+    const res = await t.tool("steward_report", waitReport("the vendor's reply", { until: "2026-12-01" }), steward);
+    expect(res.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(res.text).not.toContain("Nothing the plugin tracks will deliver this wait");
+    expect(res.text).toContain("You will be woken when something actionable changes");
+  });
+
+  it("keeps today's sentence when a worker is running", async () => {
+    const { t, steward } = await bound();
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const res = await t.tool("steward_report", waitReport("the worker's result"), steward);
+    expect(res.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(res.text).not.toContain("Nothing the plugin tracks will deliver this wait");
+    expect(res.text).toContain("You will be woken when something actionable changes");
+  });
+});
+
 // BB-247: a dated wait (`steward_report { until }`) parks the binding at the
 // date, counts no stall while it is ahead, is visible on the row and
 // `bb stewards show`, and is listed in its own digest section.

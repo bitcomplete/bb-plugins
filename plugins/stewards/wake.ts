@@ -533,6 +533,27 @@ function noWakeSourceLines(binding: Binding): string[] {
   return lines;
 }
 
+/**
+ * The report-time one-line form of `noWakeSourceLines` (BB-339): the sentence a
+ * `steward_report` reply carries when that report left the binding waiting with
+ * no wake source. The steward reads it in the turn it can still act, so it says
+ * what the plugin does not track, names the open bindings the free text mentions
+ * as `hold, behind` calls, and tells the steward to name a source before it ends
+ * the turn. `openKeys` are the keys the caller resolved to open bindings in the
+ * same project, in the order they appeared; an empty list adds no naming.
+ */
+export function noWakeSourceReportSentence(waitingOn: string | null, openKeys: readonly string[]): string {
+  const wait = waitingOn === null || waitingOn.trim() === "" ? "" : ` (${JSON.stringify(waitingOn)})`;
+  const named = openKeys
+    .map((key) => `${key} is an open binding in this project; hold behind it with \`steward_update { hold, behind: [${JSON.stringify(key)}] }\` so its finish wakes you.`)
+    .join(" ");
+  return (
+    `Nothing the plugin tracks will deliver this wait${wait}: no hold behind anything, no merge hold, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. ` +
+    "Name what will in this turn — a binding to hold behind (`steward_update { hold, behind }`), a typed `wait` (`binding`, `pull`, `review`, `deployment`, `worker`, `person`), or a dated `until` — before ending the turn." +
+    (named === "" ? "" : ` ${named}`)
+  );
+}
+
 /** Section 3's scheduling lines for a ticket or pull request binding: what it touches, and what is in flight on the same paths. */
 function schedulingLines(binding: Binding, conflicts: Conflict[], escalations: Escalation[]): string[] {
   if (binding.kind !== "ticket" && binding.kind !== "pr") return [];
