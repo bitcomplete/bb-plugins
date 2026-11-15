@@ -661,6 +661,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     hold: s.hold,
     holdBehind: s.holdBehind,
     stuck: s.stuck,
+    delegateWait: s.delegateWait,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     waitingUntil: s.waitingUntil,
@@ -1306,6 +1307,7 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     hold: s.hold,
     holdBehind: s.holdBehind,
     stuck: s.stuck,
+    delegateWait: s.delegateWait,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     waitingUntil: s.waitingUntil,
@@ -1539,7 +1541,13 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
   }
   const s = effort.steward;
   const lessons = b.lessons.filter((l) => l.key === effortKey);
-  const stuck = b.stuck.find((x) => x.key === effortKey) ?? null;
+  // BB-338: a binding can carry both a delegate wait and a real `stuck`
+  // escalation; the detail shows the real one's red line whatever else is open.
+  // If a delegate wait's `meanwhile` cannot be read back (so `delegateWait` is
+  // null), fall back to its blocked entry so the row never loses its red line.
+  const stuckEntries = b.stuck.filter((x) => x.key === effortKey);
+  const realStuck = stuckEntries.find((x) => x.kind === "stuck") ?? null;
+  const delegateStuck = stuckEntries.find((x) => x.kind === "delegate") ?? null;
   return (
     <>
       <EffortHeading board={b} effort={effort} />
@@ -1572,7 +1580,12 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
-          {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}
+          {s.delegateWait !== null && s.delegateWait !== undefined ? (
+            <p className="text-muted-foreground">Waiting on review from {s.delegateWait}</p>
+          ) : delegateStuck !== null ? (
+            <p className="text-destructive">Stuck: {delegateStuck.why}</p>
+          ) : null}
+          {realStuck !== null ? <p className="text-destructive">Stuck: {realStuck.why}</p> : null}
           <p className="text-xs text-muted-foreground">
             {s.kind === "ops" ? `Last wake ${ago(s.wokeAt, now)}` : `Reported ${ago(s.statusAt, now)} · adopted ${ago(s.createdAt, now)}`}
             {s.stage !== null ? ` · stage ${s.stage}` : ""}

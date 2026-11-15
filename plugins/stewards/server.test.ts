@@ -14163,9 +14163,12 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(esc.route).toBe("steward");
     expect(esc.meanwhile).toContain("arashout");
     expect(t.hooks.store.openNeeds(binding.id).some((n) => n.kind === "approve-pr")).toBe(false);
-    // The sidebar row reads blocked, not "needs you".
-    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; stuck: boolean; needsUser: boolean }> };
-    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, needsUser: false });
+    // The sidebar row reads blocked, not "needs you", and names the delegate (BB-338).
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; stuck: boolean; needsUser: boolean; delegateWait: string | null }> };
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, needsUser: false, delegateWait: "arashout" });
+    // The board row carries the same name (BB-338).
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; stuck: boolean; delegateWait: string | null }> } };
+    expect(board.board.stewards.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, delegateWait: "arashout" });
     // The ticket steward cannot resolve the delegate wait into a decline.
     const refused = await t.tool("steward_update", { binding: "ENG-12", guidance: "no", resolve: esc.id }, t.steward);
     expect(refused.error).toBe(true);

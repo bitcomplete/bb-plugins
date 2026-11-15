@@ -346,6 +346,23 @@ export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Bindi
  */
 export const isDelegateWait = (x: { kind: string; route: string }): boolean => x.kind === "approval" && x.route === "steward";
 
+/**
+ * The `meanwhile` text of a delegate wait (BB-338): the one builder the raise
+ * site uses, so the reader below parses exactly what the plugin wrote.
+ */
+export const delegateWaitText = (names: string): string => `Waiting: approval from ${names} (a requested reviewer), not the owner.`;
+
+/**
+ * The requested reviewers a delegate wait's `meanwhile` names (BB-338), or null
+ * when the text is not a delegate wait. The page and sidebar read the names
+ * from the escalation the plugin already holds, never from GitHub.
+ */
+export function delegateWaitNames(meanwhile: string | null): string | null {
+  if (meanwhile === null) return null;
+  const m = /^Waiting: approval from (.+) \(a requested reviewer\), not the owner\.$/u.exec(meanwhile);
+  return m === null ? null : m[1]!;
+}
+
 /** A reviewer marker's identity: a new round on the same head is a new marker (BB-51). */
 export const markerKey = (m: { round: number; sha: string } | null): string | null => (m === null ? null : `${m.round}:${m.sha}`);
 
@@ -455,7 +472,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
     // withdrawn and the ordinary owner lane returns.
     const names = g.delegates.join(", ");
     ctx.store.closeNeedByKey(b.id, "approve-pr", url, `Waiting on the requested reviewer ${names}.`);
-    const meanwhile = `Waiting: approval from ${names} (a requested reviewer), not the owner.`;
+    const meanwhile = delegateWaitText(names);
     if (approvalEsc === null) {
       ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile, route: "steward", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
     } else {

@@ -1026,6 +1026,7 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   holdBehind: [],
   needsUser: false,
   stuck: false,
+  delegateWait: null,
   deployment: null,
   pending: [],
   requeueAt: null,
@@ -1207,7 +1208,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     const slot = await renderBoardWith({
       subPath: "p1/ENG-1",
       stewards: [boardSteward({ key: "ENG-1", title: "Fix login", waitingOn: "bb-gate#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
-      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", why: "waiting on a decision", since: 1 }],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
     });
     // The wait is a plain muted line, not a destructive one (BB-109).
     const waiting = await waitFor(() => slot.getByText("Waiting on bb-gate#88"));
@@ -1216,6 +1217,52 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     expect(slot.getByText(/On hold: a freeze \(behind ENG-9\)/u)).toBeTruthy();
     expect(slot.getByText(/Stuck: waiting on a decision/u)).toBeTruthy();
     slot.lifecycle.unmount();
+  });
+
+  // BB-338: a delegate wait is blocked but names who it waits on, in muted
+  // text, while a real stuck escalation keeps the red line.
+  it("names the requested reviewer for a delegate wait, and keeps the red Stuck line for a real stuck", async () => {
+    const delegate = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true, delegateWait: "arashout" })],
+    });
+    const waiting = await waitFor(() => delegate.getByText("Waiting on review from arashout"));
+    expect(waiting.className).toContain("text-muted-foreground");
+    expect(waiting.className).not.toContain("text-destructive");
+    expect(delegate.queryByText(/Stuck:/u)).toBeNull();
+    delegate.lifecycle.unmount();
+
+    const stuck = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true })],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
+    });
+    const red = await waitFor(() => stuck.getByText(/Stuck: waiting on a decision/u));
+    expect(red.className).toContain("text-destructive");
+    expect(stuck.queryByText(/Waiting on review from/u)).toBeNull();
+    stuck.lifecycle.unmount();
+
+    // Both open at once: the delegate line does not hide the real stuck line.
+    const both = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true, delegateWait: "arashout" })],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
+    });
+    const bothWaiting = await waitFor(() => both.getByText("Waiting on review from arashout"));
+    expect(bothWaiting.className).toContain("text-muted-foreground");
+    expect(both.getByText(/Stuck: waiting on a decision/u).className).toContain("text-destructive");
+    both.lifecycle.unmount();
+
+    // A delegate entry whose meanwhile could not be read back still shows a red line.
+    const unparsed = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true })],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "delegate", why: "Waiting on the requested reviewer: unreadable", since: 1 }],
+    });
+    const fallback = await waitFor(() => unparsed.getByText("Stuck: Waiting on the requested reviewer: unreadable"));
+    expect(fallback.className).toContain("text-destructive");
+    expect(unparsed.queryByText(/Waiting on review from/u)).toBeNull();
+    unparsed.lifecycle.unmount();
   });
 
   // BB-251: the binding card shows the open recorded assumptions.

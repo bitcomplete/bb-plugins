@@ -27,6 +27,7 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   wakeFailure: null,
   needsUser: false,
   stuck: false,
+  delegateWait: null,
   status: null,
   deployment: null,
   pending: [],
@@ -60,6 +61,7 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   workers: [],
   needsUser: false,
   stuck: false,
+  delegateWait: null,
   statusActor: null,
   statusNextAction: null,
   statusAt: null,
@@ -470,8 +472,10 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     // 3. hold
     expect(effortPhrase(effort({ key: "c", hold: "a freeze", holdBehind: ["BB-57", "BB-61"] }))).toBe("held behind BB-57, BB-61");
     expect(effortPhrase(effort({ key: "d", hold: "a freeze" }))).toBe("on hold");
-    // 4. stuck
+    // 4. stuck; a delegate wait names who it waits on (BB-338)
     expect(effortPhrase(effort({ key: "e", stuck: true }))).toBe("stuck");
+    expect(effortPhrase(effort({ key: "e2", stuck: true, delegateWait: "arashout" }))).toBe("waiting on review from arashout");
+    expect(effortState(effort({ key: "e2", stuck: true, delegateWait: "arashout" }))).toBe("blocked");
     // 5. running workers, before the deployment watch and the free-text
     // nextAction, so a waiting effort with a running worker reads the count (BB-81).
     expect(effortPhrase(effort({ key: "g", runningWorkers: 2 }))).toBe("2 workers running");
