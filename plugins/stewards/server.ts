@@ -130,7 +130,7 @@ import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, apply
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
-import { classifyRefresh, hasTemplateStamp, laggingPlaybooks, refreshPrBody, refreshQueueDecision, type LaggingPlaybook } from "./refresh.js";
+import { classifyRefresh, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision, type LaggingPlaybook } from "./refresh.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -1356,24 +1356,20 @@ export function refreshPrompt(refresh: Pick<PlaybookRefresh, "playbook" | "templ
     "",
     `The project copy \`.bb/stewards/playbooks/${refresh.playbook}.md\` was copied from the shipped template \`${refresh.templateName}\` and has drifted: its stamp is \`${refresh.fromHash}\`, and the current template hash is \`${refresh.targetHash}\`.`,
     "",
-    "Merge the current shipped template into the project copy, keeping the project's own additions. A project addition that contradicts the template stays; note the contradiction in your final reply. Never drop a project-specific rule to match the template.",
+    "Merge the current shipped template into the project copy, keeping the project's own additions. A project addition that contradicts the template stays; never drop a project-specific rule to match the template.",
     "",
     "The current project copy:",
     "",
-    "```md",
-    projectCopy.replace(/```/gu, "'''"),
-    "```",
+    fencedBlock(projectCopy),
     "",
     `The current shipped template \`${refresh.templateName}\`:`,
     "",
-    "```md",
-    template.replace(/```/gu, "'''"),
-    "```",
+    fencedBlock(template),
     "",
     "Steps:",
     `1. Edit \`.bb/stewards/playbooks/${refresh.playbook}.md\` so it is the current template merged with the project's own additions, and set its front-matter stamp line to \`template: ${refresh.templateName}@${refresh.targetHash}\`.`,
     "2. Publish the `.bb` change with `workspace_publish_guidance` (it pushes the `guidance-<your thread>` branch). Do not open a pull request; the plugin does that.",
-    "3. Reply with one short summary: whether the merge is purely additive (only insertions, and no front-matter change beyond the stamp) or not, and every template rule you dropped or rewrote because the project's own text contradicts it.",
+    "3. Reply with one short summary, ending with a fixed `Contradictions:` line: `Contradictions: none` when no project addition contradicts the template, otherwise `Contradictions:` and one `- <the project rule and the template rule it contradicts>` line each. A missing line is read as a contradiction and sent to the owner, so always write it.",
   ].join("\n");
 }
 
@@ -9047,6 +9043,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       const classified = classifyRefresh(before, published);
+      // AC5: a project rule that contradicts the template is never additive,
+      // whatever the line diff looks like. The worker's `Contradictions:` line
+      // is authoritative for this; a missing line is read as a contradiction,
+      // so a worker that stays silent cannot smuggle one past the owner.
+      const contradictions = parseContradictions(claim);
+      const contradictionRules = contradictions.rules;
+      const missedLine = !contradictions.listed;
+      const effective = contradictionRules.length === 0 && !missedLine
+        ? classified
+        : {
+            ...classified,
+            classification: "not-additive" as const,
+            reasons: [...classified.reasons, ...(missedLine ? ["the refresh thread did not report its contradictions"] : []), ...contradictionRules.map((r) => `the project's own rule contradicts the template: ${r}`)],
+          };
       const base = await github.defaultBranch(primary.repo).catch((error: unknown) => {
         bb.log.warn(`stewards: could not read ${primary.repo}'s default branch: ${errorMessage(error)}`);
         return null;
@@ -9056,13 +9066,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       try {
-        const created = await github.createPull(primary.repo, { head, base, title: `Refresh ${refresh.playbook} playbook`, body: refreshPrBody(refresh, classified, threadId, claim) });
-        const removals = [...classified.removals, ...classified.rewrites.map((r) => `${r.before} → ${r.after}`)];
-        store.setPlaybookRefresh(refresh.id, { state: "pr_open", pr: created.url, branch, classification: classified.classification, removals });
+        const created = await github.createPull(primary.repo, { head, base, title: `Refresh ${refresh.playbook} playbook`, body: refreshPrBody(refresh, effective, threadId, claim, contradictionRules) });
+        const removals = [...effective.removals, ...effective.rewrites.map((r) => `${r.before} → ${r.after}`)];
+        store.setPlaybookRefresh(refresh.id, { state: "pr_open", pr: created.url, branch, classification: effective.classification, removals });
         await wakeProject(config.projectId, `playbook refresh ${refresh.playbook} is ready to review`, {
           digestDue: false,
           notes: [
-            `Refresh ${refresh.id} for \`${refresh.file}\` is open at ${created.url} (${classified.classification === "additive" ? "purely additive" : "not purely additive"}). Read the diff and decide: \`steward_update { refreshAction: { id: "${refresh.id}", action: "merge" } }\` merges a purely additive, project-lane change; \`action: "forward"\` files the owner's Review PR/Drop item; \`action: "drop"\` closes it and declines it (not retried until the template changes).`,
+            `Refresh ${refresh.id} for \`${refresh.file}\` is open at ${created.url} (${effective.classification === "additive" ? "purely additive" : "not purely additive"}). Read the diff and decide: \`steward_update { refreshAction: { id: "${refresh.id}", action: "merge" } }\` merges a purely additive, project-lane change; \`action: "forward"\` files the owner's Review PR/Drop item; \`action: "drop"\` closes it and declines it (not retried until the template changes).`,
           ],
         });
       } catch (error) {
@@ -9081,6 +9091,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function actOnPlaybookRefresh(refresh: PlaybookRefresh, action: "merge" | "forward" | "drop"): Promise<string> {
       if (action === "merge") {
         if (refresh.state !== "pr_open" || refresh.pr === null) return "there is no open pull request to merge";
+        // AC4: the lesson merge gate decides who merges. The decide list places
+        // the playbook file exactly as it places a procedure lesson in it; a
+        // `user` playbook is never merged here.
+        const decisions = (await loadConfig(refresh.projectId))?.file.bigDecisions ?? [];
+        if (lessonLandingMark({ file: refresh.file, scope: "procedure" }, decisions) !== "project") {
+          return 'the decide list makes this playbook the user\'s to approve; use action "forward" instead';
+        }
+        // AC4: only a purely additive change may be merged by the project
+        // steward. Anything with a removal, a rewrite or a contradiction goes
+        // to the owner, whatever the worker's label said.
+        if (refresh.classification !== "additive") {
+          return 'this refresh is not purely additive; use action "forward" instead';
+        }
         const ref = parsePullRef(refresh.pr);
         if (ref === null) return `the pull request ${refresh.pr} cannot be read`;
         const primary = await lessonRepo(refresh.projectId);
@@ -11060,6 +11083,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!q.choices.includes(chosen)) return { ok: false, message: `"${chosen}" is not one of the choices: ${q.choices.join(", ")}.` };
           const guidance = text === null ? chosen : `${chosen} — ${text}`;
           store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
+          // BB-328 Part 2: the owner's Review PR/Drop item for a playbook
+          // refresh. Drop closes the pull request and declines the refresh, so
+          // the next nightly pass does not re-queue it; Review PR leaves the
+          // merge to the owner and the reconcile observes it.
+          const refreshId = typeof q.data.refreshId === "string" ? q.data.refreshId : null;
+          if (refreshId !== null) {
+            const refresh = store.playbookRefresh(refreshId);
+            if (refresh !== null && refresh.state === "pr_open") {
+              if (chosen === "Drop") await actOnPlaybookRefresh(refresh, "drop");
+              await wakePlainRationale();
+              return { ok: true, message: chosen === "Drop" ? "Dropped; the refresh is declined and not retried until the template changes." : `Review ${refresh.pr ?? "the pull request"}; the refresh is marked merged when it merges.` };
+            }
+            return { ok: true, message: "The refresh is already resolved." };
+          }
           if (x !== null && b !== null && b.endedAt === null) {
             const closure = withRationale(`The user chose ${chosen} for ${b.entityKey}'s forwarded escalation on the Stewards page${text === null ? "" : `: ${text}`}.`);
             store.addGuidance(b.id, guidance, "user");

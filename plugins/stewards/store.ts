@@ -1395,6 +1395,8 @@ export type Question = {
   rationaleAsked: boolean;
   /** True once the user supplied reasoning for this question (BB-35 step 4). */
   rationaleGiven: boolean;
+  /** The structured payload the question carries, for a page action to read (BB-328: a refresh id). */
+  data: Record<string, unknown>;
 };
 
 /** The kinds of thing that can wait on the user, from the ticket's table. */
@@ -2160,6 +2162,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       rationaleWanted: e.rationaleWanted,
       rationaleAsked: e.rationaleAsked,
       rationaleGiven: e.rationaleGiven,
+      data: e.data,
     };
   };
   const insertNeed = db.prepare(

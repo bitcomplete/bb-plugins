@@ -697,12 +697,16 @@ template into the project copy keeping the project's own additions, updates
 the stamp, and publishes with `workspace_publish_guidance`; the plugin opens
 the pull request, classifies the diff (purely additive means only insertions
 and the front matter untouched apart from the stamp; a change to `models`,
-`may`, a gate or `requeue-default` is never additive) and lists the removals
-and rewrites in the body. That classification is only the plugin's read of
+`may`, a gate or `requeue-default` is never additive, and neither is a project
+rule that contradicts the template) and lists the removals and rewrites in
+the body. That classification is only the plugin's read of
 the diff: the project steward reads it in the `## Playbooks to refresh` block
 and decides with `steward_update { refreshAction: { id, action } }` — `merge`
 for a purely additive, project-lane change, `forward` to file the owner's
-Review PR/Drop item, `drop` to close it and decline. At most one refresh is
+Review PR/Drop item, `drop` to close it and decline. `merge` is refused unless
+the decide list places the playbook `project` and the stored classification is
+`additive`, so a removal, a rewrite or a contradiction can only go to the
+owner; the owner's Drop on the page closes the pull request and declines it. At most one refresh is
 open per playbook, a declined or failed refresh is not retried until the
 template changes again, and the stamp is only updated by the merged pull
 request, which is what stops the playbook being queued. A server on an image

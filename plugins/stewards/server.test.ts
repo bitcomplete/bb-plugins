@@ -8,7 +8,7 @@ import { comment, crashingPod, githubIssue, issue, parkedWorker, pull, warningEv
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
-import { needActions, parseDotenvValue, secretVariable } from "./server.js";
+import { needActions, parseDotenvValue, refreshPrompt, secretVariable } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
@@ -17036,20 +17036,25 @@ describe("playbook refreshes (BB-328 Part 2)", () => {
   const laggingCopy = () => LINEAR_TICKETS.replace("name: linear-tickets", "name: linear-tickets\ntemplate: linear-tickets@deadbeef");
 
   /** A setup whose project copy of linear-tickets carries an old stamp. */
-  const withLaggingPlaybook = async () => {
+  const withLaggingPlaybook = async (opts: { userPlaybook?: boolean } = {}) => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[playbookPath("linear-tickets")] = laggingCopy();
+    // The real project file marks playbooks `project`; mirror it so the refresh
+    // is the project steward's to merge. A test may instead make it the user's.
+    const project = JSON.parse(t.files[PROJECT_FILE]!) as { bigDecisions: unknown[] };
+    project.bigDecisions = opts.userPlaybook === true ? [] : [...project.bigDecisions, BB280_PLAYBOOK_ENTRY];
+    t.files[PROJECT_FILE] = JSON.stringify(project, null, 2);
     return t;
   };
 
   /** Simulate the worker publishing its merged copy, then finishing its turn. */
-  const publishAndFinish = async (t: Awaited<ReturnType<typeof setup>>) => {
+  const publishAndFinish = async (t: Awaited<ReturnType<typeof setup>>, claim = "Purely additive: I added the new paragraph.\nContradictions: none") => {
     const refresh = t.hooks.store.playbookRefreshes("p1")[0]!;
     const tid = refresh.threadId!;
     const branch = `guidance-${tid}`;
     const merged = laggingCopy().replace("template: linear-tickets@deadbeef", `template: linear-tickets@${templateHash(LINEAR_TICKETS)}`) + "\nA new template rule.\n";
     t.githubFileContents.set(`acme/bb#${branch}:.bb/${playbookPath("linear-tickets")}`, merged);
-    await t.idle(tid, "additive");
+    await t.idle(tid, claim);
     return t.hooks.store.playbookRefreshes("p1")[0]!;
   };
 
@@ -17119,5 +17124,77 @@ describe("playbook refreshes (BB-328 Part 2)", () => {
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     expect(t.hooks.store.playbookRefreshes("p1")).toHaveLength(1);
+  });
+
+  const client = { experimental_caller: { kind: "client" } } as const;
+
+  it("refuses to merge a refresh the plugin classified not purely additive, sending it to the owner", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    // A contradiction makes it not additive, whatever the line diff looked like.
+    const refresh = await publishAndFinish(t, "Contradictions:\n- The project's rule conflicts with the template's.");
+    expect(refresh.classification).toBe("not-additive");
+    const steward = t.hooks.store.project("p1").threadId!;
+    const refused = await t.tool("steward_update", { refreshAction: { id: refresh.id, action: "merge" } }, steward);
+    expect(refused.error).toBe(false);
+    expect(refused.text).toMatch(/not purely additive/u);
+    expect(t.githubMerges).toHaveLength(0);
+    expect(t.hooks.store.playbookRefreshes("p1")[0]!.state).toBe("pr_open");
+  });
+
+  it("refuses to merge a refresh the decide list makes the user's", async () => {
+    const t = await withLaggingPlaybook({ userPlaybook: true });
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    expect(refresh.classification).toBe("additive");
+    const steward = t.hooks.store.project("p1").threadId!;
+    const refused = await t.tool("steward_update", { refreshAction: { id: refresh.id, action: "merge" } }, steward);
+    expect(refused.error).toBe(false);
+    expect(refused.text).toMatch(/user's to approve/u);
+    expect(t.githubMerges).toHaveLength(0);
+  });
+
+  it("files the owner's item on forward, and the owner's Drop declines it", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    const steward = t.hooks.store.project("p1").threadId!;
+    await t.tool("steward_update", { refreshAction: { id: refresh.id, action: "forward" } }, steward);
+    const forwarded = t.hooks.store.playbookRefresh(refresh.id)!;
+    expect(forwarded.questionId).not.toBeNull();
+    const q = t.hooks.store.question(forwarded.questionId!)!;
+    expect(q.data.refreshId).toBe(refresh.id);
+    // The owner picks Drop on the Stewards page.
+    const answered = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: forwarded.questionId!, choice: "Drop" }, client);
+    expect(answered).toMatchObject({ ok: true });
+    await t.flush();
+    expect(t.hooks.store.playbookRefresh(refresh.id)!.state).toBe("declined");
+    expect(t.githubClosedPulls).toHaveLength(1);
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(t.hooks.store.playbookRefreshes("p1")).toHaveLength(1);
+  });
+
+  it("marks a refresh declined when its pull request is closed on GitHub without merging", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    const ref = /\/pull\/(\d+)$/u.exec(refresh.pr!)!;
+    t.entities.set(`acme/bb#${ref[1]}`, pull({ id: `acme/bb#${ref[1]}`, key: `acme/bb#${ref[1]}`, unit: "acme/bb", state: "closed" }, { merged: false }));
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(t.hooks.store.playbookRefreshes("p1")[0]!.state).toBe("declined");
+  });
+
+  it("shows the shipped template byte-for-byte, fenced, in the worker brief", async () => {
+    const brief = refreshPrompt({ playbook: "github-reviews", templateName: "github-reviews", fromHash: "old", targetHash: "new" }, "---\nname: github-reviews\n---\n", GITHUB_REVIEWS);
+    // The template's own ```-fenced marker block survives byte-for-byte.
+    expect(GITHUB_REVIEWS).toContain("\n```\n<!-- bb-review round=<N>");
+    expect(brief).toContain("\n```\n<!-- bb-review round=<N>");
+    expect(brief).not.toContain("'''");
   });
 });

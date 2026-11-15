@@ -3,7 +3,7 @@
 // after a decline until the template changes), how a published diff is
 // classified, and the pull request body.
 import { describe, expect, it } from "vitest";
-import { classifyRefresh, hasTemplateStamp, laggingPlaybooks, refreshPrBody, refreshQueueDecision } from "./refresh.js";
+import { classifyRefresh, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision } from "./refresh.js";
 import type { PlaybookRefresh } from "./store.js";
 
 const refresh = (over: Partial<PlaybookRefresh>): PlaybookRefresh => ({
@@ -174,5 +174,24 @@ describe("hasTemplateStamp", () => {
     expect(hasTemplateStamp(text, "ops-watch", "abc123")).toBe(true);
     expect(hasTemplateStamp(text, "ops-watch", "other")).toBe(false);
     expect(hasTemplateStamp(text, "other", "abc123")).toBe(false);
+  });
+});
+
+describe("parseContradictions", () => {
+  it("reads `none`, a list, and a missing line (fail closed)", () => {
+    expect(parseContradictions("Did the merge.\nContradictions: none")).toEqual({ listed: true, rules: [] });
+    expect(parseContradictions("Contradictions:\n- project says A, template says B\n- project says C")).toEqual({ listed: true, rules: ["project says A, template says B", "project says C"] });
+    expect(parseContradictions("Contradictions: project says A")).toEqual({ listed: true, rules: ["project says A"] });
+    expect(parseContradictions("Did the merge.")).toEqual({ listed: false, rules: [] });
+    expect(parseContradictions(null)).toEqual({ listed: false, rules: [] });
+  });
+});
+
+describe("fencedBlock", () => {
+  it("keeps a template's own fence byte-for-byte", () => {
+    const text = "Before\n```bb-review\nmarker\n```\nAfter";
+    const wrapped = fencedBlock(text);
+    expect(wrapped).toContain(text);
+    expect(wrapped.startsWith("````")).toBe(true);
   });
 });

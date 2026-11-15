@@ -1048,12 +1048,17 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   the pull request on the primary repo, and classifies the diff for the
   body: *purely additive* means only insertions and the front matter
   untouched apart from the stamp, and a change to `models`, `may`, a gate or
-  `requeue-default` is never additive. The classification is the plugin's
-  read, not the worker's claim; the project steward reads the diff in the
-  `## Playbooks to refresh` block and decides with
-  `steward_update { refreshAction: { id, action } }` — `merge` for a purely
-  additive, project-lane change, `forward` to file the owner's Review
-  PR/Drop item, `drop` to close it and decline. The guardrails are the row's:
+  `requeue-default` is never additive; a project rule that contradicts the
+  template is never additive either, whatever the line diff looks like. The
+  classification is the plugin's read, not the worker's claim; the project
+  steward reads the diff in the `## Playbooks to refresh` block and decides
+  with `steward_update { refreshAction: { id, action } }` — `merge` for a
+  purely additive, project-lane change, `forward` to file the owner's Review
+  PR/Drop item, `drop` to close it and decline. `merge` is refused unless the
+  decide list places the playbook `project` and the stored classification is
+  `additive`, so a removal, a rewrite or a contradiction can only go to the
+  owner; the owner's Drop on the page closes the pull request and declines
+  it. The guardrails are the row's:
   at most one refresh is open per playbook, a declined or failed refresh is
   not retried until the template changes again, and the stamp is updated only
   by the merged pull request — which is what stops the playbook being queued.

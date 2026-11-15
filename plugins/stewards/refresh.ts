@@ -80,6 +80,44 @@ export type RefreshClassification = {
 /** The front matter keys a change to which is never purely additive (BB-328). */
 const NEVER_ADDITIVE_KEYS = new Set(["models", "may", "requeue-default"]);
 
+/**
+ * Wrap a block of text in a Markdown fence longer than any backtick run it
+ * contains, so the text is shown byte-for-byte: a template that itself contains
+ * a ``` block (the `bb-review` marker) is not corrupted in the brief.
+ */
+export function fencedBlock(text: string): string {
+  const runs = [...text.matchAll(/`+/gu)].map((m) => m[0]!.length);
+  const fence = "`".repeat(Math.max(3, ...runs.map((n) => n + 1)));
+  return `${fence}\n${text}\n${fence}`;
+}
+
+/** The fixed line a refresh thread ends its reply with. */
+export const CONTRADICTIONS_PREFIX = "Contradictions:";
+
+/**
+ * Read the `Contradictions:` line from a refresh thread's reply. `listed` is
+ * false when the reply carries no such line, which the caller treats as not
+ * additive: a worker that does not say it found none is not trusted to have
+ * found none. `none` is the only value that means the project's text did not
+ * contradict the template.
+ */
+export function parseContradictions(claim: string | null): { listed: boolean; rules: string[] } {
+  if (claim === null) return { listed: false, rules: [] };
+  const lines = claim.split(/\r?\n/u);
+  const at = lines.findIndex((l) => l.trim().toLowerCase().startsWith(CONTRADICTIONS_PREFIX.toLowerCase()));
+  if (at === -1) return { listed: false, rules: [] };
+  const rules: string[] = [];
+  const first = lines[at]!.slice(lines[at]!.indexOf(":") + 1).trim();
+  if (first !== "" && first.toLowerCase() !== "none") rules.push(first);
+  for (let i = at + 1; i < lines.length; i += 1) {
+    const line = lines[i]!.trim();
+    if (line === "") break;
+    if (line.startsWith("-")) rules.push(line.replace(/^-\s*/u, ""));
+    else break;
+  }
+  return { listed: true, rules };
+}
+
 const splitFrontMatter = (text: string): { front: string | null; body: string } => {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/u.exec(text);
   if (m === null) return { front: null, body: text };
@@ -203,6 +241,7 @@ export function refreshPrBody(
   c: RefreshClassification,
   threadId: string,
   claim?: string | null,
+  contradictions: string[] = [],
 ): string {
   const path = `stewards/playbooks/${refresh.playbook}.md`;
   const lines = [
@@ -214,6 +253,7 @@ export function refreshPrBody(
     c.classification === "additive" ? "**Purely additive** — only insertions, and the front matter is untouched apart from the stamp." : "**Not purely additive** — the merge removes or rewrites something the project copy carried.",
   ];
   if (claim !== undefined && claim !== null && claim.trim() !== "") lines.push("", "The refresh thread's own summary (its claim, not the decision):", "", "```", claim.trim(), "```");
+  if (contradictions.length > 0) lines.push("", "## Contradictions", "", "The project's own text contradicts the new template, so a merge means choosing a rule. The owner decides:", ...contradictions.map((r) => `- ${r}`));
   if (c.reasons.length > 0) lines.push("", "Front matter:", ...c.reasons.map((r) => `- ${r}`));
   if (c.removals.length > 0) lines.push("", "Removed lines:", ...c.removals.map((l) => `- \`${l}\``));
   if (c.rewrites.length > 0) {
