@@ -130,7 +130,7 @@ import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, apply
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
-import { classifyRefresh, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision, type LaggingPlaybook } from "./refresh.js";
+import { CLASSIFIED_AT_PREFIX, classifyRefresh, classifiedHeadSha, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision, type LaggingPlaybook } from "./refresh.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -9068,7 +9068,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const created = await github.createPull(primary.repo, { head, base, title: `Refresh ${refresh.playbook} playbook`, body: refreshPrBody(refresh, effective, threadId, claim, contradictionRules) });
         const removals = [...effective.removals, ...effective.rewrites.map((r) => `${r.before} → ${r.after}`)];
-        store.setPlaybookRefresh(refresh.id, { state: "pr_open", pr: created.url, branch, classification: effective.classification, removals });
+        // BB-328: record the head the diff was classified at, so a later push
+        // to the branch cannot be merged under the label it never earned.
+        store.setPlaybookRefresh(refresh.id, { state: "pr_open", pr: created.url, branch, classification: effective.classification, removals, note: `${CLASSIFIED_AT_PREFIX}${created.headSha ?? "unreadable"}` });
         await wakeProject(config.projectId, `playbook refresh ${refresh.playbook} is ready to review`, {
           digestDue: false,
           notes: [
@@ -9104,8 +9106,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (refresh.classification !== "additive") {
           return 'this refresh is not purely additive; use action "forward" instead';
         }
+        // AC4/BB-328: land only the head the plugin classified. A push to the
+        // `guidance-<thread>` branch after classification is not covered by the
+        // label, so refuse it (fail closed) and pass the recorded head to the
+        // squash merge, which GitHub also refuses when it moved.
         const ref = parsePullRef(refresh.pr);
         if (ref === null) return `the pull request ${refresh.pr} cannot be read`;
+        const classifiedSha = classifiedHeadSha(refresh.note);
+        if (classifiedSha === null) return 'the refresh was not classified at a recorded head; use action "forward" or "drop" instead';
+        const current = await snapshot("github", `${ref.repo}#${ref.number}`).catch(() => null);
+        if (current !== null && current.pull !== null && current.pull.headSha !== "" && current.pull.headSha !== classifiedSha) {
+          return 'the refresh branch moved since it was classified; use action "forward" or "drop" instead';
+        }
         const primary = await lessonRepo(refresh.projectId);
         if ("error" in primary) return primary.error;
         // The narrow guard: the pull request changes this playbook and only it.
@@ -9116,7 +9128,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (bad.length > 0) return `the pull request changes files other than ${refresh.file}: ${bad.slice(0, 5).join(", ")}`;
         }
         try {
-          const { sha } = await github.squashMerge(primary.repo, ref.number, `Refresh ${refresh.playbook} playbook`, "Merged by the project steward after reading the refresh diff.");
+          const { sha } = await github.squashMerge(primary.repo, ref.number, `Refresh ${refresh.playbook} playbook`, "Merged by the project steward after reading the refresh diff.", classifiedSha);
           store.setPlaybookRefresh(refresh.id, { state: "merged", note: `merged at ${sha ?? "?"}` });
           if (refresh.questionId !== null) {
             const q = store.question(refresh.questionId);
@@ -9124,7 +9136,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           return `merged at ${sha ?? refresh.pr}`;
         } catch (error) {
-          store.setPlaybookRefresh(refresh.id, { note: errorMessage(error) });
+          store.setPlaybookRefresh(refresh.id, { note: `${CLASSIFIED_AT_PREFIX}${classifiedSha} — refused: ${errorMessage(error)}` });
           return `pull request refused: ${errorMessage(error)}`;
         }
       }

@@ -3,7 +3,7 @@
 // after a decline until the template changes), how a published diff is
 // classified, and the pull request body.
 import { describe, expect, it } from "vitest";
-import { classifyRefresh, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision } from "./refresh.js";
+import { classifyRefresh, classifiedHeadSha, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision } from "./refresh.js";
 import type { PlaybookRefresh } from "./store.js";
 
 const refresh = (over: Partial<PlaybookRefresh>): PlaybookRefresh => ({
@@ -193,5 +193,14 @@ describe("fencedBlock", () => {
     const wrapped = fencedBlock(text);
     expect(wrapped).toContain(text);
     expect(wrapped.startsWith("````")).toBe(true);
+  });
+});
+
+describe("classifiedHeadSha", () => {
+  it("reads the head a refresh was classified at, and fails closed otherwise", () => {
+    expect(classifiedHeadSha("classified at abc1234")).toBe("abc1234");
+    expect(classifiedHeadSha("classified at abc1234 — refused: boom")).toBe("abc1234");
+    expect(classifiedHeadSha("classified at unreadable")).toBeNull();
+    expect(classifiedHeadSha(null)).toBeNull();
   });
 });

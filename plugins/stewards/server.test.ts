@@ -17197,4 +17197,22 @@ describe("playbook refreshes (BB-328 Part 2)", () => {
     expect(brief).toContain("\n```\n<!-- bb-review round=<N>");
     expect(brief).not.toContain("'''");
   });
+
+  it("refuses to merge a refresh whose branch moved since it was classified", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    expect(t.hooks.store.playbookRefresh(refresh.id)!.note).toMatch(/^classified at [0-9a-f]{7,64}/u);
+    // A push to the guidance branch after classification: the pull request's
+    // head no longer matches the one the diff was classified at.
+    const number = Number(/\/(\d+)$/u.exec(refresh.pr!)![1]);
+    t.entities.set(`acme/bb#${number}`, pull({ id: `acme/bb#${number}`, key: `acme/bb#${number}`, unit: "acme/bb", state: "open" }, { head: `guidance-${refresh.threadId}`, headSha: "f".repeat(40) }));
+    const steward = t.hooks.store.project("p1").threadId!;
+    const refused = await t.tool("steward_update", { refreshAction: { id: refresh.id, action: "merge" } }, steward);
+    expect(refused.error).toBe(false);
+    expect(refused.text).toMatch(/moved since it was classified/u);
+    expect(t.githubMerges).toHaveLength(0);
+    expect(t.hooks.store.playbookRefreshes("p1")[0]!.state).toBe("pr_open");
+  });
 });

@@ -134,7 +134,7 @@ export interface GithubWriter {
    */
   branchExists(repo: string, branch: string): Promise<boolean>;
   /** Open a pull request and return its URL and number (BB-108). */
-  createPull(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
+  createPull(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number; headSha: string | null }>;
   /** Close a pull request without merging it (BB-108 Drop). */
   closePull(repo: string, number: number): Promise<void>;
   /**
@@ -266,9 +266,9 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
     },
     async createPull(repo, args) {
       const response = await request("POST", `/repos/${repo}/pulls`, { head: args.head, base: args.base, title: args.title, body: args.body });
-      const body = (await response.json().catch(() => null)) as { html_url?: unknown; number?: unknown } | null;
+      const body = (await response.json().catch(() => null)) as { html_url?: unknown; number?: unknown; head?: { sha?: unknown } } | null;
       if (typeof body?.html_url !== "string" || typeof body.number !== "number") throw new GithubApiError("GitHub created the pull request but returned no URL or number.");
-      return { url: body.html_url, number: body.number };
+      return { url: body.html_url, number: body.number, headSha: typeof body.head?.sha === "string" && body.head.sha !== "" ? body.head.sha : null };
     },
     async closePull(repo, number) {
       await request("PATCH", `/repos/${repo}/pulls/${number}`, { state: "closed" });

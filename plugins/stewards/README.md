@@ -706,7 +706,9 @@ for a purely additive, project-lane change, `forward` to file the owner's
 Review PR/Drop item, `drop` to close it and decline. `merge` is refused unless
 the decide list places the playbook `project` and the stored classification is
 `additive`, so a removal, a rewrite or a contradiction can only go to the
-owner; the owner's Drop on the page closes the pull request and declines it. At most one refresh is
+owner; a branch pushed after it was classified is refused too, so only the
+head the plugin read can be merged. The owner's Drop on the page closes the
+pull request and declines it. At most one refresh is
 open per playbook, a declined or failed refresh is not retried until the
 template changes again, and the stamp is only updated by the merged pull
 request, which is what stops the playbook being queued. A server on an image

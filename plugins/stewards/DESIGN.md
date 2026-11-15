@@ -1057,8 +1057,9 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   PR/Drop item, `drop` to close it and decline. `merge` is refused unless the
   decide list places the playbook `project` and the stored classification is
   `additive`, so a removal, a rewrite or a contradiction can only go to the
-  owner; the owner's Drop on the page closes the pull request and declines
-  it. The guardrails are the row's:
+  owner; it also refuses a branch pushed after it was classified, so only the
+  head the plugin read can be merged. The owner's Drop on the page closes the
+  pull request and declines it. The guardrails are the row's:
   at most one refresh is open per playbook, a declined or failed refresh is
   not retried until the template changes again, and the stamp is updated only
   by the merged pull request — which is what stops the playbook being queued.

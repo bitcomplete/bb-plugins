@@ -233,7 +233,9 @@ export function world() {
       const number = ++pullNumber;
       const url = `https://github.com/${repo}/pull/${number}`;
       githubPulls.push({ repo, ...args, url, number });
-      return { url, number };
+      // BB-328: a refresh records the classified head; the fake names it
+      // deterministically so a test can move it and watch the merge refuse.
+      return { url, number, headSha: number.toString(16).padStart(40, "0") };
     },
     closePull: async (repo: string, number: number) => {
       githubClosedPulls.push({ repo, number });

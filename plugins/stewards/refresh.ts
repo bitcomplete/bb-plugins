@@ -273,3 +273,17 @@ export function hasTemplateStamp(text: string, name: string, hash: string): bool
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   return new RegExp(`^template:\\s*${escaped}@${hash}\\s*$`, "mu").test(text);
 }
+
+/** The prefix `finishPlaybookRefresh` records the classified head sha under in the refresh note. */
+export const CLASSIFIED_AT_PREFIX = "classified at ";
+
+/**
+ * The head sha a refresh was classified at, read from its note, or null when
+ * the note does not name one. A null is fail-closed: `merge` refuses rather
+ * than squash-merging a head the plugin never read.
+ */
+export function classifiedHeadSha(note: string | null): string | null {
+  if (note === null) return null;
+  const m = /^classified at ([0-9a-f]{7,64})\b/u.exec(note);
+  return m === null ? null : m[1]!;
+}
