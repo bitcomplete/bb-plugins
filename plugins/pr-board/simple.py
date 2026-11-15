@@ -39,7 +39,7 @@ def plural(n, word):
 
 
 def your_move(pr):
-    """Return (bucket, sentence) when the next step is the author's, else None."""
+    """Return (sub-group, sentence) when fixing the PR is the author's next step, else None."""
     move = pr["move"]
     todo = pr["unanswered"]
     big = [t for t in todo if t["label"] != "minor"]
@@ -56,43 +56,58 @@ def your_move(pr):
         if pr["base_missing"]:
             return "Rebase", "its base branch is gone; point it at main"
         return "Rebase", "conflicts with main"
-    if move == "ci":
-        n = len(pr["ci"]["failing"])
-        s = f"{plural(n, 'check')} failing" if n else "checks still running"
-        return "Fix CI", s
-    if not pr["waiting_on"]:  # nobody is asked, so asking is the author's move, gated or not
-        if pr["changes_outstanding"] and pr["changes_requested"]:
-            return "Ask for a review", f"{name(pr['changes_requested'][0])} asked for changes; ask them to look again"
-        if pr["approvals"]["stale"]:
-            return "Ask for a review", f"{names(pr['approvals']['stale'])} approved an older version; ask for another look"
-        return "Ask for a review", "nobody is asked to review it"
+    if move == "ci" and pr["ci"]["failing"]:
+        return "Fix CI", f"{plural(len(pr['ci']['failing']), 'check')} failing"
     return None
 
 
-def waiting(pr):
-    """Return (person, sentence) for a PR waiting on a requested reviewer."""
+def age(pr):
+    days = max((w["days"] or 0 for w in pr["waiting_on"]), default=0)
+    return f" · {plural(days, 'day')}" if days else ""
+
+
+def review_place(pr):
+    """(bucket, sub-group, sentence) for a PR that needs a review: no approval yet, or changes requested."""
     asked = [w["reviewer"] for w in pr["waiting_on"]]
-    days = max(w["days"] or 0 for w in pr["waiting_on"])
-    age = f" · {plural(days, 'day')}" if days else ""
-    if pr["changes_outstanding"] and pr["changes_requested"]:
-        return name(pr["changes_requested"][0]), "asked for changes; needs to look again" + age
-    stale = pr["approvals"]["stale"]
-    if stale:
-        who = next((a for a in asked if a in stale), asked[0])
-        return name(who), "approved an older version; needs to look again" + age
-    return name(asked[0]), "first review" + age
+    if pr["changes_outstanding"]:
+        who = pr["changes_requested"][0] if pr["changes_requested"] else None
+        if who and who in asked:
+            return "theirs", name(who), f"{name(who)} asked for changes; needs to look again{age(pr)}"
+        return "mine", "Ask for a review", (f"re-request {name(who)}, who asked for changes" if who
+                                            else "re-request the reviewer who asked for changes")
+    if asked:
+        return "theirs", name(asked[0]), f"first review{age(pr)}"
+    return "mine", "Ask for a review", "nobody is asked to review it"
+
+
+def held_place(pr):
+    """(sub-group, sentence) for an approved PR that something other than a review still holds back."""
+    if pr["move"] == "ci":
+        return "Checks running", "approved; checks still running"
+    if real_gates(pr):
+        return "Blocked by a gate", "approved; blocked by a gate"
+    if pr["answered_open"]:
+        n = len(pr["answered_open"])
+        owe = "owes" if n == 1 else "owe"
+        return "Open threads you answered", f"approved; {plural(n, 'open thread')} you answered still {owe} something"
+    return "Waits for its parent", f"approved; merges after #{pr['parent']}"
 
 
 def place(pr):
-    """(bucket, sub-group, sentence): bucket is ready, mine, theirs or drafts."""
+    """(bucket, sub-group, sentence): bucket is ready, held, mine, theirs or drafts.
+
+    One human approval on any commit is enough to merge, so an approved PR is never waiting on a review
+    unless someone asked for changes."""
     if pr["move"] == "ready":
-        return "ready", None, "approved, checks green, no open comments"
+        return "ready", None, f"approved by {names(pr['approved_by'])}, checks green, no open comments"
     if pr["move"] == "draft":
         return "drafts", None, "draft"
     if (m := your_move(pr)):
         return "mine", m[0], m[1]
-    person, sentence = waiting(pr)
-    return "theirs", person, sentence
+    if pr["move"] == "review":
+        return review_place(pr)
+    group, sentence = held_place(pr)
+    return "held", group, sentence
 
 
 MONOREPO = "parsleyhealth/parsley-monorepo"
@@ -156,11 +171,13 @@ def real_gates(pr):
     return [g for g in pr["gates"] if g != stack_gate]
 
 
-REVIEW_RANK = {"approved": 0, "changes": 1, "approved_old": 2, "requested": 3}
+REVIEW_RANK = {"approved": 0, "changes": 1, "requested": 2}
 
 
 def reviewers(pr):
-    """Everyone asked or who has reviewed, by first name, with their strongest state on this PR."""
+    """Everyone asked or who has reviewed, by first name, with their latest review state on this PR.
+
+    `earlier` marks an approval given on an earlier commit; it still counts, and is shown only as a tooltip."""
     states = {}
 
     def put(login, state):
@@ -169,13 +186,13 @@ def reviewers(pr):
 
     for w in pr["waiting_on"]:
         put(w["reviewer"], "requested")
-    for login in pr["approvals"]["current"]:
+    for login in pr["approved_by"]:
         put(login, "approved")
-    for login in pr["approvals"]["stale"]:
-        put(login, "approved_old")
     for login in pr["changes_requested"]:
         put(login, "changes")
-    return [{"name": name(login), "state": st} for login, st in sorted(states.items(), key=lambda kv: name(kv[0]))]
+    earlier = set(pr["approvals"]["stale"])
+    return [{"name": name(login), "state": st, "earlier": st == "approved" and login in earlier}
+            for login, st in sorted(states.items(), key=lambda kv: name(kv[0]))]
 
 
 def lines_of(pr):
@@ -197,13 +214,18 @@ def size(pr, max_lines):
 ACTIONS = {"Fix review feedback": "fix-feedback", "Rebase": "rebase", "Fix CI": "fix-ci"}
 
 
+def playbook_of(pr):
+    """The agent playbook that fits this PR's move, ignoring gates, or None."""
+    bucket, group, _ = place(pr)
+    return ACTIONS.get(group) if bucket == "mine" and pr["repo"].startswith(WORK_ORG) else None
+
+
 def action_of(pr):
-    """(action, sentence): the agent playbook that fits this PR's move, or (None, sentence)."""
-    bucket, group, sentence = place(pr)
-    action = ACTIONS.get(group) if bucket == "mine" and pr["repo"].startswith(WORK_ORG) else None
-    if action == "fix-ci" and not pr["ci"]["failing"]:
-        action = None  # checks still running: nothing to fix yet
-    return action, sentence
+    """(action, sentence): the playbook an agent may start now, or (None, sentence).
+
+    A PR with a known gate gets no agent: the gate, not the code, may be what holds it."""
+    sentence = place(pr)[2]
+    return (None if real_gates(pr) else playbook_of(pr)), sentence
 
 
 def vm_row(pr, sentence, ctx, depth=0, after=None):
@@ -211,19 +233,22 @@ def vm_row(pr, sentence, ctx, depth=0, after=None):
     return {"key": key(pr), "number": pr["number"], "url": pr["url"], "area": a, "tone": tone(a),
             "title": title(pr), "sentence": sentence, "blocked": "; ".join(real_gates(pr)) or None,
             "depth": depth, "after": after, "reviewers": reviewers(pr), "size": size(pr, ctx["max_lines"]),
-            "stack": ctx["stack_of"].get(key(pr)), "action": action_of(pr)[0]}
+            "stack": ctx["stack_of"].get(key(pr)), "action": action_of(pr)[0],
+            "gate_blocked": playbook_of(pr) is not None and bool(real_gates(pr))}
 
 
 MINE_ORDER = ["Fix review feedback", "Fix CI", "Rebase", "Ask for a review"]
+HELD_ORDER = ["Blocked by a gate", "Waits for its parent", "Open threads you answered", "Checks running"]
 
 
 def buckets(prs):
     """{bucket: {sub-group: [(pr, sentence)]}} in board order."""
-    out = {b: defaultdict(list) for b in ("ready", "mine", "theirs", "drafts")}
+    out = {b: defaultdict(list) for b in ("ready", "held", "mine", "theirs", "drafts")}
     for pr in prs:
         b, g, sentence = place(pr)
         out[b][g].append((pr, sentence))
     out["mine"] = {k: out["mine"][k] for k in MINE_ORDER if out["mine"][k]}
+    out["held"] = {k: out["held"][k] for k in HELD_ORDER if out["held"][k]}
     out["theirs"] = dict(sorted(out["theirs"].items(), key=lambda kv: -len(kv[1])))
     return out
 
@@ -247,11 +272,13 @@ def view_model(data, busy=()):
 
     w, o = buckets(work), buckets(other)
     other_groups = (groups(o["ready"], lambda _: "Ready to merge")
+                    + groups(o["held"], lambda g: f"Approved: {g}")
                     + groups(o["mine"], lambda g: f"Needs you: {g}")
                     + groups(o["theirs"], lambda g: f"Waiting on {g}")
                     + groups(o["drafts"], lambda _: "Drafts"))
     sections = [
         section("ready", "Ready to merge", groups(w["ready"])),
+        section("held", "Approved, not ready yet", groups(w["held"])),
         section("mine", "Needs you", groups(w["mine"])),
         section("theirs", "Waiting on a reviewer", groups(w["theirs"])),
         section("drafts", "Drafts", groups(w["drafts"]), open_=False),
@@ -260,7 +287,8 @@ def view_model(data, busy=()):
     sections = [s for s in sections if s["count"]]
     count = {s["id"]: s["count"] for s in sections}
     return {"fetched_at": data["fetched_at"],
-            "summary": {"work": len(work), "ready": count.get("ready", 0), "mine": count.get("mine", 0),
+            "summary": {"work": len(work), "ready": count.get("ready", 0), "held": count.get("held", 0),
+                        "mine": count.get("mine", 0),
                         "theirs": count.get("theirs", 0), "drafts": count.get("drafts", 0),
                         "other": count.get("other", 0)},
             "suggestions": suggestions(w, set(busy)), "trains": trains, "sections": sections,
@@ -269,11 +297,13 @@ def view_model(data, busy=()):
 
 # ---------------------------------------------------------------- trains, suggestions, reviewer load
 
-LETTERS = {"ready": ("✓", "ready"), "drafts": ("D", "draft"), "theirs": ("W", "waiting on reviewer"),
+LETTERS = {"ready": ("✓", "ready"), "held": ("H", "approved, held"), "drafts": ("D", "draft"),
+           "theirs": ("W", "waiting on reviewer"),
            "Fix review feedback": ("F", "fix feedback"), "Fix CI": ("C", "fix CI"), "Rebase": ("R", "rebase"),
            "Ask for a review": ("A", "ask for review")}
 LEGEND = [{"letter": l, "label": t} for l, t in
-          [LETTERS[k] for k in ["Fix review feedback", "Fix CI", "Rebase", "Ask for a review", "theirs", "ready", "drafts"]]]
+          [LETTERS[k] for k in ["Fix review feedback", "Fix CI", "Rebase", "Ask for a review", "theirs", "held", "ready",
+                                "drafts"]]]
 
 
 def letter(pr):
@@ -320,7 +350,7 @@ def suggestions(w, busy, limit=5):
     verbs = {"fix-feedback": ("Fix review feedback on", "Fix review feedback"),
              "rebase": ("Rebase", "Rebase"), "fix-ci": ("Fix CI on", "Fix CI")}
     for action, (verb, group) in verbs.items():
-        prs = [p for p in free(w["mine"].get(group, [])) if action_of(p)[0] == action]
+        prs = [p for p in free(w["mine"].get(group, [])) if playbook_of(p) == action]
         if not prs:
             continue
         gated = [p for p in prs if real_gates(p)]
@@ -335,16 +365,13 @@ def suggestions(w, busy, limit=5):
     asks = free(w["mine"].get("Ask for a review", []))
     again = defaultdict(list)
     for p in asks:
-        who = (pr_changes := p["changes_requested"]) and p["changes_outstanding"] and pr_changes
-        for login in (who or p["approvals"]["stale"]):
-            again[name(login)].append(p)
-    if again:
-        people = sorted(again.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-        n = len({key(p) for ps in again.values() for p in ps})
-        out.append({"id": "re-request", "action": None, "keys": [],
-                    "text": f"Ask for another look at {plural(n, 'PR')} reviewed before your changes: "
-                            + ", ".join(f"{who} ({numbers(ps, 4)})" for who, ps in people)})
-    nobody = [p for p in asks if not p["changes_requested"] and not p["approvals"]["stale"]]
+        if p["changes_outstanding"] and p["changes_requested"]:
+            again[name(p["changes_requested"][0])].append(p)
+    for who, ps in sorted(again.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        out.append({"id": f"re-request:{who}", "action": None, "keys": [],
+                    "text": f"Re-request {who} on {plural(len(ps), 'PR')} where they asked for changes and you "
+                            f"have answered ({numbers(ps)})"})
+    nobody = [p for p in asks if not p["changes_outstanding"]]
     if nobody:
         out.append({"id": "pick-reviewers", "action": None, "keys": [],
                     "text": f"Pick reviewers for {plural(len(nobody), 'PR')} with nobody asked ({numbers(nobody)})"})
@@ -352,11 +379,13 @@ def suggestions(w, busy, limit=5):
 
 
 def reviewer_load(w):
-    """Per requested reviewer on PRs waiting on review: first vs re-review, count, oldest wait in days."""
+    """Per requested reviewer on PRs waiting on review: first vs re-review, count, oldest wait in days.
+
+    Re-review means that reviewer asked for changes. Approved PRs never wait on anyone, so they never count."""
     load = defaultdict(lambda: {"first": 0, "re": 0, "oldest_days": 0, "approx": False, "keys": []})
     for items in w["theirs"].values():
         for p, _ in items:
-            again = set(p["approvals"]["stale"]) | set(p["changes_requested"])
+            again = set(p["changes_requested"])
             for wt in p["waiting_on"]:
                 r = load[name(wt["reviewer"])]
                 r["re" if wt["reviewer"] in again else "first"] += 1
@@ -366,7 +395,7 @@ def reviewer_load(w):
                     r["oldest_days"], r["approx"] = days, wt.get("approx", False)
     rows = [{"name": n, "count": v["first"] + v["re"], **v} for n, v in load.items()]
     rows.sort(key=lambda r: (-r["count"], r["name"]))
-    nobody = [p for p, _ in w["mine"].get("Ask for a review", []) if not p["waiting_on"]]
+    nobody = [p for p, _ in w["mine"].get("Ask for a review", []) if not p["changes_outstanding"]]
     return {"reviewers": rows, "none": {"count": len(nobody), "keys": [key(p) for p in nobody]}}
 
 
@@ -401,7 +430,8 @@ def render_html(vm):
     n = vm["summary"]
     return TEMPLATE.replace("{{BODY}}", (
         f'<p class="lead"><b>{n["work"]}</b> open Parsley PRs: <b>{n["ready"]}</b> can merge, '
-        f'<b>{n["mine"]}</b> need you, <b>{n["theirs"]}</b> wait on a reviewer, <b>{n["drafts"]}</b> are drafts.</p>'
+        + (f'<b>{n["held"]}</b> approved but held, ' if n["held"] else "")
+        + f'<b>{n["mine"]}</b> need you, <b>{n["theirs"]}</b> wait on a reviewer, <b>{n["drafts"]}</b> are drafts.</p>'
         + "".join(html_section(s) for s in vm["sections"])
         + f'<p class="foot">As of {html.escape(vm["fetched_at"])}</p>'))
 

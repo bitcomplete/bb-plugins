@@ -23,12 +23,11 @@ const mix = (hue: string, amount = 75) => `color-mix(in oklch, ${hue} ${amount}%
 // Train dot colours by the PR's next move; the letter carries the meaning.
 const DOT_HUES: Record<string, string> = {
   F: "var(--destructive-text,#e5534b)", C: "var(--destructive-text,#e5534b)", R: "var(--warning,#d4883a)",
-  A: "var(--attention,#c8a24a)", W: "var(--pr-merged,#a98bd6)", "✓": "var(--success,#5fae8a)", D: "var(--subtle-foreground,#888)",
+  A: "var(--attention,#c8a24a)", W: "var(--pr-merged,#a98bd6)", H: "var(--file-accent,#6a9fd8)", "✓": "var(--success,#5fae8a)", D: "var(--subtle-foreground,#888)",
 };
 const REVIEW_MARK: Record<Row["reviewers"][number]["state"], [string, string]> = {
   requested: ["", "review requested"],
-  approved: [" ✓", "approved the current head"],
-  approved_old: [" ✓ old", "approved an older commit"],
+  approved: [" ✓", "approved"],
   changes: [" ✗", "requested changes"],
 };
 export const ACTION_VERB: Record<Action, string> = {
@@ -64,7 +63,8 @@ function Reviewers({ reviewers }: { reviewers: Row["reviewers"] }) {
   return (
     <span className={MUTED}>
       {reviewers.map((r, i) => {
-        const [mark, meaning] = REVIEW_MARK[r.state];
+        const [mark, state] = REVIEW_MARK[r.state];
+        const meaning = r.earlier ? `${state} on an earlier commit` : state;
         return (
           <span key={r.name} title={`${r.name} ${meaning}`} aria-label={`${r.name} ${meaning}`}>
             {i > 0 ? ", " : ""}
@@ -204,6 +204,7 @@ export function PrRow({ row, marker, confirming, onStart, renderConfirm }: {
                     Start
                   </Button>
                 ) : null}
+                {row.gate_blocked && !busy ? <span className={cn("ml-2 text-xs", MUTED)}>blocked by a gate</span> : null}
               </span>
               <span className="hidden w-[132px] shrink-0 flex-col items-end text-right text-xs @min-[600px]:flex">
                 <Reviewers reviewers={row.reviewers} />
@@ -230,7 +231,7 @@ export function Trains({ trains, selected, onSelect }: { trains: Train[]; select
   return (
     <div className="space-y-1">
       <p className={cn("mb-1.5 flex flex-wrap gap-x-3 text-[11px]", MUTED)}>
-        {[["F", "fix feedback"], ["C", "fix CI"], ["R", "rebase"], ["A", "ask for review"], ["W", "waiting"], ["✓", "ready"], ["D", "draft"]].map(([letter, label]) => (
+        {[["F", "fix feedback"], ["C", "fix CI"], ["R", "rebase"], ["A", "ask for review"], ["W", "waiting"], ["H", "approved, held"], ["✓", "ready"], ["D", "draft"]].map(([letter, label]) => (
           <span key={letter} className="inline-flex items-center gap-1">
             <Dot letter={letter!} /> {label}
           </span>
@@ -242,7 +243,7 @@ export function Trains({ trains, selected, onSelect }: { trains: Train[]; select
           <div key={train.id} className={cn("rounded-md px-1.5 py-0.5", selected === train.id && "bg-[color:var(--state-active,#8883)]")}>
             <div className="flex flex-wrap items-start gap-x-3">
             <button type="button" aria-pressed={selected === train.id} onClick={() => onSelect(train)} title={train.name}
-              className="mt-px w-full truncate text-left text-[13px] hover:underline @min-[440px]:w-[46%]">
+              className="mt-px line-clamp-2 w-full text-left text-[13px] leading-snug hover:underline @min-[440px]:w-[46%]">
               {train.name}
             </button>
             <div className="flex flex-wrap items-start">

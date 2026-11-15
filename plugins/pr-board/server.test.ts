@@ -7,13 +7,13 @@ import { createPlugin, MAX_START, THREAD_DEFAULTS } from "./server";
 const KEY = (n: number) => `parsleyhealth/parsley-monorepo#${n}`;
 const view: ViewModel = {
   fetched_at: "2026-11-13T12:00:00+00:00",
-  summary: { work: 1, ready: 1, mine: 0, theirs: 0, drafts: 0, other: 0 },
+  summary: { work: 1, ready: 1, held: 0, mine: 0, theirs: 0, drafts: 0, other: 0 },
   suggestions: [{ id: "ready", text: "1 PR is ready to merge (#7)", action: null, keys: [] }],
   trains: [],
   sections: [{ id: "ready", title: "Ready to merge", count: 1, open: true, groups: [{ title: null, rows: [
     { key: KEY(7), number: 7, url: "https://github.com/parsleyhealth/sage/pull/7", area: "sage", tone: 2, title: "Route purchases",
       sentence: "approved, checks green, no open comments", blocked: null, depth: 0, after: null, reviewers: [],
-      size: { lines: 10, files: 1, bar: 0.2, label: "10 lines · 1 file" }, stack: null, action: null }] }] }],
+      size: { lines: 10, files: 1, bar: 0.2, label: "10 lines · 1 file" }, stack: null, action: null, gate_blocked: false }] }] }],
   reviewer_load: { reviewers: [], none: { count: 0, keys: [] } },
 };
 

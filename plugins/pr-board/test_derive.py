@@ -130,9 +130,9 @@ class NextMove(unittest.TestCase):
         self.assertEqual(move(pr(1, threads=[thread(("rev", "risk: x"))]))[0], "fix")
         self.assertEqual(move(pr(1, threads=[thread(("rev", "hmm"))]))[0], "fix")
 
-    def test_fix_when_changes_requested_with_only_minor_threads(self):
+    def test_minor_threads_mean_reply_even_with_changes_requested(self):
         p = pr(1, threads=[thread(("rev", "nit: x"))], reviews=[{**approved(), "state": "CHANGES_REQUESTED"}])
-        self.assertEqual(move(p)[0], "fix")
+        self.assertEqual(move(p)[0], "reply")
 
     def test_reply_when_only_minor_threads_remain(self):
         p = pr(1, threads=[thread(("rev", "nit: x"))], mergeable="CONFLICTING")
@@ -145,12 +145,23 @@ class NextMove(unittest.TestCase):
     def test_ci_failing(self):
         self.assertEqual(move(pr(1, checks=[check(conclusion="FAILURE")], reviews=[approved()]))[0], "ci")
 
-    def test_review_sub_labels(self):
+    def test_review_only_without_approval_or_with_changes_requested(self):
         self.assertEqual(move(pr(1, requested=["rev"])), ("review", None))
-        self.assertEqual(move(pr(1, reviews=[approved(oid="OLD")])), ("review", "re-review"))
         self.assertEqual(move(pr(1)), ("review", "no reviewer"))
-        # A still-requested reviewer keeps it in review even with a current approval.
-        self.assertEqual(move(pr(1, requested=["x"], reviews=[approved()])), ("review", None))
+        changes = {**approved(), "state": "CHANGES_REQUESTED"}
+        self.assertEqual(move(pr(1, reviews=[approved("a"), changes])), ("review", "changes"))
+        self.assertEqual(move(pr(1, review_decision="CHANGES_REQUESTED", reviews=[approved()])), ("review", "changes"))
+
+    def test_an_approval_on_an_earlier_commit_still_counts(self):
+        # Follow-up commits of any size do not need re-approval.
+        self.assertEqual(move(pr(1, reviews=[approved(oid="OLD")], checks=[check()])), ("ready", None))
+
+    def test_a_pending_second_reviewer_never_blocks_an_approved_pr(self):
+        self.assertEqual(move(pr(1, requested=["x"], reviews=[approved()], checks=[check()])), ("ready", None))
+
+    def test_bot_approvals_do_not_count(self):
+        bot = {**approved("codex"), "is_bot": True}
+        self.assertEqual(move(pr(1, reviews=[bot])), ("review", "no reviewer"))
 
     def test_gated_by_gate_or_answered_open_thread(self):
         gate = {"id": "g", "label": "wait for X", "repo": REPO, "prs": [1]}
@@ -226,15 +237,16 @@ class ChangesRequested(unittest.TestCase):
     def test_outstanding_changes_request_is_never_ready(self):
         # Another reviewer's current approval does not clear flasd's request (#655 on 2026-11-13).
         p = pr(1, reviews=[approved("cstarner"), self.CR], checks=[check()])
-        self.assertEqual(move(p), ("review", "re-review"))
+        self.assertEqual(move(p), ("review", "changes"))
         f = b.pr_facts(p, ME, {"parent": None, "base_missing": False}, [], NOW)
         self.assertEqual(f["changes_requested"], ["flasd"])
 
     def test_review_decision_alone_also_blocks(self):
-        self.assertEqual(move(pr(1, reviews=[approved()], review_decision="CHANGES_REQUESTED")), ("review", "re-review"))
+        self.assertEqual(move(pr(1, reviews=[approved()], review_decision="CHANGES_REQUESTED")), ("review", "changes"))
 
-    def test_changes_request_with_threads_stays_fix(self):
-        self.assertEqual(move(pr(1, reviews=[self.CR], threads=[thread(("flasd", "nit: x"))]))[0], "fix")
+    def test_changes_request_with_only_minor_threads_is_reply(self):
+        # The new rule: fix means substantive or unlabeled threads; minor-only threads are a reply.
+        self.assertEqual(move(pr(1, reviews=[self.CR], threads=[thread(("flasd", "nit: x"))]))[0], "reply")
 
 
 class Bots(unittest.TestCase):

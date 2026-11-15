@@ -12,9 +12,16 @@ description: Read the plain-language board of the user's open GitHub PRs (ready 
   merge order), `sections` → `groups` → `rows`, and `reviewer_load`. Each row
   has `key`, `number`, `url`, `area`, `tone`, `title`, `sentence`, `blocked`,
   `depth` (stack nesting), `after` (an open parent shown elsewhere),
-  `reviewers` (`{name, state}`: requested, approved, approved_old, changes),
-  `size` (`{lines, files, bar, label}`), `stack` and `action` (fix-feedback,
-  rebase, fix-ci, or null).
+  `reviewers` (`{name, state, earlier}`: requested, approved, changes;
+  `earlier` marks an approval on an earlier commit, which still counts),
+  `size` (`{lines, files, bar, label}`), `stack`, `action` (fix-feedback,
+  rebase, fix-ci, or null) and `gate_blocked`.
+
+One human approval on any commit is enough to merge; a pending second
+reviewer never blocks. "Approved, not ready yet" (`held`) lists approved PRs
+held by a gate, a stack parent, open threads the author answered, or running
+checks. Feedback in review bodies or PR-level comments is not detected; only
+review threads are.
 - `bb pr-board refresh [--json]` fetches from GitHub now (about 10–60 seconds)
   and exits 1 when that run failed. A failed run keeps the last good board.
 

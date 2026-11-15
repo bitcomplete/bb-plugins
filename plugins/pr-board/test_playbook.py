@@ -66,6 +66,10 @@ class Recheck(unittest.TestCase):
         out = pb.prepare(data(failing(581)), f"{MONO}#581", "fix-feedback", "publish")
         self.assertEqual(out, {"ok": False, "reason": "its next move changed to Fix CI (1 check failing); nothing started"})
 
+    def test_gated_pr_refuses_because_the_gate_may_be_the_cause(self):
+        out = pb.prepare(data(failing(557, gates=["Sage migration order"])), f"{MONO}#557", "fix-ci", "publish")
+        self.assertEqual(out, {"ok": False, "reason": "it is blocked by a known gate; nothing started"})
+
     def test_closed_pr_refuses(self):
         self.assertEqual(pb.prepare(data(), f"{MONO}#581", "rebase", "publish"),
                          {"ok": False, "reason": "it is no longer open"})

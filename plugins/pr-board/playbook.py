@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from string import Template
 
-from simple import action_of, area, real_gates, title
+from simple import action_of, area, playbook_of, real_gates, title
 
 HERE = Path(__file__).resolve().parent
 BOOKS = HERE / "playbooks"
@@ -54,6 +54,8 @@ def prepare(data, key, expect, stop):
     if pr is None:
         return {"ok": False, "reason": "it is no longer open"}
     action, sentence = action_of(pr)
+    if action is None and playbook_of(pr) == expect:
+        return {"ok": False, "reason": "it is blocked by a known gate; nothing started"}
     if action != expect:
         now = LABEL.get(action, "no agent step")
         return {"ok": False, "reason": f"its next move changed to {now} ({sentence}); nothing started"}

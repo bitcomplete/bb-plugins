@@ -20,6 +20,7 @@ def pr(number, move, sub=None, repo=MONO, **facts):
             "head": f"b{number}", "head_oid": "abc123", "base": "main", "additions": 10, "deletions": 2,
             "changed_files": 1}
     base.update(facts)
+    base.setdefault("approved_by", base["approvals"]["current"] + base["approvals"]["stale"])
     return base
 
 
@@ -44,9 +45,11 @@ def placed(vm, number):
 
 
 class Buckets(unittest.TestCase):
-    def test_ready_pr_is_ready_to_merge(self):
-        sec, grp, row = placed(board(pr(1, "ready")), 1)
-        self.assertEqual((sec, grp, row["sentence"]), ("ready", None, "approved, checks green, no open comments"))
+    def test_ready_pr_names_its_approvers_even_when_they_approved_an_earlier_commit(self):
+        p = pr(1, "ready", approvals={"current": ["jakeorr"], "stale": ["flasd"]})
+        sec, grp, row = placed(board(p), 1)
+        self.assertEqual((sec, grp, row["sentence"]),
+                         ("ready", None, "approved by Jake and Marcel, checks green, no open comments"))
 
     def test_draft_goes_to_drafts_collapsed(self):
         vm = board(pr(1, "draft"))
@@ -75,12 +78,13 @@ class Buckets(unittest.TestCase):
         self.assertEqual(placed(vm, 1)[2]["sentence"], "conflicts with main")
         self.assertEqual(placed(vm, 2)[2]["sentence"], "its base branch is gone; point it at main")
 
-    def test_ci_failing_counts_checks_and_pending_says_running(self):
+    def test_ci_failing_needs_you_and_pending_on_an_approved_pr_is_held(self):
         vm = board(pr(1, "ci", ci={"failing": [{"name": "a"}, {"name": "b"}], "pending": []}),
-                   pr(2, "ci", "pending", ci={"failing": [], "pending": ["a"]}))
+                   pr(2, "ci", "pending", ci={"failing": [], "pending": ["a"]}, approved_by=["flasd"]))
         self.assertEqual(placed(vm, 1)[:2], ("mine", "Fix CI"))
         self.assertEqual(placed(vm, 1)[2]["sentence"], "2 checks failing")
-        self.assertEqual(placed(vm, 2)[2]["sentence"], "checks still running")
+        self.assertEqual(placed(vm, 2)[:2], ("held", "Checks running"))
+        self.assertEqual(placed(vm, 2)[2]["sentence"], "approved; checks still running")
 
     def test_no_reviewer_asks_you_to_request_one(self):
         sec, grp, row = placed(board(pr(1, "review", "no reviewer")), 1)
@@ -95,26 +99,36 @@ class Buckets(unittest.TestCase):
         p = pr(1, "review", "re-review", changes_outstanding=True, changes_requested=["SirPedr"],
                waiting_on=[{"reviewer": "SirPedr", "days": 1}])
         sec, grp, row = placed(board(p), 1)
-        self.assertEqual((sec, grp, row["sentence"]), ("theirs", "Pedro", "asked for changes; needs to look again · 1 day"))
+        self.assertEqual((sec, grp, row["sentence"]),
+                         ("theirs", "Pedro", "Pedro asked for changes; needs to look again · 1 day"))
 
-    def test_stale_approval_waits_on_the_approver_when_they_are_asked_again(self):
-        p = pr(1, "review", "re-review", approvals={"current": [], "stale": ["shehabPH"]},
-               waiting_on=[{"reviewer": "shehabPH", "days": 0}])
+    def test_changes_requested_by_someone_not_asked_again_means_you_re_request_them(self):
+        p = pr(1, "review", "changes", changes_outstanding=True, changes_requested=["SirPedr"])
         sec, grp, row = placed(board(p), 1)
-        self.assertEqual((sec, grp, row["sentence"]), ("theirs", "Shehab", "approved an older version; needs to look again"))
+        self.assertEqual((sec, grp, row["sentence"]), ("mine", "Ask for a review", "re-request Pedro, who asked for changes"))
 
-    def test_nobody_requested_means_you_must_ask_even_with_a_gate(self):
-        # Without a pending request no reviewer will act, so the next move is the author's.
-        vm = board(pr(1, "gated", approvals={"current": ["flasd"], "stale": []}, gates=["Sage migration order"]),
-                   pr(2, "review", "re-review", approvals={"current": [], "stale": ["shehabPH"]}),
-                   pr(3, "review", "re-review", changes_outstanding=True, changes_requested=["SirPedr"]))
-        self.assertEqual(placed(vm, 1)[:2], ("mine", "Ask for a review"))
-        self.assertEqual(placed(vm, 1)[2]["sentence"], "nobody is asked to review it")
-        self.assertEqual(placed(vm, 1)[2]["blocked"], "Sage migration order")
-        self.assertEqual(placed(vm, 2)[2]["sentence"], "Shehab approved an older version; ask for another look")
-        self.assertEqual(placed(vm, 3)[2]["sentence"], "Pedro asked for changes; ask them to look again")
-        titles = [g["title"] for s in vm["sections"] for g in s["groups"]]
-        self.assertNotIn("Nobody yet", titles)
+    def test_no_approval_and_nobody_asked_is_yours_even_with_a_gate(self):
+        p = pr(1, "review", "no reviewer", gates=["Sage migration order"])
+        sec, grp, row = placed(board(p), 1)
+        self.assertEqual((sec, grp, row["sentence"], row["blocked"]),
+                         ("mine", "Ask for a review", "nobody is asked to review it", "Sage migration order"))
+
+    def test_approved_but_held_says_what_holds_it(self):
+        # An approval on any commit is enough; a second pending request never makes it "waiting".
+        approved = {"approved_by": ["flasd"], "waiting_on": [{"reviewer": "jakeorr", "days": 2}]}
+        vm = board(pr(1, "gated", gates=["Sage migration order"], **approved),
+                   pr(2, "gated", answered_open=[{}, {}], **approved),
+                   pr(3, "gated", parent=9, gates=["parent #9 not merged"], **approved),
+                   pr(4, "gated", answered_open=[{}], **approved))
+        held = next(x for x in vm["sections"] if x["id"] == "held")
+        self.assertEqual((held["title"], [g["title"] for g in held["groups"]]),
+                         ("Approved, not ready yet", ["Blocked by a gate", "Waits for its parent", "Open threads you answered"]))
+        self.assertEqual(placed(vm, 1)[2]["sentence"], "approved; blocked by a gate")
+        self.assertEqual(placed(vm, 2)[2]["sentence"], "approved; 2 open threads you answered still owe something")
+        self.assertEqual(placed(vm, 4)[2]["sentence"], "approved; 1 open thread you answered still owes something")
+        self.assertEqual(placed(vm, 3)[2]["sentence"], "approved; merges after #9")
+        self.assertNotIn("theirs", [x["id"] for x in vm["sections"]])
+        self.assertEqual(vm["summary"]["held"], 4)
 
     def test_other_orgs_get_the_same_sentences_subgrouped_inside_one_collapsed_section(self):
         vm = board(pr(1, "review", repo="me/side", waiting_on=[{"reviewer": "flasd", "days": 2}]),
@@ -133,8 +147,8 @@ class Shape(unittest.TestCase):
         p = pr(7, "ready", labels=["service:sage"], parent=6, gates=["Sage migration order", "parent #6 not merged"])
         row = placed(board(p), 7)[2]  # parent #6 is not open here, so no `after` either
         self.assertEqual(row, {"number": 7, "url": f"https://github.com/{MONO}/pull/7", "area": "sage",
-                               "tone": s.tone("sage"), "title": "Change 7",
-                               "sentence": "approved, checks green, no open comments",
+                               "tone": s.tone("sage"), "title": "Change 7", "gate_blocked": False,
+                               "sentence": "approved by a reviewer, checks green, no open comments",
                                "blocked": "Sage migration order", "depth": 0, "after": None,
                                "key": f"{MONO}#7", "reviewers": [], "stack": None, "action": None,
                                "size": {"lines": 12, "files": 1, "bar": 1.0, "label": "12 lines · 1 file"}})
@@ -157,7 +171,7 @@ class Shape(unittest.TestCase):
                    pr(4, "ready"), pr(5, "draft"), pr(6, "ready", repo="me/x"))
         theirs = next(s for s in vm["sections"] if s["id"] == "theirs")
         self.assertEqual([(g["title"], len(g["rows"])) for g in theirs["groups"]], [("Marcel", 2), ("Jake", 1)])
-        self.assertEqual(vm["summary"], {"work": 5, "ready": 1, "mine": 0, "theirs": 3, "drafts": 1, "other": 1})
+        self.assertEqual(vm["summary"], {"work": 5, "ready": 1, "held": 0, "mine": 0, "theirs": 3, "drafts": 1, "other": 1})
         self.assertEqual([(s["id"], s["count"], s["open"]) for s in vm["sections"]],
                          [("ready", 1, True), ("theirs", 3, True), ("drafts", 1, False), ("other", 1, False)])
 
@@ -235,8 +249,10 @@ class RowFacts(unittest.TestCase):
         p = pr(1, "review", waiting_on=[{"reviewer": "flasd", "days": 1}, {"reviewer": "jakeorr", "days": 1}],
                approvals={"current": ["shehabPH"], "stale": ["flasd"]}, changes_requested=["SirPedr"])
         self.assertEqual(placed(board(p), 1)[2]["reviewers"], [
-            {"name": "Jake", "state": "requested"}, {"name": "Marcel", "state": "approved_old"},
-            {"name": "Pedro", "state": "changes"}, {"name": "Shehab", "state": "approved"}])
+            {"name": "Jake", "state": "requested", "earlier": False},
+            {"name": "Marcel", "state": "approved", "earlier": True},  # an earlier-commit approval still counts
+            {"name": "Pedro", "state": "changes", "earlier": False},
+            {"name": "Shehab", "state": "approved", "earlier": False}])
 
     def test_size_label_and_log_bar_against_the_largest_pr(self):
         vm = board(pr(1, "ready", additions=1150, deletions=50, changed_files=14), pr(2, "ready", additions=9, deletions=0))
@@ -250,6 +266,12 @@ class RowFacts(unittest.TestCase):
                    pr(5, "review", "no reviewer"), failing(6, repo="me/side"))
         self.assertEqual([placed(vm, n)[2]["action"] for n in range(1, 7)],
                          ["fix-feedback", "rebase", "fix-ci", None, None, None])
+
+    def test_a_gated_pr_gets_no_agent_and_says_so(self):
+        # The gate, not the code, may be what fails CI; the board offers no Start for it.
+        row = placed(board(failing(557, gates=["Sage migration order"])), 557)[2]
+        self.assertEqual((row["action"], row["gate_blocked"]), (None, True))
+        self.assertFalse(placed(board(failing(598)), 598)[2]["gate_blocked"])
 
 
 class Trains(unittest.TestCase):
@@ -302,19 +324,22 @@ class Suggestions(unittest.TestCase):
         self.assertEqual(self.texts(vm), ["Fix review feedback on 1 PR (#639)"])
         self.assertEqual(board(fix(581), busy=[f"{MONO}#581"])["suggestions"], [])
 
-    def test_re_request_names_people_and_is_text_only(self):
-        vm = board(pr(1, "review", "re-review", approvals={"current": [], "stale": ["flasd"]}),
-                   pr(2, "review", "re-review", approvals={"current": [], "stale": ["flasd"]}),
-                   pr(3, "review", "re-review", changes_outstanding=True, changes_requested=["SirPedr"]))
-        (again,) = vm["suggestions"]
-        self.assertEqual(again["text"], "Ask for another look at 3 PRs reviewed before your changes: "
-                                        "Marcel (#1, #2), Pedro (#3)")
-        self.assertIsNone(again["action"])
+    def test_re_request_whoever_asked_for_changes_text_only_and_never_for_earlier_approvals(self):
+        changes = {"changes_outstanding": True}
+        vm = board(pr(1, "review", "changes", changes_requested=["flasd"], **changes),
+                   pr(2, "review", "changes", changes_requested=["flasd"], **changes),
+                   pr(3, "review", "changes", changes_requested=["SirPedr"], **changes),
+                   pr(4, "ready", approvals={"current": [], "stale": ["flasd"]}))
+        self.assertEqual(self.texts(vm), [
+            "1 PR is ready to merge (#4)",
+            "Re-request Marcel on 2 PRs where they asked for changes and you have answered (#1, #2)",
+            "Re-request Pedro on 1 PR where they asked for changes and you have answered (#3)"])
+        self.assertTrue(all(x["action"] is None for x in vm["suggestions"]))
 
     def test_at_most_five_and_long_lists_are_shortened(self):
         many = [pr(n, "review", "no reviewer") for n in range(1, 9)]
         vm = board(pr(100, "ready"), fix(101), pr(102, "rebase"), failing(103),
-                   pr(104, "review", "re-review", approvals={"current": [], "stale": ["flasd"]}), *many)
+                   pr(104, "review", "changes", changes_outstanding=True, changes_requested=["flasd"]), *many)
         self.assertEqual(len(vm["suggestions"]), 5)
         self.assertNotIn("pick-reviewers", [x["id"] for x in vm["suggestions"]])
         self.assertEqual(s.numbers([{"number": n} for n in range(1, 9)]), "#1, #2, #3, #4, #5, #6 and 2 more")
@@ -323,10 +348,12 @@ class Suggestions(unittest.TestCase):
 class ReviewerLoad(unittest.TestCase):
     def test_splits_first_and_re_reviews_and_keeps_the_oldest_wait(self):
         vm = board(pr(1, "review", waiting_on=[{"reviewer": "flasd", "days": 2, "approx": False}]),
-                   pr(2, "review", "re-review", approvals={"current": [], "stale": ["flasd"]},
+                   pr(2, "review", "changes", changes_outstanding=True, changes_requested=["flasd"],
                       waiting_on=[{"reviewer": "flasd", "days": 9, "approx": True}]),
                    pr(3, "review", waiting_on=[{"reviewer": "jakeorr", "days": 1, "approx": False}]),
-                   pr(4, "review", "no reviewer"))
+                   pr(4, "review", "no reviewer"),
+                   # Approved PRs never count toward anyone's load, even with a second request pending.
+                   pr(5, "ready", approved_by=["shehabPH"], waiting_on=[{"reviewer": "flasd", "days": 30}]))
         load = vm["reviewer_load"]
         self.assertEqual(load["reviewers"][0], {"name": "Marcel", "count": 2, "first": 1, "re": 1, "oldest_days": 9,
                                                 "approx": True, "keys": [f"{MONO}#1", f"{MONO}#2"]})

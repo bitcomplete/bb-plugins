@@ -24,10 +24,12 @@ const rowSchema = z.object({
   blocked: z.string().nullable(),
   depth: z.number().int().min(0),
   after: z.object({ number: z.number().int(), url: z.string().url() }).nullable(),
-  reviewers: z.array(z.object({ name: z.string(), state: z.enum(["requested", "approved", "approved_old", "changes"]) })),
+  reviewers: z.array(z.object({ name: z.string(), state: z.enum(["requested", "approved", "changes"]), earlier: z.boolean() })),
   size: z.object({ lines: z.number().int(), files: z.number().int(), bar: z.number(), label: z.string() }),
   stack: z.string().nullable(),
   action: actionSchema.nullable(),
+  /** An agent playbook fits the move, but a known gate holds the PR, so no agent is offered. */
+  gate_blocked: z.boolean(),
 });
 
 export const viewModelSchema = z.object({
@@ -35,6 +37,7 @@ export const viewModelSchema = z.object({
   summary: z.object({
     work: z.number().int(),
     ready: z.number().int(),
+    held: z.number().int(),
     mine: z.number().int(),
     theirs: z.number().int(),
     drafts: z.number().int(),
