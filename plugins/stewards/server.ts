@@ -871,7 +871,7 @@ export const rpcContract = defineRpcContract({
               assumptions: z.array(z.object({ id: z.string(), text: z.string(), context: z.string().nullable(), recordedAt: z.number(), recordedBy: z.string() })),
             }),
           ),
-          stuck: z.array(z.object({ key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), why: z.string(), since: z.number().nullable() })),
+          stuck: z.array(z.object({ key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), /** Which kind of blocked entry this is, so the detail can keep a real `stuck` line beside a delegate wait (BB-338). */ kind: z.enum(["stuck", "delegate", "hold"]), why: z.string(), since: z.number().nullable() })),
           ended: z.array(z.object({ key: z.string(), url: z.string().nullable(), title: z.string().nullable(), kind: z.string(), endReason: z.string().nullable(), endedAt: z.number(), threadId: z.string().nullable(), nonActions: nonActionsSchema })),
         })
         .nullable(),
@@ -10442,8 +10442,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
-              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
-              delegateWait: delegateWaitOf(store.openEscalations(b.id)),
+              ...escalationRowFacts(b.id),
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
               requeueAt: b.requeueAt,
@@ -10497,9 +10496,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const { questions: projectQuestions, openIds } = needsUserInputs(projectId, open);
         const { questions, withUser, needs } = needsYou(projectId, open, projectQuestions);
         const stuck = open.flatMap((b) => [
-          ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
-          ...store.openEscalations(b.id).filter(isDelegateWait).map((x) => ({ b, why: `Waiting on the requested reviewer: ${x.meanwhile}`, since: x.createdAt })),
-          ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
+          ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, kind: "stuck" as const, why: `Stuck, with ${x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
+          ...store.openEscalations(b.id).filter(isDelegateWait).map((x) => ({ b, kind: "delegate" as const, why: `Waiting on the requested reviewer: ${x.meanwhile}`, since: x.createdAt })),
+          ...(b.hold === null ? [] : [{ b, kind: "hold" as const, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = store.endedSince(projectId, now() - ENDED_ON_BOARD_MS, 30);
         const boardConfig = configs.find((c) => c.projectId === projectId) ?? null;
@@ -10548,8 +10547,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...presentationHold(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
-              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
-              delegateWait: delegateWaitOf(store.openEscalations(b.id)),
+              ...escalationRowFacts(b.id),
               // The newest deployment watch, whatever its state; `merged` reads as deploying.
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
@@ -10565,7 +10563,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
             })),
-            stuck: stuck.map(({ b, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, why, since })),
+            stuck: stuck.map(({ b, kind, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, kind, why, since })),
             ended: ended.map((b) => ({ key: b.key, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt, threadId: b.threadId, nonActions: b.nonActions })),
           },
         };
@@ -13128,6 +13126,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return before.actionable !== next.actionable || before.why !== next.why;
       });
       if (flipped) store.signal(b.projectId, ["last_snapshot"]);
+    }
+
+    /**
+     * A binding's row facts from its open escalations in one read (BB-338): the
+     * blocked flag (a `stuck` escalation or the plugin's delegate wait) and the
+     * delegate wait's requested reviewers.
+     */
+    function escalationRowFacts(id: string): { stuck: boolean; delegateWait: string | null } {
+      const escalations = store.openEscalations(id);
+      return { stuck: escalations.some((x) => x.kind === "stuck" || isDelegateWait(x)), delegateWait: delegateWaitOf(escalations) };
     }
 
     /**

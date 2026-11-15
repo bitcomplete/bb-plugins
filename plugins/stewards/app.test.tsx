@@ -1208,7 +1208,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     const slot = await renderBoardWith({
       subPath: "p1/ENG-1",
       stewards: [boardSteward({ key: "ENG-1", title: "Fix login", waitingOn: "bb-gate#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
-      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", why: "waiting on a decision", since: 1 }],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
     });
     // The wait is a plain muted line, not a destructive one (BB-109).
     const waiting = await waitFor(() => slot.getByText("Waiting on bb-gate#88"));
@@ -1235,12 +1235,23 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     const stuck = await renderBoardWith({
       subPath: "p1/ENG-1",
       stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true })],
-      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", why: "waiting on a decision", since: 1 }],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
     });
     const red = await waitFor(() => stuck.getByText(/Stuck: waiting on a decision/u));
     expect(red.className).toContain("text-destructive");
     expect(stuck.queryByText(/Waiting on review from/u)).toBeNull();
     stuck.lifecycle.unmount();
+
+    // Both open at once: the delegate line does not hide the real stuck line.
+    const both = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true, delegateWait: "arashout" })],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
+    });
+    const bothWaiting = await waitFor(() => both.getByText("Waiting on review from arashout"));
+    expect(bothWaiting.className).toContain("text-muted-foreground");
+    expect(both.getByText(/Stuck: waiting on a decision/u).className).toContain("text-destructive");
+    both.lifecycle.unmount();
   });
 
   // BB-251: the binding card shows the open recorded assumptions.

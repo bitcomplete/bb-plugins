@@ -6,7 +6,7 @@
 // BB-279: an owner's page approval and the project steward's decision deliver
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
-import { approvalRef, approvePrPageAction, deliverApproval, deliverProjectApproval, isDelegateWait, isUserThread, recordProjectDecision, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approvalRef, approvePrPageAction, delegateWaitNames, delegateWaitText, deliverApproval, deliverProjectApproval, isDelegateWait, isUserThread, recordProjectDecision, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { isSelfWidening } from "./decisions.js";
 import { prGate } from "./gate.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
@@ -319,6 +319,14 @@ describe("a requested reviewer is the owner's delegation (BB-327)", () => {
     expect(isDelegateWait({ kind: "approval", route: "user" })).toBe(false);
     expect(isDelegateWait({ kind: "approval", route: "project" })).toBe(false);
     expect(isDelegateWait({ kind: "stuck", route: "steward" })).toBe(false);
+  });
+
+  it("round-trips the delegate names through the meanwhile it writes (BB-338)", () => {
+    expect(delegateWaitNames(delegateWaitText("arashout"))).toBe("arashout");
+    expect(delegateWaitNames(delegateWaitText("a, b"))).toBe("a, b");
+    // The owner lane's text is not a delegate wait.
+    expect(delegateWaitNames("Waiting: the owner approves on GitHub from the Stewards page.")).toBeNull();
+    expect(delegateWaitNames(null)).toBeNull();
   });
 
   it("moves a withdrawn delegation's escalation back to the owner text (round 2 suggestion)", async () => {
