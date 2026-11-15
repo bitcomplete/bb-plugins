@@ -17026,3 +17026,98 @@ describe("template stamps and the nightly live check (BB-328)", () => {
     expect(t.hooks.store.checkFindings("p1").some((f) => f.text.includes("ENG has no state Todo"))).toBe(true);
   });
 });
+
+// BB-328 Part 2: the nightly check queues a refresh for a lagging playbook, the
+// plugin spawns a short-lived worker and opens the reviewed pull request, and
+// the project steward reads the diff and decides. The queue is one per
+// playbook, a declined refresh is not retried until the template changes, and
+// the stamp is updated only by the merged refresh.
+describe("playbook refreshes (BB-328 Part 2)", () => {
+  const laggingCopy = () => LINEAR_TICKETS.replace("name: linear-tickets", "name: linear-tickets\ntemplate: linear-tickets@deadbeef");
+
+  /** A setup whose project copy of linear-tickets carries an old stamp. */
+  const withLaggingPlaybook = async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("linear-tickets")] = laggingCopy();
+    return t;
+  };
+
+  /** Simulate the worker publishing its merged copy, then finishing its turn. */
+  const publishAndFinish = async (t: Awaited<ReturnType<typeof setup>>) => {
+    const refresh = t.hooks.store.playbookRefreshes("p1")[0]!;
+    const tid = refresh.threadId!;
+    const branch = `guidance-${tid}`;
+    const merged = laggingCopy().replace("template: linear-tickets@deadbeef", `template: linear-tickets@${templateHash(LINEAR_TICKETS)}`) + "\nA new template rule.\n";
+    t.githubFileContents.set(`acme/bb#${branch}:.bb/${playbookPath("linear-tickets")}`, merged);
+    await t.idle(tid, "additive");
+    return t.hooks.store.playbookRefreshes("p1")[0]!;
+  };
+
+  it("queues one refresh per lagging playbook and spawns a short-lived worker", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const rows = t.hooks.store.playbookRefreshes("p1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ playbook: "linear-tickets", templateName: "linear-tickets", fromHash: "deadbeef", targetHash: templateHash(LINEAR_TICKETS), state: "spawned" });
+    expect(rows[0]!.threadId).not.toBeNull();
+    const spawn = t.spawns.find((s) => (s.pluginMetadata as { role?: string } | undefined)?.role === "refresh");
+    expect(spawn).toBeDefined();
+    // The fixed brief carries the project copy, the template name and the hash.
+    expect(String(spawn!.prompt)).toContain("template: linear-tickets@deadbeef");
+    expect(String(spawn!.prompt)).toContain("current template hash is");
+  });
+
+  it("keeps one open refresh per playbook: a second nightly pass queues nothing", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(t.hooks.store.playbookRefreshes("p1")).toHaveLength(1);
+  });
+
+  it("opens the reviewed pull request when the worker publishes, and leaves the stamp alone until it merges", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    expect(refresh.state).toBe("pr_open");
+    expect(refresh.classification).toBe("additive");
+    expect(refresh.pr).toMatch(/^https:\/\/github\.com\/acme\/bb\/pull\/\d+$/u);
+    expect(t.githubPulls).toHaveLength(1);
+    expect(t.githubPulls[0]!.body).toContain("Purely additive");
+    // Stamp-only-on-merge: the plugin never rewrites the project copy.
+    expect(t.files[playbookPath("linear-tickets")]).toContain("template: linear-tickets@deadbeef");
+  });
+
+  it("marks a refresh merged only when the project steward merges it, and then never re-queues that target", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    const steward = t.hooks.store.project("p1").threadId!;
+    const reply = await t.tool("steward_update", { refreshAction: { id: refresh.id, action: "merge" } }, steward);
+    expect(reply.error).toBe(false);
+    expect(t.hooks.store.playbookRefreshes("p1")[0]!.state).toBe("merged");
+    expect(t.githubMerges).toHaveLength(1);
+    // The fixture still shows the old stamp, but a merged target is not retried.
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(t.hooks.store.playbookRefreshes("p1")).toHaveLength(1);
+  });
+
+  it("does not retry a declined refresh until the template changes", async () => {
+    const t = await withLaggingPlaybook();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const refresh = await publishAndFinish(t);
+    const steward = t.hooks.store.project("p1").threadId!;
+    const dropped = await t.tool("steward_update", { refreshAction: { id: refresh.id, action: "drop" } }, steward);
+    expect(dropped.error).toBe(false);
+    expect(t.hooks.store.playbookRefreshes("p1")[0]!.state).toBe("declined");
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(t.hooks.store.playbookRefreshes("p1")).toHaveLength(1);
+  });
+});

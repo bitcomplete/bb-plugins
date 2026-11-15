@@ -22,7 +22,7 @@ import { reportedItem, type GateState } from "./ready-gate.js";
 import { currentStoredGate, type StoredGate } from "./assessed-gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
 import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
-import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
+import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type PlaybookRefresh, type Question, type Worker } from "./store.js";
 import type { CheckFinding } from "./template-stamp.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
@@ -1413,6 +1413,32 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
   return out;
 }
 
+/**
+ * The `## Playbooks to refresh` block (BB-328 Part 2): the playbook refreshes
+ * whose pull request is ready for the project steward to read and decide, plus
+ * the ones still being produced. The plugin's classification is only its read
+ * of the diff; the project steward reads the diff and decides.
+ */
+function projectRefreshesLines(refreshes: PlaybookRefresh[]): string[] {
+  const ready = refreshes.filter((r) => r.state === "pr_open");
+  const pending = refreshes.filter((r) => r.state === "queued" || r.state === "spawned");
+  if (ready.length === 0 && pending.length === 0) return [];
+  const out: string[] = ["", "## Playbooks to refresh", ""];
+  if (ready.length > 0) {
+    out.push(
+      "The nightly check found these project playbooks lag their shipped template, and the plugin opened a refresh pull request. The refresh worker merged the template into the project copy and updated the stamp. Read the diff and decide; the classification is only the plugin's read of the diff.",
+    );
+    for (const r of ready) {
+      out.push(
+        `- ${r.id} (${r.playbook}, ${r.file}): ${r.classification === "additive" ? "purely additive" : "not purely additive"} — ${r.pr ?? "(no pull request)"}${r.removals.length === 0 ? "" : `\n  Removes or rewrites: ${r.removals.map((l) => JSON.stringify(l)).join(", ")}`}\n  Merge a purely additive, project-lane change with \`steward_update { refreshAction: { id: "${r.id}", action: "merge" } }\`; send anything else to the owner with \`{ id: "${r.id}", action: "forward" }\`; drop it with \`{ id: "${r.id}", action: "drop" }\`.`,
+      );
+    }
+  }
+  if (pending.length > 0) out.push("", `In progress (no decision yet): ${pending.map((r) => `${r.id} (${r.playbook}, ${r.state})`).join("; ")}.`);
+  out.push("");
+  return out;
+}
+
 /** The decide-list listing a plugin-filed `approve-pr` need carries, or null (BB-135). */
 function needListing(n: Need): string | null {
   return typeof n.data.decideListing === "string" && n.data.decideListing !== "" ? n.data.decideListing : null;
@@ -1545,6 +1571,8 @@ export function formatProjectWake(input: {
   assumptions?: Array<{ assumption: Assumption; binding: Binding | null }>;
   /** Pending lessons: general rules waiting to be landed in `.bb`. */
   lessons?: Lesson[];
+  /** BB-328 Part 2: playbook refreshes, for the project steward to read and decide. */
+  refreshes?: PlaybookRefresh[];
   /** The hand-written guidance units this wake renders, each with the `gu_` id a steward cites (BB-288). */
   guidance?: GuidanceUnit[];
   /** The project's lesson rules, for the trial cap and the wake headings. */
@@ -1653,6 +1681,7 @@ export function formatProjectWake(input: {
   }
   const lessons = input.lessons ?? [];
   out.push(...projectLessonsLines(lessons, input.lessonRules));
+  out.push(...projectRefreshesLines(input.refreshes ?? []));
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
   const allOpen = input.bindings.map((x) => x.binding);

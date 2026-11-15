@@ -669,6 +669,13 @@ At the project file's time, 01:00 US Eastern by default:
 3. The project steward's pass follows, over the fresh status records; its
    reply is kept as the morning digest.
 
+Before the wake, the same pass queues a refresh for every stamped playbook
+that lags its shipped template and is not already open or deferred (BB-328
+Part 2). The queue is one row per playbook in `playbook_refreshes`; each is
+handed to a short-lived worker, and the project steward is woken when the
+reviewed pull request is ready. The queue and its guardrails are described
+under "A lagging playbook is refreshed" above.
+
 All of it must finish before 03:00, when bb-gate's quiet window restarts
 servers to apply staged updates and would kill a running turn.
 
@@ -1030,6 +1037,28 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   `bb stewards template <name>` prints the current shipped text, and an
   unknown name lists the valid names and exits non-zero. A refresh is a
   reviewed change, never a mechanical overwrite; Part 2 queues it.
+- **A lagging playbook is refreshed through a reviewed pull request
+  (BB-328 Part 2).** When the nightly pass finds a stamped playbook whose
+  hash differs from its template's, it queues one refresh per playbook
+  (`playbook_refreshes`) and starts a short-lived worker thread with the
+  project copy, the current template text and the stamp's template name. The
+  worker merges the template into the project copy keeping the project's own
+  additions, updates the stamp, and publishes with
+  `workspace_publish_guidance`. The plugin reads the published branch, opens
+  the pull request on the primary repo, and classifies the diff for the
+  body: *purely additive* means only insertions and the front matter
+  untouched apart from the stamp, and a change to `models`, `may`, a gate or
+  `requeue-default` is never additive. The classification is the plugin's
+  read, not the worker's claim; the project steward reads the diff in the
+  `## Playbooks to refresh` block and decides with
+  `steward_update { refreshAction: { id, action } }` — `merge` for a purely
+  additive, project-lane change, `forward` to file the owner's Review
+  PR/Drop item, `drop` to close it and decline. The guardrails are the row's:
+  at most one refresh is open per playbook, a declined or failed refresh is
+  not retried until the template changes again, and the stamp is updated only
+  by the merged pull request — which is what stops the playbook being queued.
+  A server on an image that predates the stamp key runs no queue at all and
+  leaves the playbook alone until it restarts.
 - **A phase may be keyed on a label too (BB-248).** A `label:<name>` key in
   `phases` matches a present label on the entity, ignoring case, and wins over
   the state-keyed phase; with no matching label the state decides as before.
