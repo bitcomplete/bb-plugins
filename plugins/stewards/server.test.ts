@@ -14736,6 +14736,9 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
     expect(res.text).toContain("Name what will in this turn");
     expect(res.text).not.toContain("You will be woken when something actionable changes");
+    // The new sentence already says to name a source before ending the turn;
+    // a trailing "End the turn now." would contradict it.
+    expect(res.text).not.toContain("End the turn now");
   });
 
   it("names an open binding the free text mentions, with the exact hold call", async () => {
@@ -14776,6 +14779,38 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
     expect(res.text).not.toContain("Nothing the plugin tracks will deliver this wait");
     expect(res.text).toContain("You will be woken when something actionable changes");
+  });
+
+  it("names an open pull-request binding named as owner/repo#N", async () => {
+    const { t, steward } = await bound();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const res = await t.tool("steward_report", waitReport("acme/web#7 merged"), steward);
+    expect(res.error).toBe(false);
+    expect(res.text).toContain('acme/web#7 is an open binding in this project; hold behind it with `steward_update { hold, behind: ["acme/web#7"] }` so its finish wakes you.');
+  });
+
+  it("does not name the binding's own key", async () => {
+    const { t, steward } = await bound();
+    const res = await t.tool("steward_report", waitReport("ENG-12 is merged"), steward);
+    expect(res.error).toBe(false);
+    expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
+    expect(res.text).not.toContain("ENG-12 is an open binding");
+  });
+
+  it("swaps the sentence in the follow-through branch too", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed" }));
+    await t.ring("linear", "uuid-12");
+    const res = await t.tool("steward_report", { phase: "Done", summary: "Merged.", nextAction: "Nothing", actor: "steward", waitingOn: "the vendor's reply", followThrough: "watch the deploy" }, steward);
+    expect(res.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+    expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
+    expect(res.text).toContain("stays open to follow through");
+    expect(res.text).not.toContain("End the turn now");
   });
 });
 

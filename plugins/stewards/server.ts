@@ -12390,21 +12390,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // applies directly still earns its hits. Counts only, and never a
           // correction: an unknown id is ignored and named, never a failure.
           const citesNote = input.cites === undefined ? "" : ` ${citationLines(await countCitations(b.projectId, b.id, input.cites)).join("; ")}.`;
+          // BB-339: when the report left no wake source the sentence already
+          // says to name a source before ending the turn, so the reply closes
+          // with the requeue-only note and never a second "End the turn now."
+          // that would contradict it.
+          const requeueOnly = `Until you name one, this wait is delivered only by requeue, ${requeuePhrase}.`;
           if (b.ending === "terminal") {
             if (b.followThrough === null) return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
             const followWake = noWakeSource
-              ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} You will still be woken only by requeue, ${requeuePhrase}.`
-              : `You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}.`;
-            return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. ${followWake} End the turn now.`;
+              ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
+              : `You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}. End the turn now.`;
+            return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. ${followWake}`;
           }
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
             return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
           const wakeNote = noWakeSource
-            ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} You will still be woken only by requeue, ${requeuePhrase}.`
-            : `You will be woken when something actionable changes, or ${requeuePhrase}.`;
-          return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} ${wakeNote} End the turn now.`;
+            ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
+            : `You will be woken when something actionable changes, or ${requeuePhrase}. End the turn now.`;
+          return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} ${wakeNote}`;
         } catch (error) {
           return toolError(error);
         }
