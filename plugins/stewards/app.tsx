@@ -1543,7 +1543,11 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
   const lessons = b.lessons.filter((l) => l.key === effortKey);
   // BB-338: a binding can carry both a delegate wait and a real `stuck`
   // escalation; the detail shows the real one's red line whatever else is open.
-  const realStuck = b.stuck.find((x) => x.key === effortKey && x.kind === "stuck") ?? null;
+  // If a delegate wait's `meanwhile` cannot be read back (so `delegateWait` is
+  // null), fall back to its blocked entry so the row never loses its red line.
+  const stuckEntries = b.stuck.filter((x) => x.key === effortKey);
+  const realStuck = stuckEntries.find((x) => x.kind === "stuck") ?? null;
+  const delegateStuck = stuckEntries.find((x) => x.kind === "delegate") ?? null;
   return (
     <>
       <EffortHeading board={b} effort={effort} />
@@ -1578,6 +1582,8 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.delegateWait !== null && s.delegateWait !== undefined ? (
             <p className="text-muted-foreground">Waiting on review from {s.delegateWait}</p>
+          ) : delegateStuck !== null ? (
+            <p className="text-destructive">Stuck: {delegateStuck.why}</p>
           ) : null}
           {realStuck !== null ? <p className="text-destructive">Stuck: {realStuck.why}</p> : null}
           <p className="text-xs text-muted-foreground">

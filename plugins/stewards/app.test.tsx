@@ -1252,6 +1252,17 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     expect(bothWaiting.className).toContain("text-muted-foreground");
     expect(both.getByText(/Stuck: waiting on a decision/u).className).toContain("text-destructive");
     both.lifecycle.unmount();
+
+    // A delegate entry whose meanwhile could not be read back still shows a red line.
+    const unparsed = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", stuck: true })],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "delegate", why: "Waiting on the requested reviewer: unreadable", since: 1 }],
+    });
+    const fallback = await waitFor(() => unparsed.getByText("Stuck: Waiting on the requested reviewer: unreadable"));
+    expect(fallback.className).toContain("text-destructive");
+    expect(unparsed.queryByText(/Waiting on review from/u)).toBeNull();
+    unparsed.lifecycle.unmount();
   });
 
   // BB-251: the binding card shows the open recorded assumptions.
