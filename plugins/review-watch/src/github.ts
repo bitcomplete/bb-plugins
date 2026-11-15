@@ -10,6 +10,7 @@
 import { execFile } from "node:child_process";
 import { z } from "zod";
 import { pullRequestSchema, type PullRequest } from "./types.js";
+import { reviewResolutionSchema, type ReviewDelta } from "./prs-contract.js";
 
 const GRAPHQL_URL = "https://api.github.com/graphql";
 const USER_AGENT = "bb-plugin-review-watch";
@@ -22,6 +23,7 @@ export type GraphqlTransport = (
   query: string,
   variables: Record<string, string>,
 ) => Promise<unknown>;
+export type RestTransport = (path: string) => Promise<unknown>;
 
 /**
  * Shells out; injected in tests. Rejects on a non-zero exit, with the captured
@@ -63,6 +65,8 @@ export interface GithubClient {
   fetchOpenNodeIds(ids: string[]): Promise<Set<string>>;
   /** Full details for started rows outside date-limited searches. */
   fetchRetainedPullRequests(ids: string[], login: string): Promise<{ openNodeIds: Set<string>; pullRequests: PullRequest[] }>;
+  compareCommits(repo: string, baseSha: string, headSha: string): Promise<ReviewDelta>;
+  fetchReviewResolution(nodeId: string, login: string): Promise<z.infer<typeof reviewResolutionSchema>>;
 }
 
 /**
@@ -80,6 +84,9 @@ const PR_FIELDS = `
   url
   isDraft
   updatedAt
+  additions
+  deletions
+  changedFiles
   reviewDecision
   baseRefName
   headRefName
@@ -91,7 +98,7 @@ const PR_FIELDS = `
     pageInfo { hasNextPage }
     nodes { requestedReviewer { __typename ... on User { login } } }
   }
-  reviews(author: $login, last: 10) { nodes { state submittedAt } }
+  reviews(author: $login, last: 10) { nodes { state submittedAt commit { oid } } }
 `;
 
 const SEARCH_QUERY = `
@@ -114,6 +121,9 @@ const searchNodeSchema = z
     url: z.string(),
     isDraft: z.boolean(),
     updatedAt: z.string(),
+    additions: z.number().int().nonnegative().optional(),
+    deletions: z.number().int().nonnegative().optional(),
+    changedFiles: z.number().int().nonnegative().optional(),
     reviewDecision: z.string().nullable(),
     baseRefName: z.string(),
     headRefName: z.string(),
@@ -136,7 +146,7 @@ const searchNodeSchema = z
       ),
     }),
     reviews: z.object({
-      nodes: z.array(z.object({ state: z.string(), submittedAt: z.string().nullable() })),
+      nodes: z.array(z.object({ state: z.string(), submittedAt: z.string().nullable(), commit: z.object({ oid: z.string() }).nullable().optional() })),
     }),
   });
 
@@ -159,6 +169,9 @@ function flatten(node: z.infer<typeof searchNodeSchema>): unknown {
     headSha: node.headRefOid,
     headCommittedAt: node.commits.nodes[0]?.commit.committedDate,
     updatedAt: node.updatedAt,
+    additions: node.additions,
+    deletions: node.deletions,
+    changedFiles: node.changedFiles,
     reviewDecision: node.reviewDecision,
     // Team review requests carry no login; review-watch only nags a person.
     requestedReviewers: node.reviewRequests.nodes
@@ -166,7 +179,7 @@ function flatten(node: z.infer<typeof searchNodeSchema>): unknown {
       .filter((login): login is string => login !== undefined),
     // Ignore an unsubmitted draft while retaining the latest submitted review.
     myLastReview: node.reviews.nodes
-      .filter((review): review is { state: string; submittedAt: string } => review.submittedAt !== null)
+      .flatMap((review) => review.submittedAt === null ? [] : [{ state: review.state, submittedAt: review.submittedAt, commitSha: review.commit?.oid ?? null }])
       .sort((a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt))[0] ?? null,
   };
 }
@@ -266,10 +279,23 @@ export function createTokenTransport(options: {
         "user-agent": USER_AGENT,
       },
       body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(GH_API_TIMEOUT_MS),
     });
     const text = await response.text();
     if (!response.ok) throw httpError(response, text);
     return unwrapGraphqlBody(text);
+  };
+}
+
+export function createTokenRestTransport(token: string): RestTransport {
+  return async (path) => {
+    const response = await fetch(`https://api.github.com/${path}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": USER_AGENT },
+      signal: AbortSignal.timeout(GH_API_TIMEOUT_MS),
+    });
+    const text = await response.text();
+    if (!response.ok) throw httpError(response, text);
+    return JSON.parse(text);
   };
 }
 
@@ -353,6 +379,7 @@ function runCommand(file: string, args: string[], timeoutMs: number): Promise<Co
 export type GhTransport = GraphqlTransport & {
   /** The winning candidate, or undefined until the first probe succeeds. */
   resolvedPath(): string | undefined;
+  getJson: RestTransport;
 };
 
 /**
@@ -446,12 +473,18 @@ export function createGhTransport(options?: {
     },
     {
       resolvedPath: (): string | undefined => resolved,
+      getJson: async (path: string): Promise<unknown> => {
+        const file = await resolveGh();
+        const { stdout } = await run(file, ["api", path]);
+        return JSON.parse(stdout);
+      },
     },
   );
 }
 
 export function createGithubClient(options: {
   transport: GraphqlTransport;
+  rest?: RestTransport;
   /** Called once per pull request skipped because its shape did not parse. */
   onSkip?: SkipLogger;
 }): GithubClient {
@@ -488,6 +521,63 @@ export function createGithubClient(options: {
   }
 
   return {
+    async compareCommits(repo, baseSha, headSha) {
+      if (options.rest === undefined) throw new Error("GitHub compare transport is unavailable.");
+      const path = `repos/${repo.split("/").map(encodeURIComponent).join("/")}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}?per_page=1`;
+      const result = z.object({
+        base_commit: z.object({ sha: z.string() }),
+        merge_base_commit: z.object({ sha: z.string() }),
+        files: z.array(z.object({ filename: z.string(), additions: z.number().int().nonnegative(), deletions: z.number().int().nonnegative() })),
+      }).parse(await options.rest(path));
+      // GitHub compares against the merge base. After a force-push that need
+      // not be the reviewed commit, so this response cannot prove a delta.
+      if (result.base_commit.sha !== baseSha || result.merge_base_commit.sha !== baseSha) {
+        return { kind: "unknown", reason: "The reviewed commit is not an ancestor of this head; GitHub cannot provide the exact review delta." };
+      }
+      // GitHub caps the changed-file list at 300 for a compare request.
+      if (result.files.length >= 300) return { kind: "unknown", reason: "GitHub's compare file limit prevents a complete review delta." };
+      return {
+        kind: "known", baseSha, headSha,
+        additions: result.files.reduce((sum, file) => sum + file.additions, 0),
+        deletions: result.files.reduce((sum, file) => sum + file.deletions, 0),
+        files: result.files.map((file) => ({ path: file.filename, additions: file.additions, deletions: file.deletions })),
+      };
+    },
+
+    async fetchReviewResolution(nodeId, login) {
+      const pageSchema = z.object({ node: z.object({ reviewThreads: z.object({
+        pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+        nodes: z.array(z.object({ isResolved: z.boolean(), comments: z.object({
+          pageInfo: z.object({ hasNextPage: z.boolean() }),
+          nodes: z.array(z.object({ author: z.object({ login: z.string() }).nullable() })),
+        }) })),
+      }) }).nullable() });
+      let after = "";
+      const cursors = new Set<string>();
+      let resolved = 0;
+      let unresolved = 0;
+      while (true) {
+        const data = pageSchema.parse(await graphql(`query ReviewThreadResolution($id: ID!, $after: String) {
+          node(id: $id) { ... on PullRequest { reviewThreads(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes { isResolved comments(first: 100) { pageInfo { hasNextPage } nodes { author { login } } } }
+          } } }
+        }`, { id: nodeId, ...(after === "" ? {} : { after }) }));
+        if (data.node === null) return { kind: "unknown", reason: "GitHub could not read this pull request's review threads." };
+        const page = data.node.reviewThreads;
+        for (const thread of page.nodes) {
+          if (thread.comments.pageInfo.hasNextPage) return { kind: "unknown", reason: "GitHub truncated review thread participants; resolution counts are unavailable." };
+          if (!thread.comments.nodes.some((comment) => comment.author?.login.toLowerCase() === login.toLowerCase())) continue;
+          if (thread.isResolved) resolved++; else unresolved++;
+        }
+        if (!page.pageInfo.hasNextPage) return { kind: "known", resolved, unresolved };
+        const cursor = page.pageInfo.endCursor;
+        if (cursor === null || cursors.has(cursor)) throw new Error("GitHub returned incomplete review thread pagination.");
+        cursors.add(cursor);
+        after = cursor;
+      }
+    },
+
     async viewerLogin(): Promise<string> {
       if (cachedLogin !== undefined) return cachedLogin;
       const data = viewerDataSchema.parse(await graphql(VIEWER_QUERY, {}));

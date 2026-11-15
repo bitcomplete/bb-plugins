@@ -1,23 +1,26 @@
 # bb-plugin-review-watch
 
-A personal GitHub review inbox for BB. A background poller asks GitHub what
-needs your attention, stores a deduplicated queue, and surfaces it in the
-sidebar, the thread header, and on the command line. **Start** opens one thread;
-**Review selected** opens one thread for several review requests. Both actions
-let you choose a BB project before starting. Threads use that project's default
-checkout on its registered machine, including a remote devbox.
+A personal GitHub review inbox for BB. Review Watch owns the durable queue,
+GitHub polling, review rules, project settings, and `bb review-watch` commands.
+Install **PR Board** alongside it for the unified **PRs → To review** inbox.
+The thread header keeps the initial-review and follow-up counts and links to
+that inbox.
 
-Review Watch reads GitHub and never writes to it, and it never starts a thread
-on its own. The queue notifies; you dispatch.
+**Start** opens one reviewer thread. **Review selected** opens one thread for
+several requests. Both actions let you choose a BB project and use its default
+checkout on its registered machine, including a remote devbox. Review Watch
+never starts a thread automatically. Review agents draft findings in BB; they
+must not post, approve, resolve threads, or push code on GitHub.
 
 ## Layout
 
 - `server.ts` — settings, the queue in `bb.storage.kv`, the poll service, the
   `bb review-watch` CLI, RPC for the page, and the realtime signal that keeps
   every open page current.
-- `app.tsx` — the **Reviews** page in the left sidebar
-  (`app.slots.navPanel`), a pending count on its navigation entry, two review counts in the
-  thread header, and a hover preview of up to five review requests.
+- `app.tsx` — the thread-header counts and a hover preview of up to five review
+  requests. PR Board owns the only navigation entry.
+- `src/prs.ts` — the cached unified inbox projection and expanded review details.
+- `src/prs-contract.ts` — versioned public snapshot and detail schemas.
 - `src/types.ts` — the shared vocabulary: `Rule`, `PullRequest`, `QueueItem`.
 - `src/github.ts` — the GitHub client and its two transports, a personal access
   token and the `gh` CLI. The only code that talks to the network.
@@ -47,36 +50,48 @@ them as **Your turn**.
 A queue key is `<rule>:<node-id>:<head-sha>`, so a new head commit is a new
 item. Every command that takes a key accepts an unambiguous prefix.
 
-## Notifications
+## Unified inbox and thread counts
 
-BB exposes no public SDK route for a plugin to raise a user notification. The
-navigation badge shows the total number of pending initial reviews and
-follow-ups. It uses a warning tone when follow-ups are waiting and clears when
-the queue is empty. This requires a BB server with Plugin SDK 0.6.53 or newer.
-The thread-header badge keeps both counts in separate colored chips, including
-zero counts. Hover over the header badge to see labeled counts,
-preview up to five review requests, and open the full **Reviews** page. The
-realtime signal keeps these surfaces current.
+PR Board shows your authored pull requests and Review Watch's inbox in one
+**PRs** entry. It calls Review Watch's public RPCs; it does not read this
+plugin's database or copy its queue. Install the coordinated versions of both
+plugins for the visual inbox. Review Watch's CLI works without PR Board.
 
-The page and badges share an in-memory snapshot and in-flight reads. Returning
-to Reviews shows the last snapshot immediately, while data older than 15 seconds
-refreshes in the background. Realtime changes invalidate it immediately. Refresh
-errors keep the last successful view; hidden windows skip periodic reads.
+The thread-header badge keeps initial-review and follow-up counts in separate
+chips, including zero counts. Hover over it to preview five requests. The
+header and its preview read one cached queue snapshot and keep the previous
+success when refresh fails.
 
-On the **Reviews** page, queued and started `review-requested` and
-`review-followup` items stay in their action sections and remain counted.
-Started rows link to their open threads. They stay pending until a GitHub poll
-confirms a submitted review newer than the item's baseline. A new head
-supersedes the item; a closed or merged pull request also ends its pending
-status. Select queued review items and choose **Review selected** to open one
-aggregate review thread, or use **Start** for an individual item. Completed or
-superseded reviewer threads move to **Archived threads** at the bottom, where you
-can reopen them. Dismissed items do not appear. Workstreams displays feedback
-on your own pull requests.
+The unified inbox distinguishes active reviewer turns, completed drafts, and
+stopped threads. A stopped thread is **draft ready** only when its final output
+contains the validated `review-watch-result` block for that item. Older threads
+without that evidence stay linked and show their stopped state.
 
-Each thread uses the selected project's default checkout. The agent finds
-the matching repository checkout before it inspects code. Review Watch does
-not create checkouts or worktrees when it starts a thread.
+Follow-up details compare your last submitted review's commit with the current
+head. Missing baselines, failed compares, force-push ancestry changes, and
+truncated file lists show an unknown delta. The total PR size never substitutes
+for the delta. Resolution counts include review threads in which you
+participated. **Back with authors** requires GitHub evidence of your submitted
+review with no outstanding request for you; an archived queue row alone does
+not prove that state.
+
+Snapshot reads use cached GitHub data and current BB thread states. Opening a
+review fetches and caches its real per-file comparison and thread resolution
+counts. A failed poll preserves the last successful snapshot and reports the
+error separately. Dismissal requires an explicit action and survives polling.
+
+### Public integration RPCs
+
+- `prs_snapshot(null)` returns the version-1 projection, last poll, and last
+  successful GitHub snapshot time.
+- `prs_detail({ key })` returns one review with a fresh size, comparison, prior
+  verdict, and review-thread resolution summary.
+- `review_targets`, `item_start`, `item_batch_start`, `item_dismiss`, and
+  `poll_now` retain their existing inputs and outputs.
+- `queue-changed` signals queue and reviewer-lifecycle changes.
+
+`src/prs-contract.ts` owns the runtime schemas. Unknown measurements include a
+reason. PR Board validates this public boundary independently.
 
 ## Review projects
 

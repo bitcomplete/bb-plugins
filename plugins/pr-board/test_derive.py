@@ -186,6 +186,16 @@ class Gates(unittest.TestCase):
         f = b.pr_facts(pr(1), ME, {"parent": None, "base_missing": False}, self.GATES, NOW)
         self.assertEqual(f["gates"], ["L1"])
 
+    def test_optional_cleared_by_is_validated_and_kept_as_explicit_evidence(self):
+        gate = {"id": "g", "label": "Staging schema", "repo": REPO, "prs": [1], "clearedBy": "acme/api#701"}
+        facts = b.pr_facts(pr(1), ME, {"parent": None, "base_missing": False}, [gate], NOW)
+        self.assertEqual(facts["gate_links"], [{"label": "Staging schema", "cleared_by": "acme/api#701"}])
+        raw = {"login": ME, "fetched_at": NOW.isoformat(), "prs": []}
+        for invalid in ["#701", "https://github.com/acme/api/pull/701", "acme/api#0", "acme/api#701/other"]:
+            with self.assertRaisesRegex(ValueError, "clearedBy must be owner/repo#number"):
+                b.derive(raw, {"gates": [{**gate, "clearedBy": invalid}]})
+        b.derive(raw, {"gates": [gate]})
+
     def test_gate_naming_closed_pr_is_reported_stale(self):
         raw = {"login": ME, "fetched_at": NOW.isoformat(), "prs": []}
         _, stale = b.derive(raw, {"gates": self.GATES})

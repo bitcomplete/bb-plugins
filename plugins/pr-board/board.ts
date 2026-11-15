@@ -32,8 +32,33 @@ const rowSchema = z.object({
   gate_blocked: z.boolean(),
 });
 
+export const calmRowSchema = rowSchema.extend({
+  repo: z.string(),
+  segment: z.enum(["on-you", "on-reviewers", "drafts", "ready"]),
+  group: z.enum(["one-click", "small", "large", "blocked", "held"]).nullable(),
+  move: z.string(),
+  pushed_at: z.string().nullable(),
+  parent_key: z.string().nullable(),
+  stack_front: z.boolean(),
+  gate_links: z.array(z.object({ label: z.string(), cleared_by: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]*$/).nullable() })),
+  review_summary: z.string(),
+  review_targets: z.array(z.string()),
+  waiting: z.array(z.object({ login: z.string(), name: z.string(), days: z.number().int().nullable(), approx: z.boolean() })),
+  checks: z.array(z.object({ name: z.string(), state: z.enum(["pass", "fail", "pending", "neutral"]), url: z.string().nullable() })),
+});
+export type CalmRow = z.infer<typeof calmRowSchema>;
+
+export const questionSchema = z.object({
+  id: z.string().min(1).max(100),
+  prompt: z.string().min(1).max(1500),
+  options: z.array(z.object({ id: z.string().min(1).max(100), label: z.string().min(1).max(100), message: z.string().min(1).max(2000) }).strict()).min(2).max(5),
+}).strict().refine((q) => new Set(q.options.map((option) => option.id)).size === q.options.length, "Option ids must be unique");
+export type AgentQuestion = z.infer<typeof questionSchema>;
+
 export const viewModelSchema = z.object({
   fetched_at: z.string(),
+  prs: z.array(calmRowSchema),
+  reviewer_batches: z.array(z.object({ login: z.string().nullable(), name: z.string().nullable(), keys: z.array(z.string()) })),
   summary: z.object({
     work: z.number().int(),
     ready: z.number().int(),
@@ -91,7 +116,10 @@ export const viewModelSchema = z.object({
 /** What the panel shows for a PR an agent thread was started on (see markers.ts). */
 export const markerViewSchema = z.object({
   key: z.string(),
-  status: z.enum(["starting", "live", "done", "refused"]),
+  status: z.enum(["starting", "live", "asking", "done", "refused"]),
+  question: questionSchema.nullable().default(null),
+  answering: z.boolean().default(false),
+  answerError: z.string().nullable().default(null),
   threadId: z.string().nullable(),
   title: z.string().nullable(),
   at: z.string(),

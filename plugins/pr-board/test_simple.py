@@ -285,11 +285,11 @@ class Trains(unittest.TestCase):
         self.assertEqual(placed(vm, 11)[2]["stack"], train["id"])
         self.assertIsNone(placed(vm, 13)[2]["stack"])
 
-    def test_single_survivor_and_other_org_stacks_are_not_trains(self):
+    def test_single_survivor_is_hidden_but_other_org_stacks_are_supported(self):
         vm = board(pr(10, "ready"), pr(1, "ready", repo="me/x"), pr(2, "ready", repo="me/x", parent=1),
                    groups=[{"kind": "stack", "repo": MONO, "name": "A", "order": [10, 99]},
                            {"kind": "stack", "repo": "me/x", "name": "B", "order": [1, 2]}])
-        self.assertEqual(vm["trains"], [])
+        self.assertEqual([t["id"] for t in vm["trains"]], ["me/x#1"])
 
 
 class Suggestions(unittest.TestCase):
@@ -359,6 +359,51 @@ class ReviewerLoad(unittest.TestCase):
                                                 "approx": True, "keys": [f"{MONO}#1", f"{MONO}#2"]})
         self.assertEqual(load["reviewers"][1]["name"], "Jake")
         self.assertEqual(load["none"], {"count": 1, "keys": [f"{MONO}#4"]})
+
+
+class CalmRows(unittest.TestCase):
+    def test_historical_approval_does_not_create_a_review_request_even_with_a_pending_second_reviewer(self):
+        vm = board(pr(1, "ready", approvals={"current": [], "stale": ["flasd"]},
+                      waiting_on=[{"reviewer": "jakeorr", "days": 4}]))
+        row, = vm["prs"]
+        self.assertEqual((row["segment"], row["group"], row["review_targets"]), ("ready", None, []))
+        self.assertIn("earlier commit (still counts)", row["review_summary"])
+        self.assertEqual(vm["reviewer_batches"], [])
+
+    def test_gate_wins_over_small_fixes_but_drafts_keep_their_own_segment(self):
+        vm = board(failing(1, gates=["Staging schema"]), pr(2, "draft", gates=["Staging schema"]))
+        rows = {row["number"]: row for row in vm["prs"]}
+        self.assertEqual((rows[1]["segment"], rows[1]["group"], rows[1]["action"]), ("on-you", "blocked", None))
+        self.assertEqual((rows[2]["segment"], rows[2]["group"]), ("drafts", None))
+
+    def test_cutoff_is_2000_lines_and_only_supported_actions_are_agent_groups(self):
+        vm = board(failing(1, additions=1998, deletions=1), failing(2, additions=1999, deletions=1),
+                   failing(3, repo="other/repo"))
+        self.assertEqual({r["number"]: r["group"] for r in vm["prs"]}, {1: "small", 2: "large", 3: "held"})
+        self.assertIsNone(next(r for r in vm["prs"] if r["number"] == 3)["action"])
+
+    def test_rows_are_unique_stack_fronts_first_then_oldest_push_and_check_dots_are_actual(self):
+        stack = {"kind": "stack", "repo": MONO, "name": "EPD-9", "order": [2, 3]}
+        vm = board(failing(1, committed_at="2026-11-01T00:00:00Z"),
+                   failing(2, committed_at="2026-11-10T00:00:00Z", checks=[
+                       {"name": "unit", "conclusion": "SUCCESS", "status": "COMPLETED"},
+                       {"name": "integration", "conclusion": "FAILURE", "status": "COMPLETED"},
+                       {"name": "lint", "conclusion": None, "status": "IN_PROGRESS"},
+                       {"name": "canceled", "conclusion": "CANCELLED", "status": "COMPLETED"}]),
+                   failing(3, parent=2, committed_at="2026-11-03T00:00:00Z"), groups=[stack])
+        self.assertEqual([r["number"] for r in vm["prs"]], [2, 1, 3])
+        self.assertEqual(len({r["key"] for r in vm["prs"]}), 3)
+        self.assertEqual([c["state"] for c in vm["prs"][0]["checks"]], ["pass", "fail", "pending", "neutral"])
+
+    def test_batch_targets_use_real_logins_and_gate_links_only_exist_when_configured(self):
+        vm = board(pr(1, "review", changes_outstanding=True, changes_requested=["flasd"]),
+                   pr(2, "review"), failing(3, gates=["Migrations"], gate_links=[
+                       {"label": "Migrations", "cleared_by": "parsleyhealth/sage#701"}]))
+        self.assertEqual(vm["reviewer_batches"], [
+            {"login": "flasd", "name": "Marcel", "keys": [f"{MONO}#1"]},
+            {"login": None, "name": None, "keys": [f"{MONO}#2"]}])
+        self.assertEqual(next(r for r in vm["prs"] if r["number"] == 3)["gate_links"], [
+            {"label": "Migrations", "cleared_by": "parsleyhealth/sage#701"}])
 
 
 if __name__ == "__main__":

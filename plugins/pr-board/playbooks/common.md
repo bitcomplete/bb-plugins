@@ -23,3 +23,17 @@
 Report: what you changed and why, commits and final head SHA, test and CI results with counts (say what you did not run), the Sol review outcome, and what is still open. Confirm that you did not merge.
 
 End with a section titled exactly `## Decisions for Matt`: a numbered list of every open question or judgment call that needs Matt, each with the options and your recommendation. Write `None.` when there are none.
+
+Append one machine-readable block as the final output after `## Decisions for Matt`:
+
+```pr-board-question
+{"version":1,"question":null}
+```
+
+When a decision blocks your work, replace `null` with one question. Use a unique `id` for this question and turn, a concrete `prompt`, and two to five `options`. Every option has a unique `id`, a short `label`, and the exact follow-up `message` that resumes your work with that choice. Include only choices that you can carry out. For example:
+
+```pr-board-question
+{"version":1,"question":{"id":"fixture-choice-turn-1","prompt":"Repair the fixture or defer this change?","options":[{"id":"repair","label":"Repair the fixture","message":"Repair the fixture, run the relevant checks, and continue to the requested stopping point."},{"id":"defer","label":"Defer this change","message":"Stop work and report the remaining fixture issue. Do not publish."}]}}
+```
+
+Do not infer a decision when none is open. Emit `question: null` when you finish without a blocking question. Do not reuse a question ID after the user answers it.

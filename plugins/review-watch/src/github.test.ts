@@ -296,7 +296,7 @@ describe("fetchWatchedPullRequests: parsing", () => {
       ] } })])),
     );
     const [pr] = await tokenClient(fetchImpl).fetchWatchedPullRequests("reader-ada", "2026-09-15");
-    expect(pr?.myLastReview).toEqual({ state: "COMMENTED", submittedAt: "2026-09-20T09:00:00Z" });
+    expect(pr?.myLastReview).toEqual({ state: "COMMENTED", submittedAt: "2026-09-20T09:00:00Z", commitSha: null });
     expect(calls[0]?.body.query).toContain("reviews(author: $login, last: 10)");
   });
 
@@ -528,7 +528,7 @@ describe("the two transports are interchangeable", () => {
     // Not vacuously equal: this is the fully populated node, not an empty result.
     expect(viaGh).toHaveLength(1);
     expect(viaGh[0]?.requestedReviewers).toEqual(["reader-ada"]);
-    expect(viaGh[0]?.myLastReview).toEqual({ state: "COMMENTED", submittedAt: "2026-09-20T09:00:00Z" });
+    expect(viaGh[0]?.myLastReview).toEqual({ state: "COMMENTED", submittedAt: "2026-09-20T09:00:00Z", commitSha: null });
   });
 
   it("passes the query and its variables to gh as string fields, which is how gh forwards GraphQL variables", async () => {
