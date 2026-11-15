@@ -15900,6 +15900,50 @@ describe("bb stewards divergences (BB-293)", () => {
   });
 });
 
+// BB-333: the typed-wait shadow's state table has a read-only reader, `bb
+// stewards wait-divergences`, the sibling of the BB-293 divergence log. The
+// reconcile writes the state; the command only reads it, and nothing decides
+// or renders from what it prints.
+describe("bb stewards wait-divergences (BB-333)", () => {
+  it("lists the derived-vs-noWakeSource state, with a binding filter and --json", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // Seed the state the way the shadow reconcile writes it: a typed wait that
+    // derives a stall the report-time flag did not, and the other direction
+    // under a second binding.
+    t.hooks.store.recordWaitDivergence({ bindingId: b.id, derived: true, reported: false, waitKind: "person", waitLive: false, inputs: {} }, 1_000);
+    t.hooks.store.recordWaitDivergence({ bindingId: "bnd_other", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 2_000);
+
+    const all = await t.harness.behavior.runCli(["wait-divergences"]);
+    expect(all.exitCode).toBe(0);
+    expect(all.stdout).toContain(b.id);
+    expect(all.stdout).toContain("bnd_other");
+    expect(all.stdout).toContain("kind=person");
+    expect(all.stdout).toContain("kind=pull");
+
+    // --binding resolves an entity key to the binding and keeps only its rows;
+    // --project is the same resolution scope the `divergences` command uses.
+    const one = await t.harness.behavior.runCli(["wait-divergences", "--binding", "ENG-12", "--project", "p1"]);
+    expect(one.exitCode).toBe(0);
+    expect(one.stdout).toContain(b.id);
+    expect(one.stdout).not.toContain("bnd_other");
+
+    // --json emits the rows, booleans and all.
+    const json = await t.harness.behavior.runCli(["wait-divergences", "--binding", "ENG-12", "--json"]);
+    expect(JSON.parse(json.stdout)).toEqual([{ bindingId: b.id, derived: true, reported: false, kind: "person", firstSeenAt: 1_000, lastSeenAt: 1_000, count: 1, at: 1_000 }]);
+  });
+
+  it("is registered with its own help text", async () => {
+    const t = await setup();
+    const help = await t.harness.behavior.runCli(["--help"]);
+    expect(help.exitCode).toBe(0);
+    expect(help.stdout).toContain("wait-divergences");
+    expect(help.stdout).toContain("typed wait's shadow state");
+  });
+});
+
 
 // BB-300 slice 3: the stand-up. The Stewards page starts one spoken stand-up per
 // project; the server builds the briefing's instructions, opens the voice

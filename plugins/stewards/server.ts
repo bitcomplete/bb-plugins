@@ -128,7 +128,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WakeRetry, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
@@ -356,6 +356,24 @@ export function formatDivergences(rows: ReadonlyArray<Pick<DivergenceRow, "bindi
   const at = (ms: number): string => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
   return rows
     .map((d) => `${d.bindingId}  ${d.surface}  x${d.count}  ${at(d.firstSeenAt)} -> ${at(d.lastSeenAt)}\n  old: ${d.old}\n  new: ${d.new}\n  inputs: ${JSON.stringify(d.inputs)}`)
+    .join("\n");
+}
+
+/**
+ * BB-333: the human-readable typed-wait shadow state, one line per binding
+ * (derived result, noWakeSource result, kind, count, first/last seen). The
+ * reader for the `wait_divergence_state` table behind `bb stewards
+ * wait-divergences`; like `formatDivergences`, nothing reads it to decide.
+ */
+export function formatWaitDivergences(rows: ReadonlyArray<WaitDivergenceRow>): string {
+  if (rows.length === 0) return "No wait divergences recorded.";
+  const at = (ms: number): string => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+  const result = (v: boolean): string => (v ? "no-wake-source" : "source-or-no-wait");
+  return rows
+    .map((d) => {
+      const window = d.firstSeenAt === null || d.lastSeenAt === null ? "never" : `${at(d.firstSeenAt)} -> ${at(d.lastSeenAt)}`;
+      return `${d.bindingId}  derived=${result(d.derived)}  noWakeSource=${result(d.reported)}  kind=${d.kind ?? "-"}  x${d.count}  ${window}`;
+    })
     .join("\n");
 }
 
@@ -13946,6 +13964,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const bindingId = raw === undefined ? undefined : (store.find(raw, projectId)?.id ?? raw);
               const rows = store.divergences({ bindingId, surface: input.options.surface });
               return { exitCode: 0, stdout: input.options.json === true ? JSON.stringify(rows) : formatDivergences(rows) };
+            },
+          }),
+
+          "wait-divergences": cliCommand({
+            summary: "The typed wait's shadow state, derived vs noWakeSource (BB-333), read-only",
+            description: "One row per binding that has reported a typed wait: the stall derived from the wait kind on the last reconcile, the report-time noWakeSource flag, and the wait kind, first/last seen time and count from the noWakeSource divergence row behind that state. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
+            options: {
+              binding: { type: "string", description: "Only this binding's wait divergences (binding id or entity key)" },
+              project: PROJECT_OPTION,
+              json: JSON_OPTION,
+            },
+            async run(input, ctx) {
+              const projectId = input.options.project ?? ctx.projectId;
+              const raw = input.options.binding;
+              const bindingId = raw === undefined ? undefined : (store.find(raw, projectId)?.id ?? raw);
+              const rows = store.waitDivergences({ bindingId });
+              return { exitCode: 0, stdout: input.options.json === true ? JSON.stringify(rows) : formatWaitDivergences(rows) };
             },
           }),
 

@@ -1645,6 +1645,26 @@ export type DivergenceRow = {
   count: number;
 };
 
+/**
+ * BB-333: one binding's typed-wait shadow state, the reader's row for
+ * `bb stewards wait-divergences`. `derived` is the stall the typed wait derives
+ * on each reconcile; `reported` is the report-time `noWakeSource` flag. The
+ * `kind`, `firstSeenAt`, `lastSeenAt` and `count` come from the `noWakeSource`
+ * divergence row the state last wrote, so a divergence that has stopped still
+ * reads back with its history. `at` is when the derived/reported pair last
+ * changed. Read-only: the reconcile writes this table and the divergence rows.
+ */
+export type WaitDivergenceRow = {
+  bindingId: string;
+  derived: boolean;
+  reported: boolean;
+  kind: string | null;
+  firstSeenAt: number | null;
+  lastSeenAt: number | null;
+  count: number;
+  at: number;
+};
+
 /** The requester thread the plugin spawned for an open provide-secret need (BB-22). */
 export type SecretRequester = { threadId: string; needId: string; createdAt: number };
 
@@ -1992,6 +2012,12 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const touchWaitDivergenceStmt = lazy<[number, string, string, string, string], unknown>(
     "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
   );
+  // BB-333: the reader's side of the state table. The `bb stewards
+  // wait-divergences` command reads the current derived/reported pair per
+  // binding; the `noWakeSource` divergence row the pair wrote rides along for
+  // the kind and the seen window. Prepared lazily for the same reason.
+  const waitDivergenceStatesStmt = lazy<[], Record<string, unknown>>("SELECT * FROM wait_divergence_state ORDER BY at DESC, binding_id");
+  const waitDivergenceStatesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ? ORDER BY at DESC");
 
   // BB-251: assumptions, prepared lazily for the same reason: a store from
   // before this group has no `assumptions` table yet.
@@ -3649,6 +3675,37 @@ export function createStore(db: Database.Database, now: () => number, options: S
               ? divergencesBySurfaceStmt().all(opts.surface)
               : divergencesAllStmt().all();
       return rows.map(toDivergenceRow);
+    },
+    /**
+     * The typed-wait shadow's current derived-vs-flag state, one row per
+     * binding that has ever reported a typed wait (BB-333), for the
+     * `bb stewards wait-divergences` command. Read-only. The `noWakeSource`
+     * divergence row the pair wrote rides along for the wait kind, the
+     * first/last seen window and the count; the active direction's row is
+     * preferred, and a stopped divergence keeps its most recent row.
+     */
+    waitDivergences(opts: { bindingId?: string } = {}): WaitDivergenceRow[] {
+      const states = opts.bindingId === undefined ? waitDivergenceStatesStmt().all() : waitDivergenceStatesByBindingStmt().all(opts.bindingId);
+      const logs = (opts.bindingId === undefined ? divergencesBySurfaceStmt().all("noWakeSource") : divergencesByBothStmt().all(opts.bindingId, "noWakeSource")).map(toDivergenceRow);
+      const token = (v: boolean): string => (v ? "no-wake-source" : "source-or-no-wait");
+      return states.map((r) => {
+        const bindingId = String(r.binding_id);
+        const derived = Number(r.derived) !== 0;
+        const reported = Number(r.reported) !== 0;
+        const mine = logs.filter((d) => d.bindingId === bindingId);
+        const active = derived !== reported ? mine.find((d) => d.old === token(reported) && d.new === token(derived)) : undefined;
+        const latest = active ?? [...mine].sort((a, b) => b.lastSeenAt - a.lastSeenAt)[0];
+        return {
+          bindingId,
+          derived,
+          reported,
+          kind: latest !== undefined && typeof latest.inputs.waitKind === "string" ? latest.inputs.waitKind : null,
+          firstSeenAt: latest?.firstSeenAt ?? null,
+          lastSeenAt: latest?.lastSeenAt ?? null,
+          count: latest?.count ?? 0,
+          at: Number(r.at),
+        };
+      });
     },
     /**
      * Bound the divergence log: drop rows last seen before `maxAgeMs` and keep

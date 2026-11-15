@@ -483,4 +483,23 @@ describe("the typed-wait divergence store (BB-333)", () => {
     expect(rows.find((r) => r.new === "no-wake-source")!.count).toBe(2);
     expect(rows.find((r) => r.old === "no-wake-source")!.inputs).toMatchObject({ transition: "stop" });
   });
+
+  it("reads the state table for the wait-divergences command, joining the log", () => {
+    const { s } = store();
+    // A start, then a flip to the other direction: the state points at the
+    // second row, so the reader must prefer the active direction, not the
+    // newest row by time (both were touched at the flip).
+    s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000);
+    s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 2_000);
+    // A first observation that agrees: a state row with no divergence row.
+    s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 3_000);
+    const rows = s.waitDivergences();
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.bindingId === "b1")).toEqual({ bindingId: "b1", derived: false, reported: true, kind: "pull", firstSeenAt: 2_000, lastSeenAt: 2_000, count: 1, at: 2_000 });
+    expect(rows.find((r) => r.bindingId === "b2")).toEqual({ bindingId: "b2", derived: false, reported: false, kind: null, firstSeenAt: null, lastSeenAt: null, count: 0, at: 3_000 });
+    // A stopped divergence keeps its most recent row for the seen window; the
+    // stop touch overwrites its inputs, so the kind reads back null.
+    s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 4_000);
+    expect(s.waitDivergences({ bindingId: "b1" })).toEqual([{ bindingId: "b1", derived: false, reported: false, kind: null, firstSeenAt: 2_000, lastSeenAt: 4_000, count: 1, at: 4_000 }]);
+  });
 });
