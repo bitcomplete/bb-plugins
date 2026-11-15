@@ -37,6 +37,8 @@ export interface SidebarBinding {
   needsUser: boolean;
   /** An open `stuck` escalation (BB-76). */
   stuck: boolean;
+  /** The requested reviewer(s) of the binding's open delegate wait, or null (BB-338). */
+  delegateWait: string | null;
   /** The status report's actor, next action and timestamp, or null with no report. */
   status: { actor: string; nextAction: string; at: number } | null;
   /** The state of the newest deployment watch, or null with none (BB-76). */
@@ -136,6 +138,8 @@ export interface SidebarEffort {
   workers: SidebarWorker[];
   needsUser: boolean;
   stuck: boolean;
+  /** The requested reviewer(s) of the binding's open delegate wait, or null (BB-338). */
+  delegateWait: string | null;
   statusActor: string | null;
   statusNextAction: string | null;
   statusAt: number | null;
@@ -245,6 +249,8 @@ export interface EffortStatus {
   hold: string | null;
   holdBehind: string[];
   stuck: boolean;
+  /** The requested reviewer(s) of the binding's open delegate wait, or null (BB-338). */
+  delegateWait: string | null;
   statusActor: string | null;
   statusNextAction: string | null;
   deployment: DeployState | null;
@@ -359,10 +365,12 @@ export const waitingUntilDate = (at: number): string => new Date(at).toISOString
 /**
  * Line two's status phrase, first match wins (BB-76, BB-86, BB-83, BB-152):
  * needs you › hold › stuck › running › lost hand-off › quiet worker finish ›
- * deployment › nextAction › no report. The free-text `waitingOn` is not a
- * prefix (BB-109): a running worker reads the count, and otherwise the
- * `nextAction` reads verbatim, whatever the actor. `the other party` only
- * stands in when there is no report at all.
+ * deployment › nextAction › no report. An open `stuck` escalation that is the
+ * plugin's delegate wait reads `waiting on review from <names>` instead, so a
+ * requested reviewer does not look like a failure (BB-338). The free-text
+ * `waitingOn` is not a prefix (BB-109): a running worker reads the count, and
+ * otherwise the `nextAction` reads verbatim, whatever the actor. `the other
+ * party` only stands in when there is no report at all.
  *
  * The lost hand-off (BB-152) sits after the running count and before the
  * quiet finish: a `waitingOn` naming a worker that is over, or the loud
@@ -379,7 +387,7 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   // it filed, so the row says why it is stuck rather than just that it is.
   if (e.wakeFailure !== null && e.wakeFailure !== undefined && e.wakeFailure !== "") return `wake failed: ${e.wakeFailure}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
-  if (e.stuck) return "stuck";
+  if (e.stuck) return e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "" ? `waiting on review from ${e.delegateWait}` : "stuck";
   // A running worker or reviewer paints the blue ring, but the count is of
   // running workers: a busy steward or reviewer with no running worker falls
   // through rather than reading "0 workers running". A wait on someone else
@@ -441,6 +449,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     workers: [],
     needsUser: false,
     stuck: false,
+    delegateWait: null,
     statusActor: null,
     statusNextAction: null,
     statusAt: null,
@@ -660,6 +669,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       workers: b.workers,
       needsUser: b.needsUser,
       stuck: b.stuck,
+      delegateWait: b.delegateWait,
       statusActor: b.status?.actor ?? null,
       statusNextAction: b.status?.nextAction ?? null,
       statusAt: b.status?.at ?? null,
@@ -758,6 +768,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       workers: [],
       needsUser: false,
       stuck: false,
+      delegateWait: null,
       statusActor: null,
       statusNextAction: null,
       statusAt: null,

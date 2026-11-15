@@ -75,6 +75,7 @@ const binding = (over: Record<string, unknown> = {}) => ({
   waitingOn: null,
   needsUser: false,
   stuck: false,
+  delegateWait: null,
   status: null,
   deployment: null,
   pending: [],
@@ -147,6 +148,7 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   holdBehind: [],
   needsUser: false,
   stuck: false,
+  delegateWait: null,
   deployment: null,
   pending: [],
   requeueAt: null,
@@ -974,6 +976,20 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     expect(lineTwo(slot, "B")).toContain("stuck");
     expect(glyphOf(slot, "A")).toBe("blocked");
     expect(glyphOf(slot, "B")).toBe("blocked");
+    slot.lifecycle.unmount();
+  });
+
+  // BB-338: a delegate wait is blocked but names who it waits on.
+  it("reads a delegate wait as waiting on review from <names>, still blocked", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_d", displayTitle: "ENG-1: D" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_d", stuck: true, delegateWait: "arashout" })] }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("D")).toBeTruthy());
+    expect(lineTwo(slot, "D")).toContain("waiting on review from arashout");
+    expect(glyphOf(slot, "D")).toBe("blocked");
     slot.lifecycle.unmount();
   });
 

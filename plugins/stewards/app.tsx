@@ -661,6 +661,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     hold: s.hold,
     holdBehind: s.holdBehind,
     stuck: s.stuck,
+    delegateWait: s.delegateWait,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     waitingUntil: s.waitingUntil,
@@ -1306,6 +1307,7 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     hold: s.hold,
     holdBehind: s.holdBehind,
     stuck: s.stuck,
+    delegateWait: s.delegateWait,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     waitingUntil: s.waitingUntil,
@@ -1572,7 +1574,11 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
-          {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}
+          {s.delegateWait !== null && s.delegateWait !== undefined ? (
+            <p className="text-muted-foreground">Waiting on review from {s.delegateWait}</p>
+          ) : s.stuck ? (
+            <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p>
+          ) : null}
           <p className="text-xs text-muted-foreground">
             {s.kind === "ops" ? `Last wake ${ago(s.wokeAt, now)}` : `Reported ${ago(s.statusAt, now)} · adopted ${ago(s.createdAt, now)}`}
             {s.stage !== null ? ` · stage ${s.stage}` : ""}

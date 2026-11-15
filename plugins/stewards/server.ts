@@ -105,7 +105,7 @@ import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPE
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -239,6 +239,16 @@ export const WAKE_RETRY_MAX_ATTEMPTS = 3;
 
 /** BB-55: the backstop wake when a report passes the ready gate and the turn ends with no worker started. */
 export const START_WORKER_WAKE = "The ready gate passed on your last turn and nothing holds you: start the worker.";
+
+/**
+ * The requested reviewers a binding's open delegate wait(s) name, joined, or
+ * null when it has none (BB-338). The names are read from the escalation's
+ * `meanwhile`, never re-derived from GitHub.
+ */
+function delegateWaitOf(escalations: readonly Escalation[]): string | null {
+  const names = escalations.filter(isDelegateWait).map((x) => delegateWaitNames(x.meanwhile)).filter((n): n is string => n !== null);
+  return names.length === 0 ? null : names.join(", ");
+}
 
 export interface StewardsDeps {
   now: () => number;
@@ -700,6 +710,8 @@ export const rpcContract = defineRpcContract({
               needsUser: z.boolean(),
               /** An open `stuck` escalation: the row is blocked (BB-78). */
               stuck: z.boolean(),
+              /** The requested reviewer(s) of the binding's open delegate wait, or null (BB-338). */
+              delegateWait: z.string().nullable(),
               /** The newest deployment watch's state, or null with none (BB-78). */
               deployment: z.enum(DEPLOY_STATES).nullable(),
               /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
@@ -835,6 +847,8 @@ export const rpcContract = defineRpcContract({
               needsUser: z.boolean(),
               /** An open `stuck` escalation: the row is blocked (BB-78). */
               stuck: z.boolean(),
+              /** The requested reviewer(s) of the binding's open delegate wait, or null (BB-338). */
+              delegateWait: z.string().nullable(),
               /** The newest deployment watch's state, or null with none (BB-78). */
               deployment: z.enum(DEPLOY_STATES).nullable(),
               /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
@@ -940,6 +954,8 @@ export const rpcContract = defineRpcContract({
           needsUser: z.boolean(),
           /** An open `stuck` escalation: the row is blocked (BB-76). */
           stuck: z.boolean(),
+          /** The requested reviewer(s) of the binding's open delegate wait, or null (BB-338). */
+          delegateWait: z.string().nullable(),
           /** The status report's actor, next action and timestamp; null with no report. */
           status: z.object({ actor: z.string(), nextAction: z.string(), at: z.number() }).nullable(),
           /** The newest deployment watch's state, or null with none (BB-76). */
@@ -10427,6 +10443,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
+              delegateWait: delegateWaitOf(store.openEscalations(b.id)),
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
               requeueAt: b.requeueAt,
@@ -10532,6 +10549,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck" || isDelegateWait(x)),
+              delegateWait: delegateWaitOf(store.openEscalations(b.id)),
               // The newest deployment watch, whatever its state; `merged` reads as deploying.
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               pending: b.pending,
@@ -10607,7 +10625,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const projectQuestions = store.openQuestions(projectId);
           // `needsYou` reads the project's open needs and escalations once and
           // returns the per-binding `needsUser` and `stuck` sets (BB-296).
-          const { questions, withUser, needs, needsUser, stuck } = needsYou(projectId, open, projectQuestions, { actionableOnly: true });
+          const { questions, withUser, needs, needsUser, stuck, delegateWait } = needsYou(projectId, open, projectQuestions, { actionableOnly: true });
           // Only the workers the row can show: running or finished, plus any
           // other worker that ended within the last hour (BB-100).
           const liveSince = started - 3_600_000;
@@ -10646,6 +10664,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               wakeFailure: b.wakeFailure,
               needsUser: needsUser.has(b.id),
               stuck: stuck.has(b.id),
+              delegateWait: delegateWait.get(b.id) ?? null,
               status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
               deployment: newestDeployment === null ? null : newestDeployment.state,
               pending: b.pending,
@@ -13118,7 +13137,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * drops needs the server cannot act on now, which the sidebar's badge and
      * block do not show; the board keeps them and says why.
      */
-    function needsYou(projectId: string, open: Binding[], questions: Question[], opts: { actionableOnly?: boolean } = {}): { questions: ReturnType<typeof questionView>[]; withUser: ReturnType<typeof withUserView>[]; needs: ReturnType<typeof needView>[]; needsUser: Set<string>; stuck: Set<string> } {
+    function needsYou(projectId: string, open: Binding[], questions: Question[], opts: { actionableOnly?: boolean } = {}): { questions: ReturnType<typeof questionView>[]; withUser: ReturnType<typeof withUserView>[]; needs: ReturnType<typeof needView>[]; needsUser: Set<string>; stuck: Set<string>; delegateWait: Map<string, string> } {
       const questionViews = questions.map(questionView);
       const openIds = new Set(open.map((b) => b.id));
       // BB-296: the project's open needs and escalations are read once and
@@ -13139,7 +13158,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // sidebar and board do not re-query them per binding.
       const stuck = new Set<string>();
       for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck" || isDelegateWait(x))) stuck.add(bindingId);
-      return { questions: questionViews, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds, needsUser, stuck };
+      // BB-338: the requested reviewers of a delegate wait, from the same
+      // grouped escalations, so the sidebar row can name them without another
+      // read or a GitHub call.
+      const delegateWait = new Map<string, string>();
+      for (const [bindingId, list] of escalationsByBinding) {
+        const names = delegateWaitOf(list);
+        if (names !== null) delegateWait.set(bindingId, names);
+      }
+      return { questions: questionViews, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds, needsUser, stuck, delegateWait };
     }
 
     /** A project's open needs grouped by binding, dropping ended bindings (BB-296). */
