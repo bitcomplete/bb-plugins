@@ -128,8 +128,9 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
-import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
+import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
+import { CLASSIFIED_AT_PREFIX, classifyRefresh, classifiedHeadSha, fencedBlock, hasTemplateStamp, laggingPlaybooks, parseContradictions, refreshPrBody, refreshQueueDecision, type LaggingPlaybook } from "./refresh.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { countingDatabase, countingGithub, createReadCounts, type ReadCounts } from "./read-counts.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
@@ -1340,6 +1341,36 @@ export function requesterPrompt(b: Pick<Binding, "entityKey">, need: Pick<Need, 
     "If the request fails or is cancelled, reply with one line saying what failed (the error code or message). Do not retry more than once, and never paste any value.",
   );
   return lines.join("\n");
+}
+
+/**
+ * The fixed prompt the plugin gives a playbook-refresh thread (BB-328 Part 2).
+ * The thread merges the current shipped template into the project copy, keeping
+ * the project's own additions, updates the stamp, and publishes; the plugin
+ * opens the pull request and classifies the diff, so the thread never opens or
+ * merges one and never escalates a question (nobody watches it).
+ */
+export function refreshPrompt(refresh: Pick<PlaybookRefresh, "playbook" | "templateName" | "fromHash" | "targetHash">, projectCopy: string, template: string): string {
+  return [
+    `You are a one-task playbook-refresh thread started by the stewards plugin for the playbook ${refresh.playbook}. Do only this; do not explore the workspace beyond the files named, do not open or merge a pull request, and do not ask a question.`,
+    "",
+    `The project copy \`.bb/stewards/playbooks/${refresh.playbook}.md\` was copied from the shipped template \`${refresh.templateName}\` and has drifted: its stamp is \`${refresh.fromHash}\`, and the current template hash is \`${refresh.targetHash}\`.`,
+    "",
+    "Merge the current shipped template into the project copy, keeping the project's own additions. A project addition that contradicts the template stays; never drop a project-specific rule to match the template.",
+    "",
+    "The current project copy:",
+    "",
+    fencedBlock(projectCopy),
+    "",
+    `The current shipped template \`${refresh.templateName}\`:`,
+    "",
+    fencedBlock(template),
+    "",
+    "Steps:",
+    `1. Edit \`.bb/stewards/playbooks/${refresh.playbook}.md\` so it is the current template merged with the project's own additions, and set its front-matter stamp line to \`template: ${refresh.templateName}@${refresh.targetHash}\`.`,
+    "2. Publish the `.bb` change with `workspace_publish_guidance` (it pushes the `guidance-<your thread>` branch). Do not open a pull request; the plugin does that.",
+    "3. Reply with one short summary, ending with a fixed `Contradictions:` line: `Contradictions: none` when no project addition contradicts the template, otherwise `Contradictions:` and one `- <the project rule and the template rule it contradicts>` line each. A missing line is read as a contradiction and sent to the owner, so always write it.",
+  ].join("\n");
 }
 
 export const STEWARDS_SETTINGS = {
@@ -7335,7 +7366,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
       const assumptions = store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -8889,6 +8920,278 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return x;
     }
 
+    // ---- playbook refreshes (BB-328 Part 2) -----------------------------------------------------
+    //
+    // The nightly check reports a stamped playbook whose hash lags its shipped
+    // template. The plugin queues one refresh per playbook, spawns a short-lived
+    // worker to merge the template into the project copy and publish, and opens
+    // a reviewed pull request from the published branch. The plugin classifies
+    // the diff for the pull request body; the project steward reads the diff and
+    // decides (`steward_update { refreshAction }`). The stamp is only updated by
+    // the merged pull request, so the playbook stops being queued only then.
+
+    /** The playbooks a project loaded, deduplicated by name, for the lag read. */
+    function loadedPlaybooks(config: ProjectConfig): Playbook[] {
+      const out: Playbook[] = [];
+      const seen = new Set<string>();
+      for (const p of [...Object.values(config.playbooks), config.depsAlerts, config.depsPrs, ...config.watchPlaybooks.values()]) {
+        if (p === undefined || p === null || seen.has(p.name)) continue;
+        seen.add(p.name);
+        out.push(p);
+      }
+      return out;
+    }
+
+    /** Queue and start a refresh for every playbook that lags and may be queued. */
+    async function queuePlaybookRefreshes(config: ProjectConfig): Promise<void> {
+      const lags = laggingPlaybooks(loadedPlaybooks(config), templateHashes());
+      if (lags.length === 0) return;
+      const prior = store.playbookRefreshes(config.projectId);
+      for (const lag of lags) {
+        const decision = refreshQueueDecision(prior, lag);
+        if (!decision.queue) continue;
+        const refresh = store.addPlaybookRefresh({
+          projectId: config.projectId,
+          file: playbookPath(lag.name),
+          playbook: lag.name,
+          templateName: lag.templateName,
+          fromHash: lag.fromHash,
+          targetHash: lag.toHash,
+        });
+        prior.push(refresh);
+        await spawnPlaybookRefresh(config, refresh);
+      }
+    }
+
+    /** Spawn the fixed-prompt worker for a queued refresh, or mark it failed. */
+    async function spawnPlaybookRefresh(config: ProjectConfig, refresh: PlaybookRefresh): Promise<void> {
+      const template = Object.hasOwn(PLAYBOOK_TEMPLATES, refresh.templateName) ? PLAYBOOK_TEMPLATES[refresh.templateName]! : null;
+      const projectCopy = (await config.source.readFiles([refresh.file]).catch(() => new Map<string, string | null>())).get(refresh.file) ?? null;
+      if (template === null || projectCopy === null) {
+        store.setPlaybookRefresh(refresh.id, {
+          state: "failed",
+          note: template === null ? `the template ${refresh.templateName} no longer exists` : `the project copy ${refresh.file} is unreadable`,
+        });
+        return;
+      }
+      const prompt = refreshPrompt(refresh, projectCopy, template);
+      await recordPluginSend(prompt);
+      try {
+        const thread = await bb.sdk.threads.spawn({
+          projectId: config.projectId,
+          environment: freshEnvironment(config.source, await projectHost(config.projectId)),
+          prompt,
+          title: `Refresh ${refresh.playbook} playbook`,
+          ...modelArgs(config.file.projectSteward.model ?? null),
+          pluginMetadata: { role: "refresh", refreshId: refresh.id },
+        });
+        store.setPlaybookRefresh(refresh.id, { state: "spawned", threadId: thread.id, branch: lessonBranchFor(thread.id) });
+        bb.log.info(`stewards: started a playbook-refresh thread for ${refresh.playbook} (${thread.id})`);
+      } catch (error) {
+        store.setPlaybookRefresh(refresh.id, { state: "failed", note: `could not start the refresh thread: ${errorMessage(error)}` });
+      }
+    }
+
+    /** A refresh that failed before a pull request: record it and tell the project steward once. */
+    async function failPlaybookRefresh(config: ProjectConfig | null, refresh: PlaybookRefresh, note: string): Promise<void> {
+      store.setPlaybookRefresh(refresh.id, { state: "failed", note });
+      if (config === null) return;
+      await wakeProject(config.projectId, `playbook refresh ${refresh.playbook} could not start`, {
+        digestDue: false,
+        notes: [`The refresh of \`${refresh.file}\` from template \`${refresh.templateName}\` failed: ${note}. The playbook keeps its old stamp and is not retried until the template changes.`],
+      });
+    }
+
+    /** The refresh worker finished its turn: read its published branch and open the reviewed pull request. */
+    async function finishPlaybookRefresh(threadId: string, claim: string | null): Promise<void> {
+      const refresh = store.playbookRefreshByThread(threadId);
+      if (refresh === null || refresh.state !== "spawned") return;
+      const config = await loadConfig(refresh.projectId);
+      const branch = refresh.branch ?? lessonBranchFor(threadId);
+      if (config === null) {
+        await failPlaybookRefresh(null, refresh, "the project configuration is unreadable");
+        return;
+      }
+      const primary = await lessonRepo(refresh.projectId);
+      if ("error" in primary) {
+        await failPlaybookRefresh(config, refresh, primary.error);
+        return;
+      }
+      const path = `.bb/${refresh.file}`;
+      const head = branch.replace(/^refs\/heads\//u, "");
+      let published: string | null = null;
+      if (github.fileContent !== undefined) {
+        try {
+          published = await github.fileContent(primary.repo, path, head);
+        } catch (error) {
+          bb.log.warn(`stewards: could not read the refresh branch ${head}: ${errorMessage(error)}`);
+        }
+      }
+      if (published === null) {
+        await failPlaybookRefresh(config, refresh, `the refresh branch ${head} was not published`);
+        return;
+      }
+      // The stamp-only-on-merge rule: the merged copy must carry the target
+      // stamp, or the merge would land a copy the queue still reads as lagging.
+      if (!hasTemplateStamp(published, refresh.templateName, refresh.targetHash)) {
+        await failPlaybookRefresh(config, refresh, `the published copy does not carry the stamp ${refresh.templateName}@${refresh.targetHash}`);
+        return;
+      }
+      const before = (await config.source.readFiles([refresh.file]).catch(() => new Map<string, string | null>())).get(refresh.file) ?? null;
+      if (before === null) {
+        await failPlaybookRefresh(config, refresh, `the project copy ${refresh.file} is unreadable`);
+        return;
+      }
+      const classified = classifyRefresh(before, published);
+      // AC5: a project rule that contradicts the template is never additive,
+      // whatever the line diff looks like. The worker's `Contradictions:` line
+      // is authoritative for this; a missing line is read as a contradiction,
+      // so a worker that stays silent cannot smuggle one past the owner.
+      const contradictions = parseContradictions(claim);
+      const contradictionRules = contradictions.rules;
+      const missedLine = !contradictions.listed;
+      const effective = contradictionRules.length === 0 && !missedLine
+        ? classified
+        : {
+            ...classified,
+            classification: "not-additive" as const,
+            reasons: [...classified.reasons, ...(missedLine ? ["the refresh thread did not report its contradictions"] : []), ...contradictionRules.map((r) => `the project's own rule contradicts the template: ${r}`)],
+          };
+      const base = await github.defaultBranch(primary.repo).catch((error: unknown) => {
+        bb.log.warn(`stewards: could not read ${primary.repo}'s default branch: ${errorMessage(error)}`);
+        return null;
+      });
+      if (base === null) {
+        await failPlaybookRefresh(config, refresh, `could not read ${primary.repo}'s default branch`);
+        return;
+      }
+      try {
+        const created = await github.createPull(primary.repo, { head, base, title: `Refresh ${refresh.playbook} playbook`, body: refreshPrBody(refresh, effective, threadId, claim, contradictionRules) });
+        const removals = [...effective.removals, ...effective.rewrites.map((r) => `${r.before} → ${r.after}`)];
+        // BB-328: record the head the diff was classified at, so a later push
+        // to the branch cannot be merged under the label it never earned.
+        store.setPlaybookRefresh(refresh.id, { state: "pr_open", pr: created.url, branch, classification: effective.classification, removals, note: `${CLASSIFIED_AT_PREFIX}${created.headSha ?? "unreadable"}` });
+        await wakeProject(config.projectId, `playbook refresh ${refresh.playbook} is ready to review`, {
+          digestDue: false,
+          notes: [
+            `Refresh ${refresh.id} for \`${refresh.file}\` is open at ${created.url} (${effective.classification === "additive" ? "purely additive" : "not purely additive"}). Read the diff and decide: \`steward_update { refreshAction: { id: "${refresh.id}", action: "merge" } }\` merges a purely additive, project-lane change; \`action: "forward"\` files the owner's Review PR/Drop item; \`action: "drop"\` closes it and declines it (not retried until the template changes).`,
+          ],
+        });
+      } catch (error) {
+        await failPlaybookRefresh(config, refresh, errorMessage(error));
+      }
+    }
+
+    /** The refresh worker failed: record it, so it is not retried until the template changes. */
+    async function failPlaybookRefreshThread(threadId: string, note: string): Promise<void> {
+      const refresh = store.playbookRefreshByThread(threadId);
+      if (refresh === null || refresh.state !== "spawned") return;
+      await failPlaybookRefresh(await loadConfig(refresh.projectId), refresh, note);
+    }
+
+    /** Merge, forward to the owner, or drop a refresh the project steward decided. */
+    async function actOnPlaybookRefresh(refresh: PlaybookRefresh, action: "merge" | "forward" | "drop"): Promise<string> {
+      if (action === "merge") {
+        if (refresh.state !== "pr_open" || refresh.pr === null) return "there is no open pull request to merge";
+        // AC4: the lesson merge gate decides who merges. The decide list places
+        // the playbook file exactly as it places a procedure lesson in it; a
+        // `user` playbook is never merged here.
+        const decisions = (await loadConfig(refresh.projectId))?.file.bigDecisions ?? [];
+        if (lessonLandingMark({ file: refresh.file, scope: "procedure" }, decisions) !== "project") {
+          return 'the decide list makes this playbook the user\'s to approve; use action "forward" instead';
+        }
+        // AC4: only a purely additive change may be merged by the project
+        // steward. Anything with a removal, a rewrite or a contradiction goes
+        // to the owner, whatever the worker's label said.
+        if (refresh.classification !== "additive") {
+          return 'this refresh is not purely additive; use action "forward" instead';
+        }
+        // AC4/BB-328: land only the head the plugin classified. A push to the
+        // `guidance-<thread>` branch after classification is not covered by the
+        // label, so refuse it (fail closed) and pass the recorded head to the
+        // squash merge, which GitHub also refuses when it moved.
+        const ref = parsePullRef(refresh.pr);
+        if (ref === null) return `the pull request ${refresh.pr} cannot be read`;
+        const classifiedSha = classifiedHeadSha(refresh.note);
+        if (classifiedSha === null) return 'the refresh was not classified at a recorded head; use action "forward" or "drop" instead';
+        const current = await snapshot("github", `${ref.repo}#${ref.number}`).catch(() => null);
+        if (current !== null && current.pull !== null && current.pull.headSha !== "" && current.pull.headSha !== classifiedSha) {
+          return 'the refresh branch moved since it was classified; use action "forward" or "drop" instead';
+        }
+        const primary = await lessonRepo(refresh.projectId);
+        if ("error" in primary) return primary.error;
+        // The narrow guard: the pull request changes this playbook and only it.
+        if (github.files !== undefined) {
+          const files = await github.files(primary.repo, ref.number).catch(() => null);
+          if (files === null) return "the pull request's changed files cannot be read";
+          const bad = files.filter((p) => p !== `.bb/${refresh.file}` && p !== refresh.file);
+          if (bad.length > 0) return `the pull request changes files other than ${refresh.file}: ${bad.slice(0, 5).join(", ")}`;
+        }
+        try {
+          const { sha } = await github.squashMerge(primary.repo, ref.number, `Refresh ${refresh.playbook} playbook`, "Merged by the project steward after reading the refresh diff.", classifiedSha);
+          store.setPlaybookRefresh(refresh.id, { state: "merged", note: `merged at ${sha ?? "?"}` });
+          if (refresh.questionId !== null) {
+            const q = store.question(refresh.questionId);
+            if (q !== null && q.status === "open") store.answer(refresh.questionId, "The refresh pull request merged.", "plugin");
+          }
+          return `merged at ${sha ?? refresh.pr}`;
+        } catch (error) {
+          store.setPlaybookRefresh(refresh.id, { note: `${CLASSIFIED_AT_PREFIX}${classifiedSha} — refused: ${errorMessage(error)}` });
+          return `pull request refused: ${errorMessage(error)}`;
+        }
+      }
+      if (action === "drop") {
+        if (refresh.pr !== null) {
+          const ref = parsePullRef(refresh.pr);
+          if (ref !== null) await github.closePull(ref.repo, ref.number).catch((error: unknown) => bb.log.warn(`stewards: could not close ${refresh.pr}: ${errorMessage(error)}`));
+        }
+        store.setPlaybookRefresh(refresh.id, { state: "declined", note: "Dropped by the project steward." });
+        if (refresh.questionId !== null) {
+          const q = store.question(refresh.questionId);
+          if (q !== null && q.status === "open") store.answer(refresh.questionId, "Dropped.", "project");
+        }
+        return "dropped; not retried until the template changes";
+      }
+      // forward: the owner reviews the pull request; the plugin observes the merge.
+      if (refresh.state !== "pr_open") return "there is no open pull request to forward";
+      if (refresh.questionId !== null) return `already with the owner (${refresh.questionId})`;
+      const question = store.ask({
+        projectId: refresh.projectId,
+        bindingId: null,
+        escalationId: null,
+        question: `Refresh the ${refresh.playbook} playbook from template ${refresh.templateName}?`,
+        context: `The refresh pull request ${refresh.pr ?? "(none)"} is ${refresh.classification === "additive" ? "purely additive" : "not purely additive"}${refresh.removals.length === 0 ? "" : `; it removes or rewrites ${refresh.removals.length} line(s)`}. Review the diff at the pull request and merge it, or drop it.`,
+        choices: ["Review PR", "Drop"],
+        url: refresh.pr,
+        data: { refreshId: refresh.id, file: refresh.file },
+      });
+      store.setPlaybookRefresh(refresh.id, { questionId: question.id, note: "forwarded to the owner" });
+      return `forwarded to the owner as ${question.id}`;
+    }
+
+    /** A refresh pull request merged or closed: move the row without the project steward acting. */
+    async function reconcilePlaybookRefreshes(config: ProjectConfig): Promise<void> {
+      for (const refresh of store.playbookRefreshes(config.projectId)) {
+        if (refresh.state !== "pr_open" || refresh.pr === null) continue;
+        const ref = parsePullRef(refresh.pr);
+        if (ref === null) continue;
+        try {
+          const pull = await snapshot("github", `${ref.repo}#${ref.number}`);
+          if (pull?.pull?.merged === true) {
+            store.setPlaybookRefresh(refresh.id, { state: "merged", note: "The pull request merged." });
+            if (refresh.questionId !== null) {
+              const q = store.question(refresh.questionId);
+              if (q !== null && q.status === "open") store.answer(refresh.questionId, "The refresh pull request merged.", "plugin");
+            }
+          } else if (pull !== null && (pull.state.toLowerCase() === "closed" || pull.state.toLowerCase() === "declined")) {
+            store.setPlaybookRefresh(refresh.id, { state: "declined", note: "The pull request closed without merging." });
+          }
+        } catch (error) {
+          bb.log.warn(`stewards: could not read refresh ${refresh.id}'s pull request ${refresh.pr}: ${errorMessage(error)}`);
+        }
+      }
+    }
+
     // ---- thread events ---------------------------------------------------------------------------
     //
     // Workers are started by stewards with `--parent-self
@@ -9014,6 +9317,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }));
 
     bb.events.on("thread.idle", store.coalescingTool(async ({ thread, lastAssistantText }) => {
+      // BB-328 Part 2: a playbook-refresh worker finished its turn. Read the
+      // branch it published, classify the diff and open the reviewed pull
+      // request; the project steward reads the diff and decides.
+      const refreshThread = store.playbookRefreshByThread(thread.id);
+      if (refreshThread !== null && refreshThread.state === "spawned") {
+        await finishPlaybookRefresh(thread.id, lastAssistantText);
+        return;
+      }
       const worker = store.worker(thread.id);
       if (worker !== null) {
         if (worker.status === "stopped") return;
@@ -9262,6 +9573,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }));
 
     bb.events.on("thread.failed", store.coalescingTool(async ({ thread, error }) => {
+      // BB-328 Part 2: a refresh worker that failed is recorded, so it is not
+      // retried until the template changes again.
+      const refreshThread = store.playbookRefreshByThread(thread.id);
+      if (refreshThread !== null && refreshThread.state === "spawned") {
+        await failPlaybookRefreshThread(thread.id, error ?? "the refresh worker failed");
+        return;
+      }
       const worker = store.worker(thread.id);
       if (worker === null || !workerInFlight(worker)) return;
       // BB-255: turn.failed is dispatched right after this event and decides
@@ -10777,6 +11095,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!q.choices.includes(chosen)) return { ok: false, message: `"${chosen}" is not one of the choices: ${q.choices.join(", ")}.` };
           const guidance = text === null ? chosen : `${chosen} — ${text}`;
           store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
+          // BB-328 Part 2: the owner's Review PR/Drop item for a playbook
+          // refresh. Drop closes the pull request and declines the refresh, so
+          // the next nightly pass does not re-queue it; Review PR leaves the
+          // merge to the owner and the reconcile observes it.
+          const refreshId = typeof q.data.refreshId === "string" ? q.data.refreshId : null;
+          if (refreshId !== null) {
+            const refresh = store.playbookRefresh(refreshId);
+            if (refresh !== null && refresh.state === "pr_open") {
+              if (chosen === "Drop") await actOnPlaybookRefresh(refresh, "drop");
+              await wakePlainRationale();
+              return { ok: true, message: chosen === "Drop" ? "Dropped; the refresh is declined and not retried until the template changes." : `Review ${refresh.pr ?? "the pull request"}; the refresh is marked merged when it merges.` };
+            }
+            return { ok: true, message: "The refresh is already resolved." };
+          }
           if (x !== null && b !== null && b.endedAt === null) {
             const closure = withRationale(`The user chose ${chosen} for ${b.entityKey}'s forwarded escalation on the Stewards page${text === null ? "" : `: ${text}`}.`);
             store.addGuidance(b.id, guidance, "user");
@@ -12144,6 +12476,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           })
           .optional()
           .describe("Project steward only: finish a pending lesson after applying and publishing it, retire a retired one, or drop it."),
+        refreshAction: z
+          .object({
+            id: z.string().trim().min(1).max(100).describe("The refresh id (rfr_…) from the `## Playbooks to refresh` wake block."),
+            action: z.enum(["merge", "forward", "drop"]).describe("merge: squash-merge the refresh pull request (a purely additive, project-lane change). forward: file the owner's Review PR/Drop item. drop: close the pull request and decline the refresh, which is not retried until the template changes."),
+          })
+          .optional()
+          .describe("Project steward only: decide a playbook refresh after reading its diff (BB-328 Part 2). The plugin's `purely additive` label is only its read of the diff; the project steward decides."),
       }),
       execute: store.coalescingTool(async (input, { threadId }) => {
         try {
@@ -12208,8 +12547,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (projectOf === null && (input.ask !== undefined || resolve?.startsWith("qst_") === true)) {
             return toolError(new Error("Only the project steward keeps questions to the user; a steward escalates with steward_report."));
           }
-          if (projectOf === null && (input.lesson !== undefined || input.lessonAction !== undefined)) {
-            return toolError(new Error("Only the project steward records and completes lessons; a steward escalates with steward_report."));
+          if (projectOf === null && (input.lesson !== undefined || input.lessonAction !== undefined || input.refreshAction !== undefined)) {
+            return toolError(new Error("Only the project steward records and completes lessons and decides playbook refreshes; a steward escalates with steward_report."));
           }
           if (input.lesson?.supersedes !== undefined) {
             const older = store.lesson(input.lesson.supersedes);
@@ -12229,6 +12568,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (lesson.tier === "retired") return toolError(new Error(`Lesson ${lesson.id} is retired; a retired lesson is never landed, only removed with action "retire".`));
             const outcome = await completeLesson(lesson, input.lessonAction.action);
             return `${lesson.id}: ${outcome}.`;
+          }
+          if (input.refreshAction !== undefined) {
+            const refresh = store.playbookRefresh(input.refreshAction.id);
+            if (refresh === null || refresh.projectId !== projectOf) return toolError(new Error(`No playbook refresh ${input.refreshAction.id} in this project.`));
+            const outcome = await actOnPlaybookRefresh(refresh, input.refreshAction.action);
+            return `${refresh.id}: ${outcome}.`;
           }
           /** Record the lesson this call carries, with the binding and escalation it came from. */
           const recordLesson = (bindingId: string | null, escalationId: string | null): string => {
@@ -13074,6 +13419,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await keepProjectSteward(config.projectId);
       await syncOpsBindings(config);
       await reconcileLessons(config);
+      await reconcilePlaybookRefreshes(config);
       applyLessonTransitions(config);
       applyRationaleClustering(config);
       // BB-325: close any open item left on an ended binding, once.
@@ -13165,6 +13511,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // role does not pay for the extra snapshots.
         const adoption = (await settings.get()).paused ? { adopted: 0, unassigned: [] } : await adoptionPass(config, { collectUnassigned: config.role?.projectSteward === true });
         await reconcileLessons(config);
+        await reconcilePlaybookRefreshes(config);
         applyLessonTransitions(config);
         applyValidations(config);
         applyRationaleClustering(config);
@@ -13212,6 +13559,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const diff = freshCheckFindings(current, store.checkFindings(config.projectId));
             freshFindings = diff.fresh;
             nextFindings = diff.next;
+            // BB-328 Part 2: queue a refresh for every playbook that lags its
+            // shipped template and is not already open or deferred. The
+            // worker is short-lived; the project steward is woken when the
+            // reviewed pull request is ready.
+            await queuePlaybookRefreshes(config);
           }
           let digestSent = false;
           await wakeProject(config.projectId, `nightly pass ${night}`, {

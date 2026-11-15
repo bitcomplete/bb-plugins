@@ -792,7 +792,36 @@ export const WAIT_DIVERGENCE_MIGRATIONS = [
    )`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS];
+// BB-328 Part 2: one queued refresh of a project playbook that lags its
+// shipped template, so the nightly pass queues each playbook once, a declined
+// or failed refresh is not retried until the template changes, and the stamp
+// is updated only by a merged refresh. A new table appended after every group
+// already shipped, so no recorded index moves.
+export const PLAYBOOK_REFRESH_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS playbook_refreshes (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     file TEXT NOT NULL,
+     playbook TEXT NOT NULL,
+     template_name TEXT NOT NULL,
+     from_hash TEXT NOT NULL,
+     target_hash TEXT NOT NULL,
+     state TEXT NOT NULL DEFAULT 'queued',
+     thread_id TEXT,
+     branch TEXT,
+     pr TEXT,
+     classification TEXT,
+     removals TEXT NOT NULL DEFAULT '[]',
+     question_id TEXT,
+     note TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS playbook_refreshes_project ON playbook_refreshes (project_id, playbook)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1366,6 +1395,8 @@ export type Question = {
   rationaleAsked: boolean;
   /** True once the user supplied reasoning for this question (BB-35 step 4). */
   rationaleGiven: boolean;
+  /** The structured payload the question carries, for a page action to read (BB-328: a refresh id). */
+  data: Record<string, unknown>;
 };
 
 /** The kinds of thing that can wait on the user, from the ticket's table. */
@@ -1602,6 +1633,52 @@ export type Lesson = {
   validatedAt: number | null;
   /** When the plugin last filed a validation item for this lesson, or null (BB-35 step 5). */
   validationFiledAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  resolvedAt: number | null;
+};
+
+/**
+ * The lifecycle of a playbook refresh (BB-328 Part 2): `queued` when the
+ * nightly pass found the lag, `spawned` when its worker thread started,
+ * `pr_open` when the plugin opened the reviewed pull request, and `merged`,
+ * `declined` or `failed` once it is over. The stamp is only updated by the
+ * merged pull request, which is what stops the playbook being queued again.
+ */
+export const REFRESH_STATES = ["queued", "spawned", "pr_open", "merged", "declined", "failed"] as const;
+export type RefreshState = (typeof REFRESH_STATES)[number];
+/** A refresh state read from a row, failing closed to `queued` for an unknown value. */
+export const refreshState = (value: unknown): RefreshState => (REFRESH_STATES.includes(value as RefreshState) ? (value as RefreshState) : "queued");
+export type RefreshClassificationKind = "additive" | "not-additive";
+/** One queued refresh of a project playbook that lags its shipped template. */
+export type PlaybookRefresh = {
+  id: string;
+  projectId: string;
+  /** The playbook file, repo-relative, e.g. `stewards/playbooks/ops-watch.md`. */
+  file: string;
+  /** The playbook's front-matter `name`. */
+  playbook: string;
+  /** The shipped template it is refreshed from. */
+  templateName: string;
+  /** The stamp hash the project copy carried when the refresh was queued. */
+  fromHash: string;
+  /** The current template hash the refresh targets; the stamp is set to it on merge. */
+  targetHash: string;
+  state: RefreshState;
+  /** The refresh worker thread, once spawned. */
+  threadId: string | null;
+  /** The `guidance-<thread>` branch the worker published on. */
+  branch: string | null;
+  /** The pull request the plugin opened from that branch. */
+  pr: string | null;
+  /** The plugin's own classification of the published diff. */
+  classification: RefreshClassificationKind | null;
+  /** Removed or rewritten lines, one each, from the classification. */
+  removals: string[];
+  /** The owner question the project steward filed when it forwarded, or null. */
+  questionId: string | null;
+  /** The last refusal or explanation, for the wake. */
+  note: string | null;
   createdAt: number;
   updatedAt: number;
   resolvedAt: number | null;
@@ -2085,6 +2162,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       rationaleWanted: e.rationaleWanted,
       rationaleAsked: e.rationaleAsked,
       rationaleGiven: e.rationaleGiven,
+      data: e.data,
     };
   };
   const insertNeed = db.prepare(
@@ -2117,6 +2195,20 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const setLessonTierStmt = db.prepare("UPDATE lessons SET tier = ?, tier_at = ?, updated_at = ? WHERE id = ?");
   const setLessonClusterStmt = db.prepare("UPDATE lessons SET cluster_key = ?, updated_at = ? WHERE id = ?");
   const setLessonSupersededStmt = db.prepare("UPDATE lessons SET superseded_by = ?, updated_at = ? WHERE id = ?");
+  // BB-328 Part 2: the playbook-refresh rows. A refresh is read by project and
+  // by its worker thread; every field is rewritten in one update so a caller
+  // cannot leave the row half moved. Prepared lazily, like every statement on
+  // a newer table, so a legacy store opened without the migration still starts
+  // (migrations.test.ts).
+  const insertPlaybookRefresh = lazy<[Record<string, unknown>], unknown>(
+    "INSERT INTO playbook_refreshes (id, project_id, file, playbook, template_name, from_hash, target_hash, state, created_at, updated_at) VALUES (@id, @project_id, @file, @playbook, @template_name, @from_hash, @target_hash, 'queued', @created_at, @updated_at)",
+  );
+  const getPlaybookRefresh = lazy<[string], Record<string, unknown>>("SELECT * FROM playbook_refreshes WHERE id = ?");
+  const playbookRefreshesFor = lazy<[string], Record<string, unknown>>("SELECT * FROM playbook_refreshes WHERE project_id = ? ORDER BY created_at");
+  const playbookRefreshByThreadStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM playbook_refreshes WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1");
+  const updatePlaybookRefreshStmt = lazy<[Record<string, unknown>], unknown>(
+    "UPDATE playbook_refreshes SET state = @state, thread_id = @thread_id, branch = @branch, pr = @pr, classification = @classification, removals = @removals, question_id = @question_id, note = @note, updated_at = @updated_at, resolved_at = @resolved_at WHERE id = @id",
+  );
   const lessonsByTierStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND tier = ? ORDER BY created_at");
   const setEscalationCitationsStmt = db.prepare("UPDATE escalations SET cited_lessons = ? WHERE id = ?");
   const markEscalationCorrectedStmt = db.prepare("UPDATE escalations SET corrections_counted = 1 WHERE id = ?");
@@ -2355,6 +2447,27 @@ export function createStore(db: Database.Database, now: () => number, options: S
     citedBindings: json(z.array(z.string()), r.cited_bindings === null || r.cited_bindings === undefined ? null : String(r.cited_bindings), []),
     validatedAt: r.validated_at === null || r.validated_at === undefined ? null : Number(r.validated_at),
     validationFiledAt: r.validation_filed_at === null || r.validation_filed_at === undefined ? null : Number(r.validation_filed_at),
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+  });
+
+  const toPlaybookRefresh = (r: Record<string, unknown>): PlaybookRefresh => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    file: String(r.file),
+    playbook: String(r.playbook),
+    templateName: String(r.template_name),
+    fromHash: String(r.from_hash),
+    targetHash: String(r.target_hash),
+    state: refreshState(r.state),
+    threadId: r.thread_id === null || r.thread_id === undefined ? null : String(r.thread_id),
+    branch: r.branch === null || r.branch === undefined ? null : String(r.branch),
+    pr: r.pr === null || r.pr === undefined ? null : String(r.pr),
+    classification: r.classification === "additive" || r.classification === "not-additive" ? r.classification : null,
+    removals: json(z.array(z.string()), r.removals === null || r.removals === undefined ? null : String(r.removals), []),
+    questionId: r.question_id === null || r.question_id === undefined ? null : String(r.question_id),
+    note: r.note === null || r.note === undefined ? null : String(r.note),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
@@ -3380,6 +3493,73 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const at = now();
       resolveLessonStmt.run("dropped", null, null, note, at, at, id);
       setLessonTierStmt.run("retired", at, at, id);
+    },
+
+    // playbook refreshes (BB-328 Part 2): the nightly pass queues one per
+    // lagging playbook, a worker thread produces the merged copy, and the
+    // plugin opens a reviewed pull request. The row is the queue: it is the
+    // one place the open/deferred state and the stamp's target live.
+    /** Queue a refresh of a lagging playbook. */
+    addPlaybookRefresh(fields: { projectId: string; file: string; playbook: string; templateName: string; fromHash: string; targetHash: string }): PlaybookRefresh {
+      const id = newId("rfr");
+      const at = now();
+      insertPlaybookRefresh().run({
+        id,
+        project_id: fields.projectId,
+        file: fields.file,
+        playbook: fields.playbook,
+        template_name: fields.templateName,
+        from_hash: fields.fromHash,
+        target_hash: fields.targetHash,
+        created_at: at,
+        updated_at: at,
+      });
+      projectChanged(fields.projectId);
+      return toPlaybookRefresh(getPlaybookRefresh().get(id)!);
+    },
+    playbookRefresh(id: string): PlaybookRefresh | null {
+      const r = getPlaybookRefresh().get(id);
+      return r === undefined ? null : toPlaybookRefresh(r);
+    },
+    /** A project's refreshes, oldest first, or one playbook's. */
+    playbookRefreshes(projectId: string, playbook?: string): PlaybookRefresh[] {
+      const rows = playbookRefreshesFor().all(projectId).map(toPlaybookRefresh);
+      return playbook === undefined ? rows : rows.filter((r) => r.playbook === playbook);
+    },
+    /** The refresh a worker thread belongs to, or null. */
+    playbookRefreshByThread(threadId: string): PlaybookRefresh | null {
+      const r = playbookRefreshByThreadStmt().get(threadId);
+      return r === undefined ? null : toPlaybookRefresh(r);
+    },
+    /**
+     * Move a refresh along. Only the named fields change; a terminal state
+     * stamps `resolved_at` once, so a later read of the resolved time is the
+     * moment it actually ended. A merged refresh is what makes the playbook
+     * stop lagging; nothing else writes the stamp.
+     */
+    setPlaybookRefresh(
+      id: string,
+      patch: Partial<Pick<PlaybookRefresh, "state" | "threadId" | "branch" | "pr" | "classification" | "removals" | "questionId" | "note">>,
+    ): PlaybookRefresh | null {
+      const row = getPlaybookRefresh().get(id);
+      if (row === undefined) return null;
+      const state = patch.state ?? refreshState(row.state);
+      const at = now();
+      updatePlaybookRefreshStmt().run({
+        id,
+        state,
+        thread_id: patch.threadId !== undefined ? patch.threadId : (row.thread_id as string | null),
+        branch: patch.branch !== undefined ? patch.branch : (row.branch as string | null),
+        pr: patch.pr !== undefined ? patch.pr : (row.pr as string | null),
+        classification: patch.classification !== undefined ? patch.classification : (row.classification as string | null),
+        removals: patch.removals !== undefined ? JSON.stringify(patch.removals) : String(row.removals),
+        question_id: patch.questionId !== undefined ? patch.questionId : (row.question_id as string | null),
+        note: patch.note !== undefined ? patch.note : (row.note as string | null),
+        updated_at: at,
+        resolved_at: state === "queued" || state === "spawned" || state === "pr_open" ? (row.resolved_at as number | null) : ((row.resolved_at as number | null) ?? at),
+      });
+      projectChanged(String(row.project_id));
+      return toPlaybookRefresh(getPlaybookRefresh().get(id)!);
     },
     /**
      * Record the lessons one decision cited (BB-35 step 2). A lesson's `hits`

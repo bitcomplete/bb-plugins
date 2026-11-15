@@ -689,6 +689,32 @@ deduplicated by fingerprint so an unchanged finding is said once and again
 only when it changes (or clears and returns). `check` and the nightly pass
 are read-only and need no new credential.
 
+**Refreshing the drift (BB-328 Part 2).** When the nightly pass finds a
+stamped playbook whose hash lags its template, it queues one refresh per
+playbook and starts a short-lived worker thread with the project copy, the
+current template text and the stamp's template name. The worker merges the
+template into the project copy keeping the project's own additions, updates
+the stamp, and publishes with `workspace_publish_guidance`; the plugin opens
+the pull request, classifies the diff (purely additive means only insertions
+and the front matter untouched apart from the stamp; a change to `models`,
+`may`, a gate or `requeue-default` is never additive, and neither is a project
+rule that contradicts the template) and lists the removals and rewrites in
+the body. That classification is only the plugin's read of
+the diff: the project steward reads it in the `## Playbooks to refresh` block
+and decides with `steward_update { refreshAction: { id, action } }` — `merge`
+for a purely additive, project-lane change, `forward` to file the owner's
+Review PR/Drop item, `drop` to close it and decline. `merge` is refused unless
+the decide list places the playbook `project` and the stored classification is
+`additive`, so a removal, a rewrite or a contradiction can only go to the
+owner; a branch pushed after it was classified is refused too, so only the
+head the plugin read can be merged. The owner's Drop on the page closes the
+pull request and declines it. At most one refresh is
+open per playbook, a declined or failed refresh is not retried until the
+template changes again, and the stamp is only updated by the merged pull
+request, which is what stops the playbook being queued. A server on an image
+that predates the stamp key does not run the queue and leaves the playbook
+alone until it restarts.
+
 `roles.json` (BB-105, version 2 in BB-163) assigns what each person's server
 runs. Version 2 names each role once under `roles` and lists its holders
 under `holders`:
