@@ -2,8 +2,9 @@
 import type { BoardState, ViewModel } from "./board";
 
 /** The summary sentence as text and counts, so the panel can set the counts in bold. */
-export function summaryParts({ work, ready, mine, theirs, drafts }: ViewModel["summary"]): (string | number)[] {
-  return [work, " open Parsley PRs: ", ready, " can merge, ", mine, " need you, ", theirs, " wait on a reviewer, ", drafts, " are drafts."];
+export function summaryParts({ work, ready, held, mine, theirs, drafts }: ViewModel["summary"]): (string | number)[] {
+  return [work, " open Parsley PRs: ", ready, " can merge, ", ...(held ? [held, " approved but held, "] : []),
+    mine, " need you, ", theirs, " wait on a reviewer, ", drafts, " are drafts."];
 }
 
 export function summaryLine(summary: ViewModel["summary"]): string {

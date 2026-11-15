@@ -15,14 +15,15 @@ function row(number: number, over: Partial<Row> = {}): Row {
   return {
     key: key(number), number, url: url(number), area: "my-parsley", tone: 0, title: `Change ${number}`,
     sentence: "first review", blocked: null, depth: 0, after: null, reviewers: [],
-    size: { lines: 1200, files: 14, bar: 0.7, label: "1.2k lines · 14 files" }, stack: null, action: null, ...over,
+    size: { lines: 1200, files: 14, bar: 0.7, label: "1.2k lines · 14 files" }, stack: null, action: null,
+    gate_blocked: false, ...over,
   };
 }
 
 const ciRows = [1, 2, 3, 4, 5, 6].map((n) => row(600 + n, { sentence: "1 check failing", action: "fix-ci" }));
 const view: ViewModel = {
   fetched_at: "2026-11-13T12:00:00+00:00",
-  summary: { work: 10, ready: 1, mine: 8, theirs: 1, drafts: 0, other: 0 },
+  summary: { work: 10, ready: 1, held: 0, mine: 8, theirs: 1, drafts: 0, other: 0 },
   suggestions: [
     { id: "ready", text: "1 PR is ready to merge (#660)", action: null, keys: [] },
     { id: "fix-feedback", text: "Fix review feedback on 1 PR (#581)", action: "fix-feedback", keys: [key(581)] },
@@ -34,15 +35,15 @@ const view: ViewModel = {
   ] }],
   sections: [
     { id: "ready", title: "Ready to merge", count: 1, open: true, groups: [{ title: null, rows: [
-      row(660, { area: "sage", sentence: "approved, checks green, no open comments", reviewers: [{ name: "Jake", state: "approved" }] })] }] },
+      row(660, { area: "sage", sentence: "approved, checks green, no open comments", reviewers: [{ name: "Jake", state: "approved", earlier: false }] })] }] },
     { id: "mine", title: "Needs you", count: 8, open: true, groups: [
       { title: "Fix review feedback", rows: [
         row(581, { sentence: "2 issues to fix from Pedro", blocked: "Sage migration order", action: "fix-feedback",
-          after: { number: 550, url: url(550) }, reviewers: [{ name: "Pedro", state: "changes" }, { name: "Marcel", state: "approved_old" }] }),
+          after: { number: 550, url: url(550) }, reviewers: [{ name: "Pedro", state: "changes", earlier: false }, { name: "Marcel", state: "approved", earlier: true }] }),
         row(582, { depth: 1, sentence: "2 checks failing", stack: key(550) })] },
-      { title: "Fix CI", rows: ciRows }] },
+      { title: "Fix CI", rows: [...ciRows, row(557, { sentence: "1 check failing", blocked: "Sage migration order", gate_blocked: true })] }] },
     { id: "theirs", title: "Waiting on a reviewer", count: 1, open: true, groups: [{ title: "Marcel", rows: [
-      row(550, { area: "sage +1", stack: key(550), reviewers: [{ name: "Marcel", state: "requested" }] })] }] },
+      row(550, { area: "sage +1", stack: key(550), reviewers: [{ name: "Marcel", state: "requested", earlier: false }] })] }] },
   ],
   reviewer_load: { reviewers: [{ name: "Marcel", count: 1, first: 1, re: 0, oldest_days: 3, approx: true, keys: [key(550)] }],
     none: { count: 0, keys: [] } },
@@ -89,7 +90,8 @@ it("renders summary, next steps, stacks, sections, sub-groups and each row's fac
   expect(r581.getByText("my-parsley")).toBeTruthy(); // area tag
   expect(r581.getByText("Blocked by: Sage migration order")).toBeTruthy();
   expect(r581.getAllByLabelText("Pedro requested changes")[0]?.textContent).toBe("Pedro ✗");
-  expect(r581.getAllByLabelText("Marcel approved an older commit")[0]?.textContent).toBe(", Marcel ✓ old");
+  // An approval on an earlier commit still counts: the same ✓, with the commit only in the tooltip.
+  expect(r581.getAllByLabelText("Marcel approved on an earlier commit")[0]?.textContent).toBe(", Marcel ✓");
   expect(r581.getAllByText("1.2k lines · 14 files").length).toBeGreaterThan(0);
   expect(slot.getByRole("heading", { name: "Reviewer load" }).closest("details")?.open).toBe(false); // appendix starts collapsed
 });
@@ -194,6 +196,13 @@ it("refreshes on request and shows the last error in one line, keeping the board
   fireEvent.click(slot.getByRole("button", { name: "Refresh" }));
   await slot.findByText("Last refresh failed: gh: not logged in");
   expect(slot.getByText("Change 581")).toBeTruthy();
+});
+
+it("a gate-blocked row offers no Start and says why", async () => {
+  const slot = await renderTab(state());
+  const r557 = rowOf(slot, 557);
+  expect(r557.queryByRole("button", { name: /Start an agent/ })).toBeNull();
+  expect(r557.getByText("blocked by a gate")).toBeTruthy();
 });
 
 it("is also a sidebar page, for use outside a thread", async () => {

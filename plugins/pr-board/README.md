@@ -9,43 +9,76 @@ From top to bottom:
 
 1. A one-line summary.
 2. **Suggested next steps**: up to five batched suggestions, most valuable
-   first, such as "Fix CI on 7 PRs; 3 are blocked by a known gate, so 4 are
+   first: PRs ready to merge, then fix review feedback, rebase, fix CI,
+   re-request a reviewer who asked for changes, and pick reviewers. For
+   example "Fix CI on 7 PRs; 3 are blocked by a known gate, so 4 are
    actionable (#562, …)". PRs an agent is already working on are left out.
 3. **Stacks**: one line per stack of two or more Parsley PRs, with a lettered
    dot per PR in merge order (F fix feedback, C fix CI, R rebase, A ask for
-   review, W waiting, ✓ ready, D draft). Hover or focus a dot for the PR's
+   review, W waiting, H approved but held, ✓ ready, D draft). Long names wrap
+   to two lines and show in full on hover. Hover or focus a dot for the PR's
    title and sentence. Clicking a stack filters the list to it. Collapsed by
    default in panels narrower than 440px.
 4. The list:
-   - **Ready to merge**: approved, checks green, no open comments.
+   - **Ready to merge**: approved, no unanswered or answered-but-open
+     threads, no outstanding changes request, no conflict, CI passing, no
+     gates.
+   - **Approved, not ready yet**: approved, but blocked by a gate, waiting
+     for its stack parent, holding open threads you answered, or waiting on
+     running checks.
    - **Needs you**, grouped as Fix review feedback, Fix CI, Rebase, and Ask
-     for a review. A PR with no reviewer requested is here, gated or not.
-   - **Waiting on a reviewer**, grouped by person.
+     for a review (no approval and nobody asked, or the reviewer who asked
+     for changes is not asked again).
+   - **Waiting on a reviewer**, grouped by person: PRs with no approval yet,
+     or with changes requested by a reviewer who is asked again.
    - **Drafts** (collapsed).
    - **Other repositories**: PRs outside `parsleyhealth/`, with the same
      sentences and sub-groups (collapsed).
 5. **Reviewer load** (collapsed): a bar per requested reviewer split into
-   first reviews and re-reviews, with the count and the oldest wait in days
-   since the review request (`~` when no request event exists and the wait
-   counts from the last push), plus a line for PRs with no reviewer. Clicking
-   a bar filters the list to that reviewer's PRs.
+   first reviews and re-reviews (PRs where that reviewer asked for changes),
+   with the count and the oldest wait in days since the review request (`~`
+   when no request event exists and the wait counts from the last push), plus
+   a line for PRs with no reviewer. Approved PRs never count. Clicking a bar
+   filters the list to that reviewer's PRs.
+
+### The approval rule
+
+One submitted, non-dismissed human approval is enough to merge. An approval
+on an earlier commit still counts; later commits of any size do not need
+re-approval, and a pending request to a second reviewer never blocks. What
+holds a PR back is unanswered review feedback, an outstanding changes
+request, conflicts, failing or pending CI, and known gates. Bot reviews never
+count as approvals.
+
+The next move is the first of: draft, fix (unanswered substantive or
+unlabeled threads), reply (only minor unanswered threads), rebase or
+retarget, CI failing, review (no approval, or changes requested), gated
+(approved, but a gate or an open thread you answered), CI pending, ready.
+
+Known limitation: feedback left in a review body or a PR-level comment (for
+example "LGTM with nits" with no inline thread) is not detected; only review
+threads are.
+
+### Rows
 
 Each row reads `#number  area  Title — one sentence`, then, at the right
 (or on a second line in narrow panels), who reviews it (`Marcel` requested,
-`Marcel ✓` approved this head, `Marcel ✓ old` approved an older commit,
-`Pedro ✗` requested changes) and its size (`1.2k lines · 14 files` with a
-log-scaled bar). The area is the monorepo service or app from its `service:`
-or `app:` labels (`root` when it has none), or the repository's short name.
-An optional `Blocked by: …` line shows gates from `gates.json`. Stacked PRs
-stay together, children indented under their parent with `└`; a PR whose
-parent sits in another group shows `after #N`. Clicking a PR number opens
-the PR in bb's side panel; modifier clicks, middle clicks, and copy link work
-like any link.
+`Marcel ✓` approved, `Pedro ✗` requested changes; the tooltip says when an
+approval was on an earlier commit) and its size (`1.2k lines · 14 files`
+with a log-scaled bar). The area is the monorepo service or app from its
+`service:` or `app:` labels (`root` when it has none), or the repository's
+short name. An optional `Blocked by: …` line shows gates from `gates.json`.
+Stacked PRs stay together, children indented under their parent with `└`; a
+PR whose parent sits in another group shows `after #N`. Clicking a PR number
+opens the PR in bb's side panel; modifier clicks, middle clicks, and copy
+link work like any link.
 
 ## Start agents
 
 The Fix review feedback, Fix CI and Rebase suggestions have a **Start (N)**
-button, and each row in those groups has a small **Start** button. Start
+button, and each row in those groups has a small **Start** button. A PR with
+a known gate gets no agent and shows "blocked by a gate" instead, because the
+gate, not the code, may be what holds it. Start
 opens a confirmation that names what happens, lists the PRs (uncheck any to
 leave them out), and offers two stopping points:
 

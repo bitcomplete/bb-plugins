@@ -31,7 +31,7 @@ query($q: String!, $n: Int!, $after: String) {
         __typename ... on User { login } ... on Team { name } ... on Bot { login } ... on Mannequin { login } } } }
       timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 30) { nodes { ... on ReviewRequestedEvent {
         createdAt requestedReviewer { __typename ... on User { login } ... on Team { name } ... on Bot { login } } } } }
-      latestOpinionatedReviews(first: 20) { nodes { author { login } state submittedAt commit { oid } } }
+      latestOpinionatedReviews(first: 20) { nodes { author { __typename login } state submittedAt commit { oid } } }
       reviewThreads(first: 100) {
         pageInfo { hasNextPage }
         nodes { isResolved isOutdated path
@@ -167,7 +167,8 @@ def normalize(x):
         "requested": [r["requestedReviewer"].get("login") or r["requestedReviewer"].get("name")
                       for r in x["reviewRequests"]["nodes"] if r["requestedReviewer"]],
         "reviews": [{"author": login(r["author"]), "state": r["state"], "at": r["submittedAt"],
-                     "oid": (r["commit"] or {}).get("oid")} for r in x["latestOpinionatedReviews"]["nodes"]],
+                     "oid": (r["commit"] or {}).get("oid"), "is_bot": is_bot(r["author"])}
+                    for r in x["latestOpinionatedReviews"]["nodes"]],
         "threads": [{"resolved": t["isResolved"], "outdated": t["isOutdated"], "path": t["path"],
                      "comments": [{"author": login(c["author"]), "body": c["body"], "at": c["createdAt"],
                                    "url": c["url"], "is_bot": is_bot(c["author"])} for c in t["comments"]["nodes"]]}
@@ -283,18 +284,22 @@ def pr_facts(pr, user, stack_info, gates, now):
         else:
             first = next((c for c in t["comments"] if c["author"] != user), t["comments"][0])
             unanswered.append(excerpt(first, classify(first["body"])))
-    approved = [r for r in pr["reviews"] if r["state"] == "APPROVED"]
+    human = [r for r in pr["reviews"] if not r.get("is_bot")]
+    approved = [r for r in human if r["state"] == "APPROVED"]
     days = days_between(pr["committed_at"], now)
     gate_labels = [g["label"] for g in gates if g["repo"] == pr["repo"] and pr["number"] in g["prs"]]
     if stack_info["parent"]:
         gate_labels.append(f"parent #{stack_info['parent']} not merged")
     return {
         "unanswered": unanswered, "answered_open": answered_open,
+        # One human approval is enough to merge, on any commit. `approvals` keeps which commit it was on
+        # for display only; decisions read `approved_by`.
+        "approved_by": [r["author"] for r in approved],
         "approvals": {"current": [r["author"] for r in approved if r["oid"] == pr["head_oid"]],
                       "stale": [r["author"] for r in approved if r["oid"] != pr["head_oid"]]},
-        "changes_requested": [r["author"] for r in pr["reviews"] if r["state"] == "CHANGES_REQUESTED"],
+        "changes_requested": [r["author"] for r in human if r["state"] == "CHANGES_REQUESTED"],
         "changes_outstanding": pr.get("review_decision") == "CHANGES_REQUESTED"
-                               or any(r["state"] == "CHANGES_REQUESTED" for r in pr["reviews"]),
+                               or any(r["state"] == "CHANGES_REQUESTED" for r in human),
         "conflict": pr["mergeable"] == "CONFLICTING" or pr["merge_state"] == "DIRTY",
         "base_missing": stack_info["base_missing"],
         "ci": ci_facts(pr["checks"]),
@@ -312,11 +317,14 @@ def waiting_entry(reviewer, pr, push_days, now):
 
 
 def next_move(pr, f):
-    """Return (move, sub_label). First matching rule wins."""
+    """Return (move, sub_label). First matching rule wins.
+
+    One human approval on any commit is enough to merge; a pending request to a second reviewer never
+    blocks. What blocks: unanswered feedback, an outstanding changes request, conflicts, CI, and gates."""
     labels = [t["label"] for t in f["unanswered"]]
     if pr["draft"]:
         return "draft", None
-    if any(l != "minor" for l in labels) or (f["changes_outstanding"] and labels):
+    if any(l != "minor" for l in labels):
         return "fix", None
     if labels:
         return "reply", None
@@ -324,21 +332,20 @@ def next_move(pr, f):
         return "rebase", "retarget" if f["base_missing"] else None
     if f["ci"]["failing"]:
         return "ci", None
-    cur, stale = f["approvals"]["current"], f["approvals"]["stale"]
-    if f["changes_outstanding"] or f["waiting_on"] or not cur:
-        if f["changes_outstanding"] or (not cur and stale):
-            return "review", "re-review"
-        return "review", None if f["waiting_on"] or cur else "no reviewer"
+    if f["changes_outstanding"]:
+        return "review", "changes"
+    if not f["approved_by"]:
+        return "review", None if f["waiting_on"] else "no reviewer"
     if f["gates"] or f["answered_open"]:
         return "gated", None
     if f["ci"]["pending"]:
-        return "ci", "pending"  # not covered by the brief's rules; CI must finish before "ready"
+        return "ci", "pending"  # approved and otherwise ready: only the running checks stand between
     return "ready", None
 
 
 FILTERS = {  # filter id -> membership test on a derived PR; the board's buttons use these ids
     "fix": lambda p: p["move"] in ("fix", "reply"),
-    "afb": lambda p: bool(p["approvals"]["current"] or p["approvals"]["stale"])
+    "afb": lambda p: bool(p["approved_by"])
                      and bool(p["unanswered"] or p["answered_open"]),
     "gated": lambda p: bool(p["gates"] or p["answered_open"]),
     "review": lambda p: p["move"] == "review",
