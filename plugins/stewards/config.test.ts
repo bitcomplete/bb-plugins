@@ -973,6 +973,10 @@ describe("role pull watches (BB-164)", () => {
     };
     const bot = pullWatchProblems(withAuthor("app[bot]"), ["acme/web"], [], playbooks());
     expect(bot.some((p) => /match\.author "app\[bot\]" ends in \[bot\].*GraphQL login.*suffix is ignored/u.test(p))).toBe(true);
+    // A pattern that is only a wildcard plus the suffix is kept as is, so it
+    // matches no author; the check says that rather than "suffix ignored".
+    const wildcard = pullWatchProblems(withAuthor("*[bot]"), ["acme/web"], [], playbooks());
+    expect(wildcard.some((p) => /match\.author "\*\[bot\]" names only the \[bot\] suffix, so it matches no author/u.test(p))).toBe(true);
     // The array form is defended too (the parser accepts only a string today).
     const array = withAuthor("app");
     (array.roles["jane"]!.ops!.pulls[0]!.match as { author?: string | string[] }).author = ["app[bot]", "alice"];

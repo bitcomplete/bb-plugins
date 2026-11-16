@@ -82,6 +82,7 @@ import {
   roleSentryTargets,
   roleUsesOps,
   roleWarnings,
+  stripAuthorBotSuffix,
   usesKind,
   watchProblems,
   type PullWatch,
@@ -6891,13 +6892,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * `[bot]` (BB-342). A GitHub App actor's GraphQL `author { login }` is the
      * bare slug (`bc-prod-bitcomplete-dev`), while REST and `gh` show the
      * `[bot]` form; a declared `match.author` copied from either place must
-     * match the other. The suffix is stripped from the pattern and the author
-     * before the glob compare. Author only: `title` and `branch` never strip.
+     * match the other. The suffix is stripped from the pattern (unless that
+     * would leave only wildcards, so `*[bot]` keeps matching nothing) and from
+     * the author before the glob compare. Author only: `title` and `branch`
+     * never strip.
      */
     function authorPatternMatches(pattern: string | string[], author: string): boolean {
       const patterns = Array.isArray(pattern) ? pattern : [pattern];
       const login = lc(author.replace(/\[bot\]$/iu, ""));
-      return patterns.some((p) => globMatches(lc(p.replace(/\[bot\]$/iu, "")), login));
+      return patterns.some((p) => globMatches(lc(stripAuthorBotSuffix(p)), login));
     }
 
     /**

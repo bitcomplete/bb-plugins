@@ -3700,6 +3700,10 @@ describe("role-owned pull watches (BB-164)", () => {
     await adopts({ author: "App[BOT]" }, "app", true);
     await adopts({ author: "alice" }, "alice", true);
     await adopts({ author: "app[bot]" }, "other", false);
+    // A pattern of only a wildcard plus the suffix is not stripped, so it still
+    // matches no author (a GraphQL login never ends in `[bot]`).
+    await adopts({ author: "*[bot]" }, "alice", false);
+    await adopts({ author: "*[bot]" }, "app[bot]", false);
     // No match.author still matches only the role holder's own login (jane).
     await adopts({}, "app", false);
     await adopts({}, "jane", true);

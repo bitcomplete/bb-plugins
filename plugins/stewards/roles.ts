@@ -72,6 +72,20 @@ export type PullWatch = { repo: string; match: PullMatch; playbook: string };
  */
 export const pullWatchId = (watch: Pick<PullWatch, "repo" | "playbook">): string => `${watch.playbook}@${watch.repo.toLowerCase()}`;
 
+/**
+ * Strip a trailing `[bot]` (case-insensitively) from a pull-watch
+ * `match.author` pattern, unless that would leave only wildcards (BB-342). A
+ * GitHub App actor's GraphQL `author { login }` is the bare slug, while REST
+ * and `gh` show `[bot]`, so the suffix is ignored when the pattern still names
+ * something after it. `*[bot]` (or `**[bot]`, `[bot]`) means "any bot"; a
+ * GraphQL login carries no bot marker, so the suffix is kept and the pattern
+ * matches no author rather than every one once it becomes `*`.
+ */
+export function stripAuthorBotSuffix(pattern: string): string {
+  const stripped = pattern.replace(/\[bot\]$/iu, "");
+  return stripped === "" || stripped.replace(/\*/gu, "") === "" ? pattern : stripped;
+}
+
 /** A role's watches: namespaces, Sentry projects, Dependabot repos, pull watches, and where its tickets file. */
 export const roleOpsSchema = z
   .object({
@@ -427,9 +441,13 @@ export function pullWatchProblems(roles: RolesFile, repos: readonly string[], ex
       // compares the GraphQL `author { login }`, which is the bare slug, and
       // strips a trailing `[bot]` from the pattern before the glob compare
       // (BB-342). Warn so a pattern copied from `gh` is not mistaken for one
-      // that needs the suffix.
+      // that needs the suffix. A pattern left as only wildcards (or empty) is
+      // kept, so it matches nothing instead of every author.
       for (const pattern of watch.match.author === undefined ? [] : Array.isArray(watch.match.author) ? watch.match.author : [watch.match.author]) {
-        if (/\[bot\]$/iu.test(pattern)) {
+        if (!/\[bot\]$/iu.test(pattern)) continue;
+        if (stripAuthorBotSuffix(pattern) === pattern) {
+          problems.push(`${where}: match.author ${JSON.stringify(pattern)} names only the [bot] suffix, so it matches no author; the plugin compares the GitHub GraphQL login, which does not mark bots`);
+        } else {
           problems.push(`${where}: match.author ${JSON.stringify(pattern)} ends in [bot]; the plugin compares the GitHub GraphQL login, which has no [bot] suffix, so the suffix is ignored`);
         }
       }
