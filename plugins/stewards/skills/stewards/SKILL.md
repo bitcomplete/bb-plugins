@@ -749,6 +749,11 @@ when asked to "set up stewards".
    at adoption on the first 100 changed files, so 100 or more never matches)
    under the named `pr` playbook, with no label. A watch with no `match.author`
    matches only the holder's own pull requests; any other author must be named.
+   A declared `match.author` may be written either as the bare GraphQL login or
+   with the `[bot]` suffix REST and `gh` show; a trailing `[bot]` is stripped
+   (case-insensitively) from the pattern and the author before the glob compare,
+   so `app`, `app[bot]` and `app*` all match an app's PR. `author` only, never
+   `title` or `branch`.
    `dependabot` compiles into a synthesized watch per repo, with the bot logins
    as its author and `deps-prs`, tried before the declared watches; adoption is
    first match wins, then the label, then the review. A watched pull request is

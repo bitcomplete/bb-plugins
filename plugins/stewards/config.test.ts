@@ -965,6 +965,23 @@ describe("role pull watches (BB-164)", () => {
     );
   });
 
+  it("warns when a declared match.author ends in [bot], which the plugin strips, and not for a bare or human login (BB-342)", () => {
+    const withAuthor = (author: unknown) => {
+      const parsed = v2({ a: { pulls: [{ repo: "acme/web", match: { author }, playbook: "sync-prs" }] } }, { jane: ["a"] });
+      if (!parsed.ok) throw new Error(parsed.error);
+      return parsed.value;
+    };
+    const bot = pullWatchProblems(withAuthor("app[bot]"), ["acme/web"], [], playbooks());
+    expect(bot.some((p) => /match\.author "app\[bot\]" ends in \[bot\].*GraphQL login.*suffix is ignored/u.test(p))).toBe(true);
+    // The array form is defended too (the parser accepts only a string today).
+    const array = withAuthor("app");
+    (array.roles["jane"]!.ops!.pulls[0]!.match as { author?: string | string[] }).author = ["app[bot]", "alice"];
+    expect(pullWatchProblems(array, ["acme/web"], [], playbooks()).some((p) => /match\.author "app\[bot\]" ends in \[bot\]/u.test(p))).toBe(true);
+    for (const author of ["app", "alice"]) {
+      expect(pullWatchProblems(withAuthor(author), ["acme/web"], [], playbooks()).some((p) => /\[bot\]/u.test(p))).toBe(false);
+    }
+  });
+
   it("attributes a pull binding to the role that declared its watch", () => {
     const parsed = v2({ ops: { pulls: [{ repo: "acme/web", match: {}, playbook: "sync-prs" }] } }, { jane: ["ops"] });
     if (!parsed.ok) throw new Error(parsed.error);

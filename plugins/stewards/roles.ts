@@ -423,6 +423,16 @@ export function pullWatchProblems(roles: RolesFile, repos: readonly string[], ex
         const bad = globError(pattern);
         if (bad !== null) problems.push(`${where}: match.paths ${bad}`);
       }
+      // A `[bot]` suffix is how REST and `gh` show a GitHub App, but the plugin
+      // compares the GraphQL `author { login }`, which is the bare slug, and
+      // strips a trailing `[bot]` from the pattern before the glob compare
+      // (BB-342). Warn so a pattern copied from `gh` is not mistaken for one
+      // that needs the suffix.
+      for (const pattern of watch.match.author === undefined ? [] : Array.isArray(watch.match.author) ? watch.match.author : [watch.match.author]) {
+        if (/\[bot\]$/iu.test(pattern)) {
+          problems.push(`${where}: match.author ${JSON.stringify(pattern)} ends in [bot]; the plugin compares the GitHub GraphQL login, which has no [bot] suffix, so the suffix is ignored`);
+        }
+      }
       const owners = repoOwners.get(watch.repo.toLowerCase()) ?? [];
       if (!owners.includes(login)) repoOwners.set(watch.repo.toLowerCase(), [...owners, login]);
     }
