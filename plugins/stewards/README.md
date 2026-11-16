@@ -351,9 +351,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   skills. `bb.agents.configure` gives every thread it sees every skill the
   plugin ships (`STEWARDS_SKILLS`: `stewards`, `build-tickets`, `pr-reviewer`,
   `onboarding`): a steward, the project steward, a worker, the onboarding
-  thread, and any other thread, which is how a worker's reviewer (the
-  worker's child, not a steward's) gets `pr-reviewer`. Only the tools differ
-  by role.
+  thread, and any other thread on the server. That last part is deliberate:
+  since BB-323 a worker's reviewer is spawned with no parent and the worker
+  as its lifecycle owner, which the configure context does not carry, so the
+  fallback is the only way it gets `pr-reviewer`. Only the tools differ by
+  role.
 - **One escalation chain (BB-30).** Every hop is one `escalations` row: a
   worker's `bb stewards escalate` goes to its steward, a steward's
   `steward_report { escalate }` to the project steward, and only the

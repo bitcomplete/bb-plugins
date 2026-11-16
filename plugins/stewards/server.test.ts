@@ -269,8 +269,9 @@ describe("a Linear ticket steward", () => {
   });
 
   // A wake tells the steward to have its worker follow build-tickets, and the
-  // worker spawns its reviewer to follow pr-reviewer; the reviewer is the
-  // worker's child, not the steward's. Every thread the plugin touches gets
+  // worker spawns its reviewer to follow pr-reviewer. Since BB-323 that
+  // reviewer has no parent and the worker as its lifecycle owner, which the
+  // configure context does not carry. Every thread the plugin touches gets
   // every skill it ships.
   it("gives every thread every skill the plugin ships: steward, project steward, worker and the worker's reviewer", async () => {
     const t = await setup();
@@ -285,7 +286,11 @@ describe("a Linear ticket steward", () => {
     expect(await skills({ id: steward!, parentThreadId: null })).toEqual(all);
     expect(await skills({ id: project!, parentThreadId: null })).toEqual(all);
     expect(await skills({ id: "thr_w1", parentThreadId: steward! })).toEqual(all);
-    expect(await skills({ id: "thr_r1", parentThreadId: "thr_w1" })).toEqual(all);
+    // The BB-323 reviewer: parentless, owned by the worker.
+    await t.createdReviewer("thr_r1", "thr_w1");
+    expect(await skills({ id: "thr_r1", parentThreadId: null })).toEqual(all);
+    // A reviewer spawned as the worker's child.
+    expect(await skills({ id: "thr_r2", parentThreadId: "thr_w1" })).toEqual(all);
     expect(await skills({ id: "thr_onboard", parentThreadId: null }, { role: "onboarding" })).toEqual(all);
     // A skill added under skills/ is given too.
     expect([...STEWARDS_SKILLS].sort()).toEqual(SHIPPED_SKILLS);

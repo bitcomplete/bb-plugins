@@ -182,8 +182,8 @@ export const BRIEF_MAX_CHARS = 30_000;
  */
 export const THREAD_BRIEFS_OFF = false;
 
-/** Every skill under `skills/`, given to every thread `configure()` sees. */
-export const STEWARDS_SKILLS = ["stewards", "build-tickets", "pr-reviewer", "onboarding"];
+/** Every skill under `skills/`, given to every thread `configure()` sees. Frozen, and each return gets its own copy. */
+export const STEWARDS_SKILLS: readonly string[] = Object.freeze(["stewards", "build-tickets", "pr-reviewer", "onboarding"]);
 
 /**
  * The first turn of a "Set up stewards" thread. The onboarding skill carries
@@ -11447,12 +11447,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.configure((context) => {
       // Every thread this plugin configures gets every skill it ships: a wake
       // has the steward's worker follow build-tickets, the worker's reviewer
-      // (its child, not the steward's) follows pr-reviewer, and any of them
-      // may need the stewards protocol. Only tools differ by role.
+      // follows pr-reviewer, and any of them may need the stewards protocol.
+      // Only tools differ by role. The no-role fallback below must give them
+      // too, deliberately for every thread on the server: since BB-323 a
+      // reviewer is spawned with no parent and the worker as its lifecycle
+      // owner, which this context does not carry, so it cannot be told apart.
       // The onboarding thread is an ordinary thread, not a steward; the skill
       // carries the whole procedure. It is identified by the metadata this
       // plugin set at spawn, before any binding lookup.
-      if (context.pluginMetadata.role === "onboarding") return { tools: [], skills: STEWARDS_SKILLS, instructions: ONBOARDING_INTRO };
+      if (context.pluginMetadata.role === "onboarding") return { tools: [], skills: [...STEWARDS_SKILLS], instructions: ONBOARDING_INTRO };
       const role = roleOf(context.thread.id);
       if (role === null) {
         // BB-329: a worker gets exactly one plugin tool, `worker_park`, so it
@@ -11461,12 +11464,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // landed yet, counts; the tool itself refuses anything else.
         const worker = store.worker(context.thread.id) !== null;
         const parent = context.thread.parentThreadId !== null && store.byThread(context.thread.parentThreadId) !== null;
-        return worker || parent ? { tools: ["worker_park"], skills: STEWARDS_SKILLS } : { tools: [], skills: STEWARDS_SKILLS };
+        return worker || parent ? { tools: ["worker_park"], skills: [...STEWARDS_SKILLS] } : { tools: [], skills: [...STEWARDS_SKILLS] };
       }
       if (role.kind === "project") {
         return {
           tools: ["steward_update"],
-          skills: STEWARDS_SKILLS,
+          skills: [...STEWARDS_SKILLS],
           instructions:
             "You are this project's steward. Decide escalations from the project's own guidance (AGENTS.md, architecture and design docs); only the project's big decisions go to the user. Read status with `bb stewards list` and `bb stewards show <key>`; steer with steward_update. Do not do a binding's work yourself: when an ended binding left work undone, reopen its entity so its steward resumes. Read the stewards skill for the protocol.",
         };
@@ -11478,7 +11481,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const alertmanager = target?.kind === "alertmanager";
         return {
           tools: ["steward_report", "steward_update"],
-          skills: STEWARDS_SKILLS,
+          skills: [...STEWARDS_SKILLS],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
             (sentry
@@ -11492,7 +11495,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       return {
         tools: ["steward_report", "steward_update"],
-        skills: STEWARDS_SKILLS,
+        skills: [...STEWARDS_SKILLS],
         instructions:
           `You are the steward of ${JSON.stringify(b.entityKey)} (binding ${b.id}, a ${b.kind} binding under playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
           "You act on it as the user, by the playbook. Decide what the project's guidance settles; escalate the rest with steward_report. " +
