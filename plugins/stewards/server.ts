@@ -82,6 +82,7 @@ import {
   roleSentryTargets,
   roleUsesOps,
   roleWarnings,
+  stripAuthorBotSuffix,
   usesKind,
   watchProblems,
   type PullWatch,
@@ -6887,6 +6888,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether an author pattern matches a login, ignoring case and a trailing
+     * `[bot]` (BB-342). A GitHub App actor's GraphQL `author { login }` is the
+     * bare slug (`bc-prod-bitcomplete-dev`), while REST and `gh` show the
+     * `[bot]` form; a declared `match.author` copied from either place must
+     * match the other. The suffix is stripped from the pattern (unless that
+     * would leave only wildcards, so `*[bot]` keeps matching nothing) and from
+     * the author before the glob compare. Author only: `title` and `branch`
+     * never strip.
+     */
+    function authorPatternMatches(pattern: string | string[], author: string): boolean {
+      const patterns = Array.isArray(pattern) ? pattern : [pattern];
+      const login = lc(author.replace(/\[bot\]$/iu, ""));
+      return patterns.some((p) => globMatches(lc(stripAuthorBotSuffix(p)), login));
+    }
+
+    /**
      * The first pull watch a pull request matches, or null (BB-164). The
      * synthesized Dependabot watches come first, then the role's declared
      * ones, so first match wins. A watch with no `match.author` matches only a
@@ -6895,7 +6912,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * caller has them (the full snapshot; the nightly list carries only repo
      * and author); `paths` only on the full snapshot, where a pull request with
      * 100 or more changed files never matches (fail closed: GitHub lists the
-     * first 100 only).
+     * first 100 only). A declared `match.author` and the author both have a
+     * trailing `[bot]` stripped before the compare, so `name`, `name[bot]` and
+     * `name*` all match a GitHub App's PR (BB-342).
      */
     function matchPullWatch(config: ProjectConfig, e: { unit: string; title?: string | null; branch?: string | null; author: string | null; files?: string[] }): PullWatch | null {
       for (const watch of rolePullWatches(config.role, config.repos, depsPrsPlaybookName(config.file))) {
@@ -6904,7 +6923,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (m.title !== undefined && e.title !== undefined && (e.title === null || !watchPatternMatches(m.title, e.title))) continue;
         if (m.branch !== undefined && e.branch !== undefined && (e.branch === null || !watchPatternMatches(m.branch, e.branch))) continue;
         if (m.author !== undefined) {
-          if (e.author === null || !watchPatternMatches(m.author, e.author)) continue;
+          if (e.author === null || !authorPatternMatches(m.author, e.author)) continue;
         } else if (e.author === null || config.githubLogin === null || lc(e.author) !== lc(config.githubLogin)) continue;
         if (m.paths !== undefined && e.files !== undefined) {
           if (e.files.length === 0 || e.files.length >= 100) continue;

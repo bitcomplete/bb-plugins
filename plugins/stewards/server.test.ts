@@ -3679,6 +3679,36 @@ describe("role-owned pull watches (BB-164)", () => {
     expect(t.hooks.store.find("acme/web#8")).toMatchObject({ playbook: "sync-prs", adoptedBy: "sync-prs@acme/web" });
   });
 
+  it("matches a GitHub App author through a [bot] suffix in match.author, either way and case-insensitively (BB-342)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    let next = 100;
+    const adopts = async (match: Record<string, unknown>, author: string, want: boolean) => {
+      t.files[ROLES_FILE] = roleWithWatch({ repo: "acme/web", match, playbook: "sync-prs" });
+      t.hooks.forgetConfigs();
+      const key = `acme/web#${next++}`;
+      t.entities.set(key, pull({ id: key, key, author, labels: [] }, { requestedReviewers: [] }));
+      await t.ring("github", key);
+      expect(t.hooks.store.find(key) !== null).toBe(want);
+    };
+    // The pattern may carry the suffix, the author may, both or neither; a glob
+    // and the case-insensitive suffix work; a human login is untouched.
+    await adopts({ author: "app[bot]" }, "app", true);
+    await adopts({ author: "app" }, "app", true);
+    await adopts({ author: "app*" }, "app", true);
+    await adopts({ author: "app[bot]" }, "app[bot]", true);
+    await adopts({ author: "App[BOT]" }, "app", true);
+    await adopts({ author: "alice" }, "alice", true);
+    await adopts({ author: "app[bot]" }, "other", false);
+    // A pattern of only a wildcard plus the suffix is not stripped, so it still
+    // matches no author (a GraphQL login never ends in `[bot]`).
+    await adopts({ author: "*[bot]" }, "alice", false);
+    await adopts({ author: "*[bot]" }, "app[bot]", false);
+    // No match.author still matches only the role holder's own login (jane).
+    await adopts({}, "app", false);
+    await adopts({}, "jane", true);
+  });
+
   it("does not adopt a pull request that matches title and branch but changes a file outside paths, or has 100 files", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[ROLES_FILE] = roleWithWatch(watch);

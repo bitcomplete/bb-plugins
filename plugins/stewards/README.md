@@ -798,7 +798,15 @@ them; the half-hourly sweep's list carries only the repo and author, so it is
 permissive there and the full snapshot decides. A watch with no `match.author`
 matches only a pull request authored by the role holder's own GitHub login;
 any other author must be named, as the synthesized Dependabot watch names the
-bot logins. The playbook must exist and be kind `pr`; it is read like any
+bot logins. `match.author` may be written either as the bare GraphQL login
+(`bc-prod-bitcomplete-dev`) or with the `[bot]` suffix REST and `gh` show
+(`bc-prod-bitcomplete-dev[bot]`): the plugin strips a trailing `[bot]`
+(case-insensitively) from both the pattern and the author before the glob
+compare, so `app`, `app[bot]` and `app*` all match an app's PR. A pattern
+left as only a wildcard plus the suffix (`*[bot]`) is not stripped, since it
+would then match every author; it matches no author, and `check` says so.
+This applies to `author` only, not `title` or `branch`.
+The playbook must exist and be kind `pr`; it is read like any
 other playbook, so a missing one is a `check` problem and its bindings end
 `unconfigured` rather than falling back to a merge-capable playbook.
 
