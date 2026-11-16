@@ -774,6 +774,16 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { issues: [], unsupported: true, truncated: false, errors: [] };
       },
 
+      // BB-341: the backlog steward's triage writes are Linear writes; GitHub
+      // has no issue priority or relations and no signed-comment path here.
+      // Stewards only ever asks linear, so these are guards, not a path.
+      async sourceUpdateIssue() {
+        throw new Error("sourceUpdateIssue is a Linear write; the github source does not serve it");
+      },
+      async sourceComment() {
+        throw new Error("sourceComment is a Linear write; the github source does not serve it");
+      },
+
       // A repository's Dependabot alerts, read with the token through the
       // REST API. Each repository the token cannot read (no alert access,
       // alerts disabled, not visible) is named in `errors`; the rest are

@@ -454,6 +454,32 @@ export const sourceContract = {
     }),
   },
   /**
+   * The backlog steward's one gated write (BB-341): add labels, set a
+   * priority, add relations. Stewards validates every field, the label
+   * vocabulary, the adoption check, the priority rule and the comment budget
+   * before it calls; the source only applies the plan. Additive and optional:
+   * a source that does not serve it is unavailable to the caller. A source
+   * that has no issue priority or relations (GitHub) answers with an error.
+   */
+  sourceUpdateIssue: {
+    input: z.object({
+      key: z.string().min(1).max(200),
+      addLabels: z.array(z.string().min(1).max(100)).max(50).default([]),
+      priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional(),
+      relations: z.array(z.object({ type: z.enum(["blockedBy", "blocks", "related", "duplicate"]), issue: z.string().min(1).max(200) })).max(20).default([]),
+    }),
+    output: z.object({ ok: z.boolean(), changed: z.array(z.string()) }),
+  },
+  /**
+   * The backlog steward's comment (BB-341): a body the caller has already
+   * signed with the bb thread signature line. The source refuses an unsigned
+   * body, so a bug in the caller cannot post one. Additive and optional.
+   */
+  sourceComment: {
+    input: z.object({ key: z.string().min(1).max(200), body: z.string().min(1).max(20_000) }),
+    output: z.object({ ok: z.boolean(), url: z.string().nullable() }),
+  },
+  /**
    * A team's whole open backlog, read-only: every open issue, unlabelled and
    * unassigned included. One team per call -- there is no all-teams mode --
    * and the source pages with a fixed page size up to a hard cap. When the

@@ -1,0 +1,271 @@
+// The backlog steward's triage writes (BB-341), as pure functions: the fixed
+// label vocabulary, the allowlist, the adoption check, the priority rule, the
+// comment budget and the ledger entry shape. Nothing here reads a file, a
+// source or the store; server.ts hands the values in and writes the plan
+// through the source contract. Keeping the limits here is the point: the
+// playbook says them, but the plugin enforces them.
+import { z } from "zod";
+import { signedBy, type SnapshotComment } from "./source-contract.js";
+
+/** The kind labels a triage write may add, exactly. */
+export const BACKLOG_TRIAGE_KINDS = ["bug", "feature", "chore"] as const;
+/** The size labels a triage write may add, exactly; the vocabulary is `size:S|M|L`. */
+export const BACKLOG_TRIAGE_SIZES = ["S", "M", "L"] as const;
+/** The priorities a triage write may set. */
+export const BACKLOG_TRIAGE_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
+export type BacklogPriority = (typeof BACKLOG_TRIAGE_PRIORITIES)[number];
+/** The only relation kinds a triage write may add; `blocks` is deliberately not one. */
+export const BACKLOG_TRIAGE_RELATION_TYPES = ["duplicate", "blockedBy", "related"] as const;
+export type BacklogRelationType = (typeof BACKLOG_TRIAGE_RELATION_TYPES)[number];
+
+/**
+ * Fields that are never part of a triage write. The tool's schema is strict,
+ * so a call carrying one is rejected before it runs; this list is the second
+ * check, so the pure decision refuses one too (a bug in the wiring cannot
+ * smuggle a description, state, assignee, cancel or close through).
+ */
+export const FORBIDDEN_TRIAGE_FIELDS = ["description", "state", "assignee", "cancel", "close"] as const;
+
+/** The rolling comment window, in milliseconds. */
+export const BACKLOG_COMMENT_WINDOW_MS = 7 * 86_400_000;
+
+/**
+ * The fixed label vocabulary: the three kinds, the three sizes, and one
+ * `repo:<owner/name>` per repository in the project's `repos.json`. The
+ * adoption label, `initiative` and any label a playbook adopts on are never
+ * in it, whatever the configuration says.
+ */
+export function backlogLabelVocabulary(repos: readonly string[]): Map<string, string> {
+  const vocab = new Map<string, string>();
+  for (const kind of BACKLOG_TRIAGE_KINDS) vocab.set(kind.toLowerCase(), kind);
+  for (const size of BACKLOG_TRIAGE_SIZES) vocab.set(`size:${size}`.toLowerCase(), `size:${size}`);
+  for (const repo of repos) vocab.set(`repo:${repo}`.toLowerCase(), `repo:${repo}`);
+  return vocab;
+}
+
+export const backlogRelationSchema = z.object({ type: z.enum(BACKLOG_TRIAGE_RELATION_TYPES), issue: z.string().trim().min(1).max(200) }).strict();
+export type BacklogRelation = z.infer<typeof backlogRelationSchema>;
+
+/**
+ * The one gated tool's parameters. `comment` is a body the plugin signs; the
+ * optional `proposeCancel` marks it as the stale-cancel proposal rather than a
+ * question, so the stale window is enforced on the right kind of comment.
+ */
+export const backlogTriageParamsSchema = z
+  .object({
+    key: z.string().trim().min(1).max(200),
+    addLabels: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
+    relations: z.array(backlogRelationSchema).max(20).optional(),
+    priority: z.enum(["none", ...BACKLOG_TRIAGE_PRIORITIES]).optional(),
+    comment: z.string().trim().min(1).max(20_000).optional(),
+    proposeCancel: z.boolean().optional(),
+  })
+  .strict();
+export type BacklogTriageParams = z.infer<typeof backlogTriageParamsSchema>;
+
+/** One row of the triage ledger: every accepted write and every refusal. */
+export const backlogWriteSchema = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  team: z.string(),
+  issueId: z.string(),
+  issueKey: z.string(),
+  at: z.number(),
+  outcome: z.enum(["accepted", "refused"]),
+  kind: z.enum(["label", "relation", "priority", "comment", "triage"]),
+  detail: z.record(z.string(), z.unknown()).default({}),
+  reason: z.string().nullable().default(null),
+});
+export type BacklogWrite = z.infer<typeof backlogWriteSchema>;
+
+/** What the tool read about the target ticket, enough for every rule. */
+export type TriageTicket = {
+  key: string;
+  /** The team key the ticket lives in, as the snapshot reports it. */
+  unit: string;
+  labels: string[];
+  /** Linear's priority label as the snapshot carries it ("High", "No priority"), or null. */
+  priority: string | null;
+  state: string;
+  stateType: string | null;
+  assignees: string[];
+  updatedAt: string | null;
+  comments: SnapshotComment[];
+};
+
+/** The project's backlog limits and the fixed labels no write may touch. */
+export type TriageConfig = {
+  triage: boolean;
+  /** The team the binding watches. */
+  team: string;
+  commentsPerWeek: number;
+  staleDays: number;
+  /** The project's adoption label (project.label). */
+  label: string;
+  /** Labels a triage write may never add: the adoption label, initiative, and any a playbook adopts on. */
+  adoptedLabels: string[];
+  /** The project's repos, as owner/name; the `repo:` vocabulary is built from them. */
+  repos: string[];
+};
+
+/** The plan a decision accepted, ready to write through the source contract. */
+export type TriagePlan = {
+  addLabels: string[];
+  relations: BacklogRelation[];
+  priority: BacklogPriority | null;
+  comment: { body: string; kind: "question" | "stale" } | null;
+};
+
+export type TriageDecision = { ok: true; plan: TriagePlan } | { ok: false; reason: string };
+
+const PRIORITY_SET = new Set<string>(BACKLOG_TRIAGE_PRIORITIES);
+
+/** Linear's priority label ("High", "No priority", …) as the four values, or null when unset. */
+export function normalizePriority(raw: string | null | undefined): BacklogPriority | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw.trim().toLowerCase();
+  return v === "" || v === "no priority" || v === "none" || !PRIORITY_SET.has(v) ? null : (v as BacklogPriority);
+}
+
+/** Whether a raw priority is one the tool can reason about: unset, one of the four, or hand-set (unknown). */
+function priorityState(raw: string | null | undefined): { state: "unset" } | { state: "known"; value: BacklogPriority } | { state: "hand" } {
+  if (raw === null || raw === undefined) return { state: "unset" };
+  const v = raw.trim().toLowerCase();
+  if (v === "" || v === "no priority" || v === "none") return { state: "unset" };
+  return PRIORITY_SET.has(v) ? { state: "known", value: v as BacklogPriority } : { state: "hand" };
+}
+
+/** The last priority the steward wrote for a ticket, or null. */
+export function lastStewardPriority(ledger: readonly BacklogWrite[]): BacklogPriority | "none" | null {
+  let found: BacklogPriority | "none" | null = null;
+  for (const entry of ledger) {
+    if (entry.outcome !== "accepted" || entry.kind !== "priority") continue;
+    const value = entry.detail.priority;
+    if (value === "none" || (typeof value === "string" && PRIORITY_SET.has(value))) found = value as BacklogPriority | "none";
+  }
+  return found;
+}
+
+/** The accepted comments for a ticket within the rolling window. */
+export function commentsInWindow(ledger: readonly BacklogWrite[], now: number): BacklogWrite[] {
+  return ledger.filter((e) => e.outcome === "accepted" && e.kind === "comment" && e.at > now - BACKLOG_COMMENT_WINDOW_MS);
+}
+
+/** The latest accepted question, or null. */
+export function lastQuestion(ledger: readonly BacklogWrite[]): BacklogWrite | null {
+  let found: BacklogWrite | null = null;
+  for (const entry of ledger) {
+    if (entry.outcome === "accepted" && entry.kind === "comment" && entry.detail.kind === "question") found = entry;
+  }
+  return found;
+}
+
+/**
+ * Whether the requester (any human) has written after the question. A comment
+ * signed by a bb thread is the plugin's own, so it never answers one.
+ */
+export function questionAnswered(question: BacklogWrite, comments: readonly SnapshotComment[]): boolean {
+  return comments.some((c) => c.signedBy === null && Date.parse(c.createdAt) > question.at);
+}
+
+const day = 86_400_000;
+
+/**
+ * The whole rule set, in one pure decision. The caller reads the ticket, the
+ * binding and the ledger first (a read that fails is the caller's to refuse);
+ * this returns the exact plan to write, or the reason it refused.
+ */
+export function decideTriage(input: {
+  params: BacklogTriageParams;
+  ticket: TriageTicket;
+  config: TriageConfig;
+  ledger: readonly BacklogWrite[];
+  bound: boolean;
+  now: number;
+  /** Team per related issue key, lowercased; missing means the relation could not be checked. */
+  relatedTeams: ReadonlyMap<string, string>;
+  /** The comment body with the plugin's signature line already appended, when one was given. */
+  signedComment: string | null;
+}): TriageDecision {
+  const { params, ticket, config, ledger, bound, now, relatedTeams, signedComment } = input;
+  const refuse = (reason: string): TriageDecision => ({ ok: false, reason });
+
+  if (!config.triage) return refuse("backlog.triage is off; the backlog steward is read-only");
+
+  for (const field of FORBIDDEN_TRIAGE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(params, field)) return refuse(`a triage write may not carry ${field}; it only adds labels, relations, priority and a comment`);
+  }
+
+  // The target must be un-adopted: nothing bound, nothing in an adopted state,
+  // and nothing labelled for adoption that is also assigned.
+  if (bound) return refuse(`${ticket.key} is already bound; the backlog steward only touches un-adopted tickets`);
+  if (ticket.stateType !== null && ["started", "completed", "canceled"].includes(ticket.stateType.toLowerCase())) {
+    return refuse(`${ticket.key} is ${ticket.stateType}; only un-adopted tickets are triaged`);
+  }
+  const adoption = config.label.trim().toLowerCase();
+  if (adoption !== "" && ticket.labels.some((l) => l.trim().toLowerCase() === adoption) && ticket.assignees.length > 0) {
+    return refuse(`${ticket.key} carries ${config.label} and is assigned; it is adopted`);
+  }
+
+  // Labels: the fixed vocabulary only, add-only, never an adoption label.
+  const vocab = backlogLabelVocabulary(config.repos);
+  const adopted = new Set(config.adoptedLabels.map((l) => l.trim().toLowerCase()));
+  const addLabels: string[] = [];
+  for (const raw of params.addLabels ?? []) {
+    const label = raw.trim();
+    if (label === "") continue;
+    const lower = label.toLowerCase();
+    if (adopted.has(lower)) return refuse(`${label} is an adoption label; the triage vocabulary never adds one`);
+    const canonical = vocab.get(lower);
+    if (canonical === undefined) return refuse(`${label} is not in the triage vocabulary (kind, repo:<name>, size:S|M|L)`);
+    if (!addLabels.includes(canonical)) addLabels.push(canonical);
+  }
+
+  // Relations: the three allowed kinds, both ends in the team, never the
+  // ticket itself, add-only.
+  const relations: BacklogRelation[] = [];
+  for (const relation of params.relations ?? []) {
+    const issue = relation.issue.trim();
+    if (issue.toLowerCase() === ticket.key.toLowerCase()) return refuse(`a triage write cannot relate ${ticket.key} to itself`);
+    const team = relatedTeams.get(issue.toLowerCase());
+    if (team === undefined) return refuse(`the ${relation.type} relation to ${issue} could not be checked (its team could not be read)`);
+    if (team.toUpperCase() !== ticket.unit.toUpperCase()) return refuse(`the ${relation.type} relation to ${issue} is in ${team}, not ${ticket.unit}; both ends must be in the team`);
+    relations.push({ type: relation.type, issue });
+  }
+
+  // Priority: unset or last set by the steward. Anything else was set by hand.
+  // A priority the ledger did not write is hand-set and is never changed; the
+  // steward may set one when it is unset, and change one it set itself.
+  let priority: BacklogPriority | null = null;
+  if (params.priority !== undefined) {
+    const current = priorityState(ticket.priority);
+    const last = lastStewardPriority(ledger);
+    const stewardSet = current.state === "known" && last !== null && last !== "none" && last === current.value;
+    if (current.state === "hand") return refuse(`${ticket.key} has a priority the steward did not set; it is never changed`);
+    if (current.state === "known" && !stewardSet) return refuse(`${ticket.key} has a hand-set priority (${ticket.priority}); the steward never changes it`);
+    priority = params.priority === "none" ? null : params.priority;
+  }
+
+  // Comment: signed, within the budget, one open question, and the stale
+  // proposal only when the ticket is stale.
+  let comment: TriagePlan["comment"] = null;
+  if (params.comment !== undefined) {
+    if (signedComment === null || signedBy(signedComment) === null) return refuse("a comment must end with the bb thread signature line; nothing was posted");
+    const used = commentsInWindow(ledger, now).length;
+    if (used >= config.commentsPerWeek) return refuse(`${ticket.key} already has ${used} comment${used === 1 ? "" : "s"} this week; the budget is ${config.commentsPerWeek}`);
+    if (params.proposeCancel === true) {
+      const updated = ticket.updatedAt === null ? Number.NaN : Date.parse(ticket.updatedAt);
+      if (Number.isNaN(updated) || now - updated < config.staleDays * day) return refuse(`${ticket.key} is not stale (untouched ${config.staleDays}d); no cancel is proposed`);
+      comment = { body: signedComment, kind: "stale" };
+    } else {
+      const question = lastQuestion(ledger);
+      if (question !== null && !questionAnswered(question, ticket.comments)) return refuse(`${ticket.key} has an open question; no second one until the requester replies`);
+      comment = { body: signedComment, kind: "question" };
+    }
+  }
+
+  return { ok: true, plan: { addLabels, relations, priority, comment } };
+}
+
+/** Whether a plan actually asks Linear to do anything. */
+export const planIsEmpty = (plan: TriagePlan): boolean => plan.addLabels.length === 0 && plan.relations.length === 0 && plan.priority === null && plan.comment === null;

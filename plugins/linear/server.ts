@@ -120,7 +120,7 @@ import {
   type Account,
 } from "./accounts.js";
 import { createHooksLoop, HooksRequestError, HOOKS_URL_ENV, REPLY_BODY_MAX_BYTES, REPLY_KINDS, type IdentifyResponse, type Lease, type Rejection, type ReplyKind, type SessionEvent } from "./hooks-client.js";
-import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type BacklogIssue, type SearchIssue, type SessionWake } from "./source-contract.js";
+import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, signedBy, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type BacklogIssue, type SearchIssue, type SessionWake } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signed, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
@@ -619,6 +619,11 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       sourceAdoptable: (input) => sourceAdoptable(input),
       sourceBacklog: (input) => sourceBacklog(input),
       sourceSearchIssues: (input) => sourceSearchIssues(input),
+      // BB-341: the backlog steward's gated writes. Stewards validates every
+      // field before it calls; the source applies the plan and refuses an
+      // unsigned comment body.
+      sourceUpdateIssue: (input) => sourceUpdateIssue(input),
+      sourceComment: (input) => sourceComment(input),
       // Dependabot alerts are a GitHub thing; linear has none. Stewards only
       // asks github, so this is a plain answer rather than a throw.
       async sourceDependabotAlerts() {
@@ -1525,6 +1530,62 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       } catch (error) {
         return { issues: [], unsupported: false, truncated: false, errors: [`${key}: ${errorMessage(error)}`] };
       }
+    }
+
+    // BB-341: the backlog steward's one gated write. The caller (stewards) has
+    // already validated every field -- the label vocabulary, the adoption
+    // check, the priority rule and the comment budget -- so this only applies
+    // the plan. A label or related key that does not exist is an error that
+    // changes nothing.
+    async function sourceUpdateIssue(input: { key: string; addLabels: string[]; priority?: "none" | "urgent" | "high" | "medium" | "low"; relations: Array<{ type: RelationType; issue: string }> }) {
+      const where = await forIssue(input.key, undefined, checkSignal());
+      const ref = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.key }, checkSignal()));
+      if (ref === null) throw notFound(input.key, where);
+
+      // Resolve every related key before any mutation, so a bad key changes nothing.
+      const relations: Array<{ type: RelationType; id: string; identifier: string }> = [];
+      for (const relation of input.relations) {
+        const found = parseIssueId(await query(where.key, ISSUE_ID_QUERY, { id: relation.issue }, checkSignal()));
+        if (found === null) throw notFound(relation.issue, where);
+        relations.push({ type: relation.type, id: found.id, identifier: found.identifier });
+      }
+
+      const update: Record<string, unknown> = {};
+      const changed: string[] = [];
+      if (input.addLabels.length > 0) {
+        const add = findLabels(ref.team.labels, input.addLabels);
+        if (add.missing.length > 0) {
+          const names = ref.team.labels.map((l) => l.name);
+          throw new Error(`No label named ${add.missing.map((m) => JSON.stringify(m)).join(", ")} for team ${ref.team.key}. Its labels: ${names.length > 0 ? names.join(", ") : "(none)"}.`);
+        }
+        const ids = ref.labels.map((l) => l.id);
+        for (const id of add.ids) if (!ids.includes(id)) ids.push(id);
+        update.labelIds = ids;
+      }
+      if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
+
+      if (Object.keys(update).length > 0) {
+        const updated = parseIssueUpdate(await query(where.key, ISSUE_UPDATE, { id: ref.id, input: update }, checkSignal()));
+        if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
+        if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
+      }
+      for (const relation of relations) {
+        parseIssueRelationCreate(await query(where.key, ISSUE_RELATION_CREATE, { input: relationCreateInput({ type: relation.type, issueId: relation.id }, ref.id) }, checkSignal()));
+        changed.push(`added ${relation.type} ${relation.identifier}`);
+      }
+      return { ok: true, changed };
+    }
+
+    // BB-341: a comment the caller has already signed with the bb thread
+    // signature line. An unsigned body is refused here, so a bug in the caller
+    // cannot post one.
+    async function sourceComment(input: { key: string; body: string }) {
+      if (signedBy(input.body) === null) throw new Error("a comment must end with the bb thread signature line; nothing was posted");
+      const where = await forIssue(input.key, undefined, checkSignal());
+      const ref = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.key }, checkSignal()));
+      if (ref === null) throw notFound(input.key, where);
+      const created = parseCommentCreate(await query(where.key, COMMENT_CREATE, { input: { issueId: ref.id, body: input.body } }, checkSignal()));
+      return { ok: true, url: created.url };
     }
 
     /** An issue as the search contract wants it: the description the caller matches the fingerprint line in. */

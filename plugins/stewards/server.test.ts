@@ -12099,6 +12099,117 @@ describe("the backlog watch (BB-334)", () => {
   });
 });
 
+describe("the backlog triage writes (BB-341)", () => {
+  const backlogIssue = (over: Record<string, unknown> = {}) => ({ id: "uuid-1", key: "BB-1", title: "Fix login", state: "Backlog", stateType: "backlog", unit: "BB", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", ...over });
+
+  /** A project with a backlog role and its steward thread, and one un-adopted ticket the tool reads. */
+  async function triaging(options: { triage?: boolean; block?: Record<string, unknown>; ticket?: Partial<EntitySnapshot>; comments?: EntitySnapshot["comments"] } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: options.triage ?? true, ...(options.block ?? {}) } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
+    t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
+    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null, updatedAt: "2026-10-14T00:00:00Z", comments: options.comments ?? [], ...(options.ticket ?? {}) }));
+    return { t, binding };
+  }
+
+  const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
+
+  it("is offered only when backlog.triage is true, and absent writes nothing", async () => {
+    const off = await triaging({ triage: false });
+    expect(await tools(off.t, "thr_backlog")).toEqual(["steward_report", "steward_update"]);
+    expect((await off.t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog")).error).toBe(true);
+    expect(off.t.linearWrites).toEqual([]);
+
+    const on = await triaging({ triage: true });
+    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", "steward_report", "steward_update"]);
+  });
+
+  it("writes labels, a priority and a signed comment through linear, and records each in the ledger", async () => {
+    const { t } = await triaging();
+    const result = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug", "size:S"], priority: "high", comment: "Is SSO in scope?" }, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(result.text).toMatch(/Triaged BB-1/u);
+    const update = t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!;
+    expect(update.input).toMatchObject({ key: "BB-1", addLabels: ["bug", "size:S"], priority: "high" });
+    const comment = t.linearWrites.find((w) => w.method === "sourceComment")!;
+    expect(String(comment.input.body)).toContain("Is SSO in scope?");
+    expect(String(comment.input.body)).toContain("from bb thread thr_backlog");
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger.map((e) => `${e.outcome}:${e.kind}`)).toEqual(["accepted:label", "accepted:priority", "accepted:comment"]);
+  });
+
+  it("refuses a hand-set priority, records the refusal and writes nothing", async () => {
+    const { t } = await triaging({ ticket: { priority: "Medium" } });
+    const result = await t.tool("backlog_triage", { key: "BB-1", priority: "high" }, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/hand-set/u);
+    expect(t.linearWrites).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ outcome: "refused", kind: "triage", issueKey: "BB-1" });
+  });
+
+  it("fails closed when the ticket or the ledger cannot be read", async () => {
+    const { t } = await triaging();
+    t.setSnapshotError("BB-1", true);
+    const failed = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    expect(failed.error).toBe(true);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("re-reads backlog.triage on every call, so turning it off refuses at once", async () => {
+    const { t } = await triaging({ triage: true });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: false } });
+    t.hooks.forgetConfigs();
+    const result = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/triage is off/u);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("adds a relation only when both ends are in the team", async () => {
+    const { t } = await triaging();
+    t.entities.set("BB-2", issue({ id: "uuid-2", key: "BB-2", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog" }));
+    const ok = await t.tool("backlog_triage", { key: "BB-1", relations: [{ type: "duplicate", issue: "BB-2" }] }, "thr_backlog");
+    expect(ok.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.relations).toEqual([{ type: "duplicate", issue: "BB-2" }]);
+
+    const { t: other } = await triaging();
+    other.entities.set("OPS-9", issue({ id: "uuid-9", key: "OPS-9", unit: "OPS", labels: [], assignees: [], state: "Backlog", stateType: "backlog" }));
+    const refused = await other.tool("backlog_triage", { key: "BB-1", relations: [{ type: "related", issue: "OPS-9" }] }, "thr_backlog");
+    expect(refused.error).toBe(true);
+    expect(other.linearWrites).toEqual([]);
+  });
+
+  it("lists each write and counts refusals in the digest's Backlog section", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog", "projectSteward"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
+    t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
+    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null }));
+    await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    await t.tool("backlog_triage", { key: "BB-1", addLabels: ["size:XL"] }, "thr_backlog");
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.spawns.find((s) => s.title === "Acme project steward")!.id;
+    const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(digest).toContain("- Writes: BB-1 label");
+    expect(digest).toContain("- Refused: 1");
+  });
+});
+
 describe("the dotenv a requester imports", () => {
   it("reads the named variable, quoted or not, and strips a trailing comment", () => {
     expect(parseDotenvValue("OTHER='x'\nSENTRY_TOKEN='s3cr3t'\n", "SENTRY_TOKEN")).toBe("s3cr3t");

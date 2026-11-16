@@ -18,6 +18,7 @@ import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import { waitSchema, type Wait } from "./wait.js";
 import { nonActionsSchema, nonActionDay, nonActionText, type NonActionCode, type NonActions } from "./non-actions.js";
+import { backlogWriteSchema, type BacklogWrite } from "./backlog-triage.js";
 import type { GuidanceCitation } from "./guidance.js";
 import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
@@ -821,7 +822,28 @@ export const PLAYBOOK_REFRESH_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS playbook_refreshes_project ON playbook_refreshes (project_id, playbook)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS];
+// BB-341: the backlog steward's triage ledger. Every accepted write and every
+// refusal is one row, so the comment budget, the one-open-question rule and
+// the "priority the steward set" rule survive a restart, and the digest can
+// list the writes since its last one. A new table appended after every group
+// already shipped, so no recorded index moves.
+export const BACKLOG_WRITE_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS backlog_writes (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     team TEXT NOT NULL,
+     issue_id TEXT NOT NULL,
+     issue_key TEXT NOT NULL,
+     at INTEGER NOT NULL,
+     outcome TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     detail TEXT NOT NULL DEFAULT '{}',
+     reason TEXT
+   )`,
+  `CREATE INDEX IF NOT EXISTS backlog_writes_ticket ON backlog_writes (project_id, team, issue_id, at)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -2331,6 +2353,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return null;
     }
   };
+  // BB-341: one triage ledger row, read back into the shape the budget and
+  // priority rules compare against.
+  const toBacklogWrite = (r: Record<string, unknown>): BacklogWrite =>
+    backlogWriteSchema.parse({
+      id: String(r.id),
+      projectId: String(r.project_id),
+      team: String(r.team),
+      issueId: String(r.issue_id),
+      issueKey: String(r.issue_key),
+      at: Number(r.at),
+      outcome: r.outcome,
+      kind: r.kind,
+      detail: parseJson(r.detail) ?? {},
+      reason: r.reason === null || r.reason === undefined ? null : String(r.reason),
+    });
   const toAssessmentRow = (r: Record<string, unknown>): AssessmentRow => ({
     bindingId: String(r.binding_id),
     at: Number(r.at),
@@ -3759,6 +3796,46 @@ export function createStore(db: Database.Database, now: () => number, options: S
         .all(projectId)
         .map((r) => ({ fingerprint: r.fingerprint, level: r.level === "problem" ? "problem" : "warning", text: r.text, firstSeenAt: r.first_seen_at }));
     },
+    // BB-341: the backlog steward's triage ledger. One row per accepted write
+    // and per refusal, so the comment budget and the "priority the steward
+    // set" rule survive a restart and the digest lists what happened.
+    /** The triage rows for a project, narrowed to a team or an issue and to rows at or after `since` when given. */
+    backlogWrites(projectId: string, opts: { team?: string; issueId?: string; since?: number } = {}): BacklogWrite[] {
+      const clauses = ["project_id = ?"];
+      const values: unknown[] = [projectId];
+      if (opts.team !== undefined) {
+        clauses.push("team = ?");
+        values.push(opts.team);
+      }
+      if (opts.issueId !== undefined) {
+        clauses.push("issue_id = ?");
+        values.push(opts.issueId);
+      }
+      if (opts.since !== undefined) {
+        clauses.push("at >= ?");
+        values.push(opts.since);
+      }
+      return db
+        .prepare(`SELECT * FROM backlog_writes WHERE ${clauses.join(" AND ")} ORDER BY at ASC, rowid ASC`)
+        .all(...values)
+        .map((r) => toBacklogWrite(r as Record<string, unknown>));
+    },
+    /** Append one triage row. */
+    addBacklogWrite(entry: BacklogWrite): void {
+      db.prepare("INSERT INTO backlog_writes (id, project_id, team, issue_id, issue_key, at, outcome, kind, detail, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        entry.id,
+        entry.projectId,
+        entry.team,
+        entry.issueId,
+        entry.issueKey,
+        entry.at,
+        entry.outcome,
+        entry.kind,
+        JSON.stringify(entry.detail),
+        entry.reason,
+      );
+    },
+
     /** Replace a project's recorded findings with the current set, keeping an unchanged finding's first-seen time. */
     setCheckFindings(projectId: string, findings: ReadonlyArray<{ fingerprint: string; level: "warning" | "problem"; text: string }>, at: number): void {
       const keep = new Set(findings.map((f) => f.fingerprint));
