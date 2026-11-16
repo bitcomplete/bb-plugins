@@ -299,7 +299,8 @@ through one publish step**, by the project's `publish` policy (see
   open and reports its URL and the reason on every surface.
 
 A stale `guidance-` branch is never stacked on. Before a write, a branch whose
-tip is already an ancestor of `origin/<default>` (merged) or which is gone from
+tip is already an ancestor of `origin/<default>` (merged), whose change is
+already on the default branch (a squash or rebase merge), or which is gone from
 `origin` is rebuilt from the default branch. A branch that is gone from
 `origin` but still holds unmerged commits (a closed pull request or a failed
 push) is kept under a backup ref first and the result names it, so nothing is
@@ -451,7 +452,7 @@ Accepted consequences, not bugs.
 ```sh
 npm install
 npm run typecheck
-npm test          # 299 tests, including end-to-end provisioning against real git repos
+npm test          # 302 tests, including end-to-end provisioning against real git repos
 npm run build
 ```
 

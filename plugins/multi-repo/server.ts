@@ -73,6 +73,8 @@ const CREATE_TIMEOUT_MS = 60 * 60 * 1000;
 const REMOVE_TIMEOUT_MS = 10 * 60 * 1000;
 const READ_TIMEOUT_MS = 90_000;
 const ACTION_TIMEOUT_MS = 10 * 60 * 1000;
+/** A `.bb` write that may open and merge a pull request, including a brief check wait. */
+const PUBLISH_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * What this plugin needs off `threads.get({ include: "environment" })`.
@@ -560,7 +562,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         layout,
         ...(file.publish === undefined ? {} : { publish: file.publish }),
       },
-      { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
+      { hostId: location.hostId, timeoutMs: PUBLISH_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
     // A failed commit or a failed publish is a hard error on every surface,
     // not a note: the local commit is kept, and the caller must say so.

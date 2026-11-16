@@ -36,8 +36,8 @@ const GIT_TIMEOUT_MS = 30_000;
 const FETCH_TIMEOUT_MS = 120_000;
 const PUBLISH_TIMEOUT_MS = 120_000;
 /** How long a `merge` publish waits for required checks before trying to merge. */
-const MERGE_WAIT_MS = 90_000;
-/** How often the merge wait re-reads the pull request's checks. */
+const MERGE_WAIT_MS = 30_000;
+/** How often the merge wait re-reads the pull request's mergeability. */
 const MERGE_POLL_MS = 3_000;
 
 /** True when the ref resolves to a commit. */
@@ -1264,7 +1264,14 @@ async function publishByMerge(
   }
   const merged = await mergePullRequest({ dir: request.dir, branch: branchName, signal: request.signal, options });
   if (!merged.ok) {
-    return failure(`The pull request was left open: ${merged.message}`, head, branchName, pr.url);
+    // The URL is in the message because the RPC surfaces only the message on a
+    // failure; `prUrl` is discarded there.
+    return failure(
+      `The pull request${pr.url === null ? "" : ` at ${pr.url}`} was left open: ${merged.message}`,
+      head,
+      branchName,
+      pr.url,
+    );
   }
   // The merge landed on origin; the local fast-forward and the branch cleanup
   // are best-effort and never undo it.
@@ -1327,6 +1334,10 @@ async function resolveGuidanceBase(args: {
   if (await refExists(dir, originDefault, args.options.signal)) {
     const merged = await gitIn(dir, ["merge-base", "--is-ancestor", localTip, originDefault], options);
     if (merged.code === 0) return { base, backupRef: null };
+    // The org ruleset only allows squash or rebase merges, which rewrite the
+    // commits, so a merged branch's tip is never an ancestor of the default
+    // branch. Check the change itself before treating the branch as unmerged.
+    if (await changeAlreadyOnDefault(dir, originDefault, localTip, options)) return { base, backupRef: null };
   }
   const originBranch = `refs/remotes/origin/${branchName}`;
   const originTip = await gitLine(dir, ["rev-parse", "--verify", "--quiet", `${originBranch}^{commit}`], options);
@@ -1344,8 +1355,29 @@ async function resolveGuidanceBase(args: {
   return localIsAncestor.code === 0 ? { base: originTip, backupRef: null } : { base: localTip, backupRef: null };
 }
 
-/** The pull request body: what the publish is, and the branch's net change. */
-async function pullRequestBody(
+/**
+ * Whether `tip`'s change is already present on `defaultRef`.
+ *
+ * A squash or rebase merge rewrites the branch's commits, so its tip is not an
+ * ancestor of the default branch even though the change landed. Merging the tip
+ * into the default produces the default's own tree exactly when there is
+ * nothing left to apply. Returns false when git cannot compute the merge (a
+ * conflict, or an old git), which keeps the conservative backup path.
+ */
+async function changeAlreadyOnDefault(
+  dir: string,
+  defaultRef: string,
+  tip: string,
+  options: GitOptions,
+): Promise<boolean> {
+  const merged = await gitIn(dir, ["merge-tree", "--write-tree", defaultRef, tip], options);
+  if (merged.code !== 0) return false;
+  const resultTree = merged.stdout.trim().split("\n")[0]?.trim() ?? "";
+  const defaultTree = await gitLine(dir, ["rev-parse", `${defaultRef}^{tree}`], options);
+  return resultTree.length > 0 && defaultTree !== null && resultTree === defaultTree;
+}
+
+/** The pull request body: what the publish is, and the branch's net change. */async function pullRequestBody(
   request: PublishRequest,
   base: string,
   head: string | null,
@@ -1389,12 +1421,15 @@ async function mergePullRequest(args: {
 }
 
 /**
- * Wait briefly for the pull request's checks to finish before merging.
+ * Wait briefly for the pull request to become mergeable before merging.
  *
- * A failed `gh pr view` is not an error here: the merge attempt that follows
- * reports the real reason. A check is pending while its `status` is not
- * `COMPLETED` or its legacy `state` is still waiting; a `SKIPPED` conclusion is
- * complete and therefore passes.
+ * `mergeStateStatus` is GitHub's own answer to "can this merge now": it is
+ * `UNKNOWN` while mergeability is still being computed and `BLOCKED` while a
+ * required check (or review) is outstanding, and only reaches `CLEAN`,
+ * `HAS_HOOKS` or `UNSTABLE` when the required checks have passed — a skipped
+ * required check counts as passing. Optional checks never block it. A failed
+ * `gh pr view` is not an error here: the merge attempt that follows reports the
+ * real reason.
  */
 async function waitForRequiredChecks(
   dir: string,
@@ -1405,26 +1440,21 @@ async function waitForRequiredChecks(
   const common = { cwd: dir, timeoutMs: options.timeoutMs, ...(signal === undefined ? {} : { signal }) };
   const deadline = Date.now() + MERGE_WAIT_MS;
   while (Date.now() < deadline) {
-    const view = await run("gh", ["pr", "view", branch, "--json", "statusCheckRollup"], common);
+    const view = await run("gh", ["pr", "view", branch, "--json", "mergeStateStatus"], common);
     if (view.code !== 0) return;
-    let pending = false;
+    let status: string | null = null;
     try {
-      const json = JSON.parse(view.stdout) as { statusCheckRollup?: Array<Record<string, unknown>> };
-      pending = (json.statusCheckRollup ?? []).some(isCheckPending);
+      const json = JSON.parse(view.stdout) as { mergeStateStatus?: unknown };
+      status = typeof json.mergeStateStatus === "string" ? json.mergeStateStatus.toUpperCase() : null;
     } catch {
       return;
     }
-    if (!pending) return;
+    // CLEAN/HAS_HOOKS/UNSTABLE mean the required checks are done and the merge
+    // is allowed; anything else (UNKNOWN, BLOCKED, BEHIND, DIRTY, DRAFT) waits
+    // out the brief budget and then lets `gh pr merge` report the reason.
+    if (status !== null && ["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(status)) return;
     await sleep(MERGE_POLL_MS, signal);
   }
-}
-
-/** Whether a `statusCheckRollup` entry is still running. */
-function isCheckPending(check: Record<string, unknown>): boolean {
-  const status = typeof check.status === "string" ? check.status.toUpperCase() : null;
-  if (status !== null && status !== "COMPLETED") return true;
-  const state = typeof check.state === "string" ? check.state.toUpperCase() : null;
-  return state !== null && ["PENDING", "EXPECTED", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED"].includes(state);
 }
 
 /** A cancellable sleep. */
@@ -1744,10 +1774,27 @@ async function pushGuidancePrimary(
     // `repos.json` is the primary default for `merge`, so when it changed
     // alongside guidance, it is published on its own branch through
     // `publishDefinition` and everything else stays on `guidance-<thread>`.
+    //
+    // Auto-merge it only when this thread actually changed it and the default
+    // branch's copy has not moved since provisioning: a wholesale copy of the
+    // workspace's `.bb` would otherwise revert a `repos.json` change that
+    // landed on the default branch after this workspace was cut. When the
+    // default moved, the write falls through to the guidance branch (with the
+    // existing "changed since provisioned" warning) instead of merging.
     const changed = splitNul((await gitIn(worktree, ["diff", "--cached", "--name-only", "-z"], options)).stdout);
     const reposRel = `${PROJECT_SOURCE_DIR}/${REPOS_FILE}`;
     const policy = await projectPublishPolicy(projectSourcePath, "primary", signal);
-    if (resolvePublishMode(policy, "primary", REPOS_FILE) === "merge" && changed.includes(reposRel)) {
+    const workspaceRepos = await readFile(path.join(workspaceBbPath, REPOS_FILE), "utf8").catch(() => null);
+    const definitionRepos = definitionBase == null ? null : await showAt(projectSourcePath, `${definitionBase}:${reposRel}`, options);
+    const baseRepos = await showAt(projectSourcePath, `${base}:${reposRel}`, options);
+    const threadChangedRepos = workspaceRepos !== null && definitionRepos !== null && workspaceRepos !== definitionRepos;
+    const defaultMovedRepos = definitionRepos !== null && baseRepos !== null && definitionRepos !== baseRepos;
+    if (
+      resolvePublishMode(policy, "primary", REPOS_FILE) === "merge" &&
+      changed.includes(reposRel) &&
+      threadChangedRepos &&
+      !defaultMovedRepos
+    ) {
       const split = await publishSplitGuidance({
         projectSourcePath,
         workspaceBbPath,
@@ -1786,6 +1833,12 @@ async function pushGuidancePrimary(
     await gitIn(projectSourcePath, ["worktree", "remove", "--force", worktree], options).catch(() => undefined);
     await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/** One file's content at a ref, or null when the ref or file does not resolve. */
+async function showAt(dir: string, ref: string, options: GitOptions): Promise<string | null> {
+  const result = await gitIn(dir, ["show", ref], { ...options, maxBytes: 2_000_000 });
+  return result.code === 0 ? result.stdout : null;
 }
 
 /**

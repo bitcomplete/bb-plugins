@@ -88,7 +88,8 @@ nothing else reads the file — and `AGENTS.md`, `skills/` and `stewards/` to
 never commits or publishes anything, so its `publish` key is not read.
 
 A stale `guidance-` branch is never stacked on: before a write, a branch whose
-tip is already an ancestor of `origin/<default>` (merged) or which is gone from
+tip is already an ancestor of `origin/<default>` (merged), whose change is
+already on the default branch (a squash or rebase merge), or which is gone from
 `origin` is rebuilt from the default branch. A branch that is gone from
 `origin` but still holds unmerged commits is kept under a backup ref first, and
 the result names it, so nothing is discarded. An open pull request is updated
