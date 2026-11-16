@@ -94,9 +94,52 @@ async function installFakeGh(body: string): Promise<void> {
   process.env.PATH = `${bin}:${previousPath ?? ""}`;
 }
 
+/** Advance the bare `remote`'s `main` by one commit and return its sha. */
+async function commitToRemoteMain(remote: string): Promise<string> {
+  const work = path.join(scratch, `advance-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
+  await git(["clone", "--quiet", remote, work]);
+  await gitIn(work, ["config", "user.email", "test@example.invalid"]);
+  await gitIn(work, ["config", "user.name", "Test"]);
+  await writeFile(path.join(work, "ADVANCE.md"), "advanced\n", "utf8");
+  await gitIn(work, ["add", "-A"]);
+  await gitIn(work, ["commit", "--quiet", "-m", "advance"]);
+  await gitIn(work, ["push", "--quiet", "origin", "main"]);
+  return (await gitLine(work, ["rev-parse", "HEAD"])) as string;
+}
+
+/** Squash-merge `branch` into the bare `remote`'s main and delete the branch. */
+async function squashMergeRemoteBranch(remote: string, branch: string): Promise<string> {
+  const work = path.join(scratch, `squash-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
+  await git(["clone", "--quiet", remote, work]);
+  await gitIn(work, ["config", "user.email", "test@example.invalid"]);
+  await gitIn(work, ["config", "user.name", "Test"]);
+  await gitIn(work, ["fetch", "--quiet", "origin", branch]);
+  await gitIn(work, ["checkout", "-q", `origin/${branch}`, "--", ".bb"]);
+  await gitIn(work, ["add", "--", ".bb"]);
+  await gitIn(work, ["commit", "--quiet", "-m", `squash ${branch}`]);
+  await gitIn(work, ["push", "--quiet", "origin", "HEAD:main"]);
+  await gitIn(remote, ["update-ref", "-d", `refs/heads/${branch}`]);
+  return (await gitLine(work, ["rev-parse", "HEAD"])) as string;
+}
+
 const GH_CREATE_OK = `if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "https://github.com/you/bb/pull/7"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
 exit 1`;
+
+/** A fake `gh` that opens a pull request and merges it by fast-forwarding `remote`'s main. */
+function ghMergeOk(remote: string): string {
+  return `if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "https://github.com/you/bb/pull/7"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{"mergeStateStatus":"CLEAN"}'; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  git --git-dir="${remote}" update-ref refs/heads/main "refs/heads/$3" || exit 1
+  git --git-dir="${remote}" update-ref -d "refs/heads/$3" || exit 1
+  echo "merged"
+  exit 0
+fi
+exit 1`;
+}
 
 const NEW_REPOS = `{"version":1,"repos":[{"dir":"added","url":"https://example.com/added"}]}\n`;
 
@@ -117,10 +160,11 @@ async function writeByPolicy(
   dir: string,
   text: string,
   layout: "directory" | "primary",
+  message = "Add added",
 ): Promise<Awaited<ReturnType<typeof writeReposJson>>> {
   const parsed = parseReposFile(text);
   if (!parsed.ok) throw new Error(parsed.error);
-  return writeReposJson(dir, text, "Add added", undefined, layout, parsed.value.publish);
+  return writeReposJson(dir, text, message, undefined, layout, parsed.value.publish);
 }
 
 describe("a plain directory writes in place and publishes nothing", () => {
@@ -201,14 +245,14 @@ describe("push (a primary repo's override)", () => {
   });
 });
 
-describe("pull-request (a primary repo's default)", () => {
+describe("pull-request (an explicit policy)", () => {
   it("opens a pull request from a guidance branch without moving the default branch", async () => {
     await installFakeGh(GH_CREATE_OK);
     const remote = await makeBareRemote("primary-remote");
     const dir = await makePrimary(remote, "primary-canonical");
     const beforeLocal = await gitLine(dir, ["rev-parse", "main"]);
     const beforeOrigin = await gitLine(remote, ["rev-parse", "main"]);
-    const result = await writeByPolicy(dir, NEW_REPOS, "primary");
+    const result = await writeByPolicy(dir, reposText("pull-request"), "primary");
     expect(result.ok).toBe(true);
     expect(result.mode).toBe("pull-request");
     expect(result.prUrl).toBe("https://github.com/you/bb/pull/7");
@@ -265,6 +309,7 @@ exit 1`);
 
   it("returns the open pull request when the branch already has one", async () => {
     await installFakeGh(`if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo '[{"url":"https://github.com/you/bb/pull/9"}]'; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
 echo "should not create" >&2
 exit 1`);
     const remote = await makeBareRemote("pr-existing-remote");
@@ -286,6 +331,7 @@ if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   echo "https://github.com/you/bb/pull/7"
   exit 0
 fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
 exit 1`);
     const remote = await makeBareRemote("stack-remote");
     const dir = await makePrimary(remote, "stack-canonical");
@@ -313,6 +359,200 @@ exit 1`);
     expect(await gitLine(remote, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"two"');
     // The default branch is still untouched.
     expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).not.toContain('"one"');
+  });
+});
+
+describe("merge (the primary default for repos.json)", () => {
+  it("opens and merges a pull request, fast-forwards main and deletes the local branch", async () => {
+    const remote = await makeBareRemote("merge-remote");
+    const dir = await makePrimary(remote, "merge-canonical");
+    await installFakeGh(ghMergeOk(remote));
+    const before = await gitLine(remote, ["rev-parse", "main"]);
+    const result = await writeByPolicy(dir, NEW_REPOS, "primary");
+    expect(result.ok).toBe(true);
+    expect(result.mode).toBe("merge");
+    expect(result.prUrl).toBe("https://github.com/you/bb/pull/7");
+    // The merge landed on the remote default branch and carries repos.json.
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+    // The canonical checkout's default branch was fast-forwarded to origin.
+    expect(await gitLine(dir, ["rev-parse", "main"])).toBe(await gitLine(remote, ["rev-parse", "main"]));
+    expect(await gitLine(dir, ["rev-parse", "main"])).not.toBe(before);
+    // The local guidance branch was deleted.
+    expect(await gitLine(dir, ["rev-parse", "--verify", "--quiet", "refs/heads/guidance-repos-json"])).toBeNull();
+  });
+
+  it("leaves the pull request open with the local commit intact when the merge is refused", async () => {
+    const remote = await makeBareRemote("merge-refused-remote");
+    const dir = await makePrimary(remote, "merge-refused-canonical");
+    await installFakeGh(`if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[]"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then echo "https://github.com/you/bb/pull/7"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{"mergeStateStatus":"CLEAN"}'; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then echo 'required status check "terraform-plan" is expected' >&2; exit 1; fi
+exit 1`);
+    const before = await gitLine(remote, ["rev-parse", "main"]);
+    const result = await writeByPolicy(dir, NEW_REPOS, "primary");
+    expect(result.ok).toBe(false);
+    expect(result.prUrl).toBe("https://github.com/you/bb/pull/7");
+    // The URL is in the message because the surfaces show only the message on
+    // a failure; `prUrl` is discarded by the RPC error path.
+    expect(result.message).toContain("https://github.com/you/bb/pull/7");
+    expect(result.message).toMatch(/left open/u);
+    expect(result.message).toMatch(/terraform-plan/u);
+    // The local commit is intact and neither default branch moved.
+    expect(await gitLine(dir, ["show", "guidance-repos-json:.bb/repos.json"])).toContain('"added"');
+    expect(await gitLine(remote, ["rev-parse", "main"])).toBe(before);
+    expect(await gitLine(dir, ["rev-parse", "main"])).toBe(before);
+  });
+
+  it("rebuilds a merged guidance branch from the default branch instead of stacking on it", async () => {
+    const remote = await makeBareRemote("stale-remote");
+    const dir = await makePrimary(remote, "stale-canonical");
+    await installFakeGh(GH_CREATE_OK);
+    const first = await writeByPolicy(dir, reposText("pull-request"), "primary");
+    expect(first.ok).toBe(true);
+    const mergedTip = first.head as string;
+    // The pull request merges (main moves to the branch) and its remote branch
+    // is deleted; main then advances past it.
+    await gitIn(remote, ["update-ref", "refs/heads/main", mergedTip]);
+    await gitIn(remote, ["update-ref", "-d", "refs/heads/guidance-repos-json"]);
+    const advanced = await commitToRemoteMain(remote);
+    const secondText = `${JSON.stringify({
+      version: 1,
+      repos: [{ dir: "second", url: "https://example.com/second" }],
+      publish: "pull-request",
+    })}\n`;
+    await installFakeGh(GH_CREATE_OK);
+    const second = await writeByPolicy(dir, secondText, "primary");
+    expect(second.ok).toBe(true);
+    // The new commit descends from the advanced default branch, not the
+    // already-merged tip.
+    expect(await gitLine(dir, ["rev-parse", `${second.head as string}^`])).toBe(advanced);
+    expect(second.head).not.toBe(mergedTip);
+  });
+
+  it("keeps unmerged commits under a backup ref before starting fresh", async () => {
+    const remote = await makeBareRemote("backup-remote");
+    const dir = await makePrimary(remote, "backup-canonical");
+    await installFakeGh(GH_CREATE_OK);
+    const first = await writeByPolicy(dir, reposText("pull-request"), "primary");
+    expect(first.ok).toBe(true);
+    const abandoned = first.head as string;
+    // The pull request is closed and its remote branch deleted without merging.
+    await gitIn(remote, ["update-ref", "-d", "refs/heads/guidance-repos-json"]);
+    await gitIn(dir, ["fetch", "--quiet", "origin"]);
+    const secondText = `${JSON.stringify({
+      version: 1,
+      repos: [{ dir: "second", url: "https://example.com/second" }],
+      publish: "pull-request",
+    })}\n`;
+    const second = await writeByPolicy(dir, secondText, "primary");
+    expect(second.ok).toBe(true);
+    expect(second.message).toMatch(/backup/u);
+    // The abandoned commit is preserved under a named backup ref...
+    const backupRef = `refs/heads/guidance-repos-json-backup-${abandoned.slice(0, 8)}`;
+    expect(await gitLine(dir, ["rev-parse", backupRef])).toBe(abandoned);
+    // ...and the fresh branch descends from the default branch, not from it.
+    expect(await gitLine(dir, ["rev-parse", `${second.head as string}^`])).toBe(await gitLine(remote, ["rev-parse", "main"]));
+    expect(second.head).not.toBe(abandoned);
+  });
+
+  it("rebuilds silently after a squash merge instead of backing the branch up", async () => {
+    const remote = await makeBareRemote("squash-remote");
+    const dir = await makePrimary(remote, "squash-canonical");
+    await installFakeGh(GH_CREATE_OK);
+    const first = await writeByPolicy(dir, reposText("pull-request"), "primary");
+    expect(first.ok).toBe(true);
+    const branchTip = first.head as string;
+    // The org ruleset only allows squash merges: main gets a new commit with
+    // the branch's change and the branch is deleted, so the tip is not an
+    // ancestor of main even though the change landed.
+    const squash = await squashMergeRemoteBranch(remote, "guidance-repos-json");
+    const secondText = `${JSON.stringify({
+      version: 1,
+      repos: [{ dir: "second", url: "https://example.com/second" }],
+      publish: "pull-request",
+    })}\n`;
+    await installFakeGh(GH_CREATE_OK);
+    const second = await writeByPolicy(dir, secondText, "primary");
+    expect(second.ok).toBe(true);
+    expect(second.message ?? "").not.toMatch(/backup/u);
+    // The fresh commit descends from the squash merge, not from the branch tip.
+    expect(await gitLine(dir, ["rev-parse", `${second.head as string}^`])).toBe(squash);
+    expect(branchTip).not.toBe(squash);
+  });
+
+  it("does not auto-merge a repos.json the thread did not change when the default moved", async () => {
+    const remote = await makeBareRemote("stale-split-remote");
+    const canonical = await makePrimary(remote, "stale-split-canonical");
+    const workspace = path.join(scratch, "stale-split-workspace");
+    await git(["clone", "--quiet", canonical, workspace]);
+    await gitIn(workspace, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspace, ["config", "user.name", "Test"]);
+    const definitionBase = await gitLine(workspace, ["rev-parse", "HEAD"]);
+    const workspaceBb = path.join(workspace, ".bb");
+    // Another write lands a repo on the default branch after provisioning.
+    await installFakeGh(ghMergeOk(remote));
+    const other = await writeByPolicy(canonical, NEW_REPOS, "primary");
+    expect(other.ok).toBe(true);
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+    // This thread only edits AGENTS.md; its stale repos.json must not be
+    // merged back over the other write's change.
+    await writeFile(path.join(workspaceBb, "AGENTS.md"), "# guidance\nlearned through the link\n", "utf8");
+    const result = await pushGuidance(canonical, workspaceBb, "thr_stale", undefined, definitionBase);
+    expect(result.ok).toBe(true);
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+    expect(await gitLine(remote, ["show", "main:.bb/AGENTS.md"])).not.toContain("learned through the link");
+    // The guidance branch carries the default's repos.json, not the stale copy.
+    expect(await gitLine(canonical, ["show", "guidance-thr_stale:.bb/repos.json"])).toContain('"added"');
+  });
+
+  it("is a no-op when the stale repos.json was the only difference", async () => {
+    const remote = await makeBareRemote("stale-only-remote");
+    const canonical = await makePrimary(remote, "stale-only-canonical");
+    const workspace = path.join(scratch, "stale-only-workspace");
+    await git(["clone", "--quiet", canonical, workspace]);
+    await gitIn(workspace, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspace, ["config", "user.name", "Test"]);
+    const definitionBase = await gitLine(workspace, ["rev-parse", "HEAD"]);
+    const workspaceBb = path.join(workspace, ".bb");
+    await installFakeGh(ghMergeOk(remote));
+    const other = await writeByPolicy(canonical, NEW_REPOS, "primary");
+    expect(other.ok).toBe(true);
+    // The thread made no edit at all; restoring the default's repos.json
+    // leaves nothing to publish, which is the ordinary no-op result.
+    const result = await pushGuidance(canonical, workspaceBb, "thr_noop", undefined, definitionBase);
+    expect(result.ok).toBe(true);
+    expect(result.message).toMatch(/No \.bb changes to publish/u);
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+  });
+
+  it("rewrites the open pull request's title and body when stacking", async () => {
+    const remote = await makeBareRemote("title-remote");
+    const dir = await makePrimary(remote, "title-canonical");
+    const marker = path.join(scratch, "title-pr-open");
+    const edits = path.join(scratch, "title-edits");
+    await installFakeGh(`if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  if [ -f "${marker}" ]; then echo '[{"url":"https://github.com/you/bb/pull/7"}]'; else echo "[]"; fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then touch "${marker}"; echo "https://github.com/you/bb/pull/7"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then cp "$7" "${edits}.body"; echo "$@" >> "${edits}"; exit 0; fi
+exit 1`);
+    const first = `${JSON.stringify({ version: 1, repos: [{ dir: "one", url: "https://example.com/one" }], publish: "pull-request" })}\n`;
+    const second = `${JSON.stringify({
+      version: 1,
+      repos: [
+        { dir: "one", url: "https://example.com/one" },
+        { dir: "two", url: "https://example.com/two" },
+      ],
+      publish: "pull-request",
+    })}\n`;
+    await writeByPolicy(dir, first, "primary", "Add one to the repo set");
+    await writeByPolicy(dir, second, "primary", "Add two to the repo set");
+    const logged = await readFile(edits, "utf8");
+    expect(logged).toContain("Add two to the repo set");
+    const body = await readFile(`${edits}.body`, "utf8");
+    expect(body).toContain("Net change against the default branch");
   });
 });
 
@@ -358,6 +598,38 @@ describe("mergeGuidance by policy", () => {
     expect(result.message).toContain("https://github.com/you/bb/pull/7");
     expect(await gitLine(canonical, ["rev-parse", "main"])).toBe(beforeLocal);
     expect(await gitLine(remote, ["rev-parse", "main"])).toBe(beforeOrigin);
+  });
+});
+
+describe("a mixed publish splits repos.json from guidance", () => {
+  it("merges repos.json on its own branch and leaves guidance on guidance-<thread>", async () => {
+    const remote = await makeBareRemote("mixed-remote");
+    const canonical = await makePrimary(remote, "mixed-canonical");
+    await installFakeGh(ghMergeOk(remote));
+    // The workspace's `.bb` is what a thread edits; for a primary it is the
+    // link into the primary clone's `.bb/`, so a clone stands in for it.
+    const workspace = path.join(scratch, "mixed-workspace");
+    await git(["clone", "--quiet", canonical, workspace]);
+    await gitIn(workspace, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspace, ["config", "user.name", "Test"]);
+    const workspaceBb = path.join(workspace, ".bb");
+    const definitionBase = await gitLine(workspace, ["rev-parse", "HEAD"]);
+    await writeFile(
+      path.join(workspaceBb, "repos.json"),
+      `${JSON.stringify({ version: 1, repos: [{ dir: "added", url: "https://example.com/added" }] })}\n`,
+      "utf8",
+    );
+    await writeFile(path.join(workspaceBb, "AGENTS.md"), "# guidance\nlearned through the link\n", "utf8");
+
+    const result = await pushGuidance(canonical, workspaceBb, "thr_mixed", undefined, definitionBase);
+    expect(result.ok).toBe(true);
+    expect(result.ref).toBe("refs/heads/guidance-thr_mixed");
+    // repos.json merged to the default branch, without the guidance change.
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+    expect(await gitLine(remote, ["show", "main:.bb/AGENTS.md"])).not.toContain("learned through the link");
+    // The guidance branch carries AGENTS.md, without the repos.json change.
+    expect(await gitLine(canonical, ["show", "guidance-thr_mixed:.bb/AGENTS.md"])).toContain("learned through the link");
+    expect(await gitLine(canonical, ["show", "guidance-thr_mixed:.bb/repos.json"])).not.toContain('"added"');
   });
 });
 
@@ -491,6 +763,41 @@ describe("the write paths share the publish step", () => {
     })) as { ok: boolean; error: string | null };
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/push rejected/u);
+  });
+
+  it("surfaces a refused merge's pull request URL on the panel RPC", async () => {
+    // The host puts the URL in the failure message because the RPC error path
+    // carries only the message, not `prUrl`. This asserts the surface keeps it.
+    const refused =
+      "The pull request at https://github.com/you/acme/pull/9 was left open: required status check is expected";
+    const { bb, harness } = createFakePluginHost({
+      experimental_callHostRpc: (call: { method: string; input: unknown }) => {
+        if (call.method === "prepareProjectSource") {
+          return {
+            bootstrapped: false,
+            reposJson: '{"version":1,"repos":[]}',
+            remote: "git@github.com:you/acme.git",
+            defaultBranch: "main",
+            unpushed: null,
+            layout: "primary",
+            warnings: [],
+          };
+        }
+        if (call.method === "writeProjectSourceRepos") {
+          return { ok: false, committed: true, head: "abc", mode: "merge", prUrl: null, message: refused };
+        }
+        throw new Error(`unexpected host method ${call.method}`);
+      },
+    });
+    harness.sdk.stub("projects.get", () => PROJECT);
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+    const result = (await harness.callRpc("addRepo", {
+      projectId: PROJECT_ID,
+      repo: { dir: "b", url: "https://example.com/b" },
+    })) as { ok: boolean; error: string | null };
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("https://github.com/you/acme/pull/9");
   });
 
   it("surfaces the move-it refusal for a leftover root repos.json", async () => {

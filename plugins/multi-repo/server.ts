@@ -73,6 +73,8 @@ const CREATE_TIMEOUT_MS = 60 * 60 * 1000;
 const REMOVE_TIMEOUT_MS = 10 * 60 * 1000;
 const READ_TIMEOUT_MS = 90_000;
 const ACTION_TIMEOUT_MS = 10 * 60 * 1000;
+/** A `.bb` write that may open and merge a pull request, including a brief check wait. */
+const PUBLISH_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * What this plugin needs off `threads.get({ include: "environment" })`.
@@ -560,7 +562,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         layout,
         ...(file.publish === undefined ? {} : { publish: file.publish }),
       },
-      { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
+      { hostId: location.hostId, timeoutMs: PUBLISH_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
     // A failed commit or a failed publish is a hard error on every surface,
     // not a note: the local commit is kept, and the caller must say so.
@@ -583,11 +585,17 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
    * remote. The write itself already succeeded by the time this is called.
    */
   function publishNote(published: { mode: WriteMode; prUrl: string | null; message: string | null }): string {
+    if (published.mode === "merge") {
+      const merged = published.prUrl === null ? "Merged the change." : `Merged ${published.prUrl}.`;
+      return published.message === null ? merged : `${merged} ${published.message}`;
+    }
+    if (published.mode === "pull-request") {
+      const opened =
+        published.prUrl === null ? "Opened a pull request for the change." : `Opened ${published.prUrl} for the change.`;
+      return published.message === null ? opened : `${opened} ${published.message}`;
+    }
     if (published.message !== null) return published.message;
     if (published.mode === "none") return "Nothing is published: this project is a plain directory.";
-    if (published.mode === "pull-request") {
-      return published.prUrl === null ? "Opened a pull request for the change." : `Opened ${published.prUrl} for the change.`;
-    }
     return "Pushed the change to origin.";
   }
 
@@ -1147,9 +1155,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   bb.agents.registerTool({
     name: "workspace_publish_guidance",
     description:
-      "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json) as a guidance-<thread> branch to review and merge.",
+      "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json): repos.json merges on its own branch, other paths go on a guidance-<thread> branch to review and merge.",
     instructions:
-      "Edit the files under .bb/ first, then call workspace_publish_guidance. For a primary project it commits them host-side on a guidance-<thread> branch cut from the default branch, leaving the thread's own branch alone — there is no need to commit inside .bb yourself, and the same edits can instead be committed and pushed with the thread's code. For a plain directory the files are already in place and nothing is published. Publishing to origin is best-effort: read the result message, which says whether the branch reached origin, only the local canonical checkout, or nothing at all.",
+      "Edit the files under .bb/ first, then call workspace_publish_guidance. For a primary project it commits them host-side, leaving the thread's own branch alone — there is no need to commit inside .bb yourself, and the same edits can instead be committed and pushed with the thread's code. A repos.json change is published on its own branch and merged in the same step (a refused merge leaves its pull request open and reports the URL and reason); every other path goes on a guidance-<thread> branch cut from the default branch to review and merge. For a plain directory the files are already in place and nothing is published. Read the result message: it names what merged, any pull request left open, and whether the guidance branch reached origin or only the local canonical checkout.",
     presentation: { label: { pending: "Publishing workspace guidance", completed: "Published workspace guidance" } },
     parameters: z.object({}),
     async execute(_input, { threadId, signal }) {

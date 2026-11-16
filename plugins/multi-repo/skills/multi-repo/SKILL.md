@@ -65,8 +65,8 @@ It is the **wrong** place for anything specific to one thread.
 **Every committed `.bb` write is published by the project's policy.** The
 Repos panel, `bb repos add`/`remove`, `workspace_add_repo`, the raw
 `repos.json` editor and `mergeGuidance` all go through the
-same step, so a change never stays on one server. A failed push or pull
-request keeps the local commit and is reported on the panel, the CLI and the
+same step, so a change never stays on one server. A failed push, pull request
+or merge keeps the local commit and is reported on the panel, the CLI and the
 tool result; nothing force-pushes or resets the default branch.
 
 `repos.json` may carry a `publish` key, either one mode for the project or an
@@ -75,19 +75,34 @@ object of path → mode:
 - `"push"` pushes the default branch to `origin` at once.
 - `"pull-request"` pushes a `guidance-` branch and opens a pull request,
   never moving the default branch.
+- `"merge"` cuts a fresh branch from the default branch, opens a pull request
+  and merges it in the same step with plain
+  `gh pr merge --squash --delete-branch`, waiting briefly for required checks
+  (a skipped required check counts as passing). A refused merge leaves the
+  pull request open and reports its URL and the reason.
 
 With no key set, a **primary-repo project** (`.bb/` on a code repo's default
-branch) defaults every path to `pull-request`, `repos.json` included. A
-**plain directory** never commits or publishes anything, so its `publish` key
-is not read.
+branch) defaults `repos.json` to `merge` — adding a repo is mechanical and
+nothing else reads the file — and `AGENTS.md`, `skills/` and `stewards/` to
+`pull-request`, because those are reviewed like code. A **plain directory**
+never commits or publishes anything, so its `publish` key is not read.
+
+A stale `guidance-` branch is never stacked on: before a write, a branch whose
+tip is already an ancestor of `origin/<default>` (merged), whose change is
+already on the default branch (a squash or rebase merge), or which is gone from
+`origin` is rebuilt from the default branch. A branch that is gone from
+`origin` but still holds unmerged commits is kept under a backup ref first, and
+the result names it, so nothing is discarded. An open pull request is updated
+so its title and body describe the net change, not the first commit's.
 
 To publish the whole `.bb` tree from a thread: edit the files under
 `<workspace>/.bb`, then call `workspace_publish_guidance`. In a primary project
-it commits them host-side and lands them on a `guidance-<thread>` branch in the
-canonical checkout, for a person to review and merge. There is no need to
-commit inside `.bb` yourself. Its push to `origin` is still best-effort: read
-the result message, which says whether the branch reached `origin` or only the
-local canonical checkout, and push it yourself when it did not. In a plain
+it commits them host-side. A `repos.json` change is published on its own branch
+and merged in the same step; every other path lands on a `guidance-<thread>`
+branch in the canonical checkout, for a person to review and merge. There is no
+need to commit inside `.bb` yourself. Its push to `origin` is still best-effort:
+read the result message, which says whether the branch reached `origin` or only
+the local canonical checkout, and push it yourself when it did not. In a plain
 directory the files are already in place, and the tool says nothing is
 published.
 

@@ -19,7 +19,7 @@ import { access, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "no
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { projectFilePathProblem, slugify } from "./names.js";
-import { GitError, git, gitIn, gitInOrThrow, gitLine, firstProblemLine, run, splitNul } from "./git.js";
+import { GitError, git, gitIn, gitInOrThrow, gitLine, firstProblemLine, run, splitNul, type RunOptions } from "./git.js";
 import { REPOS_FILE, parseReposFile, resolvePublishMode, serializeReposFile, type PublishMode, type PublishPolicy, type ReposFile, type WriteMode } from "./repos.js";
 import { parseCreatedUrl } from "./gh-parse.js";
 import { cacheDefaultBranch, ensureCache } from "./cache.js";
@@ -35,6 +35,10 @@ const FETCH_MARKER = ".git/bb-multi-repo-fetched-at";
 const GIT_TIMEOUT_MS = 30_000;
 const FETCH_TIMEOUT_MS = 120_000;
 const PUBLISH_TIMEOUT_MS = 120_000;
+/** How long a `merge` publish waits for required checks before trying to merge. */
+const MERGE_WAIT_MS = 30_000;
+/** How often the merge wait re-reads the pull request's mergeability. */
+const MERGE_POLL_MS = 3_000;
 
 /** True when the ref resolves to a commit. */
 async function refExists(dir: string, ref: string, signal?: AbortSignal): Promise<boolean> {
@@ -320,8 +324,9 @@ of thread start.
 A committed \`.bb\` write is published to \`origin\` by this project's
 **publish policy**, so a change never stays on one server. The Repos panel,
 \`bb repos add\`/\`remove\`, \`workspace_add_repo\`, the raw \`repos.json\`
-editor and the discovery seed all go through the same step; a failed push or
-pull request keeps the local commit and is reported, not silently swallowed.
+editor and the discovery seed all go through the same step; a failed push,
+pull request or merge keeps the local commit and is reported, not silently
+swallowed.
 
 \`repos.json\` may carry a \`publish\` key that overrides the defaults, either
 as one mode for the project or as an object of path → mode:
@@ -331,13 +336,20 @@ as one mode for the project or as an object of path → mode:
 - \`"pull-request"\` pushes a \`guidance-\` branch and opens a pull request;
   the default branch is never moved, so the change lands when the pull request
   is reviewed and merged.
+- \`"merge"\` cuts a fresh branch from the default branch, opens a pull request
+  and merges it in the same step (plain \`gh pr merge --squash
+  --delete-branch\`, waiting briefly for required checks; a skipped required
+  check counts as passing). A refused merge leaves the pull request open and
+  reports it.
 
-With no key set, every path — \`repos.json\` included — defaults to
-\`pull-request\`, because \`.bb/\` sits on a code repo's default branch and is
-reviewed like code. Set \`publish\` to \`"push"\` to opt in to direct pushes.
+With no key set, \`repos.json\` defaults to \`merge\` — adding a repo is
+mechanical, nothing else reads the file, and the person who pressed "Add repo"
+has already decided — while \`AGENTS.md\`, \`skills/\` and \`stewards/\` stay
+\`pull-request\`, because they are reviewed like code. Set \`publish\` to
+\`"push"\` to opt in to direct pushes.
 
 Either way the change reaches other machines only once it is on \`origin\` —
-for a \`push\` immediately, for a \`pull-request\` when it merges.
+for a \`push\` immediately, for a \`merge\` or \`pull-request\` when it merges.
 
 ## What belongs here
 
@@ -954,11 +966,14 @@ export async function projectPublishPolicy(
  * `bb repos add`/`remove`/base-branch, `workspace_add_repo`/`remove_repo`, the
  * raw `repos.json` editor, the discovery seed and `mergeGuidance`. It resolves
  * the mode for the path from the policy and the layout, commits if it has
- * content to commit, then either pushes the default branch (`push`) or pushes
- * a `guidance-` branch and opens a pull request (`pull-request`).
+ * content to commit, then either pushes the default branch (`push`), pushes a
+ * `guidance-` branch and opens a pull request (`pull-request`), or opens the
+ * pull request and merges it in the same step (`merge`, the `repos.json`
+ * default).
  *
- * Failure is loud and local: a rejected push or a failed `gh pr create` leaves
- * the commit exactly where it was, moves nothing back, and never force-pushes.
+ * Failure is loud and local: a rejected push, a failed `gh pr create` or a
+ * refused merge leaves the commit exactly where it was, moves nothing back, and
+ * never force-pushes.
  */
 export async function publishDefinition(request: PublishRequest): Promise<PublishResult> {
   const mode = resolvePublishMode(request.policy, request.layout, request.path);
@@ -966,6 +981,14 @@ export async function publishDefinition(request: PublishRequest): Promise<Publis
     timeoutMs: PUBLISH_TIMEOUT_MS,
     ...(request.signal === undefined ? {} : { signal: request.signal }),
   };
+  const hasRemote = (await projectSourceRemote(request.dir, request.signal)) !== null;
+  // Refresh origin's refs and prune branches deleted upstream before deciding
+  // where a guidance branch starts: a stale remote-tracking ref would make a
+  // deleted branch look open and stack already-merged commits (BB-340). A
+  // failed fetch is not fatal; the push that follows reports the real problem.
+  if (hasRemote) {
+    await gitIn(request.dir, ["fetch", "--quiet", "--prune", "origin"], options).catch(() => undefined);
+  }
   const base = await resolveDefaultBranchRef(request.dir, request.signal);
   if (base === null) {
     return {
@@ -979,10 +1002,9 @@ export async function publishDefinition(request: PublishRequest): Promise<Publis
     };
   }
   const baseName = base.replace(/^refs\/(heads|remotes\/origin)\//u, "");
-  const hasRemote = (await projectSourceRemote(request.dir, request.signal)) !== null;
-  return mode === "push"
-    ? publishByPush(request, base, baseName, hasRemote, options)
-    : publishByPullRequest(request, base, baseName, hasRemote, options);
+  if (mode === "push") return publishByPush(request, base, baseName, hasRemote, options);
+  if (mode === "merge") return publishByMerge(request, base, baseName, hasRemote, options);
+  return publishByPullRequest(request, base, baseName, hasRemote, options);
 }
 
 async function publishByPush(
@@ -1070,6 +1092,7 @@ async function publishByPullRequest(
   options: GitOptions,
 ): Promise<PublishResult> {
   const mode: PublishMode = "pull-request";
+  let note: string | null = null;
   const failure = (message: string, head: string | null = null, branch: string | null = null): PublishResult => ({
     ok: false,
     mode,
@@ -1077,27 +1100,22 @@ async function publishByPullRequest(
     head,
     branch,
     prUrl: null,
-    message,
+    message: withNote(message, note),
   });
   let head: string | null;
   let branchName: string;
   if (request.kind === "content") {
     branchName = guidanceBranchName(request.path);
     const relative = `${DEFINITION_PREFIX}${request.path}`;
-    // Stack on the branch's own tip when it already exists. A second write
-    // while the first pull request is still open must fast-forward the same
-    // branch, not replace its earlier commit: basing on the default branch
-    // would move the ref off that commit and then fail the push as
-    // non-fast-forward. When the branch does not exist yet, the default
-    // branch is the base.
-    const existing = await gitLine(
-      request.dir,
-      ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}^{commit}`],
-      options,
-    );
+    // Stack on the branch's own tip when it is still open, but rebuild it from
+    // the default branch when it is already merged or gone from origin. A
+    // stale tip must never be stacked on: the push would carry already-merged
+    // commits and the pull request would describe the wrong net change.
+    const guidance = await resolveGuidanceBase({ dir: request.dir, branchName, base, baseName, hasRemote, options });
+    note = backupNote(branchName, guidance.backupRef);
     const outcome = await commitContentOnBranch({
       dir: request.dir,
-      base: existing ?? base,
+      base: guidance.base,
       branchRef: `refs/heads/${branchName}`,
       relative,
       content: request.content,
@@ -1114,7 +1132,7 @@ async function publishByPullRequest(
         head: outcome.head,
         branch: null,
         prUrl: null,
-        message: "Nothing to commit; the change was already in place.",
+        message: withNote("Nothing to commit; the change was already in place.", note),
       };
     }
     head = outcome.head;
@@ -1141,14 +1159,355 @@ async function publishByPullRequest(
     branch: branchName,
     base: baseName,
     title: request.message,
-    body: `Publishes \`.bb/${request.path}\` for review, by the project's publish policy (BB-148).`,
+    body: await pullRequestBody(request, base, head, options),
     signal: request.signal,
     options,
   });
   if (!pr.ok) {
     return failure(`The branch ${branchName} is pushed but opening the pull request failed: ${pr.message}`, head, branchName);
   }
-  return { ok: true, mode, committed: true, head, branch: branchName, prUrl: pr.url, message: null };
+  return { ok: true, mode, committed: true, head, branch: branchName, prUrl: pr.url, message: note };
+}
+
+/**
+ * Open a pull request and merge it in the same step, the `repos.json` default.
+ *
+ * A fresh branch is cut from the default branch, pushed, opened as a pull
+ * request, and squash-merged with `gh pr merge --squash --delete-branch` once
+ * its required checks have finished (a skipped required check counts as
+ * passing). No bypass flag is ever passed, so whatever the ruleset or a
+ * required check refuses is the fallback: the pull request is left open and
+ * its URL and the refusal are reported. After a successful merge the canonical
+ * checkout's default branch is fast-forwarded and the local guidance branch is
+ * deleted.
+ */
+async function publishByMerge(
+  request: PublishRequest,
+  base: string,
+  baseName: string,
+  hasRemote: boolean,
+  options: GitOptions,
+): Promise<PublishResult> {
+  const mode: PublishMode = "merge";
+  let note: string | null = null;
+  const failure = (
+    message: string,
+    head: string | null = null,
+    branch: string | null = null,
+    prUrl: string | null = null,
+  ): PublishResult => ({
+    ok: false,
+    mode,
+    committed: head !== null,
+    head,
+    branch,
+    prUrl,
+    message: withNote(message, note),
+  });
+  let head: string | null;
+  let branchName: string;
+  if (request.kind === "content") {
+    branchName = guidanceBranchName(request.path);
+    const relative = `${DEFINITION_PREFIX}${request.path}`;
+    const guidance = await resolveGuidanceBase({ dir: request.dir, branchName, base, baseName, hasRemote, options });
+    note = backupNote(branchName, guidance.backupRef);
+    const outcome = await commitContentOnBranch({
+      dir: request.dir,
+      base: guidance.base,
+      branchRef: `refs/heads/${branchName}`,
+      relative,
+      content: request.content,
+      message: request.message,
+      signal: request.signal,
+      options,
+    });
+    if (outcome.message !== null) return failure(outcome.message, outcome.head, branchName);
+    if (!outcome.committed) {
+      return {
+        ok: true,
+        mode,
+        committed: false,
+        head: outcome.head,
+        branch: null,
+        prUrl: null,
+        message: withNote("Nothing to commit; the change was already in place.", note),
+      };
+    }
+    head = outcome.head;
+  } else {
+    branchName = request.branch;
+    head = await gitLine(request.dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}^{commit}`], options);
+    if (head === null) return failure(`No branch ${branchName} has been published; publish it first.`, null, branchName);
+  }
+  if (!hasRemote) {
+    return failure(
+      `This project has no origin remote to merge into; the commit is on ${branchName} locally. Set \`publish\` to \`push\` or add one.`,
+      head,
+      branchName,
+    );
+  }
+  const pushed = await pushRefToOrigin(request.dir, branchName, options);
+  if (pushed !== null) {
+    return failure(`The commit is on ${branchName} locally but pushing it to origin failed: ${pushed}`, head, branchName);
+  }
+  const pr = await openOrFindPullRequest({
+    dir: request.dir,
+    branch: branchName,
+    base: baseName,
+    title: request.message,
+    body: await pullRequestBody(request, base, head, options),
+    signal: request.signal,
+    options,
+  });
+  if (!pr.ok) {
+    return failure(`The branch ${branchName} is pushed but opening the pull request failed: ${pr.message}`, head, branchName);
+  }
+  const merged = await mergePullRequest({ dir: request.dir, branch: branchName, signal: request.signal, options });
+  if (!merged.ok) {
+    // The URL is in the message because the RPC surfaces only the message on a
+    // failure; `prUrl` is discarded there.
+    return failure(
+      `The pull request${pr.url === null ? "" : ` at ${pr.url}`} was left open: ${merged.message}`,
+      head,
+      branchName,
+      pr.url,
+    );
+  }
+  // The merge landed on origin; the local fast-forward and the branch cleanup
+  // are best-effort and never undo it.
+  const forward = await fastForwardDefaultBranch(request.dir, baseName, options);
+  await deleteLocalBranch(request.dir, branchName, options);
+  const mergeNote = withNote(
+    forward === null ? null : `The canonical checkout could not be fast-forwarded: ${forward}`,
+    note,
+  );
+  return { ok: true, mode, committed: true, head, branch: branchName, prUrl: pr.url, message: mergeNote };
+}
+
+/** Append a note to a message, tolerating either being absent. */
+function withNote(message: string | null, note: string | null): string | null {
+  if (message === null || message.length === 0) return note;
+  if (note === null || note.length === 0) return message;
+  return `${message} ${note}`;
+}
+
+/** The sentence a result carries when unmerged commits were moved to a backup ref. */
+function backupNote(branchName: string, backupRef: string | null): string | null {
+  return backupRef === null
+    ? null
+    : `The unmerged ${branchName} was kept at ${backupRef}; a fresh branch was cut from the default branch.`;
+}
+
+interface GuidanceBase {
+  /** The commit the new branch is based on. */
+  base: string;
+  /** A local ref holding commits that would otherwise be dropped, or null. */
+  backupRef: string | null;
+}
+
+/**
+ * Where a `guidance-` branch should be based, given what happened to it before.
+ *
+ * The rule (BB-340 deliverable 2): a branch whose tip is already an ancestor
+ * of `origin/<default>` was merged, and one that is gone from origin without
+ * being merged was a closed pull request or a failed push. Neither may be
+ * stacked on — the first would carry already-merged commits, the second is not
+ * on origin at all. In both cases the branch starts fresh from the default
+ * branch. A branch that is gone from origin but still holds unmerged commits
+ * is kept under a backup ref first, named in the result, so nothing is
+ * discarded. Only a branch that is still open on origin is stacked on.
+ */
+async function resolveGuidanceBase(args: {
+  dir: string;
+  branchName: string;
+  base: string;
+  baseName: string;
+  hasRemote: boolean;
+  options: GitOptions;
+}): Promise<GuidanceBase> {
+  const { dir, branchName, base, baseName, hasRemote, options } = args;
+  const localRef = `refs/heads/${branchName}`;
+  const localTip = await gitLine(dir, ["rev-parse", "--verify", "--quiet", `${localRef}^{commit}`], options);
+  if (localTip === null || localTip.length === 0) return { base, backupRef: null };
+  if (!hasRemote) return { base: localTip, backupRef: null };
+  const originDefault = `refs/remotes/origin/${baseName}`;
+  if (await refExists(dir, originDefault, args.options.signal)) {
+    const merged = await gitIn(dir, ["merge-base", "--is-ancestor", localTip, originDefault], options);
+    if (merged.code === 0) return { base, backupRef: null };
+    // The org ruleset only allows squash or rebase merges, which rewrite the
+    // commits, so a merged branch's tip is never an ancestor of the default
+    // branch. Check the change itself before treating the branch as unmerged.
+    if (await changeAlreadyOnDefault(dir, originDefault, localTip, options)) return { base, backupRef: null };
+  }
+  const originBranch = `refs/remotes/origin/${branchName}`;
+  const originTip = await gitLine(dir, ["rev-parse", "--verify", "--quiet", `${originBranch}^{commit}`], options);
+  if (originTip === null || originTip.length === 0) {
+    const backupRef = `refs/heads/${branchName}-backup-${localTip.slice(0, 8)}`;
+    const saved = await gitIn(dir, ["update-ref", backupRef, localTip], options);
+    // If the backup itself fails, keep the commits where they are rather than
+    // resetting over them.
+    return saved.code === 0 ? { base, backupRef } : { base: localTip, backupRef: null };
+  }
+  if (originTip === localTip) return { base: localTip, backupRef: null };
+  // The two tips can differ if the branch was pushed elsewhere; base on the
+  // descendant so the push stays a fast-forward either way.
+  const localIsAncestor = await gitIn(dir, ["merge-base", "--is-ancestor", localTip, originTip], options);
+  return localIsAncestor.code === 0 ? { base: originTip, backupRef: null } : { base: localTip, backupRef: null };
+}
+
+/**
+ * Whether `tip`'s change is already present on `defaultRef`.
+ *
+ * A squash or rebase merge rewrites the branch's commits, so its tip is not an
+ * ancestor of the default branch even though the change landed. Merging the tip
+ * into the default produces the default's own tree exactly when there is
+ * nothing left to apply. Returns false when git cannot compute the merge (a
+ * conflict, or an old git), which keeps the conservative backup path.
+ */
+async function changeAlreadyOnDefault(
+  dir: string,
+  defaultRef: string,
+  tip: string,
+  options: GitOptions,
+): Promise<boolean> {
+  const merged = await gitIn(dir, ["merge-tree", "--write-tree", defaultRef, tip], options);
+  if (merged.code !== 0) return false;
+  const resultTree = merged.stdout.trim().split("\n")[0]?.trim() ?? "";
+  const defaultTree = await gitLine(dir, ["rev-parse", `${defaultRef}^{tree}`], options);
+  return resultTree.length > 0 && defaultTree !== null && resultTree === defaultTree;
+}
+
+/** The pull request body: what the publish is, and the branch's net change. */async function pullRequestBody(
+  request: PublishRequest,
+  base: string,
+  head: string | null,
+  options: GitOptions,
+): Promise<string> {
+  const lines = [`Publishes \`.bb/${request.path}\` for review, by the project's publish policy (BB-340).`];
+  const stat = head === null ? null : await gitLine(request.dir, ["diff", "--stat", base, head], options);
+  if (stat !== null && stat.trim().length > 0) {
+    lines.push("", "Net change against the default branch:", "", "```", stat.trim(), "```");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Squash-merge an open pull request, once its required checks have finished.
+ *
+ * Plain `gh pr merge --squash --delete-branch`, never `--admin` or any other
+ * bypass: whatever the ruleset or a required check refuses is reported and the
+ * pull request is left open. A skipped required check counts as passing.
+ */
+async function mergePullRequest(args: {
+  dir: string;
+  branch: string;
+  signal?: AbortSignal;
+  options: GitOptions;
+}): Promise<{ ok: boolean; message: string | null }> {
+  const common = {
+    cwd: args.dir,
+    timeoutMs: args.options.timeoutMs,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
+  };
+  try {
+    await waitForRequiredChecks(args.dir, args.branch, args.signal, args.options);
+    const merged = await run("gh", ["pr", "merge", args.branch, "--squash", "--delete-branch"], common);
+    return merged.code === 0 ? { ok: true, message: null } : { ok: false, message: firstProblemLine(merged) };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { ok: false, message: "The gh CLI is not installed on this machine." };
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Wait briefly for the pull request to become mergeable before merging.
+ *
+ * `mergeStateStatus` is GitHub's own answer to "can this merge now": it is
+ * `UNKNOWN` while mergeability is still being computed and `BLOCKED` while a
+ * required check (or review) is outstanding, and only reaches `CLEAN`,
+ * `HAS_HOOKS` or `UNSTABLE` when the required checks have passed — a skipped
+ * required check counts as passing. Optional checks never block it. A failed
+ * `gh pr view` is not an error here: the merge attempt that follows reports the
+ * real reason.
+ */
+async function waitForRequiredChecks(
+  dir: string,
+  branch: string,
+  signal: AbortSignal | undefined,
+  options: GitOptions,
+): Promise<void> {
+  const common = { cwd: dir, timeoutMs: options.timeoutMs, ...(signal === undefined ? {} : { signal }) };
+  const deadline = Date.now() + MERGE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const view = await run("gh", ["pr", "view", branch, "--json", "mergeStateStatus"], common);
+    if (view.code !== 0) return;
+    let status: string | null = null;
+    try {
+      const json = JSON.parse(view.stdout) as { mergeStateStatus?: unknown };
+      status = typeof json.mergeStateStatus === "string" ? json.mergeStateStatus.toUpperCase() : null;
+    } catch {
+      return;
+    }
+    // CLEAN/HAS_HOOKS/UNSTABLE mean the required checks are done and the merge
+    // is allowed; anything else (UNKNOWN, BLOCKED, BEHIND, DIRTY, DRAFT) waits
+    // out the brief budget and then lets `gh pr merge` report the reason.
+    if (status !== null && ["CLEAN", "HAS_HOOKS", "UNSTABLE"].includes(status)) return;
+    await sleep(MERGE_POLL_MS, signal);
+  }
+}
+
+/** A cancellable sleep. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted === true) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+/**
+ * Fast-forward the canonical checkout's default branch to `origin/<default>`
+ * after a merge. Returns a problem sentence, or null on success. The local
+ * branch is only moved when the move is a fast-forward; a diverged branch is
+ * left exactly where it is.
+ */
+async function fastForwardDefaultBranch(dir: string, baseName: string, options: GitOptions): Promise<string | null> {
+  const fetched = await gitIn(dir, ["fetch", "--quiet", "origin"], options);
+  if (fetched.code !== 0) return firstProblemLine(fetched);
+  const originRef = `refs/remotes/origin/${baseName}`;
+  const localRef = `refs/heads/${baseName}`;
+  const originTip = await gitLine(dir, ["rev-parse", "--verify", "--quiet", `${originRef}^{commit}`], options);
+  if (originTip === null) return `${originRef} is not present after the fetch.`;
+  const localTip = await gitLine(dir, ["rev-parse", "--verify", "--quiet", `${localRef}^{commit}`], options);
+  if (localTip === originTip) return null;
+  const current = await gitLine(dir, ["rev-parse", "--abbrev-ref", "HEAD"], options);
+  if (current === baseName) {
+    const merged = await gitIn(dir, ["merge", "--ff-only", "--quiet", originRef], options);
+    return merged.code === 0 ? null : firstProblemLine(merged);
+  }
+  if (localTip !== null) {
+    const ancestor = await gitIn(dir, ["merge-base", "--is-ancestor", localTip, originTip], options);
+    if (ancestor.code !== 0) return `${localRef} has diverged from ${originRef}.`;
+  }
+  const updated = await gitIn(dir, ["update-ref", localRef, originTip], options);
+  return updated.code === 0 ? null : firstProblemLine(updated);
+}
+
+/** Delete a local guidance branch after a successful merge; best-effort. */
+async function deleteLocalBranch(dir: string, branchName: string, options: GitOptions): Promise<void> {
+  await gitIn(dir, ["branch", "-D", branchName], options).catch(() => undefined);
 }
 
 /** Write, stage and commit `content` at `relative` on the checked-out branch. */
@@ -1225,7 +1584,9 @@ async function pushRefToOrigin(dir: string, branch: string, options: GitOptions)
  *
  * A second panel edit pushes onto the same `guidance-` branch, so a PR for it
  * already exists; `gh pr create` would fail on that, and the right answer is
- * the existing URL, not an error.
+ * the existing URL, not an error. The existing pull request's title and body
+ * are rewritten to describe the net change rather than keeping the first
+ * commit's title (BB-340 deliverable 3).
  */
 async function openOrFindPullRequest(args: {
   dir: string;
@@ -1253,7 +1614,12 @@ async function openOrFindPullRequest(args: {
       return { ok: false, url: null, message: `Could not check for an existing pull request: ${firstProblemLine(listed)}` };
     }
     const existing = firstPullRequestUrl(listed.stdout);
-    if (existing !== null) return { ok: true, url: existing, message: null };
+    if (existing !== null) {
+      const updated = await editPullRequest({ ...args, common });
+      return updated === null
+        ? { ok: true, url: existing, message: null }
+        : { ok: false, url: existing, message: `Could not update the open pull request: ${updated}` };
+    }
     const bodyDir = await mkdtemp(path.join(tmpdir(), "bb-pr-"));
     const bodyPath = path.join(bodyDir, "body.md");
     await writeFile(bodyPath, args.body, "utf8");
@@ -1272,6 +1638,29 @@ async function openOrFindPullRequest(args: {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return { ok: false, url: null, message: "The gh CLI is not installed on this machine." };
     return { ok: false, url: null, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Rewrite an open pull request's title and body; returns an error, or null. */
+async function editPullRequest(args: {
+  dir: string;
+  branch: string;
+  title: string;
+  body: string;
+  common: RunOptions;
+}): Promise<string | null> {
+  const bodyDir = await mkdtemp(path.join(tmpdir(), "bb-pr-"));
+  const bodyPath = path.join(bodyDir, "body.md");
+  await writeFile(bodyPath, args.body, "utf8");
+  try {
+    const edited = await run(
+      "gh",
+      ["pr", "edit", args.branch, "--title", args.title, "--body-file", bodyPath],
+      args.common,
+    );
+    return edited.code === 0 ? null : firstProblemLine(edited);
+  } finally {
+    await rm(bodyDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -1381,6 +1770,67 @@ async function pushGuidancePrimary(
       await gitIn(projectSourcePath, ["update-ref", ref, sha], options);
       return { ok: true, ref, message: [`No .bb changes to publish; ${ref} points at the default branch.`, ...warnings].join(" ") };
     }
+    // BB-340: a merge-mode path must never share the guidance branch's commit.
+    // `repos.json` is the primary default for `merge`, so when it changed
+    // alongside guidance, it is published on its own branch through
+    // `publishDefinition` and everything else stays on `guidance-<thread>`.
+    //
+    // Auto-merge it only when this thread actually changed it and the default
+    // branch's copy has not moved since provisioning: a wholesale copy of the
+    // workspace's `.bb` would otherwise revert a `repos.json` change that
+    // landed on the default branch after this workspace was cut. When the
+    // default moved, the write falls through to the guidance branch (with the
+    // existing "changed since provisioned" warning) instead of merging.
+    const changed = splitNul((await gitIn(worktree, ["diff", "--cached", "--name-only", "-z"], options)).stdout);
+    const reposRel = `${PROJECT_SOURCE_DIR}/${REPOS_FILE}`;
+    const policy = await projectPublishPolicy(projectSourcePath, "primary", signal);
+    const workspaceRepos = await readFile(path.join(workspaceBbPath, REPOS_FILE), "utf8").catch(() => null);
+    const definitionRepos = definitionBase == null ? null : await showAt(projectSourcePath, `${definitionBase}:${reposRel}`, options);
+    const baseRepos = await showAt(projectSourcePath, `${base}:${reposRel}`, options);
+    const threadChangedRepos = workspaceRepos !== null && definitionRepos !== null && workspaceRepos !== definitionRepos;
+    const threadUnchangedRepos = workspaceRepos !== null && definitionRepos !== null && workspaceRepos === definitionRepos;
+    const defaultMovedRepos = definitionRepos !== null && baseRepos !== null && definitionRepos !== baseRepos;
+    if (
+      resolvePublishMode(policy, "primary", REPOS_FILE) === "merge" &&
+      changed.includes(reposRel) &&
+      threadChangedRepos &&
+      !defaultMovedRepos
+    ) {
+      const split = await publishSplitGuidance({
+        projectSourcePath,
+        workspaceBbPath,
+        worktree,
+        threadId,
+        ref,
+        policy,
+        guidanceChanged: changed.filter((entry) => entry !== reposRel),
+        signal,
+        options,
+      });
+      return {
+        ok: split.ok,
+        ref: split.ref,
+        message: [...split.messages, ...warnings].join(" "),
+      };
+    }
+    // The thread did not change `repos.json` but the default branch's copy
+    // moved: put the default's copy back so the guidance branch does not carry
+    // a revert of a change that landed after this workspace was cut. If that
+    // was the only change, the write is the usual no-op.
+    if (changed.includes(reposRel) && threadUnchangedRepos) {
+      await gitIn(worktree, ["checkout", base, "--", reposRel], options);
+      const stillStaged = await gitIn(worktree, ["diff", "--cached", "--quiet"], options);
+      if (stillStaged.code === 0) {
+        sha = await gitLine(projectSourcePath, ["rev-parse", base], options);
+        if (sha === null) return { ok: false, ref: null, message: `Could not resolve ${base}.` };
+        await gitIn(projectSourcePath, ["update-ref", ref, sha], options);
+        return {
+          ok: true,
+          ref,
+          message: [`No .bb changes to publish; ${ref} points at the default branch.`, ...warnings].join(" "),
+        };
+      }
+    }
     const commit = await commitAll(worktree, `Publish guidance from ${threadId}`, signal);
     if (!commit.committed || commit.head === null) {
       return { ok: false, ref: null, message: commit.message ?? "Could not commit the guidance." };
@@ -1402,6 +1852,80 @@ async function pushGuidancePrimary(
     await gitIn(projectSourcePath, ["worktree", "remove", "--force", worktree], options).catch(() => undefined);
     await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/** One file's content at a ref, or null when the ref or file does not resolve. */
+async function showAt(dir: string, ref: string, options: GitOptions): Promise<string | null> {
+  const result = await gitIn(dir, ["show", ref], { ...options, maxBytes: 2_000_000 });
+  return result.code === 0 ? result.stdout : null;
+}
+
+/**
+ * Split a workspace `.bb` publish that carries `repos.json` alongside guidance.
+ *
+ * The `repos.json` half goes through {@link publishDefinition} on its own
+ * branch (its policy default is `merge`), so it never rides in the guidance
+ * branch's commit. The remaining paths stay on the thread's `guidance-`
+ * branch, pushed as before for a person to review. Each half's outcome is
+ * reported, and the whole publish is `ok` only when both are.
+ */
+async function publishSplitGuidance(args: {
+  projectSourcePath: string;
+  workspaceBbPath: string;
+  worktree: string;
+  threadId: string;
+  ref: string;
+  policy: PublishPolicy | undefined;
+  guidanceChanged: string[];
+  signal?: AbortSignal;
+  options: GitOptions;
+}): Promise<{ ok: boolean; ref: string | null; messages: string[] }> {
+  const messages: string[] = [];
+  const reposRel = `${PROJECT_SOURCE_DIR}/${REPOS_FILE}`;
+  const content = await readFile(path.join(args.workspaceBbPath, REPOS_FILE), "utf8").catch(() => null);
+  if (content === null) {
+    return { ok: false, ref: null, messages: [`Could not read ${reposRel} to publish it.`] };
+  }
+  const repos = await publishDefinition({
+    kind: "content",
+    dir: args.projectSourcePath,
+    layout: "primary",
+    policy: args.policy,
+    path: REPOS_FILE,
+    content,
+    message: `Update the repo set from ${args.threadId}`,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
+  });
+  if (repos.ok) {
+    messages.push(repos.prUrl === null ? `Published ${reposRel}.` : `Merged ${repos.prUrl}.`);
+    if (repos.message !== null) messages.push(repos.message);
+  } else {
+    messages.push(
+      repos.prUrl === null
+        ? `Publishing ${reposRel} failed: ${repos.message ?? "unknown error"}`
+        : `The pull request for ${reposRel} was left open at ${repos.prUrl}: ${repos.message ?? "unknown reason"}`,
+    );
+  }
+  let guidanceRef: string | null = null;
+  if (args.guidanceChanged.length > 0) {
+    // Stage only the guidance paths, so the repos.json change stays out of
+    // this commit even though it is still in the worktree.
+    await gitIn(args.worktree, ["reset", "--quiet"], args.options);
+    await gitIn(args.worktree, ["add", "-A", "--", ...args.guidanceChanged], args.options);
+    const commit = await commitAll(args.worktree, `Publish guidance from ${args.threadId}`, args.signal);
+    if (!commit.committed || commit.head === null) {
+      return { ok: false, ref: null, messages: [...messages, commit.message ?? "Could not commit the guidance."] };
+    }
+    const updated = await gitIn(args.projectSourcePath, ["update-ref", args.ref, commit.head], args.options);
+    if (updated.code !== 0) {
+      return { ok: false, ref: null, messages: [...messages, firstProblemLine(updated)] };
+    }
+    const pushed = await gitIn(args.projectSourcePath, ["push", "--quiet", "origin", `${args.ref}:${args.ref}`], args.options);
+    const pushedNote = pushed.code === 0 ? " It is pushed to origin." : " Push it to origin to open a pull request.";
+    guidanceRef = args.ref;
+    messages.push(`Published ${commit.head.slice(0, 8)} to ${args.ref} in ${args.projectSourcePath}.${pushedNote}`);
+  }
+  return { ok: repos.ok, ref: guidanceRef, messages };
 }
 
 /** The `guidance-<thread>` ref a thread's published commits land on. */
