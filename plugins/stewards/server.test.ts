@@ -8,14 +8,14 @@ import { comment, crashingPod, githubIssue, issue, parkedWorker, pull, warningEv
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
-import { needActions, parseDotenvValue, refreshPrompt, secretVariable } from "./server.js";
+import { needActions, parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
 import { parseTemplateStamp, templateHash } from "./template-stamp.js";
 import { DEFAULT_ALERTMANAGER_URL } from "./alertmanager.js";
 import { STANDING_RULES } from "./wake.js";
-import { setup } from "./test-world.js";
+import { setup, SHIPPED_SKILLS } from "./test-world.js";
 
 /**
  * The decide-list entry BB-280 landed on bb-gate `main` for playbooks (read
@@ -266,6 +266,29 @@ describe("a Linear ticket steward", () => {
     expect(t.sends).toHaveLength(1);
     expect(t.sends[0]!.text).toMatch(/1 new comment from Sam/u);
     expect(t.sends[0]!.text).toMatch(/Can we also cover SSO\?/u);
+  });
+
+  // A wake tells the steward to have its worker follow build-tickets, and the
+  // worker spawns its reviewer to follow pr-reviewer; the reviewer is the
+  // worker's child, not the steward's. Every thread the plugin touches gets
+  // every skill it ships.
+  it("gives every thread every skill the plugin ships: steward, project steward, worker and the worker's reviewer", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    await t.created("thr_w1", steward!, "ENG-12: Implement");
+
+    const skills = async (thread: { id: string; parentThreadId: string | null }, pluginMetadata: Record<string, string> = {}) =>
+      (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ pluginMetadata, thread: { ...thread, title: null, sourceThreadId: null } }))).skills;
+    const all = ["stewards", "build-tickets", "pr-reviewer", "onboarding"];
+    expect(await skills({ id: steward!, parentThreadId: null })).toEqual(all);
+    expect(await skills({ id: project!, parentThreadId: null })).toEqual(all);
+    expect(await skills({ id: "thr_w1", parentThreadId: steward! })).toEqual(all);
+    expect(await skills({ id: "thr_r1", parentThreadId: "thr_w1" })).toEqual(all);
+    expect(await skills({ id: "thr_onboard", parentThreadId: null }, { role: "onboarding" })).toEqual(all);
+    // A skill added under skills/ is given too.
+    expect([...STEWARDS_SKILLS].sort()).toEqual(SHIPPED_SKILLS);
   });
 
   // BB-248: a label that moves the phase with no state change is news of its

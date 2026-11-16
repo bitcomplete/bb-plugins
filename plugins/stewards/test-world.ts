@@ -2,11 +2,18 @@
 // serving `.bb`, linear and github serving snapshots, and bb's threads. Moved
 // out of server.test.ts unchanged so a second test file can run a real
 // reconcile over the same harness (BB-297). Not loaded by the plugin.
+import { readdirSync } from "node:fs";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { createStewardsPlugin, SECRET_SETTING_NAMES, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, sourceContract, type EntitySnapshot } from "./source-contract.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
+
+/** The skills bb registers for this plugin: each directory under `skills/` (package.json `bb.skills`). */
+export const SHIPPED_SKILLS = readdirSync(new URL("./skills/", import.meta.url), { withFileTypes: true })
+  .filter((d) => d.isDirectory())
+  .map((d) => d.name)
+  .sort();
 
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
@@ -634,7 +641,7 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
   if (seedProvider === "fail-set" || seedNavigation === "fail-set") w.sdk.system.uiPreferences.set = async () => {
     throw new Error("the preferences store is down");
   };
-  const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards", "onboarding"], settings });
+  const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: SHIPPED_SKILLS, settings });
   await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
   // The local per-project switch is off by default; tests that are not about
