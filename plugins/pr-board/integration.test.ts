@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { calmRowSchema, stateSchema, viewModelSchema, type Runner } from "./board";
 import { createPlugin } from "./server";
+import { DEFAULT_AGENT_MODEL } from "./agent-model";
 import { prsReviewSchema } from "./reviews";
 import type { Github } from "./reviewers";
 
@@ -83,9 +84,9 @@ it("proxies the independent Review Watch contract, including unknown delta and e
   expect(remote[2]?.input).toEqual({ keys: [review.item.key] });
   expect(githubCalls).toEqual([]);
   await harness.behavior.callRpc("reviews_start", { key: review.item.key, projectId: "project-1" });
-  expect(remote.at(-1)).toEqual({ method: "item_start", input: { key: review.item.key, projectId: "project-1" } });
+  expect(remote.at(-1)).toEqual({ method: "item_start", input: { key: review.item.key, projectId: "project-1", agentModel: DEFAULT_AGENT_MODEL } });
   await harness.behavior.callRpc("reviews_batch", { keys: [review.item.key], projectId: "project-1" });
-  expect(remote.at(-1)).toEqual({ method: "item_batch_start", input: { keys: [review.item.key], projectId: "project-1" } });
+  expect(remote.at(-1)).toEqual({ method: "item_batch_start", input: { keys: [review.item.key], projectId: "project-1", agentModel: DEFAULT_AGENT_MODEL } });
   await harness.behavior.callRpc("reviews_dismiss", { key: review.item.key });
   expect(remote.at(-1)).toEqual({ method: "item_dismiss", input: { key: review.item.key } });
 });

@@ -102,7 +102,8 @@ threads in which the user participated.
   request changes, comment, or resolve a review thread.
 - Never push code from a review thread. Present findings and next actions in
   the thread for the user.
-- Change the queue only through `bb review-watch`. Do not edit bb.db or the
+- Change the queue through `bb review-watch` or user-authorized `prs_act`
+  calls that use PR board's public operations. Do not edit bb.db or the
   plugin's storage directly.
 - An empty queue with a failed `last poll` in `bb review-watch status` does not
   prove that no reviews need attention. Read the poll error. For transport
@@ -125,4 +126,13 @@ Configure with `bb plugin config review-watch`:
 | `pollMinutes` | Poll interval in minutes. Defaults to 5. |
 | `repoAllowlist` | Comma-separated `owner/name` entries. Empty watches every repository. |
 | `maxAgeDays` | Drop an item this old even if GitHub still lists it. Defaults to 14. |
-| `provider`, `model` | Optional. Passed through when a review thread spawns. |
+| `provider`, `model` | Optional explicit execution defaults. Without these settings or a per-start choice, reviews use Codex `gpt-6.1-sol` at `xhigh`. |
+
+
+The PRs panel forwards its shared saved `agentModel` to single and batch
+review starts. An explicit per-start choice takes precedence over Review
+Watch's settings. The backend validates the provider, model, reasoning level,
+and optional service tier against the selected project's checkout host.
+Models without reasoning controls omit the reasoning level. A failed
+validation leaves the queue unchanged. Review threads draft findings; they
+do not post reviews, approvals, comments, or code.

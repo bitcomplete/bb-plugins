@@ -35,6 +35,13 @@ import {
 import { lastPollSchema, prsReviewSchema, prsSnapshotSchema } from "./src/prs-contract.js";
 import { createPrsInbox } from "./src/prs.js";
 
+const agentModelSchema = z.object({
+  providerId: z.string().min(1).max(200), model: z.string().min(1).max(300),
+  reasoningLevel: z.string().min(1).max(100).optional(), serviceTier: z.string().min(1).max(100).optional(),
+}).strict();
+type AgentModelChoice = z.infer<typeof agentModelSchema>;
+const DEFAULT_AGENT_MODEL: AgentModelChoice = { providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: "xhigh" };
+
 const CONFIGURE_HINT =
   "Set project with `bb plugin config review-watch`, and authenticate to GitHub " +
   "either by setting githubToken or by running `gh auth login` on this host, " +
@@ -225,11 +232,11 @@ export const rpcContract = defineRpcContract({
     }),
   },
   item_start: {
-    input: z.object({ key: z.string().min(1), projectId: z.string().min(1).optional() }),
+    input: z.object({ key: z.string().min(1), projectId: z.string().min(1).optional(), agentModel: agentModelSchema.optional() }),
     output: z.object({ item: queueItemSchema }),
   },
   item_batch_start: {
-    input: z.object({ keys: z.array(z.string().min(1)).min(1), projectId: z.string().min(1).optional() }),
+    input: z.object({ keys: z.array(z.string().min(1)).min(1), projectId: z.string().min(1).optional(), agentModel: agentModelSchema.optional() }),
     output: z.object({ threadId: z.string(), items: z.array(queueItemSchema) }),
   },
   review_targets: {
@@ -659,7 +666,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function reviewEnvironment(
     projectId: string,
-  ): Promise<Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"]> {
+  ) {
     const project = await bb.sdk.projects.get({ projectId });
     const source = project.sources.find((source) => source.isDefault) ??
       (project.sources.length === 1 ? project.sources[0] : undefined);
@@ -670,10 +677,28 @@ export default async function plugin(bb: BbPluginApi) {
       type: "host",
       hostId: source.hostId,
       workspace: { type: "unmanaged", path: source.path },
-    };
+    } satisfies NonNullable<Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"]>;
   }
 
-  async function startItem(key: string, override?: string): Promise<Lookup> {
+  async function reviewAgent(projectId: string, hostId: string, override?: AgentModelChoice): Promise<AgentModelChoice> {
+    const providerId = override?.providerId ?? current.provider ?? DEFAULT_AGENT_MODEL.providerId;
+    const catalog = await bb.sdk.providers.models({ projectId, hostId, providerId });
+    if (catalog.modelLoadError) throw new Error(`Could not load the ${providerId} model catalog: ${catalog.modelLoadError.detail ?? catalog.modelLoadError.code}`);
+    if (!catalog.providers.some((provider) => provider.id === providerId && provider.available)) throw new Error(`Agent provider ${providerId} is unavailable on the review checkout host.`);
+    const requested = override?.model ?? current.model ?? (current.provider === undefined || current.provider === DEFAULT_AGENT_MODEL.providerId ? DEFAULT_AGENT_MODEL.model : undefined);
+    const models = catalog.models.filter((model) => !model.routeProviderId || model.routeProviderId === providerId);
+    const model = requested ? models.find((model) => model.model === requested) : models.find((model) => model.isDefault) ?? models[0];
+    if (!model) throw new Error(`Agent model ${requested ?? "default"} is unavailable for ${providerId}.`);
+    const configured = current.provider !== undefined || current.model !== undefined;
+    const reasoningLevel = override ? override.reasoningLevel : (configured && !model.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === "xhigh") ? (model.supportedReasoningEfforts.length ? model.defaultReasoningEffort : undefined) : DEFAULT_AGENT_MODEL.reasoningLevel);
+    if (reasoningLevel === undefined ? model.supportedReasoningEfforts.length > 0 : !model.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === reasoningLevel)) throw new Error(`Reasoning level ${reasoningLevel} is unavailable for ${model.model}.`);
+    const serviceTier = override?.serviceTier === "default" ? undefined : override?.serviceTier;
+    if (serviceTier && !model.supportedServiceTiers?.some((tier) => tier.id === serviceTier)) throw new Error(`Service tier ${serviceTier} is unavailable for ${model.model}.`);
+    if (disposed) throw new Error("Review Watch was disposed before the review started.");
+    return { providerId, model: model.model, ...(reasoningLevel ? { reasoningLevel } : {}), ...(serviceTier ? { serviceTier } : {}) };
+  }
+
+  async function startItem(key: string, override?: string, agentModel?: AgentModelChoice): Promise<Lookup> {
     return withQueueLock(async () => {
       const items = await readQueue();
       const found = lookup(items, key);
@@ -685,15 +710,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       const projectId = reviewProject([item], override);
+      const environment = await reviewEnvironment(projectId);
+      const agent = await reviewAgent(projectId, environment.hostId, agentModel);
 
       const thread = await bb.sdk.threads.spawn({
         projectId,
         prompt: promptFor(item),
         title: `Review ${item.repo}#${item.number} (${prSummary(item)})`,
-        environment: await reviewEnvironment(projectId),
+        environment,
         pluginMetadata: { itemKey: item.key, repo: item.repo, number: item.number },
-        ...(current.provider === undefined ? {} : { providerId: current.provider }),
-        ...(current.model === undefined ? {} : { model: current.model }),
+        ...agent,
       });
 
       const started: QueueItem = { ...item, state: "started", threadId: thread.id };
@@ -703,19 +729,20 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function startBatch(keys: string[], override?: string): Promise<{ threadId: string; items: QueueItem[] }> {
+  async function startBatch(keys: string[], override?: string, agentModel?: AgentModelChoice): Promise<{ threadId: string; items: QueueItem[] }> {
     return withQueueLock(async () => {
       const queue = await readQueue();
       const selected = selectedReviews(queue, keys);
       const projectId = reviewProject(selected, override);
+      const environment = await reviewEnvironment(projectId);
+      const agent = await reviewAgent(projectId, environment.hostId, agentModel);
       const thread = await bb.sdk.threads.spawn({
         projectId,
         prompt: batchPrompt(selected),
         title: `Review ${selected.length} pull requests`,
-        environment: await reviewEnvironment(projectId),
+        environment,
         pluginMetadata: { itemKeys: selected.map((item) => item.key) },
-        ...(current.provider === undefined ? {} : { providerId: current.provider }),
-        ...(current.model === undefined ? {} : { model: current.model }),
+        ...agent,
       });
       const started = selected.map((item): QueueItem => ({ ...item, state: "started", threadId: thread.id }));
       const byKey = new Map(started.map((item) => [item.key, item]));
@@ -752,12 +779,12 @@ export default async function plugin(bb: BbPluginApi) {
       items: await visibleQueue(),
       lastPoll: await readLastPoll(),
     }),
-    item_start: async ({ key, projectId }) => {
-      const result = await startItem(key, projectId);
+    item_start: async ({ key, projectId, agentModel }) => {
+      const result = await startItem(key, projectId, agentModel);
       if (!result.ok) throw new Error(result.message);
       return { item: result.item };
     },
-    item_batch_start: async ({ keys, projectId }) => startBatch(keys, projectId),
+    item_batch_start: async ({ keys, projectId, agentModel }) => startBatch(keys, projectId, agentModel),
     review_targets: async ({ keys }): Promise<z.infer<typeof rpcContract.review_targets.output>> => {
       const selected = selectedReviews(await readQueue(), keys);
       const projects = (await bb.sdk.projects.list())

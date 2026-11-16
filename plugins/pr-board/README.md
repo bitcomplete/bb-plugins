@@ -11,6 +11,11 @@ under the unit bar to filter the list. Every open PR occupies one cell.
 The bar uses proportional group blocks when the cells no longer fit or the
 board contains more than 120 items.
 
+Use **Organization** to show one repository owner's PRs across both tabs.
+The panel remembers this filter across visits and clears selections when you
+change it. Following an explicit review link switches organizations when
+needed. The sidebar attention badge covers all organizations.
+
 The sidebar uses bb's native dot. It stays hidden when nothing needs you,
 uses a neutral tone for 1–4 pending items, amber for 5–14, and red for 15 or
 more. An unanswered agent question or a review queued for at least two days
@@ -33,9 +38,16 @@ use the same layout; author-fix agents remain scoped to Parsley repositories.
 Click a title to expand its stack, real check results, review state, size,
 and links. Only one row expands at a time. Hover or focus a row for its PR
 number, action, and selection checkbox. Select mixed fixes to choose a
-stopping point in the floating toolbar. At most five fix threads start per
-click; the panel reports skipped items. Every start refetches GitHub and
-checks that the chosen action still applies.
+stopping point in the floating toolbar. Up to 100 selected fixes share one
+coordinator thread; the panel reports skipped items and later preparation
+refusals. Every start refetches GitHub and checks that each chosen action still
+applies. A shared agent question has one answer card with its linked PR count;
+the other rows retain their individual context and shared thread link.
+
+Use Left and Right Arrow, Home, and End to switch tabs. Use the arrow keys
+to select a status, skipping empty statuses. Press Space to toggle a focused
+selection checkbox or disclosure. Dialogs keep keyboard focus inside until
+you close them; a pending request blocks dismissal.
 
 **To review** reads the companion Review Watch plugin through its public
 RPCs. Quick reads include completed review drafts, follow-up deltas below
@@ -56,12 +68,18 @@ detected; the existing board rules inspect inline review threads.
 
 ## Review requests and agent answers
 
-Review requests require an explicit click. The picker lists current eligible
-repository collaborators, suggests individual CODEOWNERS, and shows their
+Request reviews through the panel's explicit Send action or user-authorized
+`prs_act` operations. The picker lists current eligible repository collaborators, suggests individual CODEOWNERS, and shows their
 existing board load. Missing ownership keeps the picker available. Before
 sending, the server refetches the PR and validates the selected logins.
 
-Fix threads use the existing Parsley project and Claude Code Opus defaults.
+The header's **Agent** picker selects a provider, model, reasoning level, and
+supported service tier for fixes and reviews. The default is Codex Sol 6.1
+with xhigh reasoning. The panel loads your saved choice before enabling starts
+and remembers changes across panel visits. A failed save keeps the confirmed
+choice. Each start captures one choice for the whole request.
+
+Fix threads use the existing Parsley project.
 Every playbook forbids merging, releases, and deploys. Prepare commits locally
 and reports; Publish can push, reply, and request review. The common playbook
 requires a final `pr-board-question` JSON block for a blocking decision.
@@ -75,6 +93,18 @@ outcome is uncertain, preventing duplicate sends.
 The bb server host needs authenticated `gh` and `python3` on `PATH`.
 Install both `pr-board` and `review-watch` for the combined experience.
 Mine remains available if Review Watch is missing or fails.
+
+In browsers with WebMCP, each open PRs panel exposes `prs_ui_snapshot`,
+`prs_ui_query`, and `prs_ui_act`. These tools read bounded SDK component
+state and change that panel's local tabs, filters, selection, and disclosures.
+They require an exact live panel ID and component reference. The browser
+bridge cannot start agents, send review requests or answers, dismiss reviews,
+change the saved agent model, or act on another plugin. Without WebMCP,
+the panel remains interactive and the typed BB PR tools remain available.
+The bridge requires the current
+`document.modelContext.registerTool(tool, { signal })` lifecycle. Legacy APIs
+that expose `unregisterTool` are unsupported; the bridge registers no tools
+and reports `unsupported-lifecycle`.
 
 ```sh
 npm ci --include=dev
@@ -112,6 +142,14 @@ link Mine gates to To review items.
 
 ## Develop
 
+The frontend uses matching, exact versions of `@ui-sdk/react` and
+`@ui-sdk/core`. Before changing its controls, read the bundled
+`node_modules/@ui-sdk/core/skills/ui-sdk/SKILL.md` and
+`node_modules/@ui-sdk/react/docs/llms.txt`, then the relevant component pages.
+The SDK owns tabs, status selection, disclosures, checkboxes, and dialog
+behavior. `calm.css` supplies their appearance without the SDK's default theme.
+BB owns navigation, URL links, RPCs, and the native sidebar badge.
+
 ```sh
 npm run typecheck
 TZ=UTC npm test
@@ -120,7 +158,9 @@ npm run build
 
 `build.py` fetches and derives GitHub facts. `simple.py` owns the canonical
 rows and preserves legacy CLI sections. `server.ts` owns refresh, start,
-answer, and cross-plugin operations. SQLite holds the full board and source
-snapshot; KV holds the smaller agent markers. `reviewers.ts` owns eligibility and
+answer, and cross-plugin operations. SQLite stores the full board, source
+snapshot, and agent markers, including large shared questions for selections
+of up to 100 PRs. After activation, one initializer imports legacy KV state
+before reading or updating the board. `reviewers.ts` owns eligibility and
 explicit GitHub review requests. `reviews.ts` validates Review Watch's
 published version 1 wire contract without importing its source or storage.

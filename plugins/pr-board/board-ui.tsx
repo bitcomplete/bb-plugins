@@ -1,5 +1,21 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import * as Dialog from "@radix-ui/react-dialog";
+import {
+  Dialog,
+  DialogBackdrop,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@ui-sdk/react/dialog";
+import {
+  Collapsible,
+  CollapsiblePanel,
+  CollapsibleTrigger,
+} from "@ui-sdk/react/collapsible";
+import { Checkbox, CheckboxIndicator } from "@ui-sdk/react/checkbox";
+import {
+  SegmentedControl,
+  SegmentedControlItem,
+} from "@ui-sdk/react/segmented-control";
 import { UrlLink, useBbNavigate } from "@get-bb/plugin-sdk/app";
 import type { Action, CalmRow, MarkerView, Stop, ViewModel } from "./board";
 
@@ -10,6 +26,22 @@ export type MinePr = {
   marker: MarkerView | undefined;
   segment: MineSegment;
 };
+export type AgentQuestionGroup = [MinePr, ...MinePr[]];
+export function groupAgentQuestions(prs: MinePr[]): AgentQuestionGroup[] {
+  const groups = new Map<string, AgentQuestionGroup>();
+  for (const pr of prs) {
+    const marker = pr.marker;
+    if (marker?.status !== "asking" || !marker.question) continue;
+    const key = JSON.stringify([
+      marker.threadId ?? pr.row.key,
+      marker.question.id,
+    ]);
+    const group = groups.get(key);
+    if (group) group.push(pr);
+    else groups.set(key, [pr]);
+  }
+  return [...groups.values()];
+}
 export const MINE_SEGMENTS: { id: MineSegment; label: string; tone: string }[] =
   [
     { id: "on-you", label: "on you", tone: "amber" },
@@ -129,57 +161,54 @@ export function CalmDialog({
   title: string;
   description: string;
   onClose: () => void;
-  children: ReactNode;
+  children: (close: () => void) => ReactNode;
   busy?: boolean;
 }) {
   const [opener] = useState(() => ({
     element: document.activeElement,
     url: window.location.href,
   }));
+  const [open, setOpen] = useState(true);
+  const finalFocus = (() => {
+    const element = opener.element;
+    if (
+      busy ||
+      window.location.href !== opener.url ||
+      !(element instanceof HTMLElement) ||
+      !element.isConnected
+    )
+      return "none";
+    const visible =
+      typeof element.checkVisibility === "function"
+        ? element.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+          })
+        : element.getClientRects().length > 0 &&
+          getComputedStyle(element).visibility === "visible";
+    return visible ? element : "none";
+  })();
   return (
-    <Dialog.Root
-      open
-      onOpenChange={(open) => {
-        if (!open && !busy) onClose();
+    <Dialog
+      open={open}
+      dismissible={!busy}
+      onOpenChange={(open, details) => {
+        if (busy) details.cancel();
+        else setOpen(open);
+      }}
+      onOpenChangeComplete={(open) => {
+        if (!open) onClose();
       }}
     >
-      <Dialog.Portal>
-        <Dialog.Overlay className="calm-dialog-overlay" />
-        <Dialog.Content
-          className="calm-dialog"
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            const element = opener.element;
-            if (
-              busy ||
-              window.location.href !== opener.url ||
-              !(element instanceof HTMLElement) ||
-              !element.isConnected
-            )
-              return;
-            const visible =
-              typeof element.checkVisibility === "function"
-                ? element.checkVisibility({
-                    checkOpacity: true,
-                    checkVisibilityCSS: true,
-                  })
-                : element.getClientRects().length > 0 &&
-                  getComputedStyle(element).visibility === "visible";
-            if (visible) element.focus();
-          }}
-          onEscapeKeyDown={(event) => {
-            if (busy) event.preventDefault();
-          }}
-          onPointerDownOutside={(event) => {
-            if (busy) event.preventDefault();
-          }}
-        >
-          <Dialog.Title>{title}</Dialog.Title>
-          <Dialog.Description>{description}</Dialog.Description>
-          {children}
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+      <DialogBackdrop className="calm-dialog-overlay" />
+      <DialogContent className="calm-dialog" finalFocus={finalFocus}>
+        <DialogTitle>{title}</DialogTitle>
+        <DialogDescription>{description}</DialogDescription>
+        {children(() => {
+          if (!busy) setOpen(false);
+        })}
+      </DialogContent>
+    </Dialog>
   );
 }
 export function UnitBar<S extends string>({
@@ -255,19 +284,25 @@ export function UnitBar<S extends string>({
           );
         })}
       </div>
-      <div className="calm-counters">
+      <SegmentedControl
+        data-prs-agent-local=""
+        className="calm-counters"
+        aria-label="Pull request status"
+        value={selected}
+        onValueChange={(next) => {
+          if (next !== null) onSelect(next);
+        }}
+      >
         {segments.map((segment) => {
           const count = items.filter(
             (item) => item.segment === segment.id,
           ).length;
           return (
-            <button
-              type="button"
+            <SegmentedControlItem
               key={segment.id}
+              value={segment.id}
               disabled={count === 0}
               aria-label={`${count} ${segment.label}`}
-              aria-pressed={selected === segment.id}
-              onClick={() => onSelect(segment.id)}
               className="calm-counter"
             >
               <strong>{count}</strong>
@@ -275,10 +310,10 @@ export function UnitBar<S extends string>({
                 <i className={`tone-${segment.tone}`} />
                 {segment.label}
               </span>
-            </button>
+            </SegmentedControlItem>
           );
         })}
-      </div>
+      </SegmentedControl>
     </>
   );
 }
@@ -321,28 +356,38 @@ export function EffortGroup({
   dots?: ReactNode;
 }) {
   if (count === 0) return null;
-  return (
-    <section className="calm-effort-group" aria-label={title}>
-      <div className="calm-group-header">
-        <span className={`calm-group-count text-${tone}`}>{count}</span>
-        {onToggle ? (
-          <button
-            type="button"
-            className="calm-group-toggle"
-            aria-expanded={!folded}
-            onClick={onToggle}
-          >
-            <h2>{title}</h2>
-            {folded ? <span className="calm-fold-dots">{dots}</span> : null}
-            <span className="calm-chevron">{folded ? "›" : "⌄"}</span>
-          </button>
-        ) : (
+  const header = (
+    <div className="calm-group-header">
+      <span className={`calm-group-count text-${tone}`}>{count}</span>
+      {onToggle ? (
+        <CollapsibleTrigger className="calm-group-toggle">
           <h2>{title}</h2>
-        )}
-        <span className="calm-effort">{effort}</span>
-        {action}
-      </div>
-      {!folded ? children : null}
+          {folded ? <span className="calm-fold-dots">{dots}</span> : null}
+          <span className="calm-chevron">{folded ? "›" : "⌄"}</span>
+        </CollapsibleTrigger>
+      ) : (
+        <h2>{title}</h2>
+      )}
+      <span className="calm-effort">{effort}</span>
+      {action}
+    </div>
+  );
+  return onToggle ? (
+    <Collapsible
+      data-prs-agent-local=""
+      render={<section />}
+      className="calm-effort-group"
+      aria-label={title}
+      open={!folded}
+      onOpenChange={onToggle}
+    >
+      {header}
+      <CollapsiblePanel>{children}</CollapsiblePanel>
+    </Collapsible>
+  ) : (
+    <section className="calm-effort-group" aria-label={title}>
+      {header}
+      {children}
     </section>
   );
 }
@@ -359,12 +404,14 @@ function PrContext({
   view,
   onStart,
   onReview,
+  startDisabled,
 }: {
   pr: MinePr;
   all: MinePr[];
   view: ViewModel;
   onStart: (rows: CalmRow[], stop: Stop) => void;
   onReview: (key: string) => void;
+  startDisabled: boolean;
 }) {
   const { row, marker } = pr;
   const threadId = marker?.threadId;
@@ -484,6 +531,7 @@ function PrContext({
       <div className="calm-actions">
         {canStart ? (
           <CalmButton
+            disabled={startDisabled}
             onClick={() =>
               onStart([row], row.group === "large" ? "prepare" : "publish")
             }
@@ -513,49 +561,63 @@ export function MineRow({
   view,
   expanded,
   onExpand,
-  selected,
-  onSelect,
   onStart,
   onReview,
   answer,
   busy,
+  startDisabled,
+  questionGroup,
 }: {
   pr: MinePr;
   all: MinePr[];
   view: ViewModel;
   expanded: boolean;
   onExpand: () => void;
-  selected: boolean;
-  onSelect: () => void;
   onStart: (rows: CalmRow[], stop: Stop) => void;
   onReview: (key: string) => void;
   answer: (pr: MinePr, option: string) => void;
   busy: boolean;
+  startDisabled: boolean;
+  questionGroup?: AgentQuestionGroup;
 }) {
   const { row, marker } = pr;
   const threadId = marker?.threadId;
   const navigate = useBbNavigate();
   const question = marker?.status === "asking" ? marker.question : null;
+  const displayedQuestion =
+    questionGroup && questionGroup[0].row.key !== row.key ? null : question;
+  const linkedPrCount = displayedQuestion
+    ? (groupAgentQuestions(all).find((group) =>
+        group.some((member) => member.row.key === row.key),
+      )?.length ?? 1)
+    : 0;
   const startable = isStartable(pr) ? row.action : null;
   const meta =
-    pr.segment === "agent"
-      ? marker?.status === "starting"
-        ? "starting…"
-        : `working · ${marker ? age(marker.at) : ""}`
-      : pr.segment === "on-reviewers"
-        ? row.waiting
-            .map(
-              (person) =>
-                `${person.name}${person.days === null ? "" : ` · ${person.approx ? "~" : ""}${person.days}d`}`,
-            )
-            .join(", ")
-        : row.repo === "parsleyhealth/parsley-monorepo"
-          ? ""
-          : row.repo;
+    question && !displayedQuestion
+      ? "Waiting on shared agent question"
+      : pr.segment === "agent"
+        ? marker?.status === "starting"
+          ? "starting…"
+          : `working · ${marker ? age(marker.at) : ""}`
+        : pr.segment === "on-reviewers"
+          ? row.waiting
+              .map(
+                (person) =>
+                  `${person.name}${person.days === null ? "" : ` · ${person.approx ? "~" : ""}${person.days}d`}`,
+              )
+              .join(", ")
+          : row.repo === "parsleyhealth/parsley-monorepo"
+            ? ""
+            : row.repo;
   const cleared = row.gate_links.find((gate) => gate.cleared_by)?.cleared_by;
   return (
-    <li
-      className={`calm-pr${expanded ? " expanded" : ""}${question ? " question-row" : ""}`}
+    <Collapsible
+      data-prs-agent-local=""
+      render={<li />}
+      open={expanded}
+      onOpenChange={onExpand}
+      aria-label={`Context for ${row.title} #${row.number}`}
+      className={`calm-pr${expanded ? " expanded" : ""}${displayedQuestion ? " question-row" : ""}`}
       data-pr-key={row.key}
     >
       <div className="calm-row">
@@ -566,26 +628,24 @@ export function MineRow({
             ring={pr.segment === "agent"}
           />
           {startable ? (
-            <input
+            <Checkbox
+              data-prs-agent-local=""
               className="calm-row-checkbox"
-              type="checkbox"
+              value={row.key}
               aria-label={`Select ${row.title} #${row.number}`}
-              checked={selected}
-              onChange={onSelect}
-            />
+            >
+              <CheckboxIndicator aria-hidden>✓</CheckboxIndicator>
+            </Checkbox>
           ) : null}
         </span>
         <div className="calm-row-content">
           <div className="calm-row-line">
-            <button
-              type="button"
+            <CollapsibleTrigger
               className="calm-title"
-              aria-expanded={expanded}
-              onClick={onExpand}
               title={`${compactLines(row.size.lines)} lines · #${row.number}`}
             >
-              {question?.prompt ?? row.title}
-            </button>
+              {displayedQuestion?.prompt ?? row.title}
+            </CollapsibleTrigger>
             <UrlLink
               href={row.url}
               className="calm-pr-number"
@@ -606,7 +666,7 @@ export function MineRow({
             <span className="calm-row-actions">
               {startable ? (
                 <CalmButton
-                  disabled={busy}
+                  disabled={busy || startDisabled}
                   onClick={() =>
                     onStart(
                       [row],
@@ -629,9 +689,16 @@ export function MineRow({
               ) : null}
             </span>
           </div>
-          {question ? (
+          {displayedQuestion && questionGroup && linkedPrCount > 1 ? (
+            <p className="calm-question-scope">
+              {linkedPrCount === questionGroup.length
+                ? `${linkedPrCount} linked PRs · agent thread`
+                : `${linkedPrCount} PRs in shared thread · ${questionGroup.length} shown`}
+            </p>
+          ) : null}
+          {displayedQuestion ? (
             <div className="calm-question-options">
-              {question.options.map((option) => (
+              {displayedQuestion.options.map((option) => (
                 <CalmButton
                   key={option.id}
                   disabled={busy || marker?.answering}
@@ -642,7 +709,7 @@ export function MineRow({
               ))}
             </div>
           ) : null}
-          {question && marker?.answerError ? (
+          {displayedQuestion && marker?.answerError ? (
             <p role="alert" className="calm-answer-error">
               {marker.answerError}
               {threadId ? (
@@ -661,16 +728,17 @@ export function MineRow({
           ) : null}
         </div>
       </div>
-      {expanded ? (
+      <CollapsiblePanel>
         <PrContext
           pr={pr}
           all={all}
           view={view}
           onStart={onStart}
           onReview={onReview}
+          startDisabled={busy || startDisabled}
         />
-      ) : null}
-    </li>
+      </CollapsiblePanel>
+    </Collapsible>
   );
 }
 export function ReviewersView({
@@ -722,13 +790,14 @@ export function ReviewersView({
         {[...people]
           .sort((a, b) => (b[1].oldest ?? -1) - (a[1].oldest ?? -1))
           .map(([login, entry]) => (
-            <div key={login}>
-              <button
-                type="button"
-                className="calm-person-row"
-                aria-expanded={person === login}
-                onClick={() => setPerson(person === login ? null : login)}
-              >
+            <Collapsible
+              data-prs-agent-local=""
+              key={login}
+              open={person === login}
+              onOpenChange={(open) => setPerson(open ? login : null)}
+              aria-label={`Pull requests waiting on ${entry.name}`}
+            >
+              <CollapsibleTrigger className="calm-person-row">
                 <span className="calm-dot-column">
                   <SizeDot lines={30} tone="purple" />
                 </span>
@@ -756,9 +825,11 @@ export function ReviewersView({
                     ? "age unknown"
                     : `oldest ${entry.approx ? "~" : ""}${entry.oldest}d`}
                 </span>
-              </button>
-              {person === login ? <ul>{entry.prs.map(renderRow)}</ul> : null}
-            </div>
+              </CollapsibleTrigger>
+              <CollapsiblePanel render={<ul />}>
+                {entry.prs.map(renderRow)}
+              </CollapsiblePanel>
+            </Collapsible>
           ))}
         <ul>{rows.filter((pr) => !covered.has(pr.row.key)).map(renderRow)}</ul>
       </EffortGroup>

@@ -1,6 +1,20 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/react/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@ui-sdk/react/select";
+import {
+  Checkbox,
+  CheckboxGroup,
+  CheckboxIndicator,
+} from "@ui-sdk/react/checkbox";
 import {
   definePluginApp,
+  experimental_ProviderModelPicker as ProviderModelPicker,
   experimental_usePluginId,
   useBbNavigate,
   useRealtime,
@@ -11,6 +25,11 @@ import { z } from "zod";
 import type { BoardState, CalmRow, Stop } from "./board";
 import type { rpcContract } from "./server";
 import type { ReviewsState } from "./reviews";
+import type { AgentModelChoice } from "./agent-model";
+import {
+  disposePrsUiAgentBridge,
+  usePrsUiAgentBridge,
+} from "./ui-agent-bridge";
 import {
   age,
   CalmButton,
@@ -25,10 +44,12 @@ import {
   SizeLegend,
   UnitBar,
   minePrs,
+  groupAgentQuestions,
   isStartable,
   rowTone,
   type MinePr,
   type MineSegment,
+  type AgentQuestionGroup,
 } from "./board-ui";
 import {
   REVIEW_SEGMENTS,
@@ -40,6 +61,12 @@ import "./calm.css";
 
 const message = (cause: unknown) =>
   cause instanceof Error ? cause.message : String(cause);
+const organizationSchema = z
+  .string()
+  .regex(/^[a-z0-9][a-z0-9-]{0,38}$/i)
+  .transform((owner) => owner.toLowerCase())
+  .nullable();
+const repoOwner = (repo: string) => repo.split("/")[0]?.toLowerCase() ?? "";
 function usePrsData() {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<BoardState | null>(null);
@@ -152,7 +179,12 @@ export function prsBadge({
         : total >= 5
           ? "warning"
           : "neutral",
-    label: [`${onYou} on you`, `${toReview} to review`, ...reasons].join(" · "),
+    label: [
+      "Across all organizations",
+      `${onYou} on you`,
+      `${toReview} to review`,
+      ...reasons,
+    ].join(" · "),
   };
 }
 function usePrsBadge(): ExperimentalBadge | null {
@@ -165,9 +197,7 @@ function usePrsBadge(): ExperimentalBadge | null {
   return prsBadge({
     onYou: prs.filter((pr) => pr.segment === "on-you").length,
     toReview: pending.length,
-    agentsAsking: prs.filter(
-      (pr) => pr.marker?.status === "asking" && pr.marker.question,
-    ).length,
+    agentsAsking: groupAgentQuestions(prs).length,
     overdueReviews: pending.filter(
       (review) => now - Date.parse(review.item.noticedAt) >= 2 * 86_400_000,
     ).length,
@@ -199,6 +229,9 @@ function useFolds() {
   };
 }
 type ReviewerOptions = z.infer<(typeof rpcContract)["reviewers_get"]["output"]>;
+type AgentModelContext = z.infer<
+  (typeof rpcContract)["agent_model_get"]["output"]
+>;
 type PickerLoad =
   | { kind: "loading" }
   | { kind: "error"; message: string }
@@ -216,7 +249,7 @@ function ReviewerPicker({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [load, setLoad] = useState<PickerLoad>({ kind: "loading" });
-  const [chosen, setChosen] = useState<Map<string, Set<string>>>(new Map());
+  const [chosen, setChosen] = useState<Map<string, string[]>>(new Map());
   const [sent, setSent] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -236,11 +269,9 @@ function ReviewerPicker({
                   []);
               return [
                 option.key,
-                new Set(
-                  option.candidates
-                    .filter((candidate) => targets.includes(candidate.login))
-                    .map((candidate) => candidate.login),
-                ),
+                option.candidates
+                  .filter((candidate) => targets.includes(candidate.login))
+                  .map((candidate) => candidate.login),
               ];
             }),
           ),
@@ -284,80 +315,90 @@ function ReviewerPicker({
       onClose={onClose}
       busy={busy}
     >
-      {load.kind === "loading" ? (
-        <p role="status">Loading eligible reviewers…</p>
-      ) : load.kind === "error" ? (
-        <p role="alert">{load.message}</p>
-      ) : (
-        <div className="calm-reviewer-choices">
-          {load.rows.map((option) => {
-            const row = rows.find((candidate) => candidate.key === option.key);
-            return (
-              <fieldset
-                key={option.key}
-                disabled={busy || sent.has(option.key)}
-              >
-                <legend>
-                  {row?.title}{" "}
-                  <span className="calm-muted">#{row?.number}</span>
-                  {sent.has(option.key) ? " · sent" : ""}
-                </legend>
-                {option.note ? (
-                  <p className="calm-muted">{option.note}</p>
-                ) : null}
-                {option.candidates.length === 0 ? (
-                  <p>No eligible reviewers are available.</p>
-                ) : (
-                  option.candidates.map((candidate) => (
-                    <label key={candidate.login}>
-                      <input
-                        type="checkbox"
-                        checked={
-                          chosen.get(option.key)?.has(candidate.login) ?? false
-                        }
-                        onChange={() =>
-                          setChosen((current) => {
-                            const next = new Map(current),
-                              logins = new Set(current.get(option.key));
-                            if (logins.has(candidate.login))
-                              logins.delete(candidate.login);
-                            else if (logins.size < 10)
-                              logins.add(candidate.login);
-                            next.set(option.key, logins);
-                            return next;
-                          })
-                        }
-                      />
-                      {candidate.login}
-                      <span className="calm-muted">
-                        {candidate.owned ? "CODEOWNER · " : ""}
-                        {candidate.load} waiting
-                      </span>
-                    </label>
-                  ))
-                )}
-              </fieldset>
-            );
-          })}
-        </div>
+      {(close) => (
+        <>
+          {load.kind === "loading" ? (
+            <p role="status">Loading eligible reviewers…</p>
+          ) : load.kind === "error" ? (
+            <p role="alert">{load.message}</p>
+          ) : (
+            <div className="calm-reviewer-choices">
+              {load.rows.map((option) => {
+                const row = rows.find(
+                  (candidate) => candidate.key === option.key,
+                );
+                return (
+                  <fieldset
+                    key={option.key}
+                    disabled={busy || sent.has(option.key)}
+                  >
+                    <legend>
+                      {row?.title}{" "}
+                      <span className="calm-muted">#{row?.number}</span>
+                      {sent.has(option.key) ? " · sent" : ""}
+                    </legend>
+                    {option.note ? (
+                      <p className="calm-muted">{option.note}</p>
+                    ) : null}
+                    {option.candidates.length === 0 ? (
+                      <p>No eligible reviewers are available.</p>
+                    ) : (
+                      <CheckboxGroup
+                        data-prs-agent-local=""
+                        aria-label={`Reviewers for ${row?.title} #${row?.number}`}
+                        value={chosen.get(option.key) ?? []}
+                        onValueChange={(next, details) => {
+                          if (next.length > 10) details.cancel();
+                          else
+                            setChosen((current) =>
+                              new Map(current).set(option.key, next),
+                            );
+                        }}
+                      >
+                        {option.candidates.map((candidate) => (
+                          <label key={candidate.login}>
+                            <Checkbox
+                              data-prs-agent-local=""
+                              value={candidate.login}
+                              className="calm-checkbox"
+                            >
+                              <CheckboxIndicator aria-hidden>
+                                ✓
+                              </CheckboxIndicator>
+                            </Checkbox>
+                            {candidate.login}
+                            <span className="calm-muted">
+                              {candidate.owned ? "CODEOWNER · " : ""}
+                              {candidate.load} waiting
+                            </span>
+                          </label>
+                        ))}
+                      </CheckboxGroup>
+                    )}
+                  </fieldset>
+                );
+              })}
+            </div>
+          )}
+          {notice ? <p role="status">{notice}</p> : null}
+          {error ? (
+            <p role="alert" className="text-red">
+              {error}
+            </p>
+          ) : null}
+          <div className="calm-dialog-actions">
+            <CalmButton onClick={close} disabled={busy}>
+              Close
+            </CalmButton>
+            <CalmButton
+              onClick={() => void send()}
+              disabled={busy || !requests.length}
+            >
+              {busy ? "Sending…" : `Send ${requests.length}`}
+            </CalmButton>
+          </div>
+        </>
       )}
-      {notice ? <p role="status">{notice}</p> : null}
-      {error ? (
-        <p role="alert" className="text-red">
-          {error}
-        </p>
-      ) : null}
-      <div className="calm-dialog-actions">
-        <CalmButton onClick={onClose} disabled={busy}>
-          Close
-        </CalmButton>
-        <CalmButton
-          onClick={() => void send()}
-          disabled={busy || !requests.length}
-        >
-          {busy ? "Sending…" : `Send ${requests.length}`}
-        </CalmButton>
-      </div>
     </CalmDialog>
   );
 }
@@ -438,6 +479,7 @@ function OneClick({
 }
 
 export function Board({ subPath }: { subPath?: string }) {
+  const { panelId, rootRef, availability } = usePrsUiAgentBridge();
   const {
     rpc,
     state,
@@ -450,6 +492,49 @@ export function Board({ subPath }: { subPath?: string }) {
     refresh,
   } = usePrsData();
   const navigate = useBbNavigate();
+  const [agentSettings, setAgentSettings] = useState<AgentModelContext | null>(
+    null,
+  );
+  const agentModel = agentSettings?.choice ?? null;
+  const modelReady = agentModel !== null;
+  const [modelSaving, setModelSaving] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const modelVersion = useRef(0);
+  const loadModel = useCallback(async () => {
+    const version = ++modelVersion.current;
+    setAgentSettings(null);
+    try {
+      const settings = await rpc.call("agent_model_get");
+      if (version !== modelVersion.current) return;
+      setAgentSettings(settings);
+      setModelError(null);
+    } catch (cause) {
+      if (version !== modelVersion.current) return;
+      setModelError(`Could not load the agent model: ${message(cause)}`);
+    }
+  }, [rpc]);
+  useEffect(() => {
+    void loadModel();
+  }, [loadModel]);
+  useRealtime("agent-model-changed", () => void loadModel());
+  const saveModel = async (choice: AgentModelChoice) => {
+    if (modelSaving) return;
+    const version = ++modelVersion.current;
+    setModelSaving(true);
+    setModelError(null);
+    try {
+      const saved = await rpc.call("agent_model_set", choice);
+      if (version === modelVersion.current)
+        setAgentSettings((current) =>
+          current ? { ...current, choice: saved } : null,
+        );
+    } catch (cause) {
+      if (version === modelVersion.current)
+        setModelError(`Could not save the agent model: ${message(cause)}`);
+    } finally {
+      setModelSaving(false);
+    }
+  };
   const [tab, setTab] = useState<"mine" | "review">(
     subPath?.startsWith("to-review") ? "review" : "mine",
   );
@@ -461,7 +546,7 @@ export function Board({ subPath }: { subPath?: string }) {
     key: string;
     pending: boolean;
   } | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<string[]>([]);
   const [stopOverride, setStopOverride] = useState<Stop | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -469,14 +554,100 @@ export function Board({ subPath }: { subPath?: string }) {
     rows: CalmRow[];
     login: string | null;
   } | null>(null);
+  const organizationKey = `${experimental_usePluginId()}:calm-organization`;
+  const [organization, setOrganization] = useState<string | null>(() => {
+    try {
+      return organizationSchema.parse(
+        JSON.parse(localStorage.getItem(organizationKey) ?? "null"),
+      );
+    } catch {
+      return null;
+    }
+  });
+  const changeOrganization = useCallback(
+    (next: string | null) => {
+      setOrganization(next);
+      setSelected([]);
+      setStopOverride(null);
+      setExpanded(null);
+      setReviewExpanded(null);
+      setReviewTarget(null);
+      setPicker(null);
+      setNotice(null);
+      try {
+        localStorage.setItem(organizationKey, JSON.stringify(next));
+      } catch {}
+    },
+    [organizationKey],
+  );
   const { folded, toggle } = useFolds();
   const view = state?.view ?? null;
-  const prs = useMemo(
+  const allPrs = useMemo(
     () => minePrs(view, state?.markers ?? []),
     [view, state?.markers],
   );
-  const reviewItems =
-    reviews?.kind === "available" ? reviews.snapshot.items : [];
+  const allReviewItems = useMemo(
+    () => (reviews?.kind === "available" ? reviews.snapshot.items : []),
+    [reviews],
+  );
+  const organizations = useMemo(
+    () =>
+      [
+        ...new Set([
+          ...allPrs.map((pr) => repoOwner(pr.row.repo)),
+          ...allReviewItems.map((review) => repoOwner(review.item.repo)),
+        ]),
+      ]
+        .filter(Boolean)
+        .sort(),
+    [allPrs, allReviewItems],
+  );
+  const completeOrganizations =
+    view !== null &&
+    state !== null &&
+    state.lastSuccess !== null &&
+    state.lastError === null &&
+    !state.refreshing &&
+    reviews?.kind === "available" &&
+    reviews.snapshot.lastSuccessAt !== null &&
+    reviews.snapshot.lastPoll?.ok === true &&
+    error === null &&
+    reviewError === null;
+  const organizationsLoading =
+    (state === null && error === null) ||
+    (reviews === null && reviewError === null);
+  const organizationItems = [
+    { value: "*", label: "All organizations" },
+    ...organizations.map((owner) => ({ value: owner, label: owner })),
+    ...(organization !== null && !organizations.includes(organization)
+      ? [
+          {
+            value: organization,
+            label: `${organization} (${organizationsLoading ? "loading…" : "unavailable"})`,
+            disabled: true,
+          },
+        ]
+      : []),
+  ];
+  useEffect(() => {
+    if (
+      organization !== null &&
+      completeOrganizations &&
+      !organizations.includes(organization)
+    ) {
+      changeOrganization(null);
+      setNotice(
+        `${organization} has no pull requests in the loaded queues. Showing all organizations.`,
+      );
+    }
+  }, [organization, completeOrganizations, organizations, changeOrganization]);
+  const prs = allPrs.filter(
+    (pr) => organization === null || repoOwner(pr.row.repo) === organization,
+  );
+  const reviewItems = allReviewItems.filter(
+    (review) =>
+      organization === null || repoOwner(review.item.repo) === organization,
+  );
   const toReview = reviewItems.filter(
     (review) => review.segment === "on-you",
   ).length;
@@ -500,16 +671,18 @@ export function Board({ subPath }: { subPath?: string }) {
   }, [subPath]);
   useEffect(() => {
     if (!reviewTarget?.pending) return;
-    const match = reviewItems.find(
+    const match = allReviewItems.find(
       (review) =>
         `${review.item.repo}#${review.item.number}` === reviewTarget.key,
     );
     if (match) {
+      if (organization !== null && repoOwner(match.item.repo) !== organization)
+        changeOrganization(repoOwner(match.item.repo));
       setReviewSegment(match.segment);
       setReviewExpanded(match.item.key);
       setReviewTarget({ ...reviewTarget, pending: false });
     }
-  }, [reviews, reviewTarget]);
+  }, [reviews, reviewTarget, organization, changeOrganization]);
   const switchTab = (next: "mine" | "review") => {
     setTab(next);
     setReviewTarget(null);
@@ -526,13 +699,13 @@ export function Board({ subPath }: { subPath?: string }) {
       navigate.toPluginPanel("pr-board", { subPath: `to-review/${key}` });
   };
   const selection = prs.filter(
-    (pr) => selected.has(pr.row.key) && isStartable(pr),
+    (pr) => selected.includes(pr.row.key) && isStartable(pr),
   );
   const stop =
     stopOverride ??
     (selection.some((pr) => pr.row.group === "large") ? "prepare" : "publish");
   const start = async (rows: CalmRow[], policy: Stop) => {
-    if (busy) return;
+    if (busy || !agentModel || modelSaving) return;
     const currentPrs = new Map(prs.map((pr) => [pr.row.key, pr]));
     const items = rows.flatMap((row) => {
       const pr = currentPrs.get(row.key);
@@ -547,13 +720,13 @@ export function Board({ subPath }: { subPath?: string }) {
       const { starting, skipped } = await rpc.call("start", {
         items: items.slice(0, 100),
         stop: policy,
+        agentModel,
       });
       setNotice(
-        `${starting.length} ${starting.length === 1 ? "agent" : "agents"} starting.${skipped.length ? ` ${skipped.length} not started: ${skipped.map((skip) => `#${skip.key.split("#").pop()} ${skip.reason}`).join(" · ")}` : ""}${items.length > 100 ? ` ${items.length - 100} remain outside this request.` : ""}`,
+        `${starting.length ? `${starting.length} ${starting.length === 1 ? "PR" : "PRs"} queued for one thread.` : "No PRs queued."}${skipped.length ? ` ${skipped.length} not queued: ${skipped.map((skip) => `#${skip.key.split("#").pop()} ${skip.reason}`).join(" · ")}` : ""}${items.length > 100 ? ` ${items.length - 100} remain outside this request.` : ""}`,
       );
-      setSelected(
-        (current) =>
-          new Set([...current].filter((key) => !starting.includes(key))),
+      setSelected((current) =>
+        current.filter((key) => !starting.includes(key)),
       );
       refetch();
     } catch (cause) {
@@ -586,26 +759,18 @@ export function Board({ subPath }: { subPath?: string }) {
       <MineRow
         key={pr.row.key}
         pr={pr}
-        all={prs}
+        all={allPrs}
         view={view}
         expanded={expanded === pr.row.key}
         onExpand={() =>
           setExpanded(expanded === pr.row.key ? null : pr.row.key)
         }
-        selected={selected.has(pr.row.key)}
-        onSelect={() => {
-          if (selected.size === 0) setStopOverride(null);
-          setSelected((current) => {
-            const next = new Set(current);
-            if (next.has(pr.row.key)) next.delete(pr.row.key);
-            else next.add(pr.row.key);
-            return next;
-          });
-        }}
         onStart={(rows, policy) => void start(rows, policy)}
         onReview={onReview}
         answer={(item, option) => void answer(item, option)}
         busy={busy !== null}
+        startDisabled={!modelReady || modelSaving}
+        questionGroup={questionGroupByPr.get(pr.row.key)}
       />
     ) : null;
   const sorted = (members: MinePr[]) =>
@@ -616,11 +781,17 @@ export function Board({ subPath }: { subPath?: string }) {
           Date.parse(b.row.pushed_at ?? "9999-01-01"),
     );
   const onYou = sorted(prs.filter((pr) => pr.segment === "on-you"));
-  const questions = onYou.filter(
+  const asking = onYou.filter(
     (pr) => pr.marker?.status === "asking" && pr.marker.question,
   );
+  const askingKeys = new Set(asking.map((pr) => pr.row.key));
+  const questionGroups = groupAgentQuestions(asking);
+  const questionGroupByPr = new Map<string, AgentQuestionGroup>();
+  for (const group of questionGroups)
+    for (const pr of group) questionGroupByPr.set(pr.row.key, group);
+  const questionRows = questionGroups.flatMap((group) => group.map(renderRow));
   const group = (id: CalmRow["group"]) =>
-    onYou.filter((pr) => pr.row.group === id && !questions.includes(pr));
+    onYou.filter((pr) => pr.row.group === id && !askingKeys.has(pr.row.key));
   const small = group("small"),
     large = group("large"),
     blocked = group("blocked"),
@@ -665,28 +836,98 @@ export function Board({ subPath }: { subPath?: string }) {
     </EffortGroup>
   );
   return (
-    <div className="calm-scroller">
-      <main className="calm-board">
+    <div
+      ref={rootRef}
+      className="calm-scroller"
+      data-prs-agent-panel={panelId}
+      data-prs-agent-availability={availability}
+    >
+      <Tabs
+        data-prs-agent-local=""
+        render={<main />}
+        className="calm-board"
+        value={tab}
+        onValueChange={(next) => {
+          if (next !== null) switchTab(next);
+        }}
+      >
         <header className="calm-header">
-          <div
-            className="calm-tabs"
-            role="group"
-            aria-label="Pull request view"
-          >
-            <button
-              type="button"
-              aria-pressed={tab === "mine"}
-              onClick={() => switchTab("mine")}
-            >
+          <TabsList className="calm-tabs" aria-label="Pull request view">
+            <TabsTab value="mine">
               Mine <span>{prs.length}</span>
-            </button>
-            <button
-              type="button"
-              aria-pressed={tab === "review"}
-              onClick={() => switchTab("review")}
-            >
+            </TabsTab>
+            <TabsTab value="review">
               To review <span className="text-amber">{toReview}</span>
-            </button>
+            </TabsTab>
+          </TabsList>
+          <div className="calm-header-filters">
+            <Select
+              items={organizationItems}
+              value={organization ?? "*"}
+              onValueChange={(next, details) => {
+                if (next === "*") changeOrganization(null);
+                else if (next !== null && organizations.includes(next))
+                  changeOrganization(next);
+                else details.cancel();
+              }}
+              disabled={organizations.length === 0 && organization === null}
+            >
+              <SelectTrigger
+                data-prs-agent-local=""
+                className="calm-organization"
+                aria-label="Organization"
+              >
+                <SelectValue /> <span aria-hidden>⌄</span>
+              </SelectTrigger>
+              <SelectContent
+                className="calm-organization-menu"
+                align="start"
+                sideOffset={4}
+              >
+                {organizationItems.map((item) => (
+                  <SelectItem
+                    key={item.value}
+                    value={item.value}
+                    disabled={"disabled" in item && item.disabled}
+                  >
+                    {item.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div
+              className="calm-agent-model"
+              role="group"
+              aria-label="Agent model for fixes and reviews"
+            >
+              <span>Agent:</span>
+              {agentSettings ? (
+                <ProviderModelPicker
+                  value={{
+                    ...agentSettings.choice,
+                    reasoningLevel: agentSettings.choice.reasoningLevel ?? "",
+                  }}
+                  routing={agentSettings.routing}
+                  onChange={({ reasoningLevel, ...choice }) =>
+                    void saveModel(
+                      reasoningLevel ? { ...choice, reasoningLevel } : choice,
+                    )
+                  }
+                  disabled={!modelReady || modelSaving}
+                  align="end"
+                  className="calm-agent-model-picker"
+                />
+              ) : null}
+              {!modelReady || modelSaving ? (
+                <span role="status">
+                  {modelSaving
+                    ? "Saving…"
+                    : modelError
+                      ? "Unavailable"
+                      : "Loading…"}
+                </span>
+              ) : null}
+            </div>
           </div>
           <time
             className={`calm-updated${stale ? " text-amber" : ""}`}
@@ -712,6 +953,20 @@ export function Board({ subPath }: { subPath?: string }) {
             ↻
           </button>
         </header>
+        {modelError ? (
+          <p role="alert" className="calm-notice">
+            {modelError}{" "}
+            {!modelReady ? (
+              <button
+                type="button"
+                className="calm-link"
+                onClick={() => void loadModel()}
+              >
+                Retry
+              </button>
+            ) : null}
+          </p>
+        ) : null}
         {currentError ? (
           <p role="alert" className="calm-notice">
             Last refresh failed: {currentError}
@@ -725,251 +980,268 @@ export function Board({ subPath }: { subPath?: string }) {
             {notice}
           </p>
         ) : null}
-        {tab === "mine" ? (
-          view ? (
-            <>
-              <UnitBar
-                segments={MINE_SEGMENTS}
-                items={prs.map((pr) => ({
-                  key: pr.row.key,
-                  segment: pr.segment,
-                  tone: rowTone(pr),
-                  label: `#${pr.row.number}: ${pr.row.title}`,
-                  outlined: isStartable(pr),
-                }))}
-                selected={mineSegment}
-                onSelect={setMineSegment}
-              />
-              {mineSegment === "on-you" ? (
-                <>
-                  <SizeLegend />
-                  {ready.length ? (
+        <TabsPanel value="mine">
+          <CheckboxGroup
+            data-prs-agent-local=""
+            aria-label="Select pull requests for agents"
+            value={selected}
+            onValueChange={(next) => {
+              if (selected.length === 0) setStopOverride(null);
+              setSelected(next);
+            }}
+          >
+            {view ? (
+              <>
+                <UnitBar
+                  segments={MINE_SEGMENTS}
+                  items={prs.map((pr) => ({
+                    key: pr.row.key,
+                    segment: pr.segment,
+                    tone: rowTone(pr),
+                    label: `#${pr.row.number}: ${pr.row.title}`,
+                    outlined: isStartable(pr),
+                  }))}
+                  selected={mineSegment}
+                  onSelect={setMineSegment}
+                />
+                {mineSegment === "on-you" ? (
+                  <>
+                    <SizeLegend />
+                    {ready.length ? (
+                      <EffortGroup
+                        title="Ready to merge"
+                        count={ready.length}
+                        tone="green"
+                        effort="merge manually"
+                      >
+                        <ul>{ready.map(renderRow)}</ul>
+                      </EffortGroup>
+                    ) : null}
                     <EffortGroup
-                      title="Ready to merge"
-                      count={ready.length}
-                      tone="green"
-                      effort="merge manually"
+                      title="Answer to unblock agents"
+                      count={questionGroups.length}
+                      tone="question"
+                      effort="seconds"
                     >
-                      <ul>{ready.map(renderRow)}</ul>
+                      <ul>{questionRows}</ul>
                     </EffortGroup>
-                  ) : null}
-                  <EffortGroup
-                    title="Answer to unblock agents"
-                    count={questions.length}
-                    tone="question"
-                    effort="seconds"
-                  >
-                    <ul>{questions.map(renderRow)}</ul>
-                  </EffortGroup>
-                  <OneClick
-                    prs={group("one-click")}
-                    view={view}
-                    onPick={(rows, login) => setPicker({ rows, login })}
-                  />
-                  <EffortGroup
-                    title="Small fixes for an agent"
-                    count={small.length}
-                    tone="blue"
-                    effort="~20 min"
-                    action={
-                      smallStartable.length ? (
+                    <OneClick
+                      prs={group("one-click")}
+                      view={view}
+                      onPick={(rows, login) => setPicker({ rows, login })}
+                    />
+                    <EffortGroup
+                      title="Small fixes for an agent"
+                      count={small.length}
+                      tone="blue"
+                      effort="~20 min"
+                      action={
+                        smallStartable.length ? (
+                          <CalmButton
+                            primary
+                            disabled={
+                              busy !== null || !modelReady || modelSaving
+                            }
+                            title={`Stop at Publish · ${smallStartable.length} eligible`}
+                            onClick={() =>
+                              void start(
+                                smallStartable.map((pr) => pr.row),
+                                "publish",
+                              )
+                            }
+                          >
+                            <span aria-hidden>▸</span> Start{" "}
+                            {Math.min(smallStartable.length, 100)}
+                          </CalmButton>
+                        ) : null
+                      }
+                    >
+                      <ul>{small.map(renderRow)}</ul>
+                    </EffortGroup>
+                    {large.length || blocked.length || held.length ? (
+                      <Later />
+                    ) : null}
+                    {laterGroup(
+                      "Large fixes",
+                      large,
+                      "mine-large",
+                      "agent, then you",
+                      "blue",
+                      largeStartable.length ? (
                         <CalmButton
-                          primary
-                          disabled={busy !== null}
-                          title={`Stop at Publish · ${smallStartable.length} eligible`}
+                          disabled={busy !== null || !modelReady || modelSaving}
+                          title={`Stop at Prepare · ${largeStartable.length} eligible`}
                           onClick={() =>
                             void start(
-                              smallStartable.slice(0, 5).map((pr) => pr.row),
-                              "publish",
+                              largeStartable.map((pr) => pr.row),
+                              "prepare",
                             )
                           }
                         >
-                          <span aria-hidden>▸</span> Start{" "}
-                          {Math.min(smallStartable.length, 5)}
+                          <span aria-hidden>▸</span> Prepare{" "}
+                          {Math.min(largeStartable.length, 100)}
                         </CalmButton>
-                      ) : null
-                    }
-                  >
-                    <ul>{small.map(renderRow)}</ul>
-                  </EffortGroup>
-                  {large.length || blocked.length || held.length ? (
-                    <Later />
-                  ) : null}
-                  {laterGroup(
-                    "Large fixes",
-                    large,
-                    "mine-large",
-                    "agent, then you",
-                    "blue",
-                    largeStartable.length ? (
-                      <CalmButton
-                        disabled={busy !== null}
-                        title={`Stop at Prepare · ${largeStartable.length} eligible`}
-                        onClick={() =>
-                          void start(
-                            largeStartable.slice(0, 5).map((pr) => pr.row),
-                            "prepare",
-                          )
-                        }
-                      >
-                        <span aria-hidden>▸</span> Prepare{" "}
-                        {Math.min(largeStartable.length, 5)}
-                      </CalmButton>
-                    ) : null,
-                  )}
-                  {laterGroup(
-                    "Blocked upstream",
-                    blocked,
-                    "mine-blocked",
-                    "gated",
-                    "orange",
-                  )}
-                  {laterGroup(
-                    "Needs a manual look",
-                    held,
-                    "mine-held",
-                    "manual",
-                    "gray",
-                  )}
-                  {onYou.length === 0 ? (
-                    <p className="calm-empty">
-                      Nothing needs you.
-                      {ready[0]
-                        ? ` Closest to merge: #${ready[0].row.number} (${ready[0].row.title}).`
-                        : prs[0]
-                          ? ` Closest to merge is not confirmed; ${prs.length} PRs remain open.`
-                          : " No open pull requests."}
-                    </p>
-                  ) : null}
-                </>
-              ) : mineSegment === "agent" ? (
-                <>
-                  <SizeLegend caption="Agent threads on your PRs" />
-                  <EffortGroup
-                    title="Working"
-                    count={prs.filter((pr) => pr.segment === "agent").length}
-                    tone="blue"
-                  >
-                    <ul>
-                      {sorted(prs.filter((pr) => pr.segment === "agent")).map(
-                        renderRow,
-                      )}
-                    </ul>
-                  </EffortGroup>
-                  <EffortGroup
-                    title="Finished, asking you"
-                    count={questions.length}
-                    tone="question"
-                  >
-                    <ul>{questions.map(renderRow)}</ul>
-                  </EffortGroup>
-                  <EffortGroup
-                    title="Finished threads"
-                    count={
-                      prs.filter((pr) => pr.marker?.status === "done").length
-                    }
-                    tone="gray"
-                  >
-                    <ul>
-                      {prs
-                        .filter((pr) => pr.marker?.status === "done")
-                        .map(renderRow)}
-                    </ul>
-                  </EffortGroup>
-                </>
-              ) : mineSegment === "on-reviewers" ? (
-                <ReviewersView
-                  rows={sorted(
-                    prs.filter((pr) => pr.segment === "on-reviewers"),
-                  )}
-                  renderRow={renderRow}
-                />
-              ) : (
-                <>
-                  <SizeLegend
-                    caption={
-                      mineSegment === "drafts"
-                        ? "Drafts, when you are ready"
-                        : "Ready to merge manually"
-                    }
+                      ) : null,
+                    )}
+                    {laterGroup(
+                      "Blocked upstream",
+                      blocked,
+                      "mine-blocked",
+                      "gated",
+                      "orange",
+                    )}
+                    {laterGroup(
+                      "Needs a manual look",
+                      held,
+                      "mine-held",
+                      "manual",
+                      "gray",
+                    )}
+                    {onYou.length === 0 ? (
+                      <p className="calm-empty">
+                        Nothing needs you.
+                        {ready[0]
+                          ? ` Closest to merge: #${ready[0].row.number} (${ready[0].row.title}).`
+                          : prs[0]
+                            ? ` Closest to merge is not confirmed; ${prs.length} PRs remain open.`
+                            : " No open pull requests."}
+                      </p>
+                    ) : null}
+                  </>
+                ) : mineSegment === "agent" ? (
+                  <>
+                    <SizeLegend caption="Agent threads on your PRs" />
+                    <EffortGroup
+                      title="Working"
+                      count={prs.filter((pr) => pr.segment === "agent").length}
+                      tone="blue"
+                    >
+                      <ul>
+                        {sorted(prs.filter((pr) => pr.segment === "agent")).map(
+                          renderRow,
+                        )}
+                      </ul>
+                    </EffortGroup>
+                    <EffortGroup
+                      title="Finished, asking you"
+                      count={questionGroups.length}
+                      tone="question"
+                    >
+                      <ul>{questionRows}</ul>
+                    </EffortGroup>
+                    <EffortGroup
+                      title="PRs with finished threads"
+                      count={
+                        prs.filter((pr) => pr.marker?.status === "done").length
+                      }
+                      tone="gray"
+                    >
+                      <ul>
+                        {prs
+                          .filter((pr) => pr.marker?.status === "done")
+                          .map(renderRow)}
+                      </ul>
+                    </EffortGroup>
+                  </>
+                ) : mineSegment === "on-reviewers" ? (
+                  <ReviewersView
+                    rows={sorted(
+                      prs.filter((pr) => pr.segment === "on-reviewers"),
+                    )}
+                    renderRow={renderRow}
                   />
-                  <EffortGroup
-                    title={
-                      mineSegment === "drafts" ? "Drafts" : "Ready to merge"
-                    }
-                    count={
-                      prs.filter((pr) => pr.segment === mineSegment).length
-                    }
-                    tone={mineSegment === "drafts" ? "gray" : "green"}
-                  >
-                    <ul>
-                      {sorted(
-                        prs.filter((pr) => pr.segment === mineSegment),
-                      ).map(renderRow)}
-                    </ul>
-                  </EffortGroup>
-                </>
-              )}
+                ) : (
+                  <>
+                    <SizeLegend
+                      caption={
+                        mineSegment === "drafts"
+                          ? "Drafts, when you are ready"
+                          : "Ready to merge manually"
+                      }
+                    />
+                    <EffortGroup
+                      title={
+                        mineSegment === "drafts" ? "Drafts" : "Ready to merge"
+                      }
+                      count={
+                        prs.filter((pr) => pr.segment === mineSegment).length
+                      }
+                      tone={mineSegment === "drafts" ? "gray" : "green"}
+                    >
+                      <ul>
+                        {sorted(
+                          prs.filter((pr) => pr.segment === mineSegment),
+                        ).map(renderRow)}
+                      </ul>
+                    </EffortGroup>
+                  </>
+                )}
+              </>
+            ) : (
+              <>
+                <div className="calm-loading-bar" aria-hidden>
+                  {Array.from({ length: 24 }, (_, index) => (
+                    <i key={index} />
+                  ))}
+                </div>
+                <p role="status" className="calm-empty">
+                  {error
+                    ? "PR data is unavailable. Refresh to retry."
+                    : state && !state.refreshing
+                      ? "No board yet. Refresh to fetch your PRs."
+                      : "Fetching your PRs…"}
+                </p>
+              </>
+            )}
+          </CheckboxGroup>
+        </TabsPanel>
+        <TabsPanel value="review">
+          {reviews?.kind === "available" ? (
+            <>
+              <UnitBar
+                segments={REVIEW_SEGMENTS}
+                items={reviewItems.map((review) => ({
+                  key: review.item.key,
+                  segment: review.segment,
+                  tone: reviewTone(review),
+                  label: `#${review.item.number}: ${review.item.title}`,
+                }))}
+                selected={reviewSegment}
+                onSelect={setReviewSegment}
+              />
+              {reviewTarget &&
+              !reviewItems.some(
+                (review) =>
+                  `${review.item.repo}#${review.item.number}` ===
+                  reviewTarget.key,
+              ) ? (
+                <p className="calm-notice">
+                  {reviewTarget.key} is not in your review queue.
+                </p>
+              ) : null}
+              <ReviewsView
+                key={organization ?? "*"}
+                agentModel={modelReady && !modelSaving ? agentModel : null}
+                items={reviewItems}
+                segment={reviewSegment}
+                expanded={reviewExpanded}
+                setExpanded={setReviewExpanded}
+                folds={folded}
+                toggleFold={toggle}
+                mine={view?.prs ?? []}
+                refetch={refetch}
+              />
             </>
           ) : (
-            <>
-              <div className="calm-loading-bar" aria-hidden>
-                {Array.from({ length: 24 }, (_, index) => (
-                  <i key={index} />
-                ))}
-              </div>
-              <p role="status" className="calm-empty">
-                {error
-                  ? "PR data is unavailable. Refresh to retry."
-                  : state && !state.refreshing
-                    ? "No board yet. Refresh to fetch your PRs."
-                    : "Fetching your PRs…"}
-              </p>
-            </>
-          )
-        ) : reviews?.kind === "available" ? (
-          <>
-            <UnitBar
-              segments={REVIEW_SEGMENTS}
-              items={reviewItems.map((review) => ({
-                key: review.item.key,
-                segment: review.segment,
-                tone: reviewTone(review),
-                label: `#${review.item.number}: ${review.item.title}`,
-              }))}
-              selected={reviewSegment}
-              onSelect={setReviewSegment}
-            />
-            {reviewTarget &&
-            !reviewItems.some(
-              (review) =>
-                `${review.item.repo}#${review.item.number}` ===
-                reviewTarget.key,
-            ) ? (
-              <p className="calm-notice">
-                {reviewTarget.key} is not in your review queue.
-              </p>
-            ) : null}
-            <ReviewsView
-              items={reviewItems}
-              segment={reviewSegment}
-              expanded={reviewExpanded}
-              setExpanded={setReviewExpanded}
-              folds={folded}
-              toggleFold={toggle}
-              mine={view?.prs ?? []}
-              refetch={refetch}
-            />
-          </>
-        ) : (
-          <p role="status" className="calm-empty">
-            {reviews?.kind === "unavailable"
-              ? `To review is unavailable: ${reviews.reason}`
-              : reviewError
-                ? `To review is unavailable: ${reviewError}`
-                : "Fetching your review queue…"}
-          </p>
-        )}
+            <p role="status" className="calm-empty">
+              {reviews?.kind === "unavailable"
+                ? `To review is unavailable: ${reviews.reason}`
+                : reviewError
+                  ? `To review is unavailable: ${reviewError}`
+                  : "Fetching your review queue…"}
+            </p>
+          )}
+        </TabsPanel>
         {tab === "mine" && selection.length ? (
           <div
             className="calm-selection"
@@ -993,7 +1265,7 @@ export function Board({ subPath }: { subPath?: string }) {
               </select>
             </label>
             <CalmButton
-              disabled={busy !== null}
+              disabled={busy !== null || !modelReady || modelSaving}
               onClick={() =>
                 void start(
                   selection.map((pr) => pr.row),
@@ -1001,18 +1273,18 @@ export function Board({ subPath }: { subPath?: string }) {
                 )
               }
             >
-              Start {Math.min(selection.length, 5)}
+              Start {Math.min(selection.length, 100)}
             </CalmButton>
             <button
               type="button"
               className="calm-dismiss"
               aria-label="Clear selection"
-              onClick={() => setSelected(new Set())}
+              onClick={() => setSelected([])}
             >
               ×
             </button>
-            {selection.length > 5 ? (
-              <small>{selection.length - 5} remain after this start</small>
+            {selection.length > 100 ? (
+              <small>{selection.length - 100} outside this request</small>
             ) : null}
           </div>
         ) : null}
@@ -1024,11 +1296,15 @@ export function Board({ subPath }: { subPath?: string }) {
             refetch={refetch}
           />
         ) : null}
-      </main>
+      </Tabs>
     </div>
   );
 }
 export default definePluginApp((app) => {
+  app.contentScripts.register({
+    id: "prs-ui-agent-bridge",
+    mount: () => disposePrsUiAgentBridge,
+  });
   app.slots.navPanel({
     id: "pr-board",
     title: "PRs",
