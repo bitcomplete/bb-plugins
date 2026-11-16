@@ -2089,6 +2089,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const touchWaitDivergenceStmt = lazy<[number, string, string, string, string], unknown>(
     "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
   );
+  // The stop touch keeps the row's own inputs (the disagreement it records) and
+  // only flips its `transition`, so a stopped row still reads back the wait
+  // kind and liveness it disagreed with. Writing the current fields here would
+  // make a stopped `worker` row read `waitLive: true` next to its `derived
+  // no-wake-source` pair (BB-333). `json_set` keeps this append-only: no
+  // migration for a display-only field.
+  const stopWaitDivergenceStmt = lazy<[number, string, string, string], unknown>(
+    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = json_set(inputs, '$.transition', 'stop') WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
+  );
   // BB-333: the reader's side of the state table. The `bb stewards
   // wait-divergences` command reads the current derived/reported pair per
   // binding; the `noWakeSource` divergence row the pair wrote rides along for
@@ -3919,6 +3928,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const touch = (transition: string, d: number, r: number): void => {
         touchWaitDivergenceStmt().run(at, note(transition), fields.bindingId, old(r), old(d));
       };
+      const stop = (d: number, r: number): void => {
+        stopWaitDivergenceStmt().run(at, fields.bindingId, old(r), old(d));
+      };
       const pairChanged = prevDerived !== derived || prevReported !== reported;
       if (!pairChanged) {
         // No transition. An ongoing disagreement keeps its open row fresh so
@@ -3930,7 +3942,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       // stopped: note it on the old row, never as a row of its own (its `old`
       // would equal its `new`). A change from one disagreement to the other is
       // that stop plus a new start.
-      if (prevDisagree === true) touch("stop", prevDerived!, prevReported!);
+      if (prevDisagree === true) stop(prevDerived!, prevReported!);
       upsertWaitDivergenceStateStmt().run(fields.bindingId, derived, reported, at);
       if (!disagree) return false;
       // A start: the first observation of a disagreement, a move from

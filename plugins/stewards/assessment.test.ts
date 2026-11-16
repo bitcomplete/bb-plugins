@@ -394,14 +394,22 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
     expect(person.liveness.waitLive).toBe(true);
   });
 
-  it("derives a date wait live while the date is ahead", () => {
+  it("derives a date wait live only while the scheduled requeue is ahead", () => {
     const now = Date.UTC(2026, 5, 1);
-    const ahead = assess(withWait({ kind: "date", ref: "2026-12-01" }, { now }));
+    const dateWait = (ref: string, requeueUntil: number | null) => assess(input({ now, binding: binding({ wait: { kind: "date", ref }, requeueUntil }) }));
+    const ahead = dateWait("2026-12-01", Date.UTC(2026, 11, 1));
     expect(ahead.liveness.waitLive).toBe(true);
     expect(ahead.liveness.stalled).toBe(false);
-    const past = assess(withWait({ kind: "date", ref: "2000-01-01" }, { now }));
+    const past = dateWait("2000-01-01", Date.UTC(2000, 0, 1));
     expect(past.liveness.waitLive).toBe(false);
     expect(past.liveness.stalled).toBe(true);
+    // A ref date the report did not turn into `requeueUntil` is not a wake
+    // source: the plugin never scheduled a wake there, so the wait stalls
+    // rather than reading live from the ref text (the `date` row the shadow
+    // showed as derived-live while `noWakeSource` said no source).
+    const unscheduled = dateWait("2026-12-01", null);
+    expect(unscheduled.liveness.waitLive).toBe(false);
+    expect(unscheduled.liveness.stalled).toBe(true);
   });
 
   it("keeps the free-text rule exactly for a report with no typed wait", () => {
@@ -460,6 +468,21 @@ describe("the typed-wait divergence store (BB-333)", () => {
     expect(s.divergences({ bindingId: "b2" })).toHaveLength(0);
   });
 
+  it("keeps a stopped row's own wait kind and liveness, only flipping its transition", () => {
+    const { s } = store();
+    // A worker disagreement: the worker was between turns, so the typed
+    // derivation stalled while the report-time flag said live.
+    s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "worker", waitLive: false, inputs: { hasWait: false } }, 1_000);
+    // It stops disagreeing while the current fields say the worker is running
+    // (waitLive true). The stopped row must keep the disagreement's own
+    // `waitKind`/`waitLive`, never the current ones, or it reads as a live
+    // worker stalling.
+    s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: "worker", waitLive: true, inputs: { hasWait: true } }, 2_000);
+    const rows = s.divergences({ bindingId: "b1" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.inputs).toMatchObject({ waitKind: "worker", waitLive: false, hasWait: false, transition: "stop" });
+  });
+
   it("keeps the two directions' rows apart and treats a flip as a stop plus a start", () => {
     const { s } = store();
     // start A, stop A, start B, ongoing B.
@@ -497,9 +520,9 @@ describe("the typed-wait divergence store (BB-333)", () => {
     expect(rows).toHaveLength(2);
     expect(rows.find((r) => r.bindingId === "b1")).toEqual({ bindingId: "b1", derived: false, reported: true, kind: "pull", firstSeenAt: 2_000, lastSeenAt: 2_000, count: 1, at: 2_000 });
     expect(rows.find((r) => r.bindingId === "b2")).toEqual({ bindingId: "b2", derived: false, reported: false, kind: null, firstSeenAt: null, lastSeenAt: null, count: 0, at: 3_000 });
-    // A stopped divergence keeps its most recent row for the seen window; the
-    // stop touch overwrites its inputs, so the kind reads back null.
+    // A stopped divergence keeps its most recent row for the seen window, and
+    // that row keeps the wait kind it disagreed about, not the current one.
     s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 4_000);
-    expect(s.waitDivergences({ bindingId: "b1" })).toEqual([{ bindingId: "b1", derived: false, reported: false, kind: null, firstSeenAt: 2_000, lastSeenAt: 4_000, count: 1, at: 4_000 }]);
+    expect(s.waitDivergences({ bindingId: "b1" })).toEqual([{ bindingId: "b1", derived: false, reported: false, kind: "pull", firstSeenAt: 2_000, lastSeenAt: 4_000, count: 1, at: 4_000 }]);
   });
 });

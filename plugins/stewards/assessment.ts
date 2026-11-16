@@ -15,7 +15,7 @@ import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./g
 import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
 import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
-import { hasLiveWakeSource, parseUntil, type WakeSourceInput } from "./wake-source.js";
+import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import type { Playbook } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
@@ -203,10 +203,14 @@ function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
       return input.workers.some((w) => w.threadId === wait.ref && w.status === "running");
     case "binding":
       return input.hasOpenBinding?.(wait.ref) ?? false;
-    case "date": {
-      const at = parseUntil(wait.ref) ?? input.binding.requeueUntil;
-      return at !== null && at > input.now;
-    }
+    case "date":
+      // The design's rule: a `date` wait is live while the binding's own
+      // requeue is still ahead (`requeueUntil`). `steward_report` sets
+      // `requeueUntil` only from `until` today, not yet from the ref, so a
+      // `date` wait that sent only a ref is not live. Reading the ref here
+      // claimed a wake the plugin never scheduled; the report-path gap (the
+      // design has the ref set `requeueUntil` too) is a separate fix.
+      return input.binding.requeueUntil !== null && input.binding.requeueUntil > input.now;
     case "person":
       return input.hasOpenItem?.(wait.ref) ?? false;
     case "external":
