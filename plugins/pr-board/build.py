@@ -305,6 +305,8 @@ def pr_facts(pr, user, stack_info, gates, now):
         "ci": ci_facts(pr["checks"]),
         "waiting_on": [waiting_entry(r, pr, days, now) for r in pr["requested"]],
         "gates": gate_labels,
+        "gate_links": [{"label": g["label"], "cleared_by": g.get("clearedBy")} for g in gates
+                       if g["repo"] == pr["repo"] and pr["number"] in g["prs"]],
     }
 
 
@@ -413,6 +415,10 @@ def derive(raw, gates_doc):
     user, now = raw["login"], datetime.fromisoformat(raw["fetched_at"])
     prs = [normalize(x) for x in raw["prs"]]
     gates = gates_doc["gates"]
+    for gate in gates:
+        cleared_by = gate.get("clearedBy")
+        if cleared_by is not None and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*", cleared_by):
+            raise ValueError(f"gate {gate['id']}: clearedBy must be owner/repo#number")
     open_keys = {key(p) for p in prs}
     stale = [f"{g['id']}:#{n}" for g in gates for n in g["prs"] if f"{g['repo']}#{n}" not in open_keys]
     stacks, info = build_stacks(prs)
@@ -425,7 +431,8 @@ def derive(raw, gates_doc):
                        "labels": p["labels"], "parent": info[key(p)]["parent"],
                        "head": p["head"], "head_oid": p["head_oid"], "base": p["base"],
                        "additions": p.get("additions", 0), "deletions": p.get("deletions", 0),
-                       "changed_files": p.get("changed_files", 0), **f}
+                       "changed_files": p.get("changed_files", 0), "checks": p["checks"],
+                       "committed_at": p["committed_at"], "created_at": p["created_at"], "updated_at": p["updated_at"], **f}
         out[key(p)]["filters"] = pr_filters(out[key(p)])
     groups = build_groups(prs, stacks, gates)
     rank = {m: i for i, m in enumerate(MOVES)}

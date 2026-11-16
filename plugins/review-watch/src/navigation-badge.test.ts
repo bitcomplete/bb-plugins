@@ -1,14 +1,18 @@
 // @vitest-environment jsdom
-import { createElement } from "react";
-import { expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import { queueCache } from "../app.js";
 import type { QueueItem } from "./types.js";
 
-it("counts pending reviews, warns about follow-ups, and clears the navigation badge in realtime", async () => {
+afterEach(() => { queueCache.clear(); vi.unstubAllGlobals(); });
+
+it("keeps the registered header's pending counts current without contributing a second nav entry", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: true }));
   const app = await loadPluginApp(() => import("../app.js"));
-  const useBadge = app.navPanels[0]?.experimental_useBadge;
-  if (!useBadge) throw new Error("Missing Reviews navigation badge");
+  expect(app.navPanels).toEqual([]);
+  const header = app.threadHeaderActions[0];
+  if (!header) throw new Error("Missing Review Watch header counts");
   const initial: QueueItem = {
     key: "review-requested:PR_1:head", rule: "review-requested", state: "queued",
     repo: "example/editor", number: 1, title: "Improve the editor", author: "alice",
@@ -20,17 +24,17 @@ it("counts pending reviews, warns about follow-ups, and clears the navigation ba
     { ...initial, key: "dismissed", state: "dismissed" },
     { ...initial, key: "archived", state: "archived" },
   ];
-  function BadgeProbe() { return createElement("output", { "aria-label": "Navigation badge" }, JSON.stringify(useBadge?.())); }
-  const slot = renderSlot({ component: BadgeProbe }, {}, { rpc: { queue_list: () => ({ items, lastPoll: null }) } });
-  const badgeValue = () => JSON.parse(slot.getByLabelText("Navigation badge").textContent ?? "null");
+  const slot = renderSlot(header, { threadId: "thread-test", projectId: "project-test", isCompactViewport: false }, { rpc: { queue_list: () => ({ items, lastPoll: null }) } });
   try {
-    await waitFor(() => expect(badgeValue()).toEqual({ count: 2, tone: "warning", label: "1 initial reviews, 1 follow-up reviews" }));
+    const link = await slot.findByRole("link", { name: "1 initial reviews, 1 follow-up reviews" });
+    expect(link.getAttribute("href")).toBe("/plugins/pr-board/pr-board/to-review");
     items = [initial];
     await slot.behavior.emitRealtime("queue-changed", {});
-    await waitFor(() => expect(badgeValue()).toEqual({ count: 1, tone: "neutral", label: "1 initial reviews, 0 follow-up reviews" }));
+    await slot.findByRole("link", { name: "1 initial reviews, 0 follow-up reviews" });
     items = [];
     await slot.behavior.emitRealtime("queue-changed", {});
-    await waitFor(() => expect(badgeValue()).toBeNull());
+    await waitFor(() => expect(slot.getByRole("link", { name: "0 initial reviews, 0 follow-up reviews" })).toBeTruthy());
+    expect(slot.getAllByText("0")).toHaveLength(2);
     expect(slot.inspection.rpcCalls.every((call) => call.method === "queue_list")).toBe(true);
   } finally { slot.lifecycle.unmount(); }
 });

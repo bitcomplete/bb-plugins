@@ -1,181 +1,126 @@
-# PR board
+# PRs
 
-A bb plugin that shows a plain-language board of your open GitHub pull
-requests in bb's side panel.
+A bb side panel for your open pull requests and your Review Watch inbox.
+The **Mine** and **To review** tabs share a unit bar, effort groups, size dots,
+and expandable context.
 
-## What it shows
+## Use the panel
 
-From top to bottom:
+Open **PRs** from the sidebar or the thread side panel. Select a segment
+under the unit bar to filter the list. Every open PR occupies one cell.
+The bar uses proportional group blocks when the cells no longer fit or the
+board contains more than 120 items.
 
-1. A one-line summary.
-2. **Suggested next steps**: up to five batched suggestions, most valuable
-   first: PRs ready to merge, then fix review feedback, rebase, fix CI,
-   re-request a reviewer who asked for changes, and pick reviewers. For
-   example "Fix CI on 7 PRs; 3 are blocked by a known gate, so 4 are
-   actionable (#562, …)". PRs an agent is already working on are left out.
-3. **Stacks**: one line per stack of two or more Parsley PRs, with a lettered
-   dot per PR in merge order (F fix feedback, C fix CI, R rebase, A ask for
-   review, W waiting, H approved but held, ✓ ready, D draft). Long names wrap
-   to two lines and show in full on hover. Hover or focus a dot for the PR's
-   title and sentence. Clicking a stack filters the list to it. Collapsed by
-   default in panels narrower than 440px.
-4. The list:
-   - **Ready to merge**: approved, no unanswered or answered-but-open
-     threads, no outstanding changes request, no conflict, CI passing, no
-     gates.
-   - **Approved, not ready yet**: approved, but blocked by a gate, waiting
-     for its stack parent, holding open threads you answered, or waiting on
-     running checks.
-   - **Needs you**, grouped as Fix review feedback, Fix CI, Rebase, and Ask
-     for a review (no approval and nobody asked, or the reviewer who asked
-     for changes is not asked again).
-   - **Waiting on a reviewer**, grouped by person: PRs with no approval yet,
-     or with changes requested by a reviewer who is asked again.
-   - **Drafts** (collapsed).
-   - **Other repositories**: PRs outside `parsleyhealth/`, with the same
-     sentences and sub-groups (collapsed).
-5. **Reviewer load** (collapsed): a bar per requested reviewer split into
-   first reviews and re-reviews (PRs where that reviewer asked for changes),
-   with the count and the oldest wait in days since the review request (`~`
-   when no request event exists and the wait counts from the last push), plus
-   a line for PRs with no reviewer. Approved PRs never count. Clicking a bar
-   filters the list to that reviewer's PRs.
+The sidebar uses bb's native dot. It stays hidden when nothing needs you,
+uses a neutral tone for 1–4 pending items, amber for 5–14, and red for 15 or
+more. An unanswered agent question or a review queued for at least two days
+also makes the dot red. Hover over the dot for exact counts and the reason.
 
-### The approval rule
+**Mine** shows your next actions, running agents, pending reviewers, drafts,
+and ready PRs. Your actions appear easiest first:
 
-One submitted, non-dismissed human approval is enough to merge. An approval
-on an earlier commit still counts; later commits of any size do not need
-re-approval, and a pending request to a second reviewer never blocks. What
-holds a PR back is unanswered review feedback, an outstanding changes
-request, conflicts, failing or pending CI, and known gates. Bot reviews never
-count as approvals.
+- **Answer to unblock agents** sends an explicit answer to the linked thread
+- **One click** requests review from an eligible person that you choose
+- **Small fixes for an agent** starts fixes below 2,000 changed lines and stops at Publish
+- **Large fixes** starts fixes at 2,000 changed lines or more and stops at Prepare
+- **Blocked upstream** shows configured gates and links to a clearing PR when provided
 
-The next move is the first of: draft, fix (unanswered substantive or
-unlabeled threads), reply (only minor unanswered threads), rebase or
-retarget, CI failing, review (no approval, or changes requested), gated
-(approved, but a gate or an open thread you answered), CI pending, ready.
+Large fixes and blocked items start folded under **Later**. The panel
+remembers folds per tab. PRs waiting on checks, a stack parent, or answered
+open threads remain visible with their actual reason. Other repositories
+use the same layout; author-fix agents remain scoped to Parsley repositories.
 
-Known limitation: feedback left in a review body or a PR-level comment (for
-example "LGTM with nits" with no inline thread) is not detected; only review
-threads are.
+Click a title to expand its stack, real check results, review state, size,
+and links. Only one row expands at a time. Hover or focus a row for its PR
+number, action, and selection checkbox. Select mixed fixes to choose a
+stopping point in the floating toolbar. At most five fix threads start per
+click; the panel reports skipped items. Every start refetches GitHub and
+checks that the chosen action still applies.
 
-### Rows
+**To review** reads the companion Review Watch plugin through its public
+RPCs. Quick reads include completed review drafts, follow-up deltas below
+150 lines, and first reviews below 300 lines. Unknown deltas stay in Longer
+read; the panel never labels the full diff as a delta. Estimates use at
+least five minutes and one minute per 30 lines, rounded up. The reviewer
+thread drafts findings; it never posts a review, comment, or approval.
+Review Watch retains its queue, settings, header counts, and CLI.
 
-Each row reads `#number  area  Title — one sentence`, then, at the right
-(or on a second line in narrow panels), who reviews it (`Marcel` requested,
-`Marcel ✓` approved, `Pedro ✗` requested changes; the tooltip says when an
-approval was on an earlier commit) and its size (`1.2k lines · 14 files`
-with a log-scaled bar). The area is the monorepo service or app from its
-`service:` or `app:` labels (`root` when it has none), or the repository's
-short name. An optional `Blocked by: …` line shows gates from `gates.json`.
-Stacked PRs stay together, children indented under their parent with `└`; a
-PR whose parent sits in another group shows `after #N`. Clicking a PR number
-opens the PR in bb's side panel; modifier clicks, middle clicks, and copy
-link work like any link.
+## Approval policy
 
-## Start agents
+One submitted, non-dismissed human approval on any commit counts. Later
+commits and a pending second reviewer do not require another approval.
+Unanswered review threads, outstanding changes requests, conflicts, failing
+or pending CI, open answered threads, and known gates still block readiness.
+Merging stays manual. Feedback in review bodies or PR-level comments is not
+detected; the existing board rules inspect inline review threads.
 
-The Fix review feedback, Fix CI and Rebase suggestions have a **Start (N)**
-button, and each row in those groups has a small **Start** button. A PR with
-a known gate gets no agent and shows "blocked by a gate" instead, because the
-gate, not the code, may be what holds it. Start
-opens a confirmation that names what happens, lists the PRs (uncheck any to
-leave them out), and offers two stopping points:
+## Review requests and agent answers
 
-- **Publish** (the default): push, reply on review threads, re-request
-  review.
-- **Prepare**: commit locally in a worktree and report; nothing is pushed or
-  posted.
+Review requests require an explicit click. The picker lists current eligible
+repository collaborators, suggests individual CODEOWNERS, and shows their
+existing board load. Missing ownership keeps the picker available. Before
+sending, the server refetches the PR and validates the selected logins.
 
-There is no merge option, and every playbook forbids merging, releases and
-deploys. At most five PRs start per click. Confirming re-fetches every PR
-from GitHub first; a PR whose next move changed since the click does not
-start, and its row says why.
-
-Each PR gets its own thread in the Parsley project (`proj_9itb3ud9c5`) on
-Claude Code with `claude-opus-5-5` at `xhigh` reasoning, titled
-`<Move> PR <n> <title>`. The prompt is filled from `playbooks/`: one file per
-move (`fix-feedback.md`, `rebase.md`, `fix-ci.md`), one per stopping point
-(`stop-prepare.md`, `stop-publish.md`) and the shared rules in `common.md`,
-which end with a required `Decisions for Matt` section. A row with a live
-thread shows "being worked on · <thread>"; after the thread stops it shows
-"worked on <time> · see thread" until the PR's head or next move changes.
-Asking for reviews and merging stay text-only suggestions.
-
-Open the board in either of two places:
-
-- In a thread, open the side panel's tab launcher and choose **PR board**.
-- From the sidebar, open the **PR board** page.
+Fix threads use the existing Parsley project and Claude Code Opus defaults.
+Every playbook forbids merging, releases, and deploys. Prepare commits locally
+and reports; Publish can push, reply, and request review. The common playbook
+requires a final `pr-board-question` JSON block for a blocking decision.
+The panel recognizes only a validated block, never questions inferred from
+prose. Answers use the supported thread follow-up API. A failed or interrupted
+delivery keeps the question visible and directs you to the thread when its
+outcome is uncertain, preventing duplicate sends.
 
 ## Requirements
 
-The bb server host needs:
-
-- `gh`, signed in to GitHub (`gh auth status`).
-- `python3` on `PATH`.
-
-When either is missing, the panel shows the error in one line and keeps the
-last good board.
-
-## Install and remove
+The bb server host needs authenticated `gh` and `python3` on `PATH`.
+Install both `pr-board` and `review-watch` for the combined experience.
+Mine remains available if Review Watch is missing or fails.
 
 ```sh
-npm install --include=dev
+npm ci --include=dev
+bb plugin build
 bb plugin install .
 ```
 
-To remove it:
-
-```sh
-bb plugin remove pr-board
-```
-
-## Refresh
-
-The backend refreshes on load and every 5 minutes. Runs never overlap. The
-panel's **Refresh** button and `bb pr-board refresh` force a run.
+The board refreshes every five minutes. **Refresh** forces a new attempt.
+A failure keeps the last successful board and its timestamp. Data older than
+15 minutes shows a stale indicator. Existing saved boards upgrade from the
+plugin's own snapshot without requiring a successful GitHub fetch.
 
 ## CLI
 
+The read-only CLI keeps its existing text sections and JSON fields. JSON
+also includes canonical `prs` rows and `reviewer_batches` for the panel.
+
 ```sh
-bb pr-board            # the board as text
-bb pr-board --json     # the view model the panel draws
-bb pr-board refresh    # fetch now, then print; exits 1 if the run failed
+bb pr-board
+bb pr-board --json
+bb pr-board refresh
 ```
 
-## Gates
+A failed refresh exits with status 1 and preserves the last good board.
 
-`gates.json`, in this directory, lists dependencies GitHub cannot see. Each
-gated PR shows a `Blocked by:` line with the gate's label. Edit the file by
-hand; the next refresh picks it up.
+## Configure gates
+
+Edit `gates.json` for dependencies GitHub cannot detect. The optional
+`clearedBy` field must use `owner/repo#number`; only configured references
+link Mine gates to To review items.
 
 ```json
-{"gates": [
-  {"id": "sage-migrations",
-   "label": "Sage migration numbering and merge order unsettled",
-   "repo": "parsleyhealth/parsley-monorepo",
-   "prs": [557, 561],
-   "group": "Optional group name for the full board"}
-]}
+{"gates":[{"id":"schema","label":"Deploy the API schema","repo":"acme/app","prs":[17],"clearedBy":"acme/api#23"}]}
 ```
 
-## How it works
-
-- `build.py` fetches every open PR you authored with `gh api graphql`, derives
-  each PR's facts and next move, and writes `data.json`.
-- `simple.py --json` turns `data.json` into the view model. All grouping,
-  sentence wording, nesting, stacks, suggestions and reviewer load live here.
-  `python3 simple.py` writes the list as `simple.html`.
-- `playbook.py` re-checks one PR's next move and fills its playbook.
-- `server.ts` runs the scripts, stores the latest view model, the last error,
-  the last success time and the in-flight markers in plugin storage, serves
-  them over RPC, and starts agent threads with `bb.sdk.threads.spawn`.
-- `app.tsx` and `board-ui.tsx` draw the view model and markers.
-
-## Development
+## Develop
 
 ```sh
 npm run typecheck
-npm test               # vitest, then the Python unit tests (TZ=UTC)
+TZ=UTC npm test
 npm run build
 ```
+
+`build.py` fetches and derives GitHub facts. `simple.py` owns the canonical
+rows and preserves legacy CLI sections. `server.ts` owns refresh, start,
+answer, and cross-plugin operations. SQLite holds the full board and source
+snapshot; KV holds the smaller agent markers. `reviewers.ts` owns eligibility and
+explicit GitHub review requests. `reviews.ts` validates Review Watch's
+published version 1 wire contract without importing its source or storage.

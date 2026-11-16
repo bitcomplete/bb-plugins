@@ -38,6 +38,9 @@ export const pullRequestSchema = z.object({
   /** When the head commit landed — the clock followup detection compares against. */
   headCommittedAt: z.string(),
   updatedAt: z.string(),
+  additions: z.number().int().nonnegative().optional(),
+  deletions: z.number().int().nonnegative().optional(),
+  changedFiles: z.number().int().nonnegative().optional(),
   /** GitHub's own verdict: null until someone reviews. */
   reviewDecision: z
     .enum(["APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"])
@@ -55,6 +58,7 @@ export const pullRequestSchema = z.object({
         "PENDING",
       ]),
       submittedAt: z.string(),
+      commitSha: z.string().nullable().optional(),
     })
     .nullable(),
 });
@@ -82,6 +86,7 @@ export const queueItemSchema = z.object({
   updatedAt: z.string(),
   /** Last submitted review when this item was first classified. */
   reviewBaselineSubmittedAt: z.string().nullable().optional(),
+  reviewBaselineCommitSha: z.string().nullable().optional(),
   /** Set once a thread has been started for this item. */
   threadId: z.string().optional(),
 });

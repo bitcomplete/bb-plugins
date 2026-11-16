@@ -5,14 +5,12 @@ description: Read the GitHub review queue and start work on a queued item. Use w
 
 # Review watch
 
-Review Watch keeps one queue of pull requests that need the user's attention. A
-background poller asks GitHub every few minutes. The **Reviews** page and
-`bb review-watch` command read the same queue. The **Reviews** navigation badge
-shows the total number of pending initial reviews and follow-ups, uses a
-warning tone when follow-ups are waiting, and clears when the queue is empty.
-The thread-header badge shows `review-requested` and `review-followup` counts
-in two colored chips, including zeros. Hover over the header badge to see
-labeled counts, preview up to five review requests, and open **Reviews**.
+Review Watch owns one durable queue of pull requests that need the user's
+attention. A background poller asks GitHub every few minutes. Install PR Board
+alongside Review Watch for the unified **PRs → To review** inbox. The
+`bb review-watch` command reads the same queue and works without PR Board.
+The thread header keeps initial-review and follow-up counts in separate chips,
+including zeros, and links to **To review**.
 
 The queue is notify-only. Review Watch never posts to GitHub or starts a
 thread on its own. A human chooses **Start**, **Review selected**, or
@@ -77,19 +75,25 @@ matters even when the poller uses a token.
 5. If `list` looks stale, run `bb review-watch poll` instead of waiting for the
    next tick.
 
-In **Reviews**, select queued review requests and follow-ups, then choose
+In **PRs → To review**, select queued review requests and follow-ups, then choose
 **Review selected** to choose a project and open one aggregate review thread.
 Organization mappings preselect the project. Mixed-project selections require
 an explicit choice. **Start** opens the same picker for an individual review.
 Canceling starts nothing. The batch action does not have a CLI command.
 
-Queued and started review items stay in their action sections and remain
-counted. A started row links to its open thread and stays pending until a
-GitHub poll confirms a submitted review newer than the item's baseline. A new
-head supersedes the item; a closed or merged pull request ends its pending
-status. The plugin moves completed or superseded reviewer items to **Archived
-threads** at the bottom, where you can reopen their threads. Dismissed items do
-not appear. Workstreams displays feedback on the user's own pull requests.
+Queued items need a review. Started items link to reviewer threads; the unified
+inbox uses current BB thread state to distinguish active work from stopped
+threads. Only a validated final `review-watch-result` block marks a completed
+draft. Do not infer completion from an idle thread or prose.
+
+A submitted review newer than the item's baseline, a new head, or a closed pull
+request archives the previous item. **Back with authors** requires current
+GitHub review evidence, not an archive state alone. Dismissed items stay hidden.
+
+Follow-up details compare the last submitted review's commit with the current
+head. If the baseline or exact comparison is unavailable, report an unknown
+delta. Never substitute the full PR diff. Resolution counts include only review
+threads in which the user participated.
 
 ## Constraints
 

@@ -18,6 +18,7 @@ import {
   createGhTransport,
   createGithubClient,
   createTokenTransport,
+  createTokenRestTransport,
   isTransportConfigurationError,
   type GhTransport,
   type GithubClient,
@@ -31,6 +32,8 @@ import {
   type QueueItem,
   type Rule,
 } from "./src/types.js";
+import { lastPollSchema, prsReviewSchema, prsSnapshotSchema } from "./src/prs-contract.js";
+import { createPrsInbox } from "./src/prs.js";
 
 const CONFIGURE_HINT =
   "Set project with `bb plugin config review-watch`, and authenticate to GitHub " +
@@ -145,18 +148,16 @@ const reviewPrompt = (item: QueueItem): string =>
     "2. If a matching local checkout exists, use it for deeper checks and relevant tests. Run the repository's review skill or `/code-review` command when available.",
     "3. Present your findings in this thread, ordered by severity, each with a file and line.",
     "",
-    "Do not submit a GitHub review, approve, request changes, or post a comment. The human posts; you draft.",
+    "Do not submit a GitHub review, approve, request changes, post a comment, resolve a thread, or push code. The human posts; you draft.",
   ].join("\n");
 
-// The queue item carries no previously-reviewed commit — `QueueItem` has no
-// field for one — so the agent resolves it from the pull request itself rather
-// than the prompt naming a sha review-watch cannot know.
 const reviewFollowupPrompt = (item: QueueItem): string =>
   [
     `Re-review the pull request ${item.repo}#${item.number} (${prSummary(item)}) by @${item.author}.`,
     `Full title: ${item.title}`,
     `URL: ${item.url}`,
     `You reviewed an earlier commit; the head is now ${item.headSha} on ${item.headBranch}.`,
+    item.reviewBaselineCommitSha ? `The last reviewed commit is ${item.reviewBaselineCommitSha}.` : "The last reviewed commit is unavailable in the queue; resolve it from the submitted review before computing a delta.",
     `Use \`gh pr diff ${item.number} -R ${item.repo}\`, \`gh pr view ${item.number} -R ${item.repo}\`, and \`gh api\` to inspect the current diff, prior review, review threads, CI, and mergeability.`,
     "",
     "1. Find your own most recent review on the pull request and the commit it was submitted against.",
@@ -165,16 +166,27 @@ const reviewFollowupPrompt = (item: QueueItem): string =>
     "4. If a matching local checkout exists, use it for deeper checks and relevant tests. Run the repository's review skill or `/code-review` command over the new range when available.",
     "5. Present your findings in this thread.",
     "",
-    "Do not submit a GitHub review, approve, request changes, or post a comment. The human posts; you draft.",
+    "If the reviewed commit is unavailable or no exact comparison is possible, report that the delta is unknown. Never present the full PR diff as the delta.",
+    "Do not submit a GitHub review, approve, request changes, post a comment, resolve a thread, or push code. The human posts; you draft.",
   ].join("\n");
 
 function promptFor(item: QueueItem): string {
   switch (item.rule) {
     case "review-requested":
-      return reviewPrompt(item);
+      return `${reviewPrompt(item)}\n\n${draftInstructions([item])}`;
     case "review-followup":
-      return reviewFollowupPrompt(item);
+      return `${reviewFollowupPrompt(item)}\n\n${draftInstructions([item])}`;
   }
+}
+
+function draftInstructions(items: QueueItem[]): string {
+  return [
+    "Use the pr-reviewer skill when it is available. Complete the draft in this thread for the human to review.",
+    "Only after the requested findings are drafted, end the final response with this exact machine-readable block. Include only completed item keys; omit this block if you stop early, fail, or need an answer.",
+    "```review-watch-result",
+    JSON.stringify({ version: 1, status: "draft-ready", itemKeys: items.map((item) => item.key) }),
+    "```",
+  ].join("\n");
 }
 
 function batchPrompt(items: QueueItem[]): string {
@@ -195,25 +207,21 @@ function batchPrompt(items: QueueItem[]): string {
     "- Next: approve, approve with explicit required before-merge changes, request changes, or defer. Approval does not enforce the required changes; name who must verify them before merge.",
     "Call out coverage gaps and dependencies between pull requests.",
     "Do not post GitHub reviews or comments, approve or request changes on GitHub, or push code. Report in this thread for the human to act on.",
+    "For follow-ups, identify the last submitted review's commit and compare it with the listed head. An unavailable baseline means an unknown delta; do not substitute the full PR diff.",
+    draftInstructions(items),
   ].join("\n");
 }
 
 // Both schemas run at the wire boundary. Handler input/output are inferred
 // from the shared contract; app.tsx imports only its type.
 export const rpcContract = defineRpcContract({
+  prs_snapshot: { input: z.null(), output: prsSnapshotSchema },
+  prs_detail: { input: z.object({ key: z.string().min(1) }), output: prsReviewSchema },
   queue_list: {
     input: z.null(),
     output: z.object({
       items: z.array(queueItemSchema),
-      lastPoll: z
-        .object({
-          at: z.string(),
-          ok: z.boolean(),
-          added: z.number(),
-          total: z.number(),
-          error: z.string().optional(),
-        })
-        .nullable(),
+      lastPoll: lastPollSchema.nullable(),
     }),
   },
   item_start: {
@@ -435,13 +443,19 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function client(transport: GraphqlTransport): GithubClient {
-    return createGithubClient({ transport });
+    const token = configuredToken();
+    return createGithubClient({ transport, rest: token === undefined ? ghTransport?.getJson : createTokenRestTransport(token) });
   }
 
   async function login(github: GithubClient): Promise<string> {
     if (cachedLogin === null) cachedLogin = await github.viewerLogin();
     return cachedLogin;
   }
+
+  const inbox = createPrsInbox({ bb, readQueue, github: async () => {
+    const github = client(selectTransport());
+    return { client: github, viewer: await login(github) };
+  } });
 
   async function runPass(): Promise<PassResult> {
     return withQueueLock(async () => {
@@ -485,6 +499,8 @@ export default async function plugin(bb: BbPluginApi) {
       const removed = existing.filter((item) => !after.has(item.key)).length;
       const changed = JSON.stringify(existing) !== JSON.stringify(merged);
       if (changed) await writeQueue(merged);
+      await inbox.observe([...pullRequests, ...retained.pullRequests].filter((pr) =>
+        allowlist.length === 0 || allowlist.some((repo) => repo.toLowerCase() === pr.repo.toLowerCase())), viewer, now);
 
       return { ok: true, added, removed, total: merged.length, changed };
     });
@@ -568,10 +584,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }, remaining);
   }
-  bb.events.on("thread.idle", async ({ thread }) => {
+  bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     try {
       const items = await readQueue();
       if (!items.some((item) => item.state === "started" && item.threadId === thread.id)) return;
+      await inbox.recordDraft(thread.id, lastAssistantText ?? null);
+      bb.realtime.publish(QUEUE_CHANGED, {});
       if (idleRefresh !== null) {
         scheduleTrailingIdleRefresh();
         return;
@@ -587,6 +605,15 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`idle refresh failed: ${cause instanceof Error ? cause.message : String(cause)}`);
     }
   });
+
+  for (const event of ["thread.active", "thread.failed"] as const) {
+    bb.events.on(event, async ({ thread }) => {
+      const items = await readQueue();
+      if (!items.some((item) => item.state === "started" && item.threadId === thread.id)) return;
+      await inbox.recordDraft(thread.id, null);
+      bb.realtime.publish(QUEUE_CHANGED, {});
+    });
+  }
 
   bb.background.service("poll", {
     async start(signal) {
@@ -702,10 +729,13 @@ export default async function plugin(bb: BbPluginApi) {
     return withQueueLock(async () => {
       const items = await readQueue();
       const found = lookup(items, key);
-      if (!found.ok) return found;
-      const dismissed: QueueItem = { ...found.item, state: "dismissed" };
+      const item = found.ok ? found.item : await inbox.findItem(key);
+      if (item === undefined) return found;
+      const dismissed: QueueItem = { ...item, state: "dismissed" };
       await writeQueue(
-        items.map((row) => (row.key === dismissed.key ? dismissed : row)),
+        items.some((row) => row.key === dismissed.key)
+          ? items.map((row) => (row.key === dismissed.key ? dismissed : row))
+          : [...items, dismissed],
       );
       return { ok: true, item: dismissed };
     });
@@ -716,6 +746,8 @@ export default async function plugin(bb: BbPluginApi) {
   // -------------------------------------------------------------------------
 
   bb.rpc.register(rpcContract, {
+    prs_snapshot: async (): Promise<z.infer<typeof prsSnapshotSchema>> => ({ version: 1, ...await inbox.snapshot(), lastPoll: await readLastPoll() }),
+    prs_detail: async ({ key }) => inbox.detail(key),
     queue_list: async () => ({
       items: await visibleQueue(),
       lastPoll: await readLastPoll(),

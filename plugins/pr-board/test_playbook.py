@@ -15,7 +15,7 @@ def data(*prs):
 
 
 class Render(unittest.TestCase):
-    def test_every_move_and_stop_forbids_merge_and_release_and_ends_with_decisions(self):
+    def test_every_move_and_stop_forbids_merge_release_and_requires_decisions_with_final_question_protocol(self):
         cases = {"fix-feedback": fix(581), "rebase": pr(150, "rebase"), "fix-ci": failing(598)}
         for action, p in cases.items():
             for stop in pb.STOPS:
@@ -23,7 +23,10 @@ class Render(unittest.TestCase):
                     text = pb.render(p, action, stop)
                     self.assertIn(NO_MERGE, text)
                     self.assertIn(NO_RELEASE, text)
-                    self.assertTrue(text.rstrip().endswith("Write `None.` when there are none."))
+                    self.assertIn("Write `None.` when there are none.", text)
+                    self.assertIn("```pr-board-question", text)
+                    self.assertIn("Emit `question: null` when you finish without a blocking question", text)
+                    self.assertIn("Do not reuse a question ID after the user answers it", text)
                     self.assertIn(DECISIONS, text)
                     self.assertNotIn("${", text)  # every placeholder filled
 

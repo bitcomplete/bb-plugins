@@ -39,6 +39,7 @@ function toItem(
     noticedAt: now,
     updatedAt: pr.updatedAt,
     reviewBaselineSubmittedAt: pr.myLastReview?.submittedAt ?? null,
+    reviewBaselineCommitSha: pr.myLastReview?.commitSha ?? null,
   };
 }
 

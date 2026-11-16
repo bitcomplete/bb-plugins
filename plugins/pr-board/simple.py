@@ -260,7 +260,7 @@ def view_model(data, busy=()):
     prs = sorted(data["prs"].values(), key=lambda p: (p["repo"], p["number"]))
     work = [p for p in prs if p["repo"].startswith(WORK_ORG)]
     other = [p for p in prs if not p["repo"].startswith(WORK_ORG)]
-    trains = build_trains(data, work)
+    trains = build_trains(data, prs)
     ctx = {"by_key": {key(p): p for p in prs}, "max_lines": max((lines_of(p) for p in prs), default=0),
            "stack_of": {k["key"]: t["id"] for t in trains for k in t["prs"]}}
 
@@ -292,7 +292,77 @@ def view_model(data, busy=()):
                         "theirs": count.get("theirs", 0), "drafts": count.get("drafts", 0),
                         "other": count.get("other", 0)},
             "suggestions": suggestions(w, set(busy)), "trains": trains, "sections": sections,
-            "reviewer_load": reviewer_load(w)}
+            "reviewer_load": reviewer_load(w), "prs": calm_rows(prs, ctx),
+            "reviewer_batches": reviewer_batches(prs)}
+
+
+def calm_rows(prs, ctx):
+    """One real PR per row. Gates take priority over fixes; old approvals still count."""
+    # stack_of maps every member; the train id is its front's key.
+    fronts = set(ctx["stack_of"].values())
+    rows = []
+    for pr in prs:
+        bucket, group, sentence = place(pr)
+        gated = bool(real_gates(pr))
+        if bucket == "drafts":
+            segment, effort = "drafts", None
+        elif gated:
+            segment, effort = "on-you", "blocked"
+        elif bucket == "ready":
+            segment, effort = bucket, None
+        elif bucket == "theirs":
+            segment, effort = "on-reviewers", None
+        elif group == "Ask for a review":
+            segment, effort = "on-you", "one-click"
+        elif your_move(pr) and action_of(pr)[0] is not None:
+            segment, effort = "on-you", "large" if lines_of(pr) >= 2000 else "small"
+        else:
+            # Running checks, an unmerged parent and answered open threads remain visible.
+            segment, effort = "on-you", "held"
+        row = vm_row(pr, sentence, ctx)
+        wait = {w["reviewer"]: w for w in pr["waiting_on"]}
+        row.update({"repo": pr["repo"], "segment": segment, "group": effort, "move": pr["move"],
+                    "pushed_at": pr.get("committed_at"), "parent_key": parent_key(pr),
+                    "stack_front": key(pr) in fronts,
+                    "gate_links": pr.get("gate_links", []),
+                    "review_summary": review_sentence(pr),
+                    "review_targets": pr["changes_requested"] if group == "Ask for a review" and pr["changes_outstanding"] else [],
+                    "waiting": [{"login": login, "name": name(login), "days": w.get("days"),
+                                 "approx": w.get("approx", False)} for login, w in wait.items()],
+                    "checks": [{"name": c["name"], "state": check_state(c), "url": c.get("url")} for c in pr.get("checks", [])]})
+        rows.append(row)
+    return sorted(rows, key=lambda r: (not r["stack_front"], r["pushed_at"] or "9999", r["key"]))
+
+
+def check_state(check):
+    if check.get("conclusion") in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED") or check.get("state") in ("FAILURE", "ERROR"):
+        return "fail"
+    if check.get("conclusion") == "SUCCESS" or check.get("state") == "SUCCESS":
+        return "pass"
+    if check.get("status") in ("QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED") or check.get("state") == "PENDING":
+        return "pending"
+    return "neutral"
+
+
+def review_sentence(pr):
+    pieces = []
+    for reviewer in reviewers(pr):
+        state = {"approved": "approved", "changes": "requested changes", "requested": "has a pending review request"}[reviewer["state"]]
+        earlier = " on an earlier commit (still counts)" if reviewer["earlier"] else ""
+        pieces.append(f"{reviewer['name']} {state}{earlier}")
+    return "; ".join(pieces) or "No submitted review or pending reviewer request"
+
+
+def reviewer_batches(prs):
+    batches = defaultdict(list)
+    for pr in prs:
+        if real_gates(pr) or place(pr)[:2] != ("mine", "Ask for a review"):
+            continue
+        targets = pr["changes_requested"] if pr["changes_outstanding"] else []
+        # A PR belongs to one batch even when several people requested changes.
+        batches[targets[0] if targets else None].append(key(pr))
+    return [{"login": login, "name": name(login) if login else None, "keys": keys}
+            for login, keys in sorted(batches.items(), key=lambda pair: (pair[0] is None, pair[0] or ""))]
 
 
 # ---------------------------------------------------------------- trains, suggestions, reviewer load
@@ -312,11 +382,11 @@ def letter(pr):
 
 
 def build_trains(data, work):
-    """One train per Parsley stack of 2+ open PRs, in merge order (parent first)."""
+    """One train per stack of 2+ open PRs, in merge order (parent first)."""
     by_key = {key(p): p for p in work}
     trains = []
     for g in data.get("groups", []):
-        if g["kind"] != "stack" or not g["repo"].startswith(WORK_ORG):
+        if g["kind"] != "stack":
             continue
         members = [by_key[f"{g['repo']}#{n}"] for n in g["order"] if f"{g['repo']}#{n}" in by_key]
         if len(members) < 2:

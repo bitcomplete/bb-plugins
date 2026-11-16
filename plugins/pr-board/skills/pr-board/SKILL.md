@@ -9,7 +9,7 @@ description: Read the plain-language board of the user's open GitHub PRs (ready 
   section with its PRs, one sentence per PR, and any "Blocked by" line.
 - `bb pr-board --json` prints the view model: `fetched_at`, `summary`,
   `suggestions` (`{id, text, action, keys}`), `trains` (stacks of 2+ PRs in
-  merge order), `sections` → `groups` → `rows`, and `reviewer_load`. Each row
+  merge order), `sections` → `groups` → `rows`, and `reviewer_load`. It also includes unique `prs` rows with segment, effort group, actual check states, waiting logins, and explicit gate links, plus `reviewer_batches`. Each legacy row
   has `key`, `number`, `url`, `area`, `tone`, `title`, `sentence`, `blocked`,
   `depth` (stack nesting), `after` (an open parent shown elsewhere),
   `reviewers` (`{name, state, earlier}`: requested, approved, changes;
@@ -27,7 +27,20 @@ review threads are.
 
 The backend refreshes on load and every 5 minutes, using `gh` and `python3`
 on the bb server host. The CLI is read-only. Starting agent threads happens
-only from the panel's Start buttons, after the user confirms; never start
+only from explicit panel actions and the selection toolbar; never start
 them on the user's behalf through the plugin's RPC.
 Dependencies GitHub cannot see live in `gates.json` in the plugin directory;
 edit that file only when the user asks.
+
+
+The combined **PRs** panel also reads Review Watch through public RPCs. Keep
+Review Watch's queue and settings in that plugin. Review agents draft
+findings without posting reviews, approvals, comments, or code. A follow-up
+with no last-reviewed commit or failed compare has an unknown delta, never
+the full diff labelled as a delta.
+
+The panel's reviewer picker reads current eligible collaborators and
+CODEOWNERS suggestions. Only an explicit Send action requests a review.
+Do not call review-request or agent-answer RPCs on the user's behalf without
+explicit authorization. Agent questions require a validated final
+`pr-board-question` block; never infer questions or draft readiness from prose.
