@@ -205,10 +205,11 @@ function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
       return input.hasOpenBinding?.(wait.ref) ?? false;
     case "date":
       // The design's rule: a `date` wait is live while the binding's own
-      // requeue is still ahead (`requeueUntil`), which `steward_report` sets
-      // from the ref (or `until`). Reading the ref here would claim a wake the
-      // plugin never scheduled, so a `date` wait whose report did not set
-      // `requeueUntil` is not live.
+      // requeue is still ahead (`requeueUntil`). `steward_report` sets
+      // `requeueUntil` only from `until` today, not yet from the ref, so a
+      // `date` wait that sent only a ref is not live. Reading the ref here
+      // claimed a wake the plugin never scheduled; the report-path gap (the
+      // design has the ref set `requeueUntil` too) is a separate fix.
       return input.binding.requeueUntil !== null && input.binding.requeueUntil > input.now;
     case "person":
       return input.hasOpenItem?.(wait.ref) ?? false;
