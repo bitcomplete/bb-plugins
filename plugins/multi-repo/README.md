@@ -452,7 +452,7 @@ Accepted consequences, not bugs.
 ```sh
 npm install
 npm run typecheck
-npm test          # 302 tests, including end-to-end provisioning against real git repos
+npm test          # 303 tests, including end-to-end provisioning against real git repos
 npm run build
 ```
 

@@ -506,6 +506,26 @@ exit 1`);
     expect(await gitLine(canonical, ["show", "guidance-thr_stale:.bb/repos.json"])).toContain('"added"');
   });
 
+  it("is a no-op when the stale repos.json was the only difference", async () => {
+    const remote = await makeBareRemote("stale-only-remote");
+    const canonical = await makePrimary(remote, "stale-only-canonical");
+    const workspace = path.join(scratch, "stale-only-workspace");
+    await git(["clone", "--quiet", canonical, workspace]);
+    await gitIn(workspace, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspace, ["config", "user.name", "Test"]);
+    const definitionBase = await gitLine(workspace, ["rev-parse", "HEAD"]);
+    const workspaceBb = path.join(workspace, ".bb");
+    await installFakeGh(ghMergeOk(remote));
+    const other = await writeByPolicy(canonical, NEW_REPOS, "primary");
+    expect(other.ok).toBe(true);
+    // The thread made no edit at all; restoring the default's repos.json
+    // leaves nothing to publish, which is the ordinary no-op result.
+    const result = await pushGuidance(canonical, workspaceBb, "thr_noop", undefined, definitionBase);
+    expect(result.ok).toBe(true);
+    expect(result.message).toMatch(/No \.bb changes to publish/u);
+    expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
+  });
+
   it("rewrites the open pull request's title and body when stacking", async () => {
     const remote = await makeBareRemote("title-remote");
     const dir = await makePrimary(remote, "title-canonical");

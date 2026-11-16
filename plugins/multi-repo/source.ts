@@ -1815,9 +1815,21 @@ async function pushGuidancePrimary(
     }
     // The thread did not change `repos.json` but the default branch's copy
     // moved: put the default's copy back so the guidance branch does not carry
-    // a revert of a change that landed after this workspace was cut.
+    // a revert of a change that landed after this workspace was cut. If that
+    // was the only change, the write is the usual no-op.
     if (changed.includes(reposRel) && threadUnchangedRepos) {
       await gitIn(worktree, ["checkout", base, "--", reposRel], options);
+      const stillStaged = await gitIn(worktree, ["diff", "--cached", "--quiet"], options);
+      if (stillStaged.code === 0) {
+        sha = await gitLine(projectSourcePath, ["rev-parse", base], options);
+        if (sha === null) return { ok: false, ref: null, message: `Could not resolve ${base}.` };
+        await gitIn(projectSourcePath, ["update-ref", ref, sha], options);
+        return {
+          ok: true,
+          ref,
+          message: [`No .bb changes to publish; ${ref} points at the default branch.`, ...warnings].join(" "),
+        };
+      }
     }
     const commit = await commitAll(worktree, `Publish guidance from ${threadId}`, signal);
     if (!commit.committed || commit.head === null) {
