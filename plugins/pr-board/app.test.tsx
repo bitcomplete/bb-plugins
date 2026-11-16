@@ -413,7 +413,7 @@ it("clears both selections when the organization changes and starts only visible
     ]),
   );
 });
-it("remembers the organization, validates stored preferences, and recovers a stale owner after both queues load", async () => {
+it("keeps the organization pinned across healthy empty queues and remounts, and validates stored preferences", async () => {
   const settings = {
     board: state({ view: { ...view, prs: [row(2), acmeRow] }, markers: [] }),
     reviews: {
@@ -436,13 +436,27 @@ it("remembers the organization, validates stored preferences, and recovers a sta
   ).toContain("acme");
   expect(restored.queryByRole("button", { name: "Change 2" })).toBeNull();
   restored.lifecycle.unmount();
-  localStorage.setItem("test-plugin:calm-organization", '"removed-org"');
-  const stale = await mount(settings);
-  await stale.findByText(
-    "removed-org has no pull requests in the loaded queues. Showing all organizations.",
-  );
-  expect(stale.getByRole("tab", { name: "Mine 2" })).toBeTruthy();
-  stale.lifecycle.unmount();
+  const emptySettings = {
+    board: state({ view: { ...view, prs: [row(2)] }, markers: [] }),
+    reviews: {
+      ...settings.reviews,
+      snapshot: { ...settings.reviews.snapshot, items: [reviewA] },
+    },
+  };
+  const empty = await mount({ ...emptySettings, waitFor: false });
+  await empty.findByText("acme (no pull requests)");
+  expect(empty.getByRole("tab", { name: "Mine 0" })).toBeTruthy();
+  expect(empty.getByRole("tab", { name: "To review 0" })).toBeTruthy();
+  expect(empty.queryByRole("button", { name: "Change 2" })).toBeNull();
+  expect(localStorage.getItem("test-plugin:calm-organization")).toBe('"acme"');
+  empty.lifecycle.unmount();
+  const pinned = await mount({ ...emptySettings, waitFor: false });
+  await pinned.findByText("acme (no pull requests)");
+  expect(localStorage.getItem("test-plugin:calm-organization")).toBe('"acme"');
+  await chooseOrganization(pinned, "All organizations");
+  expect(pinned.getByRole("tab", { name: "Mine 1" })).toBeTruthy();
+  expect(pinned.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  pinned.lifecycle.unmount();
   localStorage.setItem("test-plugin:calm-organization", '{"invalid":true}');
   const invalid = await mount(settings);
   expect(

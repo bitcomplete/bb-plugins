@@ -623,24 +623,12 @@ export function Board({ subPath }: { subPath?: string }) {
       ? [
           {
             value: organization,
-            label: `${organization} (${organizationsLoading ? "loading…" : "unavailable"})`,
-            disabled: true,
+            label: `${organization} (${completeOrganizations ? "no pull requests" : organizationsLoading ? "loading…" : "unavailable"})`,
+            disabled: !completeOrganizations,
           },
         ]
       : []),
   ];
-  useEffect(() => {
-    if (
-      organization !== null &&
-      completeOrganizations &&
-      !organizations.includes(organization)
-    ) {
-      changeOrganization(null);
-      setNotice(
-        `${organization} has no pull requests in the loaded queues. Showing all organizations.`,
-      );
-    }
-  }, [organization, completeOrganizations, organizations, changeOrganization]);
   const prs = allPrs.filter(
     (pr) => organization === null || repoOwner(pr.row.repo) === organization,
   );

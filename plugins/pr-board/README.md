@@ -13,8 +13,10 @@ board contains more than 120 items.
 
 Use **Organization** to show one repository owner's PRs across both tabs.
 The panel remembers this filter across visits and clears selections when you
-change it. Following an explicit review link switches organizations when
-needed. The sidebar attention badge covers all organizations.
+change it. The organization stays pinned when no PRs match; choose
+**All organizations** to broaden the view. Following an explicit review link
+switches organizations when needed. The sidebar attention badge covers all
+organizations.
 
 The sidebar uses bb's native dot. It stays hidden when nothing needs you,
 uses a neutral tone for 1–4 pending items, amber for 5–14, and red for 15 or
