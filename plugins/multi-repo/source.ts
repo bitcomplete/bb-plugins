@@ -1788,6 +1788,7 @@ async function pushGuidancePrimary(
     const definitionRepos = definitionBase == null ? null : await showAt(projectSourcePath, `${definitionBase}:${reposRel}`, options);
     const baseRepos = await showAt(projectSourcePath, `${base}:${reposRel}`, options);
     const threadChangedRepos = workspaceRepos !== null && definitionRepos !== null && workspaceRepos !== definitionRepos;
+    const threadUnchangedRepos = workspaceRepos !== null && definitionRepos !== null && workspaceRepos === definitionRepos;
     const defaultMovedRepos = definitionRepos !== null && baseRepos !== null && definitionRepos !== baseRepos;
     if (
       resolvePublishMode(policy, "primary", REPOS_FILE) === "merge" &&
@@ -1811,6 +1812,12 @@ async function pushGuidancePrimary(
         ref: split.ref,
         message: [...split.messages, ...warnings].join(" "),
       };
+    }
+    // The thread did not change `repos.json` but the default branch's copy
+    // moved: put the default's copy back so the guidance branch does not carry
+    // a revert of a change that landed after this workspace was cut.
+    if (changed.includes(reposRel) && threadUnchangedRepos) {
+      await gitIn(worktree, ["checkout", base, "--", reposRel], options);
     }
     const commit = await commitAll(worktree, `Publish guidance from ${threadId}`, signal);
     if (!commit.committed || commit.head === null) {

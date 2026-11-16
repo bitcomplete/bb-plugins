@@ -502,6 +502,8 @@ exit 1`);
     expect(result.ok).toBe(true);
     expect(await gitLine(remote, ["show", "main:.bb/repos.json"])).toContain('"added"');
     expect(await gitLine(remote, ["show", "main:.bb/AGENTS.md"])).not.toContain("learned through the link");
+    // The guidance branch carries the default's repos.json, not the stale copy.
+    expect(await gitLine(canonical, ["show", "guidance-thr_stale:.bb/repos.json"])).toContain('"added"');
   });
 
   it("rewrites the open pull request's title and body when stacking", async () => {
