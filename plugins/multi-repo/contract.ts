@@ -22,9 +22,10 @@ export type ProjectLayoutValue = z.infer<typeof projectLayoutSchema>;
 /**
  * How a `.bb` write reached the project. Mirrored from `repos.ts` for the same
  * frontend-bundle reason as the publish policy below; `none` is a plain
- * directory, edited in place with nothing published.
+ * directory, edited in place with nothing published, and `merge` opens a pull
+ * request and merges it in the same step.
  */
-const writeModeSchema = z.enum(["push", "pull-request", "none"]);
+const writeModeSchema = z.enum(["push", "pull-request", "merge", "none"]);
 
 /**
  * The `publish` policy, mirrored from `repos.ts` to keep this module safe for
@@ -33,8 +34,8 @@ const writeModeSchema = z.enum(["push", "pull-request", "none"]);
  * and `repos.ts` owns the strict parse that rejects an unknown value.
  */
 const publishPolicySchema = z.union([
-  z.enum(["push", "pull-request"]),
-  z.record(z.string().min(1).max(PROJECT_FILE_PATH_MAX), z.enum(["push", "pull-request"])),
+  z.enum(["push", "pull-request", "merge"]),
+  z.record(z.string().min(1).max(PROJECT_FILE_PATH_MAX), z.enum(["push", "pull-request", "merge"])),
 ]);
 
 /**
@@ -360,9 +361,9 @@ export const hostContract = defineRpcContract({
         ok: z.boolean(),
         committed: z.boolean(),
         head: z.string().max(64).nullable(),
-        /** `push`, `pull-request`, or `none` for a plain directory. */
+        /** `push`, `pull-request`, `merge`, or `none` for a plain directory. */
         mode: writeModeSchema,
-        /** The pull request opened or found, for `pull-request`. */
+        /** The pull request opened or found, for `pull-request` and `merge`. */
         prUrl: z.string().max(600).nullable(),
         /** Why the publish failed, or a note; null on a clean success. */
         message: z.string().max(600).nullable(),

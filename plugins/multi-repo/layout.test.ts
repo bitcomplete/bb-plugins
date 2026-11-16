@@ -120,7 +120,8 @@ describe("formatInstructions", () => {
     const text = formatInstructions(manifest());
     expect(text).toContain("publishes to `origin`");
     expect(text).toContain("pull request");
-    expect(text).toContain("A failed publish keeps the local commit");
+    expect(text).toContain("repos.json` defaults to `merge`");
+    expect(text).toContain("failed publish keeps the local commit");
     // The old sentence said the plugin commits locally and never pushes.
     expect(text).not.toContain("do not push it");
   });

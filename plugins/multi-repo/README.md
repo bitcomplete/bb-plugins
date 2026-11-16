@@ -114,13 +114,18 @@ bb repos list --project proj_abc123
 - `publish` — optional. How every committed `.bb` write reaches `origin`:
   `"push"` pushes the default branch at once, `"pull-request"` pushes a
   `guidance-` branch and opens a pull request without moving the default
-  branch. It may be one mode for the whole project, or an object mapping a
-  `.bb`-relative path (`repos.json`, `AGENTS.md`, `skills/`, `stewards/`) to
-  one of those modes; the most specific key wins, and an unknown value is a
-  clear error. With no key set, a **primary** project (`.bb/` on a code repo's
-  default branch) is `pull-request` for every path, `repos.json` included;
-  `push` is opt-in through this key. A **plain directory** never publishes
-  anything, so the policy is not read for it.
+  branch, and `"merge"` cuts a fresh branch from the default branch, opens a
+  pull request and merges it in the same step with plain
+  `gh pr merge --squash --delete-branch` (waiting briefly for required checks;
+  a skipped required check counts as passing). It may be one mode for the whole
+  project, or an object mapping a `.bb`-relative path (`repos.json`,
+  `AGENTS.md`, `skills/`, `stewards/`) to one of those modes; the most specific
+  key wins, and an unknown value is a clear error. With no key set, a
+  **primary** project (`.bb/` on a code repo's default branch) is `merge` for
+  `repos.json` — adding a repo is mechanical and nothing else reads the file —
+  and `pull-request` for `AGENTS.md`, `skills/` and `stewards/`; `push` is
+  opt-in through this key. A **plain directory** never publishes anything, so
+  the policy is not read for it.
 
 **Branches float; SHAs are never pinned.** This is a dev workspace, not a
 release manifest.
@@ -284,14 +289,30 @@ through one publish step**, by the project's `publish` policy (see
   with `gh`. The default branch never moves; the change lands when the pull
   request merges. A second write to the same path stacks on the open branch
   (so the push stays a fast-forward) and reuses the open pull request.
+- **`merge`** is the `repos.json` default. It builds the commit on a
+  `guidance-<path>` branch cut fresh from the default branch, pushes it, opens
+  a pull request, waits briefly for required checks (a skipped required check
+  counts as passing), and merges it with plain
+  `gh pr merge --squash --delete-branch` — never `--admin` or any other bypass.
+  A successful merge fast-forwards the canonical checkout's default branch and
+  deletes the local guidance branch. A refused merge leaves the pull request
+  open and reports its URL and the reason on every surface.
 
-A failed push or a failed `gh pr create` is a hard error on every surface
-(panel, CLI, agent tool): the local commit is kept exactly where it is, nothing
-is force-pushed, and the default branch is not reset. The generated
-instruction block still prints an **unpushed `.bb`** line when the checkout's
-default branch is ahead of `origin` — now the signal that a publish did not
-land — and `bb repos list` prints the same line under its `layout` row. The
-plugin keeps reading that local branch while it is strictly ahead (see
+A stale `guidance-` branch is never stacked on. Before a write, a branch whose
+tip is already an ancestor of `origin/<default>` (merged) or which is gone from
+`origin` is rebuilt from the default branch. A branch that is gone from
+`origin` but still holds unmerged commits (a closed pull request or a failed
+push) is kept under a backup ref first and the result names it, so nothing is
+discarded. An open pull request that a legitimate stack updates has its title
+and body rewritten to describe the net change, not the first commit's.
+
+A failed push, a failed `gh pr create` or a refused merge is a hard error on
+every surface (panel, CLI, agent tool): the local commit is kept exactly where
+it is, nothing is force-pushed, and the default branch is not reset. The
+generated instruction block still prints an **unpushed `.bb`** line when the
+checkout's default branch is ahead of `origin` — now the signal that a publish
+did not land — and `bb repos list` prints the same line under its `layout` row.
+The plugin keeps reading that local branch while it is strictly ahead (see
 `resolveDefaultBranchRef`), so a failed change is still live on this server
 and reported, and `preparePrimaryProjectSource` can seed a project and
 provision from it before the seed pull request merges.
@@ -302,15 +323,17 @@ are already in place and the result says nothing is published. `mergeGuidance`
 checks the lesson file is there and stops, with no branch to fast-forward.
 
 On the **primary** layout, `.bb/` is a directory in the primary repo and the
-default branch is reviewed like code, so `workspace_publish_guidance` builds a
-`guidance-<threadId>` branch with the workspace's `.bb/` content and stops
-there — it never moves the default branch. `mergeGuidance` now publishes the
-branch by the policy: `push` fast-forwards the default branch and pushes it,
-`pull-request` pushes the branch and opens the pull request. That avoids the
-sandbox and `receive.denyCurrentBranch` at once, and leaves a named branch to
-review and merge. `workspace_publish_guidance` is the agent's entry point for
-the whole `.bb/` tree; `repos.json` edits from the tools, the CLI and the panel
-take the same host-side route, which is why they work under `accept-edits`.
+default branch is reviewed like code, so `workspace_publish_guidance` commits
+the workspace's `.bb/` content host-side. A `repos.json` change is published on
+its own branch and merged in the same step (its policy default is `merge`);
+every other path goes on a `guidance-<threadId>` branch and stops there, for a
+person to review and merge. `mergeGuidance` publishes the branch by the policy:
+`push` fast-forwards the default branch and pushes it, `pull-request` pushes the
+branch and opens the pull request. That avoids the sandbox and
+`receive.denyCurrentBranch` at once. `workspace_publish_guidance` is the agent's
+entry point for the whole `.bb/` tree; `repos.json` edits from the tools, the
+CLI and the panel take the same host-side route, which is why they work under
+`accept-edits`.
 
 ### Reading `.bb` from another plugin
 
@@ -428,7 +451,7 @@ Accepted consequences, not bugs.
 ```sh
 npm install
 npm run typecheck
-npm test          # 173 tests, including end-to-end provisioning against real git repos
+npm test          # 299 tests, including end-to-end provisioning against real git repos
 npm run build
 ```
 

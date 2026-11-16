@@ -271,6 +271,19 @@ describe("publish policy", () => {
     expect(again.value).toEqual(parsed.value);
   });
 
+  it("accepts merge as a whole-project mode and as a split value", () => {
+    const whole = parseReposFile(JSON.stringify({ version: 1, repos: [], publish: "merge" }));
+    expect(whole.ok).toBe(true);
+    if (!whole.ok) return;
+    expect(whole.value.publish).toBe("merge");
+    const split = parseReposFile(
+      JSON.stringify({ version: 1, repos: [], publish: { "repos.json": "merge", "AGENTS.md": "pull-request" } }),
+    );
+    expect(split.ok).toBe(true);
+    if (!split.ok) return;
+    expect(split.value.publish).toEqual({ "repos.json": "merge", "AGENTS.md": "pull-request" });
+  });
+
   it("parses a policy split by path and round-trips it", () => {
     const text = JSON.stringify({
       version: 1,
@@ -346,8 +359,9 @@ describe("publish policy", () => {
 });
 
 describe("resolvePublishMode", () => {
-  it("defaults a primary project to a pull request for every path", () => {
-    for (const path of ["repos.json", "AGENTS.md", "skills/x.md", "stewards/project.json"]) {
+  it("defaults a primary project's repos.json to merge and the rest to a pull request", () => {
+    expect(resolvePublishMode(undefined, "primary", "repos.json")).toBe("merge");
+    for (const path of ["AGENTS.md", "skills/x.md", "stewards/project.json"]) {
       expect(resolvePublishMode(undefined, "primary", path)).toBe("pull-request");
     }
   });
@@ -361,6 +375,7 @@ describe("resolvePublishMode", () => {
 
   it("lets a whole-project value override the layout default", () => {
     expect(resolvePublishMode("push", "primary", "AGENTS.md")).toBe("push");
+    expect(resolvePublishMode("merge", "primary", "AGENTS.md")).toBe("merge");
     expect(resolvePublishMode("pull-request", "directory", "repos.json")).toBe("pull-request");
   });
 

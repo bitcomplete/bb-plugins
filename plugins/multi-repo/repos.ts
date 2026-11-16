@@ -75,14 +75,14 @@ export type RepoEntry = z.infer<typeof repoEntrySchema>;
  * repo set. This module attaches no behaviour to the value: it only validates
  * and round-trips it.
  */
-export const publishModeSchema = z.enum(["push", "pull-request"]);
+export const publishModeSchema = z.enum(["push", "pull-request", "merge"]);
 export type PublishMode = z.infer<typeof publishModeSchema>;
 
 /**
  * The mode a write actually used. `none` is a plain project directory, which
  * edits `.bb/` in place and never commits, pushes or opens anything.
  */
-export const writeModeSchema = z.enum(["push", "pull-request", "none"]);
+export const writeModeSchema = z.enum(["push", "pull-request", "merge", "none"]);
 export type WriteMode = z.infer<typeof writeModeSchema>;
 
 /**
@@ -123,16 +123,16 @@ export function publishPolicyProblem(value: unknown): string | null {
   if (typeof value === "string") {
     return publishModeSchema.safeParse(value).success
       ? null
-      : `publish is ${JSON.stringify(value)}; expected "push" or "pull-request".`;
+      : `publish is ${JSON.stringify(value)}; expected "push", "pull-request" or "merge".`;
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return `publish must be "push", "pull-request", or an object of path → mode.`;
+    return `publish must be "push", "pull-request", "merge", or an object of path → mode.`;
   }
   for (const [key, mode] of Object.entries(value)) {
     const problem = projectFilePathProblem(key.endsWith("/") ? key.slice(0, -1) : key);
     if (problem !== null) return `publish[${JSON.stringify(key)}]: ${problem}`;
     if (typeof mode !== "string" || !publishModeSchema.safeParse(mode).success) {
-      return `publish[${JSON.stringify(key)}] is ${JSON.stringify(mode)}; expected "push" or "pull-request".`;
+      return `publish[${JSON.stringify(key)}] is ${JSON.stringify(mode)}; expected "push", "pull-request" or "merge".`;
     }
   }
   return null;
@@ -143,11 +143,13 @@ export function publishPolicyProblem(value: unknown): string | null {
  *
  * Precedence: an explicit policy value wins; a policy object's most specific
  * matching key wins; otherwise the layout default applies. The defaults are
- * the settled ones from BB-148 deliverable 2:
+ * the settled ones from BB-148 deliverable 2, revised by BB-340:
  *
  * - A **primary** project's `.bb/` sits on a code repo's default branch, so
- *   every path — `repos.json` included — is reviewed like code and defaults to
- *   `pull-request`; `push` is opt-in through the key.
+ *   `AGENTS.md`, `skills/` and `stewards/` are reviewed like code and default
+ *   to `pull-request`. `repos.json` is mechanical and nothing else reads it,
+ *   so it defaults to `merge`: open a pull request and merge it in the same
+ *   step. `push` is opt-in through the key.
  * - A **plain directory** never publishes anything, so the mode is unused;
  *   the standalone-era defaults are kept only so the function is total.
  *
@@ -169,7 +171,7 @@ export function resolvePublishMode(
     }
     if (best !== null) return best.mode;
   }
-  if (layout === "primary") return "pull-request";
+  if (layout === "primary") return target === REPOS_FILE ? "merge" : "pull-request";
   return target === REPOS_FILE ? "push" : "pull-request";
 }
 

@@ -386,15 +386,20 @@ export function ReposPanel({ subPath = "" }: { subPath?: string }) {
 
   /** The line a successful write's publish result should show in the panel. */
   const publishMessage = (result: {
-    mode: "push" | "pull-request" | "none" | null;
+    mode: "push" | "pull-request" | "merge" | "none" | null;
     prUrl: string | null;
     message: string | null;
   }): string | null => {
+    if (result.mode === "merge") {
+      const merged = result.prUrl === null ? "Merged the change." : `Merged ${result.prUrl}.`;
+      return result.message === null ? merged : `${merged} ${result.message}`;
+    }
+    if (result.mode === "pull-request") {
+      const opened = result.prUrl === null ? "Opened a pull request for the change." : `Opened ${result.prUrl} for the change.`;
+      return result.message === null ? opened : `${opened} ${result.message}`;
+    }
     if (result.message !== null) return result.message;
     if (result.mode === "none") return "Nothing is published: this project is a plain directory.";
-    if (result.mode === "pull-request") {
-      return result.prUrl === null ? "Opened a pull request for the change." : `Opened ${result.prUrl} for the change.`;
-    }
     if (result.mode === "push") return "Pushed the change to origin.";
     return null;
   };
