@@ -151,8 +151,11 @@ ${buildBlocker("the ticket")}
 ## In Review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. When every linked pull request is merged, move the ticket to
-Done.
+failing checks. A review wait that outlives its budget reads red and the
+plugin posts one signed nudge naming the requested reviewer; if a second
+budget passes it files the owner's **Review it yourself / Reassign / Keep
+waiting** decide item, and Keep waiting resets the budget once. When every
+linked pull request is merged, move the ticket to Done.
 
 ${buildBlocker("the ticket")}
 `;
@@ -288,7 +291,11 @@ ${buildBlocker("the issue")}
 ## status:in-review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. When every linked pull request is merged and the project's
+failing checks. A review wait that outlives its budget reads red and the
+plugin posts one signed nudge naming the requested reviewer; if a second
+budget passes it files the owner's **Review it yourself / Reassign / Keep
+waiting** decide item, and Keep waiting resets the budget once. When every
+linked pull request is merged and the project's
 deployment source confirms the merge is live, close the issue with \`gh issue
 close <owner/repo#N> --comment "<what shipped and where it is live>"\` (use
 \`--reason not planned\` when the issue will not be done), and end with
@@ -342,7 +349,11 @@ contract, auth, a migration, a secret, production infrastructure, a big
 decision), needs the owner's approval before it merges. When it is approved
 and checks pass, merge it if the project's guidance says its author may;
 otherwise say so in a comment. The merge comment names the approved commit
-and, when newer commits landed after it, one line on what they changed.
+and, when newer commits landed after it, one line on what they changed. A
+review wait that outlives its budget reads red and the plugin posts one signed
+nudge naming the requested reviewer; if a second budget passes it files the
+owner's **Review it yourself / Reassign / Keep waiting** decide item, and Keep
+waiting resets the budget once.
 
 ${buildBlocker("the work")}
 `;
@@ -425,7 +436,11 @@ ${WORKER_QUESTIONS}
 
 ## open
 
-Run a round when one is due; otherwise there is nothing to do.
+Run a round when one is due; otherwise there is nothing to do. A review wait
+that outlives its budget reads red and the plugin posts one signed nudge
+naming the requested reviewer; if a second budget passes it files the owner's
+**Review it yourself / Reassign / Keep waiting** decide item, and Keep waiting
+resets the budget once.
 
 ${buildBlocker("the work")}
 

@@ -24,6 +24,8 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   waitingOn: null,
   waitingUntil: null,
   wait: null,
+  overdue: false,
+  overdueMs: null,
   noWakeSource: false,
   wakeFailure: null,
   needsUser: false,
@@ -58,6 +60,8 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   waitingOn: null,
   waitingUntil: null,
   wait: null,
+  overdue: false,
+  overdueMs: null,
   noWakeSource: false,
   wakeFailure: null,
   workers: [],
@@ -505,6 +509,38 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     // 8. no report: `the other party` stands in for an external wait with no nextAction.
     expect(effortPhrase(effort({ key: "n", statusActor: "other" }))).toBe("the other party");
     expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
+  });
+
+  // BB-351: a live wait past its kind's budget reads red (Blocked) with its
+  // own `, overdue <duration>` phrase; a live wait within budget stays grey in
+  // Waiting.
+  it("reads an overdue wait blocked, with `, overdue <duration>` appended", () => {
+    const overdue = effort({ key: "r", delegateWait: "arashout", overdue: true, overdueMs: 2 * 86_400_000 });
+    expect(effortState(overdue)).toBe("blocked");
+    expect(effortSection({ ...overdue, state: effortState(overdue), kind: "review" })).toBe("blocked");
+    expect(effortPhrase(overdue)).toBe("waiting on review from arashout, overdue 2d");
+    // The duration rounds to hours and minutes below a day.
+    expect(effortPhrase(effort({ key: "r2", delegateWait: "arashout", overdue: true, overdueMs: 3 * 3_600_000 }))).toBe("waiting on review from arashout, overdue 3h");
+    expect(effortPhrase(effort({ key: "r3", delegateWait: "arashout", overdue: true, overdueMs: 45 * 60_000 }))).toBe("waiting on review from arashout, overdue 45m");
+    // A live wait within budget is quiet and files in Waiting.
+    const within = effort({ key: "w", wait: { kind: "review", ref: "acme/web#9" }, overdue: false });
+    expect(effortState(within)).toBe("quiet");
+    expect(effortSection({ ...within, state: effortState(within), kind: "ticket" })).toBe("waiting");
+  });
+
+  it("carries an overdue wait onto the effort as red, in Blocked, with the phrase", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", wait: { kind: "review", ref: "acme/web#9" }, overdue: true, overdueMs: 2 * 86_400_000 })] })],
+      now: Date.parse("2026-11-17T00:00:00Z"),
+    });
+    const row = tabs[0]!.blocked.find((e) => e.key === "ENG-1")!;
+    expect(row.state).toBe("blocked");
+    expect(row.overdue).toBe(true);
+    expect(row.overdueMs).toBe(2 * 86_400_000);
+    expect(row.phrase).toBe("no report yet, overdue 2d");
+    expect(tabs[0]!.waiting).toHaveLength(0);
   });
 
   // BB-154/BB-348: the mark is red, so it reads right after `stuck`, ahead of

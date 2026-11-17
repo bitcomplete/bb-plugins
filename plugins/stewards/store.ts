@@ -843,7 +843,15 @@ export const BACKLOG_WRITE_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS backlog_writes_ticket ON backlog_writes (project_id, team, issue_id, at)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS];
+// BB-351: the start of the binding's current typed wait and the moment the
+// plugin nudged it. `wait_since` is set when a report first records a wait (or
+// changes its kind or ref) and is kept while a report repeats the same one;
+// `wait_nudged_at` records the overdue wake/nudge so it happens at most once
+// per wait and is the clock for the second budget. Append-only and nullable:
+// an old row reads as no wait and never nudged.
+export const WAIT_BUDGET_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait_since INTEGER`, `ALTER TABLE bindings ADD COLUMN wait_nudged_at INTEGER`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1081,6 +1089,10 @@ export type Binding = {
   backlogSnapshot: BacklogSnapshot | null;
   /** The typed wait from the last `steward_report` (BB-333), or null; the free-text `waitingOn` stays on the status record. */
   wait: Wait | null;
+  /** BB-351: when the current typed wait was first reported, or null with no wait; a repeat keeps it, a changed wait resets it. */
+  waitSince: number | null;
+  /** BB-351: when the plugin first found this wait overdue and nudged (or woke the steward), or null; at most once per wait. */
+  waitNudgedAt: number | null;
   /** The latest reason per declining branch (BB-335), keyed by code; empty with none. Rides on the assessment row and is joined into the binding read, so no surface adds a store read. */
   nonActions: NonActions;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
@@ -1181,6 +1193,8 @@ function rowToBinding(r: BindingRow): Binding {
     backlogLook: json(backlogLookSchema.nullable(), str("backlog_look"), null),
     backlogSnapshot: json(backlogSnapshotSchema.nullable(), str("backlog_snapshot"), null),
     wait: json(waitSchema.nullable(), str("wait"), null),
+    waitSince: num("wait_since"),
+    waitNudgedAt: num("wait_nudged_at"),
     nonActions: json(nonActionsSchema, str("assessment_non_actions"), {}),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
@@ -1258,6 +1272,8 @@ const COLUMNS = {
   backlogLook: "backlog_look",
   backlogSnapshot: "backlog_snapshot",
   wait: "wait",
+  waitSince: "wait_since",
+  waitNudgedAt: "wait_nudged_at",
   deployments: "deployments",
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",
@@ -1311,6 +1327,9 @@ const VISIBLE_COLUMNS = [
   "requeue_until",
   // BB-333: the typed wait renders on the card and in `bb stewards show`.
   "wait",
+  // BB-351: the wait's start decides whether the row reads overdue, so a
+  // write rings the channel.
+  "wait_since",
   // BB-255: a failed wake's phrase is the visible line two.
   "wake_failure",
 ] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;

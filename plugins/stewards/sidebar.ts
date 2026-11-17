@@ -33,6 +33,10 @@ export interface SidebarBinding {
   waitingUntil: number | null;
   /** The typed wait from the last report (BB-333), or null; a live one files the effort in Waiting (BB-348). */
   wait: Wait | null;
+  /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+  overdue: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+  overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
@@ -135,6 +139,10 @@ export interface SidebarEffort {
   waitingUntil: number | null;
   /** The typed wait from the last report (BB-333), or null; a live one files the effort in Waiting (BB-348). */
   wait: Wait | null;
+  /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+  overdue: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+  overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
@@ -271,6 +279,10 @@ export interface EffortStatus {
   waitingUntil?: number | null;
   /** The typed wait from the last report (BB-333), or null; a live one files the effort in Waiting (BB-348). */
   wait?: Wait | null;
+  /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+  overdue?: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+  overdueMs?: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource?: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
@@ -286,16 +298,16 @@ export const isRunning = (e: Pick<EffortStatus, "busy" | "runningWorkers">): boo
 const wakeFailed = (e: EffortStatus): boolean => e.wakeFailure !== null && e.wakeFailure !== undefined && e.wakeFailure !== "";
 
 /**
- * The effort's glyph, first match wins (BB-76, BB-348):
+ * The effort's glyph, first match wins (BB-76, BB-348, BB-351):
  * needs you › blocked › running › quiet. Blocked is an open `stuck` escalation,
- * a failed wake or a wait with no wake source (BB-154); a hold and the free-text
- * wait (`waitingOn`) never block (BB-109), so a held or waiting effort is quiet
- * unless a worker or reviewer runs. A running effort that also needs you is
- * yellow.
+ * a failed wake, a wait with no wake source (BB-154), or a live wait past its
+ * kind's budget (BB-351); a hold and the free-text wait (`waitingOn`) never
+ * block (BB-109), so a held or waiting effort is quiet unless a worker or
+ * reviewer runs. A running effort that also needs you is yellow.
  */
 export function effortState(e: EffortStatus): SidebarEffortState {
   if (e.needsUser) return "you";
-  if (e.stuck || wakeFailed(e) || e.noWakeSource === true) return "blocked";
+  if (e.stuck || wakeFailed(e) || e.noWakeSource === true || e.overdue === true) return "blocked";
   if (isRunning(e)) return "running";
   return "quiet";
 }
@@ -395,6 +407,17 @@ export function waitingOnNamesFinishedWorker(
   return waitingOn !== null && workers.some((w) => w.status !== "running" && waitingOnNamesWorker(waitingOn, w));
 }
 
+/**
+ * BB-351: the duration an overdue wait reads, e.g. `2d`, `3h`, `45m`. The
+ * value is the wait's age; a live wait past its budget reads `<phrase>,
+ * overdue <duration>`.
+ */
+export function overduePhrase(ms: number): string {
+  if (ms >= 86_400_000) return `${Math.round(ms / 86_400_000)}d`;
+  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.max(1, Math.round(ms / 60_000))}m`;
+}
+
 /** A short relative time to a future moment, for `next look <time>` (BB-83). */
 export function untilPhrase(at: number, now: number): string {
   const ms = at - now;
@@ -429,7 +452,7 @@ export const waitingUntilDate = (at: number): string => new Date(at).toISOString
  * `next look` time; it defaults to the wall clock so a caller with no clock
  * still gets a phrase.
  */
-export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
+function baseEffortPhrase(e: EffortStatus, now: number): string {
   if (e.needsUser) return "needs you";
   // BB-255: a wake that could not be delivered outranks the `stuck` escalation
   // it filed, so the row says why it is stuck rather than just that it is.
@@ -465,6 +488,16 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   return "no report yet";
 }
 
+/**
+ * Line two's status phrase. BB-351 appends `, overdue <duration>` to the base
+ * phrase for a live wait past its kind's budget, so a red row says why it is
+ * red: e.g. `waiting on review from arashout, overdue 2d`.
+ */
+export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
+  const phrase = baseEffortPhrase(e, now);
+  return e.overdue === true && e.overdueMs !== null && e.overdueMs !== undefined ? `${phrase}, overdue ${overduePhrase(e.overdueMs)}` : phrase;
+}
+
 /** Fill in the derived fields. Grouping calls this once the effort's children are attached. */
 function derive(e: SidebarEffort, now: number): SidebarEffort {
   e.state = effortState(e);
@@ -494,6 +527,8 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     waitingOn: null,
     waitingUntil: null,
     wait: null,
+    overdue: false,
+    overdueMs: null,
     noWakeSource: false,
     wakeFailure: null,
     workers: [],
@@ -717,6 +752,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       waitingOn: b.waitingOn,
       waitingUntil: b.waitingUntil,
       wait: b.wait,
+      overdue: b.overdue,
+      overdueMs: b.overdueMs,
       noWakeSource: b.noWakeSource,
       wakeFailure: b.wakeFailure,
       workers: b.workers,
@@ -817,6 +854,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       waitingOn: null,
       waitingUntil: null,
       wait: null,
+      overdue: false,
+      overdueMs: null,
       noWakeSource: false,
       wakeFailure: null,
       workers: [],

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_WAIT_BUDGETS,
   DEPENDENCY_BOTS,
   depsTargets,
   githubStateLabels,
@@ -20,6 +21,7 @@ import {
   sentryTargets,
   ticketWatchId,
   ticketWatchProblems,
+  waitBudgetMs,
 } from "./config.js";
 import {
   bindingRoles,
@@ -185,6 +187,23 @@ describe("the project file", () => {
     expect(parseProjectFile(JSON.stringify({ version: 1, standingRule: ["typo"] }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, standingRules: [""] }))).toMatchObject({ ok: false });
   });
+  it("takes a waitBudgets block, defaults every kind when absent, and rejects an unknown key (BB-351)", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.waitBudgets).toEqual({});
+    expect(waitBudgetMs("review", defaults.value.waitBudgets)).toBe(DEFAULT_WAIT_BUDGETS.review);
+    expect(waitBudgetMs("worker", defaults.value.waitBudgets)).toBeNull();
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, waitBudgets: { review: "2h", person: "3d", external: null } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(explicit.value.waitBudgets).toEqual({ review: 2 * 3_600_000, person: 3 * 86_400_000, external: null });
+    expect(waitBudgetMs("review", explicit.value.waitBudgets)).toBe(2 * 3_600_000);
+    expect(waitBudgetMs("person", explicit.value.waitBudgets)).toBe(3 * 86_400_000);
+    expect(waitBudgetMs("external", explicit.value.waitBudgets)).toBeNull();
+    // An unknown kind is a load error, not a silently ignored key.
+    expect(parseProjectFile(JSON.stringify({ version: 1, waitBudgets: { review: "2h", bogus: "1d" } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, waitBudgets: { review: "soon" } }))).toMatchObject({ ok: false });
+  });
+
   it("parses mergeDispatch, defaulting to none, and refuses a bad entry (BB-216)", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);
