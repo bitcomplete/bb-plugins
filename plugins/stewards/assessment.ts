@@ -63,6 +63,12 @@ export type AssessedLiveness = {
   live: boolean;
   /** The stored typed wait's own liveness (BB-333); null when the binding has no typed wait. */
   waitLive: boolean | null;
+  /**
+   * A compact fingerprint of the freshly read waited `pull`/`review` ref
+   * (BB-333), so a change on it wakes the binding. Null for any other wait or
+   * when the ref could not be read; JSON, never the raw snapshot.
+   */
+  waited: string | null;
   /** `idleInActiveStage` before the typed wait is applied: what the consumer's idle wake reads (BB-333). */
   idleBase: boolean;
   /** `idleInActiveStage`. */
@@ -181,6 +187,28 @@ function waitPullKey(ref: string): string | null {
 }
 
 /**
+ * A compact, JSON fingerprint of the freshly read waited `pull`/`review` ref
+ * (BB-333): the fields a steward's wait is about, so any change on the ref
+ * wakes the binding without storing the snapshot. Null for another kind or a
+ * ref the look could not read.
+ */
+function waitFingerprint(wait: Wait | null, input: AssessmentInput): string | null {
+  if (wait === null || (wait.kind !== "pull" && wait.kind !== "review")) return null;
+  const key = waitPullKey(wait.ref);
+  const e = key === null ? undefined : input.waitedPulls?.get(key);
+  if (e === undefined) return null;
+  return JSON.stringify({
+    key: e.key,
+    state: e.state,
+    title: e.title,
+    head: e.pull?.headSha ?? null,
+    checks: e.pull?.checks?.state ?? null,
+    review: reviewGiven(e),
+    merged: e.pull?.merged === true,
+  });
+}
+
+/**
  * Whether the stored typed wait is live, resolved against the rows the look
  * holds (BB-333): the freshly read waited pull, the deployment watches, the
  * workers, the other bindings, the page items and the date. The typed wait is
@@ -206,10 +234,9 @@ function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
     case "date":
       // The design's rule: a `date` wait is live while the binding's own
       // requeue is still ahead (`requeueUntil`). `steward_report` sets
-      // `requeueUntil` only from `until` today, not yet from the ref, so a
-      // `date` wait that sent only a ref is not live. Reading the ref here
-      // claimed a wake the plugin never scheduled; the report-path gap (the
-      // design has the ref set `requeueUntil` too) is a separate fix.
+      // `requeueUntil` from the ref (or from `until`) in PR 3, so a `date`
+      // wait that sent only a ref is live while the date is ahead. Reading the
+      // ref here would claim a wake the plugin never scheduled.
       return input.binding.requeueUntil !== null && input.binding.requeueUntil > input.now;
     case "person":
       return input.hasOpenItem?.(wait.ref) ?? false;
@@ -321,6 +348,7 @@ export function assess(input: AssessmentInput): Assessment {
     liveness: {
       live,
       waitLive,
+      waited: waitFingerprint(wait, input),
       idleBase,
       // A live typed wait is something the plugin waits on, so it suppresses
       // the idle wake; a stalled or external one does not (BB-333).

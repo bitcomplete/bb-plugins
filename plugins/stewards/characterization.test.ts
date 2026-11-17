@@ -23,11 +23,9 @@ import {
   anyWorkerInFlight,
   gateKnownUnmet,
   idleInActiveStage,
-  namesUserAsBlocker,
   productGateOptions,
   runningWorkerReason,
   stuckDue,
-  unheardWait,
   workerInFlight,
   workerRunning,
   type IdleBinding,
@@ -186,24 +184,6 @@ describe("the worker-busy predicates: workerInFlight vs runningWorkerReason", ()
   it("pins isBusy (BUSY) as the host thread's starting/active/stopping, and nothing else", () => {
     expect(["starting", "active", "stopping"].every(isBusy)).toBe(true);
     expect(["idle", "finished", "failed"].some(isBusy)).toBe(false);
-  });
-
-  it("pins unheardWait: a wait on the project steward or the user with no open escalation or need", () => {
-    const status = (waitingOn: string | null) => ({ phase: "In Progress", summary: "s", nextAction: "n", actor: "other" as const, waitingOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
-    expect(unheardWait(status("the project steward's approval of the new spec"), [])).toMatch(/project steward/u);
-    expect(unheardWait(status("the user's answer on scope"), [])).toMatch(/the user/u);
-    expect(unheardWait(status("the user's answer"), [{ kind: "approval" } as never])).toBeNull();
-    expect(unheardWait(status("Sam's review"), [])).toBeNull();
-    expect(unheardWait(status(null), [])).toBeNull();
-  });
-
-  it("pins namesUserAsBlocker: user/owner/human as a word, not inside another word", () => {
-    expect(namesUserAsBlocker("the user must choose")).toBe(true);
-    expect(namesUserAsBlocker("the owner's approval")).toBe(true);
-    expect(namesUserAsBlocker("a human review")).toBe(true);
-    expect(namesUserAsBlocker("the username is wrong")).toBe(false);
-    expect(namesUserAsBlocker("ownerless")).toBe(false);
-    expect(namesUserAsBlocker("waiting on the reviewer")).toBe(false);
   });
 });
 

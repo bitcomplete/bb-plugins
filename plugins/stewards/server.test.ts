@@ -842,15 +842,6 @@ describe("a Linear ticket steward", () => {
     expect(toProject()).toHaveLength(after);
   });
 
-  it("flags a status that waits on the project steward with no escalation", async () => {
-    const t = await setup();
-    t.entities.set("uuid-12", issue());
-    await t.ring("linear", "uuid-12");
-    const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { phase: "Todo", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the project steward's call on scope" }, steward);
-    expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toMatch(/waits on the project steward, with no open escalation/u);
-  });
-
   it("recognizes workers the steward starts with bb thread spawn, and wakes only when one asks", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
@@ -15232,9 +15223,9 @@ describe("a typed wait (BB-333)", () => {
   // BB-266: a ticket with a gate-met own pull, a parked `finished` worker and a
   // second open own pull, waiting on the plugin auto-merge. The typed ref is
   // the own gate-met pull, so it is recorded as external (reference_is_self).
-  // TODAY the second open own pull is still a live source, so the wait is not
-  // marked; PR 2 derives the stall from the external wait despite it.
-  it("pins the BB-266 fixture: the second open own pull is a live source, so the wait is not marked", async () => {
+  // BB-333 PR 3: the stored flag is now the derived stall, so the external wait
+  // stalls despite the second open own pull.
+  it("pins the BB-266 fixture: the external wait stalls despite the second open own pull", async () => {
     const t = await setup();
     t.entities.set(
       "uuid-12",
@@ -15258,7 +15249,7 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
   // bb-plugins#294: a `pr` binding's own open pull with a free-text wait. The
@@ -15278,9 +15269,9 @@ describe("a typed wait (BB-333)", () => {
 
   // bc-prod#422 / BCP-157: a ticket waiting on the owner's approval, with no
   // open approve-pr item, beside an open linked pull. The person ref is not an
-  // open page item, so it is recorded as external. TODAY the open pull watch is
-  // a live source and masks it; PR 2 derives the stall despite the mask.
-  it("pins the bc-prod#422/BCP-157 fixture: the open pull watch masks the person wait", async () => {
+  // open page item, so it is recorded as external. BB-333 PR 3: the stored flag
+  // is now the derived stall, so the external wait stalls despite the open pull.
+  it("pins the bc-prod#422/BCP-157 fixture: the external wait stalls despite the open pull watch", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
@@ -15291,7 +15282,7 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "need_approve" });
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
   // bc-prod#430 / BCP-160: a ticket waiting on a foreign pull's checks, not
@@ -15336,11 +15327,12 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    // BB-333 PR 3: the stored flag is the derived stall, so it now agrees.
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
     expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
-    // The report-time flag agrees with the second open own pull, so the
-    // derived stall is a divergence and is recorded.
-    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "noWakeSource" })).toContainEqual(expect.objectContaining({ old: "source-or-no-wait", new: "no-wake-source" }));
+    // The shadow's divergence table stopped being written: the flag and the
+    // derivation agree by construction.
+    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "noWakeSource" })).toHaveLength(0);
   });
 
   it("derives the bb-plugins#294 fixture: a pr binding's own external wait stalls", async () => {
@@ -15361,7 +15353,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
     expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
   });
 
@@ -15387,7 +15379,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     expect(github().entities).not.toContain("acme/web#430");
   });
 
-  it("a ring on a waited ref looks, sends no wake, and touches no snapshot or resource", async () => {
+  it("a ring on a waited ref wakes the binding on the ref's change (BB-333)", async () => {
     const { t, steward } = await ticket();
     t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
     await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
@@ -15396,16 +15388,57 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const wakesBefore = t.sends.filter((s) => s.threadId === steward).length;
     const pullsBefore = JSON.stringify(before.lastSnapshot?.pulls ?? []);
     t.rpcCalls.length = 0;
-    // The waited pull changes; the doorbell rings it.
+    // The waited pull changes; the doorbell rings it. BB-333 PR 3: the change
+    // now wakes the binding (in PR 2 it only fed the derived result).
     t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open", title: "changed" }));
     await t.ring("github", "acme/web#430");
     await t.flush();
-    // The waiting ticket looked (it read the waited ref) but the change woke nobody.
     expect(t.rpcCalls.some((c) => c.method === "sourceSnapshot" && c.input.id === "acme/web#430")).toBe(true);
-    expect(t.sends.filter((s) => s.threadId === steward).length).toBe(wakesBefore);
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBeGreaterThan(wakesBefore);
+    expect(t.sends.at(-1)!.text).toContain("The waited pull acme/web#430 changed");
+    // The waited ref is still not a stored linked pull or a resource.
     const after = t.hooks.store.find("ENG-12")!;
     expect(JSON.stringify(after.lastSnapshot?.pulls ?? [])).toBe(pullsBefore);
     expect(after.status?.resources.pullRequests ?? []).not.toContain("acme/web#430");
+  });
+
+  it("does not wake on a re-pointed ref, a kind switch or a failed read (BB-333)", async () => {
+    const { t, steward } = await ticket();
+    const waitedWakes = () => t.sends.filter((s) => s.threadId === steward && s.text.includes("The waited pull")).length;
+    t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "date", ref: "2027-07-01" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    // A kind switch to a pull wait has no prior fingerprint for the ref, so it
+    // must not read as a change.
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+    // Re-pointing the wait at an unchanged, different ref is not a change on
+    // the first ref.
+    t.entities.set("acme/web#431", pull({ id: "acme/web#431", key: "acme/web#431", url: "https://github.com/acme/web/pull/431", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#431 checks", wait: { kind: "pull", ref: "acme/web#431" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+    // A failed read (the ref is gone) and its recovery are not changes either.
+    t.entities.delete("acme/web#431");
+    await t.hooks.reconcilePass("p1");
+    t.entities.set("acme/web#431", pull({ id: "acme/web#431", key: "acme/web#431", url: "https://github.com/acme/web/pull/431", state: "open" }));
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+  });
+
+  it("a date wait with only a ref sets requeueUntil and is not a stall (BB-333)", async () => {
+    const { t, steward } = await ticket();
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "date", ref: "2027-07-01" } }, steward);
+    expect(report.error).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.wait).toEqual({ kind: "date", ref: "2027-07-01" });
+    expect(b.requeueUntil).toBe(Date.UTC(2027, 6, 1));
+    // A future date is the plugin's own wake source, so the wait is not marked.
+    expect(b.noWakeSource).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: true });
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 });
 
