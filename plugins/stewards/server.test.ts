@@ -15571,6 +15571,21 @@ describe("the wait budget (BB-351)", () => {
     expect(t2.hooks.store.find("ENG-12")!.waitNudgedAt).not.toBeNull();
   });
 
+  it("starts the clock for a stored wait with no wait_since, then nudges one budget later", async () => {
+    const { t, b } = await reviewWait();
+    // A wait already open when `wait_since` shipped (a migrated row, or a
+    // report from before the column) has no clock until the first look.
+    t.hooks.store.patch(b().id, { waitSince: null });
+    expect(nudgeWrites(t)).toHaveLength(0);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitSince).not.toBeNull();
+    expect(nudgeWrites(t)).toHaveLength(0);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(1);
+    expect(b().waitNudgedAt).not.toBeNull();
+  });
+
   it("keeps the wait's start on a repeat and resets it when the kind or ref changes", async () => {
     const { t, steward, b } = await reviewWait();
     t.advance(DAY + HOUR);

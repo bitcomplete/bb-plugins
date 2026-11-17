@@ -5232,6 +5232,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         waitedKind === "pull" || waitedKind === "review"
           ? ((store.assessment(b.id)?.liveness as { waited?: string | null } | null | undefined)?.waited ?? null)
           : null;
+      // BB-351: a wait stored before `wait_since` existed (or by a report that
+      // predates it) starts its clock on the first look that sees it, so a wait
+      // already open when this ships can still read overdue one budget later.
+      if (b.wait !== null && b.waitSince === null) b = store.patch(b.id, { waitSince: now() });
       let assessment: Assessment | null = null;
       try {
         assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
@@ -5269,6 +5273,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 await sourceRpc("github", "sourceComment", { key: `${ref.repo}#${ref.number}`, body: waitNudgeBody(b, reviewers, b.waitSince) }, sourceContract.sourceComment.output);
                 nudged = ` and nudged ${reviewers.join(", ")} on ${overdueWait.ref}`;
               } catch (error) {
+                // The nudge is once per wait, so a failed post must reach the
+                // steward in the wake text, not only the log.
+                nudged = `; the nudge to ${reviewers.join(", ")} on ${overdueWait.ref} failed: ${errorMessage(error)}; post it yourself, signed`;
                 bb.log.warn(`stewards: could not nudge the review wait on ${overdueWait.ref}: ${errorMessage(error)}`);
               }
             }
@@ -12439,7 +12446,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             requeueUntil: untilAt,
             // A report replaces the typed wait; a report without one clears it.
             wait,
-            ...(wait === null ? { waitSince: null, waitNudgedAt: null } : waitChanged ? { waitSince: now(), waitNudgedAt: null } : {}),
+            ...(wait === null ? { waitSince: null, waitNudgedAt: null } : waitChanged || b.waitSince === null ? { waitSince: now(), waitNudgedAt: null } : {}),
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
