@@ -46,7 +46,7 @@ import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { setStewardsSidebarCommand, getStewardsSidebarCommand } from "./sidebar-command.js";
 import { readLastPlace, writeLastPlace } from "./last-place.js";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, familySection, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import {
   AUTOMATIC_NAVIGATION_PROVIDER,
   AUTOMATIC_THREAD_LIST_PROVIDER,
@@ -665,6 +665,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     waitingUntil: s.waitingUntil,
+    wait: s.wait,
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
@@ -735,7 +736,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
       {s.waitingOn !== null && (s.waitingUntil === null || s.waitingUntil === undefined) ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
       {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
       {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
-      {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
+      {s.hold !== null ? <p className="text-muted-foreground">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
         <p key={i} className={x.route === "user" ? "text-destructive" : "text-muted-foreground"}>
           {x.kind} escalation with {x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: {x.question}
@@ -1310,7 +1311,9 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     delegateWait: s.delegateWait,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
+    waitingOn: s.waitingOn,
     waitingUntil: s.waitingUntil,
+    wait: s.wait,
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
@@ -1326,6 +1329,8 @@ interface BoardEffort {
   section: SidebarSection;
   phrase: string;
   items: NeedsYouItem[];
+  /** Child efforts nested one level under this one by `parentKey` (BB-245), for the family pass and the count line (BB-348). */
+  nested: BoardEffort[];
 }
 
 /** The most recent thing the board knows about an effort, for the section ordering. */
@@ -1374,15 +1379,43 @@ function boardEfforts(b: Board): { efforts: BoardEffort[]; orphans: NeedsYouItem
   const efforts: BoardEffort[] = b.stewards.map((s) => {
     const status = boardEffortStatus(s);
     const state = effortState(status);
-    return { steward: s, state, section: effortSection({ state, kind: s.kind }), phrase: effortPhrase(status, now), items: itemsByKey.get(s.key) ?? [] };
+    return { steward: s, state, section: effortSection({ ...status, state, kind: s.kind }, now), phrase: effortPhrase(status, now), items: itemsByKey.get(s.key) ?? [], nested: [] };
   });
+  // BB-348: the board applies the sidebar's family pass from the same
+  // `parentKey`, so a waiting initiative with live nested work counts as in
+  // flight on both surfaces. Nesting is one level, exactly as in the sidebar.
+  const byKey = new Map(efforts.map((e) => [e.steward.key, e] as const));
+  const parentKeyOf = (e: BoardEffort): string | null => {
+    const pk = e.steward.parentKey ?? null;
+    if (pk === null) return null;
+    const p = byKey.get(pk);
+    return p === undefined || p === e ? null : pk;
+  };
+  for (const e of efforts) {
+    const pk = parentKeyOf(e);
+    if (pk === null) continue;
+    const parent = byKey.get(pk)!;
+    if (parentKeyOf(parent) !== null) continue;
+    parent.nested.push(e);
+  }
+  const nestedEfforts = new Set(efforts.flatMap((e) => e.nested));
+  for (const e of efforts) {
+    if (nestedEfforts.has(e)) continue;
+    e.section = familySection(e.section, e.nested);
+  }
   return { efforts, orphans };
 }
 
 /** One line counting the efforts the sidebar holds for this project. */
 function boardCountLine(efforts: readonly BoardEffort[], ended: number): string {
-  const count = (section: SidebarSection) => efforts.filter((e) => e.section === section).length;
-  return `${efforts.length} open: ${count("blocked")} blocked · ${count("inflight")} in flight · ${count("monitors")} monitors · ${ended} recently ended`;
+  const nested = new Set(efforts.flatMap((e) => e.nested));
+  const top = efforts.filter((e) => !nested.has(e));
+  const count = (list: readonly BoardEffort[], section: SidebarSection) => list.filter((e) => e.section === section).length;
+  const blocked = count(efforts, "blocked");
+  const waiting = count(top, "waiting");
+  const inflight = count(top, "inflight");
+  const monitors = count(top, "monitors");
+  return `${blocked + waiting + inflight + monitors} open: ${blocked} blocked · ${waiting} waiting · ${inflight} in flight · ${monitors} monitors · ${ended} recently ended`;
 }
 
 /**
@@ -1579,11 +1612,11 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
           {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
-          {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
+          {s.hold !== null ? <p className="text-muted-foreground">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.delegateWait !== null && s.delegateWait !== undefined ? (
             <p className="text-muted-foreground">Waiting on review from {s.delegateWait}</p>
           ) : delegateStuck !== null ? (
-            <p className="text-destructive">Stuck: {delegateStuck.why}</p>
+            <p className="text-muted-foreground">Stuck: {delegateStuck.why}</p>
           ) : null}
           {realStuck !== null ? <p className="text-destructive">Stuck: {realStuck.why}</p> : null}
           <p className="text-xs text-muted-foreground">
@@ -2120,18 +2153,19 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
 // The opt-in replacement for bb's sidebar list, registered through the
 // exclusive `experimental_threadList` slot. One project dropdown,
 // two-line effort rows with the four glyphs in the Blocked / In flight /
-// Threads / Monitors / Recently ended sections, and a demoted project-steward
-// row. An effort row and a Recently ended row open the detail view; worker,
+// Waiting / Threads / Monitors / Recently ended sections, and a demoted
+// project-steward row. An effort row and a Recently ended row open the detail view; worker,
 // reviewer, one-off and project-steward rows open their thread; the effort the
 // Stewards page shows is highlighted and navigation expands a collapsed parent
 // (the page publishes it through `board-route.ts`, BB-94). Every
 // effort and thread row carries bb's own thread actions context menu, so
 // nothing bb's rows can do is lost.
 //
-// Blocked, In flight and Monitors rows hold a fixed pinned › display title ›
-// binding-key position (BB-128), so a host tick that only bumps recency does
-// not move them and replay their enter animation. The one-off Threads keep
-// bb's own needsUser › busy › recency order, and Recently ended is unchanged.
+// Blocked, In flight, Waiting and Monitors rows hold a fixed pinned › display
+// title › binding-key position (BB-128), so a host tick that only bumps recency
+// does not move them and replay their enter animation. Waiting starts collapsed
+// (BB-348); the one-off Threads keep bb's own needsUser › busy › recency order,
+// and Recently ended is unchanged.
 
 /** The live fields bb's thread actions read, from a sidebar row. */
 function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
@@ -3012,7 +3046,7 @@ function ancestorThreads(children: readonly SidebarChild[], id: string): string[
 
 /** Every effort row a tab renders, whatever its section, nested efforts included (BB-245). */
 function tabEfforts(tab: SidebarTab): SidebarEffort[] {
-  const all = [...tab.blocked, ...tab.efforts, ...tab.monitors, ...tab.threads];
+  const all = [...tab.blocked, ...tab.waiting, ...tab.efforts, ...tab.monitors, ...tab.threads];
   return all.flatMap((e) => [e, ...e.nested]);
 }
 
@@ -3048,6 +3082,7 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
   for (const tab of tabs) {
     if ((activeThreadId !== null && tab.ended.some((e) => e.rootThreadId === activeThreadId)) || (activeKey !== null && tab.ended.some((e) => e.key === activeKey))) open.add("Recently ended");
     if (activeThreadId !== null && tab.threads.some((e) => e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))) open.add("Threads");
+    if (tab.waiting.some((e) => (activeKey !== null && (e.bindingKey === activeKey || e.nested.some((n) => n.bindingKey === activeKey))) || (activeThreadId !== null && (e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId) || e.nested.some((n) => n.rootThreadId === activeThreadId || subtreeHas(n.children, activeThreadId)))))) open.add("Waiting");
     if (tab.monitors.some((e) => (activeKey !== null && (e.bindingKey === activeKey || e.nested.some((n) => n.bindingKey === activeKey))) || (activeThreadId !== null && (e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId) || e.nested.some((n) => n.rootThreadId === activeThreadId || subtreeHas(n.children, activeThreadId)))))) open.add("Monitors");
   }
   return open;
@@ -3362,6 +3397,11 @@ function StewardsSidebarCore({
           <ul className="flex flex-col">{rows(tab, tab.efforts)}</ul>
         )}
       </SidebarSection>
+      {tab.waiting.length > 0 ? (
+        <SidebarCollapsible title="Waiting" count={tab.waiting.length} revealed={openSections.has("Waiting")} unread={sectionHasUnread(tab.waiting, byId)}>
+          <ul className="flex flex-col">{rows(tab, tab.waiting)}</ul>
+        </SidebarCollapsible>
+      ) : null}
       {tab.threads.length > 0 ? (
         <SidebarCollapsible title="Threads" count={tab.threads.length} revealed={openSections.has("Threads")} unread={sectionHasUnread(tab.threads, byId)}>
           <ul className="flex flex-col">

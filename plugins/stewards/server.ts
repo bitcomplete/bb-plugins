@@ -853,6 +853,8 @@ export const rpcContract = defineRpcContract({
               phase: z.string().nullable(),
               stage: z.string().nullable(),
               threadId: z.string().nullable(),
+              /** The parent binding's entity key, or null; the board applies the sidebar's family pass (BB-348). Optional so a client built from the previous image still validates. */
+              parentKey: z.string().nullable().optional(),
               summary: z.string().nullable(),
               nextAction: z.string().nullable(),
               actor: z.string().nullable(),
@@ -10589,6 +10591,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           ...(b.hold === null ? [] : [{ b, kind: "hold" as const, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = store.endedSince(projectId, now() - ENDED_ON_BOARD_MS, 30);
+        const parentKeys = store.parentKeysForProject(projectId);
         const boardConfig = configs.find((c) => c.projectId === projectId) ?? null;
         const roleMap = bindingRoles(boardConfig?.roles ?? null, boardConfig?.githubLogin === null || boardConfig?.githubLogin === undefined ? null : lc(boardConfig.githubLogin), boardConfig?.repos ?? []);
         return {
@@ -10625,6 +10628,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               stage: b.kind === "ops" ? "watch" : b.stage,
               roles: rolesForBinding(roleMap, b),
               threadId: b.threadId,
+              parentKey: parentKeys.get(b.id) ?? null,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
@@ -13425,13 +13429,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * A binding's row facts from its open escalations in one read (BB-338): the
-     * blocked flag (a `stuck` escalation or the plugin's delegate wait) and the
-     * delegate wait's requested reviewers.
+     * A binding's row facts from its open escalations in one read (BB-338,
+     * BB-348): the blocked flag (a real `stuck` escalation only; a delegate wait
+     * is a wait, not a failure) and the delegate wait's requested reviewers.
      */
     function escalationRowFacts(id: string): { stuck: boolean; delegateWait: string | null } {
       const escalations = store.openEscalations(id);
-      return { stuck: escalations.some((x) => x.kind === "stuck" || isDelegateWait(x)), delegateWait: delegateWaitOf(escalations) };
+      return { stuck: escalations.some((x) => x.kind === "stuck"), delegateWait: delegateWaitOf(escalations) };
     }
 
     /**
@@ -13459,9 +13463,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // binding, from the rows and covered set above.
       const needsUser = needsUserIds(open, questions, allNeeds, covered, escalationsByBinding);
       // BB-296: the `stuck` flag shares the same grouped escalations, so the
-      // sidebar and board do not re-query them per binding.
+      // sidebar and board do not re-query them per binding. BB-348: only a real
+      // `stuck` escalation blocks; a delegate wait is a wait, not a failure.
       const stuck = new Set<string>();
-      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck" || isDelegateWait(x))) stuck.add(bindingId);
+      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck")) stuck.add(bindingId);
       // BB-338: the requested reviewers of a delegate wait, from the same
       // grouped escalations, so the sidebar row can name them without another
       // read or a GitHub call.

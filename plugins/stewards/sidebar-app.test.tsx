@@ -73,6 +73,8 @@ const binding = (over: Record<string, unknown> = {}) => ({
   hold: null,
   holdBehind: [],
   waitingOn: null,
+  waitingUntil: null,
+  wait: null,
   needsUser: false,
   stuck: false,
   delegateWait: null,
@@ -139,10 +141,13 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   phase: null,
   stage: null,
   threadId: "thr_steward",
+  parentKey: null,
   summary: null,
   nextAction: null,
   actor: null,
   waitingOn: null,
+  waitingUntil: null,
+  wait: null,
   priority: null,
   hold: null,
   holdBehind: [],
@@ -376,7 +381,7 @@ describe("the stewards sidebar list (BB-44)", () => {
       rpc: {
         stewardsSidebar: () =>
           sidebarData({
-            bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1", hold: "a freeze" })],
+            bindings: [binding({ key: "ENG-1", threadId: "thr_parent" }), binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1", stuck: true })],
           }),
       } as never,
     });
@@ -739,6 +744,29 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-348: the Waiting section starts collapsed with its count and opens when
+  // a row inside is unread.
+  it("shows a collapsed Waiting section with its count and opens it for an unread row", async () => {
+    const wait = { waitingOn: "a date", waitingUntil: Date.now() + 86_400_000 };
+    const read = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_wait", displayTitle: "ENG-1: Waiting work" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_wait", ...wait })] }) } as never,
+    });
+    const waiting = (await waitFor(() => read.getByRole("button", { name: /Waiting/u }))).closest("section")!;
+    expect(waiting.textContent).toContain("Waiting 1");
+    expect(waiting.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[0fr]");
+    expect(lineTwo(read, "Waiting work")).toBe(`ticket · waiting on a date until ${new Date(wait.waitingUntil).toISOString().slice(0, 10)}`);
+    read.lifecycle.unmount();
+
+    const unread = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_wait", displayTitle: "ENG-1: Waiting work", isUnread: true })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_wait", ...wait })] }) } as never,
+    });
+    const opened = (await waitFor(() => unread.getByRole("button", { name: /Waiting/u }))).closest("section")!;
+    await waitFor(() => expect(opened.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
+    unread.lifecycle.unmount();
+  });
+
   // BB-88 criterion 1: an ended binding whose steward thread is still in the
   // live view renders through SidebarEffortRow, title stripped of the key.
   it("renders a Recently ended binding with a live thread as the two-line effort row", async () => {
@@ -961,7 +989,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows held-behind and stuck as blocked", async () => {
+  it("shows a hold as a quiet Waiting row and a stuck escalation as blocked (BB-348)", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "ENG-1: A" }), thread({ id: "thr_b", displayTitle: "ENG-2: B" })] },
       rpc: {
@@ -974,28 +1002,35 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     await waitFor(() => expect(slot.getByText("A")).toBeTruthy());
     expect(lineTwo(slot, "A")).toContain("held behind ENG-9");
     expect(lineTwo(slot, "B")).toContain("stuck");
-    expect(glyphOf(slot, "A")).toBe("blocked");
+    // A hold is a quiet wait, not a block; a stuck escalation is red (BB-348).
+    expect(glyphOf(slot, "A")).toBe("quiet");
     expect(glyphOf(slot, "B")).toBe("blocked");
+    expect(slot.getByRole("button", { name: /Waiting/u }).closest("section")!.textContent).toContain("A");
+    expect(slot.getByRole("heading", { name: /Blocked/u }).closest("section")!.textContent).toContain("B");
     slot.lifecycle.unmount();
   });
 
-  // BB-338: a delegate wait is blocked but names who it waits on.
-  it("reads a delegate wait as waiting on review from <names>, still blocked", async () => {
+  // BB-338/BB-348: a delegate wait alone is a quiet wait that names who it
+  // waits on; a real stuck escalation still reads stuck even when a delegate
+  // wait is open, because a red row says why it is red.
+  it("reads a quiet delegate wait as waiting on review from <names>, and a stuck one as stuck", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_d", displayTitle: "ENG-1: D" })] },
+      sidebarThreads: { projects, threads: [thread({ id: "thr_d", displayTitle: "ENG-1: D" }), thread({ id: "thr_s", displayTitle: "ENG-2: S" })] },
       rpc: {
-        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_d", stuck: true, delegateWait: "arashout" })] }),
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_d", delegateWait: "arashout" }), binding({ key: "ENG-2", threadId: "thr_s", stuck: true, delegateWait: "arashout" })] }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText("D")).toBeTruthy());
     expect(lineTwo(slot, "D")).toContain("waiting on review from arashout");
-    expect(glyphOf(slot, "D")).toBe("blocked");
+    expect(glyphOf(slot, "D")).toBe("quiet");
+    expect(lineTwo(slot, "S")).toBe("ticket · stuck");
+    expect(glyphOf(slot, "S")).toBe("blocked");
     slot.lifecycle.unmount();
   });
 
   // BB-81: an external wait is not a block. One row of each kind lands in the
   // section its kind and state call for.
-  it("files one row of each kind into its section: blocked yellow and red, in flight, a monitor and a thread", async () => {
+  it("files one row of each kind into its section: blocked yellow and red, waiting, a monitor and a thread", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -1012,7 +1047,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
           sidebarData({
             bindings: [
               binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
-              binding({ key: "ENG-2", threadId: "thr_blocked", hold: "a freeze" }),
+              binding({ key: "ENG-2", threadId: "thr_blocked", stuck: true }),
               binding({ key: "ENG-3", threadId: "thr_wait_ticket", status: { actor: "other", nextAction: "an author push", at: 1 } }),
               binding({ key: "acme/web", threadId: "thr_wait_ops", kind: "ops", stage: null, status: { actor: "other", nextAction: "Next scheduled look", at: 1 } }),
             ],
@@ -1027,12 +1062,15 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     expect(blocked.textContent).not.toContain("Waiting ticket");
     expect(glyphOf(slot, "Needs you")).toBe("you");
     expect(glyphOf(slot, "Red row")).toBe("blocked");
-    // In flight holds the waiting ticket, grey, with the wait phrase.
-    const inflight = slot.getByRole("heading", { name: /In flight/u }).closest("section")!;
-    expect(inflight.textContent).toContain("Waiting ticket");
-    expect(inflight.textContent).not.toContain("Needs you");
+    // Waiting holds the ticket + other row, grey, with the wait phrase, and In
+    // flight is left with nothing (BB-348).
+    const waiting = slot.getByRole("button", { name: /Waiting/u }).closest("section")!;
+    expect(waiting.textContent).toContain("Waiting ticket");
     expect(glyphOf(slot, "Waiting ticket")).toBe("quiet");
     expect(lineTwo(slot, "Waiting ticket")).toBe("ticket · an author push");
+    const inflight = slot.getByRole("heading", { name: /In flight/u }).closest("section")!;
+    expect(inflight.textContent).toContain("Nothing in flight.");
+    expect(inflight.textContent).not.toContain("Waiting ticket");
     // Monitors holds the ops wait, grey, once opened.
     fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
     await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
@@ -1105,7 +1143,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
           sidebarData({
             bindings: [
               binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
-              binding({ key: "ENG-2", threadId: "thr_blocked", hold: "a freeze" }),
+              binding({ key: "ENG-2", threadId: "thr_blocked", stuck: true }),
               binding({ key: "ENG-3", threadId: "thr_running", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
               binding({ key: "ENG-4", threadId: "thr_quiet", status: { actor: "steward", nextAction: "wait for CI", at: 1 } }),
             ],
@@ -1199,15 +1237,15 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("keeps an ops binding out of Monitors when it is held, and shows it in Blocked", async () => {
+  it("keeps a held ops binding in Monitors, grey, since a hold is not a block (BB-348)", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" })] },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", hold: "a rotation" })] }) } as never,
     });
-    await waitFor(() => expect(slot.getByRole("heading", { name: /Blocked/u })).toBeTruthy());
-    expect(slot.getByText("Ops watch: acme/web")).toBeTruthy();
-    expect(glyphOf(slot, "Ops watch: acme/web")).toBe("blocked");
-    expect(slot.queryByRole("button", { name: /Monitors/u })).toBeNull();
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Monitors/u })));
+    await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
+    expect(glyphOf(slot, "Ops watch: acme/web")).toBe("quiet");
+    expect(slot.queryByRole("heading", { name: /Blocked/u })).toBeNull();
     slot.lifecycle.unmount();
   });
 
@@ -1754,6 +1792,121 @@ describe("the board route store (BB-94)", () => {
     await waitFor(() => expect(shownProject(listSlot)).toBe("p1"));
     await pickProject(listSlot, "Personal");
     await waitFor(() => expect(listSlot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    panelSlot.lifecycle.unmount();
+    listSlot.lifecycle.unmount();
+  });
+
+  // BB-348: navigation to a row inside Waiting opens the collapsed section, as
+  // it does for Threads and Monitors.
+  it("reveals a Waiting row the panel's path names, with no active thread", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const options = {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_wait", displayTitle: "ENG-1: Waiting work" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_wait", waitingOn: "a date", waitingUntil: Date.now() + 86_400_000 })] }),
+        stewardsBoard: () => boardData(),
+      } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const waiting = (await waitFor(() => listSlot.getByRole("button", { name: /Waiting/u }))).closest("section")!;
+    expect(waiting.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[0fr]");
+    const panelSlot = renderSlot(panel, { subPath: "p1/ENG-1" }, options);
+    const row = await waitFor(() => listSlot.getByText("Waiting work"));
+    expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
+    await waitFor(() => expect(waiting.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
+    panelSlot.lifecycle.unmount();
+    listSlot.lifecycle.unmount();
+  });
+});
+
+// BB-348: the Stewards page's count line applies the same family pass as the
+// sidebar, so the two surfaces agree for the same fixtures.
+describe("the Stewards page's section counts match the sidebar (BB-348)", () => {
+  const boardData = (stewards: unknown[]) => ({
+    projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+    board: {
+      projectId: "p1",
+      name: "Acme",
+      enabled: true,
+      paused: false,
+      projectStewardThreadId: null,
+      stages: [],
+      digest: null,
+      questions: [],
+      withUser: [],
+      needs: [],
+      lessons: [],
+      lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+      stewards,
+      stuck: [],
+      ended: [],
+    },
+  });
+
+  it("counts a waiting initiative with a running nested child as in flight on both surfaces", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const waitingUntil = Date.now() + 86_400_000;
+    const options = {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Initiative" }), thread({ id: "thr_child", displayTitle: "ENG-2: Stage" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_parent", waitingOn: "a date", waitingUntil }),
+              binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
+            ],
+          }),
+        stewardsBoard: () =>
+          boardData([
+            boardSteward({ key: "ENG-1", title: "Initiative", parentKey: null, waitingOn: "a date", waitingUntil }),
+            boardSteward({ key: "ENG-2", title: "Stage", parentKey: "ENG-1", workers: [{ threadId: "thr_w", title: "w" }] }),
+          ]),
+      } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const inflight = (await waitFor(() => listSlot.getByRole("heading", { name: /In flight/u }))).closest("section")!;
+    expect(inflight.textContent).toContain("In flight 1");
+    expect(listSlot.queryByRole("button", { name: /Waiting/u })).toBeNull();
+    const panelSlot = renderSlot(panel, { subPath: "p1" }, options);
+    const count = await waitFor(() => panelSlot.getByText(/open:/u));
+    expect(count.textContent).toContain("1 open: 0 blocked · 0 waiting · 1 in flight · 0 monitors");
+    panelSlot.lifecycle.unmount();
+    listSlot.lifecycle.unmount();
+  });
+
+  it("counts an all-waiting initiative in Waiting on both surfaces", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const waitingUntil = Date.now() + 86_400_000;
+    const options = {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Initiative" }), thread({ id: "thr_child", displayTitle: "ENG-2: Stage" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_parent", waitingOn: "a date", waitingUntil }),
+              binding({ key: "ENG-2", threadId: "thr_child", parentKey: "ENG-1", waitingOn: "a date", waitingUntil }),
+            ],
+          }),
+        stewardsBoard: () =>
+          boardData([
+            boardSteward({ key: "ENG-1", title: "Initiative", parentKey: null, waitingOn: "a date", waitingUntil }),
+            boardSteward({ key: "ENG-2", title: "Stage", parentKey: "ENG-1", waitingOn: "a date", waitingUntil }),
+          ]),
+      } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const waiting = (await waitFor(() => listSlot.getByRole("button", { name: /Waiting/u }))).closest("section")!;
+    expect(waiting.textContent).toContain("Waiting 1");
+    expect(listSlot.getByRole("heading", { name: /In flight/u }).closest("section")!.textContent).toContain("Nothing in flight.");
+    const panelSlot = renderSlot(panel, { subPath: "p1" }, options);
+    const count = await waitFor(() => panelSlot.getByText(/open:/u));
+    expect(count.textContent).toContain("1 open: 0 blocked · 1 waiting · 0 in flight · 0 monitors");
     panelSlot.lifecycle.unmount();
     listSlot.lifecycle.unmount();
   });

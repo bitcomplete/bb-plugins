@@ -1107,7 +1107,8 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     // The count line.
     const count = slot.container.querySelector("[data-board-count-line]")!;
     expect(count.textContent).toContain("3 open");
-    expect(count.textContent).toContain("2 blocked");
+    expect(count.textContent).toContain("1 blocked");
+    expect(count.textContent).toContain("1 waiting");
     expect(count.textContent).toContain("1 monitors");
     expect(count.textContent).toContain("1 recently ended");
     // The latest digest and the collapsed lessons block.
@@ -1260,7 +1261,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
       stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "delegate", why: "Waiting on the requested reviewer: unreadable", since: 1 }],
     });
     const fallback = await waitFor(() => unparsed.getByText("Stuck: Waiting on the requested reviewer: unreadable"));
-    expect(fallback.className).toContain("text-destructive");
+    expect(fallback.className).toContain("text-muted-foreground");
     expect(unparsed.queryByText(/Waiting on review from/u)).toBeNull();
     unparsed.lifecycle.unmount();
   });
