@@ -13590,7 +13590,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     ? `cannot read the target: ${alertmanager.error}`
                     : `looked ${iso(alertmanager.at)}: ${alertmanager.findings.length === 0 ? "nothing to do" : `${alertmanager.findings.length} alert(s) new, rung or resolved`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          // BB-350: a question forwarded from an open escalation is that
+          // escalation's ask, so the flags list it once, not under both ids.
+          const openPresent = new Set(open.map((x) => x.id));
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.filter((x) => !(x.isQuestion && x.forwardedFrom !== null && openPresent.has(x.forwardedFrom))).map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -13618,9 +13621,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
       const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
       const shownParts = (context: string | null, why: string | null): string[] => [...(context === null || context === "" ? [] : [`  Context: ${oneLine(context)}`]), ...(why === null || why === "" ? [] : [`  Why you: ${oneLine(why)}`])];
-      for (const x of store.escalations(b.id)) {
-        lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+      // BB-350: a question forwarded from an escalation is that escalation's
+      // ask, not a second one. The escalation renders once, headed by its esc_
+      // id, with the question id, its resolution kind and the answer indented
+      // beneath it, and the question's own row is skipped. A standalone
+      // question, or one whose escalation is not in this list, renders as
+      // before.
+      const escalations = store.escalations(b.id);
+      const present = new Set(escalations.map((x) => x.id));
+      const forwardedQuestion = new Map<string, Escalation>();
+      for (const x of escalations) if (x.isQuestion && x.forwardedFrom !== null && present.has(x.forwardedFrom)) forwardedQuestion.set(x.forwardedFrom, x);
+      for (const x of escalations) {
+        if (x.isQuestion && x.forwardedFrom !== null && present.has(x.forwardedFrom)) continue;
+        const question = forwardedQuestion.get(x.id) ?? null;
+        lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${question === null && x.resolution !== null ? ` → ${x.resolution}` : ""}`);
         lines.push(...shownParts(x.context, x.why));
+        if (question !== null) {
+          lines.push(`  Question ${question.id}`);
+          // BB-345's forwarding parts (the `why`, and any context the question
+          // did not share with the escalation) live on the question, so they
+          // print here; a part the escalation already showed is not repeated.
+          lines.push(...shownParts(question.context === x.context ? null : question.context, question.why === x.why ? null : question.why));
+          if (question.resolutionKind !== null) lines.push(`  Resolution kind: ${question.resolutionKind}`);
+          if (question.resolution !== null) lines.push(`  Answer: ${question.resolution}`);
+        }
       }
       for (const a of store.assumptions(b.id)) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
       for (const n of store.needs(b.id, true)) {

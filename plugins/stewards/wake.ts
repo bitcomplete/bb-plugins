@@ -1665,13 +1665,18 @@ export function formatProjectWake(input: {
       );
     }
   }
-  const withUser = input.withUser ?? [];
+  const questions = input.questions ?? [];
+  // BB-350: an escalation an open question covers is the question's ask, so it
+  // is listed under the questions heading alone, not also as an escalation with
+  // the user. The caller already drops the covered escalations; this keeps the
+  // formatter honest for a caller that passes both.
+  const coveredWithUser = new Set(questions.map(({ question: q }) => q.escalationId).filter((id): id is string => id !== null));
+  const withUser = (input.withUser ?? []).filter(({ escalation: x }) => !coveredWithUser.has(x.id));
   if (withUser.length > 0) {
     out.push("## Escalations with the user", "");
     for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
     out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve, cites: [ids] }, citing the lessons or hand-written guidance units the decision rested on.", "");
   }
-  const questions = input.questions ?? [];
   if (questions.length > 0) {
     out.push("## Questions open with the user", "");
     for (const { question: q, about } of questions) {
@@ -1946,7 +1951,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     [...questions.map(({ question: q }) => q.escalationId), ...(r.needs ?? []).map(({ need: n }) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null))].filter((id): id is string => id !== null),
   );
   const waiting = [
-    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}${choicesNote(q.choices)}`),
+    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}${q.escalationId === null ? "" : `, forwarded escalation ${q.escalationId}`}): ${oneLine(q.question)}${choicesNote(q.choices)}`),
     ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}`),
     ...r.withUser
       .filter(({ escalation: x }) => !asked.has(x.id))
