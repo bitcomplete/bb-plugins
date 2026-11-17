@@ -5039,14 +5039,17 @@ describe("questions to the user", () => {
     const t = await adopted();
     await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
     const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
-    const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc, resolution: "text" }, t.project)).text);
+    const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc, resolution: "text", entry: "Scope changes" }, t.project)).text);
     const show = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
     // One entry, headed by the esc_ id, with the question id and its resolution
     // kind indented beneath it, and no separate `Escalation qst_…` row.
     expect(show).toContain(`Escalation ${esc} scope (open, user): Include SSO?`);
     expect(show).toContain(`  Question ${qst}`);
+    expect(show).toContain("  Why you: The decide list marks this the user's: Scope changes.");
     expect(show).toContain("  Resolution kind: text");
     expect(show).not.toContain(`Escalation ${qst}`);
+    // The binding's flag row lists the ask once too.
+    expect(show).not.toContain(`escalation ${qst}`);
     expect(show.match(/Include SSO\?/gu)).toHaveLength(1);
 
     // Answered, the answer lands on the entry's indented line, and the ask is
