@@ -2181,8 +2181,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * a page item: a delegate-approval escalation names the requested reviewer;
      * any other item waits on the owner, so the owner is the person.
      */
-    function slackPersonFor(b: Binding, wait: Wait, assessment: Assessment, _config: ProjectConfig): SlackPerson {
-      if (wait.kind === "review") return { githubLogin: assessment.wait?.reviewers?.[0] ?? null, linearName: null };
+    function slackPersonFor(b: Binding, wait: Wait, assessment: Assessment, config: ProjectConfig): SlackPerson {
+      if (wait.kind === "review") {
+        // The same filter the BB-351 nudge applies: the owner's own review is
+        // the owner-reviewed lane, and a bot is not a person to DM.
+        const owner = lc(config.githubLogin ?? "");
+        const reviewers = (assessment.wait?.reviewers ?? []).filter((r) => owner !== "" && lc(r) !== owner && !DEPENDENCY_BOTS.has(lc(r)) && !/\[bot\]$/iu.test(r));
+        return { githubLogin: reviewers[0] ?? null, linearName: null };
+      }
       // A `person` wait names a page item. Only a delegate-approval escalation
       // names a person other than the owner; any other item is the owner's, so
       // there is no one to DM and Ask on Slack is not offered.
@@ -2190,6 +2196,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const delegate = escalation === undefined ? null : delegateWaitNames(escalation.meanwhile);
       if (delegate !== null) return { githubLogin: delegate.split(",")[0]?.trim() ?? null, linearName: null };
       return { githubLogin: null, linearName: null };
+    }
+
+    /**
+     * BB-354: a sending item whose steward turn ended without `wait-slack-sent`
+     * or `wait-slack-refused` (an interrupted turn, a skipped command, or a
+     * tool error the instruction does not cover) must not trap the owner. Put
+     * the three original choices back and record the non-action.
+     */
+    function revertSendingSlackNeed(need: Need): void {
+      const b = store.binding(need.bindingId);
+      if (b === null) return;
+      const how = "Choose what to do; Keep waiting resets the budget once. The Slack send reported no result. Add a `slack` field to the holder in stewards/roles.json, or pick another choice.";
+      const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
+      delete data.waitSlackSending;
+      delete data.waitSlackCandidates;
+      delete data.waitSince;
+      try {
+        store.reopenNeed(need.id, { what: need.what, how, data });
+      } catch {
+        return;
+      }
+      store.recordNonAction(b.id, "wait-slack-unsent", "no result reported", now());
+      store.note(b.id, `Ask on Slack reported no result for ${need.what}; the owner has the three original choices again.`);
     }
 
     /** BB-354: the opener context a filed overdue need carries, or null when it offers no Slack choice. */
@@ -12628,6 +12657,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(mergeBehind === undefined ? {} : { mergeBehind }),
             ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
+          // BB-354: a sending Ask on Slack item whose turn ended without a
+          // result (an interrupted turn, a skipped command, or an uncovered
+          // tool error) would trap the owner and block BB-351's later needs;
+          // the report is the safety net that puts the three choices back.
+          for (const sending of store.openNeeds(b.id).filter((n) => n.data.waitSlackSending === true)) revertSendingSlackNeed(sending);
           // BB-333: a changed typed wait changes the github lease (a `pull`/
           // `review` ref joins or leaves it). This report may not run a
           // reconcile that notices, so push the interest set here.

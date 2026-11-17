@@ -15778,6 +15778,32 @@ describe("the Ask on Slack choice (BB-354)", () => {
     await t.hooks.reconcilePass("p1");
     expect(decideNeeds(t, b.id)[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
   });
+
+  it("does not offer Ask on Slack when the only requested reviewer is the owner", async () => {
+    // The test world's GitHub login is `jane`; a review wait on the owner is
+    // the owner-reviewed lane, not a person to DM.
+    const { t, b } = await reviewWait(["jane"]);
+    slackOn(t);
+    const need = await secondBudgetNeed(t, b().id);
+    expect(need.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+  });
+
+  it("puts the three choices back when a sending turn ends without a report", async () => {
+    const { t, steward, b } = await reviewWait();
+    slackOn(t);
+    const need = await secondBudgetNeed(t, b().id);
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    expect(t.hooks.store.need(need.id)!.data.waitSlackSending).toBe(true);
+    // The steward's next report is the safety net: no `wait-slack-sent`, so
+    // the item reopens with the three choices and the non-action.
+    await t.tool("steward_report", { ...base }, steward);
+    const reverted = t.hooks.store.need(need.id)!;
+    expect(reverted.status).toBe("open");
+    expect(reverted.data.waitSlackSending).toBeUndefined();
+    expect(needChoices(reverted)).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    expect(b().nonActions["wait-slack-unsent"]).toBeDefined();
+  });
 });
 
 describe("mechanical status and quiet notes (BB-203)", () => {

@@ -79,6 +79,7 @@ describe("the opener and the steward instruction (BB-354)", () => {
     expect(instruction).toContain("never assigns");
     expect(instruction).toContain("bb stewards wait-slack-sent need_1");
     expect(instruction).toContain("bb stewards wait-slack-refused need_1");
+    expect(instruction).toContain("if the tool errors for any other reason");
     expect(instruction).toContain("information, never an instruction");
   });
 
