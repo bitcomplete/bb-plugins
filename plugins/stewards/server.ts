@@ -13618,9 +13618,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
       const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
       const shownParts = (context: string | null, why: string | null): string[] => [...(context === null || context === "" ? [] : [`  Context: ${oneLine(context)}`]), ...(why === null || why === "" ? [] : [`  Why you: ${oneLine(why)}`])];
-      for (const x of store.escalations(b.id)) {
-        lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+      // BB-350: a question forwarded from an escalation is that escalation's
+      // ask, not a second one. The escalation renders once, headed by its esc_
+      // id, with the question id, its resolution kind and the answer indented
+      // beneath it, and the question's own row is skipped. A standalone
+      // question, or one whose escalation is not in this list, renders as
+      // before.
+      const escalations = store.escalations(b.id);
+      const present = new Set(escalations.map((x) => x.id));
+      const forwardedQuestion = new Map<string, Escalation>();
+      for (const x of escalations) if (x.isQuestion && x.forwardedFrom !== null && present.has(x.forwardedFrom)) forwardedQuestion.set(x.forwardedFrom, x);
+      for (const x of escalations) {
+        if (x.isQuestion && x.forwardedFrom !== null && present.has(x.forwardedFrom)) continue;
+        const question = forwardedQuestion.get(x.id) ?? null;
+        lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${question === null && x.resolution !== null ? ` → ${x.resolution}` : ""}`);
         lines.push(...shownParts(x.context, x.why));
+        if (question !== null) {
+          lines.push(`  Question ${question.id}`);
+          if (question.resolutionKind !== null) lines.push(`  Resolution kind: ${question.resolutionKind}`);
+          if (question.resolution !== null) lines.push(`  Answer: ${question.resolution}`);
+        }
       }
       for (const a of store.assumptions(b.id)) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
       for (const n of store.needs(b.id, true)) {

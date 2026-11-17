@@ -338,13 +338,28 @@ describe("the nightly prompt", () => {
     ]);
     // A forwarded escalation is listed once, as its question.
     expect(section("Waiting on the user").split("\n")).toEqual([
-      `- Question ${fromForward.id} (since 2026-10-18, about ENG-4): Include SSO?`,
+      `- Question ${fromForward.id} (since 2026-10-18, about ENG-4, forwarded escalation ${forwarded.id}): Include SSO?`,
       `- Question ${a11y.id} (since 2026-10-18): Should I file an a11y ticket?`,
       `- Approval of ENG-1's spec (${approval.id}, since 2026-10-18)`,
     ]);
     expect(section("Stuck or held").split("\n")).toEqual([`- ENG-3: stuck escalation ${stuck.id} with project, since 2026-10-18: Status has not moved in 3 days.`, "- ENG-3: on hold: billing freeze"]);
     expect(wake).toMatch(/Write it from the record above, not from memory/u);
     expect(wake.indexOf("## The record since")).toBeLessThan(wake.indexOf("reply with the morning digest"));
+  });
+
+  it("lists a forwarded escalation and its open question once, as the question with its esc_ id (BB-350)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-4");
+    const forwarded = s.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: "No." });
+    const question = s.ask({ projectId: "p1", bindingId: b.id, escalationId: forwarded.id, question: "Include SSO?", context: null });
+    // A caller that passes both the escalation and its open question: the ask
+    // renders once, under the questions heading, with the esc_ id noted.
+    const wake = formatProjectWake({ reason: "escalation", bindings: [], routed: [], withUser: [{ escalation: forwarded, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [{ question, about: b }] });
+    expect(wake).toContain("## Questions open with the user");
+    expect(wake).toContain(`- ${question.id} (asked `);
+    expect(wake).toContain(`forwarded escalation ${forwarded.id}`);
+    expect(wake).not.toContain("## Escalations with the user");
+    expect(wake.match(/Include SSO\?/gu)).toHaveLength(1);
   });
 
   it("tells the project steward to cite the lessons a decision rested on (BB-35 step 2)", () => {

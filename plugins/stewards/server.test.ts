@@ -5035,6 +5035,30 @@ describe("questions to the user", () => {
     expect((await t.board()).questions).toEqual([]);
   });
 
+  it("renders a forwarded escalation and its question as one entry in `bb stewards show` (BB-350)", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc, resolution: "text" }, t.project)).text);
+    const show = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    // One entry, headed by the esc_ id, with the question id and its resolution
+    // kind indented beneath it, and no separate `Escalation qst_…` row.
+    expect(show).toContain(`Escalation ${esc} scope (open, user): Include SSO?`);
+    expect(show).toContain(`  Question ${qst}`);
+    expect(show).toContain("  Resolution kind: text");
+    expect(show).not.toContain(`Escalation ${qst}`);
+    expect(show.match(/Include SSO\?/gu)).toHaveLength(1);
+
+    // Answered, the answer lands on the entry's indented line, and the ask is
+    // still one entry.
+    await t.tool("steward_update", { resolve: qst, answer: "No SSO for now." }, t.project);
+    const answered = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(answered).toContain(`Escalation ${esc} scope (resolved, user): Include SSO?`);
+    expect(answered).toContain("  Answer: No SSO for now.");
+    expect(answered).not.toContain(`Escalation ${qst}`);
+    expect(answered.match(/Include SSO\?/gu)).toHaveLength(1);
+  });
+
   it("closing a forwarded question with resolve decides its escalation and tells the steward", async () => {
     const t = await adopted();
     await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
@@ -5045,7 +5069,8 @@ describe("questions to the user", () => {
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided: No SSO for now\./u);
     const list = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
-    expect(list).toMatch(/\(resolved, user\): Include SSO\? → No SSO for now\./u);
+    expect(list).toContain(`Escalation ${esc} scope (resolved, user): Include SSO?`);
+    expect(list).toContain("  Answer: No SSO for now.");
 
     // A retry is no error, records nothing twice, and does not tell the steward again.
     const told = t.sends.filter((s) => s.threadId === t.steward).length;
@@ -8978,6 +9003,22 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
       .filter((line) => !line.startsWith("  "))
       .map((line) => line.split(" — ")[0]);
     expect(printed).toEqual(expected);
+  });
+
+  it("lists a forwarded escalation once, as its question, when a question covers it (BB-350)", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: escalation.id, question: "Include SSO?", context: null });
+    const out = await t.cli();
+    // The covered escalation is the question's, so it is not a with-user row.
+    expect(out).toContain(question.id);
+    expect(out).not.toContain(escalation.id);
+    expect(out.match(/Include SSO\?/gu)).toHaveLength(1);
+    // The board's needsYou agrees.
+    const view = await t.board();
+    expect(view.questions.map((q) => q.id)).toEqual([question.id]);
+    expect(view.withUser).toEqual([]);
   });
 
   it("extends the old needs array with questions and with-user escalations in --json", async () => {
