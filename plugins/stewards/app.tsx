@@ -1777,18 +1777,51 @@ function ReapprovalDiff({ diff, changedLines, fullText, commentUrl }: { diff: st
   );
 }
 
-/** The prompt half of one needs-you item: what it asks, and why it is not actionable yet. */
+/**
+ * The three labelled parts of a needs-you item (BB-345): Need, Context and
+ * Why you, with the raw material one click away in a collapsed Details. The
+ * recommendation is its own labelled line inside Context.
+ */
+function NeedsYouParts({ what, context, recommendation, why, details }: { what: string; context: string | null; recommendation?: string | null; why: string | null; details: string | null }) {
+  return (
+    <>
+      <p className="text-xs font-medium text-muted-foreground">Need</p>
+      <p>{what}</p>
+      {context !== null && context !== "" ? (
+        <>
+          <p className="text-xs font-medium text-muted-foreground">Context</p>
+          <div className="text-muted-foreground"><Markdown content={context} /></div>
+        </>
+      ) : null}
+      {recommendation !== null && recommendation !== undefined && recommendation !== "" ? <p className="text-muted-foreground"><span className="font-medium">Recommendation:</span> {recommendation}</p> : null}
+      {why !== null && why !== "" ? (
+        <>
+          <p className="text-xs font-medium text-muted-foreground">Why you</p>
+          <p className="text-muted-foreground">{why}</p>
+        </>
+      ) : null}
+      {details !== null && details !== "" ? (
+        <details className="text-xs text-muted-foreground">
+          <summary className="cursor-pointer">Details</summary>
+          <div className="mt-1"><Markdown content={details} /></div>
+        </details>
+      ) : null}
+    </>
+  );
+}
+
+/** The prompt half of one needs-you item: the three parts and, when it cannot be acted on, why not. */
 function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
   if (entry.type === "question") {
     const q = entry.question;
+    const details = [q.details, q.origin, q.meanwhile === null ? null : `Meanwhile: ${q.meanwhile}`].filter((x): x is string => x !== null && x !== "").join("\n\n");
     return (
       <>
         <p className="flex flex-wrap items-center gap-2">
           <Badge tone="bad">{q.escalationId === null ? "question" : "forwarded escalation"}</Badge>
           <span className="text-xs text-muted-foreground">asked {ago(q.createdAt, now)}</span>
         </p>
-        <p>{q.question}</p>
-        {q.context !== null ? <p className="text-muted-foreground">{q.context}</p> : null}
+        <NeedsYouParts what={q.question} context={q.context} recommendation={q.recommendation} why={q.why} details={details === "" ? null : details} />
       </>
     );
   }
@@ -1800,9 +1833,7 @@ function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
           <Badge tone="bad">{x.kind === "approval" ? "approval request" : `${x.kind} escalation`}</Badge>
           <span className="text-xs text-muted-foreground">asked {ago(x.createdAt, now)}</span>
         </p>
-        <p>{x.question}</p>
-        {x.context !== null ? <p className="text-muted-foreground">{x.context}</p> : null}
-        {x.recommendation !== null ? <p className="text-muted-foreground">Recommendation: {x.recommendation}</p> : null}
+        <NeedsYouParts what={x.question} context={x.context} recommendation={x.recommendation} why={x.why} details={x.details} />
       </>
     );
   }
@@ -1813,11 +1844,10 @@ function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
         <Badge tone="bad">{n.kind}</Badge>
         <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
       </p>
-      <p>{n.what}</p>
+      <NeedsYouParts what={n.what} context={n.how} why={n.why} details={n.details} />
       {n.specChangedLines !== null ? <ReapprovalDiff diff={n.specDiff ?? ""} changedLines={n.specChangedLines} fullText={n.specFullText} commentUrl={n.specCommentUrl} /> : null}
       {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
-      {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
-      {!n.actionable ? <p className="text-xs text-attention">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
+      {!n.actionable ? <p className="text-xs text-attention">Not actionable yet: {n.notActionable ?? "the server cannot verify it now"}.</p> : null}
     </>
   );
 }

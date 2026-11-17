@@ -726,7 +726,7 @@ export function stripMarkdown(text: string): string {
 }
 
 /** An open question put to the owner, with the binding it attaches to resolved to a key. */
-export type StandupOpenQuestion = { key: string | null; question: string; choices: string[]; createdAt: number; context: string | null };
+export type StandupOpenQuestion = { key: string | null; question: string; choices: string[]; createdAt: number; context: string | null; /** The project steward's recommendation, when the question forwards an escalation (BB-345). */ recommendation?: string | null };
 
 /** The owner's decisions, as one line each: needs, forwarded escalations and open questions. */
 function decisionLines(briefing: Briefing, questions: readonly StandupOpenQuestion[], now: number): string[] {
@@ -745,7 +745,10 @@ function decisionLines(briefing: Briefing, questions: readonly StandupOpenQuesti
   // indented under its line, clipped, so the model can say what it is about
   // without a lookup (BB-306).
   for (const q of questions) {
-    const line = withAge(`${q.key ?? "the project"}: ${q.question}${q.choices.length === 0 ? "" : ` (choices: ${q.choices.join(" / ")})`}`, now, q.createdAt);
+    // BB-345: the forwarding glue is gone from `context`, so the recommendation
+    // (and nothing else the old glue carried) is passed through on its own.
+    const recommendation = q.recommendation === null || q.recommendation === undefined || q.recommendation.trim() === "" ? "" : ` — recommendation: ${q.recommendation}`;
+    const line = withAge(`${q.key ?? "the project"}: ${q.question}${q.choices.length === 0 ? "" : ` (choices: ${q.choices.join(" / ")})`}${recommendation}`, now, q.createdAt);
     out.push(q.context === null || q.context.trim() === "" ? line : `${line}\n  ${clipText(q.context, STANDUP_CONTEXT_MAX_CHARS)}`);
   }
   return out;
@@ -977,6 +980,7 @@ function agendaQuestionItem(q: StandupOpenQuestion, binding: Binding | null, fac
   const head = `${q.key ?? "the project"}: ${q.question}`;
   const lines: string[] = [];
   if (q.choices.length > 0) lines.push(`Choices: ${q.choices.join(" / ")}`);
+  if (q.recommendation !== null && q.recommendation !== undefined && q.recommendation.trim() !== "") lines.push(`Recommendation: ${clipText(q.recommendation, STANDUP_CONTEXT_MAX_CHARS)}`);
   if (q.context !== null && q.context.trim() !== "") lines.push(`Context: ${clipText(q.context, STANDUP_CONTEXT_MAX_CHARS)}`);
   if (binding !== null) {
     lines.push(...pullFactsLines(facts?.pulls[0] ?? null));

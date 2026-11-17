@@ -565,7 +565,7 @@ describe("a Linear ticket steward", () => {
     expect(t.hooks.store.openEscalations(b.id).at(-1)!.context).toBeNull();
   });
 
-  it("forwards an escalation's context ahead of the kind, meanwhile and recommendation lines", async () => {
+  it("forwards an escalation's context as written, with meanwhile and recommendation as separate fields", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -575,11 +575,18 @@ describe("a Linear ticket steward", () => {
     const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: id, recommendation: "Leave SSO out." }, project!);
     const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
     const q = t.hooks.store.question(qst)!;
+    // BB-345: the shown context is the steward's context only; the origin,
+    // meanwhile and recommendation are separate fields the page places.
     expect(q.question).toBe("Include SSO?");
-    expect(q.context).toContain("The auth doc lists both providers; the ticket does not say.");
-    expect(q.context!.indexOf("The auth doc lists both providers")).toBeLessThan(q.context!.indexOf("A scope escalation from ENG-12"));
-    expect(q.context!.indexOf("A scope escalation from ENG-12")).toBeLessThan(q.context!.indexOf("Meanwhile: Wait."));
-    expect(q.context!.indexOf("Meanwhile: Wait.")).toBeLessThan(q.context!.indexOf("Recommendation: Leave SSO out."));
+    expect(q.context).toBe("The auth doc lists both providers; the ticket does not say.");
+    expect(q.context).not.toContain("Meanwhile:");
+    expect(q.context).not.toContain("escalation from");
+    const view = ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { questions: Array<{ id: string; meanwhile: string | null; recommendation: string | null; origin: string | null; why: string | null }> } }).board!;
+    const qv = view.questions.find((x) => x.id === qst)!;
+    expect(qv.meanwhile).toBe("Wait.");
+    expect(qv.recommendation).toBe("Leave SSO out.");
+    expect(qv.origin).toContain("A scope escalation from ENG-12");
+    expect(qv.why).toBeTruthy();
   });
 
   it("has the project steward approve a substantial spec; the user only when they say so", async () => {
@@ -1986,9 +1993,11 @@ describe("declined specs converge (BB-54)", () => {
     await t.tool("steward_report", { ...base, ready: met }, t.steward);
     const esc2 = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
     await t.tool("steward_update", { binding: "ENG-12", guidance: "Name the migration.", resolve: esc2 }, t.project);
-    const q = t.hooks.store.openQuestions("p1").find((x) => /twice on the same objection/u.test(x.question));
+    const q = t.hooks.store.openQuestions("p1").find((x) => /two declines on the same objection/u.test(x.question));
     expect(q).toBeDefined();
-    expect(q!.question).toContain("Name the migration.");
+    // The objections are the raw material in Details, not the question line (BB-345).
+    expect(q!.details).toContain("Name the migration.");
+    expect(q!.why).toBeTruthy();
   });
 });
 
@@ -6803,7 +6812,7 @@ describe("needs you items", () => {
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need).toMatchObject({ what: "Approve acme/web#7: Add login retry", filedBy: "plugin" });
     expect(need.data).toMatchObject({ foreign: true });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     // BB-29: the board's `url` is the pull request and `entityUrl` the ticket,
@@ -6834,7 +6843,7 @@ describe("needs you items", () => {
     await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: b.entityKey, action: "approve", need: need.id }) }, voice);
     const rec = (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { notes: Array<{ id: string; readback: string }> } };
     // The readback names the exact pull request the note is bound to.
-    expect(rec.standup.notes[0]!.readback).toContain("Approve acme/web#7 on GitHub");
+    expect(rec.standup.notes[0]!.readback).toContain("Approve acme/web#7: Add login retry");
     const res = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: rec.standup.notes[0]!.id }, client);
     expect(res).toMatchObject({ ok: true, applied: true });
     // The same effect the Approve button has: the review lands and the item closes.
@@ -6907,7 +6916,7 @@ describe("needs you items", () => {
     const b = t.hooks.store.find("acme/web#7")!;
     expect(b.kind).toBe("review");
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need).toMatchObject({ what: "Approve acme/web#7: Add login retry", filedBy: "plugin" });
     expect(need.data).toMatchObject({ foreign: true });
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
@@ -6922,14 +6931,14 @@ describe("needs you items", () => {
     expect(b.kind).toBe("review");
     // Nothing reports `substantial` yet, so the item is the ordinary one.
     const before = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(before.how).not.toMatch(/substantial and references no ticket/u);
+    expect(before.details).not.toMatch(/substantial and references no ticket/u);
     // The reviewer's substantial verdict, with no referenced ticket carrying
     // an approved spec, asks the owner to ack the Product section.
     t.hooks.store.patch(b.id, { ready: { ...b.ready, substantial: true, why: "a new outbound integration" } });
     await t.ring("github", "acme/web#7");
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need.how).toMatch(/substantial and references no ticket with an approved spec/u);
-    expect(need.how).toMatch(/\*\*Product\*\* section/u);
+    expect(need.details).toMatch(/substantial and references no ticket with an approved spec/u);
+    expect(need.details).toMatch(/\*\*Product\*\* section/u);
     // It is still the owner's item and escalation, not the project steward's.
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
@@ -7016,7 +7025,7 @@ describe("needs you items", () => {
     const t = await withPull([unsigned]);
     const b = t.binding();
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need).toMatchObject({ what: "Approve acme/web#7: Add login retry", filedBy: "plugin" });
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
@@ -8167,13 +8176,13 @@ describe("needs you items", () => {
 
   it("shows the items on the board with their actionability", async () => {
     const t = await withPull([marker]);
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; entityUrl: string | null; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; entityUrl: string | null; actionable: boolean; notActionable: string | null }> } }).board;
     // The owner-reviewed lane is the project steward's; forwarding it to the
     // user files the page's approve-pr item (BB-30).
     const esc = t.hooks.store.openEscalations(t.binding().id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     const first = await board();
-    expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, why: null })]);
+    expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, notActionable: null })]);
     // A steward-filed Merge item (a refused merge) is the owner's to press; a
     // running worker makes it not actionable, a finished one does not.
     const b = t.binding();
@@ -8182,13 +8191,13 @@ describe("needs you items", () => {
     // plugin's merge, so the item is actionable.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, notActionable: "worker thr_w1 is mid-turn" });
     // A finished worker is a pause between turns, not a running one: the item
     // is actionable again (BB-175).
     t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
   });
 
   it("filing a merge need stops the binding's in-flight workers (BB-175)", async () => {
@@ -8211,9 +8220,9 @@ describe("needs you items", () => {
     expect(t.hooks.store.workers(b.id).find((w) => w.threadId === "thr_w1")).toMatchObject({ status: "stopped" });
     expect(t.harness.sdk.callsTo("threads.stop")).toContainEqual([{ threadId: "thr_w1" }]);
     // With no worker running, the item is actionable.
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; notActionable: string | null }> } }).board;
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ filedBy: "steward" });
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
     // BB-253: the steward-filed Merge item is the owner's only signal on the
     // HUB-218 shape, so it pushes once, to the binding's steward thread.
     const mergePushes = t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "notifications.send" && (c.input as { title?: string }).title === "acme/web#7 ready to merge");
@@ -8234,7 +8243,7 @@ describe("needs you items", () => {
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     // The gate is met, but the steward's own item blocks the plugin's merge.
     await t.ring("linear", "uuid-12");
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; notActionable: string | null }> } }).board;
     // A running worker's turn can race a push: the item is not actionable and
     // the shared merge path refuses.
     await t.created("thr_w1", steward, "ENG-12: Implement");
@@ -8246,7 +8255,7 @@ describe("needs you items", () => {
     // A finished worker is a pause between turns: the item is actionable and
     // the merge goes through.
     t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(t.githubMerges).toHaveLength(1);
@@ -8260,12 +8269,12 @@ describe("needs you items", () => {
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; notActionable: string | null }> } }).board;
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, notActionable: "worker thr_w1 is mid-turn" });
     // A finished worker is named by neither state nor thread: the item is
     // actionable again.
     t.hooks.store.setWorker("thr_w1", "finished", null);
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
   });
 
   it("lists open needs in the project steward's nightly digest", async () => {
@@ -8515,8 +8524,8 @@ describe("needs you items", () => {
     // the page approves as the owner, with no reconcile in between.
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toBeDefined();
-    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; actionable: boolean; why: string | null }> } };
-    expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ actionable: true, why: null });
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; actionable: boolean; notActionable: string | null }> } };
+    expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ actionable: true, notActionable: null });
     const approved = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
     expect(approved).toMatchObject({ ok: true });
   });
@@ -8572,7 +8581,7 @@ describe("needs you items", () => {
     expect(refused.error).toBe(true);
     expect(refused.text).toMatch(new RegExp(need.id));
     expect(refused.text).toMatch(/approve-pr/u);
-    expect(refused.text).toMatch(/Approve acme\/web#7 on GitHub/u);
+    expect(refused.text).toMatch(/Approve acme\/web#7: Add login retry/u);
     // The plugin's own approval escalation is the need's, so it is listed once,
     // as the need.
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
@@ -8971,7 +8980,12 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
     const view = await t.board();
     const expected = [...view.questions, ...view.withUser, ...view.needs].map((x) => x.id);
-    const printed = (await t.cli()).split("\n").map((line) => line.split(" — ")[0]);
+    // The three parts print as indented Context/Why you lines under each item;
+    // the item lines are the ones that are not indented (BB-345).
+    const printed = (await t.cli())
+      .split("\n")
+      .filter((line) => !line.startsWith("  "))
+      .map((line) => line.split(" — ")[0]);
     expect(printed).toEqual(expected);
   });
 
@@ -10122,7 +10136,9 @@ describe("dependency stewards", () => {
     const needs = (await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout;
     // Case 6 provenance: the filing thread is on the fingerprint row.
     expect(t.hooks.store.fingerprint("p1", "acme/web#23")).toMatchObject({ ticketKey: "ENG-50", filedByThread: filedThread });
-    expect(needs).toMatch(/decide, dependabot\/acme\/web: Adopt ENG-50\? medium Dependabot alerts \(2\) on acme\/web: github.com\/labstack\/echo\/v4 \(go\), no fixed version, due 2026-10-16\. \[choices: Dismiss as not used, Keep tracking, Adopt\] \(https:\/\/linear.app\/acme\/issue\/ENG-50\)/u);
+    expect(needs).toMatch(/decide, dependabot\/acme\/web: Adopt ENG-50\? medium Dependabot alerts on acme\/web \[choices: Dismiss as not used, Keep tracking, Adopt\] \(https:\/\/linear.app\/acme\/issue\/ENG-50\)/u);
+    // The full question (packages, ecosystems, fix, due date) is the item's Details (BB-345).
+    expect(t.hooks.store.need(t.hooks.store.depsDecision("p1", "ENG-50")!.needId!)!.details).toMatch(/github.com\/labstack\/echo\/v4 \(go\), no fixed version, due 2026-10-16\./u);
     const decision = t.hooks.store.depsDecision("p1", "ENG-50")!;
     expect(decision).toMatchObject({ status: "pending", entityId: DEPS_TARGET, fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedBy: filedThread, reminded: [] });
     const firstNeed = t.hooks.store.need(decision.needId!)!;
@@ -10171,7 +10187,7 @@ describe("dependency stewards", () => {
     await t.hooks.sweep();
     await t.flush();
     expect(t.hooks.store.depsDecision("p1", "ENG-50")!.reminded).toEqual(["overdue"]);
-    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.what).toMatch(/Overdue by 1 day\.$/u);
+    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.details).toMatch(/Overdue by 1 day\.$/u);
     expect(notes()).toMatch(/ENG-50 is a day past its due date \(2026-10-16\) and still unadopted\. The decision is need_\S+ \(dependabot\/acme\/web\); it is the owner's to answer/u);
     // The reminder is once: another look adds no second note.
     t.advance(86_400_000);
@@ -10185,7 +10201,7 @@ describe("dependency stewards", () => {
     await t.flush();
     const projectThread = t.hooks.store.project("p1").threadId!;
     const digest = t.sends.filter((x) => x.threadId === projectThread).at(-1)!.text;
-    expect(digest).toMatch(/## Needs you[\s\S]*decide, dependabot\/acme\/web\): Adopt ENG-50\? medium Dependabot alerts \(2\)[^\n]*\[choices: Dismiss as not used, Keep tracking, Adopt\]/u);
+    expect(digest).toMatch(/## Needs you[\s\S]*decide, dependabot\/acme\/web\): Adopt ENG-50\? medium Dependabot alerts on acme\/web[^\n]*\[choices: Dismiss as not used, Keep tracking, Adopt\]/u);
     expect(digest).toMatch(/ENG-50 is a day past its due date/u);
 
     // The owner answers from a thread; the steward is woken with the choice and the decision settles on the next look.
@@ -10260,7 +10276,7 @@ describe("dependency stewards", () => {
     const raised = t.hooks.store.depsDecision("p1", "ENG-50")!;
     expect(raised).toMatchObject({ status: "pending", snoozedUntil: null, reminded: ["overdue"] });
     expect(raised.needId).not.toBe(needId);
-    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.what).toMatch(/Overdue by \d+ days\.$/u);
+    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.details).toMatch(/Overdue by \d+ days\.$/u);
   });
 
   it("does not offer or describe Dismiss when the deps-alerts playbook's may list lacks dismiss-alert", async () => {
@@ -14549,9 +14565,9 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
       project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
     });
     const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
-    expect(need.how).toContain('"Identity and access" [user]');
-    expect(need.how).toContain('"A cross-repo contract other repos implement" [project]');
-    expect(need.how).toContain("Rule: a `user` entry wins");
+    expect(need.details).toContain('"Identity and access" [user]');
+    expect(need.details).toContain('"A cross-repo contract other repos implement" [project]');
+    expect(need.details).toContain("Rule: a `user` entry wins");
     expect(need.data.decideListing).toContain("Deciding entry: \"Identity and access\" [user].");
   });
 
@@ -14572,6 +14588,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const after = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
     expect(after.data.decideListing).toBeUndefined();
     expect(after.how).not.toContain("Decide list:");
+    // The why is not recomputed while checks are red; it is carried from the
+    // open item rather than downgraded to the routine line (BB-345).
+    expect(after.why).toBe(before.why);
+    expect(after.why).not.toBe("No guidance covers this; your answer is saved as a lesson.");
   });
 
   it("reports an owner review with its sha, and the project steward's marker with its sha", async () => {
@@ -15728,8 +15748,8 @@ describe("recorded assumptions (BB-251)", () => {
     const b = t.hooks.store.find("ENG-12", "p1")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
     expect(need.data.assumptionIds).toEqual([first]);
-    expect(need.how).toContain("It covers");
-    expect(need.how).toContain(first);
+    expect(need.details).toContain("It covers");
+    expect(need.details).toContain(first);
     // A later assumption is not captured by a same-spec refresh.
     const second = idOf((await t.tool("steward_update", { assume: { text: "second" } }, steward)).text);
     t.entities.set("uuid-12", issue({ comments: [comment({ id: "c9", author: "lee", body: "a note" })] }));

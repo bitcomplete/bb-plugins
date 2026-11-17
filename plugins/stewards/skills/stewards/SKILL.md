@@ -83,7 +83,8 @@ Two tools are yours; everything else you do with the tools every thread has.
   and design docs, and the playbook are your guidance. Escalate only what
   they do not settle, with `steward_report { escalate: { kind, question,
   context, meanwhile } }`: it goes to your parent steward, then the project
-  steward. The question is one line; the evidence and reasoning go in
+  steward. The question is one line, written for whoever decides, possibly
+  the owner, with no view of the thread; the evidence and reasoning go in
   `context`. When the binding already has an open item for the user — a plugin
   need, a route-`user` escalation, or an open question — the escalation must
   say how it differs from each by naming them all in `distinctFrom: [ids]`;
@@ -102,8 +103,9 @@ Two tools are yours; everything else you do with the tools every thread has.
   ask them. An escalation or approval request that is already open is on the
   Stewards page: do not ask for it again, and a reply that does counts like a
   missed report toward `stuck`. The question is one line, written as the
-  sidebar row will show it; the evidence and reasoning go in `context`, and a
-  question longer than the limit is refused.
+  sidebar row will show it, and is read by whoever decides, possibly the
+  owner: write it for a person with no view of the thread; the evidence and
+  reasoning go in `context`, and a question longer than the limit is refused.
 - **Ask when the wrong answer is irreversible or blocks everything;
   otherwise record an assumption and proceed.** A question the guidance does
   not settle has a third move besides asking (which blocks and accumulates)
@@ -550,7 +552,9 @@ You decide what the stewards below you escalate, from the project's own
 guidance, and forward to the user (`steward_update { forward }`) only what
 the project file lists as a big decision. A forwarded `approval` becomes an
 Approve/Decline item on the Stewards page, so do not ask it in prose;
-anything else you ask them in your reply. A forward must say how the
+anything else you ask them in your reply. The question goes to the user as
+written, and `recommendation` is your one addition: do not reword the
+question or fold your reasoning into it. A forward must say how the
 escalation differs from every open item for the user, by naming them all in
 `distinctFrom: [ids]`, or name the item that already covers it with
 `coveredBy: <need_ id>` on `forward`, or `resolve` the escalation with
