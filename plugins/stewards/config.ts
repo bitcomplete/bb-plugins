@@ -347,6 +347,13 @@ export const backlogSchema = z
     staleDays: z.number().int().positive().max(3650).default(14),
     /** Stage 2's comment budget: at most this many comments per ticket per week. */
     commentsPerWeek: z.number().int().positive().max(7).default(1),
+    /**
+     * Stage 2 (BB-341): whether the backlog steward may write to Linear. Off
+     * by default, so a merged plugin changes nothing until the owner enables
+     * it. The tool is offered only when it is true, and every call re-reads
+     * it, so turning it off refuses at once.
+     */
+    triage: z.boolean().default(false),
   })
   .strict();
 export type BacklogConfig = z.infer<typeof backlogSchema>;

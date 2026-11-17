@@ -114,13 +114,13 @@ describe("the project file", () => {
     if (!absent.ok) throw new Error(absent.error);
     expect(absent.value.backlog).toBeUndefined();
 
-    const explicit = parseProjectFile(JSON.stringify({ version: 1, backlog: { team: " bb ", wipLimit: 3, staleDays: 21, commentsPerWeek: 2 } }));
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, backlog: { team: " bb ", wipLimit: 3, staleDays: 21, commentsPerWeek: 2, triage: true } }));
     if (!explicit.ok) throw new Error(explicit.error);
-    expect(explicit.value.backlog).toEqual({ team: "BB", wipLimit: 3, staleDays: 21, commentsPerWeek: 2 });
+    expect(explicit.value.backlog).toEqual({ team: "BB", wipLimit: 3, staleDays: 21, commentsPerWeek: 2, triage: true });
 
     const defaults = parseProjectFile(JSON.stringify({ version: 1, backlog: {} }));
     if (!defaults.ok) throw new Error(defaults.error);
-    expect(defaults.value.backlog).toEqual({ wipLimit: 5, staleDays: 14, commentsPerWeek: 1 });
+    expect(defaults.value.backlog).toEqual({ wipLimit: 5, staleDays: 14, commentsPerWeek: 1, triage: false });
 
     expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { bogus: true } }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { wipLimit: 0 } }))).toMatchObject({ ok: false });

@@ -41,6 +41,7 @@ import {
   githubStateLabels,
   isTerminal,
   legacyOpsPresent,
+  INITIATIVE_LABEL,
   modelSpecSchema,
   parsePlaybook,
   parseProjectFile,
@@ -128,6 +129,7 @@ import {
   type WorkflowRun,
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
+import { backlogTriageParamsSchema, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -7369,7 +7371,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // and the previous digest's snapshot. Empty without a backlog role. The
       // ids are the ones the report was computed from, written only after the
       // send, so a look that moves in between does not move the snapshot.
-      const backlog = records === undefined ? null : backlogReports(projectId, config);
+      const backlog = records === undefined ? null : backlogReports(projectId, config, records.since);
       if (records !== undefined && backlog !== null) records.backlog = backlog.digests;
       // BB-328: the live-check findings new or changed since the last nightly
       // pass ride in the digest record, so the project steward reads them once.
@@ -7437,14 +7439,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** The backlog reports for a digest, and the issue ids each was computed from (BB-334). */
-    function backlogReports(projectId: string, config: ProjectConfig): { digests: BacklogDigest[]; snapshots: Array<{ bindingId: string; ids: string[] }> } {
+    function backlogReports(projectId: string, config: ProjectConfig, since: number): { digests: BacklogDigest[]; snapshots: Array<{ bindingId: string; ids: string[] }> } {
       const staleDays = config.file.backlog?.staleDays ?? 14;
       const at = now();
       const digests: BacklogDigest[] = [];
       const snapshots: Array<{ bindingId: string; ids: string[] }> = [];
       for (const b of store.open(projectId)) {
-        if (b.kind !== "ops" || b.backlogLook === null || parseOpsTargetKey(b.entityId)?.kind !== "backlog") continue;
-        digests.push(backlogDigest(b.backlogLook, b.backlogSnapshot, { staleDays }, at));
+        const target = parseOpsTargetKey(b.entityId);
+        if (b.kind !== "ops" || b.backlogLook === null || target?.kind !== "backlog") continue;
+        // BB-341: the triage ledger since the previous digest, so the section
+        // lists each write and counts the refusals.
+        const writes = store.backlogWrites(projectId, { team: target.team, since });
+        digests.push(backlogDigest(b.backlogLook, b.backlogSnapshot, { staleDays, writes }, at));
         // A failed read keeps the previous snapshot: the next digest still
         // compares against the last good one.
         if (b.backlogLook.error === null) snapshots.push({ bindingId: b.id, ids: b.backlogLook.issues.map((i) => i.id) });
@@ -11469,8 +11475,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const target = parseOpsTargetKey(b.entityId);
         const sentry = target?.kind === "sentry-project";
         const alertmanager = target?.kind === "alertmanager";
+        // BB-341: the triage tool is offered only while the project's
+        // `backlog.triage` is true; the tool re-reads the flag itself, so
+        // turning it off refuses at once even before the selection refreshes.
+        const backlogTriage = target?.kind === "backlog" && configs.get(b.projectId)?.value?.file.backlog?.triage === true;
         return {
-          tools: ["steward_report", "steward_update"],
+          tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage"] : ["steward_report", "steward_update"],
           skills: ["stewards"],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
@@ -11702,6 +11712,154 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         notes: [`Assumption ${a.id} on ${where} was corrected: ${answer}. If the correction is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }.`],
       });
     }
+
+    /**
+     * BB-341: a per-ticket promise chain for the triage tool. The comment
+     * budget and the one-open-question rule are a read-then-write across an
+     * await, so two parallel calls on one ticket must run one after the other;
+     * `store.coalescingTool` only batches change notifications.
+     */
+    const triageLocks = new Map<string, Promise<unknown>>();
+    function withTriageLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      const previous = triageLocks.get(key) ?? Promise.resolve();
+      const run = previous.then(fn, fn);
+      const done = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      triageLocks.set(key, done);
+      void done.then(() => {
+        if (triageLocks.get(key) === done) triageLocks.delete(key);
+      });
+      return run;
+    }
+
+    /**
+     * BB-341: the backlog steward's one gated write. It is offered only when
+     * `backlog.triage` is true, and the flag is re-read on every call, so
+     * turning it off refuses at once. Every accepted write and every refusal
+     * is appended to the ledger the digest reports from.
+     */
+    bb.agents.registerTool({
+      name: "backlog_triage",
+      description:
+        "Triage one un-adopted ticket in your backlog team: add kind (bug/feature/chore), repo:<name> and size:S|M|L labels; add duplicate/blockedBy/related relations; set a priority that is unset or last set by you; or post one signed comment (a question, or with proposeCancel a stale-cancel proposal). It never edits a description, changes state, assigns, cancels or closes, and it enforces the comment budget, the one-open-question rule and the stale window.",
+      presentation: { label: { pending: "Triaging a backlog ticket", completed: "Triaged a backlog ticket" } },
+      parameters: backlogTriageParamsSchema,
+      execute: store.coalescingTool(async (input, { threadId }) => {
+        const binding = store.byThread(threadId);
+        const target = binding === null || binding.kind !== "ops" ? null : parseOpsTargetKey(binding.entityId);
+        if (binding === null || target === null || target.kind !== "backlog") {
+          return toolError(new Error("backlog_triage is for a backlog steward's thread; this thread is not one."));
+        }
+        const projectId = binding.projectId;
+        const team = target.team;
+        const record = (outcome: "accepted" | "refused", kind: BacklogWrite["kind"], detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
+          store.addBacklogWrite({ id: newId("btw"), projectId, team, issueId, issueKey, at: now(), outcome, kind, detail, reason });
+        const attempted = Object.keys(input).filter((k) => k !== "key");
+        // Serialise per ticket, so the budget and the open-question rule see
+        // the other call's ledger write.
+        return withTriageLock(`${projectId}:${input.key.trim().toLowerCase()}`, async () => {
+          try {
+            const config = await loadConfig(projectId, true);
+          if (config === null) return toolError(new Error(`no ${PROJECT_FILE} for project ${projectId}`));
+          const block = config.file.backlog;
+          const triageConfig: TriageConfig = {
+            triage: block?.triage === true,
+            team,
+            commentsPerWeek: block?.commentsPerWeek ?? 1,
+            staleDays: block?.staleDays ?? 14,
+            label: config.file.label,
+            adoptedLabels: [config.file.label, INITIATIVE_LABEL, ...config.file.tickets.flatMap((t) => t.match.labels ?? [])],
+            repos: config.repos,
+          };
+          // The opt-in is read on every call, never only at registration.
+          if (!triageConfig.triage) return toolError(new Error("backlog.triage is off; the backlog steward is read-only."));
+
+          // Fail closed: a ticket that cannot be read is refused, and no
+          // Linear write happens.
+          const entity = await snapshot("linear", input.key).catch((error: unknown) => {
+            throw new Error(`${input.key} could not be read: ${errorMessage(error)}`);
+          });
+          if (entity === null) return toolError(new Error(`No Linear issue ${input.key}, or it is not visible to the connected user.`));
+          const ticket: TriageTicket = {
+            key: entity.key,
+            unit: entity.unit,
+            labels: entity.labels,
+            priority: entity.priority,
+            state: entity.state,
+            stateType: entity.stateType,
+            assignees: entity.assignees,
+            updatedAt: entity.updatedAt,
+            comments: entity.comments,
+          };
+          const bound = store.find(entity.key, projectId) !== null || store.find(entity.id, projectId) !== null;
+
+          const relatedTeams = new Map<string, string>();
+          for (const relation of input.relations ?? []) {
+            const related = await snapshot("linear", relation.issue).catch(() => null);
+            if (related !== null) relatedTeams.set(relation.issue.trim().toLowerCase(), related.unit);
+          }
+
+          let ledger: BacklogWrite[];
+          try {
+            ledger = store.backlogWrites(projectId, { team, issueId: entity.id });
+          } catch (error) {
+            return toolError(new Error(`the triage ledger could not be read: ${errorMessage(error)}`));
+          }
+
+          const signedComment = input.comment === undefined ? null : `${input.comment.trimEnd()}\n\n${signatureLine(threadId)}`;
+          const decision = decideTriage({ params: input, ticket, config: triageConfig, ledger, bound, now: now(), relatedTeams, signedComment });
+          if (!decision.ok) {
+            record("refused", "triage", { attempted }, decision.reason, entity.id, entity.key);
+            return toolError(new Error(decision.reason));
+          }
+          const plan = decision.plan;
+          if (planIsEmpty(plan)) return toolError(new Error("nothing to triage; give at least one of addLabels, relations, priority, comment."));
+
+          // Labels, priority and relations in one RPC, then the comment. A
+          // failure writes a refusal; nothing is reported as accepted that
+          // Linear refused.
+          if (plan.addLabels.length > 0 || plan.priority !== null || plan.relations.length > 0) {
+            try {
+              await sourceRpc(
+                "linear",
+                "sourceUpdateIssue",
+                { key: entity.key, addLabels: plan.addLabels, ...(plan.priority === null ? {} : { priority: plan.priority }), relations: plan.relations },
+                sourceContract.sourceUpdateIssue.output,
+              );
+            } catch (error) {
+              const reason = `the write was refused: ${errorMessage(error)}`;
+              record("refused", "triage", { attempted }, reason, entity.id, entity.key);
+              return toolError(new Error(reason));
+            }
+            if (plan.addLabels.length > 0) record("accepted", "label", { labels: plan.addLabels }, null, entity.id, entity.key);
+            if (plan.priority !== null) record("accepted", "priority", { priority: plan.priority }, null, entity.id, entity.key);
+            if (plan.relations.length > 0) record("accepted", "relation", { relations: plan.relations }, null, entity.id, entity.key);
+          }
+          if (plan.comment !== null) {
+            try {
+              await sourceRpc("linear", "sourceComment", { key: entity.key, body: plan.comment.body }, sourceContract.sourceComment.output);
+            } catch (error) {
+              const reason = `the comment was refused: ${errorMessage(error)}`;
+              record("refused", "comment", { kind: plan.comment.kind }, reason, entity.id, entity.key);
+              return toolError(new Error(reason));
+            }
+            record("accepted", "comment", { kind: plan.comment.kind }, null, entity.id, entity.key);
+          }
+          const parts = [
+            plan.addLabels.length > 0 ? `labels ${plan.addLabels.join(", ")}` : null,
+            plan.relations.length > 0 ? `relations ${plan.relations.map((r) => `${r.type} ${r.issue}`).join(", ")}` : null,
+            plan.priority !== null ? `priority ${plan.priority}` : null,
+            plan.comment !== null ? (plan.comment.kind === "stale" ? "a stale-cancel proposal" : "a question") : null,
+          ].filter((p): p is string => p !== null);
+          return `Triaged ${entity.key}: ${parts.join("; ")}.`;
+          } catch (error) {
+            return toolError(error);
+          }
+        });
+      }),
+    });
 
     /**
      * BB-329: the worker's own park. One additive argument: the worker says

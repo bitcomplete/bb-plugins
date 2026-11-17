@@ -369,6 +369,33 @@ describe("tools", () => {
     expect(linear.calls.at(-1)!.body!.variables).toEqual({ term: "acme/web#4", filter: { team: { key: { eq: "ENG" } } }, first: 10 });
   });
 
+  it("sourceUpdateIssue applies labels and priority, and sourceComment refuses an unsigned body (BB-341)", async () => {
+    const ref = issue({ labels: { nodes: [{ id: "l-bug", name: "Bug" }] }, team: { ...(issue().team as object), labels: { nodes: [{ id: "l-bug", name: "Bug" }, { id: "l-size", name: "size:S" }] } } });
+    let lastInput: Record<string, unknown> = {};
+    const { harness, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")) {
+            lastInput = body.variables!.input as Record<string, unknown>;
+            const labels = (lastInput.labelIds as string[]).map((id) => ({ name: id === "l-size" ? "size:S" : "Bug" }));
+            return { data: { issueUpdate: { success: true, issue: { identifier: "ENG-123", state: { name: "Todo" }, assignee: null, labels: { nodes: labels }, priority: lastInput.priority ?? 0 } } } };
+          }
+          if (body.query.startsWith("mutation($input: CommentCreateInput!)")) return { data: { commentCreate: { success: true, comment: { url: "https://linear.app/c/2" } } } };
+          return { data: { issue: ref, issueLabels: { nodes: [] } } };
+        },
+      },
+    });
+    const out = (await harness.callRpc("sourceUpdateIssue", { key: "ENG-123", addLabels: ["size:S"], priority: "high" })) as { ok: boolean; changed: string[] };
+    expect(out.ok).toBe(true);
+    expect(lastInput).toEqual({ labelIds: ["l-bug", "l-size"], priority: 2 });
+
+    // An unsigned comment never reaches Linear.
+    await expect(harness.callRpc("sourceComment", { key: "ENG-123", body: "No signature here" })).rejects.toThrow(/signature line/u);
+    expect(linear.calls.some((c) => c.body?.query.startsWith("mutation($input: CommentCreateInput!)"))).toBe(false);
+    expect(await harness.callRpc("sourceComment", { key: "ENG-123", body: "Hi there\n\n_— from bb thread thr_x_" })).toEqual({ ok: true, url: "https://linear.app/c/2" });
+  });
+
   it("linear_comment signs the comment with the thread and reports the URL", async () => {
     const { tool, text, linear } = await setup({
       token: "at-0",

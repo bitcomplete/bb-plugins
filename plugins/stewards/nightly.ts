@@ -16,6 +16,7 @@ import type { Assumption, Binding, Escalation, Need, Question, Store } from "./s
 import type { NonActions } from "./non-actions.js";
 import type { BacklogIssue } from "./source-contract.js";
 import type { BacklogLook, BacklogSnapshot } from "./ops.js";
+import type { BacklogWrite } from "./backlog-triage.js";
 import type { DigestRecords } from "./wake.js";
 import { createHash } from "node:crypto";
 import type { CheckFinding } from "./template-stamp.js";
@@ -259,6 +260,10 @@ export type BacklogDigest = {
   duplicates: BacklogDuplicate[];
   stale: BacklogStale[];
   next: BacklogNext[];
+  /** BB-341: the accepted triage writes since the previous digest, each a ticket and a kind. */
+  writes: Array<{ issueKey: string; kind: string; at: number }>;
+  /** BB-341: how many triage calls were refused in the window. */
+  refusals: number;
 };
 
 const daysSince = (from: string | null, now: number): number | null => {
@@ -362,8 +367,9 @@ export function nextBacklog(issues: readonly BacklogIssue[], now: number, limit 
  * null. The read's `error` is carried through, so the renderer shows a problem
  * line and never an empty backlog.
  */
-export function backlogDigest(look: BacklogLook, previous: BacklogSnapshot | null, opts: { staleDays: number }, now: number): BacklogDigest {
+export function backlogDigest(look: BacklogLook, previous: BacklogSnapshot | null, opts: { staleDays: number; writes?: readonly BacklogWrite[] }, now: number): BacklogDigest {
   const issues = look.issues;
+  const ledger = opts.writes ?? [];
   const previousIds = new Set(previous?.ids ?? []);
   const currentIds = new Set(issues.map((i) => i.id));
   const ages = BACKLOG_AGE_BUCKETS.map((bucket, index) => {
@@ -382,5 +388,7 @@ export function backlogDigest(look: BacklogLook, previous: BacklogSnapshot | nul
     duplicates: duplicateBacklog(issues),
     stale: staleBacklog(issues, opts.staleDays, now),
     next: nextBacklog(issues, now),
+    writes: ledger.filter((w) => w.outcome === "accepted").map((w) => ({ issueKey: w.issueKey, kind: w.kind, at: w.at })),
+    refusals: ledger.filter((w) => w.outcome === "refused").length,
   };
 }

@@ -81,6 +81,30 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   Merge item to the replacement instead of ending it with the bot's. Reading
   alerts needs the token's alert access; a server whose login cannot read
   them skips the targets, and `bb stewards check` says which. DESIGN.md §19.
+- **Backlog stewards.** A `backlog` role watches one Linear team's whole open
+  backlog (unlabelled and unassigned included) through the `sourceBacklog`
+  read and contributes a **Backlog** section to the morning digest: size, age
+  distribution, inflow and outflow, likely duplicates, stale tickets and the
+  proposed next three. It is read-only until the project sets
+  `backlog.triage: true`; then the steward is offered one gated tool,
+  `backlog_triage { key, addLabels?, relations?, priority?, comment?,
+  proposeCancel? }`, and nothing else. The plugin, not the playbook, enforces
+  the hard limits: the fields are allowlisted (no description, state,
+  assignee, cancel or close); only un-adopted tickets are touched (nothing
+  bound, nothing in a started/completed/canceled state, and no `bb-managed`
+  ticket with an assignee); labels come from the fixed vocabulary (kind
+  `bug`/`feature`/`chore`, `repo:<name>` from `repos.json`, and
+  `size:S|M|L`) and never an adoption label; relations are only `duplicate`,
+  `blockedBy` and `related`, both ends in the team, add-only; a priority is
+  set only when it is unset or was last set by the steward, never a hand-set
+  one; and a comment is signed, within `backlog.commentsPerWeek` per ticket
+  over a rolling seven days, with one open question per ticket and the
+  stale-cancel proposal only after `backlog.staleDays`. Every accepted write
+  and every refusal is appended to a stored ledger ([backlog-triage.ts](backlog-triage.ts),
+  [store.ts](store.ts)); the digest lists each write and counts the refusals.
+  The flag is re-read on every call, so turning it off refuses at once, and
+  a ticket, ledger or configuration that cannot be read refuses and writes
+  nothing. The `.bb` keys land in a later, owner-reviewed pull request.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with

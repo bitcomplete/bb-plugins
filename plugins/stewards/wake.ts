@@ -1877,6 +1877,10 @@ function backlogLines(b: BacklogDigest): string[] {
   if (b.duplicates.length > 0) out.push(`  - Likely duplicates: ${b.duplicates.map((d) => d.keys.join(" / ")).join("; ")}`);
   if (b.stale.length > 0) out.push(`  - Stale: ${b.stale.map((s) => `${s.key} (${s.days}d)`).join(", ")}`);
   if (b.next.length > 0) out.push(`  - Proposed next: ${b.next.map((n) => `${n.key} (${n.reason})`).join("; ")}`);
+  // BB-341: what the steward wrote, so the owner can review it against the
+  // budget, and how many attempts it refused.
+  if (b.writes.length > 0) out.push(`  - Writes: ${b.writes.map((w) => `${w.issueKey} ${w.kind}`).join(", ")}`);
+  if (b.refusals > 0) out.push(`  - Refused: ${b.refusals}`);
   return out;
 }
 
