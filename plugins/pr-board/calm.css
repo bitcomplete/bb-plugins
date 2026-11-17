@@ -1,5 +1,111 @@
 @layer ui-sdk;
 
+.calm-workspace {
+  display: flex;
+  container: prs-workspace / inline-size;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.calm-workspace > .calm-scroller {
+  flex: 1;
+  min-width: 0;
+}
+.calm-conversation {
+  display: flex;
+  flex: 0 0 min(460px, 100%);
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--sidebar, var(--background));
+  color: var(--foreground);
+}
+.calm-conversation-header {
+  flex-shrink: 0;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-sans, Inter, system-ui, sans-serif);
+  font-size: 12px;
+}
+.calm-conversation-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.calm-conversation-heading h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.calm-conversation-button,
+.calm-conversation-scope {
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.calm-conversation-button:hover,
+.calm-conversation-scope:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+.calm-conversation-header :is(button, a, h2):focus-visible {
+  outline: 2px solid var(--file-accent, var(--primary));
+  outline-offset: 2px;
+}
+.calm-conversation-members {
+  max-height: 120px;
+  overflow: auto;
+  margin: 6px 0;
+  padding: 0 6px;
+  list-style: none;
+  overflow-wrap: anywhere;
+}
+.calm-conversation-members li + li {
+  margin-top: 5px;
+}
+.calm-conversation-members a {
+  color: var(--foreground);
+  text-decoration: none;
+}
+.calm-conversation-chat {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.calm-agent-report {
+  margin-top: 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--calm-blue);
+  overflow-wrap: anywhere;
+}
+.calm-agent-report-label {
+  color: var(--calm-muted);
+  font-size: 11px;
+}
+.calm-agent-report p + p {
+  max-height: 160px;
+  overflow: auto;
+  margin-top: 4px;
+  white-space: pre-wrap;
+}
+@container prs-workspace (max-width: 959px) {
+  .calm-workspace.conversation-open > .calm-scroller {
+    display: none;
+  }
+  .calm-conversation {
+    flex-basis: 100%;
+    border-left: 0;
+  }
+}
+
 .calm-board,
 .calm-dialog,
 .calm-organization-menu {

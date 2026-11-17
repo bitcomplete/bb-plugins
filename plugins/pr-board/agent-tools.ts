@@ -2,6 +2,7 @@ import type { BbPluginApi, PluginAgentToolContext, PluginAgentToolResult, Plugin
 import { z } from "zod";
 import { actionSchema, calmRowSchema, stopSchema, type BoardState, type Prepared } from "./board.js";
 import type { rpcContract } from "./server.js";
+import { reportInputSchema, ReportRetryableError, type ReportInput } from "./reports.js";
 
 const key = z.string().min(1).max(300);
 const pagination = { offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(20).default(10) };
@@ -12,6 +13,7 @@ type Operations = PluginRpcHandlers<typeof rpcContract> & {
   start(input: z.infer<typeof rpcContract.start.input>, signal?: AbortSignal): Promise<z.infer<typeof rpcContract.start.output>>;
   agent_model_set(input: z.infer<typeof rpcContract.agent_model_set.input>, signal?: AbortSignal): Promise<z.infer<typeof rpcContract.agent_model_set.output>>;
   reviewers_get(input: z.infer<typeof rpcContract.reviewers_get.input>, signal?: AbortSignal): Promise<z.infer<typeof rpcContract.reviewers_get.output>>;
+  report(threadId: string, input: ReportInput, signal: AbortSignal): Promise<{ accepted: string[]; receivedAt: string }>;
 };
 
 function page<T>(items: T[], offset: number, limit: number) {
@@ -49,7 +51,7 @@ export function registerAgentTools(bb: BbPluginApi, operations: Operations, cont
       signal.throwIfAborted();
       return result(value);
     } catch (cause) {
-      return result({ error: signal.aborted ? "cancelled" : "operation_refused", message: cause instanceof Error ? cause.message : String(cause) }, true);
+      return result({ error: signal.aborted ? "cancelled" : cause instanceof ReportRetryableError ? "report_retryable" : "operation_refused", message: cause instanceof Error ? cause.message : String(cause) }, true);
     }
   }
   const readInput = z.discriminatedUnion("kind", [
@@ -114,6 +116,13 @@ export function registerAgentTools(bb: BbPluginApi, operations: Operations, cont
         default: { const _exhaustive: never = input; return _exhaustive; }
       }
     }),
+  });
+  bb.agents.registerTool({
+    name: "prs_report",
+    description: "Report progress or results for PRs assigned to this coordinator. Submit 1–100 distinct PR updates atomically. Children report through their coordinator. Reports describe work; they do not change GitHub readiness, BB lifecycle, or authorize publication. If assignment is not saved yet, retry after the start finishes.",
+    presentation: { label: { pending: "Recording PR progress", completed: "Recorded PR progress" } },
+    parameters: reportInputSchema,
+    execute: (input, context) => run(context, (signal) => operations.report(context.threadId, input, signal)),
   });
   bb.agents.registerTool({
     name: "prs_prepare",

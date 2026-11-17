@@ -22,6 +22,7 @@ import { agentModelSchema, DEFAULT_AGENT_MODEL, normalizeAgentModel, agentModelR
 import { afterRefresh, busyKeys, isLiveStatus, markerSchema, toView, type Marker, type ThreadInfo, parseQuestion } from "./markers.js";
 import { prsSnapshotSchema, prsReviewSchema, reviewsStateSchema, reviewTargetsSchema, reviewStartSchema, reviewBatchSchema, reviewPollSchema } from "./reviews.js";
 import { reviewerOptions, requestReview, reviewerOptionsSchema, type Github } from "./reviewers.js";
+import { recordReports, type ReportInput } from "./reports.js";
 
 /** Fix and review starts share the saved agent choice, initially Codex Sol at xhigh. */
 export const THREAD_DEFAULTS = {
@@ -182,6 +183,28 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
       markerQueue = next.catch(() => undefined);
       return next;
     }
+    async function report(threadId: string, input: ReportInput, requestSignal: AbortSignal) {
+      const result = await updateMarkers((markers) => {
+        requestSignal.throwIfAborted();
+        const recorded = recordReports(markers, threadId, input);
+        return { markers: recorded.assignments, result: recorded.result };
+      });
+      changed();
+      return result;
+    }
+
+    async function pendingInput(threadIds: string[]): Promise<Record<string, boolean>> {
+      try {
+        const ids = [...new Set(threadIds)];
+        const batches = [];
+        for (let offset = 0; offset < ids.length; offset += 200) {
+          batches.push(bb.sdk.threads.list({ threadIds: ids.slice(offset, offset + 200), includeHidden: true, limit: 200, signal }));
+        }
+        return Object.fromEntries((await Promise.all(batches)).flat().map((thread) => [thread.id, thread.hasPendingInteraction]));
+      } catch {
+        return {};
+      }
+    }
 
     async function threadInfo(threadId: string): Promise<ThreadInfo> {
       try {
@@ -244,6 +267,7 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
     };
     bb.events.on("thread.active", threadChanged);
     bb.events.on("thread.failed", threadChanged);
+    bb.events.on("interaction.pending", () => changed());
     let running: Promise<void> | null = null;
     async function read(): Promise<BoardState> {
       let markers = await readMarkers();
@@ -254,6 +278,7 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
         ...(await readSaved()),
         refreshing: running !== null,
         markers: markers.map((m) => toView(m, m.threadId ? threads[m.threadId] : undefined)),
+        needsInput: await pendingInput(markers.flatMap((marker) => marker.threadId ? [marker.threadId] : [])),
       };
     }
 
@@ -320,7 +345,7 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
       const prepared: PreparedTask[] = [];
       const outcomes: Marker[] = [];
       const base = (item: { key: string; action: Action }) => ({ key: item.key, action: item.action, at: new Date().toISOString(), threadId: null, title: null, head: null, move: null,
-        reason: null, question: null, answeredQuestions: [], answering: null, answerError: null });
+        reason: null, question: null, answeredQuestions: [], answering: null, answerError: null, report: null });
       for (const item of items) {
         try {
           if (lastError !== null || data === null) throw new Error(`could not re-check the PR on GitHub: ${lastError ?? "no data yet"}`);
@@ -374,7 +399,7 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
           }
         }
         const at = new Date().toISOString();
-        const added = starting.map((item): Marker => ({ ...item, status: "starting", at, threadId: null, title: null, head: null, move: null, reason: null, question: null, answeredQuestions: [], answering: null, answerError: null }));
+        const added = starting.map((item): Marker => ({ ...item, status: "starting", at, threadId: null, title: null, head: null, move: null, reason: null, question: null, answeredQuestions: [], answering: null, answerError: null, report: null }));
         const keys = new Set(starting.map((item) => item.key));
         return { markers: [...markers.filter((m) => !keys.has(m.key)), ...added], result: { starting, skipped } };
       });
@@ -450,7 +475,10 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
       agent_model_get: async () => ({ choice: await agentModel(), routing: await agentModelRouting(bb, THREAD_DEFAULTS.projectId) }), agent_model_set: saveAgentModel,
       prs_integration: () => ({ version: 1 as const }),
       reviews_get: async () => {
-        try { return { kind: "available" as const, snapshot: await reviewCall("prs_snapshot", prsSnapshotSchema) }; }
+        try {
+          const snapshot = await reviewCall("prs_snapshot", prsSnapshotSchema);
+          return { kind: "available" as const, snapshot, needsInput: await pendingInput(snapshot.items.flatMap(({ item }) => item.threadId ? [item.threadId] : [])) };
+        }
         catch (cause) { return { kind: "unavailable" as const, reason: cause instanceof Error ? cause.message : "Review Watch unavailable" }; }
       },
       reviews_detail: (input: z.infer<typeof rpcContract.reviews_detail.input>) => reviewCall("prs_detail", prsReviewSchema, input),
@@ -520,7 +548,7 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
       agent_model_set: (input) => operations.agent_model_set(input),
       reviewers_get: (input, context) => operations.reviewers_get(input, context.experimental_signal),
     });
-    registerAgentTools(bb, { ...operations, prepare }, rpcContract, signal);
+    registerAgentTools(bb, { ...operations, prepare, report }, rpcContract, signal);
 
     bb.cli.register({
       name: "pr-board",

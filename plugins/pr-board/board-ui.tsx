@@ -25,16 +25,20 @@ export type MinePr = {
   row: CalmRow;
   marker: MarkerView | undefined;
   segment: MineSegment;
+  needsInput: boolean;
 };
 export type AgentQuestionGroup = [MinePr, ...MinePr[]];
+export function hasAgentQuestion(pr: MinePr): boolean {
+  return pr.needsInput || (pr.marker?.status === "asking" && pr.marker.question !== null);
+}
 export function groupAgentQuestions(prs: MinePr[]): AgentQuestionGroup[] {
   const groups = new Map<string, AgentQuestionGroup>();
   for (const pr of prs) {
     const marker = pr.marker;
-    if (marker?.status !== "asking" || !marker.question) continue;
+    if (!hasAgentQuestion(pr)) continue;
     const key = JSON.stringify([
-      marker.threadId ?? pr.row.key,
-      marker.question.id,
+      marker?.threadId ?? pr.row.key,
+      marker?.question?.id ?? "pending-input",
     ]);
     const group = groups.get(key);
     if (group) group.push(pr);
@@ -59,17 +63,19 @@ export const ACTION_LABEL: Record<Action, string> = {
 export function minePrs(
   view: ViewModel | null,
   markers: MarkerView[],
+  pendingInput: Record<string, boolean> = {},
 ): MinePr[] {
   const byKey = new Map(markers.map((marker) => [marker.key, marker]));
   return (view?.prs ?? []).map((row) => {
     const marker = byKey.get(row.key);
+    const needsInput = !!(marker?.threadId && pendingInput[marker.threadId]);
     const segment =
-      marker?.status === "live" || marker?.status === "starting"
+      needsInput ? "on-you" : marker?.status === "live" || marker?.status === "starting"
         ? "agent"
         : marker?.status === "asking" && marker.question
           ? "on-you"
           : row.segment;
-    return { row, marker, segment };
+    return { row, marker, segment, needsInput };
   });
 }
 export function isStartable(
@@ -104,7 +110,7 @@ export function age(iso: string, now = Date.now()): string {
 }
 export function rowTone(pr: MinePr): string {
   if (pr.segment === "agent") return "blue";
-  if (pr.marker?.status === "asking" && pr.marker.question) return "question";
+  if (hasAgentQuestion(pr)) return "question";
   if (pr.segment === "drafts") return "gray";
   if (pr.row.gate_blocked) return "gated";
   if (pr.segment === "on-reviewers") return "purple";
@@ -404,6 +410,7 @@ function PrContext({
   view,
   onStart,
   onReview,
+  onConversation,
   startDisabled,
 }: {
   pr: MinePr;
@@ -411,6 +418,7 @@ function PrContext({
   view: ViewModel;
   onStart: (rows: CalmRow[], stop: Stop) => void;
   onReview: (key: string) => void;
+  onConversation: (threadId: string) => void;
   startDisabled: boolean;
 }) {
   const { row, marker } = pr;
@@ -541,9 +549,11 @@ function PrContext({
           </CalmButton>
         ) : null}
         {threadId ? (
-          <CalmButton onClick={() => navigate.toThread(threadId)}>
-            {pr.segment === "agent" ? "Open agent" : "Open thread"}
-          </CalmButton>
+          marker?.status === "asking" && marker.question ? (
+            <CalmButton onClick={() => navigate.toThread(threadId)}>Open thread</CalmButton>
+          ) : (
+            <CalmButton onClick={() => onConversation(threadId)}>Open conversation</CalmButton>
+          )
         ) : null}
         <UrlLink href={row.url} className="calm-button">
           Open PR
@@ -563,6 +573,7 @@ export function MineRow({
   onExpand,
   onStart,
   onReview,
+  onConversation,
   answer,
   busy,
   startDisabled,
@@ -575,6 +586,7 @@ export function MineRow({
   onExpand: () => void;
   onStart: (rows: CalmRow[], stop: Stop) => void;
   onReview: (key: string) => void;
+  onConversation: (threadId: string) => void;
   answer: (pr: MinePr, option: string) => void;
   busy: boolean;
   startDisabled: boolean;
@@ -592,7 +604,7 @@ export function MineRow({
       )?.length ?? 1)
     : 0;
   const startable = isStartable(pr) ? row.action : null;
-  const meta =
+  const meta = pr.needsInput ? "Agent needs your input" :
     question && !displayedQuestion
       ? "Waiting on shared agent question"
       : pr.segment === "agent"
@@ -617,7 +629,7 @@ export function MineRow({
       open={expanded}
       onOpenChange={onExpand}
       aria-label={`Context for ${row.title} #${row.number}`}
-      className={`calm-pr${expanded ? " expanded" : ""}${displayedQuestion ? " question-row" : ""}`}
+      className={`calm-pr${expanded ? " expanded" : ""}${displayedQuestion || pr.needsInput ? " question-row" : ""}`}
       data-pr-key={row.key}
     >
       <div className="calm-row">
@@ -682,13 +694,22 @@ export function MineRow({
                 <button
                   type="button"
                   className="calm-link"
-                  onClick={() => navigate.toThread(threadId)}
+                  onClick={() => onConversation(threadId)}
                 >
-                  Open thread →
+                  Open conversation →
                 </button>
               ) : null}
             </span>
           </div>
+          {marker?.report ? (
+            <div className="calm-agent-report">
+              <span className="calm-agent-report-label">
+                Agent reported{marker.report.kind === "result" ? ` · ${marker.report.outcome}` : " · progress"}
+              </span>
+              <p>{marker.report.summary}</p>
+              {marker.report.kind === "result" && marker.report.detail ? <p>{marker.report.detail}</p> : null}
+            </div>
+          ) : null}
           {displayedQuestion && questionGroup && linkedPrCount > 1 ? (
             <p className="calm-question-scope">
               {linkedPrCount === questionGroup.length
@@ -735,6 +756,7 @@ export function MineRow({
           view={view}
           onStart={onStart}
           onReview={onReview}
+          onConversation={onConversation}
           startDisabled={busy || startDisabled}
         />
       </CollapsiblePanel>

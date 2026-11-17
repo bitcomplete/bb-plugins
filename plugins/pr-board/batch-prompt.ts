@@ -23,6 +23,7 @@ You may work sequentially or start child threads for independent PR tasks. If yo
 Keep progress and user decisions in this coordinator thread. Report each PR separately with its actual outcome, commits, checks, unresolved decisions, and retained worktree. Idle or stopped children alone do not prove that a PR is complete.
 
 ## Final report and questions
+Use prs_report from this coordinator to record progress and a final result for each assigned PR key. Progress updates have kind, key, and summary. Results also have outcome and detail. Keep summaries within 300 characters and detail within 4000 characters. Submit up to 100 distinct keys per call. If the tool returns report_retryable, retry after the start finishes. Children report through this coordinator.
 Produce one combined report and one final "## Decisions for Matt" section for the whole batch. Append exactly one final pr-board-question block using the existing version 1 protocol. Any question is a decision for this shared coordinator, and its prompt must identify the affected PRs. Do not concatenate child question blocks or send multiple final question blocks. Use question: null only when no decision remains, and never reuse an answered question ID. These requirements replace the enclosed per-task final-report instructions.
 
 ## Independent PR task briefs

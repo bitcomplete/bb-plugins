@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@ui-sdk/react/tabs";
 import {
   Select,
@@ -26,6 +33,7 @@ import type { BoardState, CalmRow, Stop } from "./board";
 import type { rpcContract } from "./server";
 import type { ReviewsState } from "./reviews";
 import type { AgentModelChoice } from "./agent-model";
+import { ConversationPanel } from "./conversation-ui";
 import {
   disposePrsUiAgentBridge,
   usePrsUiAgentBridge,
@@ -45,6 +53,7 @@ import {
   UnitBar,
   minePrs,
   groupAgentQuestions,
+  hasAgentQuestion,
   isStartable,
   rowTone,
   type MinePr,
@@ -55,6 +64,7 @@ import {
   REVIEW_SEGMENTS,
   ReviewsView,
   reviewTone,
+  reviewsWithPendingInput,
   type ReviewSegment,
 } from "./reviews-ui";
 import "./calm.css";
@@ -189,15 +199,18 @@ export function prsBadge({
 }
 function usePrsBadge(): ExperimentalBadge | null {
   const { state, reviews, now } = usePrsData();
-  const prs = minePrs(state?.view ?? null, state?.markers ?? []);
+  const prs = minePrs(state?.view ?? null, state?.markers ?? [], state?.needsInput ?? {});
   const pending =
     reviews?.kind === "available"
-      ? reviews.snapshot.items.filter((review) => review.segment === "on-you")
+      ? reviewsWithPendingInput(reviews.snapshot.items, reviews.needsInput ?? {}).filter((review) => review.segment === "on-you")
       : [];
   return prsBadge({
     onYou: prs.filter((pr) => pr.segment === "on-you").length,
     toReview: pending.length,
-    agentsAsking: groupAgentQuestions(prs).length,
+    agentsAsking: new Set([
+      ...groupAgentQuestions(prs).map((group) => group[0].marker?.threadId ?? group[0].row.key),
+      ...pending.flatMap((review) => review.item.threadId && reviews?.kind === "available" && reviews.needsInput?.[review.item.threadId] ? [review.item.threadId] : []),
+    ]).size,
     overdueReviews: pending.filter(
       (review) => now - Date.parse(review.item.noticedAt) >= 2 * 86_400_000,
     ).length,
@@ -492,6 +505,34 @@ export function Board({ subPath }: { subPath?: string }) {
     refresh,
   } = usePrsData();
   const navigate = useBbNavigate();
+  const [conversationThread, setConversationThread] = useState<string | null>(null);
+  const conversationOpener = useRef<{ element: Element | null; url: string } | null>(null);
+  const conversationRoster = useRef<Parameters<typeof ConversationPanel>[0]["members"]>([]);
+  const openConversation = (threadId: string) => {
+    conversationOpener.current = {
+      element: document.activeElement,
+      url: window.location.href,
+    };
+    conversationRoster.current = [
+      ...allPrs.flatMap((pr) => pr.marker?.threadId === threadId ? [pr.row] : []),
+      ...allReviewItems.flatMap((review) => review.item.threadId === threadId
+        ? [{ ...review.item, key: `${review.item.repo}#${review.item.number}` }]
+        : []),
+    ];
+    setConversationThread(threadId);
+  };
+  useLayoutEffect(() => {
+    if (conversationThread !== null || conversationOpener.current === null) return;
+    const { element, url } = conversationOpener.current;
+    conversationOpener.current = null;
+    if (
+      url === window.location.href &&
+      element instanceof HTMLElement &&
+      element.isConnected &&
+      !element.closest("[hidden], [inert]") &&
+      element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+    ) element.focus();
+  }, [conversationThread]);
   const [agentSettings, setAgentSettings] = useState<AgentModelContext | null>(
     null,
   );
@@ -583,11 +624,11 @@ export function Board({ subPath }: { subPath?: string }) {
   const { folded, toggle } = useFolds();
   const view = state?.view ?? null;
   const allPrs = useMemo(
-    () => minePrs(view, state?.markers ?? []),
-    [view, state?.markers],
+    () => minePrs(view, state?.markers ?? [], state?.needsInput ?? {}),
+    [view, state?.markers, state?.needsInput],
   );
   const allReviewItems = useMemo(
-    () => (reviews?.kind === "available" ? reviews.snapshot.items : []),
+    () => reviews?.kind === "available" ? reviewsWithPendingInput(reviews.snapshot.items, reviews.needsInput ?? {}) : [],
     [reviews],
   );
   const organizations = useMemo(
@@ -755,6 +796,7 @@ export function Board({ subPath }: { subPath?: string }) {
         }
         onStart={(rows, policy) => void start(rows, policy)}
         onReview={onReview}
+        onConversation={openConversation}
         answer={(item, option) => void answer(item, option)}
         busy={busy !== null}
         startDisabled={!modelReady || modelSaving}
@@ -770,7 +812,7 @@ export function Board({ subPath }: { subPath?: string }) {
     );
   const onYou = sorted(prs.filter((pr) => pr.segment === "on-you"));
   const asking = onYou.filter(
-    (pr) => pr.marker?.status === "asking" && pr.marker.question,
+    hasAgentQuestion,
   );
   const askingKeys = new Set(asking.map((pr) => pr.row.key));
   const questionGroups = groupAgentQuestions(asking);
@@ -823,7 +865,11 @@ export function Board({ subPath }: { subPath?: string }) {
       <ul>{members.map(renderRow)}</ul>
     </EffortGroup>
   );
-  return (
+  const shownConversationKeys = new Set([
+    ...prs.map((pr) => pr.row.key),
+    ...reviewItems.map((review) => `${review.item.repo}#${review.item.number}`),
+  ]);
+  const board = (
     <div
       ref={rootRef}
       className="calm-scroller"
@@ -1218,6 +1264,8 @@ export function Board({ subPath }: { subPath?: string }) {
                 toggleFold={toggle}
                 mine={view?.prs ?? []}
                 refetch={refetch}
+                onConversation={openConversation}
+                needsInput={reviews?.kind === "available" ? reviews.needsInput ?? {} : {}}
               />
             </>
           ) : (
@@ -1285,6 +1333,19 @@ export function Board({ subPath }: { subPath?: string }) {
           />
         ) : null}
       </Tabs>
+    </div>
+  );
+  return (
+    <div className={`calm-workspace${conversationThread ? " conversation-open" : ""}`}>
+      {board}
+      {conversationThread ? (
+        <ConversationPanel
+          threadId={conversationThread}
+          members={conversationRoster.current}
+          shownKeys={shownConversationKeys}
+          onClose={() => setConversationThread(null)}
+        />
+      ) : null}
     </div>
   );
 }
