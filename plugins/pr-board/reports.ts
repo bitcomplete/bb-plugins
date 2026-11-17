@@ -20,11 +20,11 @@ export class ReportRetryableError extends Error {
 }
 
 /** Validate the whole batch before replacing any assigned key's latest report. */
-export function recordReports<T extends { key: string; threadId: string | null; report?: Report | null }>(
+export function recordReports<T extends { key: string; threadId: string | null; status: string; report?: Report | null }>(
   assignments: T[], threadId: string, input: ReportInput,
 ) {
   const owned = new Set(assignments.filter((item) => item.threadId === threadId).map((item) => item.key));
-  if (!owned.size && !assignments.some((item) => item.threadId !== null && input.updates.some((update) => update.key === item.key))) {
+  if (!owned.size && input.updates.every((update) => assignments.some((item) => item.key === update.key && item.status === "starting" && item.threadId === null))) {
     throw new ReportRetryableError();
   }
   if (input.updates.some((update) => !owned.has(update.key))) throw new Error("This key is not assigned to the reporting coordinator.");

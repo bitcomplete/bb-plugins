@@ -81,6 +81,19 @@ it("returns a retryable error while spawn has started but markers have no thread
   expect(await report([{ kind: "progress", key, summary: "Assigned" }])).toMatchObject({ accepted: [key] });
 });
 
+it("refuses reports for missing assignments instead of suggesting a retry", async () => {
+  const { report } = await host();
+  expect(await report([{ kind: "progress", key, summary: "Missing" }])).toMatchObject({ error: "operation_refused", message: expect.stringContaining("not assigned") });
+});
+
+it("refuses reports after preparation is refused instead of suggesting a retry", async () => {
+  const { runner, start, report, board } = await host();
+  runner.prepare = async () => ({ ok: false, reason: "This task is no longer eligible" });
+  await start([key]);
+  expect((await board()).markers[0]).toMatchObject({ status: "refused", threadId: null });
+  expect(await report([{ kind: "progress", key, summary: "Refused" }])).toMatchObject({ error: "operation_refused", message: expect.stringContaining("not assigned") });
+});
+
 it("rejects caller-supplied thread IDs and duplicate keys instead of trusting report payloads", async () => {
   const { harness, start, board } = await host(); await start();
   const update = { kind: "progress", key, summary: "Forged" };
@@ -99,6 +112,7 @@ it("lets reports expire with their marker and refuses an old coordinator after r
   control.head = "next";
   await harness.behavior.callRpc("board_refresh", null);
   expect((await board()).markers).toEqual([]);
+  expect(await report([{ kind: "progress", key, summary: "Expired report" }])).toMatchObject({ error: "operation_refused", message: expect.stringContaining("not assigned") });
   await start([key]);
   expect(await report([{ kind: "progress", key, summary: "Late report" }])).toMatchObject({ error: "operation_refused" });
   expect((await board()).markers[0]).toMatchObject({ threadId: "worker-2", report: null });
@@ -137,4 +151,31 @@ it("keeps reviews available when pending-input lookup fails", async () => {
   harness.sdk.stub("threads.list", async () => { throw new Error("Thread list unavailable"); });
   expect(reviewsStateSchema.parse(await harness.behavior.callRpc("reviews_get", null))).toEqual({ kind: "available", snapshot, needsInput: {} });
   expect(harness.sdk.callsTo("threads.list").at(-1)?.[0]).toMatchObject({ threadIds: ["reviewer"] });
+});
+
+it("publishes pending interactions only for marker threads and the latest review snapshot", async () => {
+  const { harness, start, board } = await host(); await start(); await board();
+  const pending = (threadId: string) => harness.behavior.emitThreadEvent("interaction.pending", {
+    thread: makeThreadResponse({ id: threadId }),
+    interaction: {
+      id: "interaction-synthetic", threadId, status: "pending", createdAt: Date.now(),
+      origin: { kind: "plugin", pluginId: "synthetic", rendererId: "question" },
+      payload: { kind: "plugin", title: "Choose a task", data: {} },
+      turnId: null, resolution: null, resolvedAt: null, statusReason: null,
+    },
+  });
+  const before = harness.realtimeSignals.length;
+  await pending("unrelated");
+  expect(harness.realtimeSignals).toHaveLength(before);
+  await pending("worker-1");
+  expect(harness.realtimeSignals).toHaveLength(before + 1);
+  let items = [review];
+  harness.sdk.stub("plugins.callRpc", async () => ({ version: 1, items, lastPoll: null, lastSuccessAt: null }));
+  await harness.behavior.callRpc("reviews_get", null);
+  await pending("reviewer");
+  expect(harness.realtimeSignals).toHaveLength(before + 2);
+  items = [];
+  await harness.behavior.callRpc("reviews_get", null);
+  await pending("reviewer");
+  expect(harness.realtimeSignals).toHaveLength(before + 2);
 });

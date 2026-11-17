@@ -1859,7 +1859,8 @@ it("shows marker reports and pending input, opens a filtered shared roster, and 
   const members = [row(2), acmeRow];
   const markers = members.map((pr) => ({ ...marker(pr.number, { status: "done", threadId: "thr_shared" }), key: pr.key }));
   markers[0] = { ...markers[0], report: { kind: "progress", summary: "Reading the failing check", receivedAt: ago(1) } };
-  const slot = await mount({ board: state({ view: { ...view, prs: members }, markers, needsInput: { thr_shared: true } }) });
+  let current = state({ view: { ...view, prs: members }, markers, needsInput: { thr_shared: true } });
+  const slot = await mount({ rpc: { board_get: () => current } });
   await chooseOrganization(slot, "parsleyhealth");
   const item = mineRow(slot, "Change 2");
   expect(item.getByText("Agent needs your input")).toBeTruthy();
@@ -1893,11 +1894,21 @@ it("shows marker reports and pending input, opens a filtered shared roster, and 
   expect(calls(slot, "answer")).toEqual([]);
   expect(calls(slot, "answer_interaction")).toEqual([]);
   expect(calls(slot, "conversation_get")).toEqual([]);
+  current = { ...current, markers: [markers[0]] };
+  await slot.behavior.emitRealtime("board-changed", null);
+  const refreshed = within(slot.getByRole("complementary", { name: "Agent conversation" }));
+  fireEvent.click(await refreshed.findByRole("button", { name: "1 PR in conversation" }));
+  expect(refreshed.queryByRole("link", { name: "acme/app #20 · Change 20" })).toBeNull();
+  current = { ...current, markers: [] };
+  await slot.behavior.emitRealtime("board-changed", null);
+  await refreshed.findByRole("button", { name: "Conversation scope is unavailable" });
+  expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_shared");
 });
 
 it("opens review conversations using every queue item in the shared thread, including filtered organizations", async () => {
   const items = [reviewA, acmeReview].map((review) => ({ ...review, segment: "agent" as const, item: { ...review.item, state: "started" as const, threadId: "thr_review_shared" } }));
-  const slot = await mount({ path: "to-review", reviews: { kind: "available", snapshot: { version: 1, items, lastPoll: null, lastSuccessAt: null }, needsInput: { thr_review_shared: true } } });
+  let current: ReviewsState = { kind: "available", snapshot: { version: 1, items, lastPoll: null, lastSuccessAt: null }, needsInput: { thr_review_shared: true } };
+  const slot = await mount({ path: "to-review", rpc: { reviews_get: () => current } });
   await chooseOrganization(slot, "parsleyhealth");
   expect(slot.getByText("Agent needs your input")).toBeTruthy();
   const opener = slot.getByRole("button", { name: "Open conversation" });
@@ -1907,6 +1918,10 @@ it("opens review conversations using every queue item in the shared thread, incl
   fireEvent.click(within(panel).getByRole("button", { name: "2 PRs in shared conversation · 1 shown" }));
   expect(within(panel).getByRole("link", { name: "acme/app #703 · Review change 703" })).toBeTruthy();
   expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_review_shared");
+  current = { ...current, snapshot: { ...current.snapshot, items: [items[0]] } };
+  await slot.behavior.emitRealtime("board-changed", null);
+  await within(panel).findByRole("button", { name: "1 PR in conversation" });
+  expect(within(panel).queryByRole("link", { name: "acme/app #703 · Review change 703" })).toBeNull();
   fireEvent.click(within(panel).getByRole("button", { name: "Close conversation" }));
   expect(document.activeElement).toBe(opener);
 });
@@ -1923,4 +1938,19 @@ it("counts pending BB interactions once per agent thread across fixes and review
   });
   unmounts.push(() => slot.lifecycle.unmount());
   await slot.findByText("Across all organizations · 2 on you · 2 to review · 2 agents waiting");
+});
+
+it("shows a finished marker with pending input only in the asking group", async () => {
+  const slot = await mount({ board: state({
+    view: { ...view, prs: [row(2), row(3), row(10)] },
+    markers: [marker(2, { status: "done" }), marker(3, { status: "done" }), marker(10)],
+    needsInput: { thr_2: true },
+  }) });
+  fireEvent.click(slot.getByRole("radio", { name: "1 agent" }));
+  const asking = within(slot.getByRole("region", { name: "Finished, asking you" }));
+  const finished = within(slot.getByRole("region", { name: "PRs with finished threads" }));
+  expect(asking.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  expect(finished.queryByRole("button", { name: "Change 2" })).toBeNull();
+  expect(finished.getByRole("button", { name: "Change 3" })).toBeTruthy();
+  expect(slot.getAllByRole("button", { name: "Change 2" })).toHaveLength(1);
 });

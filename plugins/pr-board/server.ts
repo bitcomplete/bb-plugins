@@ -262,12 +262,16 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
       outputVersions.set(thread.id, new Date(thread.updatedAt).toISOString());
       changed();
     });
+    let reviewThreadIds = new Set<string>();
     const threadChanged = async ({ thread }: { thread: { id: string } }) => {
       if ((await readMarkers()).some((marker) => marker.threadId === thread.id)) changed();
     };
     bb.events.on("thread.active", threadChanged);
     bb.events.on("thread.failed", threadChanged);
-    bb.events.on("interaction.pending", () => changed());
+    bb.events.on("interaction.pending", async (event) => {
+      if (reviewThreadIds.has(event.thread.id)) changed();
+      else await threadChanged(event);
+    });
     let running: Promise<void> | null = null;
     async function read(): Promise<BoardState> {
       let markers = await readMarkers();
@@ -477,7 +481,8 @@ export function createPlugin(options: { runner?: Runner; github?: Github } = {})
       reviews_get: async () => {
         try {
           const snapshot = await reviewCall("prs_snapshot", prsSnapshotSchema);
-          return { kind: "available" as const, snapshot, needsInput: await pendingInput(snapshot.items.flatMap(({ item }) => item.threadId ? [item.threadId] : [])) };
+          reviewThreadIds = new Set(snapshot.items.flatMap(({ item }) => item.threadId ? [item.threadId] : []));
+          return { kind: "available" as const, snapshot, needsInput: await pendingInput([...reviewThreadIds]) };
         }
         catch (cause) { return { kind: "unavailable" as const, reason: cause instanceof Error ? cause.message : "Review Watch unavailable" }; }
       },

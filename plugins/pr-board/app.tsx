@@ -507,18 +507,11 @@ export function Board({ subPath }: { subPath?: string }) {
   const navigate = useBbNavigate();
   const [conversationThread, setConversationThread] = useState<string | null>(null);
   const conversationOpener = useRef<{ element: Element | null; url: string } | null>(null);
-  const conversationRoster = useRef<Parameters<typeof ConversationPanel>[0]["members"]>([]);
   const openConversation = (threadId: string) => {
     conversationOpener.current = {
       element: document.activeElement,
       url: window.location.href,
     };
-    conversationRoster.current = [
-      ...allPrs.flatMap((pr) => pr.marker?.threadId === threadId ? [pr.row] : []),
-      ...allReviewItems.flatMap((review) => review.item.threadId === threadId
-        ? [{ ...review.item, key: `${review.item.repo}#${review.item.number}` }]
-        : []),
-    ];
     setConversationThread(threadId);
   };
   useLayoutEffect(() => {
@@ -815,6 +808,7 @@ export function Board({ subPath }: { subPath?: string }) {
     hasAgentQuestion,
   );
   const askingKeys = new Set(asking.map((pr) => pr.row.key));
+  const finished = prs.filter((pr) => pr.marker?.status === "done" && !askingKeys.has(pr.row.key));
   const questionGroups = groupAgentQuestions(asking);
   const questionGroupByPr = new Map<string, AgentQuestionGroup>();
   for (const group of questionGroups)
@@ -865,6 +859,12 @@ export function Board({ subPath }: { subPath?: string }) {
       <ul>{members.map(renderRow)}</ul>
     </EffortGroup>
   );
+  const conversationMembers = [
+    ...allPrs.flatMap((pr) => pr.marker?.threadId === conversationThread ? [pr.row] : []),
+    ...allReviewItems.flatMap((review) => review.item.threadId === conversationThread
+      ? [{ ...review.item, key: `${review.item.repo}#${review.item.number}` }]
+      : []),
+  ];
   const shownConversationKeys = new Set([
     ...prs.map((pr) => pr.row.key),
     ...reviewItems.map((review) => `${review.item.repo}#${review.item.number}`),
@@ -1165,15 +1165,11 @@ export function Board({ subPath }: { subPath?: string }) {
                     </EffortGroup>
                     <EffortGroup
                       title="PRs with finished threads"
-                      count={
-                        prs.filter((pr) => pr.marker?.status === "done").length
-                      }
+                      count={finished.length}
                       tone="gray"
                     >
                       <ul>
-                        {prs
-                          .filter((pr) => pr.marker?.status === "done")
-                          .map(renderRow)}
+                        {finished.map(renderRow)}
                       </ul>
                     </EffortGroup>
                   </>
@@ -1341,7 +1337,7 @@ export function Board({ subPath }: { subPath?: string }) {
       {conversationThread ? (
         <ConversationPanel
           threadId={conversationThread}
-          members={conversationRoster.current}
+          members={conversationMembers}
           shownKeys={shownConversationKeys}
           onClose={() => setConversationThread(null)}
         />
