@@ -1388,6 +1388,10 @@ export type Escalation = {
   rationaleGiven: boolean;
   /** The cluster a repeat escalation belongs to, or null (BB-35 step 4). */
   clusterKey: string | null;
+  /** Why this reached the user instead of being decided, one or two sentences (BB-345). */
+  why: string | null;
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: string | null;
 };
 
 /**
@@ -1419,6 +1423,10 @@ export type Question = {
   rationaleGiven: boolean;
   /** The structured payload the question carries, for a page action to read (BB-328: a refresh id). */
   data: Record<string, unknown>;
+  /** Why this reached the user instead of being decided, one or two sentences (BB-345). */
+  why: string | null;
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: string | null;
 };
 
 /** The kinds of thing that can wait on the user, from the ticket's table. */
@@ -1452,6 +1460,10 @@ export type Need = {
   url: string;
   what: string;
   how: string | null;
+  /** Why this reached the user instead of being decided, one or two sentences (BB-345). */
+  why: string | null;
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: string | null;
   data: Record<string, unknown>;
   /** Who filed it: "plugin", "steward", "project" or "user". */
   filedBy: string;
@@ -1817,6 +1829,19 @@ export interface StoreOptions {
   log?: (message: string) => void;
 }
 
+/**
+ * Merge the optional `why`/`details` parts of a needs-you item into a row's
+ * `data` JSON (BB-345). They are additive and need no schema migration; an
+ * existing row without them reads as null.
+ */
+function withParts(data: Record<string, unknown> | undefined, why: string | null | undefined, details: string | null | undefined): Record<string, unknown> {
+  return {
+    ...(data ?? {}),
+    ...(why === undefined || why === null || why === "" ? {} : { why }),
+    ...(details === undefined || details === null || details === "" ? {} : { details }),
+  };
+}
+
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
   // BB-335: the non-actions live on the `assessments` row (BB-293). Join them
   // into every full binding read so a card, `bb stewards show` and the digest
@@ -2144,37 +2169,44 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
   const upsertProject = db.prepare("INSERT INTO project_stewards (project_id) VALUES (?) ON CONFLICT (project_id) DO NOTHING");
 
-  const toEscalation = (r: Record<string, unknown>): Escalation => ({
-    id: String(r.id),
-    bindingId: String(r.binding_id),
-    kind: String(r.kind) as EscalationKind,
-    question: String(r.question),
-    context: r.context === null || r.context === undefined ? null : String(r.context),
-    meanwhile: String(r.meanwhile),
-    route: String(r.route) as EscalationRoute,
-    recommendation: r.recommendation === null ? null : String(r.recommendation),
-    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
-    status: String(r.status) as "open" | "resolved",
-    resolution: r.resolution === null ? null : String(r.resolution),
-    createdAt: Number(r.created_at),
-    resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
-    deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
-    projectId: r.project_id === null || r.project_id === undefined ? null : String(r.project_id),
-    origin: json(escalationOriginSchema, r.origin === null || r.origin === undefined ? null : String(r.origin), { threadId: null, bindingId: null, chain: [] }),
-    resolutionKind: r.resolution_kind === null || r.resolution_kind === undefined ? null : (String(r.resolution_kind) as ResolutionKind),
-    url: r.url === null || r.url === undefined ? null : String(r.url),
-    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
-    answeredBy: r.answered_by === null || r.answered_by === undefined ? null : String(r.answered_by),
-    forwardedFrom: r.forwarded_from === null || r.forwarded_from === undefined ? null : String(r.forwarded_from),
-    headSha: r.head_sha === null || r.head_sha === undefined ? null : String(r.head_sha),
-    isQuestion: Number(r.is_question ?? 0) === 1,
-    citedLessons: json(z.array(z.string()), r.cited_lessons === null || r.cited_lessons === undefined ? null : String(r.cited_lessons), []),
-    correctionsCounted: Number(r.corrections_counted ?? 0) === 1,
-    rationaleWanted: r.rationale_wanted === null || r.rationale_wanted === undefined ? null : String(r.rationale_wanted),
-    rationaleAsked: Number(r.rationale_asked ?? 0) === 1,
-    rationaleGiven: Number(r.rationale_given ?? 0) === 1,
-    clusterKey: r.cluster_key === null || r.cluster_key === undefined ? null : String(r.cluster_key),
-  });
+  const toEscalation = (r: Record<string, unknown>): Escalation => {
+    // BB-345: `why` and `details` are optional and live in the `data` JSON, so
+    // no schema migration is needed and an older row without them reads as null.
+    const data = json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {});
+    return {
+      id: String(r.id),
+      bindingId: String(r.binding_id),
+      kind: String(r.kind) as EscalationKind,
+      question: String(r.question),
+      context: r.context === null || r.context === undefined ? null : String(r.context),
+      meanwhile: String(r.meanwhile),
+      route: String(r.route) as EscalationRoute,
+      recommendation: r.recommendation === null ? null : String(r.recommendation),
+      choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
+      status: String(r.status) as "open" | "resolved",
+      resolution: r.resolution === null ? null : String(r.resolution),
+      createdAt: Number(r.created_at),
+      resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
+      deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
+      projectId: r.project_id === null || r.project_id === undefined ? null : String(r.project_id),
+      origin: json(escalationOriginSchema, r.origin === null || r.origin === undefined ? null : String(r.origin), { threadId: null, bindingId: null, chain: [] }),
+      resolutionKind: r.resolution_kind === null || r.resolution_kind === undefined ? null : (String(r.resolution_kind) as ResolutionKind),
+      url: r.url === null || r.url === undefined ? null : String(r.url),
+      data,
+      answeredBy: r.answered_by === null || r.answered_by === undefined ? null : String(r.answered_by),
+      forwardedFrom: r.forwarded_from === null || r.forwarded_from === undefined ? null : String(r.forwarded_from),
+      headSha: r.head_sha === null || r.head_sha === undefined ? null : String(r.head_sha),
+      isQuestion: Number(r.is_question ?? 0) === 1,
+      citedLessons: json(z.array(z.string()), r.cited_lessons === null || r.cited_lessons === undefined ? null : String(r.cited_lessons), []),
+      correctionsCounted: Number(r.corrections_counted ?? 0) === 1,
+      rationaleWanted: r.rationale_wanted === null || r.rationale_wanted === undefined ? null : String(r.rationale_wanted),
+      rationaleAsked: Number(r.rationale_asked ?? 0) === 1,
+      rationaleGiven: Number(r.rationale_given ?? 0) === 1,
+      clusterKey: r.cluster_key === null || r.cluster_key === undefined ? null : String(r.cluster_key),
+      why: typeof data.why === "string" ? data.why : null,
+      details: typeof data.details === "string" ? data.details : null,
+    };
+  };
   const toQuestion = (r: Record<string, unknown>): Question => {
     const e = toEscalation(r);
     return {
@@ -2194,6 +2226,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
       rationaleAsked: e.rationaleAsked,
       rationaleGiven: e.rationaleGiven,
       data: e.data,
+      why: e.why,
+      details: e.details,
     };
   };
   const insertNeed = db.prepare(
@@ -2273,20 +2307,27 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const settleClusterRationaleStmt = db.prepare("UPDATE escalations SET rationale_given = 1, rationale_asked = 1 WHERE project_id = ? AND cluster_key = ?");
   const lessonsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND cluster_key = ? AND tier != 'retired' ORDER BY created_at");
 
-  const toNeed = (r: Record<string, unknown>): Need => ({
-    id: String(r.id),
-    bindingId: String(r.binding_id),
-    kind: String(r.kind) as NeedKind,
-    url: String(r.url ?? ""),
-    what: String(r.what),
-    how: r.how === null || r.how === undefined ? null : String(r.how),
-    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
-    filedBy: String(r.filed_by ?? "steward"),
-    status: String(r.status) as "open" | "done",
-    resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
-    createdAt: Number(r.created_at),
-    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
-  });
+  const toNeed = (r: Record<string, unknown>): Need => {
+    // BB-345: `why` and `details` are optional and live in the `data` JSON, so
+    // no schema migration is needed and an older row without them reads as null.
+    const data = json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {});
+    return {
+      id: String(r.id),
+      bindingId: String(r.binding_id),
+      kind: String(r.kind) as NeedKind,
+      url: String(r.url ?? ""),
+      what: String(r.what),
+      how: r.how === null || r.how === undefined ? null : String(r.how),
+      why: typeof data.why === "string" ? data.why : null,
+      details: typeof data.details === "string" ? data.details : null,
+      data,
+      filedBy: String(r.filed_by ?? "steward"),
+      status: String(r.status) as "open" | "done",
+      resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
+      createdAt: Number(r.created_at),
+      resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+    };
+  };
 
   const toAssumption = (r: Record<string, unknown>): Assumption => ({
     id: String(r.id),
@@ -2315,6 +2356,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     url: x.url ?? "",
     what: x.question,
     how: null,
+    why: x.why,
+    details: x.details,
     data: x.data,
     filedBy: "project",
     status: x.status === "open" ? "open" : "done",
@@ -2990,6 +3033,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
       data?: Record<string, unknown>;
       forwardedFrom?: string | null;
       headSha?: string | null;
+      why?: string | null;
+      details?: string | null;
     }): Escalation {
       const id = newId("esc");
       const origin: EscalationOrigin = fields.origin ?? { threadId: null, bindingId: fields.bindingId, chain: [] };
@@ -3013,7 +3058,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         chain: JSON.stringify(origin.chain),
         resolution_kind: fields.resolutionKind ?? null,
         url: fields.url ?? null,
-        data: JSON.stringify(fields.data ?? {}),
+        data: JSON.stringify(withParts(fields.data, fields.why, fields.details)),
         forwarded_from: fields.forwardedFrom ?? null,
         is_question: 0,
         context: fields.context === undefined || fields.context === null || fields.context === "" ? null : fields.context,
@@ -3115,7 +3160,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     ...createApprovalsStore(db, now),
 
     // questions to the user
-    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[]; resolutionKind?: ResolutionKind; url?: string | null; data?: Record<string, unknown> }): Question {
+    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[]; resolutionKind?: ResolutionKind; url?: string | null; data?: Record<string, unknown>; why?: string | null; details?: string | null }): Question {
       const id = newId("qst");
       insertQuestion.run({
         id,
@@ -3128,7 +3173,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         created_at: now(),
         resolution_kind: fields.resolutionKind ?? ((fields.choices ?? []).length > 0 ? "choice" : "text"),
         url: fields.url ?? null,
-        data: JSON.stringify(fields.data ?? {}),
+        data: JSON.stringify(withParts(fields.data, fields.why, fields.details)),
         origin: JSON.stringify({ threadId: null, bindingId: fields.bindingId, chain: [] }),
       });
       projectChanged(fields.projectId);
@@ -3276,16 +3321,16 @@ export function createStore(db: Database.Database, now: () => number, options: S
      * File a need, deduplicated by (binding, kind, url) while open: a steward
      * that re-reports one updates the wording rather than adding a row.
      */
-    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
+    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; why?: string | null; details?: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
       const projectId = projectIdForBinding(fields.bindingId);
       const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
       if (existing !== undefined) {
-        updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
+        updateNeed.run(fields.what, fields.how, JSON.stringify(withParts(fields.data, fields.why, fields.details)), existing.id);
         projectChanged(projectId);
         return toNeed(getNeed.get(String(existing.id))!);
       }
       const id = newId("need");
-      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
+      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(withParts(fields.data, fields.why, fields.details)), filed_by: fields.filedBy ?? "steward", created_at: now() });
       projectChanged(projectId);
       return toNeed(getNeed.get(id)!);
     },

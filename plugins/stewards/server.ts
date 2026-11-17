@@ -91,6 +91,7 @@ import {
   type RolesFile,
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
+import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, mergeNeedParts, ROUTINE_FORWARD_WHY } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -454,6 +455,16 @@ const questionViewSchema = z.object({
   id: z.string(),
   question: z.string(),
   context: z.string().nullable(),
+  /** Why this reached the user instead of being decided (BB-345). */
+  why: z.string().nullable(),
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: z.string().nullable(),
+  /** The escalation's meanwhile text, when the question forwards one (BB-345). */
+  meanwhile: z.string().nullable(),
+  /** The project steward's recommendation, when the question forwards one (BB-345). */
+  recommendation: z.string().nullable(),
+  /** A line naming the escalation the question forwards, for Details (BB-345). */
+  origin: z.string().nullable(),
   choices: z.array(z.string()),
   key: z.string().nullable(),
   url: z.string().nullable(),
@@ -473,6 +484,10 @@ const withUserViewSchema = z.object({
   /** The evidence and reasoning the escalation carries; the page shows it under the question. */
   context: z.string().nullable(),
   recommendation: z.string().nullable(),
+  /** Why this reached the user instead of being decided (BB-345). */
+  why: z.string().nullable(),
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: z.string().nullable(),
   key: z.string(),
   url: z.string().nullable(),
   threadId: z.string().nullable(),
@@ -513,9 +528,13 @@ const needViewSchema = z.object({
   destination: z.string().nullable(),
   threadId: z.string().nullable(),
   createdAt: z.number(),
-  /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
+  /** Whether the server can verify the preconditions now; when false, `notActionable` says what is missing. */
   actionable: z.boolean(),
+  notActionable: z.string().nullable(),
+  /** Why this reached the user instead of being decided (BB-345). */
   why: z.string().nullable(),
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: z.string().nullable(),
   /** The buttons this need offers, built once on the server (BB-122). */
   actions: z.array(needActionSchema),
   /** Whether the page offers Other… for a free-text answer (BB-122). */
@@ -5764,12 +5783,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const hasFix = alerts.length > 0 && alerts.some((a) => a.fixedVersion !== null);
       const allowDismiss = dismissAllowed(config);
       const due = dueDate(dueAt, config.file.nightly.timezone);
+      const severities = [...new Set(alerts.map((a) => a.severity))];
       return store.fileNeed({
         bindingId: b.id,
         kind: "decide",
         url: ticket?.url ?? ticketKey,
-        what: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
+        what: adoptionNeedLine(ticketKey, repo, severities),
         how: adoptionHow(allowDismiss),
+        why: ADOPTION_WHY,
+        details: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
         data: { adoption: true, ticket: ticketKey, fingerprints, choices: adoptionChoices(hasFix, allowDismiss), dueDate: due },
         filedBy: "plugin",
       });
@@ -8391,9 +8413,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // not in `assumptionIds`, so it stays open.
       const openById = new Map(store.openAssumptions(b.id).map((a) => [a.id, a]));
       const covered = assumptionIds.map((id) => openById.get(id)).filter((a): a is NonNullable<typeof a> => a !== undefined);
-      const how =
-        "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes." +
-        (covered.length === 0 ? "" : ` It covers ${covered.length} open assumption${covered.length === 1 ? "" : "s"}: ${covered.map((a) => `${a.id} — ${a.text}`).join("; ")}.`);
       // BB-249: a re-approval after an edit leads with a diff from the text the
       // last approval pinned. A prior approval with no `approvedText` (recorded
       // before the field existed) files the item as a first approval.
@@ -8409,12 +8428,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           : reapproval.changedLines === 0
             ? "Re-approve: no visible change"
             : `Re-approve: ${reapproval.changedLines} line${reapproval.changedLines === 1 ? "" : "s"} changed`;
+      const parts = approveSpecNeedParts({ what, covered: covered.map((a) => `${a.id} — ${a.text}`) });
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-spec",
         url: b.url ?? "",
-        what,
-        how,
+        what: parts.what,
+        how: parts.how,
+        why: parts.why,
+        details: parts.details,
         data: {
           specHash,
           ...(escalationId === null ? {} : { escalationId }),
@@ -8780,12 +8802,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // automatic multi-PR merge order.
               const existing = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
               const told = existing !== undefined && existing.data.workerTold === true && existing.data.sha === g.headSha;
+              const mergeParts = mergeNeedParts({ key: pull.key, lane: g.lane, note: "A parked worker owns another open pull request of this ticket, so the plugin does not merge out of order." });
               store.fileNeed({
                 bindingId: b.id,
                 kind: "merge",
                 url,
-                what: `Merge ${pull.key}`,
-                how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}, but a parked worker owns another open pull request of this ticket, so the plugin does not merge out of order. Merge squash-merges through the server's gh login and posts the merge comment.`,
+                what: mergeParts.what,
+                how: mergeParts.how,
+                why: mergeParts.why,
+                details: mergeParts.details,
                 data: { sha: g.headSha, workerTold: true },
                 filedBy: "plugin",
               });
@@ -8846,12 +8871,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 decline(b, "merge-refused", pull.key);
               }
             } else {
+              const mergeParts = mergeNeedParts({ key: pull.key, lane: g.lane });
               store.fileNeed({
                 bindingId: b.id,
                 kind: "merge",
                 url,
-                what: `Merge ${pull.key}`,
-                how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}. Merge squash-merges through the server's gh login and posts the merge comment.`,
+                what: mergeParts.what,
+                how: mergeParts.how,
+                why: mergeParts.why,
+                details: mergeParts.details,
                 data: { sha: g.headSha },
                 filedBy: "plugin",
               });
@@ -11962,7 +11990,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               kind: z.enum(NEEDS_KINDS).describe("approve-spec, approve-pr, merge, decide, provide-secret, or configure."),
               url: z.string().trim().max(500).optional().describe("The link: the entity, the pull request, the external page, or the worker thread."),
               what: z.string().trim().min(1).max(300).describe("One line saying what the user must do."),
-              how: z.string().trim().max(4000).optional().describe("The steps, in Markdown."),
+              how: z.string().trim().max(4000).optional().describe("The context lines, in Markdown: what the options mean and what happens on each."),
+              why: z.string().trim().max(600).optional().describe("Why this reached the user instead of being decided, one or two sentences. Optional; the plugin fills it for its own items."),
               variable: z.string().trim().max(200).optional().describe("provide-secret: the variable name."),
               purpose: z.string().trim().max(500).optional().describe("provide-secret: what the value is for."),
               worker: z.string().trim().max(200).optional().describe("provide-secret: the worker thread that will request it; its link is used when url is left out."),
@@ -11983,8 +12012,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               .trim()
               .min(1)
               .max(240, "The question is the one line the sidebar row shows; keep it to 240 characters and put the evidence and reasoning in `context`.")
-              .describe("The one-line ask, as the sidebar row shows it. Put the why in context."),
-            context: z.string().trim().max(3000).optional().describe("What the reader needs to decide: the evidence and the reasoning. Not shown in the sidebar row."),
+              .describe("The one-line ask, as the sidebar row shows it. It is read by whoever decides, possibly the owner, so write it for a person with no view of the thread. Put the evidence in context."),
+            context: z.string().trim().max(3000).optional().describe("What the reader needs to decide: the evidence and the reasoning, written for whoever decides, possibly the owner. Not shown in the sidebar row."),
+            why: z.string().trim().max(600).optional().describe("Why this reached the user instead of being decided, one or two sentences. Optional; the project steward fills it when forwarding."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
             choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
             distinctFrom: z
@@ -12291,7 +12321,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, why: input.escalate.why ?? null, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,
@@ -12409,6 +12439,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               url: n.url ?? n.worker ?? b.url ?? "",
               what: n.what,
               how: n.how ?? null,
+              why: n.why ?? null,
               data: {},
               filedBy: "steward",
             });
@@ -12528,7 +12559,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             approvalNotes.push(`Approval of the spec is requested from ${holder(specEscalation.route)} (${specEscalation.id}); wait for it, and do not escalate for it.`);
           }
           for (const need of approvePrNeeds) {
-            approvalNotes.push(`Approval of ${need.what.replace(/^Approve\s+/u, "").replace(/\s+on GitHub$/u, "")} is requested from the user, on the Stewards page (${need.id}): they approve on GitHub.`);
+            approvalNotes.push(`Approval of ${need.what.replace(/^Approve\s+/u, "").replace(/:\s.*$/u, "").replace(/\s+on GitHub$/u, "")} is requested from the user, on the Stewards page (${need.id}): they approve on GitHub.`);
           }
           for (const esc of approvalEscalations.filter((x) => x.resolutionKind === "approve-decline")) {
             if (approvePrNeeds.some((n) => n.data.escalationId === esc.id)) continue;
@@ -13107,8 +13138,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     projectId: target.projectId,
                     bindingId: target.id,
                     escalationId: forwarding.id,
-                    question: forwarding.question,
-                    context: [forwarding.context, `A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                    ...forwardedQuestionParts({ question: forwarding.question, context: forwarding.context, why: forwardWhy(input.entry ?? null) }),
                     ...(forwarding.choices.length === 0 ? {} : { choices: forwarding.choices }),
                     resolutionKind,
                     ...(input.url === undefined ? {} : { url: input.url }),
@@ -13281,9 +13311,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; specDiff: string | null; specChangedLines: number | null; specCommentUrl: string | null; specFullText: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null; actions: NeedAction[]; freeText: boolean } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; why: string | null; details: string | null; specDiff: string | null; specChangedLines: number | null; specCommentUrl: string | null; specFullText: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; notActionable: string | null; actions: NeedAction[]; freeText: boolean } {
       let actionable = true;
-      let why: string | null = null;
+      let notActionable: string | null = null;
       let threadId: string | null = null;
       if (n.kind === "approve-pr" || n.kind === "merge") {
         const observed = b.lastSnapshot;
@@ -13291,14 +13321,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const gate = target === null ? null : assessedGate(store, b, target, now());
         if (n.kind === "approve-pr") {
           actionable = gate?.needsOwnerApproval ?? false;
-          why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
+          notActionable = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
         } else {
           // BB-175: only a running turn can race a push; a `finished` worker
           // is a pause, and a steward-filed merge item exists because it
           // could not merge, so it must not keep the item not actionable.
           const busy = assessWorker(store.workers(b.id)).reason;
           actionable = (gate?.gateMet ?? false) && busy === null;
-          why = actionable ? null : busy ?? (gate?.missing ?? "the pull request has not been observed yet");
+          notActionable = actionable ? null : busy ?? (gate?.missing ?? "the pull request has not been observed yet");
         }
       } else if (n.kind === "provide-secret") {
         // Always actionable: the page opens a requester thread and the form
@@ -13306,7 +13336,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
       const { actions, freeText } = needActions(n, b);
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, specDiff: typeof n.data.specDiff === "string" ? n.data.specDiff : null, specChangedLines: typeof n.data.specChangedLines === "number" ? n.data.specChangedLines : null, specCommentUrl: typeof n.data.specCommentUrl === "string" ? n.data.specCommentUrl : null, specFullText: typeof n.data.specFullText === "string" ? n.data.specFullText : null, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why, actions, freeText };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, why: n.why, details: n.details, specDiff: typeof n.data.specDiff === "string" ? n.data.specDiff : null, specChangedLines: typeof n.data.specChangedLines === "number" ? n.data.specChangedLines : null, specCommentUrl: typeof n.data.specCommentUrl === "string" ? n.data.specCommentUrl : null, specFullText: typeof n.data.specFullText === "string" ? n.data.specFullText : null, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, notActionable, actions, freeText };
     }
 
     /**
@@ -13329,7 +13359,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const flipped = needs.some((n) => {
         const before = needView(n, b);
         const next = needView(n, after);
-        return before.actionable !== next.actionable || before.why !== next.why;
+        return before.actionable !== next.actionable || before.notActionable !== next.notActionable;
       });
       if (flipped) store.signal(b.projectId, ["last_snapshot"]);
     }
@@ -13435,13 +13465,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function questionView(q: Question) {
       const b = q.bindingId === null ? null : store.binding(q.bindingId);
       const { actions, freeText } = questionActions(q);
-      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted, actions, freeText };
+      // BB-345: the escalation a question forwards holds the meanwhile, the
+      // project steward's recommendation and the origin the old forwarding
+      // glue concatenated; the page places them under their labels or in
+      // Details. `why` and `details` are the question's own optional fields.
+      const parent = q.escalationId === null ? null : store.escalation(q.escalationId);
+      const parentBinding = parent === null ? null : store.binding(parent.bindingId);
+      const origin = parent === null ? null : `A ${parent.kind} escalation from ${parentBinding?.entityKey ?? parent.bindingId}${parentBinding?.title === null || parentBinding?.title === undefined ? "" : ` (${parentBinding.title})`}.`;
+      return { id: q.id, question: q.question, context: q.context, why: q.why, details: q.details, meanwhile: parent?.meanwhile ?? null, recommendation: parent?.recommendation ?? null, origin, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted, actions, freeText };
     }
 
     /** The board's with-user row; the sidebar reuses it, tagged. */
     function withUserView(x: Escalation, b: Binding) {
       const { actions, freeText } = withUserActions();
-      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
+      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, why: x.why ?? ROUTINE_FORWARD_WHY, details: x.details, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
     }
 
     /**
@@ -13517,9 +13554,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-335: the binding's recorded non-actions, newest day first. Information only: they never become a need, a button or a count.
       for (const n of sortedNonActions(b.nonActions)) lines.push(`Non-action ${n.date}: ${n.text}`);
       for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
-      for (const x of store.escalations(b.id)) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+      const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
+      const shownParts = (context: string | null, why: string | null): string[] => [...(context === null || context === "" ? [] : [`  Context: ${oneLine(context)}`]), ...(why === null || why === "" ? [] : [`  Why you: ${oneLine(why)}`])];
+      for (const x of store.escalations(b.id)) {
+        lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+        lines.push(...shownParts(x.context, x.why));
+      }
       for (const a of store.assumptions(b.id)) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
-      for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
+      for (const n of store.needs(b.id, true)) {
+        lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
+        lines.push(...shownParts(n.how, n.why));
+      }
       for (const w of store.workers(b.id)) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
       for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.filedByThread === null || f.filedByThread === undefined ? "" : `, filed by ${f.filedByThread}`}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
       if (b.kind === "ops") {
@@ -14795,7 +14840,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                       // it cannot be acted on now (BB-283).
                       if (n.status === "done") return `${head}${n.resolution === null ? "" : ` → ${n.resolution}`}`;
                       const view = b === null ? null : needView(n, b);
-                      return `${head}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
+                      return `${head}${view !== null && !view.actionable ? ` [not actionable: ${view.notActionable}]` : ""}`;
                     })
                     .join("\n"),
                 };
@@ -14810,10 +14855,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (questions.length + withUser.length + needs.length === 0) return { exitCode: 0, stdout: "Nothing is waiting on the user." };
               const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
               const done = (id: string, choices: readonly string[]) => `bb stewards done ${id}${choices.length === 0 ? "" : ` --choice "<label>"`}`;
+              const parts = (context: string | null, why: string | null): string[] => [...(context === null ? [] : [`  Context: ${oneLine(context)}`]), ...(why === null ? [] : [`  Why you: ${oneLine(why)}`])];
               const lines = [
-                ...questions.map((q) => `${q.id} — question, ${q.key ?? "project"}: ${oneLine(q.question)}${choicesNote(q.choices)} — ${done(q.id, q.choices)}`),
-                ...withUser.map((x) => `${x.id} — ${x.kind} escalation, ${x.key}: ${oneLine(x.question)} — ${done(x.id, [])}`),
-                ...needs.map((n) => `${n.id} — ${n.kind}, ${n.key}: ${oneLine(n.what)}${choicesNote(n.choices)}${n.url === null ? "" : ` (${n.url})`}${n.actionable ? "" : ` [not actionable: ${n.why ?? "unknown"}]`} — ${done(n.id, n.choices)}`),
+                ...questions.flatMap((q) => [`${q.id} — question, ${q.key ?? "project"}: ${oneLine(q.question)}${choicesNote(q.choices)} — ${done(q.id, q.choices)}`, ...parts(q.context, q.why)]),
+                ...withUser.flatMap((x) => [`${x.id} — ${x.kind} escalation, ${x.key}: ${oneLine(x.question)} — ${done(x.id, [])}`, ...parts(x.context, x.why)]),
+                ...needs.flatMap((n) => [
+                  `${n.id} — ${n.kind}, ${n.key}: ${oneLine(n.what)}${choicesNote(n.choices)}${n.url === null ? "" : ` (${n.url})`}${n.actionable ? "" : ` [not actionable: ${n.notActionable ?? "unknown"}]`} — ${done(n.id, n.choices)}`,
+                  ...(n.how === null ? [] : [`  Context: ${oneLine(n.how)}`]),
+                  ...(n.why === null ? [] : [`  Why you: ${oneLine(n.why)}`]),
+                ]),
               ];
               return { exitCode: 0, stdout: lines.join("\n") };
             },
