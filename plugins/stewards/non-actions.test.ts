@@ -422,6 +422,23 @@ describe("the declining branches record their reason (BB-335)", () => {
     written(t, b, "needs-decline-closed");
   });
 
+  it("wait-slack-unsent: an Ask on Slack that sent nothing", async () => {
+    const t = await setup();
+    const b = create(t);
+    const need = t.hooks.store.fileNeed({
+      bindingId: b.id,
+      kind: "decide",
+      url: "acme/web#9",
+      what: "The review wait is overdue.",
+      how: "Choose.",
+      data: { waitBudget: true, choices: ["Review it yourself", "Reassign", "Keep waiting", "Ask on Slack"], waitKind: "review", waitRef: "acme/web#9", waitSlackCandidates: ["arashout"] },
+      filedBy: "plugin",
+    });
+    const out = await t.harness.behavior.runCli(["wait-slack-refused", need.id, "--candidates", "arashout"]);
+    expect(out.exitCode).toBe(0);
+    written(t, b, "wait-slack-unsent");
+  });
+
   it("covers every code in the closed table", () => {
     // The table and the branch tests cannot drift: every code has a test above,
     // and no test names a code the table does not have.
@@ -429,7 +446,7 @@ describe("the declining branches record their reason (BB-335)", () => {
       "config-unreadable", "project-disabled", "no-playbook", "entity-unreadable", "entity-gone", "stay-ended", "other-binding-open",
       "ending-in-progress", "follow-through-ran-out", "nothing-to-do", "deferred", "worker-busy", "pull-foreign-owner", "pull-closed",
       "merge-held", "retarget-needed", "merge-steward-filed", "worker-running", "merge-paused", "parked-owns-another", "base-not-default",
-      "merge-refused", "head-moved", "gate-not-met", "binding-ended-closed", "needs-decline-closed",
+      "merge-refused", "head-moved", "gate-not-met", "binding-ended-closed", "needs-decline-closed", "wait-slack-unsent",
     ];
     expect([...tested].sort()).toEqual([...NON_ACTION_CODES].sort());
   });
