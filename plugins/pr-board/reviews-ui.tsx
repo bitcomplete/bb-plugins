@@ -1,6 +1,17 @@
 import { useEffect, useState, type ReactNode } from "react";
+import {
+  Checkbox,
+  CheckboxGroup,
+  CheckboxIndicator,
+} from "@ui-sdk/react/checkbox";
+import {
+  Collapsible,
+  CollapsiblePanel,
+  CollapsibleTrigger,
+} from "@ui-sdk/react/collapsible";
 import { UrlLink, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import type { AgentModelChoice } from "./agent-model";
 import {
   estimatedMinutes,
   quickRead,
@@ -47,10 +58,12 @@ type ProjectLoad =
   | { kind: "ready"; targets: ReviewTargets };
 function ReviewProjectPicker({
   keys,
+  agentModel,
   onClose,
   onStarted,
 }: {
   keys: string[];
+  agentModel: AgentModelChoice | null;
   onClose: () => void;
   onStarted: () => void;
 }) {
@@ -78,7 +91,7 @@ function ReviewProjectPicker({
     };
   }, [rpc, keys]);
   const start = async () => {
-    if (!project || busy) return;
+    if (!project || busy || !agentModel) return;
     setBusy(true);
     setError(null);
     try {
@@ -87,9 +100,17 @@ function ReviewProjectPicker({
       const result =
         keys.length === 1
           ? await rpc
-              .call("reviews_start", { key: first, projectId: project })
+              .call("reviews_start", {
+                key: first,
+                projectId: project,
+                agentModel,
+              })
               .then(({ item }) => ({ threadId: item.threadId }))
-          : await rpc.call("reviews_batch", { keys, projectId: project });
+          : await rpc.call("reviews_batch", {
+              keys,
+              projectId: project,
+              agentModel,
+            });
       if (!result.threadId)
         throw new Error(
           "The review started without a thread link. Refresh before retrying.",
@@ -113,67 +134,75 @@ function ReviewProjectPicker({
       busy={busy}
       onClose={onClose}
     >
-      {load.kind === "loading" ? (
-        <p role="status">Loading projects…</p>
-      ) : load.kind === "error" ? (
-        <p role="alert">{load.message}</p>
-      ) : (
+      {(close) => (
         <>
-          <label className="calm-field">
-            Project
-            <select
-              value={project}
-              disabled={busy}
-              onChange={(event) => setProject(event.target.value)}
+          {load.kind === "loading" ? (
+            <p role="status">Loading projects…</p>
+          ) : load.kind === "error" ? (
+            <p role="alert">{load.message}</p>
+          ) : (
+            <>
+              <label className="calm-field">
+                Project
+                <select
+                  value={project}
+                  disabled={busy}
+                  onChange={(event) => setProject(event.target.value)}
+                >
+                  <option value="" disabled>
+                    Choose a project
+                  </option>
+                  {load.targets.projects.map((candidate) => (
+                    <option key={candidate.id} value={candidate.id}>
+                      {candidate.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="calm-muted">
+                {load.targets.projects.length === 0
+                  ? "Add a project checkout in BB to start reviews."
+                  : load.targets.reason === "mixed"
+                    ? "These PRs map to different projects. Choose one for this batch."
+                    : load.targets.reason === "organization"
+                      ? "Preselected from your organization mappings."
+                      : load.targets.reason === "default"
+                        ? "Preselected from your default review project."
+                        : "Choose a project for this review."}
+              </p>
+            </>
+          )}
+          {error ? (
+            <p role="alert" className="text-red">
+              {error}
+            </p>
+          ) : null}
+          <div className="calm-dialog-actions">
+            <CalmButton disabled={busy} onClick={close}>
+              Cancel
+            </CalmButton>
+            <CalmButton
+              disabled={
+                !project || load.kind !== "ready" || busy || !agentModel
+              }
+              onClick={() => void start()}
             >
-              <option value="" disabled>
-                Choose a project
-              </option>
-              {load.targets.projects.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="calm-muted">
-            {load.targets.projects.length === 0
-              ? "Add a project checkout in BB to start reviews."
-              : load.targets.reason === "mixed"
-                ? "These PRs map to different projects. Choose one for this batch."
-                : load.targets.reason === "organization"
-                  ? "Preselected from your organization mappings."
-                  : load.targets.reason === "default"
-                    ? "Preselected from your default review project."
-                    : "Choose a project for this review."}
-          </p>
+              {busy ? "Starting…" : "Start review"}
+            </CalmButton>
+          </div>
         </>
       )}
-      {error ? (
-        <p role="alert" className="text-red">
-          {error}
-        </p>
-      ) : null}
-      <div className="calm-dialog-actions">
-        <CalmButton disabled={busy} onClick={onClose}>
-          Cancel
-        </CalmButton>
-        <CalmButton
-          disabled={!project || load.kind !== "ready" || busy}
-          onClick={() => void start()}
-        >
-          {busy ? "Starting…" : "Start review"}
-        </CalmButton>
-      </div>
     </CalmDialog>
   );
 }
 function ReviewContext({
   review,
   start,
+  startDisabled,
 }: {
   review: PrsReview;
   start: () => void;
+  startDisabled: boolean;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [detail, setDetail] = useState<PrsReview | null>(null);
@@ -299,7 +328,7 @@ function ReviewContext({
             Open thread
           </CalmButton>
         ) : detail.item.state === "queued" ? (
-          <CalmButton onClick={start}>
+          <CalmButton disabled={startDisabled} onClick={start}>
             <span aria-hidden>▸</span>{" "}
             {detail.item.rule === "review-followup"
               ? "Re-review"
@@ -325,21 +354,19 @@ function ReviewRow({
   review,
   expanded,
   onExpand,
-  selected,
-  select,
   start,
   dismiss,
   busy,
+  startDisabled,
   unblocks,
 }: {
   review: PrsReview;
   expanded: boolean;
   onExpand: () => void;
-  selected: boolean;
-  select: () => void;
   start: () => void;
   dismiss: () => void;
   busy: boolean;
+  startDisabled: boolean;
   unblocks: CalmRow[];
 }) {
   const navigate = useBbNavigate();
@@ -353,7 +380,12 @@ function ReviewRow({
     !review.item.threadId;
   const lines = reviewLines(review);
   return (
-    <li
+    <Collapsible
+      data-prs-agent-local=""
+      render={<li />}
+      open={expanded}
+      onOpenChange={onExpand}
+      aria-label={`Review context for ${review.item.title} #${review.item.number}`}
       className={`calm-pr${expanded ? " expanded" : ""}`}
       data-review-key={review.item.key}
     >
@@ -361,26 +393,24 @@ function ReviewRow({
         <span className="calm-dot-column">
           <SizeDot lines={lines} tone={reviewTone(review)} />
           {selectable ? (
-            <input
-              type="checkbox"
+            <Checkbox
+              data-prs-agent-local=""
               className="calm-row-checkbox"
+              value={review.item.key}
               aria-label={`Select ${review.item.title} #${review.item.number}`}
-              checked={selected}
-              onChange={select}
-            />
+            >
+              <CheckboxIndicator aria-hidden>✓</CheckboxIndicator>
+            </Checkbox>
           ) : null}
         </span>
         <div className="calm-row-content">
           <div className="calm-row-line">
-            <button
-              type="button"
+            <CollapsibleTrigger
               className="calm-title"
-              aria-expanded={expanded}
-              onClick={onExpand}
               title={`${lines === null ? "size unknown" : `${compactLines(lines)} lines`} · #${review.item.number}`}
             >
               {review.item.title}
-            </button>
+            </CollapsibleTrigger>
             <UrlLink
               className="calm-pr-number"
               href={review.item.url}
@@ -404,7 +434,7 @@ function ReviewRow({
                   Open thread
                 </CalmButton>
               ) : selectable ? (
-                <CalmButton disabled={busy} onClick={start}>
+                <CalmButton disabled={busy || startDisabled} onClick={start}>
                   <span aria-hidden>▸</span>{" "}
                   {quickRead(review) ? "Start" : "Draft"}
                 </CalmButton>
@@ -435,12 +465,19 @@ function ReviewRow({
           ) : null}
         </div>
       </div>
-      {expanded ? <ReviewContext review={review} start={start} /> : null}
-    </li>
+      <CollapsiblePanel>
+        <ReviewContext
+          review={review}
+          start={start}
+          startDisabled={busy || startDisabled}
+        />
+      </CollapsiblePanel>
+    </Collapsible>
   );
 }
 export function ReviewsView({
   items,
+  agentModel,
   segment,
   expanded,
   setExpanded,
@@ -450,6 +487,7 @@ export function ReviewsView({
   refetch,
 }: {
   items: PrsReview[];
+  agentModel: AgentModelChoice | null;
   segment: ReviewSegment;
   expanded: string | null;
   setExpanded: (key: string | null) => void;
@@ -460,7 +498,7 @@ export function ReviewsView({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
-  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [picked, setPicked] = useState<string[]>([]);
   const [lastOpened, setLastOpened] = useState<string | null>(null);
   const [startKeys, setStartKeys] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -471,7 +509,9 @@ export function ReviewsView({
       review.segment === "on-you" &&
       !review.item.threadId,
   );
-  const selection = selectable.filter((review) => picked.has(review.item.key));
+  const selection = selectable.filter((review) =>
+    picked.includes(review.item.key),
+  );
   const shown = items.filter((review) => review.segment === segment);
   const quick = shown.filter(quickRead),
     long = shown.filter((review) => !quickRead(review));
@@ -504,18 +544,10 @@ export function ReviewsView({
       onExpand={() =>
         setExpanded(expanded === review.item.key ? null : review.item.key)
       }
-      selected={picked.has(review.item.key)}
-      select={() =>
-        setPicked((current) => {
-          const next = new Set(current);
-          if (next.has(review.item.key)) next.delete(review.item.key);
-          else next.add(review.item.key);
-          return next;
-        })
-      }
       start={() => setStartKeys([review.item.key])}
       dismiss={() => void dismiss(review)}
       busy={busy}
+      startDisabled={!agentModel}
       unblocks={mine.filter((row) =>
         row.gate_links.some(
           (gate) =>
@@ -538,7 +570,12 @@ export function ReviewsView({
     (review) => review.item.state === "queued" && !review.item.threadId,
   );
   return (
-    <>
+    <CheckboxGroup
+      data-prs-agent-local=""
+      aria-label="Select pull requests to review"
+      value={picked}
+      onValueChange={setPicked}
+    >
       <SizeLegend
         caption={
           segment === "agent"
@@ -573,7 +610,7 @@ export function ReviewsView({
             action={
               draftLong.length ? (
                 <CalmButton
-                  disabled={busy}
+                  disabled={busy || !agentModel}
                   onClick={() =>
                     setStartKeys(draftLong.map((review) => review.item.key))
                   }
@@ -633,9 +670,9 @@ export function ReviewsView({
           aria-label="Review selected pull requests"
         >
           <span>{selection.length} selected</span>
-          <CalmButton onClick={() => setPicked(new Set())}>Clear</CalmButton>
+          <CalmButton onClick={() => setPicked([])}>Clear</CalmButton>
           <CalmButton
-            disabled={busy}
+            disabled={busy || !agentModel}
             onClick={() =>
               setStartKeys(selection.map((review) => review.item.key))
             }
@@ -647,14 +684,17 @@ export function ReviewsView({
       {startKeys ? (
         <ReviewProjectPicker
           keys={startKeys}
+          agentModel={agentModel}
           onClose={() => setStartKeys(null)}
           onStarted={() => {
             setStartKeys(null);
-            setPicked(new Set());
+            setPicked((current) =>
+              current.filter((key) => !startKeys.includes(key)),
+            );
             refetch();
           }}
         />
       ) : null}
-    </>
+    </CheckboxGroup>
   );
 }

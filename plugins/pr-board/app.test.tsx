@@ -1,12 +1,52 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { createAgent } from "@ui-sdk/react/agent";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { BoardState, CalmRow, MarkerView, ViewModel } from "./board";
 import type { PrsReview, ReviewsState } from "./reviews";
 import { Board, prsBadge } from "./app";
 import { minePrs, sizeDiameter } from "./board-ui";
 import { z } from "zod";
+import {
+  agentModelSchema,
+  DEFAULT_AGENT_MODEL,
+  type AgentModelChoice,
+} from "./agent-model";
+import type { rpcContract } from "./server";
+
+declare global {
+  var __UI_SDK_STRICT__: boolean | undefined;
+}
+globalThis.__UI_SDK_STRICT__ = true;
+const uiAgent = createAgent();
+function modelContext(
+  choice: AgentModelChoice,
+): z.infer<typeof rpcContract.agent_model_get.output> {
+  return { choice, routing: { kind: "host", hostId: "prs-project-host" } };
+}
+
+// jsdom doesn't implement the browser top layer or layout used by UI SDK.
+HTMLElement.prototype.showPopover = function () {};
+HTMLElement.prototype.hidePopover = function () {};
+Element.prototype.getAnimations = () => [];
+Element.prototype.scrollIntoView = function () {};
+Element.prototype.checkVisibility = () => true;
+Element.prototype.getClientRects = () =>
+  Object.assign([], { item: () => null });
+document.elementFromPoint = () => null;
+document.elementsFromPoint = () => [];
+globalThis.ResizeObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+document.head.append(
+  Object.assign(document.createElement("style"), {
+    textContent: "[popover] { display: block !important }",
+  }),
+);
 
 const repo = "parsleyhealth/parsley-monorepo";
 const key = (number: number) => `${repo}#${number}`;
@@ -177,6 +217,7 @@ const unmounts: (() => void)[] = [];
 afterEach(() => {
   for (const unmount of unmounts.splice(0)) unmount();
   sessionStorage.clear();
+  localStorage.clear();
   vi.restoreAllMocks();
 });
 async function mount(
@@ -186,6 +227,7 @@ async function mount(
     path?: string;
     rpc?: Record<string, (input: unknown) => unknown>;
     openUrl?: (url: string) => boolean;
+    waitFor?: string | false;
   } = {},
 ) {
   const app = await loadPluginApp(() => import("./app"));
@@ -196,6 +238,8 @@ async function mount(
     { subPath: options.path ?? "" },
     {
       rpc: {
+        agent_model_get: () => modelContext(DEFAULT_AGENT_MODEL),
+        agent_model_set: (input) => agentModelSchema.parse(input),
         board_get: () => options.board ?? state(),
         board_refresh: () => options.board ?? state(),
         reviews_get: () => options.reviews ?? reviews(),
@@ -247,9 +291,13 @@ async function mount(
     },
   );
   unmounts.push(() => slot.lifecycle.unmount());
-  await slot.findByText(
-    options.path?.startsWith("to-review") ? "Review change 701" : "Change 2",
-  );
+  if (options.waitFor !== false)
+    await slot.findByText(
+      options.waitFor ??
+        (options.path?.startsWith("to-review")
+          ? "Review change 701"
+          : "Change 2"),
+    );
   return slot;
 }
 const calls = (slot: Awaited<ReturnType<typeof mount>>, method: string) =>
@@ -261,6 +309,330 @@ function mineRow(slot: Awaited<ReturnType<typeof mount>>, title: string) {
   if (!item) throw new Error("Missing PR row");
   return within(item);
 }
+function modelInput(slot: Awaited<ReturnType<typeof mount>>, name: string) {
+  const input = slot.getByLabelText(name);
+  if (!(input instanceof HTMLInputElement))
+    throw new Error("Missing model picker input");
+  return input;
+}
+const acmeRow = row(20, {
+  repo: "acme/app",
+  key: "acme/app#20",
+  url: "https://github.com/acme/app/pull/20",
+});
+const acmeReview = review(703, {
+  item: {
+    ...review(703).item,
+    repo: "acme/app",
+    url: "https://github.com/acme/app/pull/703",
+  },
+});
+async function chooseOrganization(
+  slot: Awaited<ReturnType<typeof mount>>,
+  name: string,
+) {
+  const user = userEvent.setup();
+  await user.click(slot.getByRole("combobox", { name: "Organization" }));
+  await user.click(await slot.findByRole("option", { name }));
+}
+
+it("filters both tabs, counters, and unit bars using owners from both complete queues", async () => {
+  const slot = await mount({
+    board: state({ view: { ...view, prs: [row(2), acmeRow] }, markers: [] }),
+    reviews: reviews([reviewA, acmeReview]),
+  });
+  await chooseOrganization(slot, "acme");
+  expect(slot.getByRole("tab", { name: "Mine 1" })).toBeTruthy();
+  expect(slot.getByRole("tab", { name: "To review 1" })).toBeTruthy();
+  expect(slot.getByRole("radio", { name: "1 on you" })).toBeTruthy();
+  expect(
+    slot
+      .getByLabelText("1 pull requests by status")
+      .querySelectorAll(".calm-unit-cell"),
+  ).toHaveLength(1);
+  expect(slot.queryByRole("button", { name: "Change 2" })).toBeNull();
+  expect(slot.getByRole("button", { name: "Change 20" })).toBeTruthy();
+  fireEvent.click(slot.getByRole("tab", { name: "To review 1" }));
+  expect(slot.getByRole("button", { name: "Review change 703" })).toBeTruthy();
+  expect(slot.queryByRole("button", { name: "Review change 701" })).toBeNull();
+  expect(slot.getByRole("radio", { name: "1 on you" })).toBeTruthy();
+  await chooseOrganization(slot, "All organizations");
+  expect(slot.getByRole("tab", { name: "Mine 2" })).toBeTruthy();
+  expect(slot.getByRole("button", { name: "Review change 701" })).toBeTruthy();
+  expect(calls(slot, "board_refresh")).toEqual([]);
+  expect(calls(slot, "reviews_refresh")).toEqual([]);
+});
+it("clears both selections when the organization changes and starts only visible bulk rows", async () => {
+  const slot = await mount({
+    board: state({ view: { ...view, prs: [row(2), acmeRow] }, markers: [] }),
+    reviews: reviews([reviewA, acmeReview]),
+  });
+  fireEvent.click(slot.getByRole("checkbox", { name: "Select Change 2 #2" }));
+  expect(
+    slot.getByRole("group", { name: "Start selected agents" }),
+  ).toBeTruthy();
+  await chooseOrganization(slot, "acme");
+  expect(
+    slot.queryByRole("group", { name: "Start selected agents" }),
+  ).toBeNull();
+  fireEvent.click(slot.getByRole("button", { name: "Start 1" }));
+  await waitFor(() =>
+    expect(calls(slot, "start")).toEqual([
+      {
+        items: [{ key: acmeRow.key, action: "fix-ci" }],
+        stop: "publish",
+        agentModel: DEFAULT_AGENT_MODEL,
+      },
+    ]),
+  );
+  fireEvent.click(slot.getByRole("tab", { name: /To review/ }));
+  fireEvent.click(
+    slot.getByRole("checkbox", { name: "Select Review change 703 #703" }),
+  );
+  expect(
+    slot.getByRole("group", { name: "Review selected pull requests" }),
+  ).toBeTruthy();
+  await chooseOrganization(slot, "parsleyhealth");
+  expect(
+    slot.queryByRole("group", { name: "Review selected pull requests" }),
+  ).toBeNull();
+  fireEvent.click(
+    slot.getByRole("checkbox", { name: "Select Review change 701 #701" }),
+  );
+  fireEvent.click(slot.getByRole("button", { name: "Review 1" }));
+  const dialog = within(await slot.findByRole("dialog"));
+  await dialog.findByText("Preselected from your organization mappings.");
+  fireEvent.click(dialog.getByRole("button", { name: "Start review" }));
+  await waitFor(() =>
+    expect(calls(slot, "reviews_start")).toEqual([
+      {
+        key: reviewA.item.key,
+        projectId: "p1",
+        agentModel: DEFAULT_AGENT_MODEL,
+      },
+    ]),
+  );
+});
+it("keeps the organization pinned across healthy empty queues and remounts, and validates stored preferences", async () => {
+  const settings = {
+    board: state({ view: { ...view, prs: [row(2), acmeRow] }, markers: [] }),
+    reviews: {
+      kind: "available",
+      snapshot: {
+        version: 1,
+        items: [reviewA, acmeReview],
+        lastSuccessAt: ago(3),
+        lastPoll: { at: ago(1), ok: true, added: 0, total: 2 },
+      },
+    } satisfies ReviewsState,
+  };
+  const slot = await mount(settings);
+  await chooseOrganization(slot, "acme");
+  expect(localStorage.getItem("test-plugin:calm-organization")).toBe('"acme"');
+  slot.lifecycle.unmount();
+  const restored = await mount({ ...settings, waitFor: "Change 20" });
+  expect(
+    restored.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("acme");
+  expect(restored.queryByRole("button", { name: "Change 2" })).toBeNull();
+  restored.lifecycle.unmount();
+  const emptySettings = {
+    board: state({ view: { ...view, prs: [row(2)] }, markers: [] }),
+    reviews: {
+      ...settings.reviews,
+      snapshot: { ...settings.reviews.snapshot, items: [reviewA] },
+    },
+  };
+  const empty = await mount({ ...emptySettings, waitFor: false });
+  await empty.findByText("acme (no pull requests)");
+  expect(empty.getByRole("tab", { name: "Mine 0" })).toBeTruthy();
+  expect(empty.getByRole("tab", { name: "To review 0" })).toBeTruthy();
+  expect(empty.queryByRole("button", { name: "Change 2" })).toBeNull();
+  expect(localStorage.getItem("test-plugin:calm-organization")).toBe('"acme"');
+  empty.lifecycle.unmount();
+  const pinned = await mount({ ...emptySettings, waitFor: false });
+  await pinned.findByText("acme (no pull requests)");
+  expect(localStorage.getItem("test-plugin:calm-organization")).toBe('"acme"');
+  await chooseOrganization(pinned, "All organizations");
+  expect(pinned.getByRole("tab", { name: "Mine 1" })).toBeTruthy();
+  expect(pinned.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  pinned.lifecycle.unmount();
+  localStorage.setItem("test-plugin:calm-organization", '{"invalid":true}');
+  const invalid = await mount(settings);
+  expect(
+    invalid.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("All organizations");
+});
+it.each([
+  {
+    name: "a failed first review poll",
+    board: {},
+    lastSuccessAt: null,
+    lastPoll: {
+      at: ago(1),
+      ok: false,
+      added: 0,
+      total: 0,
+      error: "GitHub unavailable",
+    },
+  },
+  {
+    name: "a failed review refresh after success",
+    board: {},
+    lastSuccessAt: ago(3),
+    lastPoll: {
+      at: ago(1),
+      ok: false,
+      added: 0,
+      total: 0,
+      error: "GitHub unavailable",
+    },
+  },
+  {
+    name: "reviews without a completed poll",
+    board: {},
+    lastSuccessAt: ago(3),
+    lastPoll: null,
+  },
+  {
+    name: "a failed Mine refresh with cached rows",
+    board: { lastError: "GitHub unavailable" },
+    lastSuccessAt: ago(3),
+    lastPoll: { at: ago(1), ok: true, added: 0, total: 0 },
+  },
+  {
+    name: "Mine without a successful refresh",
+    board: { lastSuccess: null },
+    lastSuccessAt: ago(3),
+    lastPoll: { at: ago(1), ok: true, added: 0, total: 0 },
+  },
+])(
+  "preserves the saved organization through $name until you explicitly choose All",
+  async ({ board, lastSuccessAt, lastPoll }) => {
+    localStorage.setItem("test-plugin:calm-organization", '"acme"');
+    const slot = await mount({
+      board: state({ view: { ...view, prs: [row(2)] }, markers: [], ...board }),
+      reviews: {
+        kind: "available",
+        snapshot: { version: 1, items: [], lastSuccessAt, lastPoll },
+      },
+      waitFor: false,
+    });
+    await slot.behavior.emitRealtime("board-changed", null);
+    expect(localStorage.getItem("test-plugin:calm-organization")).toBe(
+      '"acme"',
+    );
+    expect(
+      slot.getByRole("combobox", { name: "Organization" }).textContent,
+    ).toContain("acme (unavailable)");
+    expect(slot.queryByRole("button", { name: "Change 2" })).toBeNull();
+    expect(slot.getByRole("tab", { name: "Mine 0" })).toBeTruthy();
+    expect(calls(slot, "start")).toEqual([]);
+    await chooseOrganization(slot, "All organizations");
+    expect(slot.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  },
+);
+it("keeps a saved owner during loading or partial failure and offers All when no options are available", async () => {
+  localStorage.setItem("test-plugin:calm-organization", '"acme"');
+  let finish = () => {};
+  const pending = new Promise((resolve) => {
+    finish = () =>
+      resolve({ kind: "unavailable", reason: "Review Watch offline" });
+  });
+  const slot = await mount({
+    reviews: undefined,
+    rpc: { reviews_get: () => pending },
+    waitFor: false,
+  });
+  await slot.findByRole("tab", { name: "Mine 0" });
+  expect(
+    slot.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("acme (loading…)");
+  await act(async () => finish());
+  expect(
+    slot.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("acme (unavailable)");
+  expect(localStorage.getItem("test-plugin:calm-organization")).toBe('"acme"');
+  await chooseOrganization(slot, "All organizations");
+  expect(slot.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  slot.lifecycle.unmount();
+  const empty = await mount({
+    board: state({ view: { ...view, prs: [] }, markers: [] }),
+    reviews: reviews([]),
+    waitFor: false,
+  });
+  await empty.findByText("Nothing needs you. No open pull requests.");
+  expect(
+    empty
+      .getByRole("combobox", { name: "Organization" })
+      .hasAttribute("disabled"),
+  ).toBe(true);
+});
+it("keeps cross-organization dependency context and follows an explicit review link into its organization once", async () => {
+  const gated = row(2, {
+    group: "blocked",
+    action: null,
+    gate_blocked: true,
+    gate_links: [
+      { label: "External prerequisite", cleared_by: "acme/app#703" },
+    ],
+  });
+  const slot = await mount({
+    board: state({ view: { ...view, prs: [gated, acmeRow] }, markers: [] }),
+    reviews: reviews([reviewA, acmeReview]),
+    rpc: { reviews_detail: () => acmeReview },
+    waitFor: "Change 20",
+  });
+  await chooseOrganization(slot, "parsleyhealth");
+  fireEvent.click(slot.getByRole("button", { name: /Blocked upstream/ }));
+  fireEvent.click(slot.getByRole("button", { name: "Change 2" }));
+  expect(slot.getByText(/External prerequisite/)).toBeTruthy();
+  fireEvent.click(
+    mineRow(slot, "Change 2").getByRole("button", { name: "Review #703 →" }),
+  );
+  await slot.findByRole("region", {
+    name: "Review context for Review change 703",
+  });
+  expect(
+    slot.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("acme");
+  fireEvent.click(slot.getByRole("button", { name: "Review change 703" }));
+  await slot.behavior.emitRealtime("board-changed", null);
+  expect(
+    slot.queryByRole("region", {
+      name: "Review context for Review change 703",
+    }),
+  ).toBeNull();
+  await chooseOrganization(slot, "parsleyhealth");
+  await slot.behavior.emitRealtime("board-changed", null);
+  expect(
+    slot.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("parsleyhealth");
+});
+it("opens an explicit cross-organization URL target and lets a later filter change cancel it", async () => {
+  localStorage.setItem("test-plugin:calm-organization", '"parsleyhealth"');
+  const slot = await mount({
+    path: "to-review/acme/app%23703",
+    board: state({ view: { ...view, prs: [row(2), acmeRow] }, markers: [] }),
+    reviews: reviews([reviewA, acmeReview]),
+    rpc: { reviews_detail: () => acmeReview },
+    waitFor: "Review change 703",
+  });
+  await slot.findByRole("region", {
+    name: "Review context for Review change 703",
+  });
+  expect(
+    slot.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("acme");
+  await chooseOrganization(slot, "parsleyhealth");
+  await slot.behavior.emitRealtime("board-changed", null);
+  expect(slot.queryByRole("button", { name: "Review change 703" })).toBeNull();
+  expect(slot.getByRole("button", { name: "Review change 701" })).toBeTruthy();
+  slot.lifecycle.rerender(<Board subPath="to-review" />);
+  expect(
+    slot.getByRole("combobox", { name: "Organization" }).textContent,
+  ).toContain("parsleyhealth");
+});
 
 it("registers one PRs panel and partitions each real PR once despite marker overrides", async () => {
   const app = await loadPluginApp(() => import("./app"));
@@ -274,14 +646,472 @@ it("registers one PRs panel and partitions each real PR once despite marker over
   expect(prs.find((pr) => pr.row.number === 9)?.segment).toBe("on-you");
   const slot = await mount();
   expect(
-    slot.getByRole("button", { name: "Mine 10" }).getAttribute("aria-pressed"),
+    slot.getByRole("tab", { name: "Mine 10" }).getAttribute("aria-selected"),
   ).toBe("true");
-  expect(slot.getByRole("button", { name: "6 on you" })).toBeTruthy();
+  expect(slot.getByRole("radio", { name: "6 on you" })).toBeTruthy();
   expect(
     slot.getByRole("heading", { name: "Answer to unblock agents" }),
   ).toBeTruthy();
   expect(calls(slot, "start")).toEqual([]);
   expect(calls(slot, "reviewers_request")).toEqual([]);
+});
+it("loads the actual saved agent model before enabling starts", async () => {
+  let finish = () => {};
+  const saved = {
+    providerId: "codex",
+    model: "gpt-6.1-terra",
+    reasoningLevel: "high",
+    serviceTier: "fast",
+  };
+  const pending = new Promise((resolve) => {
+    finish = () => resolve(modelContext(saved));
+  });
+  const slot = await mount({ rpc: { agent_model_get: () => pending } });
+  expect(slot.queryByLabelText("Model")).toBeNull();
+  const start = slot.getByRole("button", { name: "Start 1" });
+  expect(start.hasAttribute("disabled")).toBe(true);
+  fireEvent.click(start);
+  expect(calls(slot, "start")).toEqual([]);
+  await act(async () => finish());
+  expect(modelInput(slot, "Model").value).toBe(saved.model);
+  expect(modelInput(slot, "Reasoning level").value).toBe("high");
+  fireEvent.click(start);
+  await waitFor(() =>
+    expect(calls(slot, "start")).toEqual([
+      {
+        items: [{ key: key(2), action: "fix-ci" }],
+        stop: "publish",
+        agentModel: saved,
+      },
+    ]),
+  );
+});
+it("defaults to Sol6.1 xhigh and remembers one chosen execution selection for fixes and reviews", async () => {
+  let saved = DEFAULT_AGENT_MODEL;
+  const slot = await mount({
+    rpc: {
+      agent_model_get: () => modelContext(saved),
+      agent_model_set: (input) => (saved = agentModelSchema.parse(input)),
+    },
+  });
+  expect(saved).toEqual({
+    providerId: "codex",
+    model: "gpt-6.1-sol",
+    reasoningLevel: "xhigh",
+  });
+  expect(modelInput(slot, "Model").value).toBe("gpt-6.1-sol");
+  fireEvent.change(slot.getByLabelText("Model"), {
+    target: { value: "gpt-6.1-terra" },
+  });
+  fireEvent.change(slot.getByLabelText("Reasoning level"), {
+    target: { value: "high" },
+  });
+  fireEvent.change(slot.getByLabelText("Service tier"), {
+    target: { value: "fast" },
+  });
+  fireEvent.click(
+    slot.getByRole("button", { name: "Apply execution selection" }),
+  );
+  await waitFor(() =>
+    expect(calls(slot, "agent_model_set")).toEqual([
+      {
+        providerId: "codex",
+        model: "gpt-6.1-terra",
+        reasoningLevel: "high",
+        serviceTier: "fast",
+      },
+    ]),
+  );
+  await waitFor(() =>
+    expect(
+      slot.getByRole("button", { name: "Start 1" }).hasAttribute("disabled"),
+    ).toBe(false),
+  );
+  fireEvent.click(slot.getByRole("button", { name: "Start 1" }));
+  await waitFor(() => expect(calls(slot, "start")).toHaveLength(1));
+  expect(calls(slot, "start")[0]).toMatchObject({ agentModel: saved });
+  fireEvent.click(slot.getByRole("tab", { name: /To review/ }));
+  fireEvent.click(
+    mineRow(slot, "Review change 701").getByRole("button", { name: "Start" }),
+  );
+  const dialog = within(await slot.findByRole("dialog"));
+  await dialog.findByText("Preselected from your organization mappings.");
+  fireEvent.click(dialog.getByRole("button", { name: "Start review" }));
+  await waitFor(() =>
+    expect(calls(slot, "reviews_start")).toEqual([
+      { key: reviewA.item.key, projectId: "p1", agentModel: saved },
+    ]),
+  );
+  slot.lifecycle.unmount();
+  const restored = await mount({
+    rpc: { agent_model_get: () => modelContext(saved) },
+  });
+  expect(modelInput(restored, "Model").value).toBe(saved.model);
+});
+it("routes discovery to the project checkout host and uses the confirmed default service tier", async () => {
+  const confirmed = { ...DEFAULT_AGENT_MODEL, serviceTier: "standard" };
+  const slot = await mount({ rpc: { agent_model_set: () => confirmed } });
+  const picker = slot.getByTestId("bb-provider-model-picker");
+  expect(picker.getAttribute("data-routing-kind")).toBe("host");
+  expect(picker.getAttribute("data-routing-id")).toBe("prs-project-host");
+  fireEvent.change(slot.getByLabelText("Service tier"), {
+    target: { value: "default" },
+  });
+  fireEvent.click(
+    slot.getByRole("button", { name: "Apply execution selection" }),
+  );
+  await waitFor(() =>
+    expect(calls(slot, "agent_model_set")).toEqual([
+      { ...DEFAULT_AGENT_MODEL, serviceTier: "default" },
+    ]),
+  );
+  await waitFor(() =>
+    expect(
+      slot.getByRole("button", { name: "Start 1" }).hasAttribute("disabled"),
+    ).toBe(false),
+  );
+  fireEvent.click(slot.getByRole("button", { name: "Start 1" }));
+  await waitFor(() =>
+    expect(calls(slot, "start")[0]).toMatchObject({ agentModel: confirmed }),
+  );
+});
+it("retains the confirmed agent choice after save failure and blocks starts while saving", async () => {
+  let fail = () => {};
+  const pending = new Promise((_, reject) => {
+    fail = () => reject(new Error("catalog unavailable"));
+  });
+  const slot = await mount({ rpc: { agent_model_set: () => pending } });
+  fireEvent.change(slot.getByLabelText("Model"), {
+    target: { value: "gpt-6.1-terra" },
+  });
+  fireEvent.click(
+    slot.getByRole("button", { name: "Apply execution selection" }),
+  );
+  expect(
+    slot.getByRole("button", { name: "Start 1" }).hasAttribute("disabled"),
+  ).toBe(true);
+  await act(async () => fail());
+  await slot.findByText("Could not save the agent model: catalog unavailable");
+  fireEvent.click(slot.getByRole("button", { name: "Start 1" }));
+  await waitFor(() =>
+    expect(calls(slot, "start")[0]).toMatchObject({
+      agentModel: DEFAULT_AGENT_MODEL,
+    }),
+  );
+});
+it("presents absent reasoning without inventing an effort in saved choices or starts", async () => {
+  const choice = {
+    providerId: "synthetic-provider",
+    model: "synthetic-no-effort",
+  };
+  const slot = await mount({
+    rpc: { agent_model_get: () => modelContext(choice) },
+  });
+  expect(modelInput(slot, "Reasoning level").value).toBe("");
+  fireEvent.click(
+    slot.getByRole("button", { name: "Apply execution selection" }),
+  );
+  await waitFor(() => expect(calls(slot, "agent_model_set")).toEqual([choice]));
+  await waitFor(() =>
+    expect(
+      slot.getByRole("button", { name: "Start 1" }).hasAttribute("disabled"),
+    ).toBe(false),
+  );
+  fireEvent.click(slot.getByRole("button", { name: "Start 1" }));
+  await waitFor(() =>
+    expect(calls(slot, "start")[0]).toMatchObject({ agentModel: choice }),
+  );
+});
+it("retries a failed preference load and refuses an older response after another panel changes it", async () => {
+  let reads = 0;
+  let finishOld = () => {};
+  const old = new Promise((resolve) => {
+    finishOld = () => resolve(modelContext(DEFAULT_AGENT_MODEL));
+  });
+  const current = { ...DEFAULT_AGENT_MODEL, model: "gpt-6.1-terra" };
+  const slot = await mount({
+    rpc: {
+      agent_model_get: () => {
+        reads++;
+        if (reads === 1) throw new Error("settings unavailable");
+        return reads === 2 ? old : modelContext(current);
+      },
+    },
+  });
+  await slot.findByText("Could not load the agent model: settings unavailable");
+  expect(
+    slot.getByRole("button", { name: "Start 1" }).hasAttribute("disabled"),
+  ).toBe(true);
+  fireEvent.click(slot.getByRole("button", { name: "Retry" }));
+  await slot.behavior.emitRealtime("agent-model-changed", {});
+  await slot.findByLabelText("Model");
+  expect(modelInput(slot, "Model").value).toBe(current.model);
+  await act(async () => finishOld());
+  expect(modelInput(slot, "Model").value).toBe(current.model);
+  fireEvent.click(slot.getByRole("button", { name: "Start 1" }));
+  await waitFor(() =>
+    expect(calls(slot, "start")[0]).toMatchObject({ agentModel: current }),
+  );
+});
+it("uses one tab stop and links each keyboard-selected tab to its panel", async () => {
+  const slot = await mount();
+  const user = userEvent.setup();
+  const tabs = within(slot.getByRole("tablist", { name: "Pull request view" }));
+  const mine = tabs.getByRole("tab", { name: /Mine/ });
+  const review = tabs.getByRole("tab", { name: /To review/ });
+  expect(mine.tabIndex).toBe(0);
+  expect(review.tabIndex).toBe(-1);
+  mine.focus();
+  await user.keyboard("{ArrowRight}");
+  expect(document.activeElement).toBe(review);
+  expect(review.getAttribute("aria-selected")).toBe("true");
+  const panel = slot.getByRole("tabpanel", { name: /To review/ });
+  expect(review.getAttribute("aria-controls")).toBe(panel.id);
+  expect(panel.getAttribute("aria-labelledby")).toBe(review.id);
+  expect(mine.tabIndex).toBe(-1);
+  expect(review.tabIndex).toBe(0);
+  await user.keyboard("{Home}");
+  expect(document.activeElement).toBe(mine);
+  expect(
+    slot.getByRole("heading", { name: "Small fixes for an agent" }),
+  ).toBeTruthy();
+  await user.keyboard("{End}");
+  expect(document.activeElement).toBe(review);
+  expect(calls(slot, "start")).toEqual([]);
+  expect(slot.inspection.navigateCalls).toContainEqual({
+    method: "toPluginPanel",
+    path: "pr-board",
+    options: { subPath: "to-review" },
+  });
+});
+it("shares the status value between arrow navigation and bar shortcuts while skipping empty statuses", async () => {
+  const slot = await mount({
+    board: state({
+      view: {
+        ...view,
+        prs: [
+          row(2),
+          row(6, { segment: "drafts", group: null, action: null }),
+          row(7, { segment: "ready", group: null, action: null }),
+        ],
+      },
+      markers: [],
+    }),
+  });
+  const user = userEvent.setup();
+  const filters = within(
+    slot.getByRole("radiogroup", { name: "Pull request status" }),
+  );
+  const mine = filters.getByRole("radio", { name: "1 on you" });
+  const draft = filters.getByRole("radio", { name: "1 drafts" });
+  expect(
+    filters
+      .getAllByRole("radio")
+      .filter((item) => item.tabIndex === 0 && !item.hasAttribute("disabled")),
+  ).toEqual([mine]);
+  expect(
+    filters
+      .getByRole("radio", { name: "0 agent" })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
+  mine.focus();
+  await user.keyboard("{ArrowRight}");
+  expect(document.activeElement).toBe(draft);
+  expect(draft.getAttribute("aria-checked")).toBe("true");
+  expect(slot.getByRole("heading", { name: "Drafts" })).toBeTruthy();
+  expect(
+    slot
+      .getByRole("button", { name: "Show 1 drafts" })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
+  fireEvent.click(slot.getByRole("button", { name: "Show 1 on you" }));
+  expect(mine.getAttribute("aria-checked")).toBe("true");
+  expect(draft.tabIndex).toBe(-1);
+  draft.focus();
+  await user.keyboard(" ");
+  expect(draft.getAttribute("aria-checked")).toBe("true");
+});
+it("connects effort, row, and reviewer disclosures to their panels and preserves keyboard focus", async () => {
+  const slot = await mount();
+  const user = userEvent.setup();
+  const fold = slot.getByRole("button", { name: /Large fixes/ });
+  expect(fold.getAttribute("aria-expanded")).toBe("false");
+  fold.focus();
+  await user.keyboard(" ");
+  expect(fold.getAttribute("aria-expanded")).toBe("true");
+  expect(
+    document
+      .getElementById(fold.getAttribute("aria-controls") ?? "")
+      ?.contains(slot.getByRole("button", { name: "Change 3" })),
+  ).toBe(true);
+  const title = slot.getByRole("button", { name: "Change 3" });
+  title.focus();
+  await user.keyboard("{Enter}");
+  const context = slot.getByRole("region", { name: "Context for Change 3" });
+  expect(
+    document
+      .getElementById(title.getAttribute("aria-controls") ?? "")
+      ?.contains(context),
+  ).toBe(true);
+  await user.keyboard(" ");
+  expect(title.getAttribute("aria-expanded")).toBe("false");
+  expect(
+    slot.queryByRole("region", { name: "Context for Change 3" }),
+  ).toBeNull();
+  expect(document.activeElement).toBe(title);
+  fireEvent.click(slot.getByRole("radio", { name: "1 on reviewers" }));
+  const person = slot.getByRole("button", { name: /Dev One/ });
+  person.focus();
+  await user.keyboard(" ");
+  expect(person.getAttribute("aria-expanded")).toBe("true");
+  expect(
+    document
+      .getElementById(person.getAttribute("aria-controls") ?? "")
+      ?.contains(slot.getByRole("button", { name: "Change 5" })),
+  ).toBe(true);
+});
+it("keeps keyboard-selected PRs after a failure and removes only successful starts", async () => {
+  let fail = true;
+  const slot = await mount({
+    rpc: {
+      start: () => {
+        if (fail) throw new Error("start unavailable");
+        return {
+          starting: [key(2)],
+          skipped: [{ key: key(3), reason: "already starting" }],
+        };
+      },
+    },
+  });
+  const user = userEvent.setup();
+  fireEvent.click(slot.getByRole("button", { name: /Large fixes/ }));
+  const small = slot.getByRole("checkbox", { name: "Select Change 2 #2" });
+  const large = slot.getByRole("checkbox", { name: "Select Change 3 #3" });
+  for (const checkbox of [small, large]) {
+    checkbox.focus();
+    await user.keyboard(" ");
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+  }
+  let selection = within(
+    slot.getByRole("group", { name: "Start selected agents" }),
+  );
+  fireEvent.click(selection.getByRole("button", { name: "Start 2" }));
+  await slot.findByText("Could not start: start unavailable");
+  expect(small.getAttribute("aria-checked")).toBe("true");
+  expect(large.getAttribute("aria-checked")).toBe("true");
+  await user.click(slot.getByRole("tab", { name: /To review/ }));
+  await user.click(slot.getByRole("tab", { name: /Mine/ }));
+  expect(
+    slot
+      .getByRole("checkbox", { name: "Select Change 2 #2" })
+      .getAttribute("aria-checked"),
+  ).toBe("true");
+  fail = false;
+  selection = within(
+    slot.getByRole("group", { name: "Start selected agents" }),
+  );
+  fireEvent.click(selection.getByRole("button", { name: "Start 2" }));
+  await slot.findByText(/1 PR queued for one thread/);
+  expect(
+    slot
+      .getByRole("checkbox", { name: "Select Change 2 #2" })
+      .getAttribute("aria-checked"),
+  ).toBe("false");
+  expect(
+    slot
+      .getByRole("checkbox", { name: "Select Change 3 #3" })
+      .getAttribute("aria-checked"),
+  ).toBe("true");
+});
+it("selects each review with Space and clears the same controlled group", async () => {
+  const slot = await mount({ path: "to-review" });
+  const user = userEvent.setup();
+  for (const checkbox of slot.getAllByRole("checkbox")) {
+    checkbox.focus();
+    await user.keyboard(" ");
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+  }
+  expect(slot.getByRole("button", { name: "Review 2" })).toBeTruthy();
+  await user.click(slot.getByRole("button", { name: "Clear" }));
+  for (const checkbox of slot.getAllByRole("checkbox"))
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+  expect(
+    slot.queryByRole("group", { name: "Review selected pull requests" }),
+  ).toBeNull();
+  expect(calls(slot, "reviews_batch")).toEqual([]);
+});
+it("names the migrated components and exposes status changes through the SDK API", async () => {
+  const slot = await mount();
+  const components = uiAgent
+    .snapshot()
+    .filter((entry) => !entry.offPage && entry.component !== "more");
+  for (const entry of components)
+    expect(
+      entry.label,
+      `${entry.component} ${entry.ref} has no name`,
+    ).toBeTruthy();
+  const labels = components.map((entry) => entry.label);
+  for (const label of [
+    "Pull request view",
+    "Pull request status",
+    "Select pull requests for agents",
+  ])
+    expect(labels).toContain(label);
+  const result = await act(() =>
+    uiAgent.act({
+      steps: [
+        { ref: "Pull request status", action: "setValue", args: ["drafts"] },
+      ],
+    }),
+  );
+  expect(result.ok, result.error?.message).toBe(true);
+  expect(slot.getByRole("heading", { name: "Drafts" })).toBeTruthy();
+  expect(
+    slot.getByRole("radio", { name: "1 drafts" }).getAttribute("aria-checked"),
+  ).toBe("true");
+  expect(calls(slot, "start")).toEqual([]);
+});
+it("traps dialog keyboard focus and refuses dismissal until a review start settles", async () => {
+  let finish = () => {};
+  const pending = new Promise((resolve) => {
+    finish = () =>
+      resolve({
+        item: { ...reviewA.item, state: "started", threadId: "thr_review" },
+      });
+  });
+  const slot = await mount({
+    path: "to-review",
+    rpc: { reviews_start: () => pending },
+  });
+  const user = userEvent.setup();
+  fireEvent.click(
+    mineRow(slot, "Review change 701").getByRole("button", { name: "Start" }),
+  );
+  const dialog = within(
+    await slot.findByRole("dialog", { name: "Start review" }),
+  );
+  await dialog.findByText("Preselected from your organization mappings.");
+  const start = dialog.getByRole("button", { name: "Start review" });
+  start.focus();
+  await user.tab();
+  expect(document.activeElement).toBe(
+    dialog.getByRole("combobox", { name: "Project" }),
+  );
+  await user.tab({ shift: true });
+  expect(document.activeElement).toBe(start);
+  await user.click(start);
+  expect(
+    dialog.getByRole("button", { name: "Cancel" }).hasAttribute("disabled"),
+  ).toBe(true);
+  await user.keyboard("{Escape}");
+  await user.click(document.body);
+  expect(slot.getByRole("dialog", { name: "Start review" })).toBeTruthy();
+  await act(async () => finish());
+  await waitFor(() => expect(slot.queryByRole("dialog")).toBeNull());
+  expect(slot.inspection.navigateCalls).toContainEqual({
+    method: "toThread",
+    threadId: "thr_review",
+  });
 });
 it("sizes dots logarithmically and bounds zero and large diffs", () => {
   expect(sizeDiameter(10)).toBe(6);
@@ -295,14 +1125,15 @@ it("uses native badge dots with count thresholds, exact counts, and urgent reaso
   expect(badge(0)).toBeNull();
   expect(badge(1)).toEqual({
     tone: "neutral",
-    label: "1 on you · 0 to review",
+    label: "Across all organizations · 1 on you · 0 to review",
   });
   expect(badge(4)?.tone).toBe("neutral");
   expect(badge(5)?.tone).toBe("warning");
   expect(badge(14)?.tone).toBe("warning");
   expect(badge(15)).toEqual({
     tone: "critical",
-    label: "15 on you · 0 to review · high pending count",
+    label:
+      "Across all organizations · 15 on you · 0 to review · high pending count",
   });
   expect(badge(1, 1)?.label).toContain("1 agent waiting");
   expect(badge(1, 0, 1)?.tone).toBe("critical");
@@ -342,16 +1173,18 @@ it("small group starts at Publish, large group at Prepare, and exposes actual sk
       slot.getByRole("region", { name: "Small fixes for an agent" }),
     ).getByRole("button", { name: "Start 1" }),
   );
-  await slot.findByText(/1 agent starting.*already running/);
+  await slot.findByText(/1 PR queued for one thread.*already running/);
   expect(calls(slot, "start")[0]).toEqual({
     items: [{ key: key(2), action: "fix-ci" }],
     stop: "publish",
+    agentModel: DEFAULT_AGENT_MODEL,
   });
   fireEvent.click(slot.getByRole("button", { name: "Prepare 1" }));
   await waitFor(() => expect(calls(slot, "start")).toHaveLength(2));
   expect(calls(slot, "start")[1]).toEqual({
     items: [{ key: key(3), action: "rebase" }],
     stop: "prepare",
+    agentModel: DEFAULT_AGENT_MODEL,
   });
 });
 it("sends mixed selected actions with the explicit stop policy and no confirmation dialog", async () => {
@@ -377,13 +1210,20 @@ it("sends mixed selected actions with the explicit stop policy and no confirmati
       { key: key(3), action: "rebase" },
     ],
     stop: "publish",
+    agentModel: DEFAULT_AGENT_MODEL,
   });
   expect(slot.queryByRole("dialog")).toBeNull();
 });
-it("sends all selected rows so the server can report the five-thread cap honestly", async () => {
+it("queues all selected rows for one coordinator thread", async () => {
   const many = Array.from({ length: 6 }, (_, index) => row(index + 20));
   const slot = await mount({
     board: state({ view: { ...view, prs: [row(2), ...many] }, markers: [] }),
+    rpc: {
+      start: () => ({
+        starting: [row(2), ...many].map((pr) => pr.key),
+        skipped: [],
+      }),
+    },
   });
   for (const candidate of [row(2), ...many])
     fireEvent.click(
@@ -394,13 +1234,116 @@ it("sends all selected rows so the server can report the five-thread cap honestl
   fireEvent.click(
     within(
       slot.getByRole("group", { name: "Start selected agents" }),
-    ).getByRole("button", { name: "Start 5" }),
+    ).getByRole("button", { name: "Start 7" }),
   );
   await waitFor(() => expect(calls(slot, "start")).toHaveLength(1));
   expect(
     z.object({ items: z.array(z.unknown()) }).parse(calls(slot, "start")[0])
       .items,
   ).toHaveLength(7);
+  await slot.findByText("7 PRs queued for one thread.");
+});
+it("renders one shared question across all row contexts and keeps followers linked to its coordinator", async () => {
+  const sharedRows = [
+    row(2),
+    row(3, { group: "large" }),
+    row(4, { group: "blocked", gate_blocked: true }),
+    acmeRow,
+  ];
+  const sharedMarkers = sharedRows.map((pr) => ({
+    ...marker(pr.number, {
+      status: "asking",
+      question,
+      threadId: "thr_coordinator",
+    }),
+    key: pr.key,
+  }));
+  let current = state({
+    view: { ...view, prs: [...sharedRows, row(10)] },
+    markers: [...sharedMarkers, marker(10)],
+  });
+  const slot = await mount({
+    rpc: {
+      board_get: () => current,
+      answer: () => {
+        current = {
+          ...current,
+          markers: [
+            ...sharedMarkers.map<MarkerView>((item) => ({
+              ...item,
+              status: "live",
+              question: null,
+            })),
+            marker(10),
+          ],
+        };
+        return { sent: true };
+      },
+    },
+    waitFor: question.prompt,
+  });
+  expect(
+    slot.getAllByRole("button", { name: "Use synthetic fixture" }),
+  ).toHaveLength(1);
+  expect(slot.getByText("4 linked PRs · agent thread")).toBeTruthy();
+  expect(slot.getAllByText("Waiting on shared agent question")).toHaveLength(3);
+  expect(slot.queryByRole("heading", { name: "Large fixes" })).toBeNull();
+  expect(slot.queryByRole("heading", { name: "Blocked upstream" })).toBeNull();
+  fireEvent.click(slot.getByRole("button", { name: "Change 3" }));
+  expect(
+    slot.getAllByRole("button", { name: "Use synthetic fixture" }),
+  ).toHaveLength(1);
+  fireEvent.click(
+    mineRow(slot, "Change 3").getByRole("button", { name: "Open thread" }),
+  );
+  expect(slot.inspection.navigateCalls).toContainEqual({
+    method: "toThread",
+    threadId: "thr_coordinator",
+  });
+  fireEvent.click(slot.getByRole("radio", { name: "1 agent" }));
+  expect(
+    slot.getAllByRole("button", { name: "Use synthetic fixture" }),
+  ).toHaveLength(1);
+  expect(slot.getByText("4 linked PRs · agent thread")).toBeTruthy();
+  await chooseOrganization(slot, "parsleyhealth");
+  expect(slot.getByText("4 PRs in shared thread · 3 shown")).toBeTruthy();
+  expect(slot.queryByRole("button", { name: "Change 20" })).toBeNull();
+  fireEvent.click(slot.getByRole("button", { name: "Use synthetic fixture" }));
+  await waitFor(() => expect(slot.queryByText(question.prompt)).toBeNull());
+  expect(calls(slot, "answer")).toEqual([
+    { key: key(2), questionId: question.id, optionId: "a" },
+  ]);
+  await chooseOrganization(slot, "All organizations");
+  expect(slot.getByRole("radio", { name: "5 agent" })).toBeTruthy();
+  expect(
+    slot.queryByRole("button", { name: "Use synthetic fixture" }),
+  ).toBeNull();
+});
+it("counts shared questions once in the global badge while retaining per-PR counts", async () => {
+  const app = await loadPluginApp(() => import("./app"));
+  const useBadge = app.navPanels[0]?.experimental_useBadge;
+  if (!useBadge) throw new Error("Missing PRs badge");
+  const asking = [2, 3, 4].map((number) =>
+    marker(number, { status: "asking", question, threadId: "thr_shared" }),
+  );
+  const slot = renderSlot(
+    { component: () => <span>{useBadge()?.label}</span> },
+    {},
+    {
+      rpc: {
+        board_get: () =>
+          state({
+            view: { ...view, prs: [row(2), row(3), row(4)] },
+            markers: asking,
+          }),
+        reviews_get: () => reviews([]),
+      },
+    },
+  );
+  unmounts.push(() => slot.lifecycle.unmount());
+  await slot.findByText(
+    "Across all organizations · 3 on you · 0 to review · 1 agent waiting",
+  );
 });
 it("expands one context with actual check counts and keeps historical approval wording", async () => {
   const slot = await mount();
@@ -456,7 +1399,7 @@ it("never invents asking status for old finished threads and opens live agents",
     board: state({ markers: [marker(10), marker(9, { status: "done" })] }),
   });
   expect(slot.queryByText(question.prompt)).toBeNull();
-  fireEvent.click(slot.getByRole("button", { name: "1 agent" }));
+  fireEvent.click(slot.getByRole("radio", { name: "1 agent" }));
   fireEvent.click(
     within(slot.getByRole("region", { name: "Working" })).getByRole("button", {
       name: "Open thread →",
@@ -466,7 +1409,9 @@ it("never invents asking status for old finished threads and opens live agents",
     method: "toThread",
     threadId: "thr_10",
   });
-  expect(slot.getByRole("heading", { name: "Finished threads" })).toBeTruthy();
+  expect(
+    slot.getByRole("heading", { name: "PRs with finished threads" }),
+  ).toBeTruthy();
 });
 it("loads actual reviewer candidates and writes only after the explicit Send click", async () => {
   const slot = await mount();
@@ -520,7 +1465,7 @@ it("keeps Mine available when Review Watch is unavailable", async () => {
     reviews: { kind: "unavailable", reason: "Review Watch disabled" },
   });
   expect(slot.getByText("Change 2")).toBeTruthy();
-  fireEvent.click(slot.getByRole("button", { name: "To review 0" }));
+  fireEvent.click(slot.getByRole("tab", { name: "To review 0" }));
   await slot.findByText("To review is unavailable: Review Watch disabled");
 });
 it("advances Open in order through quick reads without starting a thread", async () => {
@@ -554,7 +1499,11 @@ it("preselects organization project, cancels without starting, then forwards a c
   fireEvent.click(dialog.getByRole("button", { name: "Start review" }));
   await waitFor(() =>
     expect(calls(slot, "reviews_start")).toEqual([
-      { key: reviewA.item.key, projectId: "p2" },
+      {
+        key: reviewA.item.key,
+        projectId: "p2",
+        agentModel: DEFAULT_AGENT_MODEL,
+      },
     ]),
   );
   expect(slot.inspection.navigateCalls).toContainEqual({
@@ -596,7 +1545,11 @@ it("requires a mixed-batch project choice and preserves selection after failed s
   fireEvent.click(dialog.getByRole("button", { name: "Start review" }));
   await dialog.findByText("spawn failed");
   expect(calls(slot, "reviews_batch")).toEqual([
-    { keys: [reviewA.item.key, reviewB.item.key], projectId: "p2" },
+    {
+      keys: [reviewA.item.key, reviewB.item.key],
+      projectId: "p2",
+      agentModel: DEFAULT_AGENT_MODEL,
+    },
   ]);
   fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
   expect(slot.getByText("2 selected")).toBeTruthy();
@@ -672,7 +1625,7 @@ it("uses proportional segments when narrow panels cannot fit every minimum-width
       .getByLabelText("91 pull requests by status")
       .classList.contains("proportional"),
   ).toBe(true);
-  expect(slot.getByRole("button", { name: "91 on you" })).toBeTruthy();
+  expect(slot.getByRole("radio", { name: "91 on you" })).toBeTruthy();
   expect(
     slot
       .getByLabelText("91 pull requests by status")
@@ -696,7 +1649,7 @@ it("removes a question after confirmed answer delivery and retains approximate r
   expect(calls(slot, "answer")).toEqual([
     { key: key(9), questionId: "next", optionId: "a" },
   ]);
-  fireEvent.click(slot.getByRole("button", { name: "1 on reviewers" }));
+  fireEvent.click(slot.getByRole("radio", { name: "1 on reviewers" }));
   expect(slot.getByText("oldest ~4d")).toBeTruthy();
 });
 
@@ -724,11 +1677,12 @@ it("starts fresh candidates after completed Prepare rows and keeps finished thre
     method: "toThread",
     threadId: "thr_60",
   });
-  fireEvent.click(slot.getByRole("button", { name: "Prepare 5" }));
+  fireEvent.click(slot.getByRole("button", { name: "Prepare 7" }));
   await waitFor(() => expect(calls(slot, "start")).toHaveLength(1));
   expect(calls(slot, "start")[0]).toEqual({
-    items: fresh.slice(0, 5).map((pr) => ({ key: pr.key, action: "fix-ci" })),
+    items: fresh.map((pr) => ({ key: pr.key, action: "fix-ci" })),
     stop: "prepare",
+    agentModel: DEFAULT_AGENT_MODEL,
   });
 });
 it("drops an existing selection when a non-refused marker arrives", async () => {

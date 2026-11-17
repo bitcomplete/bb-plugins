@@ -46,6 +46,7 @@ async function setup(items: QueueItem[], githubToken?: string, organizationProje
     { id: "project-parsley", name: "Parsley", sources: [{ isDefault: true }] },
     { id: "project-no-checkout", name: "No checkout", sources: [] },
   ]);
+  host.harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: "codex", available: true }], models: [{ model: "gpt-6.1-sol", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] }] }));
   await plugin(host.bb);
   return host;
 }
@@ -483,4 +484,69 @@ describe("stored rows from the retired feedback-to-address rule", () => {
     expect((await host.bb.storage.kv.get<QueueItem[]>("queue"))?.map((row) => row.key))
       .toEqual([review.key]);
   });
+});
+
+describe("review agent execution choice", () => {
+  it("defaults single and batch reviews to Codex Sol xhigh on the checkout host", async () => {
+    const first = item(91), second = item(92);
+    const host = await setup([first, second]);
+    await host.harness.behavior.callRpc("item_start", { key: first.key });
+    await host.harness.behavior.callRpc("item_batch_start", { keys: [second.key] });
+    for (const [spawn] of host.harness.sdk.callsTo("threads.spawn")) {
+      expect(spawn).toMatchObject({ providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: "xhigh" });
+    }
+    expect(host.harness.sdk.callsTo("providers.models")).toEqual([
+      [{ projectId: "project-test", hostId: "devbox-host", providerId: "codex" }],
+      [{ projectId: "project-test", hostId: "devbox-host", providerId: "codex" }],
+    ]);
+  });
+
+  it("preserves a validated per-start override and tier instead of configured defaults", async () => {
+    const first = item(93);
+    const host = await setup([first]);
+    await host.harness.behavior.setSettings({ provider: "configured-provider", model: "configured-model" });
+    const choice = { providerId: "selected-provider", model: "selected-model", reasoningLevel: "high", serviceTier: "priority" };
+    host.harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: choice.providerId, available: true }], models: [{ model: choice.model, supportedReasoningEfforts: [{ reasoningEffort: "high" }], supportedServiceTiers: [{ id: "priority" }] }] }));
+    await host.harness.behavior.callRpc("item_start", { key: first.key, agentModel: choice });
+    expect(host.harness.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject(choice);
+  });
+
+  it("retains deliberate provider settings and accepts models without reasoning controls", async () => {
+    const first = item(94), second = item(95);
+    const host = await setup([first, second]);
+    await host.harness.behavior.setSettings({ provider: "configured-provider", model: "configured-model" });
+    host.harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: "configured-provider", available: true }], models: [{ model: "configured-model", supportedReasoningEfforts: [], defaultReasoningEffort: "" }] }));
+    await host.harness.behavior.callRpc("item_start", { key: first.key });
+    const implicit = host.harness.sdk.callsTo("threads.spawn")[0]?.[0];
+    expect(implicit).toMatchObject({ providerId: "configured-provider", model: "configured-model" });
+    expect(implicit).not.toHaveProperty("reasoningLevel");
+    await host.harness.behavior.callRpc("item_batch_start", { keys: [second.key], agentModel: { providerId: "configured-provider", model: "configured-model" } });
+    expect(host.harness.sdk.callsTo("threads.spawn")[1]?.[0]).not.toHaveProperty("reasoningLevel");
+  });
+
+  it("refuses unavailable models, unsupported reasoning, and tiers without consuming queue items", async () => {
+    const first = item(96);
+    const host = await setup([first]);
+    const base = { providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: "xhigh" };
+    for (const agentModel of [{ ...base, model: "invented" }, { ...base, reasoningLevel: "invented" }, { ...base, serviceTier: "invented" }]) {
+      await expect(host.harness.behavior.callRpc("item_start", { key: first.key, agentModel })).rejects.toThrow(/unavailable/);
+    }
+    expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(await host.bb.storage.kv.get("queue")).toEqual([first]);
+  });
+});
+
+it("normalizes the native picker's standard tier for single and batch review overrides", async () => {
+  const first = item(97), second = item(98), third = item(99);
+  const host = await setup([first, second, third]);
+  const choice = { providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: "xhigh" };
+  host.harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: "codex", available: true }], models: [{ model: choice.model, supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }], supportedServiceTiers: [{ id: "fast" }] }] }));
+  await host.harness.behavior.callRpc("item_start", { key: first.key, agentModel: { ...choice, serviceTier: "default" } });
+  await host.harness.behavior.callRpc("item_batch_start", { keys: [second.key], agentModel: { ...choice, serviceTier: "default" } });
+  for (const [spawn] of host.harness.sdk.callsTo("threads.spawn")) {
+    expect(spawn).toMatchObject(choice);
+    expect(spawn).not.toHaveProperty("serviceTier");
+  }
+  await host.harness.behavior.callRpc("item_start", { key: third.key, agentModel: { ...choice, serviceTier: "fast" } });
+  expect(host.harness.sdk.callsTo("threads.spawn").at(-1)?.[0]).toMatchObject({ ...choice, serviceTier: "fast" });
 });
