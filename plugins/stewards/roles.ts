@@ -108,8 +108,10 @@ export const roleOpsSchema = z
   .strict();
 export type RoleOps = z.infer<typeof roleOpsSchema>;
 
-/** One person's role: whether their server is the project steward, and the watches it runs. */
-export const roleSchema = z.object({ projectSteward: z.boolean().default(false), ops: roleOpsSchema.optional() }).strict();
+/** One person's role: whether their server is the project steward, the watches it runs, and their Slack name (BB-354). */
+export const roleSchema = z
+  .object({ projectSteward: z.boolean().default(false), ops: roleOpsSchema.optional(), slack: z.string().trim().min(1).max(100).optional() })
+  .strict();
 export type Role = z.infer<typeof roleSchema>;
 
 /** The built-in role name for the project steward. It has no `roles` definition. */
@@ -166,13 +168,24 @@ const rolesFileV1Schema = rolesFileV1RawSchema.transform((file, ctx): RolesFile 
   return { version: 1, roles, holders, definitions };
 });
 
+/**
+ * A version 2 holder entry: the role names it holds, or an object carrying
+ * those names and the person's Slack handle (BB-354). The array form is the
+ * original shape and still parses; the object form is strict, so an unknown
+ * key beside `roles`/`slack` is refused.
+ */
+const holderEntrySchema = z.union([
+  z.array(roleNameSchema).min(1).max(50),
+  z.object({ roles: z.array(roleNameSchema).min(1).max(50), slack: z.string().trim().min(1).max(100).optional() }).strict(),
+]);
+
 const rolesFileV2RawSchema = z
   .object({
     version: z.literal(2),
     /** The named role definitions: today's `roleOpsSchema` body, once per name. */
     roles: z.record(roleNameSchema, roleOpsSchema),
-    /** login -> the role names it holds. `projectSteward` is a built-in name. */
-    holders: z.record(z.string(), z.array(roleNameSchema).min(1).max(50)),
+    /** login -> the role names it holds (or an object with those and a `slack` handle). `projectSteward` is a built-in name. */
+    holders: z.record(z.string(), holderEntrySchema),
   })
   .strict()
   .superRefine((file, ctx) => {
@@ -228,16 +241,17 @@ function samePullWatch(a: PullWatch, b: PullWatch): boolean {
   return a.repo.toLowerCase() === b.repo.toLowerCase() && a.playbook === b.playbook && JSON.stringify(a.match) === JSON.stringify(b.match);
 }
 
-/** The effective role a holder runs: the merge of the roles it holds, and whether one is `projectSteward`. */
-function effectiveRole(names: readonly string[], definitions: Record<string, RoleOps>): Role {
+/** The effective role a holder runs: the merge of the roles it holds, whether one is `projectSteward`, and its Slack handle (BB-354). */
+function effectiveRole(names: readonly string[], definitions: Record<string, RoleOps>, slack?: string): Role {
   const defs = names.filter((name) => name !== PROJECT_STEWARD_ROLE).map((name) => definitions[name]).filter((def): def is RoleOps => def !== undefined);
-  return { projectSteward: names.includes(PROJECT_STEWARD_ROLE), ...(defs.length === 0 ? {} : { ops: mergeRoleOps(defs) }) };
+  return { projectSteward: names.includes(PROJECT_STEWARD_ROLE), ...(defs.length === 0 ? {} : { ops: mergeRoleOps(defs) }), ...(slack === undefined ? {} : { slack }) };
 }
 
 /** Folds holder logins to lower case and refuses two that name the same login ignoring case. */
 const rolesFileV2Schema = rolesFileV2RawSchema.transform((file, ctx): RolesFile => {
   const holders: Record<string, string[]> = {};
-  for (const [key, names] of Object.entries(file.holders)) {
+  const slack: Record<string, string | undefined> = {};
+  for (const [key, entry] of Object.entries(file.holders)) {
     const parsed = githubLogin.safeParse(key);
     if (!parsed.success) {
       ctx.addIssue({ code: "custom", path: ["holders", key], message: `${JSON.stringify(key)} is not a GitHub login` });
@@ -248,10 +262,12 @@ const rolesFileV2Schema = rolesFileV2RawSchema.transform((file, ctx): RolesFile 
       ctx.addIssue({ code: "custom", path: ["holders", key], message: `${key} names the same login as another entry, ignoring case` });
       return z.NEVER;
     }
+    const names = Array.isArray(entry) ? entry : entry.roles;
     holders[login] = [...new Set(names)];
+    slack[login] = Array.isArray(entry) ? undefined : entry.slack;
   }
   const roles: Record<string, Role> = {};
-  for (const [login, names] of Object.entries(holders)) roles[login] = effectiveRole(names, file.roles);
+  for (const [login, names] of Object.entries(holders)) roles[login] = effectiveRole(names, file.roles, slack[login]);
   return { version: 2, roles, holders, definitions: file.roles };
 });
 

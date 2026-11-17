@@ -851,7 +851,14 @@ export const BACKLOG_WRITE_MIGRATIONS = [
 // an old row reads as no wait and never nudged.
 export const WAIT_BUDGET_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait_since INTEGER`, `ALTER TABLE bindings ADD COLUMN wait_nudged_at INTEGER`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS];
+// BB-354: when the plugin first offered Ask on Slack for the current typed
+// wait. Append-only and nullable beside `wait_nudged_at`: an old row reads as
+// never slacked, and Ask on Slack is offered at most once per wait (Keep
+// waiting does not re-arm it). A changed wait (kind or ref) resets it with the
+// rest of the wait clock.
+export const WAIT_SLACK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait_slacked_at INTEGER`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1093,6 +1100,8 @@ export type Binding = {
   waitSince: number | null;
   /** BB-351: when the plugin first found this wait overdue and nudged (or woke the steward), or null; at most once per wait. */
   waitNudgedAt: number | null;
+  /** BB-354: when the plugin first offered Ask on Slack for the current wait, or null; at most once per wait, and reset with the wait clock. */
+  waitSlackedAt: number | null;
   /** The latest reason per declining branch (BB-335), keyed by code; empty with none. Rides on the assessment row and is joined into the binding read, so no surface adds a store read. */
   nonActions: NonActions;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
@@ -1195,6 +1204,7 @@ function rowToBinding(r: BindingRow): Binding {
     wait: json(waitSchema.nullable(), str("wait"), null),
     waitSince: num("wait_since"),
     waitNudgedAt: num("wait_nudged_at"),
+    waitSlackedAt: num("wait_slacked_at"),
     nonActions: json(nonActionsSchema, str("assessment_non_actions"), {}),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
@@ -1274,6 +1284,7 @@ const COLUMNS = {
   wait: "wait",
   waitSince: "wait_since",
   waitNudgedAt: "wait_nudged_at",
+  waitSlackedAt: "wait_slacked_at",
   deployments: "deployments",
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",
@@ -2259,6 +2270,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const openNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? AND n.status = 'open' ORDER BY n.created_at");
   const allNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? ORDER BY n.created_at");
   const updateNeed = db.prepare("UPDATE needs SET what = ?, how = ?, data = ? WHERE id = ?");
+  const reopenNeedStmt = db.prepare("UPDATE needs SET status = 'open', resolution = NULL, resolved_at = NULL, what = ?, how = ?, data = ? WHERE id = ?");
   const closeNeedStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
   const closeNeedKindStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND status = 'open'");
   const closeNeedKeyStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open'");
@@ -3369,6 +3381,18 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const changed = closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
       if (changed > 0) projectChanged(projectIdForBinding(bindingId));
       return changed;
+    },
+    /**
+     * Reopen a closed need, replacing its wording and data (BB-354): used when
+     * an Ask on Slack could not find the person, so the owner gets the three
+     * original choices again with the tool's candidates named.
+     */
+    reopenNeed(id: string, fields: { what: string; how: string | null; data: Record<string, unknown> }): boolean {
+      const row = getNeed.get(id);
+      if (row === undefined) return false;
+      reopenNeedStmt.run(fields.what, fields.how, JSON.stringify(fields.data), id);
+      projectChanged(projectIdForBinding(String(row.binding_id)));
+      return true;
     },
     closeNeedByKey(bindingId: string, kind: NeedKind, url: string, resolution: string): number {
       const changed = closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;

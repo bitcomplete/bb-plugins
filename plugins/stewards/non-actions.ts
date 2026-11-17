@@ -52,6 +52,9 @@ export const NON_ACTION_CODES = [
   // The owner's two named cases.
   "binding-ended-closed",
   "needs-decline-closed",
+  // BB-354: an Ask on Slack that sent nothing (Slack unavailable, or the
+  // person not found).
+  "wait-slack-unsent",
 ] as const;
 
 export type NonActionCode = (typeof NON_ACTION_CODES)[number];
@@ -92,6 +95,7 @@ const NON_ACTION_TEXT: Record<NonActionCode, (detail: string | null, day: string
   "gate-not-met": (d) => `The merge gate${d === null ? "" : ` for ${d}`} is not met`,
   "binding-ended-closed": (d) => `Closed because the binding ended (${d ?? "ended"})`,
   "needs-decline-closed": (d) => `Closed the spec approval because the spec was declined${d === null ? "" : ` (${d})`}`,
+  "wait-slack-unsent": (d) => `Ask on Slack sent nothing: the person was not found or Slack was unavailable${d === null ? "" : ` (${d})`}`,
 };
 
 /** The UTC day (YYYY-MM-DD) a moment falls in, so a reason's date rolls at midnight UTC. */

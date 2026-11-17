@@ -754,6 +754,14 @@ describe("roles.json (BB-105)", () => {
     expect(roles({ jane: { ops: { alertmanager: { projects: [] } } } })).toMatchObject({ ok: false });
   });
 
+  it("parses an optional slack handle per holder, and still refuses an unknown key beside it (BB-354)", () => {
+    const parsed = roles({ jane: { projectSteward: true, slack: "jane-doe" }, bob: {} });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.roles["jane"]!.slack).toBe("jane-doe");
+    expect(parsed.value.roles["bob"]!.slack).toBeUndefined();
+    expect(roles({ jane: { slack: "jane", unknown: true } })).toMatchObject({ ok: false });
+  });
+
   it("rejects unknown keys, a bad version, and two keys naming one login ignoring case", () => {
     expect(roles({ jane: { projectSteward: true } }, { extra: true })).toMatchObject({ ok: false });
     expect(roles({ jane: { unknown: true } })).toMatchObject({ ok: false });
@@ -807,7 +815,7 @@ describe("roles.json (BB-105)", () => {
 });
 
 describe("roles.json version 2 (BB-163)", () => {
-  const v2 = (definitions: Record<string, unknown>, holders: Record<string, string[]>) => parseRolesFile(JSON.stringify({ version: 2, roles: definitions, holders }));
+  const v2 = (definitions: Record<string, unknown>, holders: Record<string, unknown>) => parseRolesFile(JSON.stringify({ version: 2, roles: definitions, holders }));
   const project = () => {
     const parsed = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "web-production" }] } }));
     if (!parsed.ok) throw new Error(parsed.error);
@@ -832,6 +840,19 @@ describe("roles.json version 2 (BB-163)", () => {
     expect(parsed.value.roles["bob"]!.projectSteward).toBe(false);
     expect(roleOpsTargets(parsed.value.roles["bob"]!)).toEqual(roleOpsTargets(role));
     expect(roleDepsTargets(parsed.value.roles["bob"]!, ["acme/web", "acme/other"])).toEqual(roleDepsTargets(role, ["acme/web", "acme/other"]));
+  });
+
+  it("parses a holder's slack field in the object form, keeps the array form, and refuses an unknown key beside it (BB-354)", () => {
+    const parsed = v2({ ops: {} }, { jane: { roles: ["ops", "projectSteward"], slack: "jane-doe" } });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.holders["jane"]).toEqual(["ops", "projectSteward"]);
+    expect(parsed.value.roles["jane"]!.slack).toBe("jane-doe");
+    // The array form still parses, with no slack.
+    const array = v2({ ops: {} }, { jane: ["ops"] });
+    if (!array.ok) throw new Error(array.error);
+    expect(array.value.roles["jane"]!.slack).toBeUndefined();
+    // Strict: an unknown key beside roles/slack is refused.
+    expect(v2({ ops: {} }, { jane: { roles: ["ops"], handle: "jane" } })).toMatchObject({ ok: false });
   });
 
   it("gives the same bindings, target keys and check result as the equivalent version 1 file", () => {

@@ -95,6 +95,7 @@ import { decideForPull, explainDecision, formatDecisionListing, globMatches, typ
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
+import { ASK_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackNameCandidates, waitSlackInstruction, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
@@ -144,7 +145,7 @@ import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPu
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
-import { WAIT_REFUSAL_MESSAGE, waitInputSchema, waitPhrase, waitSchema, validateWait, type Wait, type WaitContext } from "./wait.js";
+import { WAIT_REFUSAL_MESSAGE, waitInputSchema, waitPhrase, waitSchema, validateWait, type Wait, type WaitContext, type WaitKind } from "./wait.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
@@ -2152,6 +2153,78 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       readCounts.sourceCall();
       return rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
     };
+
+    // BB-354: whether this server can send a Slack DM, read from the Slack
+    // plugin's own `status` RPC. A missing plugin, a method that predates it or
+    // a disconnected server is "cannot send": the overdue need keeps the three
+    // original choices and nothing else changes.
+    const SLACK_STATUS_OUTPUT: z.ZodType<SlackStatus> = z
+      .object({
+        user: z.object({ id: z.string(), name: z.string() }).nullable(),
+        hooks: z.object({ configured: z.boolean(), connected: z.boolean() }),
+      })
+      .passthrough();
+    async function slackAvailable(): Promise<boolean> {
+      try {
+        return slackCanSend(await rpc<SlackStatus>(SLACK_PLUGIN_ID, "status", null, SLACK_STATUS_OUTPUT));
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * BB-354: the person an overdue wait is on, as a GitHub login or a Linear
+     * name. A `review` wait names the requested reviewer. A `person` wait names
+     * a page item: a delegate-approval escalation names the requested reviewer;
+     * any other item waits on the owner, so the owner is the person.
+     */
+    function slackPersonFor(b: Binding, wait: Wait, assessment: Assessment, config: ProjectConfig): SlackPerson {
+      if (wait.kind === "review") return { githubLogin: assessment.wait?.reviewers?.[0] ?? null, linearName: null };
+      const escalation = store.openEscalations(b.id).find((x) => x.id === wait.ref);
+      const delegate = escalation === undefined ? null : delegateWaitNames(escalation.meanwhile);
+      if (delegate !== null) return { githubLogin: delegate.split(",")[0]?.trim() ?? null, linearName: null };
+      return { githubLogin: config.githubLogin, linearName: config.linearLogin };
+    }
+
+    /** BB-354: the opener context a filed overdue need carries, or null when it offers no Slack choice. */
+    function waitSlackContextFromNeed(b: Binding, need: Need): WaitSlackContext | null {
+      const candidates = Array.isArray(need.data.waitSlackCandidates) ? need.data.waitSlackCandidates.filter((x): x is string => typeof x === "string") : [];
+      if (candidates.length === 0) return null;
+      const waitKind = typeof need.data.waitKind === "string" ? (need.data.waitKind as WaitKind) : "external";
+      const ref = typeof need.data.waitRef === "string" && need.data.waitRef !== "" ? need.data.waitRef : need.url;
+      const since = typeof need.data.waitSince === "number" ? need.data.waitSince : (b.waitSince ?? now());
+      return { waitKind, ref, entityKey: b.entityKey, url: b.url, since, candidates };
+    }
+
+    /**
+     * BB-354: reopen an overdue-wait decide item after Slack refused every
+     * candidate, with the three original choices and the names Slack returned.
+     * `waitSlackedAt` stays recorded, so Ask on Slack is not offered again for
+     * the same wait. Called by the `wait-slack-refused` CLI command.
+     */
+    function reopenWaitSlackNeed(needId: string, candidates: readonly string[]): { ok: boolean; message: string } {
+      const need = store.need(needId);
+      if (need === null) return { ok: false, message: "That item is gone." };
+      if (need.kind !== "decide" || need.data.waitBudget !== true) return { ok: false, message: "That item is not an overdue-wait decide item." };
+      const b = store.binding(need.bindingId);
+      if (b === null) return { ok: false, message: "That item's binding is gone." };
+      const named = candidates.map((c) => c.trim()).filter((c) => c !== "");
+      const line = named.length === 0 ? "Slack could not find the person and named no candidates." : `Slack could not find the person; it named: ${named.join(", ")}.`;
+      const how = `Choose what to do; Keep waiting resets the budget once. ${line} Add a \`slack\` field to the holder in stewards/roles.json, or pick another choice.`;
+      const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
+      delete data.waitSlackCandidates;
+      delete data.waitSince;
+      try {
+        store.reopenNeed(need.id, { what: need.what, how, data });
+      } catch {
+        return { ok: false, message: "Another open item already covers that wait, so it cannot be reopened." };
+      }
+      // BB-354: a send that did nothing is the usual non-action (BB-291).
+      store.recordNonAction(b.id, "wait-slack-unsent", named.length === 0 ? null : named.join(", "), now());
+      store.note(b.id, `Ask on Slack could not find the person for ${need.what}; the owner has the three original choices again.`);
+      scheduleReconcile(b.id);
+      return { ok: true, message: `Reopened ${need.id}; the owner has the three original choices again.` };
+    }
 
     // ---- push-notifications (BB-253) ----------------------------------------------------------------
     //
@@ -5287,18 +5360,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           b = store.patch(b.id, { waitNudgedAt: now() });
         } else if ((overdueWait.kind === "review" || overdueWait.kind === "person") && overdueBudget !== null && now() - b.waitNudgedAt > overdueBudget) {
           // `fileNeed` dedupes by (binding, kind, url) while open, so this
-          // files once and rewording later repeats.
-          store.fileNeed({
-            bindingId: b.id,
-            kind: "decide",
-            url: overdueWait.ref,
-            what: `The ${overdueWait.kind} wait on ${overdueWait.ref} is still open after a second budget.`,
-            how: "Choose what to do; Keep waiting resets the budget once.",
-            why: "The wait outlived two budgets, so it comes to the owner.",
-            data: { waitBudget: true, choices: [...WAIT_DECIDE_CHOICES], waitKind: overdueWait.kind, waitRef: overdueWait.ref },
-            filedBy: "plugin",
-          });
-          changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} outlived a second budget; the owner has a decide item.`, actionable: true });
+          // files once. An open item is left as it is, so the Slack status RPC
+          // is not asked again on every look.
+          const openWaitNeed = store.openNeeds(b.id).some((n) => n.kind === "decide" && n.data.waitBudget === true && n.url === overdueWait.ref);
+          if (!openWaitNeed) {
+            // BB-354: Ask on Slack is offered only when this server can send and
+            // this wait has not already been slacked; otherwise the three
+            // original choices are all that changes.
+            let candidates: string[] = [];
+            if (b.waitSlackedAt === null && (await slackAvailable())) candidates = slackNameCandidates(slackPersonFor(b, overdueWait, assessment, config), config.roles);
+            const data: Record<string, unknown> = {
+              waitBudget: true,
+              choices: candidates.length > 0 ? [...WAIT_DECIDE_CHOICES, ASK_ON_SLACK_CHOICE] : [...WAIT_DECIDE_CHOICES],
+              waitKind: overdueWait.kind,
+              waitRef: overdueWait.ref,
+            };
+            if (candidates.length > 0) {
+              data.waitSlackCandidates = candidates;
+              data.waitSince = b.waitSince;
+            }
+            store.fileNeed({
+              bindingId: b.id,
+              kind: "decide",
+              url: overdueWait.ref,
+              what: `The ${overdueWait.kind} wait on ${overdueWait.ref} is still open after a second budget.`,
+              how: "Choose what to do; Keep waiting resets the budget once.",
+              why: "The wait outlived two budgets, so it comes to the owner.",
+              data,
+              filedBy: "plugin",
+            });
+            changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} outlived a second budget; the owner has a decide item.`, actionable: true });
+            // BB-354: the offer is recorded on the binding, so Ask on Slack is
+            // offered at most once per wait; Keep waiting resets the budget but
+            // not this marker. A changed wait resets it with the wait clock.
+            if (candidates.length > 0) store.patch(b.id, { waitSlackedAt: now() });
+          }
         }
       }
       // BB-329: one worker-busy predicate. Every surface reads the assessment's
@@ -11471,29 +11567,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (choices.length === 0) return { ok: false, message: "That item has no choices; answer it in the text box." };
           if (!choices.includes(label)) return { ok: false, message: `"${label}" is not one of the choices: ${choices.join(", ")}.` };
           const guidance = text === null ? label : `${label} — ${text}`;
+          // BB-354: an Ask on Slack pick carries the tool call, the ordered
+          // candidates and the opener in the guidance, so the steward's next
+          // wake knows exactly what to send.
+          const slackContext = need.data.waitBudget === true && label === ASK_ON_SLACK_CHOICE ? waitSlackContextFromNeed(b, need) : null;
+          const effectiveGuidance = slackContext === null ? guidance : `${guidance} ${waitSlackInstruction(need.id, slackContext)}`;
           // A decide item the project steward forwarded is the escalation
           // itself, so resolving it delivers the answer to the originator.
           const ownEscalation = store.escalation(need.id);
           if (ownEscalation !== null && ownEscalation.status === "open") {
-            store.addGuidance(b.id, guidance, "user");
+            store.addGuidance(b.id, effectiveGuidance, "user");
             store.answerEscalation(need.id, `Chose: ${label}${text === null ? "" : ` — ${text}`}`, "user");
-            countCorrections(ownEscalation, guidance);
+            countCorrections(ownEscalation, effectiveGuidance);
           } else {
             store.closeNeedByKey(b.id, "decide", need.url, `Chose: ${label}${text === null ? "" : ` — ${text}`}`);
-            store.addGuidance(b.id, guidance, "user");
+            store.addGuidance(b.id, effectiveGuidance, "user");
             const escalationId = typeof need.data.escalationId === "string" ? need.data.escalationId : null;
             if (escalationId !== null) {
               const escalation = store.escalation(escalationId);
               if (escalation !== null && escalation.status === "open") {
-                store.answerEscalation(escalationId, guidance, "user");
-                countCorrections(escalation, guidance);
+                store.answerEscalation(escalationId, effectiveGuidance, "user");
+                countCorrections(escalation, effectiveGuidance);
               }
             }
           }
           // BB-351: an overdue-wait decide item resets the budget once it is
           // answered, so a new decide is not filed on the very next look and
-          // "Keep waiting" buys exactly one more budget.
+          // "Keep waiting" buys exactly one more budget. BB-354: the offer is
+          // recorded when the need is filed; the pick records it again, so a
+          // pick from a need filed before the wait changed still marks the new
+          // wait as slacked.
           if (need.data.waitBudget === true) store.patch(b.id, { waitNudgedAt: now() });
+          if (slackContext !== null) store.patch(b.id, { waitSlackedAt: now() });
           store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
           scheduleReconcile(b.id);
           await wakeProjectOnForwardedAnswer(b, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`, forwarded);
@@ -12456,7 +12561,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             requeueUntil: untilAt,
             // A report replaces the typed wait; a report without one clears it.
             wait,
-            ...(wait === null ? { waitSince: null, waitNudgedAt: null } : waitChanged || b.waitSince === null ? { waitSince: now(), waitNudgedAt: null } : {}),
+            ...(wait === null ? { waitSince: null, waitNudgedAt: null, waitSlackedAt: null } : waitChanged || b.waitSince === null ? { waitSince: now(), waitNudgedAt: null, waitSlackedAt: null } : {}),
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
@@ -14730,6 +14835,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
               const report = await gateReport(b, ref, pull);
               return { exitCode: report.gateMet ? 0 : 1, stdout: input.options.json === true ? JSON.stringify(report) : formatGateReport(report) };
+            },
+          }),
+
+          "wait-slack-refused": cliCommand({
+            summary: "Reopen an overdue-wait decide item with the three original choices after Slack refused the person (BB-354)",
+            description: "Run after `slack_start_conversation` refuses every candidate on an Ask on Slack pick. The item reopens with the three original choices and a line naming the candidates Slack returned, so the owner can add a `slack` field to the holder in stewards/roles.json or pick another choice. Ask on Slack is not offered again for the same wait.",
+            positionals: [{ name: "need", description: "The decide item id (need_…)", required: true }],
+            options: { candidates: { type: "string", description: "The candidates Slack returned, comma-separated" } },
+            async run(input) {
+              const candidates = (input.options.candidates ?? "")
+                .split(",")
+                .map((c) => c.trim())
+                .filter((c) => c !== "");
+              const result = reopenWaitSlackNeed(input.positionals.need ?? "", candidates);
+              if (!result.ok) throw new PluginCliError(result.message, { code: "wait_slack_refused" });
+              return { exitCode: 0, stdout: result.message };
             },
           }),
 

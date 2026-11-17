@@ -10,7 +10,7 @@ import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
 import { parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
-import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
+import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, needChoices, type Binding } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
 import { parseTemplateStamp, templateHash } from "./template-stamp.js";
 import { DEFAULT_ALERTMANAGER_URL } from "./alertmanager.js";
@@ -15628,6 +15628,133 @@ describe("the wait budget (BB-351)", () => {
     await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
     expect(b().waitSince).toBeGreaterThan(first);
     expect(b().waitNudgedAt).toBeNull();
+  });
+});
+
+// BB-354: an overdue review/person wait's decide need offers a fourth choice,
+// Ask on Slack, only when this server can send; the owner's pick wakes the
+// steward with the tool call and the opener, records wait_slacked_at, and a
+// changed wait offers it again. A refused name reopens the need with the three
+// original choices.
+describe("the Ask on Slack choice (BB-354)", () => {
+  const base = { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const };
+  const DAY = 86_400_000;
+  const HOUR = 3_600_000;
+  type World = Awaited<ReturnType<typeof setup>>;
+  const decideNeeds = (t: World, id: string) => t.hooks.store.openNeeds(id).filter((n) => n.kind === "decide" && n.data.waitBudget === true);
+  const slackOn = (t: World) => t.setSlackStatus({ user: { id: "U1", name: "dylan" }, hooks: { configured: true, connected: true } });
+
+  /** A bound ENG-12 with a review wait on a foreign pull requested from a person. */
+  async function reviewWait(reviewers: string[] = ["arashout"]) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }, { requestedReviewers: reviewers }));
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    expect(report.error).toBe(false);
+    return { t, steward, b: () => t.hooks.store.find("ENG-12")! };
+  }
+
+  it("offers Ask on Slack only when this server can send", async () => {
+    // The Slack plugin is absent (the default): the three original choices.
+    const off = await reviewWait();
+    off.t.advance(DAY + HOUR);
+    await off.t.hooks.reconcilePass("p1");
+    off.t.advance(DAY + HOUR);
+    await off.t.hooks.reconcilePass("p1");
+    expect(decideNeeds(off.t, off.b().id)[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+
+    // Slack installed, hooks configured and identity proved: the fourth choice.
+    const on = await reviewWait();
+    slackOn(on.t);
+    on.t.advance(DAY + HOUR);
+    await on.t.hooks.reconcilePass("p1");
+    on.t.advance(DAY + HOUR);
+    await on.t.hooks.reconcilePass("p1");
+    const need = decideNeeds(on.t, on.b().id)[0]!;
+    expect(need.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting", "Ask on Slack"]);
+    expect(need.data.waitSlackCandidates).toEqual(["arashout"]);
+  });
+
+  it("the owner's pick wakes the steward with the instruction and records wait_slacked_at", async () => {
+    const { t, steward, b } = await reviewWait();
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: true });
+    await t.flush();
+    expect(b().waitSlackedAt).not.toBeNull();
+    expect(b().guidance.some((g) => g.text.includes("slack_start_conversation") && g.text.includes('"arashout"'))).toBe(true);
+    const wake = t.sends.filter((s) => s.threadId === steward).slice(before).map((s) => s.text).join("\n");
+    expect(wake).toContain("slack_start_conversation");
+    expect(wake).toContain('"arashout"');
+    // The choice is not offered again on the same wait: a later budget files a
+    // need with the three original choices.
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const next = decideNeeds(t, b().id);
+    expect(next).toHaveLength(1);
+    expect(next[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+  });
+
+  it("a changed wait resets wait_slacked_at and offers Ask on Slack again", async () => {
+    const { t, steward, b } = await reviewWait();
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    expect(b().waitSlackedAt).not.toBeNull();
+    // A changed wait (a different kind) resets the marker with the wait clock.
+    await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
+    expect(b().waitSlackedAt).toBeNull();
+  });
+
+  it("Keep waiting does not re-arm Ask on Slack on the same wait", async () => {
+    const { t, b } = await reviewWait();
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    expect(need.data.choices).toContain("Ask on Slack");
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Keep waiting" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    // A later budget files the need again, but without the fourth choice.
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const next = decideNeeds(t, b().id);
+    expect(next).toHaveLength(1);
+    expect(next[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+  });
+
+  it("reopens the need with the three original choices when Slack refuses the person", async () => {
+    const { t, b } = await reviewWait();
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    const out = await t.harness.behavior.runCli(["wait-slack-refused", need.id, "--candidates", "arashout, Arash"]);
+    expect(out.exitCode).toBe(0);
+    const reopened = t.hooks.store.need(need.id)!;
+    expect(reopened.status).toBe("open");
+    expect(needChoices(reopened)).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    expect(reopened.how).toContain("arashout");
+    expect(reopened.how).toContain("Arash");
   });
 });
 
