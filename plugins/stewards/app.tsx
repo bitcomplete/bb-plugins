@@ -736,7 +736,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
       {s.waitingOn !== null && (s.waitingUntil === null || s.waitingUntil === undefined) ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
       {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
       {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
-      {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
+      {s.hold !== null ? <p className="text-muted-foreground">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
         <p key={i} className={x.route === "user" ? "text-destructive" : "text-muted-foreground"}>
           {x.kind} escalation with {x.route === "user" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: {x.question}
@@ -1311,6 +1311,7 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     delegateWait: s.delegateWait,
     statusActor: s.actor,
     statusNextAction: s.nextAction,
+    waitingOn: s.waitingOn,
     waitingUntil: s.waitingUntil,
     wait: s.wait,
     deployment: s.deployment,
@@ -1611,11 +1612,11 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
           {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
-          {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
+          {s.hold !== null ? <p className="text-muted-foreground">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.delegateWait !== null && s.delegateWait !== undefined ? (
             <p className="text-muted-foreground">Waiting on review from {s.delegateWait}</p>
           ) : delegateStuck !== null ? (
-            <p className="text-destructive">Stuck: {delegateStuck.why}</p>
+            <p className="text-muted-foreground">Stuck: {delegateStuck.why}</p>
           ) : null}
           {realStuck !== null ? <p className="text-destructive">Stuck: {realStuck.why}</p> : null}
           <p className="text-xs text-muted-foreground">

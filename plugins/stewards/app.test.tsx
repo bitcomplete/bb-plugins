@@ -1261,7 +1261,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
       stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "delegate", why: "Waiting on the requested reviewer: unreadable", since: 1 }],
     });
     const fallback = await waitFor(() => unparsed.getByText("Stuck: Waiting on the requested reviewer: unreadable"));
-    expect(fallback.className).toContain("text-destructive");
+    expect(fallback.className).toContain("text-muted-foreground");
     expect(unparsed.queryByText(/Waiting on review from/u)).toBeNull();
     unparsed.lifecycle.unmount();
   });

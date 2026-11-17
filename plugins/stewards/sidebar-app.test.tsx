@@ -1010,17 +1010,21 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  // BB-338: a delegate wait is blocked but names who it waits on.
-  it("reads a delegate wait as waiting on review from <names>, still blocked", async () => {
+  // BB-338/BB-348: a delegate wait alone is a quiet wait that names who it
+  // waits on; a real stuck escalation still reads stuck even when a delegate
+  // wait is open, because a red row says why it is red.
+  it("reads a quiet delegate wait as waiting on review from <names>, and a stuck one as stuck", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_d", displayTitle: "ENG-1: D" })] },
+      sidebarThreads: { projects, threads: [thread({ id: "thr_d", displayTitle: "ENG-1: D" }), thread({ id: "thr_s", displayTitle: "ENG-2: S" })] },
       rpc: {
-        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_d", stuck: true, delegateWait: "arashout" })] }),
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "ENG-1", threadId: "thr_d", delegateWait: "arashout" }), binding({ key: "ENG-2", threadId: "thr_s", stuck: true, delegateWait: "arashout" })] }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText("D")).toBeTruthy());
     expect(lineTwo(slot, "D")).toContain("waiting on review from arashout");
-    expect(glyphOf(slot, "D")).toBe("blocked");
+    expect(glyphOf(slot, "D")).toBe("quiet");
+    expect(lineTwo(slot, "S")).toBe("ticket · stuck");
+    expect(glyphOf(slot, "S")).toBe("blocked");
     slot.lifecycle.unmount();
   });
 

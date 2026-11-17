@@ -481,7 +481,8 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "d", hold: "a freeze" }))).toBe("on hold");
     // 4. stuck; a delegate wait names who it waits on (BB-338)
     expect(effortPhrase(effort({ key: "e", stuck: true }))).toBe("stuck");
-    expect(effortPhrase(effort({ key: "e2", stuck: true, delegateWait: "arashout" }))).toBe("waiting on review from arashout");
+    expect(effortPhrase(effort({ key: "e2", stuck: true, delegateWait: "arashout" }))).toBe("stuck");
+    expect(effortPhrase(effort({ key: "e3", delegateWait: "arashout" }))).toBe("waiting on review from arashout");
     expect(effortState(effort({ key: "e2", stuck: true, delegateWait: "arashout" }))).toBe("blocked");
     // 5. running workers, before the deployment watch and the free-text
     // nextAction, so a waiting effort with a running worker reads the count (BB-81).
@@ -506,16 +507,17 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
   });
 
-  // BB-154: the mark reads on line two, ahead of the deployment phrase and the
-  // free-text nextAction, which can look live when nothing will deliver the wait.
-  it("reads waiting, no wake source while marked, after a more specific phrase", () => {
+  // BB-154/BB-348: the mark is red, so it reads right after `stuck`, ahead of
+  // the quiet phrases (a running worker, a lost hand-off) and the deployment
+  // phrase and free-text nextAction, which can look live when nothing will
+  // deliver the wait.
+  it("reads waiting, no wake source as a red phrase, ahead of the quiet ones", () => {
     expect(effortPhrase(effort({ key: "w", noWakeSource: true, waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
     expect(effortPhrase(effort({ key: "w2", noWakeSource: true, deployment: "deployed", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
-    // A running worker is a live source, so the count still wins.
-    expect(effortPhrase(effort({ key: "w3", noWakeSource: true, runningWorkers: 1 }))).toBe("1 worker running");
-    // A lost hand-off is more specific and sits ahead of the mark.
+    // Red outranks a running worker and a lost hand-off.
+    expect(effortPhrase(effort({ key: "w3", noWakeSource: true, runningWorkers: 1 }))).toBe("waiting, no wake source");
     const finished = [{ threadId: "thr_w", title: "Implement", status: "finished" }];
-    expect(effortPhrase(effort({ key: "w4", noWakeSource: true, waitingOn: "Implement", workers: finished }))).toBe("hand-off lost: worker finished");
+    expect(effortPhrase(effort({ key: "w4", noWakeSource: true, waitingOn: "Implement", workers: finished }))).toBe("waiting, no wake source");
     // Unmarked still reads the next action verbatim.
     expect(effortPhrase(effort({ key: "w5", waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("the vendor");
   });

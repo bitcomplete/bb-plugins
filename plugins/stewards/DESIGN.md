@@ -1931,18 +1931,18 @@ thread-briefs ring at all: the single off switch leaves every steward thread
 with no brief, so this list's own glyph is the only one they draw.
 
 **The status phrase (BB-76, BB-109, BB-348).** First match wins: `needs you`;
-`wake failed: <reason>` (BB-255); `waiting on review from <names>` when a
-delegate wait names its requested reviewers (BB-338 — a wait, not a failure,
-so it reads ahead of the other quiet phrases); `held behind <holdBehind keys>`
-when `holdBehind` is non-empty, else `on hold`; `stuck` for an open stuck
-escalation; `N worker(s) running` counting only workers whose worker-table
-status is `running` (a busy steward or reviewer with no running worker falls
-through, rather than reading `0 workers running`); the lost hand-off when
-`waitingOn` names a finished worker or a loud hand-off note is pending
-(BB-152); `worker finished, next look <time>` when the binding has a pending
-quiet worker-finish note and no running worker (BB-83 — the status summary a
-finished worker left behind must not keep the row, and the time is the
-binding's `requeueAt`); `waiting, no wake source` (BB-154); a dated wait as
+`wake failed: <reason>` (BB-255); `stuck` for an open stuck escalation;
+`waiting, no wake source` (BB-154); `waiting on review from <names>` when a
+delegate wait names its requested reviewers (BB-338 — a wait, not a failure, so
+it reads after the red phrases and ahead of the other quiet ones); `held behind
+<holdBehind keys>` when `holdBehind` is non-empty, else `on hold`; `N worker(s)
+running` counting only workers whose worker-table status is `running` (a busy
+steward or reviewer with no running worker falls through, rather than reading
+`0 workers running`); the lost hand-off when `waitingOn` names a finished
+worker or a loud hand-off note is pending (BB-152); `worker finished, next look
+<time>` when the binding has a pending quiet worker-finish note and no running
+worker (BB-83 — the status summary a finished worker left behind must not keep
+the row, and the time is the binding's `requeueAt`); a dated wait as
 `waiting on <text> until <date>` (BB-247); the newest deployment watch's state
 (`deploying`, `deployed`, `deploy failed`), ahead of the free-text `nextAction`
 whatever the actor (BB-86); the status `nextAction` verbatim, with `the other

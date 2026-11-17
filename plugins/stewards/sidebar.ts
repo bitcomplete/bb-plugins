@@ -409,11 +409,13 @@ export const waitingUntilDate = (at: number): string => new Date(at).toISOString
 
 /**
  * Line two's status phrase, first match wins (BB-76, BB-86, BB-83, BB-152,
- * BB-348): needs you › wake failure › delegate wait › hold › stuck › running ›
- * lost hand-off › quiet worker finish › no wake source › deployment ›
- * nextAction › no report. The delegate wait (BB-338) is a wait, not a failure,
- * so it reads `waiting on review from <names>` from `delegateWait` alone, ahead
- * of the other quiet phrases. The free-text `waitingOn` is not a prefix
+ * BB-348): needs you › wake failure › stuck › no wake source › delegate wait ›
+ * hold › running › lost hand-off › quiet worker finish › dated wait ›
+ * deployment › nextAction › no report. Red comes first: a red row says why it
+ * is red, so a real `stuck` escalation and a no-wake-source wait outrank the
+ * quiet delegate-wait and hold phrases. The delegate wait (BB-338) is a wait,
+ * not a failure, so it reads `waiting on review from <names>` from
+ * `delegateWait` alone. The free-text `waitingOn` is not a prefix
  * (BB-109): a running worker reads the count, and otherwise the `nextAction`
  * reads verbatim, whatever the actor. `the other party` only stands in when
  * there is no report at all.
@@ -432,12 +434,13 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   // BB-255: a wake that could not be delivered outranks the `stuck` escalation
   // it filed, so the row says why it is stuck rather than just that it is.
   if (e.wakeFailure !== null && e.wakeFailure !== undefined && e.wakeFailure !== "") return `wake failed: ${e.wakeFailure}`;
-  // BB-348: a delegate wait is a wait, not a failure, so it reads its own
-  // phrase ahead of the other quiet ones, whether or not a real `stuck` is
-  // also open.
+  // BB-348: red first — a red row says why it is red, so a real `stuck`
+  // escalation and a no-wake-source wait outrank the quiet delegate-wait and
+  // hold phrases.
+  if (e.stuck) return "stuck";
+  if (e.noWakeSource) return "waiting, no wake source";
   if (e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "") return `waiting on review from ${e.delegateWait}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
-  if (e.stuck) return "stuck";
   // A running worker or reviewer paints the blue ring, but the count is of
   // running workers: a busy steward or reviewer with no running worker falls
   // through rather than reading "0 workers running". A wait on someone else
@@ -451,10 +454,6 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? []) || e.pending.some(isLostHandoffNote);
   if (lostHandoff) return e.requeueAt === null ? "hand-off lost: worker finished" : `hand-off lost: worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
-  // BB-154: a free-text wait with no structured source reads so on line two,
-  // ahead of the deployment phrase and the next action, which can look live
-  // when nothing the plugin tracks will deliver the wait.
-  if (e.noWakeSource) return "waiting, no wake source";
   // BB-247: a dated wait reads its date, so the row says when the plugin will
   // wake the steward even though nothing else is live on the binding.
   if (e.waitingUntil !== null && e.waitingUntil !== undefined && e.waitingOn !== null && e.waitingOn !== undefined && e.waitingOn !== "") {
