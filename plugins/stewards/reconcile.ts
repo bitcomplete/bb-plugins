@@ -560,6 +560,18 @@ export function diffObserved(before: Observed, after: Observed, ctx: ObservedDif
 }
 
 /**
+ * A `waitingOn` that names the user, the owner or a human. Retained for a
+ * typed wait that is not a valid `person` wait (an `external` wait, or a
+ * `person` ref the plugin could not resolve) and for a no-kind report: naming
+ * one of them without an open `needs` item is refused, because the item is
+ * what puts the ask on the Stewards page. A valid `person` wait is the
+ * structured replacement and bypasses it (BB-333).
+ */
+export function mentionsOwnerOrUser(text: string): boolean {
+  return /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(text);
+}
+
+/**
  * A steward that asks for an approval that is already open. The plugin files
  * the request and lists it on the Stewards page, so the playbook says not to
  * ask the user again; a report whose next action is to ask them anyway is a

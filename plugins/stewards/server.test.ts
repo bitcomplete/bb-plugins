@@ -15402,6 +15402,31 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     expect(after.status?.resources.pullRequests ?? []).not.toContain("acme/web#430");
   });
 
+  it("does not wake on a re-pointed ref, a kind switch or a failed read (BB-333)", async () => {
+    const { t, steward } = await ticket();
+    const waitedWakes = () => t.sends.filter((s) => s.threadId === steward && s.text.includes("The waited pull")).length;
+    t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "date", ref: "2027-07-01" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    // A kind switch to a pull wait has no prior fingerprint for the ref, so it
+    // must not read as a change.
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+    // Re-pointing the wait at an unchanged, different ref is not a change on
+    // the first ref.
+    t.entities.set("acme/web#431", pull({ id: "acme/web#431", key: "acme/web#431", url: "https://github.com/acme/web/pull/431", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#431 checks", wait: { kind: "pull", ref: "acme/web#431" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+    // A failed read (the ref is gone) and its recovery are not changes either.
+    t.entities.delete("acme/web#431");
+    await t.hooks.reconcilePass("p1");
+    t.entities.set("acme/web#431", pull({ id: "acme/web#431", key: "acme/web#431", url: "https://github.com/acme/web/pull/431", state: "open" }));
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+  });
+
   it("a date wait with only a ref sets requeueUntil and is not a stall (BB-333)", async () => {
     const { t, steward } = await ticket();
     const report = await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "date", ref: "2027-07-01" } }, steward);

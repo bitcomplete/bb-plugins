@@ -106,7 +106,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
@@ -3259,6 +3259,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether two stored waited-ref fingerprints name the same pull request
+     * (BB-333). A fingerprint that does not parse, or names no key, is not the
+     * same ref, so a change in either cannot be read as the other's.
+     */
+    function sameWaitedRef(a: string, b: string): boolean {
+      const key = (fp: string): string | null => {
+        try {
+          const parsed = JSON.parse(fp) as { key?: unknown };
+          return typeof parsed.key === "string" ? parsed.key : null;
+        } catch {
+          return null;
+        }
+      };
+      const ka = key(a);
+      return ka !== null && ka === key(b);
+    }
+
+    /**
      * Read the binding's waited pull/review refs fresh, one source read each,
      * under the linked-pull ceiling (BB-333). A ref already in the look's linked
      * pulls is reused without a read, so it never adds one. Returns them keyed
@@ -5232,24 +5250,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // absent assessment fails closed.
       // BB-333: a change on a leased pull/review ref now wakes the binding. The
       // waited ref is not in the observed snapshot, so the transition is read
-      // from the previous look's stored fingerprint against this look's. A
-      // first look after the wait was reported has no prior boolean, so it does
-      // not wake.
+      // from the previous look's stored fingerprint against this look's. Only
+      // two fingerprints of the same ref can move: a re-pointed ref, a kind
+      // switch, a failed read and the first look after the rollout leave the
+      // pair unusable and stay quiet.
       const waitedKind = b.wait?.kind ?? null;
-      const priorLiveness =
+      const priorWaited =
         waitedKind === "pull" || waitedKind === "review"
-          ? (store.assessment(b.id)?.liveness as { waitLive?: boolean | null; waited?: string | null } | null | undefined)
-          : undefined;
-      const priorWaitLive = typeof priorLiveness?.waitLive === "boolean" ? priorLiveness.waitLive : null;
-      const priorWaited = priorWaitLive === null ? null : (priorLiveness?.waited ?? null);
+          ? ((store.assessment(b.id)?.liveness as { waited?: string | null } | null | undefined)?.waited ?? null)
+          : null;
       let assessment: Assessment | null = null;
       try {
         assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
       } catch (error) {
         bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
       }
-      if ((waitedKind === "pull" || waitedKind === "review") && priorWaitLive !== null && assessment !== null && assessment.liveness.waited !== priorWaited) {
-        changes.push({ text: `The waited ${waitedKind} ${b.wait?.ref ?? ""} changed`, actionable: true });
+      if (waitedKind === "pull" || waitedKind === "review") {
+        const nowWaited = assessment?.liveness.waited ?? null;
+        if (priorWaited !== null && nowWaited !== null && sameWaitedRef(priorWaited, nowWaited) && priorWaited !== nowWaited) {
+          changes.push({ text: `The waited ${waitedKind} ${b.wait?.ref ?? ""} changed`, actionable: true });
+        }
       }
       // BB-329: one worker-busy predicate. Every surface reads the assessment's
       // worker state (assessment.ts `assessWorker`); the old `anyWorkerInFlight`
@@ -12283,8 +12303,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // not resolve) and a no-kind report still may not name the owner
           // with nothing filed (BB-213).
           const personWait = wait !== null && wait.kind === "person";
-          const namesOwner = waitingOn !== null && /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(waitingOn);
-          if (!personWait && namesOwner && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
+          if (!personWait && waitingOn !== null && mentionsOwnerOrUser(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
                 `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,

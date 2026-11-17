@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, mentionsOwnerOrUser, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, classifyApproval, ownerApproval, prGate, productReason, projectApprovalMarker, reviewMarker, reviewWorkerThread, UNREADABLE_VERDICT, type ProjectApprovalRecord } from "./gate.js";
 import { approvalWanted, gateState, resolveChecklistItem } from "./ready-gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
@@ -981,6 +981,20 @@ describe("the pull request gate (build-tickets)", () => {
     expect(ownerApproval(pull({ comments: [decline] })).approved).toBe(false);
     // An unframed approving note by the owner still approves, as before.
     expect(ownerApproval(pull({ comments: [comment({ id: "a1", author: "jane", body: "Looks good, but add a test first", signedBy: null, createdAt: "2026-10-14T18:00:00Z" })] })).approved).toBe(true);
+  });
+});
+
+describe("a waitingOn naming the user", () => {
+  // BB-333: the exported name is retired, but the guard is live for an
+  // `external`/no-kind report; its word boundaries stay pinned.
+  it("matches user/owner/human as a word, not inside another word", () => {
+    expect(mentionsOwnerOrUser("the user's answer on scope")).toBe(true);
+    expect(mentionsOwnerOrUser("the owner's approval")).toBe(true);
+    expect(mentionsOwnerOrUser("a human has to install it")).toBe(true);
+    expect(mentionsOwnerOrUser("the username is wrong")).toBe(false);
+    expect(mentionsOwnerOrUser("ownerless")).toBe(false);
+    expect(mentionsOwnerOrUser("the project steward's call")).toBe(false);
+    expect(mentionsOwnerOrUser("sam's review")).toBe(false);
   });
 });
 
