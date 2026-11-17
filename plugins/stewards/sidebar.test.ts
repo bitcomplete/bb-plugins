@@ -729,7 +729,7 @@ describe("stewards sidebar Waiting section (BB-348)", () => {
   });
 
   it("demotes a waiting parent to In flight when a nested child is live, and only then", () => {
-    const build = (child: { workers?: { threadId: string; title: string; status: string }[]; waitingOn?: string | null; waitingUntil?: number | null; stuck?: boolean }) =>
+    const build = (child: { workers?: { threadId: string; title: string; status: string }[]; waitingOn?: string | null; waitingUntil?: number | null; needsUser?: boolean }) =>
       buildSidebar({
         projects: [project({ id: "p1" })],
         threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Parent work" }), thread({ id: "thr_child" })],
@@ -754,9 +754,9 @@ describe("stewards sidebar Waiting section (BB-348)", () => {
     const allWaiting = build({ waitingOn: "a date", waitingUntil: ahead });
     expect(allWaiting.waiting.map((e) => e.key)).toEqual(["ENG-1"]);
     expect(allWaiting.efforts).toHaveLength(0);
-    // A stuck nested child demotes the parent and keeps its flat Blocked
+    // A needs-you nested child demotes the parent and keeps its flat Blocked
     // duplicate, so a collapsed parent hides nothing that needs the user.
-    const blocked = build({ stuck: true });
+    const blocked = build({ needsUser: true });
     expect(blocked.waiting).toHaveLength(0);
     expect(blocked.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
     expect(blocked.blocked.map((e) => e.key)).toEqual(["ENG-2"]);
