@@ -108,6 +108,9 @@ describe("every plugin-composed item reads in three plain parts", () => {
     expect(readabilityProblems({ need: auto.what, context: auto.how, why: auto.why })).toEqual([]);
     const lesson = lessonDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", boundary: true, retire: false, branch: "guidance-x", prUrl: "https://github.com/acme/web/pull/9" });
     expect(readabilityProblems({ need: lesson.what, context: lesson.how, why: lesson.why })).toEqual([]);
+    const retired = lessonDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", boundary: true, retire: true, branch: "guidance-x", prUrl: "https://github.com/acme/web/pull/9" });
+    expect(retired.how).toMatch(/nightly pass retired/u);
+    expect(readabilityProblems({ need: retired.what, context: retired.how, why: retired.why })).toEqual([]);
     const mixed = mixedEvidenceDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", hits: 4, corrections: 1 });
     expect(readabilityProblems({ need: mixed.what, context: mixed.how, why: mixed.why })).toEqual([]);
     const refresh = playbookRefreshQuestionParts({ playbook: "linear-tickets", templateName: "linear-tickets", pr: "https://github.com/acme/web/pull/9", additive: false, removals: 2 });
@@ -118,14 +121,18 @@ describe("every plugin-composed item reads in three plain parts", () => {
 
   it("an approve-pr why reflects the gate, not just the decide list", () => {
     const winner = { text: "Identity and access", decide: "user" as const, files: ["x"] };
+    const projectWinner = { text: "A store migration", decide: "project" as const, files: ["x"] };
     expect(approvePrWhy({ product: true, escalated: false, explanation: explanation({ winner }) })).toMatch(/substantial and references no ticket/u);
-    expect(approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner: { text: "A store migration", decide: "project", files: ["x"] } }) })).toMatch(/reviewer escalated/u);
+    // Escalated only overrides a project mark; a user winner still names the entry.
+    expect(approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner: projectWinner, mark: "project" }) })).toMatch(/reviewer escalated/u);
+    expect(approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner }) })).toMatch(/Identity and access/u);
     expect(approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner }) })).toMatch(/Identity and access/u);
     expect(approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner: null }) })).toMatch(/No decide-list entry/u);
     expect(approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner: null, selfWidening: true }) })).toMatch(/touches the decide list/u);
     expect(approvePrWhy({ product: false, escalated: false, explanation: null })).toMatch(/No decide-list entry/u);
     for (const why of [
       approvePrWhy({ product: true, escalated: false, explanation: explanation({ winner }) }),
+      approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner: projectWinner, mark: "project" }) }),
       approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner }) }),
       approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner: null }) }),
     ]) {

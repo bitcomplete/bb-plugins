@@ -74,12 +74,14 @@ export function decisionWhy(explanation: DecisionExplanation): string {
  */
 export function approvePrWhy(input: { product: boolean; escalated: boolean; explanation: DecisionExplanation | null }): string {
   if (input.product) return "This pull request is substantial and references no ticket with an approved spec, so its product decision is yours.";
-  if (input.escalated) return "The reviewer escalated this pull request to you; a project-steward approval does not meet the gate.";
   const e = input.explanation;
-  if (e === null || e.unreadable || e.winner === null) {
-    if (e !== null && e.selfWidening) return "The change touches the decide list or the code that enforces it, so it is yours to approve.";
-    return "No decide-list entry places this pull request, so it is yours to approve.";
-  }
+  if (e === null || e.unreadable) return "No decide-list entry places this pull request, so it is yours to approve.";
+  if (e.selfWidening) return "The change touches the decide list or the code that enforces it, so it is yours to approve.";
+  // A marker says `approver=owner` on every round the decide list makes the
+  // owner's, so the escalated branch is only right when the decide list alone
+  // would leave it to the project steward (BB-345).
+  if (input.escalated && e.mark === "project") return "The reviewer escalated this pull request to you; a project-steward approval does not meet the gate.";
+  if (e.winner === null || e.winner.decide === "project") return "No decide-list entry places this pull request, so it is yours to approve.";
   return `The decide list marks this the user's: ${e.winner.text}.`;
 }
 
@@ -146,9 +148,11 @@ export function autoDecideParts(nextAction: string | null): { what: string; how:
 /** The one line, context, why and details of a lesson review/retire decide item. */
 export function lessonDecideParts(input: { file: string; lessonText: string; boundary: boolean; retire: boolean; branch: string | null; prUrl: string | null }): { what: string; how: string; why: string; details: string } {
   const what = clampNeedLine(`${input.retire ? "Retire" : "Review"} the lesson for ${input.file}`);
-  const how = input.boundary
-    ? "A general rule that changes its own escalation boundary: only you may make it permanent. Review merges the pull request; Drop discards the lesson."
-    : "A general rule for a file the decide list makes yours. Review merges the pull request; Drop discards the lesson.";
+  const how = input.retire
+    ? `The nightly pass retired this lesson, so removing its anchored text${input.boundary ? " also changes the boundary and" : ""} only you may make permanent. Review merges its removal; Drop discards the lesson.`
+    : input.boundary
+      ? "A general rule that changes its own escalation boundary: only you may make it permanent. Review merges the pull request; Drop discards the lesson."
+      : "A general rule for a file the decide list makes yours. Review merges the pull request; Drop discards the lesson.";
   const why = input.boundary ? "Boundary lessons are always yours to make permanent." : "The decide list makes this file yours to change.";
   const details = [
     `Lesson: ${input.lessonText}`,
@@ -186,22 +190,29 @@ export function adoptionNeedLine(ticketKey: string, repo: string, severities: re
 export function playbookRefreshQuestionParts(input: { playbook: string; templateName: string; pr: string | null; additive: boolean; removals: number }): { question: string; context: string; why: string; details: string } {
   const question = clampNeedLine(`Refresh the ${input.playbook} playbook from ${input.templateName}?`);
   const context = "Review the refresh pull request and merge it, or drop it.";
-  const why = input.additive ? "The refresh is yours to land because it touches a file outside the project steward's authority." : "This refresh is not purely additive, so it is yours to review.";
+  const why = input.additive ? "Your project steward forwarded this refresh to you rather than merging it itself." : "This refresh is not purely additive, so it is yours to review.";
   const details = `The refresh pull request ${input.pr ?? "(none)"} is ${input.additive ? "purely additive" : "not purely additive"}${input.removals === 0 ? "" : `; it removes or rewrites ${input.removals} line(s)`}.`;
   return { question, context, why, details };
 }
 
 /**
- * The shown parts of the repeated-objection question: a short ask, the first
- * objection as context, why it reached the user, and the objections in
- * Details (BB-345).
+ * The shown parts of the repeated-objection question: a short ask, the current
+ * objection (clipped) as context, why it reached the user, and the full
+ * objections in Details (BB-345).
  */
 export function repeatedObjectionQuestionParts(input: { key: string; objections: string[]; previous: string[] }): { question: string; context: string; why: string; details: string } {
   const question = clampNeedLine(`Decide ${input.key}'s spec after two declines on the same objection`);
-  const context = "The revision did not answer the objection, so a third round would only repeat it.";
+  const context = `The revision did not answer ${clipWords(input.objections.join("; "), 40)}, so a third round would only repeat it.`;
   const why = "The same objection came back after a revision, so it is yours to decide.";
   const details = `First declined on: ${input.previous.join("; ")}.\n\nCurrent objection: ${input.objections.join("; ")}.`;
   return { question, context, why, details };
+}
+
+/** Collapse whitespace and clip `text` to at most `max` words, adding an ellipsis. */
+export function clipWords(text: string, max: number): string {
+  const one = cleanInline(text);
+  const words = one.split(" ").filter((w) => w !== "");
+  return words.length <= max ? one : `${words.slice(0, max).join(" ")}…`;
 }
 
 /** One problem with a shown part, or null when it is readable. */
