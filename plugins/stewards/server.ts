@@ -2210,6 +2210,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const how = "Choose what to do; Keep waiting resets the budget once. The Slack send reported no result. Add a `slack` field to the holder in stewards/roles.json, or pick another choice.";
       const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
       delete data.waitSlackSending;
+      delete data.waitSlackPickedAt;
       delete data.waitSlackCandidates;
       delete data.waitSince;
       try {
@@ -2253,6 +2254,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
       delete data.waitSlackCandidates;
       delete data.waitSlackSending;
+      delete data.waitSlackPickedAt;
       delete data.waitSince;
       try {
         store.reopenNeed(need.id, { what: need.what, how, data });
@@ -11643,7 +11645,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               how: `Sending the DM; the steward's turn is under way. ${waitSlackInstruction(need.id, slackContext)}`,
               why: need.why,
               details: need.details,
-              data: { ...need.data, waitSlackSending: true },
+              data: { ...need.data, waitSlackSending: true, waitSlackPickedAt: now() },
               filedBy: "plugin",
             });
             store.addGuidance(b.id, effectiveGuidance, "user");
@@ -12661,7 +12663,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // result (an interrupted turn, a skipped command, or an uncovered
           // tool error) would trap the owner and block BB-351's later needs;
           // the report is the safety net that puts the three choices back.
-          for (const sending of store.openNeeds(b.id).filter((n) => n.data.waitSlackSending === true)) revertSendingSlackNeed(sending);
+          // Only a turn woken at or after the pick is that turn: a report from
+          // a turn that was already running when the owner clicked must not
+          // revert the item the next turn is about to send.
+          for (const sending of store.openNeeds(b.id).filter(
+            (n) => n.data.waitSlackSending === true && typeof n.data.waitSlackPickedAt === "number" && b.wokeAt !== null && b.wokeAt >= n.data.waitSlackPickedAt,
+          )) {
+            revertSendingSlackNeed(sending);
+          }
           // BB-333: a changed typed wait changes the github lease (a `pull`/
           // `review` ref joins or leaves it). This report may not run a
           // reconcile that notices, so push the interest set here.

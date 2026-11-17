@@ -15804,6 +15804,21 @@ describe("the Ask on Slack choice (BB-354)", () => {
     expect(needChoices(reverted)).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
     expect(b().nonActions["wait-slack-unsent"]).toBeDefined();
   });
+
+  it("does not revert a sending item for a turn woken before the pick", async () => {
+    const { t, steward, b } = await reviewWait();
+    slackOn(t);
+    const need = await secondBudgetNeed(t, b().id);
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    // The owner clicked while the steward's turn was already running: the
+    // reporting turn was woken before the pick, so its report must not revert
+    // the item the next turn is about to send.
+    const pickedAt = t.hooks.store.need(need.id)!.data.waitSlackPickedAt as number;
+    t.hooks.store.patch(b().id, { wokeAt: pickedAt - 60_000 });
+    await t.tool("steward_report", { ...base }, steward);
+    expect(t.hooks.store.need(need.id)!.data.waitSlackSending).toBe(true);
+  });
 });
 
 describe("mechanical status and quiet notes (BB-203)", () => {
