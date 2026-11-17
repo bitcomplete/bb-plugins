@@ -560,16 +560,6 @@ export function diffObserved(before: Observed, after: Observed, ctx: ObservedDif
 }
 
 /**
- * A `waitingOn` that names the user, the owner or a human. A status record
- * naming one of them without an open `needs` item is refused: the item is what
- * puts the ask on the Stewards page (BB-109 keeps the refusal for `waitingOn`).
- */
-export function namesUserAsBlocker(text: string): boolean {
-  return /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(text);
-}
-
-
-/**
  * A steward that asks for an approval that is already open. The plugin files
  * the request and lists it on the Stewards page, so the playbook says not to
  * ask the user again; a report whose next action is to ask them anyway is a
@@ -647,17 +637,6 @@ export function gateKnownUnmet(playbook: Playbook, ready: ReadyState, currentSpe
   if (gate.passed) return false;
   if (gate.approvalNeeded && (!gate.approved || gate.approvalStale)) return true;
   return gate.unmet.some((item) => reportedItem(ready, item)?.met === false);
-}
-
-/**
- * A status that says it waits on the project steward or the user while
- * none of its escalations is open: a wait nobody above it hears about.
- */
-export function unheardWait(status: Binding["status"], open: readonly Escalation[], needs: readonly Pick<Need, "kind">[] = []): string | null {
-  if (status === null || status.waitingOn === null || open.length > 0 || needs.length > 0) return null;
-  if (/project steward/iu.test(status.waitingOn)) return "waits on the project steward, with no open escalation";
-  if (/\buser\b/iu.test(status.waitingOn)) return "waits on the user, with no open escalation";
-  return null;
 }
 
 // ---- idle in an active stage (BB-83) --------------------------------------------

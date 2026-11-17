@@ -266,28 +266,42 @@ Two tools are yours; everything else you do with the tools every thread has.
   flagged in `bb stewards list` and the digest. A `waitingOn` naming the
   user, the owner or a human is refused unless an open needs item says so:
   raise it with `steward_report { escalate }` (or file a gate item) instead
-  of only saying it. `waitingOn` stays for third parties. It never marks the
-  effort blocked: a hold, an open `stuck` escalation or a needs item does
-  (BB-109). The old name `blockedOn` is accepted as an alias for one
-  release.
-- **A wait with no wake source, and a stall (BB-154).** Every wait the
-  plugin understands is structured and has a clock it tracks: a
-  `holdBehind`, a deployment watch, a running worker, an open escalation or
-  need, a watched pull request. A free-text `waitingOn` beside them can name
-  something nothing will ever deliver. When you report a wait and none of
-  those sources is live, the binding is marked `noWakeSource`: the row and
-  `bb stewards list`/`show` read `waiting, no wake source`, and the report
-  reply itself flags it and tells you to name what will deliver the wait in
-  that same turn — a binding to hold behind (`steward_update { hold,
-  behind }`), a typed `wait`, or a dated `until` — not at the next wake. If
-  the free text names an open binding in the same project, the reply names
-  it and the exact `hold, behind` call. Clear the mark by
-  adding a real source or clearing the wait. If you wake by `requeue` twice
-  in a row with the same wait and no source, the plugin raises one `stall`
-  escalation to the project steward naming the binding, the wait, when you
-  first reported it and the wake count. A wake for another reason, a changed
-  wait or a new source resets the count, and a stall already open is not
-  raised again.
+  of only saying it. The structured form is a typed `wait: { kind: "person",
+  ref: "need_…" }` on an open page item (a `need_`, `esc_` or `qst_` id):
+  the item itself is what reaches the page, so it passes the refusal.
+  `waitingOn` stays for third parties. It never marks the effort blocked: a
+  hold, an open `stuck` escalation or a needs item does (BB-109). The old
+  name `blockedOn` is accepted as an alias for one release.
+- **A wait with no wake source, and a stall (BB-154, BB-333).** A wait is
+  typed: `wait: { kind, ref }` with a closed kind set — `pull` and `review`
+  (a leased `owner/repo#N`), `deployment` (a watch key), `worker` (a thread
+  id), `binding` (an entity key), `date` (an ISO date, the structured form
+  of `until`), `person` (an open `need_`/`esc_`/`qst_` item) and `external`
+  (free text nothing the plugin tracks will deliver). Liveness, idle and
+  stall are derived from the kind on every reconcile, never stored at report
+  time: `pull` is live while the pull is open and not merged, `review` while
+  it is open and unreviewed at head, `deployment` while the watch is
+  `merged`/`deploying`, `worker` while that worker runs, `binding` while the
+  other binding is open and unfinished, `date` while the date is ahead,
+  `person` while the page item is open, and `external` never. A `waitingOn`
+  with no `kind` keeps the free-text rule: it is live only if a tracked
+  source (a `holdBehind`, a deployment watch, a running worker, an open
+  escalation or need, a watched pull request) is. When nothing the plugin
+  tracks will deliver the wait, the binding is marked `noWakeSource`, computed
+  from that derivation (never a flag frozen at report time): the row and `bb
+  stewards list`/`show` read `waiting, no wake source`, and the report reply
+  itself flags it and tells you to name what will deliver the wait in that
+  same turn — a binding to hold behind (`steward_update { hold, behind }`), a
+  typed `wait`, or a dated `until` — not at the next wake. A `pull` or
+  `review` wait is leased beside the ticket's linked pulls and read on each
+  look; a change on it wakes the binding. If the free text names an open
+  binding in the same project, the reply names it and the exact `hold,
+  behind` call. Clear the mark by adding a real source or clearing the wait.
+  If you wake by `requeue` twice in a row with the same wait and no source,
+  the plugin raises one `stall` escalation to the project steward naming the
+  binding, the wait, when you first reported it and the wake count. A wake
+  for another reason, a changed wait or a new source resets the count, and a
+  stall already open is not raised again.
 - **A wait with a known end is a dated wait (BB-247).** When the wait has a
   date — a tax year closing, a deployment window, a pilot cycle finishing, a
   decision promised for Monday — report it as `steward_report { waitingOn,

@@ -106,7 +106,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
@@ -4776,15 +4776,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * BB-293/BB-322: the binding's assessment. Computed from the rows this
-     * reconcile has already read and stored for every merge-gate surface to
-     * read. BB-322 made it the consumer-facing source: the reconcile derives
-     * its own gate-met set from it and passes it to `syncNeeds`, and the
-     * page, CLI, wake and approvals read the stored copy. It is still wrapped
-     * in a try/catch by the caller so a failure cannot crash the reconcile;
-     * an absent assessment fails closed everywhere it is read.
+     * BB-293/BB-322/BB-333: assemble the one assessment input from the rows the
+     * look already holds. The reconcile and the report path both call it, so
+     * liveness, idle and stall are derived in one place; `assessBinding`
+     * records the result and the report reads it for the turn it is in.
      */
-    async function assessBinding(
+    async function buildAssessmentInput(
       b: Binding,
       observed: Observed,
       workers: readonly Worker[],
@@ -4792,7 +4789,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
-    ): Promise<Assessment> {
+    ): Promise<AssessmentInput> {
       // BB-322: gate every pull request that belongs to the binding, the same
       // set `syncNeeds` acts on, not only the worker-reported own ones. A
       // linked pull request whose head names the ticket is the binding's even
@@ -4861,34 +4858,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         },
         hasOpenItem: (id) => needs.some((n) => n.id === id) || escalations.some((x) => x.id === id) || (id.startsWith("qst_") && store.openQuestions(b.projectId).some((q) => q.id === id)),
       };
+      return input;
+    }
+
+    /**
+     * BB-293/BB-322/BB-333: the binding's one assessment, from the rows the look
+     * already holds. BB-333 made the typed-wait derivation authoritative: the
+     * stored `noWakeSource` is recomputed from the assessment on every
+     * reconcile (never a report-time guess), and the shadow's `noWakeSource`
+     * divergence is retired because the flag and the derivation now agree by
+     * construction. The column and every surface that reads it are unchanged.
+     */
+    async function assessBinding(
+      b: Binding,
+      observed: Observed,
+      workers: readonly Worker[],
+      ownPulls: ReadonlySet<string>,
+      playbook: Playbook,
+      currentSpecHash: string,
+      config: ProjectConfig,
+    ): Promise<Assessment> {
+      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
       const assessment = assess(input);
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
-      const divergences = compare(input, assessment);
-      // BB-333: a typed wait's divergence is written only when it starts or
-      // stops disagreeing, through the state table. A no-kind report keeps the
-      // existing deduped row, and a binding with no typed wait reads no state.
-      if (b.wait !== null) {
-        store.recordDivergences(divergences.filter((d) => d.surface !== "noWakeSource"));
-        store.recordWaitDivergence({
-          bindingId: b.id,
-          derived: assessment.liveness.stalled,
-          reported: b.noWakeSource,
-          waitKind: b.wait.kind,
-          waitLive: assessment.liveness.waitLive === true,
-          inputs: {
-            binding: b.id,
-            live: assessment.liveness.live,
-            idle: assessment.liveness.idle,
-            stuck: assessment.liveness.stuck,
-            readyPassed: assessment.gate.readyPassed,
-            requeueUntil: b.requeueUntil,
-            phase: b.phase,
-            hasWait: (b.status?.waitingOn ?? "").trim() !== "",
-          },
-        });
-      } else {
-        store.recordDivergences(divergences);
-      }
+      // The shadow's `noWakeSource` divergence is retired with the flag: the
+      // two agree by construction now, so `wait_divergence_state` stops being
+      // written and keeps its history. The other surfaces' rows still record.
+      // The derived `noWakeSource` itself rides the reconcile's existing
+      // binding patch, so no extra store read is added.
+      store.recordDivergences(compare(input, assessment).filter((d) => d.surface !== "noWakeSource"));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
       return assessment;
     }
@@ -5232,11 +5230,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // gate-met set below and every later surface read it. A failure is
       // logged and swallowed so the reconcile's own result never changes; an
       // absent assessment fails closed.
+      // BB-333: a change on a leased pull/review ref now wakes the binding. The
+      // waited ref is not in the observed snapshot, so the transition is read
+      // from the previous look's stored fingerprint against this look's. A
+      // first look after the wait was reported has no prior boolean, so it does
+      // not wake.
+      const waitedKind = b.wait?.kind ?? null;
+      const priorLiveness =
+        waitedKind === "pull" || waitedKind === "review"
+          ? (store.assessment(b.id)?.liveness as { waitLive?: boolean | null; waited?: string | null } | null | undefined)
+          : undefined;
+      const priorWaitLive = typeof priorLiveness?.waitLive === "boolean" ? priorLiveness.waitLive : null;
+      const priorWaited = priorWaitLive === null ? null : (priorLiveness?.waited ?? null);
       let assessment: Assessment | null = null;
       try {
         assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
       } catch (error) {
         bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
+      }
+      if ((waitedKind === "pull" || waitedKind === "review") && priorWaitLive !== null && assessment !== null && assessment.liveness.waited !== priorWaited) {
+        changes.push({ text: `The waited ${waitedKind} ${b.wait?.ref ?? ""} changed`, actionable: true });
       }
       // BB-329: one worker-busy predicate. Every surface reads the assessment's
       // worker state (assessment.ts `assessWorker`); the old `anyWorkerInFlight`
@@ -5343,7 +5356,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       signalNeedActionability(b, observed, ready);
-      b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
+      b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready, ...(assessment === null ? {} : { noWakeSource: assessment.liveness.stalled }) });
       // BB-54 item 4: a ticket that links a new pull request re-runs the
       // overlap check, even past its ready gate, and a new pull request clears
       // a "no more coming" report. The report path clears it too, when a
@@ -12241,6 +12254,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             wait = validation.wait;
             if (validation.downgraded !== null) waitNote = ` ${WAIT_REFUSAL_MESSAGE[validation.downgraded]}`;
           }
+          // BB-333: a `date` wait is the structured form of `until`; its ref
+          // sets `requeueUntil` when the report did not also send an `until`.
+          // A past date is ignored with a note, exactly as `until` is.
+          if (wait !== null && wait.kind === "date" && untilAt === null) {
+            const parsed = parseUntil(wait.ref);
+            if (parsed === null) return toolError(new Error(WAIT_REFUSAL_MESSAGE.date_wait_without_date));
+            if (parsed <= now()) {
+              untilNote += ` The date ${iso(parsed)} is in the past, so it was ignored; the wait requeues on the playbook default.`;
+            } else {
+              untilAt = parsed;
+            }
+          }
           // `until` wins over an explicit `requeueAfter` in the same report. The
           // deployment-deadline min below is untouched; a dated wait is not
           // capped by `requeue-default`.
@@ -12251,9 +12276,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // An auto-filed need does not satisfy this: it is filed from prose,
           // not the item the user acts on, so a wait naming the user still
           // needs a real item or escalation (BB-213).
-          // Only a stored `person` wait — one that resolved to an open page item and was not downgraded — bypasses the guard: the item it names is itself what reaches the page. An `external` wait, or a `person` wait downgraded to `external`, still has to file the item.
+          // BB-333: a stored `person` wait is the structured replacement for
+          // the old free-text owner check: the open page item it names is
+          // itself what reaches the page. A typed wait that is not a valid
+          // person wait (an `external` wait, or a person ref the plugin could
+          // not resolve) and a no-kind report still may not name the owner
+          // with nothing filed (BB-213).
           const personWait = wait !== null && wait.kind === "person";
-          if (!personWait && waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
+          const namesOwner = waitingOn !== null && /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(waitingOn);
+          if (!personWait && namesOwner && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
                 `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,
@@ -12468,11 +12499,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // ticket's own pull request counts as a source or not by one rule.
           const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
           const liveSource = liveWakeSourceFor(current, currentOwnPulls);
+          // BB-333: liveness and stall come from the typed wait, derived by the
+          // one assessment on every reconcile. The report computes the same
+          // answer here so its reply is current in the turn the wait is set; a
+          // no-kind report keeps today's free-text rule exactly.
+          let derivedStalled: boolean | null = null;
+          if (current.wait !== null && current.lastSnapshot !== null && playbook !== null && config !== null) {
+            try {
+              const derived = assess(await buildAssessmentInput(current, current.lastSnapshot, store.workers(current.id), currentOwnPulls, playbook, specHashFor(current, current.lastSnapshot.entity), config));
+              derivedStalled = derived.liveness.stalled;
+            } catch (error) {
+              bb.log.warn(`stewards: could not derive the typed wait's liveness for ${current.entityKey}: ${errorMessage(error)}`);
+            }
+          }
           // BB-247: a dated wait is the plugin's own wake source while the date
           // is ahead, so it is not marked waiting with no source (and is listed
           // as a dated wait in the digest instead).
           const datedFuture = current.requeueUntil !== null && current.requeueUntil > now();
-          const noWakeSource = waitingOn !== null && waitingOn.trim() !== "" && !liveSource && !datedFuture;
+          const noWakeSource = derivedStalled ?? (waitingOn !== null && waitingOn.trim() !== "" && !liveSource && !datedFuture);
           // BB-339: the open bindings the free text names, in the order they
           // appeared, so the report reply can point the steward at the hold it
           // can take in this turn. A key that resolves to nothing, to an ended
@@ -12485,7 +12529,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             : [];
           const stall = advanceStall(
             { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
-            { reason: wakeReason, waitingOn, liveSource, now: now(), until: current.requeueUntil },
+            { reason: wakeReason, waitingOn, liveSource: derivedStalled !== null ? !derivedStalled : liveSource, now: now(), until: current.requeueUntil },
           );
           b = store.patch(b.id, { noWakeSource, requeueWakeCount: stall.state.count, requeueWaitText: stall.state.waitText, requeueFirstAt: stall.state.firstAt });
           const requests = [requested === null ? null : "approval", scheduling === null ? null : "scheduling"].filter((r) => r !== null);
@@ -13527,7 +13571,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     ? `cannot read the target: ${alertmanager.error}`
                     : `looked ${iso(alertmanager.at)}: ${alertmanager.findings.length === 0 ? "nothing to do" : `${alertmanager.findings.length} alert(s) new, rung or resolved`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");

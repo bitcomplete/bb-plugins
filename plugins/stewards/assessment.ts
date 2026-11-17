@@ -63,6 +63,12 @@ export type AssessedLiveness = {
   live: boolean;
   /** The stored typed wait's own liveness (BB-333); null when the binding has no typed wait. */
   waitLive: boolean | null;
+  /**
+   * A compact fingerprint of the freshly read waited `pull`/`review` ref
+   * (BB-333), so a change on it wakes the binding. Null for any other wait or
+   * when the ref could not be read; JSON, never the raw snapshot.
+   */
+  waited: string | null;
   /** `idleInActiveStage` before the typed wait is applied: what the consumer's idle wake reads (BB-333). */
   idleBase: boolean;
   /** `idleInActiveStage`. */
@@ -178,6 +184,28 @@ function reviewGiven(e: EntitySnapshot): boolean {
 function waitPullKey(ref: string): string | null {
   const parsed = parsePullRef(ref);
   return parsed === null ? null : `${parsed.repo}#${parsed.number}`.toLowerCase();
+}
+
+/**
+ * A compact, JSON fingerprint of the freshly read waited `pull`/`review` ref
+ * (BB-333): the fields a steward's wait is about, so any change on the ref
+ * wakes the binding without storing the snapshot. Null for another kind or a
+ * ref the look could not read.
+ */
+function waitFingerprint(wait: Wait | null, input: AssessmentInput): string | null {
+  if (wait === null || (wait.kind !== "pull" && wait.kind !== "review")) return null;
+  const key = waitPullKey(wait.ref);
+  const e = key === null ? undefined : input.waitedPulls?.get(key);
+  if (e === undefined) return null;
+  return JSON.stringify({
+    key: e.key,
+    state: e.state,
+    title: e.title,
+    head: e.pull?.headSha ?? null,
+    checks: e.pull?.checks?.state ?? null,
+    review: reviewGiven(e),
+    merged: e.pull?.merged === true,
+  });
 }
 
 /**
@@ -321,6 +349,7 @@ export function assess(input: AssessmentInput): Assessment {
     liveness: {
       live,
       waitLive,
+      waited: waitFingerprint(wait, input),
       idleBase,
       // A live typed wait is something the plugin waits on, so it suppresses
       // the idle wake; a stalled or external one does not (BB-333).
