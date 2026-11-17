@@ -372,7 +372,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   written into the skills. A `.bb/skills/build-tickets` or
   `.bb/skills/pr-reviewer` copy with the same name overrides the plugin's, so
   a project can still pin its own: bb resolves project skills over plugin
-  skills.
+  skills. `bb.agents.configure` gives every thread it sees every skill the
+  plugin ships (`STEWARDS_SKILLS`: `stewards`, `build-tickets`, `pr-reviewer`,
+  `onboarding`): a steward, the project steward, a worker, the onboarding
+  thread, and any other thread on the server. That last part is deliberate:
+  since BB-323 a worker's reviewer is spawned with no parent and the worker
+  as its lifecycle owner, which the configure context does not carry, so the
+  fallback is the only way it gets `pr-reviewer`. Only the tools differ by
+  role.
 - **One escalation chain (BB-30).** Every hop is one `escalations` row: a
   worker's `bb stewards escalate` goes to its steward, a steward's
   `steward_report { escalate }` to the project steward, and only the
