@@ -91,7 +91,7 @@ import {
   type RolesFile,
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, mergeNeedParts, ROUTINE_FORWARD_WHY } from "./need-parts.js";
+import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, autoDecideParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -2011,7 +2011,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const questions = store
           .openQuestions(projectId)
           .filter((q) => scope === null || q.bindingId === scope.id)
-          .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
+          .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context, recommendation: q.escalationId === null ? null : (store.escalation(q.escalationId)?.recommendation ?? null) }));
         const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
         let text: string;
         if (scope === null) {
@@ -3860,12 +3860,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (auto !== null) store.closeNeed(auto.id, actor === "user" ? "A later report filed its own item for the user." : "A later report named a different actor.", "plugin");
         return null;
       }
+      const autoParts = autoDecideParts(b.status?.nextAction ?? null);
       return store.fileNeed({
         bindingId: b.id,
         kind: "decide",
         url,
-        what: b.status?.nextAction ?? "The user has the next action.",
-        how: "The report named the user as the actor but filed no item for them, so this was filed from its `nextAction`. File the specific item (`approve-pr`) or raise an escalation if that is the real ask.",
+        what: autoParts.what,
+        how: autoParts.how,
+        why: autoParts.why,
+        details: autoParts.details,
         data: { autoFiled: true },
         filedBy: "plugin",
       });
@@ -7876,24 +7879,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function fileLessonOwnerNeed(lesson: Lesson, branch: string | null, prUrl: string | null, retire = false, boundary = false): boolean {
       if (lesson.bindingId === null) return false;
-      const kind = boundary ? "boundary lesson" : "lesson";
+      const parts = lessonDecideParts({ file: lesson.file, lessonText: lesson.text, boundary, retire, branch, prUrl });
       store.fileNeed({
         bindingId: lesson.bindingId,
         kind: "decide",
         url: lesson.id,
-        what: `Review or drop the ${retire ? "retirement of the " : ""}${kind} for ${lesson.file}`,
-        how: [
-          retire
-            ? `The nightly pass retired this ${kind}, so removing its anchored text ${boundary ? "also changes the boundary and " : ""}only you may make it permanent.`
-            : boundary
-              ? "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent."
-              : "The project steward recorded a general rule for a file the decide list makes the user's, so only you may make it permanent.",
-          "",
-          `> ${lesson.text}`,
-          "",
-          `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
-          prUrl === null ? "The pull request is not open yet." : `Review the pull request at ${prUrl}; the lesson is marked ${retire ? "dropped" : "merged"} when it merges. Drop closes it and discards the lesson.`,
-        ].join("\n"),
+        what: parts.what,
+        how: parts.how,
+        why: parts.why,
+        details: parts.details,
         data: { lessonId: lesson.id, branch, file: lesson.file, prUrl, retire, choices: ["Review PR", "Drop"], validation: "boundary-promotion" },
         filedBy: "project",
       });
@@ -7905,18 +7899,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     function fileMixedEvidenceNeed(lesson: Lesson): boolean {
       if (lesson.bindingId === null) return false;
+      const parts = mixedEvidenceDecideParts({ file: lesson.file, lessonText: lesson.text, hits: lesson.hits, corrections: lesson.corrections });
       store.fileNeed({
         bindingId: lesson.bindingId,
         kind: "decide",
         url: lesson.id,
-        what: `Keep or retire the lesson for ${lesson.file}`,
-        how: [
-          `This promoted lesson has ${lesson.hits} citation${lesson.hits === 1 ? "" : "s"} and ${lesson.corrections} correction${lesson.corrections === 1 ? "" : "s"}, so its evidence is mixed.`,
-          "",
-          `> ${lesson.text}`,
-          "",
-          `File: \`${lesson.file}\`. Keep leaves it in \`.bb\`; Retire removes its anchored text. Silence retires it on the next nightly pass.`,
-        ].join("\n"),
+        what: parts.what,
+        how: parts.how,
+        why: parts.why,
+        details: parts.details,
         data: { lessonId: lesson.id, file: lesson.file, choices: ["Keep", "Retire"], validation: "mixed-evidence" },
         filedBy: "plugin",
       });
@@ -9232,12 +9223,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // forward: the owner reviews the pull request; the plugin observes the merge.
       if (refresh.state !== "pr_open") return "there is no open pull request to forward";
       if (refresh.questionId !== null) return `already with the owner (${refresh.questionId})`;
+      const refreshParts = playbookRefreshQuestionParts({ playbook: refresh.playbook, templateName: refresh.templateName, pr: refresh.pr, additive: refresh.classification === "additive", removals: refresh.removals.length });
       const question = store.ask({
         projectId: refresh.projectId,
         bindingId: null,
         escalationId: null,
-        question: `Refresh the ${refresh.playbook} playbook from template ${refresh.templateName}?`,
-        context: `The refresh pull request ${refresh.pr ?? "(none)"} is ${refresh.classification === "additive" ? "purely additive" : "not purely additive"}${refresh.removals.length === 0 ? "" : `; it removes or rewrites ${refresh.removals.length} line(s)`}. Review the diff at the pull request and merge it, or drop it.`,
+        question: refreshParts.question,
+        context: refreshParts.context,
+        why: refreshParts.why,
+        details: refreshParts.details,
         choices: ["Review PR", "Drop"],
         url: refresh.pr,
         data: { refreshId: refresh.id, file: refresh.file },
@@ -10834,7 +10828,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const questions = store
             .openQuestions(targetProjectId)
             .filter((q) => scoped === null || q.bindingId === scoped.id)
-            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
+            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context, recommendation: q.escalationId === null ? null : (store.escalation(q.escalationId)?.recommendation ?? null) }));
           const scopeKey = scoped?.entityKey ?? null;
           const standupConfig = await loadConfig(targetProjectId);
           const brief = briefing(targetProjectId, since, scoped?.id);
@@ -13260,12 +13254,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (repeated) {
                 // The same objection came back after a revision: a third round
                 // would only repeat it, so the user decides (BB-54).
+                const objectionParts = repeatedObjectionQuestionParts({ key: target.entityKey, objections, previous });
                 const q = store.ask({
                   projectId: target.projectId,
                   bindingId: target.id,
                   escalationId: resolving.id,
-                  question: `The project steward declined ${target.entityKey}'s spec twice on the same objection: ${objections.join("; ")}. Decide how to proceed.`,
-                  context: `First declined on: ${previous.join("; ")}. The revision did not answer it, so it is forwarded to you instead of a third round.`,
+                  question: objectionParts.question,
+                  context: objectionParts.context,
+                  why: objectionParts.why,
+                  details: objectionParts.details,
                   resolutionKind: "text",
                 });
                 done.push(`forwarded the repeated objection to the user as question ${q.id}`);
@@ -13468,8 +13465,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-345: the escalation a question forwards holds the meanwhile, the
       // project steward's recommendation and the origin the old forwarding
       // glue concatenated; the page places them under their labels or in
-      // Details. `why` and `details` are the question's own optional fields.
-      const parent = q.escalationId === null ? null : store.escalation(q.escalationId);
+      // Details. Only a new-shape question (one whose forwarding set `why`)
+      // gets those separate fields, so an old question whose stored `context`
+      // already carries the glue renders exactly as before (BB-345).
+      const parent = q.why === null || q.escalationId === null ? null : store.escalation(q.escalationId);
       const parentBinding = parent === null ? null : store.binding(parent.bindingId);
       const origin = parent === null ? null : `A ${parent.kind} escalation from ${parentBinding?.entityKey ?? parent.bindingId}${parentBinding?.title === null || parentBinding?.title === undefined ? "" : ` (${parentBinding.title})`}.`;
       return { id: q.id, question: q.question, context: q.context, why: q.why, details: q.details, meanwhile: parent?.meanwhile ?? null, recommendation: parent?.recommendation ?? null, origin, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted, actions, freeText };
@@ -13478,7 +13477,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The board's with-user row; the sidebar reuses it, tagged. */
     function withUserView(x: Escalation, b: Binding) {
       const { actions, freeText } = withUserActions();
-      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, why: x.why ?? ROUTINE_FORWARD_WHY, details: x.details, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
+      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, why: x.why, details: x.details, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
     }
 
     /**

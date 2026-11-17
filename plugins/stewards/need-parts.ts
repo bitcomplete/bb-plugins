@@ -67,6 +67,22 @@ export function decisionWhy(explanation: DecisionExplanation): string {
   return ROUTINE_FORWARD_WHY;
 }
 
+/**
+ * Why an approve-pr item reached the user, from the gate as well as the decide
+ * list: the product reason, a reviewer escalation over a project match, the
+ * user's own entry, or the fact that no entry placed it (BB-345).
+ */
+export function approvePrWhy(input: { product: boolean; escalated: boolean; explanation: DecisionExplanation | null }): string {
+  if (input.product) return "This pull request is substantial and references no ticket with an approved spec, so its product decision is yours.";
+  if (input.escalated) return "The reviewer escalated this pull request to you; a project-steward approval does not meet the gate.";
+  const e = input.explanation;
+  if (e === null || e.unreadable || e.winner === null) {
+    if (e !== null && e.selfWidening) return "The change touches the decide list or the code that enforces it, so it is yours to approve.";
+    return "No decide-list entry places this pull request, so it is yours to approve.";
+  }
+  return `The decide list marks this the user's: ${e.winner.text}.`;
+}
+
 /** Why a forwarded escalation reached the user: the named entry, or the routine line. */
 export function forwardWhy(entry: string | null): string {
   const wanted = cleanInline(entry ?? "");
@@ -118,10 +134,74 @@ export function mergeNeedParts(input: { key: string; lane: string | null; note?:
   return { what, how, why: MERGE_WHY, details: how };
 }
 
+/** The one line, context, why and details of the auto-filed decide item. */
+export function autoDecideParts(nextAction: string | null): { what: string; how: string; why: string; details: string } {
+  const what = clampNeedLine(nextAction === null || nextAction.trim() === "" ? "The user has the next action." : nextAction);
+  const how = "Your steward reported you as the next actor but filed no specific item.";
+  const why = "This came from the report's next action rather than a guidance rule.";
+  const details = "File the specific item (approve-pr) or raise an escalation if that is the real ask.";
+  return { what, how, why, details };
+}
+
+/** The one line, context, why and details of a lesson review/retire decide item. */
+export function lessonDecideParts(input: { file: string; lessonText: string; boundary: boolean; retire: boolean; branch: string | null; prUrl: string | null }): { what: string; how: string; why: string; details: string } {
+  const what = clampNeedLine(`${input.retire ? "Retire" : "Review"} the lesson for ${input.file}`);
+  const how = input.boundary
+    ? "A general rule that changes its own escalation boundary: only you may make it permanent. Review merges the pull request; Drop discards the lesson."
+    : "A general rule for a file the decide list makes yours. Review merges the pull request; Drop discards the lesson.";
+  const why = input.boundary ? "Boundary lessons are always yours to make permanent." : "The decide list makes this file yours to change.";
+  const details = [
+    `Lesson: ${input.lessonText}`,
+    `File: ${input.file}.`,
+    `Branch: ${input.branch ?? "(not published yet)"}.`,
+    input.prUrl === null ? "The pull request is not open yet." : `Review the pull request at ${input.prUrl}; the lesson is marked ${input.retire ? "dropped" : "merged"} when it merges.`,
+  ].join("\n\n");
+  return { what, how, why, details };
+}
+
+/** The one line, context, why and details of a mixed-evidence lesson decide item. */
+export function mixedEvidenceDecideParts(input: { file: string; lessonText: string; hits: number; corrections: number }): { what: string; how: string; why: string; details: string } {
+  const what = clampNeedLine(`Keep or retire the lesson for ${input.file}`);
+  const how = "This promoted lesson has mixed evidence. Keep leaves it in the guidance; Retire removes its anchored text.";
+  const why = "Its citations and corrections are mixed, so only you can settle it.";
+  const details = [
+    `Lesson: ${input.lessonText}`,
+    `File: ${input.file}.`,
+    `${input.hits} citation${input.hits === 1 ? "" : "s"} and ${input.corrections} correction${input.corrections === 1 ? "" : "s"}.`,
+    "Silence retires it on the next nightly pass.",
+  ].join("\n\n");
+  return { what, how, why, details };
+}
+
 /** The one-line ask of a Dependabot adoption decision, short enough for the sidebar. */
 export function adoptionNeedLine(ticketKey: string, repo: string, severities: readonly string[]): string {
   const severity = severities.length === 0 ? "" : `${severities.join("/")} `;
   return clampNeedLine(`Adopt ${ticketKey}? ${severity}Dependabot alerts on ${repo}`);
+}
+
+/**
+ * The shown parts of a playbook-refresh question: a short ask, the options, why
+ * it is the user's, and the raw pull-request facts in Details (BB-345).
+ */
+export function playbookRefreshQuestionParts(input: { playbook: string; templateName: string; pr: string | null; additive: boolean; removals: number }): { question: string; context: string; why: string; details: string } {
+  const question = clampNeedLine(`Refresh the ${input.playbook} playbook from ${input.templateName}?`);
+  const context = "Review the refresh pull request and merge it, or drop it.";
+  const why = input.additive ? "The refresh is yours to land because it touches a file outside the project steward's authority." : "This refresh is not purely additive, so it is yours to review.";
+  const details = `The refresh pull request ${input.pr ?? "(none)"} is ${input.additive ? "purely additive" : "not purely additive"}${input.removals === 0 ? "" : `; it removes or rewrites ${input.removals} line(s)`}.`;
+  return { question, context, why, details };
+}
+
+/**
+ * The shown parts of the repeated-objection question: a short ask, the first
+ * objection as context, why it reached the user, and the objections in
+ * Details (BB-345).
+ */
+export function repeatedObjectionQuestionParts(input: { key: string; objections: string[]; previous: string[] }): { question: string; context: string; why: string; details: string } {
+  const question = clampNeedLine(`Decide ${input.key}'s spec after two declines on the same objection`);
+  const context = "The revision did not answer the objection, so a third round would only repeat it.";
+  const why = "The same objection came back after a revision, so it is yours to decide.";
+  const details = `First declined on: ${input.previous.join("; ")}.\n\nCurrent objection: ${input.objections.join("; ")}.`;
+  return { question, context, why, details };
 }
 
 /** One problem with a shown part, or null when it is readable. */

@@ -10,7 +10,7 @@
 import { type BigDecision, decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type DecideMark } from "./decisions.js";
 import type { ApprovalMode } from "./config.js";
 import { approvalMarkerLine, classifyApproval, ESCALATED_APPROVAL_REFUSAL, latestReviewMarker, productReason, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
-import { approvePrNeedParts, decisionWhy, ROUTINE_FORWARD_WHY } from "./need-parts.js";
+import { approvePrNeedParts, approvePrWhy, decisionWhy, ROUTINE_FORWARD_WHY } from "./need-parts.js";
 import { assessedGate } from "./assessed-gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
 import { isSpecComment, productGateOptions, workerInFlight, type MechanicalEvent } from "./reconcile.js";
@@ -298,6 +298,9 @@ export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: Entit
   const url = pull.url ?? pull.key;
   const existing = ctx.store.openNeeds(b.id).find((n) => n.kind === "approve-pr" && n.url === url);
   const carried = listing ?? (existing?.data.decideListingSha === headSha && typeof existing.data.decideListing === "string" ? existing.data.decideListing : null);
+  // A refresh that does not recompute the why (checks went red) carries the
+  // open item's why rather than downgrading it to the routine line (BB-345).
+  const carriedWhy = why ?? (existing === undefined ? null : existing.why) ?? ROUTINE_FORWARD_WHY;
   const parts = approvePrNeedParts({
     key: pull.key,
     title: pull.title,
@@ -305,7 +308,7 @@ export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: Entit
     verdict: latestReviewMarker(pull.comments)?.verdict ?? null,
     foreign,
     product: reason === "product",
-    why: why ?? ROUTINE_FORWARD_WHY,
+    why: carriedWhy,
     listing: carried,
   });
   ctx.store.fileNeed({
@@ -334,6 +337,9 @@ export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Bindi
   const listing = explanation === null ? null : formatDecisionListing(explanation);
   // The same product text the plugin-filed item carries (BB-207).
   const product = productGateOptions(b, pull);
+  // The approval escalation the project steward forwarded carries the why the
+  // plugin computed when it filed it; fall back to the decide list (BB-345).
+  const forwardedWhy = ctx.store.escalation(forwarding.id)?.why ?? null;
   const parts = approvePrNeedParts({
     key: pull?.key ?? key,
     title: pull?.title ?? null,
@@ -341,7 +347,7 @@ export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Bindi
     verdict: pull === undefined ? null : latestReviewMarker(pull.comments)?.verdict ?? null,
     foreign: pull !== undefined && isForeignPull(pull),
     product: productReason(product.substantial, product.ticketApprovedSpec) === "product",
-    why: explanation === null ? ROUTINE_FORWARD_WHY : decisionWhy(explanation),
+    why: forwardedWhy ?? (explanation === null ? ROUTINE_FORWARD_WHY : decisionWhy(explanation)),
     listing,
   });
   ctx.store.fileNeed({
@@ -434,7 +440,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
     const files = await ctx.pullChangedFiles(pull);
     const explanation = explainDecision(files, decisions);
     listing = formatDecisionListing(explanation);
-    approvalWhy = decisionWhy(explanation);
+    approvalWhy = approvePrWhy({ product: g.reason === "product", escalated: g.escalated, explanation });
   }
   const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
   const approvalEsc = ctx.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;

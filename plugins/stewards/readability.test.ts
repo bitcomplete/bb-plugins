@@ -5,14 +5,20 @@ import {
   ADOPTION_WHY,
   adoptionNeedLine,
   approvePrNeedParts,
+  approvePrWhy,
   approveSpecNeedParts,
+  autoDecideParts,
   contextProblem,
   decisionWhy,
   forwardedQuestionParts,
   forwardWhy,
+  lessonDecideParts,
   mergeNeedParts,
+  mixedEvidenceDecideParts,
   needLineProblem,
+  playbookRefreshQuestionParts,
   readabilityProblems,
+  repeatedObjectionQuestionParts,
   ROUTINE_FORWARD_WHY,
   whyProblem,
 } from "./need-parts.js";
@@ -95,6 +101,36 @@ describe("every plugin-composed item reads in three plain parts", () => {
   it("a deps adoption decide item is short and readable", () => {
     const need = adoptionNeedLine("SC-111", "bitcomplete/santaclaw", ["medium", "high"]);
     expect(readabilityProblems({ need, context: adoptionHow(true), why: ADOPTION_WHY })).toEqual([]);
+  });
+
+  it("the other plugin-composed decide items are readable", () => {
+    const auto = autoDecideParts("Review the failing deploy and decide");
+    expect(readabilityProblems({ need: auto.what, context: auto.how, why: auto.why })).toEqual([]);
+    const lesson = lessonDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", boundary: true, retire: false, branch: "guidance-x", prUrl: "https://github.com/acme/web/pull/9" });
+    expect(readabilityProblems({ need: lesson.what, context: lesson.how, why: lesson.why })).toEqual([]);
+    const mixed = mixedEvidenceDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", hits: 4, corrections: 1 });
+    expect(readabilityProblems({ need: mixed.what, context: mixed.how, why: mixed.why })).toEqual([]);
+    const refresh = playbookRefreshQuestionParts({ playbook: "linear-tickets", templateName: "linear-tickets", pr: "https://github.com/acme/web/pull/9", additive: false, removals: 2 });
+    expect(readabilityProblems({ need: refresh.question, context: refresh.context, why: refresh.why })).toEqual([]);
+    const objection = repeatedObjectionQuestionParts({ key: "ENG-12", objections: ["Add a rollback plan."], previous: ["Add a rollback plan."] });
+    expect(readabilityProblems({ need: objection.question, context: objection.context, why: objection.why })).toEqual([]);
+  });
+
+  it("an approve-pr why reflects the gate, not just the decide list", () => {
+    const winner = { text: "Identity and access", decide: "user" as const, files: ["x"] };
+    expect(approvePrWhy({ product: true, escalated: false, explanation: explanation({ winner }) })).toMatch(/substantial and references no ticket/u);
+    expect(approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner: { text: "A store migration", decide: "project", files: ["x"] } }) })).toMatch(/reviewer escalated/u);
+    expect(approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner }) })).toMatch(/Identity and access/u);
+    expect(approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner: null }) })).toMatch(/No decide-list entry/u);
+    expect(approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner: null, selfWidening: true }) })).toMatch(/touches the decide list/u);
+    expect(approvePrWhy({ product: false, escalated: false, explanation: null })).toMatch(/No decide-list entry/u);
+    for (const why of [
+      approvePrWhy({ product: true, escalated: false, explanation: explanation({ winner }) }),
+      approvePrWhy({ product: false, escalated: true, explanation: explanation({ winner }) }),
+      approvePrWhy({ product: false, escalated: false, explanation: explanation({ winner: null }) }),
+    ]) {
+      expect(whyProblem(why)).toBeNull();
+    }
   });
 
   it("a forwarded question shows the steward's context as written, with no glue", () => {

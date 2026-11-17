@@ -1993,9 +1993,11 @@ describe("declined specs converge (BB-54)", () => {
     await t.tool("steward_report", { ...base, ready: met }, t.steward);
     const esc2 = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
     await t.tool("steward_update", { binding: "ENG-12", guidance: "Name the migration.", resolve: esc2 }, t.project);
-    const q = t.hooks.store.openQuestions("p1").find((x) => /twice on the same objection/u.test(x.question));
+    const q = t.hooks.store.openQuestions("p1").find((x) => /two declines on the same objection/u.test(x.question));
     expect(q).toBeDefined();
-    expect(q!.question).toContain("Name the migration.");
+    // The objections are the raw material in Details, not the question line (BB-345).
+    expect(q!.details).toContain("Name the migration.");
+    expect(q!.why).toBeTruthy();
   });
 });
 
@@ -14586,6 +14588,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const after = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
     expect(after.data.decideListing).toBeUndefined();
     expect(after.how).not.toContain("Decide list:");
+    // The why is not recomputed while checks are red; it is carried from the
+    // open item rather than downgraded to the routine line (BB-345).
+    expect(after.why).toBe(before.why);
+    expect(after.why).not.toBe("No guidance covers this; your answer is saved as a lesson.");
   });
 
   it("reports an owner review with its sha, and the project steward's marker with its sha", async () => {
