@@ -15677,14 +15677,19 @@ describe("the Ask on Slack choice (BB-354)", () => {
     expect(need.data.waitSlackCandidates).toEqual(["arashout"]);
   });
 
-  it("the owner's pick wakes the steward with the instruction and records wait_slacked_at", async () => {
+  /** File the second-budget need for the review wait. */
+  async function secondBudgetNeed(t: World, id: string) {
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    return decideNeeds(t, id)[0]!;
+  }
+
+  it("the owner's pick wakes the steward with the instruction, links the PR, and closes with the permalink", async () => {
     const { t, steward, b } = await reviewWait();
     slackOn(t);
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    const need = decideNeeds(t, b().id)[0]!;
+    const need = await secondBudgetNeed(t, b().id);
     const before = t.sends.filter((s) => s.threadId === steward).length;
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
     expect(res).toMatchObject({ ok: true });
@@ -15694,6 +15699,18 @@ describe("the Ask on Slack choice (BB-354)", () => {
     const wake = t.sends.filter((s) => s.threadId === steward).slice(before).map((s) => s.text).join("\n");
     expect(wake).toContain("slack_start_conversation");
     expect(wake).toContain('"arashout"');
+    // The opener links the pull request, not the ticket (blocker 2).
+    expect(wake).toContain("https://github.com/acme/web/pull/9");
+    // The item reads as sending until the steward reports the DM.
+    const sending = t.hooks.store.need(need.id)!;
+    expect(sending.status).toBe("open");
+    expect(sending.data.waitSlackSending).toBe(true);
+    // The steward reports the permalink, which closes the item with the link.
+    const sent = await t.harness.behavior.runCli(["wait-slack-sent", need.id, "--permalink", "https://acme.slack.com/archives/C1/p1"]);
+    expect(sent.exitCode).toBe(0);
+    const closed = t.hooks.store.need(need.id)!;
+    expect(closed.status).toBe("done");
+    expect(closed.resolution).toContain("https://acme.slack.com/archives/C1/p1");
     // The choice is not offered again on the same wait: a later budget files a
     // need with the three original choices.
     t.advance(DAY + HOUR);
@@ -15706,11 +15723,7 @@ describe("the Ask on Slack choice (BB-354)", () => {
   it("a changed wait resets wait_slacked_at and offers Ask on Slack again", async () => {
     const { t, steward, b } = await reviewWait();
     slackOn(t);
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    const need = decideNeeds(t, b().id)[0]!;
+    const need = await secondBudgetNeed(t, b().id);
     await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
     await t.flush();
     expect(b().waitSlackedAt).not.toBeNull();
@@ -15722,11 +15735,7 @@ describe("the Ask on Slack choice (BB-354)", () => {
   it("Keep waiting does not re-arm Ask on Slack on the same wait", async () => {
     const { t, b } = await reviewWait();
     slackOn(t);
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    const need = decideNeeds(t, b().id)[0]!;
+    const need = await secondBudgetNeed(t, b().id);
     expect(need.data.choices).toContain("Ask on Slack");
     await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Keep waiting" }, { experimental_caller: { kind: "client" } });
     await t.flush();
@@ -15741,20 +15750,33 @@ describe("the Ask on Slack choice (BB-354)", () => {
   it("reopens the need with the three original choices when Slack refuses the person", async () => {
     const { t, b } = await reviewWait();
     slackOn(t);
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    t.advance(DAY + HOUR);
-    await t.hooks.reconcilePass("p1");
-    const need = decideNeeds(t, b().id)[0]!;
+    const need = await secondBudgetNeed(t, b().id);
     await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
     await t.flush();
     const out = await t.harness.behavior.runCli(["wait-slack-refused", need.id, "--candidates", "arashout, Arash"]);
     expect(out.exitCode).toBe(0);
     const reopened = t.hooks.store.need(need.id)!;
     expect(reopened.status).toBe("open");
+    expect(reopened.data.waitSlackSending).toBeUndefined();
     expect(needChoices(reopened)).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
     expect(reopened.how).toContain("arashout");
     expect(reopened.how).toContain("Arash");
+  });
+
+  it("a non-delegate person wait gets no Ask on Slack", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const b = t.hooks.store.find("ENG-12")!;
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    await t.tool("steward_report", { ...base, waitingOn: "the owner's approval", wait: { kind: "person", ref: q.id } }, steward);
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b.id)[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
   });
 });
 

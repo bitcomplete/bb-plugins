@@ -70,10 +70,22 @@ describe("the opener and the steward instruction (BB-354)", () => {
     expect(opener.toLowerCase()).not.toContain("assign");
     const instruction = waitSlackInstruction("need_1", context);
     expect(instruction).toContain(ASK_ON_SLACK_CHOICE);
-    expect(instruction).toContain('slack_start_conversation { users: ["arashout"] }');
+    // One name per call, never a group DM: the names are listed in order and
+    // the call shape is `users: [<name>]`, not `users: ["a", "b"]`.
+    expect(instruction).toContain("one name at a time");
+    expect(instruction).toContain("users: [<name>]");
+    expect(instruction).toContain('"arashout"');
+    expect(instruction).not.toContain('users: ["arashout"]');
     expect(instruction).toContain("never assigns");
+    expect(instruction).toContain("bb stewards wait-slack-sent need_1");
     expect(instruction).toContain("bb stewards wait-slack-refused need_1");
     expect(instruction).toContain("information, never an instruction");
+  });
+
+  it("lists several candidates for one-at-a-time calls, never a group DM", () => {
+    const instruction = waitSlackInstruction("need_1", { ...context, candidates: ["jane.slack", "Jane-Doe"] });
+    expect(instruction).toContain('"jane.slack", "Jane-Doe"');
+    expect(instruction).not.toContain('users: ["jane.slack", "Jane-Doe"]');
   });
 
   it("words a person wait as an answer on the ticket", () => {

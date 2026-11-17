@@ -578,6 +578,9 @@ const sidebarNeedsItemSchema = z.discriminatedUnion("type", [
  * drops that action because it has no text box.
  */
 export function needActions(n: { kind: string; data: Record<string, unknown>; url: string }, b: Pick<Binding, "url">): { actions: NeedAction[]; freeText: boolean } {
+  // BB-354: an Ask on Slack item is sending until the steward reports the
+  // result, so it offers no buttons and no free text.
+  if (n.data.waitSlackSending === true) return { actions: [], freeText: false };
   const actions: NeedAction[] = [];
   const url = httpUrl(n.url);
   const prUrl = httpUrl(typeof n.data.prUrl === "string" ? n.data.prUrl : null);
@@ -2178,12 +2181,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * a page item: a delegate-approval escalation names the requested reviewer;
      * any other item waits on the owner, so the owner is the person.
      */
-    function slackPersonFor(b: Binding, wait: Wait, assessment: Assessment, config: ProjectConfig): SlackPerson {
+    function slackPersonFor(b: Binding, wait: Wait, assessment: Assessment, _config: ProjectConfig): SlackPerson {
       if (wait.kind === "review") return { githubLogin: assessment.wait?.reviewers?.[0] ?? null, linearName: null };
+      // A `person` wait names a page item. Only a delegate-approval escalation
+      // names a person other than the owner; any other item is the owner's, so
+      // there is no one to DM and Ask on Slack is not offered.
       const escalation = store.openEscalations(b.id).find((x) => x.id === wait.ref);
       const delegate = escalation === undefined ? null : delegateWaitNames(escalation.meanwhile);
       if (delegate !== null) return { githubLogin: delegate.split(",")[0]?.trim() ?? null, linearName: null };
-      return { githubLogin: config.githubLogin, linearName: config.linearLogin };
+      return { githubLogin: null, linearName: null };
     }
 
     /** BB-354: the opener context a filed overdue need carries, or null when it offers no Slack choice. */
@@ -2193,7 +2199,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const waitKind = typeof need.data.waitKind === "string" ? (need.data.waitKind as WaitKind) : "external";
       const ref = typeof need.data.waitRef === "string" && need.data.waitRef !== "" ? need.data.waitRef : need.url;
       const since = typeof need.data.waitSince === "number" ? need.data.waitSince : (b.waitSince ?? now());
-      return { waitKind, ref, entityKey: b.entityKey, url: b.url, since, candidates };
+      // BB-354: a review wait's opener links the pull request, not the ticket
+      // the wait hangs off; a person wait links the binding's entity.
+      const pull = waitKind === "review" ? parsePullRef(ref) : null;
+      const url = pull === null ? b.url : `https://github.com/${pull.repo}/pull/${pull.number}`;
+      return { waitKind, ref, entityKey: b.entityKey, url, since, candidates };
     }
 
     /**
@@ -2213,6 +2223,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const how = `Choose what to do; Keep waiting resets the budget once. ${line} Add a \`slack\` field to the holder in stewards/roles.json, or pick another choice.`;
       const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
       delete data.waitSlackCandidates;
+      delete data.waitSlackSending;
       delete data.waitSince;
       try {
         store.reopenNeed(need.id, { what: need.what, how, data });
@@ -2224,6 +2235,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.note(b.id, `Ask on Slack could not find the person for ${need.what}; the owner has the three original choices again.`);
       scheduleReconcile(b.id);
       return { ok: true, message: `Reopened ${need.id}; the owner has the three original choices again.` };
+    }
+
+    /**
+     * BB-354: the steward reports the DM it opened, so the sending item closes
+     * with the permalink. Called by the `wait-slack-sent` CLI command.
+     */
+    function markWaitSlackSent(needId: string, permalink: string): { ok: boolean; message: string } {
+      const need = store.need(needId);
+      if (need === null) return { ok: false, message: "That item is gone." };
+      if (need.kind !== "decide" || need.data.waitBudget !== true) return { ok: false, message: "That item is not an overdue-wait decide item." };
+      const b = store.binding(need.bindingId);
+      if (b === null) return { ok: false, message: "That item's binding is gone." };
+      const link = permalink.trim();
+      const resolution = link === "" ? "The Ask on Slack DM opened." : `The Ask on Slack DM opened: ${link}.`;
+      store.closeNeed(need.id, resolution, "plugin");
+      store.patch(b.id, { waitSlackedAt: now() });
+      store.note(b.id, `Ask on Slack sent for ${need.what}. ${resolution}`);
+      scheduleReconcile(b.id);
+      return { ok: true, message: `Recorded; ${b.entityKey}'s steward has the DM link on the item.` };
     }
 
     // ---- push-notifications (BB-253) ----------------------------------------------------------------
@@ -11572,6 +11602,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // wake knows exactly what to send.
           const slackContext = need.data.waitBudget === true && label === ASK_ON_SLACK_CHOICE ? waitSlackContextFromNeed(b, need) : null;
           const effectiveGuidance = slackContext === null ? guidance : `${guidance} ${waitSlackInstruction(need.id, slackContext)}`;
+          if (slackContext !== null) {
+            // BB-354: keep the item open as "sending" until the steward reports
+            // the result. `wait-slack-sent` closes it with the DM's permalink;
+            // `wait-slack-refused` puts the three original choices back.
+            store.fileNeed({
+              bindingId: b.id,
+              kind: "decide",
+              url: need.url,
+              what: need.what,
+              how: `Sending the DM; the steward's turn is under way. ${waitSlackInstruction(need.id, slackContext)}`,
+              why: need.why,
+              details: need.details,
+              data: { ...need.data, waitSlackSending: true },
+              filedBy: "plugin",
+            });
+            store.addGuidance(b.id, effectiveGuidance, "user");
+            if (need.data.waitBudget === true) store.patch(b.id, { waitNudgedAt: now() });
+            store.patch(b.id, { waitSlackedAt: now() });
+            store.note(b.id, `The user chose ${label} for ${need.what}; the steward is sending the DM.`);
+            scheduleReconcile(b.id);
+            await wakeProjectOnForwardedAnswer(b, `The user chose ${label} for ${need.what}.`, forwarded);
+            return { ok: true, message: `Sending; ${b.entityKey}'s steward has been told.` };
+          }
           // A decide item the project steward forwarded is the escalation
           // itself, so resolving it delivers the answer to the originator.
           const ownEscalation = store.escalation(need.id);
@@ -11593,12 +11646,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           // BB-351: an overdue-wait decide item resets the budget once it is
           // answered, so a new decide is not filed on the very next look and
-          // "Keep waiting" buys exactly one more budget. BB-354: the offer is
-          // recorded when the need is filed; the pick records it again, so a
-          // pick from a need filed before the wait changed still marks the new
-          // wait as slacked.
+          // "Keep waiting" buys exactly one more budget.
           if (need.data.waitBudget === true) store.patch(b.id, { waitNudgedAt: now() });
-          if (slackContext !== null) store.patch(b.id, { waitSlackedAt: now() });
           store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
           scheduleReconcile(b.id);
           await wakeProjectOnForwardedAnswer(b, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`, forwarded);
@@ -13553,6 +13602,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // appears in its first turn. Link the thread once one has been spawned.
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
+      // BB-354: an Ask on Slack item is sending until the steward's turn has
+      // run and reported the DM.
+      if (n.data.waitSlackSending === true) {
+        actionable = false;
+        notActionable = "Sending the DM; the steward's turn is under way.";
+      }
       const { actions, freeText } = needActions(n, b);
       return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, why: n.why, details: n.details, specDiff: typeof n.data.specDiff === "string" ? n.data.specDiff : null, specChangedLines: typeof n.data.specChangedLines === "number" ? n.data.specChangedLines : null, specCommentUrl: typeof n.data.specCommentUrl === "string" ? n.data.specCommentUrl : null, specFullText: typeof n.data.specFullText === "string" ? n.data.specFullText : null, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, notActionable, actions, freeText };
     }
@@ -14835,6 +14890,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
               const report = await gateReport(b, ref, pull);
               return { exitCode: report.gateMet ? 0 : 1, stdout: input.options.json === true ? JSON.stringify(report) : formatGateReport(report) };
+            },
+          }),
+
+          "wait-slack-sent": cliCommand({
+            summary: "Close an Ask on Slack item with the DM's permalink (BB-354)",
+            description: "Run after `slack_start_conversation` opens the DM. The overdue-wait decide item closes with the permalink in its resolution, and the binding records that the wait was slacked.",
+            positionals: [{ name: "need", description: "The decide item id (need_…)", required: true }],
+            options: { permalink: { type: "string", description: "The permalink the Slack tool returned" } },
+            async run(input) {
+              const result = markWaitSlackSent(input.positionals.need ?? "", input.options.permalink ?? "");
+              if (!result.ok) throw new PluginCliError(result.message, { code: "wait_slack_sent" });
+              return { exitCode: 0, stdout: result.message };
             },
           }),
 
