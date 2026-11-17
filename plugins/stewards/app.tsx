@@ -666,6 +666,8 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     statusNextAction: s.nextAction,
     waitingUntil: s.waitingUntil,
     wait: s.wait,
+    overdue: s.overdue,
+    overdueMs: s.overdueMs,
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
@@ -1314,6 +1316,8 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     waitingOn: s.waitingOn,
     waitingUntil: s.waitingUntil,
     wait: s.wait,
+    overdue: s.overdue,
+    overdueMs: s.overdueMs,
     deployment: s.deployment,
     pending: s.pending,
     requeueAt: s.requeueAt,
@@ -1612,7 +1616,8 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
           {s.wait !== null && s.wait !== undefined ? <p className="text-muted-foreground">Typed wait: {s.wait.kind} {s.wait.ref}</p> : null}
           {nonActionLines(s.nonActions).length > 0 ? <p className="text-muted-foreground">Non-actions: {nonActionLines(s.nonActions).join("; ")}</p> : null}
           {s.roles !== undefined && s.roles.length > 0 ? <p className="text-muted-foreground">Role: {s.roles.join(", ")}</p> : null}
-          {s.hold !== null ? <p className="text-muted-foreground">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
+          {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
+          {s.overdue === true && s.overdueMs !== null && s.overdueMs !== undefined ? <p className="text-destructive">Overdue: {effortPhrase({ ...boardEffortStatus(s), overdue: true, overdueMs: s.overdueMs }, now)}</p> : null}
           {s.delegateWait !== null && s.delegateWait !== undefined ? (
             <p className="text-muted-foreground">Waiting on review from {s.delegateWait}</p>
           ) : delegateStuck !== null ? (

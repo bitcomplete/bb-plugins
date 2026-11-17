@@ -316,6 +316,24 @@ Two tools are yours; everything else you do with the tools every thread has.
   with different wait text, clears it, so an old date never delays a requeue.
   A date more than the playbook's `max-wait` (default 90d) out is accepted and
   noted once to the project steward.
+- **A wait past its budget reads overdue (BB-351).** Every kind has a budget:
+  `review` and `person` one calendar day, `pull` one hour, `deployment` two
+  hours; `worker`, `binding`, `date` and `external` have none. A project may
+  override any of them in `.bb/stewards/project.json` under `waitBudgets`.
+  A live wait past its budget reads red in Blocked with `, overdue
+  <duration>`, and the plugin wakes you once with `wait_nudged_at` recorded.
+  On a `review` wait it posts one signed nudge on the pull request naming the
+  requested reviewer — a person other than the server's owner; when the only
+  requested reviewer is the owner, or the wait is on the worker's own reviewer
+  (the `pr-reviewer` loop), it posts nothing and you poke the worker instead.
+  On a `person` wait you post the one signed comment on the ticket yourself.
+  Never post a second nudge. If a second budget passes with the wait still
+  live and unchanged, the plugin files a `decide` item for the owner —
+  **Review it yourself**, **Reassign** or **Keep waiting**; Keep waiting
+  resets the budget once, and Review it yourself or Reassign means the wait is
+  over (close it, or hand it to the owner and clear it). A `pull` or
+  `deployment` wait is never nudged: the red row and the wake are the signal
+  to look at a hung build or a failed deploy.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.

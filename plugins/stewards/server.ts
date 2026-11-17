@@ -54,6 +54,7 @@ import {
   STAGES,
   ticketWatchId,
   ticketWatchProblems,
+  waitBudgetMs,
   type BindingKind,
   type EscalationKind,
   type FilingTarget,
@@ -92,7 +93,7 @@ import {
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
@@ -252,6 +253,24 @@ export const START_WORKER_WAKE = "The ready gate passed on your last turn and no
 function delegateWaitOf(escalations: readonly Escalation[]): string | null {
   const names = escalations.filter(isDelegateWait).map((x) => delegateWaitNames(x.meanwhile)).filter((n): n is string => n !== null);
   return names.length === 0 ? null : names.join(", ");
+}
+
+/** BB-351: the three choices the owner's overdue-wait decide item offers. */
+export const WAIT_DECIDE_CHOICES = ["Review it yourself", "Reassign", "Keep waiting"] as const;
+
+/**
+ * BB-351: the one nudge comment the plugin posts on a pull request whose
+ * review wait has run past its budget. It names the requested reviewers, says
+ * the steward posted it, and asks for no approval or change, so it is never
+ * mistaken for the owner's review; it carries the thread signature.
+ */
+export function waitNudgeBody(binding: Pick<Binding, "threadId">, reviewers: readonly string[], since: number): string {
+  return [
+    `This pull request has been waiting on a review from ${reviewers.map((r) => `@${r}`).join(", ")} since ${new Date(since).toISOString().slice(0, 10)}.`,
+    "The steward posted this one nudge because the review wait passed its budget. It is not an approval or a change request; no reply is needed if the review is under way.",
+    "",
+    signatureLine(binding.threadId ?? ""),
+  ].join("\n");
 }
 
 export interface StewardsDeps {
@@ -717,6 +736,10 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** The typed wait from the last report (BB-333), or null; rendered on the card. */
               wait: waitSchema.nullable(),
+              /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+              overdue: z.boolean(),
+              /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+              overdueMs: z.number().nullable(),
               nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
@@ -855,6 +878,10 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** The typed wait from the last report (BB-333), or null; rendered on the card. */
               wait: waitSchema.nullable(),
+              /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+              overdue: z.boolean(),
+              /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+              overdueMs: z.number().nullable(),
               nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
@@ -970,6 +997,10 @@ export const rpcContract = defineRpcContract({
           waitingUntil: z.number().nullable(),
           /** The typed wait from the last report (BB-333), or null; the sidebar row carries it for a later render. */
           wait: waitSchema.nullable(),
+          /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+          overdue: z.boolean(),
+          /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+          overdueMs: z.number().nullable(),
           nonActions: nonActionsSchema,
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
@@ -4807,6 +4838,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations,
         needs,
         sources: wakeSourcesFor(b, ownPulls),
+        waitBudgets: config.file.waitBudgets,
         playbook,
         currentSpecHash,
         now: now(),
@@ -5200,6 +5232,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         waitedKind === "pull" || waitedKind === "review"
           ? ((store.assessment(b.id)?.liveness as { waited?: string | null } | null | undefined)?.waited ?? null)
           : null;
+      // BB-351: a wait stored before `wait_since` existed (or by a report that
+      // predates it) starts its clock on the first look that sees it, so a wait
+      // already open when this ships can still read overdue one budget later.
+      if (b.wait !== null && b.waitSince === null) b = store.patch(b.id, { waitSince: now() });
       let assessment: Assessment | null = null;
       try {
         assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
@@ -5210,6 +5246,56 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const nowWaited = assessment?.liveness.waited ?? null;
         if (priorWaited !== null && nowWaited !== null && sameWaitedRef(priorWaited, nowWaited) && priorWaited !== nowWaited) {
           changes.push({ text: `The waited ${waitedKind} ${b.wait?.ref ?? ""} changed`, actionable: true });
+        }
+      }
+      // BB-351: a live wait past its kind's budget reads overdue and wakes the
+      // steward once, recording `wait_nudged_at`. A `review` wait on a person
+      // other than the server's owner is nudged once on the pull request; a
+      // `person` wait is the steward's to nudge in the place it lives (a
+      // ticket comment), and `pull`/`deployment` are never nudged: the wake
+      // asks the steward to look. When a second budget passes with the wait
+      // still live and unchanged, the owner gets one decide item.
+      if (assessment !== null && assessment.liveness.overdue && b.wait !== null && b.waitSince !== null) {
+        const overdueWait = b.wait;
+        const overdueBudget = waitBudgetMs(overdueWait.kind, config.file.waitBudgets);
+        if (b.waitNudgedAt === null) {
+          let nudged = "";
+          if (overdueWait.kind === "review" && b.threadId !== null) {
+            const owner = lc(config.githubLogin ?? "");
+            // Only a requested reviewer who is a person other than the server's
+            // owner is nudged: the owner's own review is the owner-reviewed
+            // lane, and the worker's own `pr-reviewer` thread requests no
+            // GitHub reviewer, so neither has one to nudge.
+            const reviewers = (assessment.wait?.reviewers ?? []).filter((r) => owner !== "" && lc(r) !== owner && !DEPENDENCY_BOTS.has(lc(r)) && !/\[bot\]$/iu.test(r));
+            const ref = parsePullRef(overdueWait.ref);
+            if (reviewers.length > 0 && ref !== null) {
+              try {
+                await sourceRpc("github", "sourceComment", { key: `${ref.repo}#${ref.number}`, body: waitNudgeBody(b, reviewers, b.waitSince) }, sourceContract.sourceComment.output);
+                nudged = ` and nudged ${reviewers.join(", ")} on ${overdueWait.ref}`;
+              } catch (error) {
+                // The nudge is once per wait, so a failed post must reach the
+                // steward in the wake text, not only the log.
+                nudged = `; the nudge to ${reviewers.join(", ")} on ${overdueWait.ref} failed: ${errorMessage(error)}; post it yourself, signed`;
+                bb.log.warn(`stewards: could not nudge the review wait on ${overdueWait.ref}: ${errorMessage(error)}`);
+              }
+            }
+          }
+          changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} is overdue${nudged}; the steward was woken once.`, actionable: true });
+          b = store.patch(b.id, { waitNudgedAt: now() });
+        } else if ((overdueWait.kind === "review" || overdueWait.kind === "person") && overdueBudget !== null && now() - b.waitNudgedAt > overdueBudget) {
+          // `fileNeed` dedupes by (binding, kind, url) while open, so this
+          // files once and rewording later repeats.
+          store.fileNeed({
+            bindingId: b.id,
+            kind: "decide",
+            url: overdueWait.ref,
+            what: `The ${overdueWait.kind} wait on ${overdueWait.ref} is still open after a second budget.`,
+            how: "Choose what to do; Keep waiting resets the budget once.",
+            why: "The wait outlived two budgets, so it comes to the owner.",
+            data: { waitBudget: true, choices: [...WAIT_DECIDE_CHOICES], waitKind: overdueWait.kind, waitRef: overdueWait.ref },
+            filedBy: "plugin",
+          });
+          changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} outlived a second budget; the owner has a decide item.`, actionable: true });
         }
       }
       // BB-329: one worker-busy predicate. Every surface reads the assessment's
@@ -10481,6 +10567,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               workers: store.workers(b.id).filter((w) => w.status === "running").length,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              ...overdueOf(b, config),
               nonActions: b.nonActions,
               escalations: store.openEscalations(b.id).map((x) => ({ kind: x.kind, route: x.route, question: x.question })),
             })),
@@ -10590,6 +10677,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              ...overdueOf(b, boardConfig),
               nonActions: b.nonActions,
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
@@ -10642,7 +10730,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { projects: picker, projectId: null, projectStewardThreadId: null, roleProblem: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
         }
         const { projectId } = picked;
-        const roleProblem = configs.find((c) => c.projectId === projectId)?.problems.find((p) => p.startsWith("No role for ")) ?? null;
+        const pickedConfig = configs.find((c) => c.projectId === projectId) ?? null;
+        const roleProblem = pickedConfig?.problems.find((p) => p.startsWith("No role for ")) ?? null;
         // BB-296: the per-project section is the expensive half. Serve it from
         // the cache when the reconcile has not changed the project, so several
         // connected clients and a burst of signals share one recompute.
@@ -10701,6 +10790,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              ...overdueOf(b, pickedConfig),
               nonActions: b.nonActions,
               workers,
             };
@@ -11397,6 +11487,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               }
             }
           }
+          // BB-351: an overdue-wait decide item resets the budget once it is
+          // answered, so a new decide is not filed on the very next look and
+          // "Keep waiting" buys exactly one more budget.
+          if (need.data.waitBudget === true) store.patch(b.id, { waitNudgedAt: now() });
           store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
           scheduleReconcile(b.id);
           await wakeProjectOnForwardedAnswer(b, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`, forwarded);
@@ -12336,6 +12430,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const noteBeyondMaxWait = untilAt !== null && untilAt - now() > maxWaitMs && b.requeueUntilNoted !== untilAt;
           if (noteBeyondMaxWait) untilNote += ` The date is beyond the playbook's max-wait (${formatDuration(maxWaitMs)}); the project steward is told once.`;
           const waitBefore = b.wait;
+          // BB-351: a report repeating the same kind and ref keeps the wait's
+          // start and its nudge marker; a changed or cleared wait resets both.
+          const waitChanged = (waitBefore?.kind ?? null) !== (wait?.kind ?? null) || (waitBefore?.ref ?? null) !== (wait?.ref ?? null);
           b = store.patch(b.id, {
             status,
             statusAt: now(),
@@ -12349,6 +12446,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             requeueUntil: untilAt,
             // A report replaces the typed wait; a report without one clears it.
             wait,
+            ...(wait === null ? { waitSince: null, waitNudgedAt: null } : waitChanged || b.waitSince === null ? { waitSince: now(), waitNudgedAt: null } : {}),
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
@@ -13377,6 +13475,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function escalationRowFacts(id: string): { stuck: boolean; delegateWait: string | null } {
       const escalations = store.openEscalations(id);
       return { stuck: escalations.some((x) => x.kind === "stuck"), delegateWait: delegateWaitOf(escalations) };
+    }
+
+    /** BB-351: a binding's overdue wait and its age, from the project's `waitBudgets`. */
+    function overdueOf(b: Binding, config: ProjectConfig | null): { overdue: boolean; overdueMs: number | null } {
+      const ms = waitOverdueMs(b.wait, b.waitSince, config?.file.waitBudgets ?? {}, now());
+      return { overdue: ms !== null, overdueMs: ms };
     }
 
     /**

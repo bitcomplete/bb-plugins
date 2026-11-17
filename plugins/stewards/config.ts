@@ -68,6 +68,62 @@ export function formatDuration(ms: number): string {
  */
 export const DEFAULT_MAX_WAIT_MS = 90 * 86_400_000;
 
+/**
+ * BB-351: a wait kind's budget is how long a live wait of that kind may run
+ * before it reads overdue. The kinds are `WAIT_KINDS` in wait.ts, repeated
+ * here so the project file parses without importing the wait module.
+ */
+export const WAIT_BUDGET_KINDS = ["review", "pull", "deployment", "worker", "binding", "date", "person", "external"] as const;
+export type WaitBudgetKind = (typeof WAIT_BUDGET_KINDS)[number];
+
+/**
+ * The defaults, in ms. `null` means the kind has no time budget: `worker`
+ * follows the phase backstop, `binding` lifts by state, `date` never reads
+ * overdue before its date, and `external` follows the no-wake-source rule.
+ * A working day follows the project's calendar where one exists; this project
+ * has none, so it is one calendar day.
+ */
+export const DEFAULT_WAIT_BUDGETS: Record<WaitBudgetKind, number | null> = {
+  review: 86_400_000,
+  pull: 3_600_000,
+  deployment: 7_200_000,
+  worker: null,
+  binding: null,
+  date: null,
+  person: 86_400_000,
+  external: null,
+};
+
+/**
+ * BB-351: the project's `waitBudgets` block, parsed strictly so an unknown
+ * kind is a load error rather than a silently ignored key. Every kind is
+ * optional; a missing key falls back to `DEFAULT_WAIT_BUDGETS`. An explicit
+ * `null` turns a default budget off.
+ */
+export const waitBudgetsSchema = z
+  .object({
+    review: durationSchema.nullable().optional(),
+    pull: durationSchema.nullable().optional(),
+    deployment: durationSchema.nullable().optional(),
+    worker: durationSchema.nullable().optional(),
+    binding: durationSchema.nullable().optional(),
+    date: durationSchema.nullable().optional(),
+    person: durationSchema.nullable().optional(),
+    external: durationSchema.nullable().optional(),
+  })
+  .strict()
+  .default({});
+export type WaitBudgets = z.infer<typeof waitBudgetsSchema>;
+
+/**
+ * The budget in ms for one wait kind: the project's override when it sets one,
+ * else the default. `null` means the kind has no time budget.
+ */
+export function waitBudgetMs(kind: WaitBudgetKind, budgets: Partial<Record<WaitBudgetKind, number | null>>): number | null {
+  const override = budgets[kind];
+  return override === undefined ? DEFAULT_WAIT_BUDGETS[kind] : override;
+}
+
 // ---- models ---------------------------------------------------------------------
 
 /** "claude" is how people write the Claude Code provider; bb calls it claude-code. */
@@ -418,6 +474,12 @@ export const projectFileSchema = z
      */
     notifications: z.object({ enabled: z.boolean().default(true) }).strict().default({ enabled: true }),
     adoption: z.object({ perPass: z.number().int().min(1).max(100).default(10) }).strict().default({ perPass: 10 }),
+    /**
+     * BB-351: how long each wait kind may run before it reads overdue. Absent,
+     * every kind uses its default (see `DEFAULT_WAIT_BUDGETS`); parsed strictly
+     * so an unknown kind is a load error, not a silently ignored key.
+     */
+    waitBudgets: waitBudgetsSchema,
     /**
      * Project-level ticket watches (BB-246): a labelled, assigned issue whose
      * shape matches is adopted under the named ticket playbook, before the

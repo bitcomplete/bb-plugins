@@ -15446,6 +15446,163 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
 // BB-203: the plugin writes the binding's status from events it observed
 // itself, before the steward's next turn, and quiets a running worker's own
 // pull request activity only while nothing the user must act on is open.
+// BB-351: a wait that outlives its per-kind budget reads overdue, is nudged
+// once on the pull request (review/person), and comes to the owner as one
+// decide item after a second budget. `pull` and `deployment` are never nudged.
+describe("the wait budget (BB-351)", () => {
+  const base = { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const };
+  const DAY = 86_400_000;
+  const HOUR = 3_600_000;
+  type World = Awaited<ReturnType<typeof setup>>;
+  const nudgeWrites = (t: World) => t.linearWrites.filter((w) => w.method === "sourceComment");
+  const decideNeeds = (t: World, id: string) => t.hooks.store.openNeeds(id).filter((n) => n.kind === "decide" && n.data.waitBudget === true);
+
+  /** A bound ENG-12 with a review wait on a foreign pull requested from a person. */
+  async function reviewWait(reviewers: string[] = ["arashout"]) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }, { requestedReviewers: reviewers }));
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    expect(report.error).toBe(false);
+    return { t, steward, b: () => t.hooks.store.find("ENG-12")! };
+  }
+
+  it("nudges once on the first overdue reconcile, with a signed body, and records wait_nudged_at", async () => {
+    const { t, steward, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const writes = nudgeWrites(t);
+    expect(writes).toHaveLength(1);
+    const body = String(writes[0]!.input.body);
+    expect(body).toContain("@arashout");
+    expect(body).toContain(`_— from bb thread ${steward}_`);
+    expect(b().waitNudgedAt).not.toBeNull();
+    const overdueWakes = () => t.sends.filter((s) => s.threadId === steward && s.text.includes("is overdue")).length;
+    expect(overdueWakes()).toBe(1);
+    // A second overdue reconcile neither nudges nor wakes again.
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(1);
+    expect(overdueWakes()).toBe(1);
+  });
+
+  it("does not nudge when the only requested reviewer is the owner", async () => {
+    // The test world's GitHub login is `jane`; a review wait on the owner is
+    // the owner-reviewed lane, which the steward does not nudge.
+    const { t, b } = await reviewWait(["jane"]);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(0);
+    expect(b().waitNudgedAt).not.toBeNull();
+  });
+
+  it("does not nudge a review wait with no requested reviewer (the pr-reviewer loop), but still comes to the owner", async () => {
+    const { t, b } = await reviewWait([]);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(0);
+    expect(b().waitNudgedAt).not.toBeNull();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("files one decide need with the three choices after the second budget", async () => {
+    const { t, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitNudgedAt).not.toBeNull();
+    expect(decideNeeds(t, b().id)).toHaveLength(0);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const needs = decideNeeds(t, b().id);
+    expect(needs).toHaveLength(1);
+    expect(needs[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    // A repeated look does not file a second item.
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("Keep waiting resets the budget once and files no second need until it passes again", async () => {
+    const { t, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Keep waiting" }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: true });
+    await t.flush();
+    // The reset moves the decide clock: within the next budget no new item.
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(0);
+    // Past it, the item is filed again.
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("never nudges a pull or deployment wait, though it still wakes once", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
+    t.advance(2 * HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(0);
+    expect(t.hooks.store.find("ENG-12")!.waitNudgedAt).not.toBeNull();
+    // A deployment wait with a live watch, likewise.
+    const t2 = await setup();
+    t2.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t2.ring("linear", "uuid-12");
+    const b2 = t2.hooks.store.find("ENG-12")!;
+    t2.hooks.store.patch(b2.id, { wait: { kind: "deployment", ref: "acme/web#9" }, waitSince: t2.now() });
+    t2.hooks.store.patch(b2.id, {
+      deployments: {
+        "acme/web#9": { key: "acme/web#9", state: "deploying", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: t2.now(), deadlineAt: null, note: null, workflowRuns: [] },
+      },
+    });
+    t2.advance(3 * HOUR);
+    await t2.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t2)).toHaveLength(0);
+    expect(t2.hooks.store.find("ENG-12")!.waitNudgedAt).not.toBeNull();
+  });
+
+  it("starts the clock for a stored wait with no wait_since, then nudges one budget later", async () => {
+    const { t, b } = await reviewWait();
+    // A wait already open when `wait_since` shipped (a migrated row, or a
+    // report from before the column) has no clock until the first look.
+    t.hooks.store.patch(b().id, { waitSince: null });
+    expect(nudgeWrites(t)).toHaveLength(0);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitSince).not.toBeNull();
+    expect(nudgeWrites(t)).toHaveLength(0);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(1);
+    expect(b().waitNudgedAt).not.toBeNull();
+  });
+
+  it("keeps the wait's start on a repeat and resets it when the kind or ref changes", async () => {
+    const { t, steward, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitNudgedAt).not.toBeNull();
+    const first = b().waitSince!;
+    t.advance(HOUR);
+    await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    expect(b().waitSince).toBe(first);
+    expect(b().waitNudgedAt).not.toBeNull();
+    t.advance(HOUR);
+    await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
+    expect(b().waitSince).toBeGreaterThan(first);
+    expect(b().waitNudgedAt).toBeNull();
+  });
+});
+
 describe("mechanical status and quiet notes (BB-203)", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
   const marker = comment({

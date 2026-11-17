@@ -8,7 +8,7 @@
 // about their absence (named in the title).
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, type AssessmentInput } from "./assessment.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, waitOverdueMs, type AssessmentInput } from "./assessment.js";
 import { parsePlaybook, type Playbook } from "./config.js";
 import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { approvalMarkerLine } from "./gate.js";
@@ -429,6 +429,77 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
     expect(a.liveness.idle).toBe(false);
     // The parked-worker surface still compares the consumer's idle.
     expect(compare(i, a).find((x) => x.surface === "idleInActiveStage")).toMatchObject({ old: "idle", new: "parked" });
+  });
+});
+
+// BB-351: the per-kind wait budget. `overdue` is true only when the stored
+// wait is live, its kind has a budget, and `now - waitSince` exceeds it.
+describe("the shadow assessment: the wait budget (BB-351)", () => {
+  const DAY = 86_400_000;
+  const HOUR = 3_600_000;
+  const now = 100 * DAY;
+  const openPull = (key: string) => pull({ key, url: `https://github.com/${key.split("#")[0]}/pull/${key.split("#")[1]}`, state: "open" });
+  const withWait = (wait: NonNullable<AssessmentInput["binding"]["wait"]>, since: number, over: Partial<AssessmentInput> = {}) => input({ now, binding: binding({ wait, waitSince: since }), ...over });
+
+  it("reads overdue for each kind with its default budget, and not within it", () => {
+    const open = openPull("acme/web#9");
+    const waited = new Map([[open.key.toLowerCase(), open]]);
+    // review: one calendar day (no project calendar exists).
+    expect(assess(withWait({ kind: "review", ref: "acme/web#9" }, now - DAY - 1, { waitedPulls: waited })).liveness.overdue).toBe(true);
+    expect(assess(withWait({ kind: "review", ref: "acme/web#9" }, now - DAY + 1, { waitedPulls: waited })).liveness.overdue).toBe(false);
+    // pull: one hour.
+    expect(assess(withWait({ kind: "pull", ref: "acme/web#9" }, now - HOUR - 1, { waitedPulls: waited })).liveness.overdue).toBe(true);
+    expect(assess(withWait({ kind: "pull", ref: "acme/web#9" }, now - HOUR + 1, { waitedPulls: waited })).liveness.overdue).toBe(false);
+    // deployment: two hours, live while its watch is merged or deploying.
+    const watch = { key: "acme/web#9", state: "deploying" as const, mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: 1, deadlineAt: null, note: null, workflowRuns: [] };
+    expect(assess(withWait({ kind: "deployment", ref: "acme/web#9" }, now - 2 * HOUR - 1, { binding: binding({ wait: { kind: "deployment", ref: "acme/web#9" }, waitSince: now - 2 * HOUR - 1, deployments: { "acme/web#9": watch } }) })).liveness.overdue).toBe(true);
+    // person: one calendar day, live while its page item is open.
+    expect(assess(withWait({ kind: "person", ref: "need_1" }, now - DAY - 1, { hasOpenItem: () => true })).liveness.overdue).toBe(true);
+    // worker/binding/date/external have no time budget.
+    expect(assess(withWait({ kind: "worker", ref: "thr_w1" }, now - 10 * DAY, { workers: [{ threadId: "thr_w1", status: "running" } as never] })).liveness.overdue).toBe(false);
+    expect(assess(withWait({ kind: "binding", ref: "ENG-13" }, now - 10 * DAY, { hasOpenBinding: () => true })).liveness.overdue).toBe(false);
+    expect(assess(withWait({ kind: "external", ref: "the vendor" }, now - 10 * DAY)).liveness.overdue).toBe(false);
+  });
+
+  it("honours a project.json override and a kind turned off with null", () => {
+    const open = openPull("acme/web#9");
+    const waited = new Map([[open.key.toLowerCase(), open]]);
+    const overridden = withWait({ kind: "review", ref: "acme/web#9" }, now - DAY - 1, { waitedPulls: waited, waitBudgets: { review: 3 * DAY } });
+    expect(assess(overridden).liveness.overdue).toBe(false);
+    const off = withWait({ kind: "review", ref: "acme/web#9" }, now - 10 * DAY, { waitedPulls: waited, waitBudgets: { review: null } });
+    expect(assess(off).liveness.overdue).toBe(false);
+  });
+
+  it("never reads a date wait overdue before its date, and not at all after it", () => {
+    // The date is ahead: the wait is live but has no time budget.
+    const ahead = assess(input({ now, binding: binding({ wait: { kind: "date", ref: "2026-12-01" }, waitSince: now - 10 * DAY, requeueUntil: now + DAY }) }));
+    expect(ahead.liveness.waitLive).toBe(true);
+    expect(ahead.liveness.overdue).toBe(false);
+    // The date has passed: the wait is not live, so it cannot be overdue.
+    const past = assess(input({ now, binding: binding({ wait: { kind: "date", ref: "2026-12-01" }, waitSince: now - 10 * DAY, requeueUntil: now - DAY }) }));
+    expect(past.liveness.waitLive).toBe(false);
+    expect(past.liveness.overdue).toBe(false);
+  });
+
+  it("is false while the wait is not live, however old it is", () => {
+    const merged = pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "merged" }, { merged: true });
+    const i = withWait({ kind: "review", ref: "acme/web#9" }, now - 10 * DAY, { waitedPulls: new Map([[merged.key.toLowerCase(), merged]]) });
+    expect(assess(i).liveness.waitLive).toBe(false);
+    expect(assess(i).liveness.overdue).toBe(false);
+    // A closed page item, likewise.
+    expect(assess(withWait({ kind: "person", ref: "need_1" }, now - 10 * DAY, { hasOpenItem: () => false })).liveness.overdue).toBe(false);
+  });
+
+  it("reads a changed wait as fresh: a new kind or ref resets the clock", () => {
+    const open = openPull("acme/web#9");
+    const waited = new Map([[open.key.toLowerCase(), open]]);
+    // The old wait's start is far past the budget, so a changed wait reported
+    // now carries a fresh `waitSince` and is not overdue.
+    const changed = withWait({ kind: "pull", ref: "acme/web#9" }, now - 1, { waitedPulls: waited });
+    expect(assess(changed).liveness.overdue).toBe(false);
+    // waitOverdueMs is the one derivation: the same wait and start is overdue.
+    expect(waitOverdueMs({ kind: "pull", ref: "acme/web#9" }, now - HOUR - 1, {}, now)).toBe(HOUR + 1);
+    expect(waitOverdueMs({ kind: "pull", ref: "acme/web#9" }, now - 1, {}, now)).toBeNull();
   });
 });
 
