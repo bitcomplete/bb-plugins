@@ -167,10 +167,11 @@ describe("needs you items", () => {
 describe("countNeedsUser (BB-104)", () => {
   // The same predicate the SQL count evaluates from the store's own reads.
   // Only a route-`me` escalation counts (BB-208); project, steward and parent
-  // ones do not. The status actor does not count by itself (BB-213): the report
-  // files a need, so the actor is true only through the open row. The server's
-  // row predicate is narrower since BB-237 (a non-actionable need is not a
-  // yellow row), but the count is still every open item waiting on the user.
+  // ones do not. The status actor does not count by itself (BB-213, BB-349): a
+  // report files no item from it, so the actor is true only through an open
+  // row. The server's row predicate is narrower since BB-237 (a non-actionable
+  // need is not a yellow row), but the count is still every open item waiting
+  // on the user.
   const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
     s.openEscalations(b.id).some((x) => x.route === "user") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
 
@@ -181,11 +182,10 @@ describe("countNeedsUser (BB-104)", () => {
 
   it("counts exactly the open bindings needsUser flags: each condition once, and once when a binding has all four", () => {
     const { s, binding } = store();
-    // The base binding: actor `user` alone does not count (BB-213); the need the
-    // report files from it does.
+    // The base binding: actor `user` alone does not count (BB-213, BB-349); the
+    // report files nothing from it, so the row needs an item of its own.
     s.patch(binding.id, { status: userStatus(1_000) });
     expect(needsUser(s, s.binding(binding.id)!)).toBe(false);
-    s.fileNeed({ bindingId: binding.id, kind: "decide", url: "", what: "Do the thing", how: null, data: { autoFiled: true } });
     // One binding per remaining condition. The escalation that counts is the
     // one routed to the user; escalations routed elsewhere are added below.
     const escalation = add(s, 13);
@@ -219,7 +219,7 @@ describe("countNeedsUser (BB-104)", () => {
 
     const open = s.open("p1");
     const expected = open.filter((b) => needsUser(s, b)).length;
-    expect(expected).toBe(5); // auto-filed need, escalation, need, question, and all four
+    expect(expected).toBe(4); // escalation, need, question, and all four
     expect(s.countNeedsUser("p1")).toBe(expected);
     expect(s.countNeedsUser("p1")).not.toBe(s.countNeedsUser("p2"));
     expect(s.countNeedsUser("p2")).toBe(1);

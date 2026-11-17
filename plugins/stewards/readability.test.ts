@@ -7,7 +7,6 @@ import {
   approvePrNeedParts,
   approvePrWhy,
   approveSpecNeedParts,
-  autoDecideParts,
   contextProblem,
   decisionWhy,
   forwardedQuestionParts,
@@ -104,8 +103,6 @@ describe("every plugin-composed item reads in three plain parts", () => {
   });
 
   it("the other plugin-composed decide items are readable", () => {
-    const auto = autoDecideParts("Review the failing deploy and decide");
-    expect(readabilityProblems({ need: auto.what, context: auto.how, why: auto.why })).toEqual([]);
     const lesson = lessonDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", boundary: true, retire: false, branch: "guidance-x", prUrl: "https://github.com/acme/web/pull/9" });
     expect(readabilityProblems({ need: lesson.what, context: lesson.how, why: lesson.why })).toEqual([]);
     const retired = lessonDecideParts({ file: "AGENTS.md", lessonText: "Always run the tests.", boundary: true, retire: true, branch: "guidance-x", prUrl: "https://github.com/acme/web/pull/9" });

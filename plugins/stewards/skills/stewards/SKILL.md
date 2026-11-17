@@ -75,7 +75,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   without a report raise `stuck`. When only the user can do something — a
   step outside the repos, a secret, a decision — raise it as an escalation
   (`steward_report { escalate }`); the project steward forwards it, and it
-  appears on the Stewards page with a button. `steward_report { needs }`
+  appears on the Stewards page with a button. A report that names the user as
+  its `actor` files nothing by itself: the plugin does not create an item from
+  `nextAction`, so file a real item or raise an escalation.
+  `steward_report { needs }`
   accepts only the plugin's gate kinds (`approve-spec`, `approve-pr`,
   `merge`); a steward-filed `decide`, `configure` or `provide-secret` is
   refused and points at `escalate`.

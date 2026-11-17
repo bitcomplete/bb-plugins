@@ -1953,8 +1953,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
    * or a question, the open predicates `openEscalations`, `openNeeds` and
    * `openQuestions` use. An escalation routed to the project steward, the
    * binding's own steward or its parent does not count (BB-208). A report whose
-   * actor is `user` no longer counts by itself: the plugin files a need from it
-   * (BB-213), so the actor contributes only through that open row. Since
+   * actor is `user` does not count by itself: the actor contributes only
+   * through an open item, and since BB-349 no item is auto-filed from the
+   * report's next action. Since
    * BB-237 the row phrase is narrower than this count — a need the server cannot
    * act on yet is not a yellow row — so the picker may count a binding the
    * sidebar does not list; the count stays "everything waiting on the user".
