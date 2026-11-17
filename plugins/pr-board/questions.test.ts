@@ -18,7 +18,7 @@ it("recognizes only a validated final question block, never prose that sounds li
 });
 
 it("preserves an unanswered question after the worker pushes, until the PR closes, even when the thread lookup fails", () => {
-  const marker: Marker = { key: "acme/repo#1", action: "fix-ci", status: "started", at: "t0", threadId: "t", title: "Repair check", head: "old", move: "ci", reason: null, question, answeredQuestions: [], answering: null, answerError: null };
+  const marker: Marker = { key: "acme/repo#1", action: "fix-ci", status: "started", at: "t0", threadId: "t", title: "Repair check", head: "old", move: "ci", reason: null, question, answeredQuestions: [], answering: null, answerError: null, report: null };
   const threads = { t: { live: false, updatedAt: "t1" } };
   expect(afterRefresh([marker], { [marker.key]: { head_oid: "new", move: "ready" } }, threads, "t2")).toEqual([marker]);
   expect(afterRefresh([marker], {}, threads, "t2")).toEqual([]);

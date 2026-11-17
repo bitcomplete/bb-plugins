@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 // BB-20: the Stewards page renders a decide item or question with fixed
 // choices as one button per choice plus Other…, and a text-only one with
-// Answer rather than Done. BB-213: a decide item the plugin auto-filed from an
-// actor-`user` report is the exception, with Done as its only button.
+// Answer rather than Done.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
@@ -43,8 +42,6 @@ type Need = {
   createdAt: number;
   actionable: boolean;
   why: string | null;
-  /** Whether the plugin auto-filed it from an actor-`user` report (BB-213). */
-  autoFiled?: boolean;
   actions: NeedAction[];
   freeText: boolean;
 };
@@ -89,7 +86,7 @@ const need = (over: Partial<Need> = {}): Need => {
     why: null,
     ...over,
   };
-  const { actions, freeText } = needActions({ kind: base.kind, url: base.url ?? "", data: { choices: base.choices, lessonId: base.lessonId, prUrl: base.prUrl, ...(over.autoFiled === true ? { autoFiled: true } : {}) } }, { url: base.entityUrl });
+  const { actions, freeText } = needActions({ kind: base.kind, url: base.url ?? "", data: { choices: base.choices, lessonId: base.lessonId, prUrl: base.prUrl } }, { url: base.entityUrl });
   return { ...base, actions: over.actions ?? actions, freeText: over.freeText ?? freeText };
 };
 
@@ -255,15 +252,6 @@ describe("the Stewards page's decide items and questions (BB-20)", () => {
     await waitFor(() => expect(slot.getByRole("button", { name: "Answer" })).toBeTruthy());
     expect(slot.queryByRole("button", { name: "Other…" })).toBeNull();
     expect(slot.getAllByRole("button", { name: "Done" })).toHaveLength(1);
-    slot.lifecycle.unmount();
-  });
-
-  it("shows only Done for a need the plugin auto-filed from an actor-`user` report (BB-213)", async () => {
-    const slot = await renderBoard([need({ autoFiled: true, what: "Approve the pull request" })], []);
-    await waitFor(() => expect(slot.getByRole("button", { name: "Done" })).toBeTruthy());
-    expect(slot.queryByRole("button", { name: "Answer" })).toBeNull();
-    expect(slot.queryByRole("button", { name: "Other…" })).toBeNull();
-    expect(slot.queryByRole("button", { name: "Open PR" })).toBeNull();
     slot.lifecycle.unmount();
   });
 
@@ -1107,7 +1095,8 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     // The count line.
     const count = slot.container.querySelector("[data-board-count-line]")!;
     expect(count.textContent).toContain("3 open");
-    expect(count.textContent).toContain("2 blocked");
+    expect(count.textContent).toContain("1 blocked");
+    expect(count.textContent).toContain("1 waiting");
     expect(count.textContent).toContain("1 monitors");
     expect(count.textContent).toContain("1 recently ended");
     // The latest digest and the collapsed lessons block.
@@ -1260,7 +1249,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
       stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "delegate", why: "Waiting on the requested reviewer: unreadable", since: 1 }],
     });
     const fallback = await waitFor(() => unparsed.getByText("Stuck: Waiting on the requested reviewer: unreadable"));
-    expect(fallback.className).toContain("text-destructive");
+    expect(fallback.className).toContain("text-muted-foreground");
     expect(unparsed.queryByText(/Waiting on review from/u)).toBeNull();
     unparsed.lifecycle.unmount();
   });

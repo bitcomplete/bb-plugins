@@ -8,7 +8,7 @@ import { comment, crashingPod, githubIssue, issue, parkedWorker, pull, warningEv
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
-import { needActions, parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
+import { parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
@@ -593,7 +593,7 @@ describe("a Linear ticket steward", () => {
     expect(t.hooks.store.openEscalations(b.id).at(-1)!.context).toBeNull();
   });
 
-  it("forwards an escalation's context ahead of the kind, meanwhile and recommendation lines", async () => {
+  it("forwards an escalation's context as written, with meanwhile and recommendation as separate fields", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -603,11 +603,18 @@ describe("a Linear ticket steward", () => {
     const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: id, recommendation: "Leave SSO out." }, project!);
     const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
     const q = t.hooks.store.question(qst)!;
+    // BB-345: the shown context is the steward's context only; the origin,
+    // meanwhile and recommendation are separate fields the page places.
     expect(q.question).toBe("Include SSO?");
-    expect(q.context).toContain("The auth doc lists both providers; the ticket does not say.");
-    expect(q.context!.indexOf("The auth doc lists both providers")).toBeLessThan(q.context!.indexOf("A scope escalation from ENG-12"));
-    expect(q.context!.indexOf("A scope escalation from ENG-12")).toBeLessThan(q.context!.indexOf("Meanwhile: Wait."));
-    expect(q.context!.indexOf("Meanwhile: Wait.")).toBeLessThan(q.context!.indexOf("Recommendation: Leave SSO out."));
+    expect(q.context).toBe("The auth doc lists both providers; the ticket does not say.");
+    expect(q.context).not.toContain("Meanwhile:");
+    expect(q.context).not.toContain("escalation from");
+    const view = ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { questions: Array<{ id: string; meanwhile: string | null; recommendation: string | null; origin: string | null; why: string | null }> } }).board!;
+    const qv = view.questions.find((x) => x.id === qst)!;
+    expect(qv.meanwhile).toBe("Wait.");
+    expect(qv.recommendation).toBe("Leave SSO out.");
+    expect(qv.origin).toContain("A scope escalation from ENG-12");
+    expect(qv.why).toBeTruthy();
   });
 
   it("has the project steward approve a substantial spec; the user only when they say so", async () => {
@@ -861,15 +868,6 @@ describe("a Linear ticket steward", () => {
     t.entities.set("uuid-12", issue({ description: "Users cannot log in. SSO is out of scope. Retry once.", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
     await t.ring("linear", "uuid-12");
     expect(toProject()).toHaveLength(after);
-  });
-
-  it("flags a status that waits on the project steward with no escalation", async () => {
-    const t = await setup();
-    t.entities.set("uuid-12", issue());
-    await t.ring("linear", "uuid-12");
-    const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { phase: "Todo", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the project steward's call on scope" }, steward);
-    expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toMatch(/waits on the project steward, with no open escalation/u);
   });
 
   it("recognizes workers the steward starts with bb thread spawn, and wakes only when one asks", async () => {
@@ -2014,9 +2012,11 @@ describe("declined specs converge (BB-54)", () => {
     await t.tool("steward_report", { ...base, ready: met }, t.steward);
     const esc2 = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
     await t.tool("steward_update", { binding: "ENG-12", guidance: "Name the migration.", resolve: esc2 }, t.project);
-    const q = t.hooks.store.openQuestions("p1").find((x) => /twice on the same objection/u.test(x.question));
+    const q = t.hooks.store.openQuestions("p1").find((x) => /two declines on the same objection/u.test(x.question));
     expect(q).toBeDefined();
-    expect(q!.question).toContain("Name the migration.");
+    // The objections are the raw material in Details, not the question line (BB-345).
+    expect(q!.details).toContain("Name the migration.");
+    expect(q!.why).toBeTruthy();
   });
 });
 
@@ -4208,7 +4208,7 @@ describe("the status report actor (BB-97)", () => {
     return sidebar.projects.find((p) => p.projectId === "p1")!.needsCount;
   };
 
-  it("records `user` as the server's owner, so the row needs you; `steward` and `other` do not", async () => {
+  it("records `user` as the server's owner; `steward` and `other` do not, and the actor alone is not a row needing you (BB-97, BB-349)", async () => {
     const t = await bound();
     await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait for the worker", actor: "steward" }, t.steward);
     expect(status(t)!.actor).toBe("steward");
@@ -4218,18 +4218,22 @@ describe("the status report actor (BB-97)", () => {
     expect(status(t)!.actor).toBe("other");
     expect(await needsUser(t)).toBe(false);
 
-    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", waitingOn: "a bb-gate deployment" }, t.steward);
+    // `user` is stored, but naming the user files no item, so the row does not
+    // need them until a real item or escalation is open (BB-349).
+    const report = await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", waitingOn: "a bb-gate deployment" }, t.steward);
     expect(status(t)!.actor).toBe("user");
-    expect(await needsUser(t)).toBe(true);
+    expect(await needsUser(t)).toBe(false);
+    expect(report.text).toMatch(/filed nothing for them/u);
   });
 
-  it("accepts `me` for one release: stored as `user`, needs you, and one log line", async () => {
+  it("accepts `me` for one release: stored as `user`, files nothing, and one log line", async () => {
     const t = await bound();
     const before = t.harness.logEntries.length;
     const report = await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "me" }, t.steward);
     expect(report.error).toBe(false);
     expect(status(t)!.actor).toBe("user");
-    expect(await needsUser(t)).toBe(true);
+    expect(await needsUser(t)).toBe(false);
+    expect(report.text).toMatch(/filed nothing for them/u);
     expect(t.harness.logEntries.slice(before).filter((entry) => entry.message.includes('actor "me" is renamed to "user"'))).toHaveLength(1);
   });
 
@@ -4273,7 +4277,7 @@ describe("the status report actor (BB-97)", () => {
     t.hooks.store.resolve(own.id, "Done.", "steward");
   });
 
-  it("still counts an open need and an open question, but an actor `user` report only once it has filed a need (BB-208, BB-213)", async () => {
+  it("still counts an open need and an open question, but not an actor `user` report by itself (BB-208, BB-349)", async () => {
     const t = await bound();
     const create = (n: number, key: string) => t.hooks.store.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: key, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
 
@@ -4285,120 +4289,70 @@ describe("the status report actor (BB-97)", () => {
     t.hooks.store.ask({ projectId: "p1", bindingId: question.id, escalationId: null, question: "Which?", context: null });
     expect(await needsUser(t, "ENG-21")).toBe(true);
 
-    // The actor alone is not the badge: the row needs you only through the
-    // need the report files (BB-213).
+    // The actor alone is not the badge: the row needs you only through an
+    // open item (BB-213), and an actor-`user` report files none (BB-349).
     const user = create(22, "ENG-22");
     t.hooks.store.patch(user.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "On the user", actor: "user", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
     expect(await needsUser(t, "ENG-22")).toBe(false);
-    t.hooks.store.fileNeed({ bindingId: user.id, kind: "decide", url: "", what: "On the user", how: null, data: { autoFiled: true } });
-    expect(await needsUser(t, "ENG-22")).toBe(true);
 
-    expect(await pickerCount(t)).toBe(3);
+    expect(await pickerCount(t)).toBe(2);
   });
 
-  it("files one `decide` need from a report whose actor is `user` and nothing else is open (BB-213)", async () => {
+  it("files nothing for a report whose actor is `user` and nothing else is open, and says how to reach the owner (BB-349)", async () => {
     const t = await bound();
     const b = t.hooks.store.find("ENG-12")!;
     const report = await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Approve the pull request", actor: "user" }, t.steward);
     expect(report.error).toBe(false);
-    const needs = t.hooks.store.openNeeds(b.id);
-    expect(needs).toHaveLength(1);
-    expect(needs[0]).toMatchObject({ kind: "decide", url: "https://linear.app/acme/issue/ENG-12", what: "Approve the pull request", filedBy: "plugin", data: { autoFiled: true } });
-    // Its only button is Done.
-    expect(needActions(needs[0]!, b)).toEqual({ actions: [{ label: "Done", action: "done", choice: null, primary: true, note: false }], freeText: false });
-    // The badge and the picker agree with the filed item, and the reply names it.
-    expect(await needsUser(t)).toBe(true);
-    expect(await pickerCount(t)).toBe(1);
-    expect(report.text).toMatch(/on the Stewards page from your nextAction/u);
+    // No need, question or route-`user` escalation is filed or left open.
+    expect(t.hooks.store.openNeeds(b.id)).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id)).toEqual([]);
+    expect(t.hooks.store.openQuestions(b.projectId).filter((q) => q.bindingId === b.id)).toEqual([]);
+    // The result names the real item kinds and an escalation.
+    expect(report.text).toMatch(/filed nothing for them/u);
+    expect(report.text).toMatch(/approve-pr, merge, approve-spec/u);
+    expect(report.text).toMatch(/raise an escalation/u);
   });
 
-  it("a re-report updates the same auto-filed need rather than adding one (BB-213)", async () => {
+  it("a re-report with actor `user` still files nothing (BB-349)", async () => {
     const t = await bound();
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Approve the pull request", actor: "user" }, t.steward);
-    const first = t.hooks.store.openNeeds(b.id);
-    expect(first).toHaveLength(1);
     await t.tool("steward_report", { phase: "In Review", summary: "Waiting still.", nextAction: "Approve the pull request now", actor: "user" }, t.steward);
-    const second = t.hooks.store.openNeeds(b.id);
-    expect(second).toHaveLength(1);
-    expect(second[0]!.id).toBe(first[0]!.id);
-    expect(second[0]!.what).toBe("Approve the pull request now");
+    expect(t.hooks.store.openNeeds(b.id)).toEqual([]);
+    expect(await needsUser(t)).toBe(false);
   });
 
-  it("Done closes the auto-filed need and wakes the steward (BB-213)", async () => {
+  it("bb stewards show prints the next action as a line, not a Need (BB-349)", async () => {
     const t = await bound();
-    const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Approve the pull request", actor: "user" }, t.steward);
-    const need = t.hooks.store.openNeeds(b.id)[0]!;
-    const result = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "done", note: null }, { experimental_caller: { kind: "client" } });
-    expect(result).toMatchObject({ ok: true });
-    expect(t.hooks.store.need(need.id)!.status).toBe("done");
-    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(0);
-    expect(await needsUser(t)).toBe(false);
-    expect(t.hooks.store.binding(b.id)!.pending.some((n) => n.text.includes(need.id))).toBe(true);
+    const shown = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(shown).toContain("Waiting. Next: Approve the pull request (user)");
+    expect(shown).not.toMatch(/Need need_/u);
   });
 
-  it("closes the auto-filed need when a later report names another actor or files its own item (BB-213)", async () => {
+  it("closes every open auto-filed need at startup, once, without deleting it (BB-349)", async () => {
     const t = await bound();
     const b = t.hooks.store.find("ENG-12")!;
-    const fileAuto = () => t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Approve the pull request", actor: "user" }, t.steward);
-
-    await fileAuto();
-    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(1);
-    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait for the worker", actor: "steward" }, t.steward);
-    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(0);
-    expect(await needsUser(t)).toBe(false);
-
-    await fileAuto();
-    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(1);
-    // The report's own item (a configure escalation in this harness) replaces
-    // the auto one, so nothing is filed twice.
-    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Enable the event", actor: "user", needs: [{ kind: "configure", url: "https://example.test", what: "Enable it" }] }, t.steward);
-    expect(t.hooks.store.openNeeds(b.id).some((n) => n.data.autoFiled === true)).toBe(false);
-    expect(t.hooks.store.openEscalations(b.id).some((x) => x.route === "user")).toBe(true);
+    const auto = t.hooks.store.fileNeed({ bindingId: b.id, kind: "decide", url: "", what: "On the user", how: null, data: { autoFiled: true } });
+    const other = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable it", how: null });
+    await t.hooks.closeAutoFiledNeedsOnce();
+    const closed = t.hooks.store.need(auto.id)!;
+    expect(closed.status).toBe("done");
+    expect(closed.resolution).toBe("Auto-filed needs are no longer used (BB-349)");
+    const resolvedAt = closed.resolvedAt;
+    // Nothing is deleted: the row is still there, and a need without the mark
+    // is untouched.
+    expect(t.hooks.store.needs(b.id, true).some((n) => n.id === auto.id)).toBe(true);
+    expect(t.hooks.store.need(other.id)!.status).toBe("open");
+    // A second start does nothing: the marker is set and the row is unchanged.
+    await t.hooks.closeAutoFiledNeedsOnce();
+    expect(t.hooks.store.need(auto.id)!.status).toBe("done");
+    expect(t.hooks.store.need(auto.id)!.resolvedAt).toBe(resolvedAt);
   });
 
-  it("files the same auto-filed need whether the report raises the escalation or a later one finds it open (BB-213)", async () => {
+  it("the sidebar badge and the SQL picker count agree at zero for an actor-`user` report (BB-349)", async () => {
     const t = await bound();
-    const b = t.hooks.store.find("ENG-12")!;
-    // A new escalation routes to the project steward (parent/project), never
-    // `me`, so the actor-`user` report files the auto item either way.
-    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Decide the question", actor: "user", escalate: { kind: "decision", question: "Which?", meanwhile: "Wait." } }, t.steward);
-    const first = t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true);
-    expect(first).toHaveLength(1);
-    expect(await needsUser(t)).toBe(true);
-    // The next report leaves the escalation open and files nothing new: the
-    // same item is updated, not closed and not duplicated.
-    await t.tool("steward_report", { phase: "In Review", summary: "Waiting still.", nextAction: "Decide the question", actor: "user" }, t.steward);
-    const second = t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true);
-    expect(second).toHaveLength(1);
-    expect(second[0]!.id).toBe(first[0]!.id);
-    expect(await needsUser(t)).toBe(true);
-  });
-
-  it("backfills an auto-filed need for an open actor-`user` binding on the first start, once (BB-213)", async () => {
-    const t = await bound();
-    const b = t.hooks.store.find("ENG-12")!;
-    // A row stored before the change: actor `user`, no item.
-    t.hooks.store.patch(b.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "Approve the pull request", actor: "user", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
-    expect(await needsUser(t)).toBe(false);
-    await t.hooks.backfillAutoNeedsOnce();
-    const needs = t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true);
-    expect(needs).toHaveLength(1);
-    expect(needs[0]!.what).toBe("Approve the pull request");
-    expect(await needsUser(t)).toBe(true);
-    // A second start does nothing: no duplicate.
-    await t.hooks.backfillAutoNeedsOnce();
-    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.data.autoFiled === true)).toHaveLength(1);
-  });
-
-  it("the sidebar badge and the SQL picker count agree on the auto-filed need (BB-213)", async () => {
-    const t = await bound();
-    const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "Approve the pull request", actor: "user" }, t.steward);
-    expect(await needsUser(t)).toBe(true);
-    expect(await pickerCount(t)).toBe(t.hooks.store.countNeedsUser("p1"));
-    t.hooks.store.closeNeed(t.hooks.store.openNeeds(b.id)[0]!.id, "Done.", "user");
     expect(await needsUser(t)).toBe(false);
     expect(await pickerCount(t)).toBe(t.hooks.store.countNeedsUser("p1"));
     expect(await pickerCount(t)).toBe(0);
@@ -5063,6 +5017,33 @@ describe("questions to the user", () => {
     expect((await t.board()).questions).toEqual([]);
   });
 
+  it("renders a forwarded escalation and its question as one entry in `bb stewards show` (BB-350)", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc, resolution: "text", entry: "Scope changes" }, t.project)).text);
+    const show = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    // One entry, headed by the esc_ id, with the question id and its resolution
+    // kind indented beneath it, and no separate `Escalation qst_…` row.
+    expect(show).toContain(`Escalation ${esc} scope (open, user): Include SSO?`);
+    expect(show).toContain(`  Question ${qst}`);
+    expect(show).toContain("  Why you: The decide list marks this the user's: Scope changes.");
+    expect(show).toContain("  Resolution kind: text");
+    expect(show).not.toContain(`Escalation ${qst}`);
+    // The binding's flag row lists the ask once too.
+    expect(show).not.toContain(`escalation ${qst}`);
+    expect(show.match(/Include SSO\?/gu)).toHaveLength(1);
+
+    // Answered, the answer lands on the entry's indented line, and the ask is
+    // still one entry.
+    await t.tool("steward_update", { resolve: qst, answer: "No SSO for now." }, t.project);
+    const answered = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(answered).toContain(`Escalation ${esc} scope (resolved, user): Include SSO?`);
+    expect(answered).toContain("  Answer: No SSO for now.");
+    expect(answered).not.toContain(`Escalation ${qst}`);
+    expect(answered.match(/Include SSO\?/gu)).toHaveLength(1);
+  });
+
   it("closing a forwarded question with resolve decides its escalation and tells the steward", async () => {
     const t = await adopted();
     await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
@@ -5073,7 +5054,8 @@ describe("questions to the user", () => {
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided: No SSO for now\./u);
     const list = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
-    expect(list).toMatch(/\(resolved, user\): Include SSO\? → No SSO for now\./u);
+    expect(list).toContain(`Escalation ${esc} scope (resolved, user): Include SSO?`);
+    expect(list).toContain("  Answer: No SSO for now.");
 
     // A retry is no error, records nothing twice, and does not tell the steward again.
     const told = t.sends.filter((s) => s.threadId === t.steward).length;
@@ -6100,11 +6082,11 @@ describe("the stewards sidebar call", () => {
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const first = t.hooks.store.find("ENG-12", "p1")!;
-    // One binding needs the user through the need its report actor filed (the
-    // actor alone does not count, BB-213), another through an open need; an
-    // ended one must not count.
+    // One binding needs the user through an open need (the actor alone does
+    // not count, BB-213, BB-349), another through an open need; an ended one
+    // must not count.
     t.hooks.store.patch(first.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "On the user", actor: "user", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
-    t.hooks.store.fileNeed({ bindingId: first.id, kind: "decide", url: first.url ?? "", what: "On the user", how: null, data: { autoFiled: true } });
+    t.hooks.store.fileNeed({ bindingId: first.id, kind: "decide", url: first.url ?? "", what: "On the user", how: null });
     const second = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
     t.hooks.store.fileNeed({ bindingId: second.id, kind: "configure", url: "", what: "Enable it", how: null });
     const ended = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-14", entityKey: "ENG-14", url: null, title: "Ended", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
@@ -6831,7 +6813,7 @@ describe("needs you items", () => {
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need).toMatchObject({ what: "Approve acme/web#7: Add login retry", filedBy: "plugin" });
     expect(need.data).toMatchObject({ foreign: true });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     // BB-29: the board's `url` is the pull request and `entityUrl` the ticket,
@@ -6862,7 +6844,7 @@ describe("needs you items", () => {
     await t.harness.callRpc("stewardsStandupTool", { sessionId: started.sessionId, name: "take_note", arguments: JSON.stringify({ type: "gate", text: "Looks good", binding: b.entityKey, action: "approve", need: need.id }) }, voice);
     const rec = (await t.harness.callRpc("stewardsStandupRecord", { projectId: "p1" })) as { standup: { notes: Array<{ id: string; readback: string }> } };
     // The readback names the exact pull request the note is bound to.
-    expect(rec.standup.notes[0]!.readback).toContain("Approve acme/web#7 on GitHub");
+    expect(rec.standup.notes[0]!.readback).toContain("Approve acme/web#7: Add login retry");
     const res = await t.harness.callRpc("stewardsStandupConfirm", { standupId: started.standupId, noteId: rec.standup.notes[0]!.id }, client);
     expect(res).toMatchObject({ ok: true, applied: true });
     // The same effect the Approve button has: the review lands and the item closes.
@@ -6935,7 +6917,7 @@ describe("needs you items", () => {
     const b = t.hooks.store.find("acme/web#7")!;
     expect(b.kind).toBe("review");
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need).toMatchObject({ what: "Approve acme/web#7: Add login retry", filedBy: "plugin" });
     expect(need.data).toMatchObject({ foreign: true });
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
@@ -6950,14 +6932,14 @@ describe("needs you items", () => {
     expect(b.kind).toBe("review");
     // Nothing reports `substantial` yet, so the item is the ordinary one.
     const before = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(before.how).not.toMatch(/substantial and references no ticket/u);
+    expect(before.details).not.toMatch(/substantial and references no ticket/u);
     // The reviewer's substantial verdict, with no referenced ticket carrying
     // an approved spec, asks the owner to ack the Product section.
     t.hooks.store.patch(b.id, { ready: { ...b.ready, substantial: true, why: "a new outbound integration" } });
     await t.ring("github", "acme/web#7");
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need.how).toMatch(/substantial and references no ticket with an approved spec/u);
-    expect(need.how).toMatch(/\*\*Product\*\* section/u);
+    expect(need.details).toMatch(/substantial and references no ticket with an approved spec/u);
+    expect(need.details).toMatch(/\*\*Product\*\* section/u);
     // It is still the owner's item and escalation, not the project steward's.
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
@@ -7044,7 +7026,7 @@ describe("needs you items", () => {
     const t = await withPull([unsigned]);
     const b = t.binding();
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
-    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need).toMatchObject({ what: "Approve acme/web#7: Add login retry", filedBy: "plugin" });
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     expect(esc).toMatchObject({ route: "user" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
@@ -7185,8 +7167,8 @@ describe("needs you items", () => {
     expect(report.text).toMatch(/approve-pr for https:\/\/github\.com\/acme\/web\/pull\/7 not filed: no reviewer round yet\./u);
     expect(report.text).toMatch(/build-tickets review loop first/u);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
-    // The report's own item was refused, so it does not auto-file one either:
-    // the refusal says the user is not the actor yet (BB-213).
+    // The report's own item was refused, so nothing is filed; the refusal
+    // says the user is not the actor yet (BB-213, BB-349).
     expect(t.hooks.store.openNeeds(b.id)).toEqual([]);
     expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toBe("Nothing is waiting on the user.");
   });
@@ -7854,9 +7836,9 @@ describe("needs you items", () => {
     expect(t.hooks.store.openEscalations(b.id).some((x) => x.question === "Provide API_TOKEN." && !x.isQuestion && x.status === "open")).toBe(true);
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; id: string }>; withUser: Array<{ id: string }> } };
     expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ kind: "provide-secret" });
-    // The actor-`user` report auto-filed its `nextAction` first, but forwarding
-    // the escalation to the user files the real item, so the auto one closes
-    // and only the provide-secret item is left (BB-213).
+    // BB-349: the actor-`user` report files nothing, so forwarding the
+    // escalation to the user files the only item and the provide-secret need is
+    // left (BB-213).
     expect(t.hooks.store.openNeeds(b.id)).toHaveLength(1);
     expect(t.hooks.store.openNeeds(b.id)[0]).toMatchObject({ id: need.id, kind: "provide-secret" });
     expect(board.board.needs.filter((n) => n.id !== need.id)).toEqual([]);
@@ -8195,13 +8177,13 @@ describe("needs you items", () => {
 
   it("shows the items on the board with their actionability", async () => {
     const t = await withPull([marker]);
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; entityUrl: string | null; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; entityUrl: string | null; actionable: boolean; notActionable: string | null }> } }).board;
     // The owner-reviewed lane is the project steward's; forwarding it to the
     // user files the page's approve-pr item (BB-30).
     const esc = t.hooks.store.openEscalations(t.binding().id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
     await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     const first = await board();
-    expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, why: null })]);
+    expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, notActionable: null })]);
     // A steward-filed Merge item (a refused merge) is the owner's to press; a
     // running worker makes it not actionable, a finished one does not.
     const b = t.binding();
@@ -8210,13 +8192,13 @@ describe("needs you items", () => {
     // plugin's merge, so the item is actionable.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, notActionable: "worker thr_w1 is mid-turn" });
     // A finished worker is a pause between turns, not a running one: the item
     // is actionable again (BB-175).
     t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
   });
 
   it("filing a merge need stops the binding's in-flight workers (BB-175)", async () => {
@@ -8239,9 +8221,9 @@ describe("needs you items", () => {
     expect(t.hooks.store.workers(b.id).find((w) => w.threadId === "thr_w1")).toMatchObject({ status: "stopped" });
     expect(t.harness.sdk.callsTo("threads.stop")).toContainEqual([{ threadId: "thr_w1" }]);
     // With no worker running, the item is actionable.
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; notActionable: string | null }> } }).board;
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toMatchObject({ filedBy: "steward" });
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
     // BB-253: the steward-filed Merge item is the owner's only signal on the
     // HUB-218 shape, so it pushes once, to the binding's steward thread.
     const mergePushes = t.rpcCalls.filter((c) => c.pluginId === "push-notifications" && c.method === "notifications.send" && (c.input as { title?: string }).title === "acme/web#7 ready to merge");
@@ -8262,7 +8244,7 @@ describe("needs you items", () => {
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
     // The gate is met, but the steward's own item blocks the plugin's merge.
     await t.ring("linear", "uuid-12");
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; notActionable: string | null }> } }).board;
     // A running worker's turn can race a push: the item is not actionable and
     // the shared merge path refuses.
     await t.created("thr_w1", steward, "ENG-12: Implement");
@@ -8274,7 +8256,7 @@ describe("needs you items", () => {
     // A finished worker is a pause between turns: the item is actionable and
     // the merge goes through.
     t.hooks.store.setWorker("thr_w1", "finished", "Waiting on the owner's approval.");
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
     const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
     expect(t.githubMerges).toHaveLength(1);
@@ -8288,12 +8270,12 @@ describe("needs you items", () => {
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; why: string | null }> } }).board;
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "worker thr_w1 is mid-turn" });
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; actionable: boolean; notActionable: string | null }> } }).board;
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, notActionable: "worker thr_w1 is mid-turn" });
     // A finished worker is named by neither state nor thread: the item is
     // actionable again.
     t.hooks.store.setWorker("thr_w1", "finished", null);
-    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, notActionable: null });
   });
 
   it("lists open needs in the project steward's nightly digest", async () => {
@@ -8543,8 +8525,8 @@ describe("needs you items", () => {
     // the page approves as the owner, with no reconcile in between.
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toBeDefined();
-    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; actionable: boolean; why: string | null }> } };
-    expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ actionable: true, why: null });
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; actionable: boolean; notActionable: string | null }> } };
+    expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ actionable: true, notActionable: null });
     const approved = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
     expect(approved).toMatchObject({ ok: true });
   });
@@ -8600,7 +8582,7 @@ describe("needs you items", () => {
     expect(refused.error).toBe(true);
     expect(refused.text).toMatch(new RegExp(need.id));
     expect(refused.text).toMatch(/approve-pr/u);
-    expect(refused.text).toMatch(/Approve acme\/web#7 on GitHub/u);
+    expect(refused.text).toMatch(/Approve acme\/web#7: Add login retry/u);
     // The plugin's own approval escalation is the need's, so it is listed once,
     // as the need.
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
@@ -8999,8 +8981,29 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
     const view = await t.board();
     const expected = [...view.questions, ...view.withUser, ...view.needs].map((x) => x.id);
-    const printed = (await t.cli()).split("\n").map((line) => line.split(" — ")[0]);
+    // The three parts print as indented Context/Why you lines under each item;
+    // the item lines are the ones that are not indented (BB-345).
+    const printed = (await t.cli())
+      .split("\n")
+      .filter((line) => !line.startsWith("  "))
+      .map((line) => line.split(" — ")[0]);
     expect(printed).toEqual(expected);
+  });
+
+  it("lists a forwarded escalation once, as its question, when a question covers it (BB-350)", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: escalation.id, question: "Include SSO?", context: null });
+    const out = await t.cli();
+    // The covered escalation is the question's, so it is not a with-user row.
+    expect(out).toContain(question.id);
+    expect(out).not.toContain(escalation.id);
+    expect(out.match(/Include SSO\?/gu)).toHaveLength(1);
+    // The board's needsYou agrees.
+    const view = await t.board();
+    expect(view.questions.map((q) => q.id)).toEqual([question.id]);
+    expect(view.withUser).toEqual([]);
   });
 
   it("extends the old needs array with questions and with-user escalations in --json", async () => {
@@ -10150,7 +10153,9 @@ describe("dependency stewards", () => {
     const needs = (await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout;
     // Case 6 provenance: the filing thread is on the fingerprint row.
     expect(t.hooks.store.fingerprint("p1", "acme/web#23")).toMatchObject({ ticketKey: "ENG-50", filedByThread: filedThread });
-    expect(needs).toMatch(/decide, dependabot\/acme\/web: Adopt ENG-50\? medium Dependabot alerts \(2\) on acme\/web: github.com\/labstack\/echo\/v4 \(go\), no fixed version, due 2026-10-16\. \[choices: Dismiss as not used, Keep tracking, Adopt\] \(https:\/\/linear.app\/acme\/issue\/ENG-50\)/u);
+    expect(needs).toMatch(/decide, dependabot\/acme\/web: Adopt ENG-50\? medium Dependabot alerts on acme\/web \[choices: Dismiss as not used, Keep tracking, Adopt\] \(https:\/\/linear.app\/acme\/issue\/ENG-50\)/u);
+    // The full question (packages, ecosystems, fix, due date) is the item's Details (BB-345).
+    expect(t.hooks.store.need(t.hooks.store.depsDecision("p1", "ENG-50")!.needId!)!.details).toMatch(/github.com\/labstack\/echo\/v4 \(go\), no fixed version, due 2026-10-16\./u);
     const decision = t.hooks.store.depsDecision("p1", "ENG-50")!;
     expect(decision).toMatchObject({ status: "pending", entityId: DEPS_TARGET, fingerprints: ["acme/web#23", "acme/web#24"], severity: "medium", raisedBy: filedThread, reminded: [] });
     const firstNeed = t.hooks.store.need(decision.needId!)!;
@@ -10199,7 +10204,7 @@ describe("dependency stewards", () => {
     await t.hooks.sweep();
     await t.flush();
     expect(t.hooks.store.depsDecision("p1", "ENG-50")!.reminded).toEqual(["overdue"]);
-    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.what).toMatch(/Overdue by 1 day\.$/u);
+    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.details).toMatch(/Overdue by 1 day\.$/u);
     expect(notes()).toMatch(/ENG-50 is a day past its due date \(2026-10-16\) and still unadopted\. The decision is need_\S+ \(dependabot\/acme\/web\); it is the owner's to answer/u);
     // The reminder is once: another look adds no second note.
     t.advance(86_400_000);
@@ -10213,7 +10218,7 @@ describe("dependency stewards", () => {
     await t.flush();
     const projectThread = t.hooks.store.project("p1").threadId!;
     const digest = t.sends.filter((x) => x.threadId === projectThread).at(-1)!.text;
-    expect(digest).toMatch(/## Needs you[\s\S]*decide, dependabot\/acme\/web\): Adopt ENG-50\? medium Dependabot alerts \(2\)[^\n]*\[choices: Dismiss as not used, Keep tracking, Adopt\]/u);
+    expect(digest).toMatch(/## Needs you[\s\S]*decide, dependabot\/acme\/web\): Adopt ENG-50\? medium Dependabot alerts on acme\/web[^\n]*\[choices: Dismiss as not used, Keep tracking, Adopt\]/u);
     expect(digest).toMatch(/ENG-50 is a day past its due date/u);
 
     // The owner answers from a thread; the steward is woken with the choice and the decision settles on the next look.
@@ -10288,7 +10293,7 @@ describe("dependency stewards", () => {
     const raised = t.hooks.store.depsDecision("p1", "ENG-50")!;
     expect(raised).toMatchObject({ status: "pending", snoozedUntil: null, reminded: ["overdue"] });
     expect(raised.needId).not.toBe(needId);
-    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.what).toMatch(/Overdue by \d+ days\.$/u);
+    expect(t.hooks.store.openNeedsForProject("p1").find((n) => n.data.adoption === true)!.details).toMatch(/Overdue by \d+ days\.$/u);
   });
 
   it("does not offer or describe Dismiss when the deps-alerts playbook's may list lacks dismiss-alert", async () => {
@@ -12157,6 +12162,150 @@ describe("the backlog watch (BB-334)", () => {
   });
 });
 
+describe("the backlog triage writes (BB-341)", () => {
+  const backlogIssue = (over: Record<string, unknown> = {}) => ({ id: "uuid-1", key: "BB-1", title: "Fix login", state: "Backlog", stateType: "backlog", unit: "BB", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", ...over });
+
+  /** A project with a backlog role and its steward thread, and one un-adopted ticket the tool reads. */
+  async function triaging(options: { triage?: boolean; block?: Record<string, unknown>; ticket?: Partial<EntitySnapshot>; comments?: EntitySnapshot["comments"] } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: options.triage ?? true, ...(options.block ?? {}) } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
+    t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
+    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null, updatedAt: "2026-10-14T00:00:00Z", comments: options.comments ?? [], ...(options.ticket ?? {}) }));
+    return { t, binding };
+  }
+
+  const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
+
+  it("is offered only when backlog.triage is true, and absent writes nothing", async () => {
+    const off = await triaging({ triage: false });
+    expect(await tools(off.t, "thr_backlog")).toEqual(["steward_report", "steward_update"]);
+    expect((await off.t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog")).error).toBe(true);
+    expect(off.t.linearWrites).toEqual([]);
+
+    const on = await triaging({ triage: true });
+    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", "steward_report", "steward_update"]);
+  });
+
+  it("writes labels, a priority and a signed comment through linear, and records each in the ledger", async () => {
+    const { t } = await triaging();
+    const result = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug", "size:S"], priority: "high", comment: "Is SSO in scope?" }, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(result.text).toMatch(/Triaged BB-1/u);
+    const update = t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!;
+    expect(update.input).toMatchObject({ key: "BB-1", addLabels: ["bug", "size:S"], priority: "high" });
+    const comment = t.linearWrites.find((w) => w.method === "sourceComment")!;
+    expect(String(comment.input.body)).toContain("Is SSO in scope?");
+    expect(String(comment.input.body)).toContain("from bb thread thr_backlog");
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger.map((e) => `${e.outcome}:${e.kind}`)).toEqual(["accepted:label", "accepted:priority", "accepted:comment"]);
+  });
+
+  it("refuses a hand-set priority, records the refusal and writes nothing", async () => {
+    const { t } = await triaging({ ticket: { priority: "Medium" } });
+    const result = await t.tool("backlog_triage", { key: "BB-1", priority: "high" }, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/hand-set/u);
+    expect(t.linearWrites).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ outcome: "refused", kind: "triage", issueKey: "BB-1" });
+  });
+
+  it("carries a priority clear through to Linear, not an empty plan", async () => {
+    const { t } = await triaging({ ticket: { priority: "High" } });
+    // The steward set High, so it may clear it.
+    t.hooks.store.addBacklogWrite({ id: "btw_seed", projectId: "p1", team: "BB", issueId: "uuid-1", issueKey: "BB-1", at: 1, outcome: "accepted", kind: "priority", detail: { priority: "high" }, reason: null });
+    const result = await t.tool("backlog_triage", { key: "BB-1", priority: "none" }, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.priority).toBe("none");
+    expect(t.hooks.store.backlogWrites("p1", { team: "BB" }).filter((e) => e.kind === "priority").at(-1)).toMatchObject({ outcome: "accepted", detail: { priority: "none" } });
+  });
+
+  it("fails closed when the ticket or the ledger cannot be read", async () => {
+    const { t } = await triaging();
+    t.setSnapshotError("BB-1", true);
+    const failed = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    expect(failed.error).toBe(true);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("re-reads backlog.triage on every call, so turning it off refuses at once", async () => {
+    const { t } = await triaging({ triage: true });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: false } });
+    t.hooks.forgetConfigs();
+    const result = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/triage is off/u);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("refuses a ticket outside the watched team and writes nothing", async () => {
+    const { t } = await triaging({ ticket: { unit: "OPS" } });
+    const result = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/not the watched team/u);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("serialises two parallel comments on one ticket, so the budget holds", async () => {
+    const { t } = await triaging({ block: { commentsPerWeek: 1 } });
+    const [first, second] = await Promise.all([
+      t.tool("backlog_triage", { key: "BB-1", comment: "First question?" }, "thr_backlog"),
+      t.tool("backlog_triage", { key: "BB-1", comment: "Second question?" }, "thr_backlog"),
+    ]);
+    // Exactly one comment reached Linear, and the ledger has one accepted and
+    // one refused: the second call saw the first's write.
+    expect(t.linearWrites.filter((w) => w.method === "sourceComment")).toHaveLength(1);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger.filter((e) => e.outcome === "accepted" && e.kind === "comment")).toHaveLength(1);
+    expect(ledger.filter((e) => e.outcome === "refused")).toHaveLength(1);
+    expect([first.error, second.error].filter(Boolean)).toHaveLength(1);
+  });
+
+  it("adds a relation only when both ends are in the team", async () => {
+    const { t } = await triaging();
+    t.entities.set("BB-2", issue({ id: "uuid-2", key: "BB-2", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog" }));
+    const ok = await t.tool("backlog_triage", { key: "BB-1", relations: [{ type: "duplicate", issue: "BB-2" }] }, "thr_backlog");
+    expect(ok.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.relations).toEqual([{ type: "duplicate", issue: "BB-2" }]);
+
+    const { t: other } = await triaging();
+    other.entities.set("OPS-9", issue({ id: "uuid-9", key: "OPS-9", unit: "OPS", labels: [], assignees: [], state: "Backlog", stateType: "backlog" }));
+    const refused = await other.tool("backlog_triage", { key: "BB-1", relations: [{ type: "related", issue: "OPS-9" }] }, "thr_backlog");
+    expect(refused.error).toBe(true);
+    expect(other.linearWrites).toEqual([]);
+  });
+
+  it("lists each write and counts refusals in the digest's Backlog section", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog", "projectSteward"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
+    t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
+    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null }));
+    await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    await t.tool("backlog_triage", { key: "BB-1", addLabels: ["size:XL"] }, "thr_backlog");
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.spawns.find((s) => s.title === "Acme project steward")!.id;
+    const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(digest).toContain("- Writes: BB-1 label");
+    expect(digest).toContain("- Refused: 1");
+  });
+});
+
 describe("the dotenv a requester imports", () => {
   it("reads the named variable, quoted or not, and strips a trailing comment", () => {
     expect(parseDotenvValue("OTHER='x'\nSENTRY_TOKEN='s3cr3t'\n", "SENTRY_TOKEN")).toBe("s3cr3t");
@@ -12400,7 +12549,7 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     expect(t.metadata.get("thr_r1")).toEqual({ threadBriefs: false });
   });
 
-  it("marks a steward read after a report that needs nobody, and leaves it unread when it needs the user", async () => {
+  it("marks a steward read after a report that needs nobody, and leaves it unread only with a real item (BB-349)", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull());
     await t.ring("github", "acme/web#7");
@@ -12411,10 +12560,12 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", waitingOn: "sam" }, steward);
     expect(marks()).toContain(steward);
 
-    // The user is next: left unread.
+    // Naming the user files no item (BB-349): nothing is on the page, so the
+    // thread is marked read and the reply says how to reach the owner.
     const before = marks().length;
-    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "You decide", actor: "user" }, steward);
-    expect(marks()).toHaveLength(before);
+    const report = await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "You decide", actor: "user" }, steward);
+    expect(marks().length).toBeGreaterThan(before);
+    expect(report.text).toMatch(/filed nothing for them/u);
 
     // An escalation to the project steward is not the user's: the report marks
     // the thread read (BB-208).
@@ -14213,7 +14364,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     return { ...t, project, steward, key, binding: () => t.hooks.store.find("ENG-12")! };
   }
 
-  it("waits on a requested reviewer: blocked in the sidebar and not decidable by the steward (BB-327)", async () => {
+  it("waits on a requested reviewer: quiet in the sidebar and not decidable by the steward (BB-327, BB-348)", async () => {
     const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { pullOver: { requestedReviewers: ["arashout"] } });
     const binding = t.binding();
     const esc = t.hooks.store.openEscalations(binding.id).find((x) => x.kind === "approval")!;
@@ -14221,12 +14372,13 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(esc.route).toBe("steward");
     expect(esc.meanwhile).toContain("arashout");
     expect(t.hooks.store.openNeeds(binding.id).some((n) => n.kind === "approve-pr")).toBe(false);
-    // The sidebar row reads blocked, not "needs you", and names the delegate (BB-338).
+    // BB-348: the delegate wait is a wait, not a failure, so the sidebar row is
+    // quiet (not blocked) and not "needs you", and names the delegate (BB-338).
     const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; stuck: boolean; needsUser: boolean; delegateWait: string | null }> };
-    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, needsUser: false, delegateWait: "arashout" });
-    // The board row carries the same name (BB-338).
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: false, needsUser: false, delegateWait: "arashout" });
+    // The board row carries the same name and the same quiet flag (BB-338, BB-348).
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; stuck: boolean; delegateWait: string | null }> } };
-    expect(board.board.stewards.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, delegateWait: "arashout" });
+    expect(board.board.stewards.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: false, delegateWait: "arashout" });
     // The ticket steward cannot resolve the delegate wait into a decline.
     const refused = await t.tool("steward_update", { binding: "ENG-12", guidance: "no", resolve: esc.id }, t.steward);
     expect(refused.error).toBe(true);
@@ -14433,9 +14585,9 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
       project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
     });
     const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
-    expect(need.how).toContain('"Identity and access" [user]');
-    expect(need.how).toContain('"A cross-repo contract other repos implement" [project]');
-    expect(need.how).toContain("Rule: a `user` entry wins");
+    expect(need.details).toContain('"Identity and access" [user]');
+    expect(need.details).toContain('"A cross-repo contract other repos implement" [project]');
+    expect(need.details).toContain("Rule: a `user` entry wins");
     expect(need.data.decideListing).toContain("Deciding entry: \"Identity and access\" [user].");
   });
 
@@ -14456,6 +14608,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     const after = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
     expect(after.data.decideListing).toBeUndefined();
     expect(after.how).not.toContain("Decide list:");
+    // The why is not recomputed while checks are red; it is carried from the
+    // open item rather than downgraded to the routine line (BB-345).
+    expect(after.why).toBe(before.why);
+    expect(after.why).not.toBe("No guidance covers this; your answer is saved as a lesson.");
   });
 
   it("reports an owner review with its sha, and the project steward's marker with its sha", async () => {
@@ -15096,9 +15252,9 @@ describe("a typed wait (BB-333)", () => {
   // BB-266: a ticket with a gate-met own pull, a parked `finished` worker and a
   // second open own pull, waiting on the plugin auto-merge. The typed ref is
   // the own gate-met pull, so it is recorded as external (reference_is_self).
-  // TODAY the second open own pull is still a live source, so the wait is not
-  // marked; PR 2 derives the stall from the external wait despite it.
-  it("pins the BB-266 fixture: the second open own pull is a live source, so the wait is not marked", async () => {
+  // BB-333 PR 3: the stored flag is now the derived stall, so the external wait
+  // stalls despite the second open own pull.
+  it("pins the BB-266 fixture: the external wait stalls despite the second open own pull", async () => {
     const t = await setup();
     t.entities.set(
       "uuid-12",
@@ -15122,7 +15278,7 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
   // bb-plugins#294: a `pr` binding's own open pull with a free-text wait. The
@@ -15142,9 +15298,9 @@ describe("a typed wait (BB-333)", () => {
 
   // bc-prod#422 / BCP-157: a ticket waiting on the owner's approval, with no
   // open approve-pr item, beside an open linked pull. The person ref is not an
-  // open page item, so it is recorded as external. TODAY the open pull watch is
-  // a live source and masks it; PR 2 derives the stall despite the mask.
-  it("pins the bc-prod#422/BCP-157 fixture: the open pull watch masks the person wait", async () => {
+  // open page item, so it is recorded as external. BB-333 PR 3: the stored flag
+  // is now the derived stall, so the external wait stalls despite the open pull.
+  it("pins the bc-prod#422/BCP-157 fixture: the external wait stalls despite the open pull watch", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
@@ -15155,7 +15311,7 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "need_approve" });
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
   // bc-prod#430 / BCP-160: a ticket waiting on a foreign pull's checks, not
@@ -15200,11 +15356,12 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    // BB-333 PR 3: the stored flag is the derived stall, so it now agrees.
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
     expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
-    // The report-time flag agrees with the second open own pull, so the
-    // derived stall is a divergence and is recorded.
-    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "noWakeSource" })).toContainEqual(expect.objectContaining({ old: "source-or-no-wait", new: "no-wake-source" }));
+    // The shadow's divergence table stopped being written: the flag and the
+    // derivation agree by construction.
+    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "noWakeSource" })).toHaveLength(0);
   });
 
   it("derives the bb-plugins#294 fixture: a pr binding's own external wait stalls", async () => {
@@ -15225,7 +15382,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
     expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
   });
 
@@ -15251,7 +15408,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     expect(github().entities).not.toContain("acme/web#430");
   });
 
-  it("a ring on a waited ref looks, sends no wake, and touches no snapshot or resource", async () => {
+  it("a ring on a waited ref wakes the binding on the ref's change (BB-333)", async () => {
     const { t, steward } = await ticket();
     t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
     await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
@@ -15260,22 +15417,220 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const wakesBefore = t.sends.filter((s) => s.threadId === steward).length;
     const pullsBefore = JSON.stringify(before.lastSnapshot?.pulls ?? []);
     t.rpcCalls.length = 0;
-    // The waited pull changes; the doorbell rings it.
+    // The waited pull changes; the doorbell rings it. BB-333 PR 3: the change
+    // now wakes the binding (in PR 2 it only fed the derived result).
     t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open", title: "changed" }));
     await t.ring("github", "acme/web#430");
     await t.flush();
-    // The waiting ticket looked (it read the waited ref) but the change woke nobody.
     expect(t.rpcCalls.some((c) => c.method === "sourceSnapshot" && c.input.id === "acme/web#430")).toBe(true);
-    expect(t.sends.filter((s) => s.threadId === steward).length).toBe(wakesBefore);
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBeGreaterThan(wakesBefore);
+    expect(t.sends.at(-1)!.text).toContain("The waited pull acme/web#430 changed");
+    // The waited ref is still not a stored linked pull or a resource.
     const after = t.hooks.store.find("ENG-12")!;
     expect(JSON.stringify(after.lastSnapshot?.pulls ?? [])).toBe(pullsBefore);
     expect(after.status?.resources.pullRequests ?? []).not.toContain("acme/web#430");
+  });
+
+  it("does not wake on a re-pointed ref, a kind switch or a failed read (BB-333)", async () => {
+    const { t, steward } = await ticket();
+    const waitedWakes = () => t.sends.filter((s) => s.threadId === steward && s.text.includes("The waited pull")).length;
+    t.entities.set("acme/web#430", pull({ id: "acme/web#430", key: "acme/web#430", url: "https://github.com/acme/web/pull/430", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "date", ref: "2027-07-01" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    // A kind switch to a pull wait has no prior fingerprint for the ref, so it
+    // must not read as a change.
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+    // Re-pointing the wait at an unchanged, different ref is not a change on
+    // the first ref.
+    t.entities.set("acme/web#431", pull({ id: "acme/web#431", key: "acme/web#431", url: "https://github.com/acme/web/pull/431", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "bc-prod#431 checks", wait: { kind: "pull", ref: "acme/web#431" } }, steward);
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+    // A failed read (the ref is gone) and its recovery are not changes either.
+    t.entities.delete("acme/web#431");
+    await t.hooks.reconcilePass("p1");
+    t.entities.set("acme/web#431", pull({ id: "acme/web#431", key: "acme/web#431", url: "https://github.com/acme/web/pull/431", state: "open" }));
+    await t.hooks.reconcilePass("p1");
+    expect(waitedWakes()).toBe(0);
+  });
+
+  it("a date wait with only a ref sets requeueUntil and is not a stall (BB-333)", async () => {
+    const { t, steward } = await ticket();
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the vendor's reply", wait: { kind: "date", ref: "2027-07-01" } }, steward);
+    expect(report.error).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.wait).toEqual({ kind: "date", ref: "2027-07-01" });
+    expect(b.requeueUntil).toBe(Date.UTC(2027, 6, 1));
+    // A future date is the plugin's own wake source, so the wait is not marked.
+    expect(b.noWakeSource).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: true });
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 });
 
 // BB-203: the plugin writes the binding's status from events it observed
 // itself, before the steward's next turn, and quiets a running worker's own
 // pull request activity only while nothing the user must act on is open.
+// BB-351: a wait that outlives its per-kind budget reads overdue, is nudged
+// once on the pull request (review/person), and comes to the owner as one
+// decide item after a second budget. `pull` and `deployment` are never nudged.
+describe("the wait budget (BB-351)", () => {
+  const base = { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const };
+  const DAY = 86_400_000;
+  const HOUR = 3_600_000;
+  type World = Awaited<ReturnType<typeof setup>>;
+  const nudgeWrites = (t: World) => t.linearWrites.filter((w) => w.method === "sourceComment");
+  const decideNeeds = (t: World, id: string) => t.hooks.store.openNeeds(id).filter((n) => n.kind === "decide" && n.data.waitBudget === true);
+
+  /** A bound ENG-12 with a review wait on a foreign pull requested from a person. */
+  async function reviewWait(reviewers: string[] = ["arashout"]) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }, { requestedReviewers: reviewers }));
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    expect(report.error).toBe(false);
+    return { t, steward, b: () => t.hooks.store.find("ENG-12")! };
+  }
+
+  it("nudges once on the first overdue reconcile, with a signed body, and records wait_nudged_at", async () => {
+    const { t, steward, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const writes = nudgeWrites(t);
+    expect(writes).toHaveLength(1);
+    const body = String(writes[0]!.input.body);
+    expect(body).toContain("@arashout");
+    expect(body).toContain(`_— from bb thread ${steward}_`);
+    expect(b().waitNudgedAt).not.toBeNull();
+    const overdueWakes = () => t.sends.filter((s) => s.threadId === steward && s.text.includes("is overdue")).length;
+    expect(overdueWakes()).toBe(1);
+    // A second overdue reconcile neither nudges nor wakes again.
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(1);
+    expect(overdueWakes()).toBe(1);
+  });
+
+  it("does not nudge when the only requested reviewer is the owner", async () => {
+    // The test world's GitHub login is `jane`; a review wait on the owner is
+    // the owner-reviewed lane, which the steward does not nudge.
+    const { t, b } = await reviewWait(["jane"]);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(0);
+    expect(b().waitNudgedAt).not.toBeNull();
+  });
+
+  it("does not nudge a review wait with no requested reviewer (the pr-reviewer loop), but still comes to the owner", async () => {
+    const { t, b } = await reviewWait([]);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(0);
+    expect(b().waitNudgedAt).not.toBeNull();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("files one decide need with the three choices after the second budget", async () => {
+    const { t, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitNudgedAt).not.toBeNull();
+    expect(decideNeeds(t, b().id)).toHaveLength(0);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const needs = decideNeeds(t, b().id);
+    expect(needs).toHaveLength(1);
+    expect(needs[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    // A repeated look does not file a second item.
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("Keep waiting resets the budget once and files no second need until it passes again", async () => {
+    const { t, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Keep waiting" }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: true });
+    await t.flush();
+    // The reset moves the decide clock: within the next budget no new item.
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(0);
+    // Past it, the item is filed again.
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("never nudges a pull or deployment wait, though it still wakes once", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }));
+    await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
+    t.advance(2 * HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(0);
+    expect(t.hooks.store.find("ENG-12")!.waitNudgedAt).not.toBeNull();
+    // A deployment wait with a live watch, likewise.
+    const t2 = await setup();
+    t2.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t2.ring("linear", "uuid-12");
+    const b2 = t2.hooks.store.find("ENG-12")!;
+    t2.hooks.store.patch(b2.id, { wait: { kind: "deployment", ref: "acme/web#9" }, waitSince: t2.now() });
+    t2.hooks.store.patch(b2.id, {
+      deployments: {
+        "acme/web#9": { key: "acme/web#9", state: "deploying", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: t2.now(), deadlineAt: null, note: null, workflowRuns: [] },
+      },
+    });
+    t2.advance(3 * HOUR);
+    await t2.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t2)).toHaveLength(0);
+    expect(t2.hooks.store.find("ENG-12")!.waitNudgedAt).not.toBeNull();
+  });
+
+  it("starts the clock for a stored wait with no wait_since, then nudges one budget later", async () => {
+    const { t, b } = await reviewWait();
+    // A wait already open when `wait_since` shipped (a migrated row, or a
+    // report from before the column) has no clock until the first look.
+    t.hooks.store.patch(b().id, { waitSince: null });
+    expect(nudgeWrites(t)).toHaveLength(0);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitSince).not.toBeNull();
+    expect(nudgeWrites(t)).toHaveLength(0);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(nudgeWrites(t)).toHaveLength(1);
+    expect(b().waitNudgedAt).not.toBeNull();
+  });
+
+  it("keeps the wait's start on a repeat and resets it when the kind or ref changes", async () => {
+    const { t, steward, b } = await reviewWait();
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(b().waitNudgedAt).not.toBeNull();
+    const first = b().waitSince!;
+    t.advance(HOUR);
+    await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    expect(b().waitSince).toBe(first);
+    expect(b().waitNudgedAt).not.toBeNull();
+    t.advance(HOUR);
+    await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "pull", ref: "acme/web#9" } }, steward);
+    expect(b().waitSince).toBeGreaterThan(first);
+    expect(b().waitNudgedAt).toBeNull();
+  });
+});
+
 describe("mechanical status and quiet notes (BB-203)", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
   const marker = comment({
@@ -15612,8 +15967,8 @@ describe("recorded assumptions (BB-251)", () => {
     const b = t.hooks.store.find("ENG-12", "p1")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
     expect(need.data.assumptionIds).toEqual([first]);
-    expect(need.how).toContain("It covers");
-    expect(need.how).toContain(first);
+    expect(need.details).toContain("It covers");
+    expect(need.details).toContain(first);
     // A later assumption is not captured by a same-spec refresh.
     const second = idOf((await t.tool("steward_update", { assume: { text: "second" } }, steward)).text);
     t.entities.set("uuid-12", issue({ comments: [comment({ id: "c9", author: "lee", body: "a note" })] }));

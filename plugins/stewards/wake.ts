@@ -17,7 +17,7 @@ import type { DepsFinding, DepsLook } from "./deps.js";
 import { ADOPTION_CHOICES, adoptionHow, dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
 import type { AlertmanagerFinding, AlertmanagerLook, AlertmanagerReason } from "./alertmanager.js";
-import { newHumanComments, unheardWait } from "./reconcile.js";
+import { newHumanComments } from "./reconcile.js";
 import { reportedItem, type GateState } from "./ready-gate.js";
 import { currentStoredGate, type StoredGate } from "./assessed-gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
@@ -634,12 +634,8 @@ export function formatWake(input: WakeInput): string {
   out.push("", "## Waiting on you", "");
   if (needs.length === 0) out.push("Nothing is filed for the user.");
   else {
-    for (const n of needs) out.push(`- ${n.id} (${n.kind}${n.data.autoFiled === true ? ", auto-filed" : ""}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${choicesNote(needChoices(n))}${n.how === null ? "" : `\n  ${n.how}`}`);
+    for (const n of needs) out.push(`- ${n.id} (${n.kind}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${choicesNote(needChoices(n))}${n.how === null ? "" : `\n  ${n.how}`}`);
     out.push("", "These are on the Stewards page with their own buttons. Do not ask the user about them in prose; the page is where they act.");
-    // BB-213: an item the plugin auto-filed from the report's `nextAction` is
-    // there only because nothing specific was filed, so the steward is told to
-    // file the real item next time and the auto one closes.
-    if (needs.some((n) => n.data.autoFiled === true)) out.push("", "An auto-filed item was created from your report's `nextAction` because it named the user but filed no item. If the real ask is a specific item (`approve-pr`) or an escalation, file that instead next time; the auto item then closes.");
   }
 
   out.push("", "## 3. Guidance, priority, holds and scheduling", "");
@@ -1623,7 +1619,7 @@ export function formatProjectWake(input: {
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons or hand-written guidance units it rested on with `cites: [ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [ids] }) only when it is one of these big decisions, and name the entry you matched with `entry: \"<the entry>\"` so the page knows not to ask why; a routine escalation the guidance did not settle is forwarded without `entry`, and the page asks the user why:",
+      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons or hand-written guidance units it rested on with `cites: [ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [ids] }) only when it is one of these big decisions, and name the entry you matched with `entry: \"<the entry>\"` so the page fills the why; a routine escalation the guidance did not settle is forwarded without `entry`. The question goes to the user as written, and `recommendation` is your one addition: do not reword the question or fold your reasoning into it. The big decisions are:",
       "",
       ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
       "",
@@ -1665,13 +1661,18 @@ export function formatProjectWake(input: {
       );
     }
   }
-  const withUser = input.withUser ?? [];
+  const questions = input.questions ?? [];
+  // BB-350: an escalation an open question covers is the question's ask, so it
+  // is listed under the questions heading alone, not also as an escalation with
+  // the user. The caller already drops the covered escalations; this keeps the
+  // formatter honest for a caller that passes both.
+  const coveredWithUser = new Set(questions.map(({ question: q }) => q.escalationId).filter((id): id is string => id !== null));
+  const withUser = (input.withUser ?? []).filter(({ escalation: x }) => !coveredWithUser.has(x.id));
   if (withUser.length > 0) {
     out.push("## Escalations with the user", "");
     for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
     out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve, cites: [ids] }, citing the lessons or hand-written guidance units the decision rested on.", "");
   }
-  const questions = input.questions ?? [];
   if (questions.length > 0) {
     out.push("## Questions open with the user", "");
     for (const { question: q, about } of questions) {
@@ -1709,7 +1710,7 @@ export function formatProjectWake(input: {
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
     const conflicts = conflictsOf(b, allOpen);
-    const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
+    const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${day(b.requeueUntil)}`}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   // BB-288: the guidance index sits at the end of the bindings list, so `fit`
@@ -1877,6 +1878,10 @@ function backlogLines(b: BacklogDigest): string[] {
   if (b.duplicates.length > 0) out.push(`  - Likely duplicates: ${b.duplicates.map((d) => d.keys.join(" / ")).join("; ")}`);
   if (b.stale.length > 0) out.push(`  - Stale: ${b.stale.map((s) => `${s.key} (${s.days}d)`).join(", ")}`);
   if (b.next.length > 0) out.push(`  - Proposed next: ${b.next.map((n) => `${n.key} (${n.reason})`).join("; ")}`);
+  // BB-341: what the steward wrote, so the owner can review it against the
+  // budget, and how many attempts it refused.
+  if (b.writes.length > 0) out.push(`  - Writes: ${b.writes.map((w) => `${w.issueKey} ${w.kind}`).join(", ")}`);
+  if (b.refusals > 0) out.push(`  - Refused: ${b.refusals}`);
   return out;
 }
 
@@ -1942,7 +1947,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     [...questions.map(({ question: q }) => q.escalationId), ...(r.needs ?? []).map(({ need: n }) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null))].filter((id): id is string => id !== null),
   );
   const waiting = [
-    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}${choicesNote(q.choices)}`),
+    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}${q.escalationId === null ? "" : `, forwarded escalation ${q.escalationId}`}): ${oneLine(q.question)}${choicesNote(q.choices)}`),
     ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}`),
     ...r.withUser
       .filter(({ escalation: x }) => !asked.has(x.id))

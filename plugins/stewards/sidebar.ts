@@ -12,6 +12,7 @@
 // reviewer's is its worker, so the fallback and the records agree.
 
 import type { DeployState } from "./deploy.js";
+import type { Wait } from "./wait.js";
 
 /** A binding as `stewardsSidebar` reports it. */
 export interface SidebarBinding {
@@ -30,6 +31,12 @@ export interface SidebarBinding {
   waitingOn: string | null;
   /** When a dated wait parks the binding, for `waiting on <text> until <date>` (BB-247). */
   waitingUntil: number | null;
+  /** The typed wait from the last report (BB-333), or null; a live one files the effort in Waiting (BB-348). */
+  wait: Wait | null;
+  /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+  overdue: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+  overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
@@ -110,7 +117,7 @@ export interface SidebarChild {
 export type SidebarEffortState = "you" | "blocked" | "running" | "quiet";
 
 /** Which section an effort belongs to. `ops` bindings are `monitors` unless they need you or are blocked. */
-export type SidebarSection = "blocked" | "inflight" | "monitors";
+export type SidebarSection = "blocked" | "waiting" | "inflight" | "monitors";
 
 /** One effort: a root thread and the threads that belong to it. */
 export interface SidebarEffort {
@@ -130,6 +137,12 @@ export interface SidebarEffort {
   waitingOn: string | null;
   /** When a dated wait parks the binding (BB-247). */
   waitingUntil: number | null;
+  /** The typed wait from the last report (BB-333), or null; a live one files the effort in Waiting (BB-348). */
+  wait: Wait | null;
+  /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+  overdue: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+  overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
@@ -173,6 +186,8 @@ export interface SidebarTab {
   isPersonal: boolean;
   /** Blocked efforts (stewarded and ops), pinned › title › key (BB-128). */
   blocked: SidebarEffort[];
+  /** Quiet stewarded efforts with a wait the plugin will deliver, top-level only, pinned › title › key (BB-348). */
+  waiting: SidebarEffort[];
   /** In-flight stewarded efforts, pinned › title › key (BB-128). `ops` bindings are in `monitors`, one-off threads in `threads`. */
   efforts: SidebarEffort[];
   /** One-off threads (no steward binding), bb's own needsUser › busy › recency order. */
@@ -262,6 +277,12 @@ export interface EffortStatus {
   waitingOn?: string | null;
   /** When a dated wait parks the binding (BB-247). */
   waitingUntil?: number | null;
+  /** The typed wait from the last report (BB-333), or null; a live one files the effort in Waiting (BB-348). */
+  wait?: Wait | null;
+  /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+  overdue?: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+  overdueMs?: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource?: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
@@ -273,24 +294,60 @@ export interface EffortStatus {
 /** Whether a worker or reviewer thread is running: the binding is in flight, not quiet. */
 export const isRunning = (e: Pick<EffortStatus, "busy" | "runningWorkers">): boolean => e.busy || e.runningWorkers > 0;
 
+/** Whether the binding's last wake failed (BB-255), so the effort is red (BB-348). */
+const wakeFailed = (e: EffortStatus): boolean => e.wakeFailure !== null && e.wakeFailure !== undefined && e.wakeFailure !== "";
+
 /**
- * The effort's glyph, first match wins (BB-76):
- * needs you › blocked › running › quiet. Blocked is a hold or an open `stuck`
- * escalation only (BB-109); the free-text wait (`waitingOn`) never makes an
- * effort blocked, so a waiting effort is running when a worker or reviewer
- * runs and quiet otherwise. A running effort that also needs you is yellow.
+ * The effort's glyph, first match wins (BB-76, BB-348, BB-351):
+ * needs you › blocked › running › quiet. Blocked is an open `stuck` escalation,
+ * a failed wake, a wait with no wake source (BB-154), or a live wait past its
+ * kind's budget (BB-351); a hold and the free-text wait (`waitingOn`) never
+ * block (BB-109), so a held or waiting effort is quiet unless a worker or
+ * reviewer runs. A running effort that also needs you is yellow.
  */
 export function effortState(e: EffortStatus): SidebarEffortState {
   if (e.needsUser) return "you";
-  if (e.hold !== null || e.stuck) return "blocked";
+  if (e.stuck || wakeFailed(e) || e.noWakeSource === true || e.overdue === true) return "blocked";
   if (isRunning(e)) return "running";
   return "quiet";
 }
 
-/** The section the effort sits in: blocked (you or red), monitors for a quiet/running `ops`, else in flight. */
-export function effortSection(e: { state: SidebarEffortState; kind: string | null }): SidebarSection {
+/**
+ * Whether a quiet effort has a wait the plugin itself will deliver, so it sits
+ * in Waiting (BB-348): a hold, a delegate wait, a stored typed wait with a wake
+ * source, a dated wait still ahead, or a report that names the other party and
+ * a next action. A lost hand-off, a quiet worker finish and a free-text wait
+ * with no kind and no date stay In flight.
+ */
+function isWaitingEffort(e: EffortStatus, now: number): boolean {
+  if (e.pending.some(isLostHandoffNote) || e.pending.some(isQuietWorkerFinish)) return false;
+  if (waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? [])) return false;
+  if (e.hold !== null) return true;
+  if (e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "") return true;
+  if (e.wait !== null && e.wait !== undefined && e.noWakeSource !== true) return true;
+  if (e.waitingUntil !== null && e.waitingUntil !== undefined && e.waitingUntil > now) return true;
+  return e.statusActor === "other" && e.statusNextAction !== null && e.statusNextAction !== undefined && e.statusNextAction.trim() !== "";
+}
+
+/**
+ * The section the effort sits in (BB-348): blocked (you or red); monitors for
+ * an `ops` binding; waiting for a quiet stewarded effort with a wait the plugin
+ * will deliver; else in flight. `now` is the clock for the dated-wait test.
+ */
+export function effortSection(e: EffortStatus & { state: SidebarEffortState; kind: string | null }, now: number = Date.now()): SidebarSection {
   if (e.state === "you" || e.state === "blocked") return "blocked";
-  return e.kind === "ops" ? "monitors" : "inflight";
+  if (e.kind === "ops") return "monitors";
+  if (e.state === "quiet" && isWaitingEffort(e, now)) return "waiting";
+  return "inflight";
+}
+
+/**
+ * The family pass (BB-348): a parent whose own section is `waiting` is
+ * `inflight` when any of its one-level nested children is not `waiting`.
+ * Children keep their own section.
+ */
+export function familySection(parent: SidebarSection, nested: readonly { section: SidebarSection }[]): SidebarSection {
+  return parent === "waiting" && nested.some((n) => n.section !== "waiting") ? "inflight" : parent;
 }
 
 /** A deployment watch's state, in words: the three the row shows. */
@@ -350,6 +407,17 @@ export function waitingOnNamesFinishedWorker(
   return waitingOn !== null && workers.some((w) => w.status !== "running" && waitingOnNamesWorker(waitingOn, w));
 }
 
+/**
+ * BB-351: the duration an overdue wait reads, e.g. `2d`, `3h`, `45m`. The
+ * value is the wait's age; a live wait past its budget reads `<phrase>,
+ * overdue <duration>`.
+ */
+export function overduePhrase(ms: number): string {
+  if (ms >= 86_400_000) return `${Math.round(ms / 86_400_000)}d`;
+  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.max(1, Math.round(ms / 60_000))}m`;
+}
+
 /** A short relative time to a future moment, for `next look <time>` (BB-83). */
 export function untilPhrase(at: number, now: number): string {
   const ms = at - now;
@@ -363,14 +431,17 @@ export function untilPhrase(at: number, now: number): string {
 export const waitingUntilDate = (at: number): string => new Date(at).toISOString().slice(0, 10);
 
 /**
- * Line two's status phrase, first match wins (BB-76, BB-86, BB-83, BB-152):
- * needs you › hold › stuck › running › lost hand-off › quiet worker finish ›
- * deployment › nextAction › no report. An open `stuck` escalation that is the
- * plugin's delegate wait reads `waiting on review from <names>` instead, so a
- * requested reviewer does not look like a failure (BB-338). The free-text
- * `waitingOn` is not a prefix (BB-109): a running worker reads the count, and
- * otherwise the `nextAction` reads verbatim, whatever the actor. `the other
- * party` only stands in when there is no report at all.
+ * Line two's status phrase, first match wins (BB-76, BB-86, BB-83, BB-152,
+ * BB-348): needs you › wake failure › stuck › no wake source › delegate wait ›
+ * hold › running › lost hand-off › quiet worker finish › dated wait ›
+ * deployment › nextAction › no report. Red comes first: a red row says why it
+ * is red, so a real `stuck` escalation and a no-wake-source wait outrank the
+ * quiet delegate-wait and hold phrases. The delegate wait (BB-338) is a wait,
+ * not a failure, so it reads `waiting on review from <names>` from
+ * `delegateWait` alone. The free-text `waitingOn` is not a prefix
+ * (BB-109): a running worker reads the count, and otherwise the `nextAction`
+ * reads verbatim, whatever the actor. `the other party` only stands in when
+ * there is no report at all.
  *
  * The lost hand-off (BB-152) sits after the running count and before the
  * quiet finish: a `waitingOn` naming a worker that is over, or the loud
@@ -381,13 +452,18 @@ export const waitingUntilDate = (at: number): string => new Date(at).toISOString
  * `next look` time; it defaults to the wall clock so a caller with no clock
  * still gets a phrase.
  */
-export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
+function baseEffortPhrase(e: EffortStatus, now: number): string {
   if (e.needsUser) return "needs you";
   // BB-255: a wake that could not be delivered outranks the `stuck` escalation
   // it filed, so the row says why it is stuck rather than just that it is.
   if (e.wakeFailure !== null && e.wakeFailure !== undefined && e.wakeFailure !== "") return `wake failed: ${e.wakeFailure}`;
+  // BB-348: red first — a red row says why it is red, so a real `stuck`
+  // escalation and a no-wake-source wait outrank the quiet delegate-wait and
+  // hold phrases.
+  if (e.stuck) return "stuck";
+  if (e.noWakeSource) return "waiting, no wake source";
+  if (e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "") return `waiting on review from ${e.delegateWait}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
-  if (e.stuck) return e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "" ? `waiting on review from ${e.delegateWait}` : "stuck";
   // A running worker or reviewer paints the blue ring, but the count is of
   // running workers: a busy steward or reviewer with no running worker falls
   // through rather than reading "0 workers running". A wait on someone else
@@ -401,10 +477,6 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? []) || e.pending.some(isLostHandoffNote);
   if (lostHandoff) return e.requeueAt === null ? "hand-off lost: worker finished" : `hand-off lost: worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
-  // BB-154: a free-text wait with no structured source reads so on line two,
-  // ahead of the deployment phrase and the next action, which can look live
-  // when nothing the plugin tracks will deliver the wait.
-  if (e.noWakeSource) return "waiting, no wake source";
   // BB-247: a dated wait reads its date, so the row says when the plugin will
   // wake the steward even though nothing else is live on the binding.
   if (e.waitingUntil !== null && e.waitingUntil !== undefined && e.waitingOn !== null && e.waitingOn !== undefined && e.waitingOn !== "") {
@@ -416,10 +488,20 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
   return "no report yet";
 }
 
+/**
+ * Line two's status phrase. BB-351 appends `, overdue <duration>` to the base
+ * phrase for a live wait past its kind's budget, so a red row says why it is
+ * red: e.g. `waiting on review from arashout, overdue 2d`.
+ */
+export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
+  const phrase = baseEffortPhrase(e, now);
+  return e.overdue === true && e.overdueMs !== null && e.overdueMs !== undefined ? `${phrase}, overdue ${overduePhrase(e.overdueMs)}` : phrase;
+}
+
 /** Fill in the derived fields. Grouping calls this once the effort's children are attached. */
 function derive(e: SidebarEffort, now: number): SidebarEffort {
   e.state = effortState(e);
-  e.section = effortSection(e);
+  e.section = effortSection(e, now);
   e.phrase = effortPhrase(e, now);
   return e;
 }
@@ -444,6 +526,9 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     holdBehind: [],
     waitingOn: null,
     waitingUntil: null,
+    wait: null,
+    overdue: false,
+    overdueMs: null,
     noWakeSource: false,
     wakeFailure: null,
     workers: [],
@@ -607,6 +692,7 @@ function sameEfforts(next: readonly SidebarEffort[], previous: readonly SidebarE
 function reconcileTab(next: SidebarTab, previous: SidebarTab | undefined): SidebarTab {
   if (previous === undefined) return next;
   const blocked = reconcileEfforts(next.blocked, previous.blocked);
+  const waiting = reconcileEfforts(next.waiting, previous.waiting);
   const efforts = reconcileEfforts(next.efforts, previous.efforts);
   const threads = reconcileEfforts(next.threads, previous.threads);
   const monitors = reconcileEfforts(next.monitors, previous.monitors);
@@ -617,6 +703,7 @@ function reconcileTab(next: SidebarTab, previous: SidebarTab | undefined): Sideb
     next.isPersonal === previous.isPersonal &&
     next.projectStewardThreadId === previous.projectStewardThreadId &&
     sameEfforts(blocked, previous.blocked) &&
+    sameEfforts(waiting, previous.waiting) &&
     sameEfforts(efforts, previous.efforts) &&
     sameEfforts(threads, previous.threads) &&
     sameEfforts(monitors, previous.monitors) &&
@@ -625,7 +712,7 @@ function reconcileTab(next: SidebarTab, previous: SidebarTab | undefined): Sideb
   ) {
     return previous;
   }
-  return { ...next, blocked, efforts, threads, monitors, ended };
+  return { ...next, blocked, waiting, efforts, threads, monitors, ended };
 }
 
 function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefined, threads: readonly SidebarLiveThread[], now: number): SidebarTab {
@@ -664,6 +751,9 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       holdBehind: b.holdBehind,
       waitingOn: b.waitingOn,
       waitingUntil: b.waitingUntil,
+      wait: b.wait,
+      overdue: b.overdue,
+      overdueMs: b.overdueMs,
       noWakeSource: b.noWakeSource,
       wakeFailure: b.wakeFailure,
       workers: b.workers,
@@ -763,6 +853,9 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       holdBehind: [],
       waitingOn: null,
       waitingUntil: null,
+      wait: null,
+      overdue: false,
+      overdueMs: null,
       noWakeSource: false,
       wakeFailure: null,
       workers: [],
@@ -818,6 +911,13 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     if (e.section === "blocked") blockedDuplicates.push({ ...e, parentTitle: effortTitle(parent.title, parent.key), nested: [] });
   }
   const topLevel = (e: SidebarEffort): boolean => !nestedEfforts.has(e);
+  // BB-348: a parent that would read Waiting is demoted to In flight when a
+  // nested child is not waiting, so a collapsed Waiting row never hides live
+  // work under it. Children keep their own section.
+  for (const e of efforts) {
+    if (!topLevel(e)) continue;
+    e.section = familySection(e.section, e.nested);
+  }
 
   const nonOps = efforts.filter((e) => e.bindingKey !== null && e.kind !== "ops");
   const ops = efforts.filter((e) => e.kind === "ops");
@@ -826,6 +926,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     name: project.name,
     isPersonal: project.isPersonal,
     blocked: [...[...nonOps, ...ops].filter((e) => e.section === "blocked" && topLevel(e)), ...blockedDuplicates].sort(compareBlocked),
+    waiting: nonOps.filter((e) => e.section === "waiting" && topLevel(e)).sort(compareInflight),
     efforts: nonOps.filter((e) => e.section === "inflight" && topLevel(e)).sort(compareInflight),
     threads: efforts.filter((e) => e.bindingKey === null).sort(compareEfforts),
     monitors: ops.filter((e) => e.section === "monitors" && topLevel(e)).sort(compareMonitors),

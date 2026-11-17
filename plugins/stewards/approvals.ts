@@ -9,7 +9,8 @@
 // closure, so nothing here reads the plugin's config or snapshots on its own.
 import { type BigDecision, decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, type DecideMark } from "./decisions.js";
 import type { ApprovalMode } from "./config.js";
-import { approvalMarkerLine, classifyApproval, ESCALATED_APPROVAL_REFUSAL, productReason, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
+import { approvalMarkerLine, classifyApproval, ESCALATED_APPROVAL_REFUSAL, latestReviewMarker, productReason, PRODUCT_APPROVAL_REFUSAL, reviewWorkerThread, type PrGate } from "./gate.js";
+import { approvePrNeedParts, approvePrWhy, decisionWhy, ROUTINE_FORWARD_WHY } from "./need-parts.js";
 import { assessedGate } from "./assessed-gate.js";
 import { parsePullRef, type GithubWriter } from "./github.js";
 import { isSpecComment, productGateOptions, workerInFlight, type MechanicalEvent } from "./reconcile.js";
@@ -289,26 +290,35 @@ export function isForeignPull(pull: EntitySnapshot): boolean {
  * teammate's pull request the owner can approve with a real GitHub review, so
  * the item says that rather than the agent-PR comment convention (BB-118).
  */
-export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null, listing: string | null = null, reason: "product" | null = null): void {
+export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null, listing: string | null = null, reason: "product" | null = null, why: string | null = null): void {
   const foreign = isForeignPull(pull);
-  const base = foreign
-    ? `Submit an APPROVED review as you from the Stewards page; that is what counts as your approval.`
-    : `Post the unsigned comment "Approved ${ctx.shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`;
-  // The product reason (BB-207) points the owner at the Product section of the
-  // review, which is what the approval acks.
-  const how = reason === "product" ? `${base}\n\nThis pull request is substantial and references no ticket with an approved spec: read the **Product** section of the review before you approve.` : base;
   // A later refresh (checks went red) may not have the files at hand; keep
   // the listing an earlier wake stored for the same head rather than
   // dropping it or showing the previous head's listing (BB-135).
   const url = pull.url ?? pull.key;
   const existing = ctx.store.openNeeds(b.id).find((n) => n.kind === "approve-pr" && n.url === url);
   const carried = listing ?? (existing?.data.decideListingSha === headSha && typeof existing.data.decideListing === "string" ? existing.data.decideListing : null);
+  // A refresh that does not recompute the why (checks went red) carries the
+  // open item's why rather than downgrading it to the routine line (BB-345).
+  const carriedWhy = why ?? (existing === undefined ? null : existing.why) ?? ROUTINE_FORWARD_WHY;
+  const parts = approvePrNeedParts({
+    key: pull.key,
+    title: pull.title,
+    shortSha: ctx.shortSha(headSha),
+    verdict: latestReviewMarker(pull.comments)?.verdict ?? null,
+    foreign,
+    product: reason === "product",
+    why: carriedWhy,
+    listing: carried,
+  });
   ctx.store.fileNeed({
     bindingId: b.id,
     kind: "approve-pr",
     url,
-    what: `Approve ${pull.key} on GitHub`,
-    how: carried === null ? how : `${how}\n\n${carried}`,
+    what: parts.what,
+    how: parts.how,
+    why: parts.why,
+    details: parts.details,
     data: { sha: headSha, escalationId, foreign, ...(carried === null ? {} : { decideListing: carried, decideListingSha: headSha }) },
     filedBy: "plugin",
   });
@@ -323,17 +333,31 @@ export function fileApprovePrNeed(ctx: ApprovalsContext, b: Binding, pull: Entit
 export async function fileForwardedApprovePrNeed(ctx: ApprovalsContext, b: Binding, forwarding: { id: string; question: string; url: string | null; headSha: string | null }): Promise<void> {
   const pull = b.lastSnapshot === null ? undefined : ctx.observedPulls(b, b.lastSnapshot).find((p) => (p.url ?? p.key) === forwarding.url);
   const key = forwarding.question.replace(/^Approve\s+/u, "");
-  const listing = pull === undefined ? null : formatDecisionListing(explainDecision(await ctx.pullChangedFiles(pull), await ctx.loadDecisions(b.projectId)));
-  const base = `Post the unsigned comment "Approved ${ctx.shortSha(forwarding.headSha)} from the Stewards page" as you; that is what counts as your approval.`;
+  const explanation = pull === undefined ? null : explainDecision(await ctx.pullChangedFiles(pull), await ctx.loadDecisions(b.projectId));
+  const listing = explanation === null ? null : formatDecisionListing(explanation);
   // The same product text the plugin-filed item carries (BB-207).
   const product = productGateOptions(b, pull);
-  const how = productReason(product.substantial, product.ticketApprovedSpec) === "product" ? `${base}\n\nThis pull request is substantial and references no ticket with an approved spec: read the **Product** section of the review before you approve.` : base;
+  // The approval escalation the project steward forwarded carries the why the
+  // plugin computed when it filed it; fall back to the decide list (BB-345).
+  const forwardedWhy = ctx.store.escalation(forwarding.id)?.why ?? null;
+  const parts = approvePrNeedParts({
+    key: pull?.key ?? key,
+    title: pull?.title ?? null,
+    shortSha: ctx.shortSha(forwarding.headSha),
+    verdict: pull === undefined ? null : latestReviewMarker(pull.comments)?.verdict ?? null,
+    foreign: pull !== undefined && isForeignPull(pull),
+    product: productReason(product.substantial, product.ticketApprovedSpec) === "product",
+    why: forwardedWhy ?? (explanation === null ? ROUTINE_FORWARD_WHY : decisionWhy(explanation)),
+    listing,
+  });
   ctx.store.fileNeed({
     bindingId: b.id,
     kind: "approve-pr",
     url: forwarding.url ?? b.url ?? "",
-    what: `Approve ${key} on GitHub`,
-    how: listing === null ? how : `${how}\n\n${listing}`,
+    what: parts.what,
+    how: parts.how,
+    why: parts.why,
+    details: parts.details,
     data: { sha: forwarding.headSha, escalationId: forwarding.id, ...(listing === null ? {} : { decideListing: listing, decideListingSha: forwarding.headSha }) },
     filedBy: "plugin",
   });
@@ -411,9 +435,12 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
   // The decide-list listing is fetched once, with the changed files, and
   // passed to whichever surface asks for the approval (BB-135).
   let listing: string | null = null;
+  let approvalWhy: string | null = null;
   if (g.lane !== "no-review" && g.marker?.verdict === "approved" && g.checksGreen && !g.ownerApproved && !g.projectApproved) {
     const files = await ctx.pullChangedFiles(pull);
-    listing = formatDecisionListing(explainDecision(files, decisions));
+    const explanation = explainDecision(files, decisions);
+    listing = formatDecisionListing(explanation);
+    approvalWhy = approvePrWhy({ product: g.reason === "product", escalated: g.escalated, explanation });
   }
   const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
   const approvalEsc = ctx.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
@@ -451,8 +478,8 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       ctx.store.closeNeedByKey(b.id, "approve-pr", url, "Declined on the Stewards page; waiting for a new review round.");
       if (approvalEsc !== null) ctx.store.resolve(approvalEsc.id, "Declined on the Stewards page.");
     } else if (approvalEsc === null) {
-      const x = ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "user", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
-      fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing, g.reason);
+      const x = ctx.store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "user", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId, why: approvalWhy });
+      fileApprovePrNeed(ctx, b, pull, x.id, g.headSha, listing, g.reason, approvalWhy);
     } else {
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
       if (approvalEsc.route !== "user") {
@@ -462,7 +489,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
         // (BB-327).
         ctx.store.setEscalationMeanwhile(approvalEsc.id, "Waiting: the owner approves on GitHub from the Stewards page.");
       }
-      fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
+      fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason, approvalWhy);
     }
   } else if (g.delegatePending) {
     // BB-327: the owner delegated the review by requesting one. No page item
@@ -502,7 +529,7 @@ export async function syncPullApproval(ctx: ApprovalsContext, b: Binding, pull: 
       // Checks went pending or failing: never resolve the request as
       // approved. Keep it and the page item open, re-pointed at the head.
       if (approvalEsc.headSha !== g.headSha) ctx.store.setEscalationHead(approvalEsc.id, g.headSha);
-      if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason);
+      if (approvalEsc.route === "user") fileApprovePrNeed(ctx, b, pull, approvalEsc.id, g.headSha, listing, g.reason, approvalWhy);
       ctx.store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
     } else if (g.baseStale) {
       // The approval is present but stale: the base ref changed after it was

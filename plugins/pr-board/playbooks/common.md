@@ -12,14 +12,15 @@
 ## Working rules
 - Read the code and the PR diff before changing anything. Keep changes surgical: only what this task needs. Match the surrounding style. Tests must encode why the behavior matters; write a failing test first for each bug fix.
 - Read and apply `~/.bb/skills/codebase-design/SKILL.md` to the changed code and its callers.
-- Commits: lowercase conventional commits `type(scope): subject` with the Linear id prefix when the PR title has one. No real member data; people as first name plus last initial only. End each commit message with:
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+- Commits: lowercase conventional commits `type(scope): subject` with the Linear id prefix when the PR title has one. No real member data; people as first name plus last initial only. Follow the repository's required co-author trailer and attribute the agent that makes the commit.
 - After your changes are committed, get an independent read-only review of the full PR diff from a `gpt-6.1-sol` agent (provider `codex`) at `xhigh` reasoning: `bb thread spawn --parent-self --provider codex --model gpt-6.1-sol --reasoning-level xhigh --prompt-file <brief>`. Give it the diff and the review threads, not your conclusions, and tell it to make no edits. Evaluate its findings yourself, fix material ones, and rerun the review after material changes.
 - Write any reply in plain, active, present-tense prose. When you mention another PR, add a 3-8 word summary of what it does.
 - Never post PHI or secrets anywhere.
 - If a fix needs a judgment call about product behavior, stop and ask instead of choosing.
 
 ## Final report
+Use `prs_report` from the assigned coordinator to record progress and a final result for this PR key (`${repo}#${number}`). Progress updates have `kind: "progress"`, `key`, and `summary` (at most 300 characters). Results have `kind: "result"`, `key`, `outcome` (`prepared`, `published`, `blocked`, or `stopped`), `summary`, and `detail` (at most 4000 characters). Match the outcome to the authorized stopping point. If the tool returns `report_retryable`, retry after the start finishes. Child threads report through their coordinator.
+
 Report: what you changed and why, commits and final head SHA, test and CI results with counts (say what you did not run), the Sol review outcome, and what is still open. Confirm that you did not merge.
 
 End with a section titled exactly `## Decisions for Matt`: a numbered list of every open question or judgment call that needs Matt, each with the options and your recommendation. Write `None.` when there are none.

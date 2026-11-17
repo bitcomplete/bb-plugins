@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, namesUserAsBlocker, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, mentionsOwnerOrUser, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, classifyApproval, ownerApproval, prGate, productReason, projectApprovalMarker, reviewMarker, reviewWorkerThread, UNREADABLE_VERDICT, type ProjectApprovalRecord } from "./gate.js";
 import { approvalWanted, gateState, resolveChecklistItem } from "./ready-gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
@@ -304,15 +304,7 @@ describe("a worker in flight between its turns (BB-11)", () => {
 
 describe("waits nobody hears", () => {
   const status = (waitingOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, waitingOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
-  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", context: null, meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null, projectId: null, origin: { threadId: null, bindingId: null, chain: [] }, resolutionKind: null, url: null, data: {}, answeredBy: null, forwardedFrom: null, headSha: null, isQuestion: false, citedLessons: [], correctionsCounted: false, rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null }];
-
-  it("flags a status waiting on the project steward or the user with no escalation open", () => {
-    expect(unheardWait(status("project steward's approval of the new spec"), [])).toMatch(/project steward/u);
-    expect(unheardWait(status("the user's answer on scope"), [])).toMatch(/the user/u);
-    expect(unheardWait(status("project steward's approval"), open)).toBeNull();
-    expect(unheardWait(status("Sam's review"), [])).toBeNull();
-    expect(unheardWait(status(null), [])).toBeNull();
-  });
+  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", context: null, meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null, projectId: null, origin: { threadId: null, bindingId: null, chain: [] }, resolutionKind: null, url: null, data: {}, answeredBy: null, forwardedFrom: null, headSha: null, isQuestion: false, citedLessons: [], correctionsCounted: false, rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null, why: null, details: null }];
 
   it("tells the steward's own signed description edit from someone else's edit of it", () => {
     const signed = (text: string) => issue({ description: `${text}\n\n_— from bb thread thr_s_` });
@@ -993,12 +985,16 @@ describe("the pull request gate (build-tickets)", () => {
 });
 
 describe("a waitingOn naming the user", () => {
-  it("is refused without an item and allowed with one", () => {
-    expect(namesUserAsBlocker("the user's answer on scope")).toBe(true);
-    expect(namesUserAsBlocker("the owner's approval")).toBe(true);
-    expect(namesUserAsBlocker("a human has to install it")).toBe(true);
-    expect(namesUserAsBlocker("the project steward's call")).toBe(false);
-    expect(namesUserAsBlocker("sam's review")).toBe(false);
+  // BB-333: the exported name is retired, but the guard is live for an
+  // `external`/no-kind report; its word boundaries stay pinned.
+  it("matches user/owner/human as a word, not inside another word", () => {
+    expect(mentionsOwnerOrUser("the user's answer on scope")).toBe(true);
+    expect(mentionsOwnerOrUser("the owner's approval")).toBe(true);
+    expect(mentionsOwnerOrUser("a human has to install it")).toBe(true);
+    expect(mentionsOwnerOrUser("the username is wrong")).toBe(false);
+    expect(mentionsOwnerOrUser("ownerless")).toBe(false);
+    expect(mentionsOwnerOrUser("the project steward's call")).toBe(false);
+    expect(mentionsOwnerOrUser("sam's review")).toBe(false);
   });
 });
 

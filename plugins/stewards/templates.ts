@@ -11,7 +11,7 @@ import { templateHash } from "./template-stamp.js";
  * user sees.
  */
 const SECRET_REQUEST =
-  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, naming the variable and what it is for in `context`. The question is one line, as the sidebar row shows it; the evidence and reasoning go in `context`, and a question longer than 240 characters is refused. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. `secret` is the only resolution for a credential, even when the ticket or spec says the owner produces or seals it by hand; such spec wording is corrected at spec approval, never followed. A by-hand step outside the repos the feature needs to work — an app scope, a webhook, a registry entry, a tailnet rule — is a `configure` escalation raised in the spec turn (`steward_report { escalate: { kind: \"decision\", … } }`; the project steward forwards it with `resolution: \"done\"`), never a README line or a closing-comment follow-up; a step that adds or widens an app scope, a token or a tailnet rule is the user's to grant, forwarded under the project's \"new credential, token or access, or widening what an existing one can reach\" decision, never the project steward's; at wrap-up a still-open step keeps the binding open with `followThrough`, and a provide-secret whose form answer is \"unchanged\" has not provided the value: raise that step again with `steward_report { escalate: { kind: \"decision\", … } }` rather than settling it. Never paste the secret, and never a script for the user to run.";
+  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, naming the variable and what it is for in `context`. The question is one line, as the sidebar row shows it, and is read by whoever decides, possibly the owner: write it for a person with no view of the thread; the evidence and reasoning go in `context`, and a question longer than 240 characters is refused. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. `secret` is the only resolution for a credential, even when the ticket or spec says the owner produces or seals it by hand; such spec wording is corrected at spec approval, never followed. A by-hand step outside the repos the feature needs to work — an app scope, a webhook, a registry entry, a tailnet rule — is a `configure` escalation raised in the spec turn (`steward_report { escalate: { kind: \"decision\", … } }`; the project steward forwards it with `resolution: \"done\"`), never a README line or a closing-comment follow-up; a step that adds or widens an app scope, a token or a tailnet rule is the user's to grant, forwarded under the project's \"new credential, token or access, or widening what an existing one can reach\" decision, never the project steward's; at wrap-up a still-open step keeps the binding open with `followThrough`, and a provide-secret whose form answer is \"unchanged\" has not provided the value: raise that step again with `steward_report { escalate: { kind: \"decision\", … } }` rather than settling it. Never paste the secret, and never a script for the user to run.";
 
 /**
  * Every playbook that can start a worker carries this, next to its other
@@ -29,7 +29,7 @@ const WORKER_QUESTIONS =
  * escalates with `steward_report` rather than `bb stewards escalate`.
  */
 const OPS_QUESTIONS =
-  "Never use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click) yourself: it parks the thread until a person clicks, and nobody watches an ops steward. Raise a decision you cannot make with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, one question per escalation.";
+  "Never use the interactive question tool (`AskUserQuestion`, or any prompt that waits for a click) yourself: it parks the thread until a person clicks, and nobody watches an ops steward. Raise a decision you cannot make with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, one question per escalation: the question is read by whoever decides, possibly the owner, so write it for a person with no view of the thread.";
 
 /**
  * A build-time blocker is a `decision` in the same turn, never a follow-up,
@@ -151,8 +151,11 @@ ${buildBlocker("the ticket")}
 ## In Review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. When every linked pull request is merged, move the ticket to
-Done.
+failing checks. A review wait that outlives its budget reads red and the
+plugin posts one signed nudge naming the requested reviewer; if a second
+budget passes it files the owner's **Review it yourself / Reassign / Keep
+waiting** decide item, and Keep waiting resets the budget once. When every
+linked pull request is merged, move the ticket to Done.
 
 ${buildBlocker("the ticket")}
 `;
@@ -288,7 +291,11 @@ ${buildBlocker("the issue")}
 ## status:in-review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. When every linked pull request is merged and the project's
+failing checks. A review wait that outlives its budget reads red and the
+plugin posts one signed nudge naming the requested reviewer; if a second
+budget passes it files the owner's **Review it yourself / Reassign / Keep
+waiting** decide item, and Keep waiting resets the budget once. When every
+linked pull request is merged and the project's
 deployment source confirms the merge is live, close the issue with \`gh issue
 close <owner/repo#N> --comment "<what shipped and where it is live>"\` (use
 \`--reason not planned\` when the issue will not be done), and end with
@@ -342,7 +349,11 @@ contract, auth, a migration, a secret, production infrastructure, a big
 decision), needs the owner's approval before it merges. When it is approved
 and checks pass, merge it if the project's guidance says its author may;
 otherwise say so in a comment. The merge comment names the approved commit
-and, when newer commits landed after it, one line on what they changed.
+and, when newer commits landed after it, one line on what they changed. A
+review wait that outlives its budget reads red and the plugin posts one signed
+nudge naming the requested reviewer; if a second budget passes it files the
+owner's **Review it yourself / Reassign / Keep waiting** decide item, and Keep
+waiting resets the budget once.
 
 ${buildBlocker("the work")}
 `;
@@ -425,7 +436,11 @@ ${WORKER_QUESTIONS}
 
 ## open
 
-Run a round when one is due; otherwise there is nothing to do.
+Run a round when one is due; otherwise there is nothing to do. A review wait
+that outlives its budget reads red and the plugin posts one signed nudge
+naming the requested reviewer; if a second budget passes it files the owner's
+**Review it yourself / Reassign / Keep waiting** decide item, and Keep waiting
+resets the budget once.
 
 ${buildBlocker("the work")}
 

@@ -18,6 +18,7 @@ import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import { waitSchema, type Wait } from "./wait.js";
 import { nonActionsSchema, nonActionDay, nonActionText, type NonActionCode, type NonActions } from "./non-actions.js";
+import { backlogWriteSchema, type BacklogWrite } from "./backlog-triage.js";
 import type { GuidanceCitation } from "./guidance.js";
 import { APPROVAL_MARKER_MIGRATIONS, APPROVALS_CHAIN_MIGRATIONS, createApprovalsStore, PULL_REQUESTER_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS } from "./approvals-store.js";
 export type { ProjectApproval } from "./approvals-store.js";
@@ -821,7 +822,36 @@ export const PLAYBOOK_REFRESH_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS playbook_refreshes_project ON playbook_refreshes (project_id, playbook)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS];
+// BB-341: the backlog steward's triage ledger. Every accepted write and every
+// refusal is one row, so the comment budget, the one-open-question rule and
+// the "priority the steward set" rule survive a restart, and the digest can
+// list the writes since its last one. A new table appended after every group
+// already shipped, so no recorded index moves.
+export const BACKLOG_WRITE_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS backlog_writes (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     team TEXT NOT NULL,
+     issue_id TEXT NOT NULL,
+     issue_key TEXT NOT NULL,
+     at INTEGER NOT NULL,
+     outcome TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     detail TEXT NOT NULL DEFAULT '{}',
+     reason TEXT
+   )`,
+  `CREATE INDEX IF NOT EXISTS backlog_writes_ticket ON backlog_writes (project_id, team, issue_id, at)`,
+];
+
+// BB-351: the start of the binding's current typed wait and the moment the
+// plugin nudged it. `wait_since` is set when a report first records a wait (or
+// changes its kind or ref) and is kept while a report repeats the same one;
+// `wait_nudged_at` records the overdue wake/nudge so it happens at most once
+// per wait and is the clock for the second budget. Append-only and nullable:
+// an old row reads as no wait and never nudged.
+export const WAIT_BUDGET_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait_since INTEGER`, `ALTER TABLE bindings ADD COLUMN wait_nudged_at INTEGER`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1059,6 +1089,10 @@ export type Binding = {
   backlogSnapshot: BacklogSnapshot | null;
   /** The typed wait from the last `steward_report` (BB-333), or null; the free-text `waitingOn` stays on the status record. */
   wait: Wait | null;
+  /** BB-351: when the current typed wait was first reported, or null with no wait; a repeat keeps it, a changed wait resets it. */
+  waitSince: number | null;
+  /** BB-351: when the plugin first found this wait overdue and nudged (or woke the steward), or null; at most once per wait. */
+  waitNudgedAt: number | null;
   /** The latest reason per declining branch (BB-335), keyed by code; empty with none. Rides on the assessment row and is joined into the binding read, so no surface adds a store read. */
   nonActions: NonActions;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
@@ -1159,6 +1193,8 @@ function rowToBinding(r: BindingRow): Binding {
     backlogLook: json(backlogLookSchema.nullable(), str("backlog_look"), null),
     backlogSnapshot: json(backlogSnapshotSchema.nullable(), str("backlog_snapshot"), null),
     wait: json(waitSchema.nullable(), str("wait"), null),
+    waitSince: num("wait_since"),
+    waitNudgedAt: num("wait_nudged_at"),
     nonActions: json(nonActionsSchema, str("assessment_non_actions"), {}),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
@@ -1236,6 +1272,8 @@ const COLUMNS = {
   backlogLook: "backlog_look",
   backlogSnapshot: "backlog_snapshot",
   wait: "wait",
+  waitSince: "wait_since",
+  waitNudgedAt: "wait_nudged_at",
   deployments: "deployments",
   idleSince: "idle_since",
   idleWokenAt: "idle_woken_at",
@@ -1289,6 +1327,9 @@ const VISIBLE_COLUMNS = [
   "requeue_until",
   // BB-333: the typed wait renders on the card and in `bb stewards show`.
   "wait",
+  // BB-351: the wait's start decides whether the row reads overdue, so a
+  // write rings the channel.
+  "wait_since",
   // BB-255: a failed wake's phrase is the visible line two.
   "wake_failure",
 ] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;
@@ -1366,6 +1407,10 @@ export type Escalation = {
   rationaleGiven: boolean;
   /** The cluster a repeat escalation belongs to, or null (BB-35 step 4). */
   clusterKey: string | null;
+  /** Why this reached the user instead of being decided, one or two sentences (BB-345). */
+  why: string | null;
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: string | null;
 };
 
 /**
@@ -1397,6 +1442,10 @@ export type Question = {
   rationaleGiven: boolean;
   /** The structured payload the question carries, for a page action to read (BB-328: a refresh id). */
   data: Record<string, unknown>;
+  /** Why this reached the user instead of being decided, one or two sentences (BB-345). */
+  why: string | null;
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: string | null;
 };
 
 /** The kinds of thing that can wait on the user, from the ticket's table. */
@@ -1430,6 +1479,10 @@ export type Need = {
   url: string;
   what: string;
   how: string | null;
+  /** Why this reached the user instead of being decided, one or two sentences (BB-345). */
+  why: string | null;
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: string | null;
   data: Record<string, unknown>;
   /** Who filed it: "plugin", "steward", "project" or "user". */
   filedBy: string;
@@ -1795,6 +1848,19 @@ export interface StoreOptions {
   log?: (message: string) => void;
 }
 
+/**
+ * Merge the optional `why`/`details` parts of a needs-you item into a row's
+ * `data` JSON (BB-345). They are additive and need no schema migration; an
+ * existing row without them reads as null.
+ */
+function withParts(data: Record<string, unknown> | undefined, why: string | null | undefined, details: string | null | undefined): Record<string, unknown> {
+  return {
+    ...(data ?? {}),
+    ...(why === undefined || why === null || why === "" ? {} : { why }),
+    ...(details === undefined || details === null || details === "" ? {} : { details }),
+  };
+}
+
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
   // BB-335: the non-actions live on the `assessments` row (BB-293). Join them
   // into every full binding read so a card, `bb stewards show` and the digest
@@ -1906,8 +1972,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
    * or a question, the open predicates `openEscalations`, `openNeeds` and
    * `openQuestions` use. An escalation routed to the project steward, the
    * binding's own steward or its parent does not count (BB-208). A report whose
-   * actor is `user` no longer counts by itself: the plugin files a need from it
-   * (BB-213), so the actor contributes only through that open row. Since
+   * actor is `user` does not count by itself: the actor contributes only
+   * through an open item, and since BB-349 no item is auto-filed from the
+   * report's next action. Since
    * BB-237 the row phrase is narrower than this count — a need the server cannot
    * act on yet is not a yellow row — so the picker may count a binding the
    * sidebar does not list; the count stays "everything waiting on the user".
@@ -2122,37 +2189,44 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
   const upsertProject = db.prepare("INSERT INTO project_stewards (project_id) VALUES (?) ON CONFLICT (project_id) DO NOTHING");
 
-  const toEscalation = (r: Record<string, unknown>): Escalation => ({
-    id: String(r.id),
-    bindingId: String(r.binding_id),
-    kind: String(r.kind) as EscalationKind,
-    question: String(r.question),
-    context: r.context === null || r.context === undefined ? null : String(r.context),
-    meanwhile: String(r.meanwhile),
-    route: String(r.route) as EscalationRoute,
-    recommendation: r.recommendation === null ? null : String(r.recommendation),
-    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
-    status: String(r.status) as "open" | "resolved",
-    resolution: r.resolution === null ? null : String(r.resolution),
-    createdAt: Number(r.created_at),
-    resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
-    deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
-    projectId: r.project_id === null || r.project_id === undefined ? null : String(r.project_id),
-    origin: json(escalationOriginSchema, r.origin === null || r.origin === undefined ? null : String(r.origin), { threadId: null, bindingId: null, chain: [] }),
-    resolutionKind: r.resolution_kind === null || r.resolution_kind === undefined ? null : (String(r.resolution_kind) as ResolutionKind),
-    url: r.url === null || r.url === undefined ? null : String(r.url),
-    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
-    answeredBy: r.answered_by === null || r.answered_by === undefined ? null : String(r.answered_by),
-    forwardedFrom: r.forwarded_from === null || r.forwarded_from === undefined ? null : String(r.forwarded_from),
-    headSha: r.head_sha === null || r.head_sha === undefined ? null : String(r.head_sha),
-    isQuestion: Number(r.is_question ?? 0) === 1,
-    citedLessons: json(z.array(z.string()), r.cited_lessons === null || r.cited_lessons === undefined ? null : String(r.cited_lessons), []),
-    correctionsCounted: Number(r.corrections_counted ?? 0) === 1,
-    rationaleWanted: r.rationale_wanted === null || r.rationale_wanted === undefined ? null : String(r.rationale_wanted),
-    rationaleAsked: Number(r.rationale_asked ?? 0) === 1,
-    rationaleGiven: Number(r.rationale_given ?? 0) === 1,
-    clusterKey: r.cluster_key === null || r.cluster_key === undefined ? null : String(r.cluster_key),
-  });
+  const toEscalation = (r: Record<string, unknown>): Escalation => {
+    // BB-345: `why` and `details` are optional and live in the `data` JSON, so
+    // no schema migration is needed and an older row without them reads as null.
+    const data = json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {});
+    return {
+      id: String(r.id),
+      bindingId: String(r.binding_id),
+      kind: String(r.kind) as EscalationKind,
+      question: String(r.question),
+      context: r.context === null || r.context === undefined ? null : String(r.context),
+      meanwhile: String(r.meanwhile),
+      route: String(r.route) as EscalationRoute,
+      recommendation: r.recommendation === null ? null : String(r.recommendation),
+      choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
+      status: String(r.status) as "open" | "resolved",
+      resolution: r.resolution === null ? null : String(r.resolution),
+      createdAt: Number(r.created_at),
+      resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
+      deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
+      projectId: r.project_id === null || r.project_id === undefined ? null : String(r.project_id),
+      origin: json(escalationOriginSchema, r.origin === null || r.origin === undefined ? null : String(r.origin), { threadId: null, bindingId: null, chain: [] }),
+      resolutionKind: r.resolution_kind === null || r.resolution_kind === undefined ? null : (String(r.resolution_kind) as ResolutionKind),
+      url: r.url === null || r.url === undefined ? null : String(r.url),
+      data,
+      answeredBy: r.answered_by === null || r.answered_by === undefined ? null : String(r.answered_by),
+      forwardedFrom: r.forwarded_from === null || r.forwarded_from === undefined ? null : String(r.forwarded_from),
+      headSha: r.head_sha === null || r.head_sha === undefined ? null : String(r.head_sha),
+      isQuestion: Number(r.is_question ?? 0) === 1,
+      citedLessons: json(z.array(z.string()), r.cited_lessons === null || r.cited_lessons === undefined ? null : String(r.cited_lessons), []),
+      correctionsCounted: Number(r.corrections_counted ?? 0) === 1,
+      rationaleWanted: r.rationale_wanted === null || r.rationale_wanted === undefined ? null : String(r.rationale_wanted),
+      rationaleAsked: Number(r.rationale_asked ?? 0) === 1,
+      rationaleGiven: Number(r.rationale_given ?? 0) === 1,
+      clusterKey: r.cluster_key === null || r.cluster_key === undefined ? null : String(r.cluster_key),
+      why: typeof data.why === "string" ? data.why : null,
+      details: typeof data.details === "string" ? data.details : null,
+    };
+  };
   const toQuestion = (r: Record<string, unknown>): Question => {
     const e = toEscalation(r);
     return {
@@ -2172,6 +2246,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
       rationaleAsked: e.rationaleAsked,
       rationaleGiven: e.rationaleGiven,
       data: e.data,
+      why: e.why,
+      details: e.details,
     };
   };
   const insertNeed = db.prepare(
@@ -2251,20 +2327,27 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const settleClusterRationaleStmt = db.prepare("UPDATE escalations SET rationale_given = 1, rationale_asked = 1 WHERE project_id = ? AND cluster_key = ?");
   const lessonsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND cluster_key = ? AND tier != 'retired' ORDER BY created_at");
 
-  const toNeed = (r: Record<string, unknown>): Need => ({
-    id: String(r.id),
-    bindingId: String(r.binding_id),
-    kind: String(r.kind) as NeedKind,
-    url: String(r.url ?? ""),
-    what: String(r.what),
-    how: r.how === null || r.how === undefined ? null : String(r.how),
-    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
-    filedBy: String(r.filed_by ?? "steward"),
-    status: String(r.status) as "open" | "done",
-    resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
-    createdAt: Number(r.created_at),
-    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
-  });
+  const toNeed = (r: Record<string, unknown>): Need => {
+    // BB-345: `why` and `details` are optional and live in the `data` JSON, so
+    // no schema migration is needed and an older row without them reads as null.
+    const data = json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {});
+    return {
+      id: String(r.id),
+      bindingId: String(r.binding_id),
+      kind: String(r.kind) as NeedKind,
+      url: String(r.url ?? ""),
+      what: String(r.what),
+      how: r.how === null || r.how === undefined ? null : String(r.how),
+      why: typeof data.why === "string" ? data.why : null,
+      details: typeof data.details === "string" ? data.details : null,
+      data,
+      filedBy: String(r.filed_by ?? "steward"),
+      status: String(r.status) as "open" | "done",
+      resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
+      createdAt: Number(r.created_at),
+      resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+    };
+  };
 
   const toAssumption = (r: Record<string, unknown>): Assumption => ({
     id: String(r.id),
@@ -2293,6 +2376,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     url: x.url ?? "",
     what: x.question,
     how: null,
+    why: x.why,
+    details: x.details,
     data: x.data,
     filedBy: "project",
     status: x.status === "open" ? "open" : "done",
@@ -2331,6 +2416,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return null;
     }
   };
+  // BB-341: one triage ledger row, read back into the shape the budget and
+  // priority rules compare against.
+  const toBacklogWrite = (r: Record<string, unknown>): BacklogWrite =>
+    backlogWriteSchema.parse({
+      id: String(r.id),
+      projectId: String(r.project_id),
+      team: String(r.team),
+      issueId: String(r.issue_id),
+      issueKey: String(r.issue_key),
+      at: Number(r.at),
+      outcome: r.outcome,
+      kind: r.kind,
+      detail: parseJson(r.detail) ?? {},
+      reason: r.reason === null || r.reason === undefined ? null : String(r.reason),
+    });
   const toAssessmentRow = (r: Record<string, unknown>): AssessmentRow => ({
     bindingId: String(r.binding_id),
     at: Number(r.at),
@@ -2953,6 +3053,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
       data?: Record<string, unknown>;
       forwardedFrom?: string | null;
       headSha?: string | null;
+      why?: string | null;
+      details?: string | null;
     }): Escalation {
       const id = newId("esc");
       const origin: EscalationOrigin = fields.origin ?? { threadId: null, bindingId: fields.bindingId, chain: [] };
@@ -2976,7 +3078,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         chain: JSON.stringify(origin.chain),
         resolution_kind: fields.resolutionKind ?? null,
         url: fields.url ?? null,
-        data: JSON.stringify(fields.data ?? {}),
+        data: JSON.stringify(withParts(fields.data, fields.why, fields.details)),
         forwarded_from: fields.forwardedFrom ?? null,
         is_question: 0,
         context: fields.context === undefined || fields.context === null || fields.context === "" ? null : fields.context,
@@ -3078,7 +3180,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     ...createApprovalsStore(db, now),
 
     // questions to the user
-    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[]; resolutionKind?: ResolutionKind; url?: string | null; data?: Record<string, unknown> }): Question {
+    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[]; resolutionKind?: ResolutionKind; url?: string | null; data?: Record<string, unknown>; why?: string | null; details?: string | null }): Question {
       const id = newId("qst");
       insertQuestion.run({
         id,
@@ -3091,7 +3193,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         created_at: now(),
         resolution_kind: fields.resolutionKind ?? ((fields.choices ?? []).length > 0 ? "choice" : "text"),
         url: fields.url ?? null,
-        data: JSON.stringify(fields.data ?? {}),
+        data: JSON.stringify(withParts(fields.data, fields.why, fields.details)),
         origin: JSON.stringify({ threadId: null, bindingId: fields.bindingId, chain: [] }),
       });
       projectChanged(fields.projectId);
@@ -3239,16 +3341,16 @@ export function createStore(db: Database.Database, now: () => number, options: S
      * File a need, deduplicated by (binding, kind, url) while open: a steward
      * that re-reports one updates the wording rather than adding a row.
      */
-    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
+    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; why?: string | null; details?: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
       const projectId = projectIdForBinding(fields.bindingId);
       const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
       if (existing !== undefined) {
-        updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
+        updateNeed.run(fields.what, fields.how, JSON.stringify(withParts(fields.data, fields.why, fields.details)), existing.id);
         projectChanged(projectId);
         return toNeed(getNeed.get(String(existing.id))!);
       }
       const id = newId("need");
-      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
+      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(withParts(fields.data, fields.why, fields.details)), filed_by: fields.filedBy ?? "steward", created_at: now() });
       projectChanged(projectId);
       return toNeed(getNeed.get(id)!);
     },
@@ -3759,6 +3861,46 @@ export function createStore(db: Database.Database, now: () => number, options: S
         .all(projectId)
         .map((r) => ({ fingerprint: r.fingerprint, level: r.level === "problem" ? "problem" : "warning", text: r.text, firstSeenAt: r.first_seen_at }));
     },
+    // BB-341: the backlog steward's triage ledger. One row per accepted write
+    // and per refusal, so the comment budget and the "priority the steward
+    // set" rule survive a restart and the digest lists what happened.
+    /** The triage rows for a project, narrowed to a team or an issue and to rows at or after `since` when given. */
+    backlogWrites(projectId: string, opts: { team?: string; issueId?: string; since?: number } = {}): BacklogWrite[] {
+      const clauses = ["project_id = ?"];
+      const values: unknown[] = [projectId];
+      if (opts.team !== undefined) {
+        clauses.push("team = ?");
+        values.push(opts.team);
+      }
+      if (opts.issueId !== undefined) {
+        clauses.push("issue_id = ?");
+        values.push(opts.issueId);
+      }
+      if (opts.since !== undefined) {
+        clauses.push("at >= ?");
+        values.push(opts.since);
+      }
+      return db
+        .prepare(`SELECT * FROM backlog_writes WHERE ${clauses.join(" AND ")} ORDER BY at ASC, rowid ASC`)
+        .all(...values)
+        .map((r) => toBacklogWrite(r as Record<string, unknown>));
+    },
+    /** Append one triage row. */
+    addBacklogWrite(entry: BacklogWrite): void {
+      db.prepare("INSERT INTO backlog_writes (id, project_id, team, issue_id, issue_key, at, outcome, kind, detail, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        entry.id,
+        entry.projectId,
+        entry.team,
+        entry.issueId,
+        entry.issueKey,
+        entry.at,
+        entry.outcome,
+        entry.kind,
+        JSON.stringify(entry.detail),
+        entry.reason,
+      );
+    },
+
     /** Replace a project's recorded findings with the current set, keeping an unchanged finding's first-seen time. */
     setCheckFindings(projectId: string, findings: ReadonlyArray<{ fingerprint: string; level: "warning" | "problem"; text: string }>, at: number): void {
       const keep = new Set(findings.map((f) => f.fingerprint));

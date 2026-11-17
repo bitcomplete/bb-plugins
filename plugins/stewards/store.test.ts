@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, BACKLOG_LOOK_MIGRATIONS, BACKLOG_SNAPSHOT_MIGRATIONS, CHECK_FINDING_MIGRATIONS, HUDDLE_MIGRATIONS, NON_ACTION_MIGRATIONS, PLAYBOOK_REFRESH_MIGRATIONS, TYPED_WAIT_MIGRATIONS, WAIT_DIVERGENCE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_REQUESTER_MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, WORKER_PARK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
+import { ACTOR_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, BACKLOG_LOOK_MIGRATIONS, BACKLOG_SNAPSHOT_MIGRATIONS, BACKLOG_WRITE_MIGRATIONS, CHECK_FINDING_MIGRATIONS, HUDDLE_MIGRATIONS, NON_ACTION_MIGRATIONS, PLAYBOOK_REFRESH_MIGRATIONS, TYPED_WAIT_MIGRATIONS, WAIT_BUDGET_MIGRATIONS, WAIT_DIVERGENCE_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, ASSESSMENT_MIGRATIONS, ASSUMPTION_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, DATED_WAIT_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ENDED_READ_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_PR_MIGRATIONS, LESSON_TIER_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, MIGRATIONS, PULL_REQUESTER_MIGRATIONS, PULL_WATCH_MIGRATIONS, RATIONALE_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, STACK_MIGRATIONS, STACKED_PULLS_MIGRATIONS, VALIDATION_MIGRATIONS, WAKE_RETRY_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, STANDUP_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, WORKER_PARK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!));
@@ -167,10 +167,11 @@ describe("needs you items", () => {
 describe("countNeedsUser (BB-104)", () => {
   // The same predicate the SQL count evaluates from the store's own reads.
   // Only a route-`me` escalation counts (BB-208); project, steward and parent
-  // ones do not. The status actor does not count by itself (BB-213): the report
-  // files a need, so the actor is true only through the open row. The server's
-  // row predicate is narrower since BB-237 (a non-actionable need is not a
-  // yellow row), but the count is still every open item waiting on the user.
+  // ones do not. The status actor does not count by itself (BB-213, BB-349): a
+  // report files no item from it, so the actor is true only through an open
+  // row. The server's row predicate is narrower since BB-237 (a non-actionable
+  // need is not a yellow row), but the count is still every open item waiting
+  // on the user.
   const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
     s.openEscalations(b.id).some((x) => x.route === "user") || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
 
@@ -181,11 +182,10 @@ describe("countNeedsUser (BB-104)", () => {
 
   it("counts exactly the open bindings needsUser flags: each condition once, and once when a binding has all four", () => {
     const { s, binding } = store();
-    // The base binding: actor `user` alone does not count (BB-213); the need the
-    // report files from it does.
+    // The base binding: actor `user` alone does not count (BB-213, BB-349); the
+    // report files nothing from it, so the row needs an item of its own.
     s.patch(binding.id, { status: userStatus(1_000) });
     expect(needsUser(s, s.binding(binding.id)!)).toBe(false);
-    s.fileNeed({ bindingId: binding.id, kind: "decide", url: "", what: "Do the thing", how: null, data: { autoFiled: true } });
     // One binding per remaining condition. The escalation that counts is the
     // one routed to the user; escalations routed elsewhere are added below.
     const escalation = add(s, 13);
@@ -219,7 +219,7 @@ describe("countNeedsUser (BB-104)", () => {
 
     const open = s.open("p1");
     const expected = open.filter((b) => needsUser(s, b)).length;
-    expect(expected).toBe(5); // auto-filed need, escalation, need, question, and all four
+    expect(expected).toBe(4); // escalation, need, question, and all four
     expect(s.countNeedsUser("p1")).toBe(expected);
     expect(s.countNeedsUser("p1")).not.toBe(s.countNeedsUser("p2"));
     expect(s.countNeedsUser("p2")).toBe(1);
@@ -746,8 +746,10 @@ describe("the actor rename migration (BB-97)", () => {
     // and BB-328 appended the check-findings table after that. BB-334's
     // snapshot column followed, BB-333's typed wait column after that, and
     // BB-335's non-action column after that. BB-333 PR 2's wait-divergence
-    // table followed, and BB-328 Part 2's playbook-refresh table is the newest.
-    const groups = [PLAYBOOK_REFRESH_MIGRATIONS, WAIT_DIVERGENCE_MIGRATIONS, NON_ACTION_MIGRATIONS, TYPED_WAIT_MIGRATIONS, BACKLOG_SNAPSHOT_MIGRATIONS, CHECK_FINDING_MIGRATIONS, BACKLOG_LOOK_MIGRATIONS, WORKER_PARK_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS, PULL_REQUESTER_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
+    // table followed, BB-328 Part 2's playbook-refresh table after that, and
+    // BB-341's backlog-writes ledger after that. BB-351's wait-budget columns
+    // are the newest.
+    const groups = [WAIT_BUDGET_MIGRATIONS, BACKLOG_WRITE_MIGRATIONS, PLAYBOOK_REFRESH_MIGRATIONS, WAIT_DIVERGENCE_MIGRATIONS, NON_ACTION_MIGRATIONS, TYPED_WAIT_MIGRATIONS, BACKLOG_SNAPSHOT_MIGRATIONS, CHECK_FINDING_MIGRATIONS, BACKLOG_LOOK_MIGRATIONS, WORKER_PARK_MIGRATIONS, REVIEWER_REQUEST_MIGRATIONS, PULL_REQUESTER_MIGRATIONS, ALERTMANAGER_LOOK_MIGRATIONS, STANDUP_COMPLETED_MIGRATIONS, STANDUP_DELEGATION_MIGRATIONS, STANDUP_BINDING_MIGRATIONS, STANDUP_MIGRATIONS, HUDDLE_MIGRATIONS, ENDED_READ_MIGRATIONS, ASSESSMENT_MIGRATIONS, STACKED_PULLS_MIGRATIONS, RETARGET_PULLS_MIGRATIONS, MERGE_BEHIND_MIGRATIONS, WAKE_RETRY_MIGRATIONS, DATED_WAIT_MIGRATIONS, ASSUMPTION_MIGRATIONS, WORKER_STOP_REASON_MIGRATIONS, DEPS_DECISION_MIGRATIONS, ESCALATION_ROUTE_MIGRATIONS, STACK_MIGRATIONS, PULL_WATCH_MIGRATIONS, SERVER_SETTINGS_MIGRATIONS, WAKE_SOURCE_MIGRATIONS, REVIEWER_MODEL_MIGRATIONS, LESSON_PR_MIGRATIONS, ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS];
     let end = MIGRATIONS.length;
     for (const group of groups) {
       expect(MIGRATIONS.slice(end - group.length, end)).toEqual([...group]);
@@ -847,8 +849,12 @@ describe("the escalation route rename migration (BB-209)", () => {
     // BB-328's check-findings table after that, BB-334's backlog snapshot
     // column after that, and BB-333's typed wait column after that. BB-335's
     // non-action column is last but for BB-333 PR 2's wait-divergence table.
-    const withoutPlaybookRefresh = MIGRATIONS.slice(0, -PLAYBOOK_REFRESH_MIGRATIONS.length);
-    expect(MIGRATIONS.slice(-PLAYBOOK_REFRESH_MIGRATIONS.length)).toEqual([...PLAYBOOK_REFRESH_MIGRATIONS]);
+    const withoutWaitBudget = MIGRATIONS.slice(0, -WAIT_BUDGET_MIGRATIONS.length);
+    expect(MIGRATIONS.slice(-WAIT_BUDGET_MIGRATIONS.length)).toEqual([...WAIT_BUDGET_MIGRATIONS]);
+    const withoutBacklogWrites = withoutWaitBudget.slice(0, -BACKLOG_WRITE_MIGRATIONS.length);
+    expect(withoutWaitBudget.slice(-BACKLOG_WRITE_MIGRATIONS.length)).toEqual([...BACKLOG_WRITE_MIGRATIONS]);
+    const withoutPlaybookRefresh = withoutBacklogWrites.slice(0, -PLAYBOOK_REFRESH_MIGRATIONS.length);
+    expect(withoutBacklogWrites.slice(-PLAYBOOK_REFRESH_MIGRATIONS.length)).toEqual([...PLAYBOOK_REFRESH_MIGRATIONS]);
     const withoutWaitDivergence = withoutPlaybookRefresh.slice(0, -WAIT_DIVERGENCE_MIGRATIONS.length);
     expect(withoutPlaybookRefresh.slice(-WAIT_DIVERGENCE_MIGRATIONS.length)).toEqual([...WAIT_DIVERGENCE_MIGRATIONS]);
     const withoutNonAction = withoutWaitDivergence.slice(0, -NON_ACTION_MIGRATIONS.length);
@@ -1455,5 +1461,26 @@ describe("the stand-up completion marker (BB-312)", () => {
     const scoped = s.createStandup({ id: "sup_3", projectId: "p1", startedAt: 300, binding: "ENG-12" });
     s.saveStandup(scoped.id, { endedAt: 350, completed: true });
     expect(s.lastCompletedStandup("p1")).toBe(200);
+  });
+});
+
+describe("the backlog triage ledger (BB-341)", () => {
+  it("survives a restart, and is read back by team, issue and window", () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS) db.exec(sql);
+    const first = createStore(db, () => 1_000);
+    first.addBacklogWrite({ id: "btw_1", projectId: "p1", team: "BB", issueId: "i1", issueKey: "BB-1", at: 900, outcome: "accepted", kind: "comment", detail: { kind: "question" }, reason: null });
+    first.addBacklogWrite({ id: "btw_2", projectId: "p1", team: "BB", issueId: "i2", issueKey: "BB-2", at: 1_100, outcome: "refused", kind: "triage", detail: { attempted: ["priority"] }, reason: "hand-set" });
+
+    // A second store on the same database is a restart: the rows are still there.
+    const second = createStore(db, () => 2_000);
+    expect(second.backlogWrites("p1", { team: "BB" })).toEqual([
+      { id: "btw_1", projectId: "p1", team: "BB", issueId: "i1", issueKey: "BB-1", at: 900, outcome: "accepted", kind: "comment", detail: { kind: "question" }, reason: null },
+      { id: "btw_2", projectId: "p1", team: "BB", issueId: "i2", issueKey: "BB-2", at: 1_100, outcome: "refused", kind: "triage", detail: { attempted: ["priority"] }, reason: "hand-set" },
+    ]);
+    expect(second.backlogWrites("p1", { team: "BB", issueId: "i1" })).toHaveLength(1);
+    expect(second.backlogWrites("p1", { team: "BB", issueId: "i1", since: 950 })).toEqual([]);
+    expect(second.backlogWrites("p1", { team: "BB", issueId: "i1", since: 900 })).toHaveLength(1);
+    expect(second.backlogWrites("p1", { team: "OPS" })).toEqual([]);
   });
 });

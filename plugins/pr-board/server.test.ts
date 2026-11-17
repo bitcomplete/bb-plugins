@@ -1,8 +1,9 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { calmRowSchema, stateSchema, type BoardState, type Prepared, type Runner, type ViewModel } from "./board";
-import { afterRefresh, type Marker } from "./markers";
-import { createPlugin, MAX_START, MIGRATIONS, THREAD_DEFAULTS } from "./server";
+import { afterRefresh, markerSchema, type Marker } from "./markers";
+import { createPlugin, MIGRATIONS, THREAD_DEFAULTS } from "./server";
 
 const KEY = (n: number) => `parsleyhealth/parsley-monorepo#${n}`;
 const view: ViewModel = {
@@ -23,6 +24,7 @@ function fakeRunner() {
   const control = {
     heads: {} as Record<string, string>,
     refuse: {} as Record<string, string>,
+    throwOn: {} as Record<string, string>,
     view,
     fetchError: null as string | null,
     gate: null as Promise<void> | null,
@@ -41,6 +43,7 @@ function fakeRunner() {
     },
     async prepare(_data, { key, expect, stop }): Promise<Prepared> {
       calls.prepared.push(`${key}:${expect}:${stop}`);
+      if (control.throwOn[key]) throw new Error(control.throwOn[key]);
       const reason = control.refuse[key];
       return reason ? { ok: false, reason }
         : { ok: true, title: `Fix CI PR ${key.split("#")[1]} Title`, prompt: `PROMPT ${key} ${stop}`, head_oid: control.heads[key] ?? "h0", move: "ci" };
@@ -54,11 +57,12 @@ afterEach(async () => { for (const dispose of disposers.splice(0)) await dispose
 
 async function host(runner: Runner, threadStatus: { value: "active" | "idle" } = { value: "active" }) {
   let spawned = 0;
-  const delivery = { output: null as string | null, error: null as string | null, gate: null as Promise<void> | null, updatedAt: Date.parse("2026-11-13T13:00:00Z") };
+  const delivery = { output: null as string | null, outputGate: null as Promise<void> | null, error: null as string | null, gate: null as Promise<void> | null, updatedAt: Date.parse("2026-11-13T13:00:00Z") };
   const { bb, harness } = createFakePluginHost({
     pluginId: "pr-board",
     sdk: { threads: {
-      output: async () => ({ output: delivery.output }),
+      list: async () => [],
+      output: async () => { const output = delivery.output; if (delivery.outputGate) await delivery.outputGate; return { output }; },
       send: async () => {
         if (delivery.gate) await delivery.gate;
         if (delivery.error) throw new Error(delivery.error);
@@ -68,6 +72,8 @@ async function host(runner: Runner, threadStatus: { value: "active" | "idle" } =
       get: async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: threadStatus.value, updatedAt: delivery.updatedAt }),
     } },
   });
+  harness.sdk.stub("projects.get", async () => ({ sources: [{ hostId: "host-test", path: "/synthetic", isDefault: true }] }));
+  harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: "codex", available: true }], models: [{ model: "gpt-6.1-sol", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] }] }));
   await createPlugin({ runner })(bb);
   disposers.push(() => harness.lifecycle.dispose());
   const get = async () => (await harness.behavior.callRpc("board_get", null)) as BoardState;
@@ -131,29 +137,36 @@ it("the CLI prints the board as text, the view model with --json, and fails on r
   expect(refresh.stdout).toContain("Last refresh failed: gh missing");
 });
 
-it("starts one thread per PR, at most five, on fresh data, with the playbook and Parsley defaults", async () => {
+it("starts all seven selected PRs in one coordinator on fresh data and preserves each preparation", async () => {
   const { runner, calls, control } = fakeRunner();
-  const { harness, settle } = await host(runner);
+  const { harness, settle, bb } = await host(runner);
   await harness.behavior.callRpc("board_refresh", null);
   const fetchesBefore = calls.fetch;
   for (let n = 1; n <= 7; n++) control.heads[KEY(n)] = `h${n}`;
   const items = Array.from({ length: 7 }, (_, i) => ({ key: KEY(i + 1), action: "fix-ci" as const }));
-  const result = await harness.behavior.callRpc("start", { items, stop: "prepare" });
-  expect(result).toEqual({ starting: [1, 2, 3, 4, 5].map(KEY), skipped: [6, 7].map((n) => ({ key: KEY(n), reason: "at most 5 agents start per click" })) });
+  expect(await harness.behavior.callRpc("start", { items, stop: "prepare" })).toEqual({ starting: items.map((item) => item.key), skipped: [] });
   const state = await settle();
-  expect(calls.fetch).toBe(fetchesBefore + 1); // re-checked against GitHub before starting
+  expect(calls.fetch).toBe(fetchesBefore + 1);
   const spawns = harness.inspection.sdk.callsTo("threads.spawn");
-  expect(spawns).toHaveLength(MAX_START);
-  expect(spawns[0]?.[0]).toMatchObject({
-    ...THREAD_DEFAULTS,
-    environment: { type: "project-default" },
-    title: "Fix CI PR 1 Title",
-    prompt: `PROMPT ${KEY(1)} prepare`,
-    pluginMetadata: { pr: KEY(1), action: "fix-ci", stop: "prepare" },
+  expect(spawns).toHaveLength(1);
+  expect(spawns[0]?.[0]).toMatchObject({ ...THREAD_DEFAULTS, environment: { type: "project-default" }, title: "Work on 7 pull requests", pluginMetadata: { prs: items.map((item) => item.key), stop: "prepare" } });
+  const prompt = z.object({ prompt: z.string() }).parse(spawns[0]?.[0]).prompt;
+  for (const item of items) expect(prompt).toContain(`PROMPT ${item.key} prepare`);
+  expect(state.markers.map((m) => [m.key, m.status, m.threadId])).toEqual(items.map((item) => [item.key, "live", "thr_1"]));
+  expect(calls.busy.at(-1)).toEqual(items.map((item) => item.key));
+  const savedRow = z.object({ body: z.string() }).parse(bb.storage.database().prepare("SELECT body FROM marker_cache WHERE id = 1").get());
+  const saved = z.array(markerSchema).parse(JSON.parse(savedRow.body));
+  expect(saved.map((marker) => marker.head)).toEqual(items.map((_, index) => `h${index + 1}`));
+  for (const marker of JSON.parse(savedRow.body)) expect(marker).not.toHaveProperty("prepared");
+  expect(await bb.storage.kv.get("markers")).toBeUndefined();
+});
+
+it("keeps the single-PR prompt, title, and metadata unchanged", async () => {
+  const { runner } = fakeRunner(); const { harness, settle } = await host(runner);
+  await harness.behavior.callRpc("start", { items: [{ key: KEY(1), action: "fix-ci" }], stop: "prepare" }); await settle();
+  expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
+    ...THREAD_DEFAULTS, title: "Fix CI PR 1 Title", prompt: `PROMPT ${KEY(1)} prepare`, pluginMetadata: { pr: KEY(1), action: "fix-ci", stop: "prepare" },
   });
-  expect(state.markers.map((m) => [m.key, m.status, m.threadId])).toEqual(
-    [1, 2, 3, 4, 5].map((n) => [KEY(n), "live", `thr_${n}`]));
-  expect(calls.busy.at(-1)).toEqual([1, 2, 3, 4, 5].map(KEY)); // suggestions skip PRs being worked on
 });
 
 it("refuses to start when the PR's move changed since the click, and says why", async () => {
@@ -208,7 +221,7 @@ it("marker lifecycle: live while the thread runs, then worked-on until the PR's 
 });
 
 it("afterRefresh keeps a live thread's marker even after its head moves", () => {
-  const marker: Marker = { key: "k", action: "fix-ci", status: "started", at: "t0", threadId: "thr", title: "T", head: "h1", move: "ci", reason: null, question: null, answeredQuestions: [], answering: null, answerError: null };
+  const marker: Marker = { key: "k", action: "fix-ci", status: "started", at: "t0", threadId: "thr", title: "T", head: "h1", move: "ci", reason: null, question: null, answeredQuestions: [], answering: null, answerError: null, report: null };
   const prs = { k: { head_oid: "h2", move: "ci" } };
   expect(afterRefresh([marker], prs, { thr: { live: true, updatedAt: "t1" } }, "t2")).toEqual([marker]);
   expect(afterRefresh([marker], prs, { thr: { live: false, updatedAt: "t1" } }, "t2")).toEqual([]);
@@ -412,6 +425,8 @@ it("migrates a validated canonical KV board on first read and retains it through
   const { bb, harness } = createFakePluginHost({ pluginId: "pr-board" });
   const legacy = { view, lastSuccess: "2026-11-13T12:00:05Z", lastError: "Last remote attempt failed" };
   await bb.storage.kv.set("board", legacy);
+  harness.sdk.stub("projects.get", async () => ({ sources: [{ hostId: "host-test", path: "/synthetic", isDefault: true }] }));
+  harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: "codex", available: true }], models: [{ model: "gpt-6.1-sol", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] }] }));
   await createPlugin({ runner })(bb);
   disposers.push(() => harness.lifecycle.dispose());
   expect(stateSchema.parse(await harness.behavior.callRpc("board_get", null))).toMatchObject(legacy);
@@ -420,4 +435,273 @@ it("migrates a validated canonical KV board on first read and retains it through
   disposers.push(() => reloaded.harness.lifecycle.dispose());
   expect(stateSchema.parse(await reloaded.harness.behavior.callRpc("board_get", null))).toMatchObject(legacy);
   expect(calls.fetch).toBe(0);
+});
+
+it("keeps eligible work while recording individual preparation refusals and exceptions", async () => {
+  const { runner, control } = fakeRunner();
+  control.refuse[KEY(2)] = "the next move changed";
+  control.throwOn[KEY(3)] = "could not build this playbook";
+  const { harness, settle } = await host(runner);
+  await harness.behavior.callRpc("start", { items: [1, 2, 3].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" });
+  const state = await settle();
+  expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  expect(state.markers).toMatchObject([
+    { key: KEY(1), status: "live", threadId: "thr_1" },
+    { key: KEY(2), status: "refused", reason: "the next move changed" },
+    { key: KEY(3), status: "refused", reason: "could not build this playbook" },
+  ]);
+  expect(state.markers.some((marker) => marker.status === "starting")).toBe(false);
+});
+
+it("spawns nothing when every selected PR refuses preparation", async () => {
+  const { runner, control } = fakeRunner();
+  control.refuse[KEY(1)] = "closed"; control.refuse[KEY(2)] = "gated";
+  const { harness, settle } = await host(runner);
+  await harness.behavior.callRpc("start", { items: [1, 2].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" });
+  expect((await settle()).markers.map((marker) => marker.status)).toEqual(["refused", "refused"]);
+  expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
+it("refuses every eligible marker when its single coordinator cannot spawn", async () => {
+  const { runner } = fakeRunner(); const { harness, settle } = await host(runner);
+  harness.sdk.stub("threads.spawn", async () => { throw new Error("coordinator unavailable"); });
+  await harness.behavior.callRpc("start", { items: [1, 2].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" });
+  const state = await settle();
+  expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  for (const marker of state.markers) expect(marker).toMatchObject({ status: "refused", threadId: null, reason: "coordinator unavailable" });
+});
+
+it("reads a shared question once, claims every row atomically, and sends one answer across RPC and native calls", async () => {
+  const { runner } = fakeRunner(); const thread = { value: "active" as "active" | "idle" };
+  const { harness, settle, delivery, get } = await host(runner, thread);
+  await harness.behavior.callRpc("start", { items: [1, 2].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" }); await settle();
+  thread.value = "idle"; delivery.output = output;
+  const before = harness.inspection.sdk.callsTo("threads.output").length;
+  expect((await get()).markers.map((marker) => marker.question)).toEqual([question, question]);
+  expect(harness.inspection.sdk.callsTo("threads.output")).toHaveLength(before + 1);
+  let release = () => {}; delivery.gate = new Promise<void>((resolve) => { release = resolve; });
+  const sending = harness.behavior.callRpc("answer", answer);
+  await vi.waitFor(() => expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1));
+  expect((await get()).markers.map((marker) => marker.answering)).toEqual([true, true]);
+  expect(await harness.behavior.callAgentTool("prs_act", { kind: "answer-question", ...answer, key: KEY(2) })).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("no longer available") }] });
+  release(); await sending;
+  for (const marker of (await get()).markers) expect(marker).toMatchObject({ question: null, answering: false, answerError: null });
+  await expect(harness.behavior.callRpc("answer", { ...answer, key: KEY(2) })).rejects.toThrow(/no longer available/);
+  expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+});
+
+it("retains ambiguous answer locks on every batch row across reload instead of sending again", async () => {
+  const { runner } = fakeRunner(); const thread = { value: "active" as "active" | "idle" };
+  const { harness, settle, delivery, get } = await host(runner, thread);
+  await harness.behavior.callRpc("start", { items: [1, 2].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" }); await settle();
+  thread.value = "idle"; delivery.output = output; await get(); delivery.error = "connection lost";
+  await expect(harness.behavior.callRpc("answer", answer)).rejects.toThrow(/connection lost/);
+  for (const marker of (await get()).markers) expect(marker).toMatchObject({ question, answering: true, answerError: expect.stringContaining("Could not confirm") });
+  const reloaded = await harness.lifecycle.reload(createPlugin({ runner }));
+  disposers.push(() => reloaded.harness.lifecycle.dispose());
+  const recovered = stateSchema.parse(await reloaded.harness.behavior.callRpc("board_get", null));
+  expect(recovered.markers).toHaveLength(2);
+  for (const marker of recovered.markers) expect(marker).toMatchObject({ question, answering: true, answerError: expect.stringContaining("interrupted") });
+  await expect(reloaded.harness.behavior.callRpc("answer", { ...answer, key: KEY(2) })).rejects.toThrow(/no longer available/);
+  expect(reloaded.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+});
+
+it("discards a stale shared output read when a newer question reaches the whole batch", async () => {
+  const { runner } = fakeRunner(); const thread = { value: "active" as "active" | "idle" };
+  const { harness, settle, delivery, get } = await host(runner, thread);
+  await harness.behavior.callRpc("start", { items: [1, 2].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" }); await settle();
+  thread.value = "idle"; delivery.output = output;
+  let release = () => {}; delivery.outputGate = new Promise<void>((resolve) => { release = resolve; });
+  const reading = get();
+  await vi.waitFor(() => expect(harness.inspection.sdk.callsTo("threads.output")).toHaveLength(1));
+  const nextQuestion = { ...question, id: "batch-next", prompt: "Continue with both PRs?" };
+  const nextOutput = "```pr-board-question\n" + JSON.stringify({ version: 1, question: nextQuestion }) + "\n```";
+  await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_1", status: "idle", updatedAt: delivery.updatedAt }), lastAssistantText: nextOutput });
+  release();
+  expect((await reading).markers.map((marker) => marker.question)).toEqual([nextQuestion, nextQuestion]);
+});
+
+it("preserves a new batch question before answer acknowledgement and retires it on a validated null result", async () => {
+  const { runner } = fakeRunner(); const thread = { value: "active" as "active" | "idle" };
+  const { harness, settle, delivery, get } = await host(runner, thread);
+  await harness.behavior.callRpc("start", { items: [1, 2].map((n) => ({ key: KEY(n), action: "fix-ci" })), stop: "prepare" }); await settle();
+  thread.value = "idle"; delivery.output = output; await get();
+  let release = () => {}; delivery.gate = new Promise<void>((resolve) => { release = resolve; });
+  const sending = harness.behavior.callRpc("answer", answer);
+  await vi.waitFor(() => expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1));
+  const nextQuestion = { ...question, id: "batch-next", prompt: "Continue with both PRs?" };
+  delivery.output = "```pr-board-question\n" + JSON.stringify({ version: 1, question: nextQuestion }) + "\n```";
+  await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_1", status: "idle" }), lastAssistantText: delivery.output });
+  release(); await sending;
+  for (const marker of (await get()).markers) expect(marker).toMatchObject({ question: nextQuestion, answering: false });
+  delivery.output = "```pr-board-question\n" + JSON.stringify({ version: 1, question: null }) + "\n```";
+  await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_1", status: "idle" }), lastAssistantText: delivery.output });
+  for (const marker of (await get()).markers) expect(marker).toMatchObject({ status: "done", question: null, answering: false });
+  await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_1", status: "idle" }), lastAssistantText: output });
+  expect((await get()).markers.map((marker) => marker.question)).toEqual([null, null]);
+  await expect(harness.behavior.callRpc("answer", { ...answer, key: KEY(2) })).rejects.toThrow(/no longer available/);
+});
+
+it("persists a valid maximum-size shared question for 100 PRs above the real KV limit and through reload", async () => {
+  const { runner } = fakeRunner(); const thread = { value: "active" as "active" | "idle" };
+  const { harness, settle, delivery, bb } = await host(runner, thread);
+  await harness.behavior.callRpc("start", { items: Array.from({ length: 100 }, (_, index) => ({ key: KEY(index + 1), action: "fix-ci" })), stop: "prepare" }); await settle();
+  const large = { id: "q".repeat(100), prompt: "p".repeat(1500), options: Array.from({ length: 5 }, (_, index) => ({ id: `option-${index}`, label: "l".repeat(100), message: "m".repeat(2000) })) };
+  const largeOutput = "```pr-board-question\n" + JSON.stringify({ version: 1, question: large }) + "\n```";
+  thread.value = "idle"; delivery.output = largeOutput;
+  const emitted = await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_1", status: "idle", updatedAt: delivery.updatedAt }), lastAssistantText: largeOutput });
+  expect(emitted.errors).toEqual([]);
+  const before = stateSchema.parse(await harness.behavior.callRpc("board_get", null));
+  expect(before.markers).toHaveLength(100);
+  expect(Buffer.byteLength(JSON.stringify(before.markers))).toBeGreaterThan(256 * 1024);
+  for (const marker of before.markers) expect(marker.question).toEqual(large);
+  expect(await bb.storage.kv.get("markers")).toBeUndefined();
+  const reloaded = await harness.lifecycle.reload(createPlugin({ runner }));
+  disposers.push(() => reloaded.harness.lifecycle.dispose());
+  const restored = stateSchema.parse(await reloaded.harness.behavior.callRpc("board_get", null));
+  expect(restored.markers).toHaveLength(100);
+  for (const marker of restored.markers) expect(marker).toMatchObject({ status: "asking", question: large });
+  await reloaded.harness.behavior.callRpc("answer", { key: KEY(100), questionId: large.id, optionId: "option-0" });
+  const answered = stateSchema.parse(await reloaded.harness.behavior.callRpc("board_get", null));
+  expect(answered.markers.map((marker) => marker.question)).toEqual(Array(100).fill(null));
+  await expect(reloaded.harness.behavior.callRpc("answer", { key: KEY(1), questionId: large.id, optionId: "option-0" })).rejects.toThrow(/no longer available/);
+  expect(reloaded.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+});
+
+it("imports legacy markers after prior migrations, preserves question history, and stores SQL before deleting KV", async () => {
+  const { runner } = fakeRunner();
+  const { bb, harness } = createFakePluginHost({ pluginId: "pr-board" });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, MIGRATIONS.slice(0, 2));
+  const legacy = markerSchema.parse({ key: KEY(1), action: "fix-ci", status: "started", at: "2026-11-15T10:00:00Z", threadId: "legacy-thread", title: "Repair checks", head: "head", move: "ci", reason: null, question, answeredQuestions: ["answered-before"], answering: question.id });
+  const interrupted = markerSchema.parse({ ...legacy, key: KEY(2), status: "starting", threadId: null, question: null, answering: null });
+  await bb.storage.kv.set("markers", [legacy, interrupted]);
+  const remove = bb.storage.kv.delete.bind(bb.storage.kv);
+  const cleanup = vi.spyOn(bb.storage.kv, "delete").mockImplementation(async (key) => {
+    if (key === "markers") expect(db.prepare("SELECT body FROM marker_cache WHERE id = 1").get()).toMatchObject({ body: expect.any(String) });
+    await remove(key);
+  });
+  harness.sdk.stub("threads.list", async () => []);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "legacy-thread", status: "idle" }));
+  harness.sdk.stub("threads.output", async () => ({ output: null }));
+  await createPlugin({ runner })(bb);
+  disposers.push(() => harness.lifecycle.dispose());
+  const state = stateSchema.parse(await harness.behavior.callRpc("board_get", null));
+  expect(state.markers).toMatchObject([
+    { key: KEY(1), question, answering: true, answerError: expect.stringContaining("interrupted") },
+    { key: KEY(2), status: "refused", reason: expect.stringContaining("start was interrupted") },
+  ]);
+  expect(cleanup).toHaveBeenCalledWith("markers");
+  expect(await bb.storage.kv.get("markers")).toBeUndefined();
+  const saved = z.object({ body: z.string() }).parse(db.prepare("SELECT body FROM marker_cache WHERE id = 1").get());
+  expect(z.array(markerSchema).parse(JSON.parse(saved.body))[0].answeredQuestions).toEqual(["answered-before"]);
+  await expect(harness.behavior.callRpc("answer", answer)).rejects.toThrow(/no longer available/);
+});
+
+it("initializes concurrent activated reads once and does not replace newer SQL with a late legacy read", async () => {
+  const { runner } = fakeRunner();
+  const { bb, harness } = createFakePluginHost({ pluginId: "pr-board" });
+  const legacy = markerSchema.parse({ key: KEY(1), action: "fix-ci", status: "started", at: "2026-11-15T10:00:00Z", threadId: "legacy-thread", title: "Repair checks", head: "head", move: "ci", reason: null, question });
+  const newer = { ...legacy, key: KEY(2), threadId: "newer-thread", question: { ...question, id: "newer-question" }, answeredQuestions: [question.id] };
+  await bb.storage.kv.set("markers", [legacy]);
+  const original = bb.storage.kv.get.bind(bb.storage.kv);
+  let held = false, release = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  vi.spyOn(bb.storage.kv, "get").mockImplementation(async (key) => {
+    const value = await original(key);
+    if (key === "markers" && !held) { held = true; await gate; }
+    return value;
+  });
+  harness.sdk.stub("threads.list", async () => []);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "newer-thread", status: "idle" }));
+  harness.sdk.stub("threads.output", async () => ({ output: null }));
+  await createPlugin({ runner })(bb);
+  const loading = Promise.all([harness.behavior.callRpc("board_get", null), harness.behavior.callRpc("board_get", null)]);
+  await vi.waitFor(() => expect(held).toBe(true));
+  bb.storage.database().prepare("INSERT INTO marker_cache (id, body) VALUES (1, ?)").run(JSON.stringify([newer]));
+  release(); await loading;
+  expect(vi.mocked(bb.storage.kv.get).mock.calls.filter(([key]) => key === "markers")).toHaveLength(1);
+  disposers.push(() => harness.lifecycle.dispose());
+  const state = stateSchema.parse(await harness.behavior.callRpc("board_get", null));
+  expect(state.markers).toMatchObject([{ key: KEY(2), threadId: "newer-thread", question: newer.question }]);
+  expect(state.markers).toHaveLength(1);
+  expect(await bb.storage.kv.get("markers")).toBeUndefined();
+});
+
+it("leaves markers and legacy boards untouched in the candidate factory and imports an old generation's late answer claim on activation", async () => {
+  const { runner, calls } = fakeRunner();
+  const { bb, harness } = createFakePluginHost({ pluginId: "pr-board" });
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [MIGRATIONS[0]]);
+  db.prepare("INSERT INTO snapshot (id, body) VALUES (1, ?)").run(JSON.stringify({ prs: {} }));
+  const { prs, reviewer_batches, ...legacyView } = view;
+  const legacyBoard = { view: legacyView, lastSuccess: "2026-11-15T10:00:00Z", lastError: null };
+  const original = markerSchema.parse({ key: KEY(1), action: "fix-ci", status: "started", at: "2026-11-15T10:00:00Z", threadId: "legacy-thread", title: "Repair checks", head: "head", move: "ci", reason: null, question });
+  await bb.storage.kv.set("markers", [original]);
+  await bb.storage.kv.set("board", legacyBoard);
+  const reads = vi.spyOn(bb.storage.kv, "get"), writes = vi.spyOn(bb.storage.kv, "set"), deletes = vi.spyOn(bb.storage.kv, "delete");
+  harness.sdk.stub("threads.list", async () => []);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "legacy-thread", status: "idle" }));
+  harness.sdk.stub("threads.output", async () => ({ output }));
+  await createPlugin({ runner })(bb);
+  disposers.push(() => harness.lifecycle.dispose());
+  expect(reads.mock.calls.filter(([key]) => key === "markers" || key === "board")).toEqual([]);
+  expect(writes.mock.calls).toEqual([]);
+  expect(deletes.mock.calls).toEqual([]);
+  expect(db.prepare("SELECT body FROM marker_cache WHERE id = 1").get()).toBeUndefined();
+  expect(db.prepare("SELECT body FROM board_cache WHERE id = 1").get()).toBeUndefined();
+  expect(calls.busy).toEqual([]);
+  // The still-active previous generation claims delivery after candidate construction.
+  const latest = { ...original, answering: question.id, answeredQuestions: ["retired-before-handover"] };
+  await bb.storage.kv.set("markers", [latest]);
+  const state = stateSchema.parse(await harness.behavior.callRpc("board_get", null));
+  expect(state.markers).toMatchObject([{ question, answering: true, answerError: expect.stringContaining("interrupted") }]);
+  expect(state.view).toEqual(view);
+  expect(calls.busy).toEqual([[KEY(1)]]);
+  expect(calls.fetch).toBe(0);
+  await expect(harness.behavior.callRpc("answer", answer)).rejects.toThrow(/no longer available/);
+  expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  expect(await bb.storage.kv.get("markers")).toBeUndefined();
+  expect(await bb.storage.kv.get("board")).toBeUndefined();
+});
+
+it("keeps legacy marker data intact when a candidate fails before activation", async () => {
+  const { runner } = fakeRunner();
+  const { bb, harness } = createFakePluginHost({ pluginId: "pr-board" });
+  const legacy = markerSchema.parse({ key: KEY(1), action: "fix-ci", status: "started", at: "2026-11-15T10:00:00Z", threadId: "legacy-thread", title: "Repair checks", head: "head", move: "ci", reason: null, question, answering: question.id });
+  await bb.storage.kv.set("markers", [legacy]);
+  disposers.push(() => harness.lifecycle.dispose());
+  await expect(harness.lifecycle.reload(async (candidate) => {
+    await createPlugin({ runner })(candidate);
+    throw new Error("candidate failed validation");
+  })).rejects.toThrow(/candidate failed validation/);
+  expect(await bb.storage.kv.get("markers")).toEqual([legacy]);
+  expect(bb.storage.database().prepare("SELECT body FROM marker_cache WHERE id = 1").get()).toBeUndefined();
+});
+
+it("retries a failed activation import from durable SQL without resurrecting a stale KV question", async () => {
+  const { runner } = fakeRunner();
+  const { bb, harness } = createFakePluginHost({ pluginId: "pr-board" });
+  const latest = markerSchema.parse({ key: KEY(1), action: "fix-ci", status: "started", at: "2026-11-15T10:00:00Z", threadId: "legacy-thread", title: "Repair checks", head: "head", move: "ci", reason: null, question, answering: question.id, answeredQuestions: ["already-retired"] });
+  await bb.storage.kv.set("markers", [latest]);
+  const remove = bb.storage.kv.delete.bind(bb.storage.kv);
+  let refuseCleanup = true;
+  vi.spyOn(bb.storage.kv, "delete").mockImplementation(async (key) => {
+    if (key === "markers" && refuseCleanup) { refuseCleanup = false; throw new Error("temporary cleanup failure"); }
+    await remove(key);
+  });
+  harness.sdk.stub("threads.list", async () => []);
+  harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "legacy-thread", status: "idle" }));
+  harness.sdk.stub("threads.output", async () => ({ output }));
+  await createPlugin({ runner })(bb);
+  disposers.push(() => harness.lifecycle.dispose());
+  await expect(harness.behavior.callRpc("board_get", null)).rejects.toThrow(/temporary cleanup failure/);
+  const saved = z.object({ body: z.string() }).parse(bb.storage.database().prepare("SELECT body FROM marker_cache WHERE id = 1").get());
+  expect(z.array(markerSchema).parse(JSON.parse(saved.body))).toEqual([latest]);
+  await bb.storage.kv.set("markers", [{ ...latest, question: { ...question, id: "stale-question" }, answering: null, answeredQuestions: [] }]);
+  const restored = stateSchema.parse(await harness.behavior.callRpc("board_get", null));
+  expect(restored.markers).toMatchObject([{ question, answering: true, answerError: expect.stringContaining("interrupted") }]);
+  expect(await bb.storage.kv.get("markers")).toBeUndefined();
+  await expect(harness.behavior.callRpc("answer", answer)).rejects.toThrow(/no longer available/);
+  expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
 });

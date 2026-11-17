@@ -90,7 +90,7 @@ export type ReviewDelta = z.infer<typeof reviewDeltaSchema>;
 
 
 export const reviewsStateSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("available"), snapshot: prsSnapshotSchema }),
+  z.object({ kind: z.literal("available"), snapshot: prsSnapshotSchema, needsInput: z.record(z.string(), z.boolean()).optional() }),
   z.object({ kind: z.literal("unavailable"), reason: z.string() }),
 ]);
 export type ReviewsState = z.infer<typeof reviewsStateSchema>;

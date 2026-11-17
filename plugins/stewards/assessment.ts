@@ -16,10 +16,10 @@ import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
 import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
 import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
-import type { Playbook } from "./config.js";
+import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
-import type { Wait } from "./wait.js";
+import type { Wait, WaitKind } from "./wait.js";
 
 export type DecideMark = "project" | "user";
 
@@ -63,6 +63,12 @@ export type AssessedLiveness = {
   live: boolean;
   /** The stored typed wait's own liveness (BB-333); null when the binding has no typed wait. */
   waitLive: boolean | null;
+  /**
+   * A compact fingerprint of the freshly read waited `pull`/`review` ref
+   * (BB-333), so a change on it wakes the binding. Null for any other wait or
+   * when the ref could not be read; JSON, never the raw snapshot.
+   */
+  waited: string | null;
   /** `idleInActiveStage` before the typed wait is applied: what the consumer's idle wake reads (BB-333). */
   idleBase: boolean;
   /** `idleInActiveStage`. */
@@ -73,6 +79,10 @@ export type AssessedLiveness = {
   stalled: boolean;
   /** The report-time flag the assessment replaces. */
   reportedNoWakeSource: boolean;
+  /** BB-351: the stored wait is live and past its kind's budget. */
+  overdue: boolean;
+  /** BB-351: the wait's age in ms when `overdue`, for the `, overdue <duration>` phrase; null otherwise. */
+  overdueMs: number | null;
 };
 
 export type Assessment = {
@@ -89,6 +99,12 @@ export type Assessment = {
   };
   worker: AssessedWorker;
   liveness: AssessedLiveness;
+  /**
+   * BB-351: the stored typed wait, and the requested reviewers of a live
+   * `review` wait from the fresh snapshot. Null with no typed wait. Nothing
+   * stores this; it is read by the reconcile's nudge step in the same look.
+   */
+  wait: { kind: WaitKind; ref: string; reviewers: readonly string[] } | null;
 };
 
 /**
@@ -100,7 +116,7 @@ export type AssessmentInput = {
   binding: Pick<
     Binding,
     "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "noWakeSource" | "status" | "createdAt" | "advancedAt" | "phase"
-  > & { wait?: Binding["wait"] };
+  > & { wait?: Binding["wait"]; waitSince?: number | null };
   /**
    * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
    * keyed by lowercased `owner/repo#N`. Read by the look, never stored in the
@@ -145,6 +161,8 @@ export type AssessmentInput = {
   /** The wake sources the report path already assembles (BB-154). */
   sources: WakeSourceInput;
   playbook: Playbook;
+  /** BB-351: the project's `waitBudgets` overrides; omitted reads as the defaults. */
+  waitBudgets?: Partial<Record<WaitBudgetKind, number | null>>;
   /** The spec hash the ready gate compares its approval against. */
   currentSpecHash: string;
   now: number;
@@ -181,6 +199,52 @@ function waitPullKey(ref: string): string | null {
 }
 
 /**
+ * A compact, JSON fingerprint of the freshly read waited `pull`/`review` ref
+ * (BB-333): the fields a steward's wait is about, so any change on the ref
+ * wakes the binding without storing the snapshot. Null for another kind or a
+ * ref the look could not read.
+ */
+function waitFingerprint(wait: Wait | null, input: AssessmentInput): string | null {
+  if (wait === null || (wait.kind !== "pull" && wait.kind !== "review")) return null;
+  const key = waitPullKey(wait.ref);
+  const e = key === null ? undefined : input.waitedPulls?.get(key);
+  if (e === undefined) return null;
+  return JSON.stringify({
+    key: e.key,
+    state: e.state,
+    title: e.title,
+    head: e.pull?.headSha ?? null,
+    checks: e.pull?.checks?.state ?? null,
+    review: reviewGiven(e),
+    merged: e.pull?.merged === true,
+  });
+}
+
+/**
+ * BB-351: the wait's age in ms when it is past its kind's budget, else null.
+ * `since` is the moment the current wait was first reported. A kind with no
+ * budget (`worker`, `binding`, `date`, `external`) never reads overdue.
+ */
+export function waitOverdueMs(wait: Wait | null, since: number | null, budgets: Partial<Record<WaitBudgetKind, number | null>>, now: number): number | null {
+  if (wait === null || since === null) return null;
+  const budget = waitBudgetMs(wait.kind, budgets);
+  if (budget === null) return null;
+  const age = now - since;
+  return age > budget ? age : null;
+}
+
+/**
+ * The requested reviewers of a live `review` wait, from the freshly read pull
+ * (BB-351). Empty for any other wait or when the ref could not be read.
+ */
+function waitReviewers(wait: Wait | null, input: AssessmentInput): readonly string[] {
+  if (wait === null || wait.kind !== "review") return [];
+  const key = waitPullKey(wait.ref);
+  const e = key === null ? undefined : input.waitedPulls?.get(key);
+  return e?.pull?.requestedReviewers ?? [];
+}
+
+/**
  * Whether the stored typed wait is live, resolved against the rows the look
  * holds (BB-333): the freshly read waited pull, the deployment watches, the
  * workers, the other bindings, the page items and the date. The typed wait is
@@ -206,10 +270,9 @@ function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
     case "date":
       // The design's rule: a `date` wait is live while the binding's own
       // requeue is still ahead (`requeueUntil`). `steward_report` sets
-      // `requeueUntil` only from `until` today, not yet from the ref, so a
-      // `date` wait that sent only a ref is not live. Reading the ref here
-      // claimed a wake the plugin never scheduled; the report-path gap (the
-      // design has the ref set `requeueUntil` too) is a separate fix.
+      // `requeueUntil` from the ref (or from `until`) in PR 3, so a `date`
+      // wait that sent only a ref is live while the date is ahead. Reading the
+      // ref here would claim a wake the plugin never scheduled.
       return input.binding.requeueUntil !== null && input.binding.requeueUntil > input.now;
     case "person":
       return input.hasOpenItem?.(wait.ref) ?? false;
@@ -306,6 +369,7 @@ export function assess(input: AssessmentInput): Assessment {
   const wait = binding.wait ?? null;
   const waitLive = wait === null ? null : typedWaitLive(wait, input);
   const dateAhead = binding.requeueUntil !== null && binding.requeueUntil > now;
+  const overdueMs = waitLive === true ? waitOverdueMs(wait, binding.waitSince ?? null, input.waitBudgets ?? {}, now) : null;
   const idleBase = assessIdle(idleBinding, observed, now);
   return {
     bindingId: binding.id,
@@ -321,6 +385,7 @@ export function assess(input: AssessmentInput): Assessment {
     liveness: {
       live,
       waitLive,
+      waited: waitFingerprint(wait, input),
       idleBase,
       // A live typed wait is something the plugin waits on, so it suppresses
       // the idle wake; a stalled or external one does not (BB-333).
@@ -328,7 +393,10 @@ export function assess(input: AssessmentInput): Assessment {
       stuck: stuckDue(binding, playbook, [...escalations], now) !== null,
       stalled: wait === null ? observedStall(binding, live, now) : waitLive !== true && !dateAhead,
       reportedNoWakeSource: binding.noWakeSource,
+      overdue: overdueMs !== null,
+      overdueMs,
     },
+    wait: wait === null ? null : { kind: wait.kind, ref: wait.ref, reviewers: waitReviewers(wait, input) },
   };
 }
 

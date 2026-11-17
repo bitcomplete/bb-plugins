@@ -41,6 +41,7 @@ import {
   githubStateLabels,
   isTerminal,
   legacyOpsPresent,
+  INITIATIVE_LABEL,
   modelSpecSchema,
   parsePlaybook,
   parseProjectFile,
@@ -53,6 +54,7 @@ import {
   STAGES,
   ticketWatchId,
   ticketWatchProblems,
+  waitBudgetMs,
   type BindingKind,
   type EscalationKind,
   type FilingTarget,
@@ -90,7 +92,8 @@ import {
   type RolesFile,
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, type Assessment, type AssessmentInput } from "./assessment.js";
+import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
@@ -104,7 +107,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, namesUserAsBlocker, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
@@ -128,6 +131,7 @@ import {
   type WorkflowRun,
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
+import { backlogTriageParamsSchema, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -252,6 +256,24 @@ export const START_WORKER_WAKE = "The ready gate passed on your last turn and no
 function delegateWaitOf(escalations: readonly Escalation[]): string | null {
   const names = escalations.filter(isDelegateWait).map((x) => delegateWaitNames(x.meanwhile)).filter((n): n is string => n !== null);
   return names.length === 0 ? null : names.join(", ");
+}
+
+/** BB-351: the three choices the owner's overdue-wait decide item offers. */
+export const WAIT_DECIDE_CHOICES = ["Review it yourself", "Reassign", "Keep waiting"] as const;
+
+/**
+ * BB-351: the one nudge comment the plugin posts on a pull request whose
+ * review wait has run past its budget. It names the requested reviewers, says
+ * the steward posted it, and asks for no approval or change, so it is never
+ * mistaken for the owner's review; it carries the thread signature.
+ */
+export function waitNudgeBody(binding: Pick<Binding, "threadId">, reviewers: readonly string[], since: number): string {
+  return [
+    `This pull request has been waiting on a review from ${reviewers.map((r) => `@${r}`).join(", ")} since ${new Date(since).toISOString().slice(0, 10)}.`,
+    "The steward posted this one nudge because the review wait passed its budget. It is not an approval or a change request; no reply is needed if the review is under way.",
+    "",
+    signatureLine(binding.threadId ?? ""),
+  ].join("\n");
 }
 
 export interface StewardsDeps {
@@ -455,6 +477,16 @@ const questionViewSchema = z.object({
   id: z.string(),
   question: z.string(),
   context: z.string().nullable(),
+  /** Why this reached the user instead of being decided (BB-345). */
+  why: z.string().nullable(),
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: z.string().nullable(),
+  /** The escalation's meanwhile text, when the question forwards one (BB-345). */
+  meanwhile: z.string().nullable(),
+  /** The project steward's recommendation, when the question forwards one (BB-345). */
+  recommendation: z.string().nullable(),
+  /** A line naming the escalation the question forwards, for Details (BB-345). */
+  origin: z.string().nullable(),
   choices: z.array(z.string()),
   key: z.string().nullable(),
   url: z.string().nullable(),
@@ -474,6 +506,10 @@ const withUserViewSchema = z.object({
   /** The evidence and reasoning the escalation carries; the page shows it under the question. */
   context: z.string().nullable(),
   recommendation: z.string().nullable(),
+  /** Why this reached the user instead of being decided (BB-345). */
+  why: z.string().nullable(),
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: z.string().nullable(),
   key: z.string(),
   url: z.string().nullable(),
   threadId: z.string().nullable(),
@@ -514,9 +550,13 @@ const needViewSchema = z.object({
   destination: z.string().nullable(),
   threadId: z.string().nullable(),
   createdAt: z.number(),
-  /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
+  /** Whether the server can verify the preconditions now; when false, `notActionable` says what is missing. */
   actionable: z.boolean(),
+  notActionable: z.string().nullable(),
+  /** Why this reached the user instead of being decided (BB-345). */
   why: z.string().nullable(),
+  /** The raw material behind the ask, in Markdown, one click away (BB-345). */
+  details: z.string().nullable(),
   /** The buttons this need offers, built once on the server (BB-122). */
   actions: z.array(needActionSchema),
   /** Whether the page offers Other… for a free-text answer (BB-122). */
@@ -564,14 +604,6 @@ export function needActions(n: { kind: string; data: Record<string, unknown>; ur
       actions.push({ label: "Done", action: "done", choice: null, primary: false, note: false });
       return { actions, freeText: false };
     case "decide": {
-      // BB-213: a need the plugin auto-filed from an actor-`user` report is a
-      // plain "Done" item. Its `nextAction` is prose, not a question, so it has
-      // no choices, no text box and no other button; Done resolves it and wakes
-      // the steward like any other closed item.
-      if (n.data.autoFiled === true) {
-        actions.push({ label: "Done", action: "done", choice: null, primary: true, note: false });
-        return { actions, freeText: false };
-      }
       const choices = needChoices(n);
       // A boundary lesson's Review PR/Drop are its only choices: no free-text
       // "Other…", and no note box (BB-35 step 5, BB-108).
@@ -707,6 +739,10 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** The typed wait from the last report (BB-333), or null; rendered on the card. */
               wait: waitSchema.nullable(),
+              /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+              overdue: z.boolean(),
+              /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+              overdueMs: z.number().nullable(),
               nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
@@ -835,6 +871,8 @@ export const rpcContract = defineRpcContract({
               phase: z.string().nullable(),
               stage: z.string().nullable(),
               threadId: z.string().nullable(),
+              /** The parent binding's entity key, or null; the board applies the sidebar's family pass (BB-348). Optional so a client built from the previous image still validates. */
+              parentKey: z.string().nullable().optional(),
               summary: z.string().nullable(),
               nextAction: z.string().nullable(),
               actor: z.string().nullable(),
@@ -843,6 +881,10 @@ export const rpcContract = defineRpcContract({
               waitingUntil: z.number().nullable(),
               /** The typed wait from the last report (BB-333), or null; rendered on the card. */
               wait: waitSchema.nullable(),
+              /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+              overdue: z.boolean(),
+              /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+              overdueMs: z.number().nullable(),
               nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
@@ -958,6 +1000,10 @@ export const rpcContract = defineRpcContract({
           waitingUntil: z.number().nullable(),
           /** The typed wait from the last report (BB-333), or null; the sidebar row carries it for a later render. */
           wait: waitSchema.nullable(),
+          /** BB-351: the live wait is past its kind's budget, so the row reads blocked. */
+          overdue: z.boolean(),
+          /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
+          overdueMs: z.number().nullable(),
           nonActions: nonActionsSchema,
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
@@ -1993,7 +2039,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const questions = store
           .openQuestions(projectId)
           .filter((q) => scope === null || q.bindingId === scope.id)
-          .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
+          .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context, recommendation: q.escalationId === null ? null : (store.escalation(q.escalationId)?.recommendation ?? null) }));
         const name = (await bb.sdk.projects.list()).find((p) => p.id === projectId)?.name ?? projectId;
         let text: string;
         if (scope === null) {
@@ -3241,6 +3287,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether two stored waited-ref fingerprints name the same pull request
+     * (BB-333). A fingerprint that does not parse, or names no key, is not the
+     * same ref, so a change in either cannot be read as the other's.
+     */
+    function sameWaitedRef(a: string, b: string): boolean {
+      const key = (fp: string): string | null => {
+        try {
+          const parsed = JSON.parse(fp) as { key?: unknown };
+          return typeof parsed.key === "string" ? parsed.key : null;
+        } catch {
+          return null;
+        }
+      };
+      const ka = key(a);
+      return ka !== null && ka === key(b);
+    }
+
+    /**
      * Read the binding's waited pull/review refs fresh, one source read each,
      * under the linked-pull ceiling (BB-333). A ref already in the look's linked
      * pulls is reused without a read, so it never adds one. Returns them keyed
@@ -3746,12 +3810,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * inferred from the text.
      */
     function userItemsFor(b: Binding): OpenUserItem[] {
-      // An auto-filed `decide` need is a placeholder made from a report's
-      // `nextAction`, not a real ask, so it is never a coverage candidate
-      // (BB-213, BB-231). A route-`user` escalation an open question already
-      // covers is the question's, and one an open need links through its
-      // `data.escalationId` is that need's, so each ask is listed once.
-      const needs = store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n));
+      // A route-`user` escalation an open question already covers is the
+      // question's, and one an open need links through its `data.escalationId`
+      // is that need's, so each ask is listed once. Since BB-349 no need is
+      // auto-filed from a report's `nextAction`, so there is no placeholder to
+      // exclude.
+      const needs = store.openNeeds(b.id);
       const linked = new Set(needs.map((n) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null)).filter((x): x is string => x !== null));
       const covered = new Set(store.openQuestionEscalationIds(b.projectId));
       const escalations = store.openEscalations(b.id).filter((x) => !covered.has(x.id) && !linked.has(x.id));
@@ -3801,56 +3865,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function needsUserInputs(projectId: string, open?: Binding[]): { questions: Question[]; openIds: Set<string> } {
       const openIds = open === undefined ? new Set(store.openBindingIds(projectId)) : new Set(open.map((b) => b.id));
       return { questions: store.openQuestions(projectId), openIds };
-    }
-
-    /**
-     * The `decide` need the plugin auto-files from a report whose actor is
-     * `user` (BB-213), marked in `data` so the page's single "Done" button, the
-     * wake's note and this reconciliation all agree on which item it is.
-     */
-    function isAutoFiledNeed(n: Pick<Need, "data">): boolean {
-      return n.data.autoFiled === true;
-    }
-
-    /**
-     * Reconcile the need auto-filed from a report whose actor is `user`
-     * (BB-213). A report that names the user but files nothing for them gets a
-     * `decide` item from its `nextAction`, so the sidebar badge, the picker
-     * count and the effort page's "Needs you" section agree. It is deduped by
-     * (binding, kind, url) like every need, so a re-report updates the wording
-     * rather than adding a row. A later report with another actor, or one that
-     * files its own item or leaves an open question or route-`user` escalation,
-     * closes it. A report whose own `approve-pr`/`merge` was refused does not
-     * file one either: the refusal says the user is not the actor yet. Returns
-     * the item it filed or refreshed, null otherwise.
-     */
-    function reconcileAutoNeed(b: Binding, actor: string, hadRefusal = false): Need | null {
-      const open = store.openNeeds(b.id);
-      const url = b.url ?? "";
-      const autos = open.filter(isAutoFiledNeed);
-      const auto = autos.find((n) => n.url === url) ?? null;
-      // A report that changed the entity's link leaves the old row behind; it
-      // is the same auto item, so close the stale one rather than keep two.
-      for (const stale of autos) if (stale.id !== auto?.id) store.closeNeed(stale.id, "Superseded by a newer report.", "plugin");
-      const other = open.filter((n) => n.id !== auto?.id);
-      const userItem =
-        hadRefusal ||
-        other.length > 0 ||
-        store.openQuestions(b.projectId).some((q) => q.bindingId === b.id) ||
-        store.openEscalations(b.id).some((x) => x.route === "user");
-      if (actor !== "user" || userItem) {
-        if (auto !== null) store.closeNeed(auto.id, actor === "user" ? "A later report filed its own item for the user." : "A later report named a different actor.", "plugin");
-        return null;
-      }
-      return store.fileNeed({
-        bindingId: b.id,
-        kind: "decide",
-        url,
-        what: b.status?.nextAction ?? "The user has the next action.",
-        how: "The report named the user as the actor but filed no item for them, so this was filed from its `nextAction`. File the specific item (`approve-pr`) or raise an escalation if that is the real ask.",
-        data: { autoFiled: true },
-        filedBy: "plugin",
-      });
     }
 
     /**
@@ -4041,29 +4055,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The one-time BB-213 backfill. Dropping the actor clause from `needsUser`
-     * means an open binding whose stored report says the user acts next loses
-     * its badge until its steward reports again, which the default requeue can
-     * put two days out. On the first start after the change, file the auto item
-     * for every such binding that has nothing else for the user, so the rows
-     * this ticket is about keep something to press. The marker lives in the
-     * plugin's kv store, so a later start does nothing; a failure leaves it
-     * unset so the next start retries.
+     * The one-time BB-349 close-out. BB-213 filed a `decide` need from a
+     * report's `nextAction` when the actor was `user`; that behaviour is gone,
+     * so every open need it left behind is closed once with a reason naming the
+     * change. Nothing is deleted: the rows stay for the record. The marker
+     * lives in the plugin's kv store, so a later start does nothing; a failure
+     * leaves it unset so the next start retries.
      */
-    const AUTO_NEEDS_ONCE_KEY = "migrations/auto-file-user-needs";
-    async function backfillAutoNeedsOnce(): Promise<void> {
-      if ((await bb.storage.kv.get<string>(AUTO_NEEDS_ONCE_KEY)) != null) return;
+    const AUTO_NEEDS_CLOSED_ONCE_KEY = "migrations/close-auto-filed-needs";
+    async function closeAutoFiledNeedsOnce(): Promise<void> {
+      if ((await bb.storage.kv.get<string>(AUTO_NEEDS_CLOSED_ONCE_KEY)) != null) return;
       let failed = false;
       for (const b of store.all()) {
-        if (b.endedAt !== null || b.status?.actor !== "user") continue;
-        try {
-          reconcileAutoNeed(b, "user");
-        } catch (error) {
-          failed = true;
-          bb.log.warn(`stewards: BB-213 backfill for ${b.entityKey}: ${errorMessage(error)}`);
+        for (const n of store.openNeeds(b.id)) {
+          if (n.data.autoFiled !== true) continue;
+          try {
+            store.closeNeed(n.id, "Auto-filed needs are no longer used (BB-349)", "plugin");
+          } catch (error) {
+            failed = true;
+            bb.log.warn(`stewards: BB-349 close-out for ${b.entityKey}: ${errorMessage(error)}`);
+          }
         }
       }
-      if (!failed) await bb.storage.kv.set(AUTO_NEEDS_ONCE_KEY, String(now()));
+      if (!failed) await bb.storage.kv.set(AUTO_NEEDS_CLOSED_ONCE_KEY, String(now()));
     }
 
     /**
@@ -4755,15 +4769,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * BB-293/BB-322: the binding's assessment. Computed from the rows this
-     * reconcile has already read and stored for every merge-gate surface to
-     * read. BB-322 made it the consumer-facing source: the reconcile derives
-     * its own gate-met set from it and passes it to `syncNeeds`, and the
-     * page, CLI, wake and approvals read the stored copy. It is still wrapped
-     * in a try/catch by the caller so a failure cannot crash the reconcile;
-     * an absent assessment fails closed everywhere it is read.
+     * BB-293/BB-322/BB-333: assemble the one assessment input from the rows the
+     * look already holds. The reconcile and the report path both call it, so
+     * liveness, idle and stall are derived in one place; `assessBinding`
+     * records the result and the report reads it for the turn it is in.
      */
-    async function assessBinding(
+    async function buildAssessmentInput(
       b: Binding,
       observed: Observed,
       workers: readonly Worker[],
@@ -4771,7 +4782,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
-    ): Promise<Assessment> {
+    ): Promise<AssessmentInput> {
       // BB-322: gate every pull request that belongs to the binding, the same
       // set `syncNeeds` acts on, not only the worker-reported own ones. A
       // linked pull request whose head names the ticket is the binding's even
@@ -4830,6 +4841,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations,
         needs,
         sources: wakeSourcesFor(b, ownPulls),
+        waitBudgets: config.file.waitBudgets,
         playbook,
         currentSpecHash,
         now: now(),
@@ -4840,34 +4852,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         },
         hasOpenItem: (id) => needs.some((n) => n.id === id) || escalations.some((x) => x.id === id) || (id.startsWith("qst_") && store.openQuestions(b.projectId).some((q) => q.id === id)),
       };
+      return input;
+    }
+
+    /**
+     * BB-293/BB-322/BB-333: the binding's one assessment, from the rows the look
+     * already holds. BB-333 made the typed-wait derivation authoritative: the
+     * stored `noWakeSource` is recomputed from the assessment on every
+     * reconcile (never a report-time guess), and the shadow's `noWakeSource`
+     * divergence is retired because the flag and the derivation now agree by
+     * construction. The column and every surface that reads it are unchanged.
+     */
+    async function assessBinding(
+      b: Binding,
+      observed: Observed,
+      workers: readonly Worker[],
+      ownPulls: ReadonlySet<string>,
+      playbook: Playbook,
+      currentSpecHash: string,
+      config: ProjectConfig,
+    ): Promise<Assessment> {
+      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
       const assessment = assess(input);
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
-      const divergences = compare(input, assessment);
-      // BB-333: a typed wait's divergence is written only when it starts or
-      // stops disagreeing, through the state table. A no-kind report keeps the
-      // existing deduped row, and a binding with no typed wait reads no state.
-      if (b.wait !== null) {
-        store.recordDivergences(divergences.filter((d) => d.surface !== "noWakeSource"));
-        store.recordWaitDivergence({
-          bindingId: b.id,
-          derived: assessment.liveness.stalled,
-          reported: b.noWakeSource,
-          waitKind: b.wait.kind,
-          waitLive: assessment.liveness.waitLive === true,
-          inputs: {
-            binding: b.id,
-            live: assessment.liveness.live,
-            idle: assessment.liveness.idle,
-            stuck: assessment.liveness.stuck,
-            readyPassed: assessment.gate.readyPassed,
-            requeueUntil: b.requeueUntil,
-            phase: b.phase,
-            hasWait: (b.status?.waitingOn ?? "").trim() !== "",
-          },
-        });
-      } else {
-        store.recordDivergences(divergences);
-      }
+      // The shadow's `noWakeSource` divergence is retired with the flag: the
+      // two agree by construction now, so `wait_divergence_state` stops being
+      // written and keeps its history. The other surfaces' rows still record.
+      // The derived `noWakeSource` itself rides the reconcile's existing
+      // binding patch, so no extra store read is added.
+      store.recordDivergences(compare(input, assessment).filter((d) => d.surface !== "noWakeSource"));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
       return assessment;
     }
@@ -5211,11 +5224,82 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // gate-met set below and every later surface read it. A failure is
       // logged and swallowed so the reconcile's own result never changes; an
       // absent assessment fails closed.
+      // BB-333: a change on a leased pull/review ref now wakes the binding. The
+      // waited ref is not in the observed snapshot, so the transition is read
+      // from the previous look's stored fingerprint against this look's. Only
+      // two fingerprints of the same ref can move: a re-pointed ref, a kind
+      // switch, a failed read and the first look after the rollout leave the
+      // pair unusable and stay quiet.
+      const waitedKind = b.wait?.kind ?? null;
+      const priorWaited =
+        waitedKind === "pull" || waitedKind === "review"
+          ? ((store.assessment(b.id)?.liveness as { waited?: string | null } | null | undefined)?.waited ?? null)
+          : null;
+      // BB-351: a wait stored before `wait_since` existed (or by a report that
+      // predates it) starts its clock on the first look that sees it, so a wait
+      // already open when this ships can still read overdue one budget later.
+      if (b.wait !== null && b.waitSince === null) b = store.patch(b.id, { waitSince: now() });
       let assessment: Assessment | null = null;
       try {
         assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
       } catch (error) {
         bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
+      }
+      if (waitedKind === "pull" || waitedKind === "review") {
+        const nowWaited = assessment?.liveness.waited ?? null;
+        if (priorWaited !== null && nowWaited !== null && sameWaitedRef(priorWaited, nowWaited) && priorWaited !== nowWaited) {
+          changes.push({ text: `The waited ${waitedKind} ${b.wait?.ref ?? ""} changed`, actionable: true });
+        }
+      }
+      // BB-351: a live wait past its kind's budget reads overdue and wakes the
+      // steward once, recording `wait_nudged_at`. A `review` wait on a person
+      // other than the server's owner is nudged once on the pull request; a
+      // `person` wait is the steward's to nudge in the place it lives (a
+      // ticket comment), and `pull`/`deployment` are never nudged: the wake
+      // asks the steward to look. When a second budget passes with the wait
+      // still live and unchanged, the owner gets one decide item.
+      if (assessment !== null && assessment.liveness.overdue && b.wait !== null && b.waitSince !== null) {
+        const overdueWait = b.wait;
+        const overdueBudget = waitBudgetMs(overdueWait.kind, config.file.waitBudgets);
+        if (b.waitNudgedAt === null) {
+          let nudged = "";
+          if (overdueWait.kind === "review" && b.threadId !== null) {
+            const owner = lc(config.githubLogin ?? "");
+            // Only a requested reviewer who is a person other than the server's
+            // owner is nudged: the owner's own review is the owner-reviewed
+            // lane, and the worker's own `pr-reviewer` thread requests no
+            // GitHub reviewer, so neither has one to nudge.
+            const reviewers = (assessment.wait?.reviewers ?? []).filter((r) => owner !== "" && lc(r) !== owner && !DEPENDENCY_BOTS.has(lc(r)) && !/\[bot\]$/iu.test(r));
+            const ref = parsePullRef(overdueWait.ref);
+            if (reviewers.length > 0 && ref !== null) {
+              try {
+                await sourceRpc("github", "sourceComment", { key: `${ref.repo}#${ref.number}`, body: waitNudgeBody(b, reviewers, b.waitSince) }, sourceContract.sourceComment.output);
+                nudged = ` and nudged ${reviewers.join(", ")} on ${overdueWait.ref}`;
+              } catch (error) {
+                // The nudge is once per wait, so a failed post must reach the
+                // steward in the wake text, not only the log.
+                nudged = `; the nudge to ${reviewers.join(", ")} on ${overdueWait.ref} failed: ${errorMessage(error)}; post it yourself, signed`;
+                bb.log.warn(`stewards: could not nudge the review wait on ${overdueWait.ref}: ${errorMessage(error)}`);
+              }
+            }
+          }
+          changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} is overdue${nudged}; the steward was woken once.`, actionable: true });
+          b = store.patch(b.id, { waitNudgedAt: now() });
+        } else if ((overdueWait.kind === "review" || overdueWait.kind === "person") && overdueBudget !== null && now() - b.waitNudgedAt > overdueBudget) {
+          // `fileNeed` dedupes by (binding, kind, url) while open, so this
+          // files once and rewording later repeats.
+          store.fileNeed({
+            bindingId: b.id,
+            kind: "decide",
+            url: overdueWait.ref,
+            what: `The ${overdueWait.kind} wait on ${overdueWait.ref} is still open after a second budget.`,
+            how: "Choose what to do; Keep waiting resets the budget once.",
+            why: "The wait outlived two budgets, so it comes to the owner.",
+            data: { waitBudget: true, choices: [...WAIT_DECIDE_CHOICES], waitKind: overdueWait.kind, waitRef: overdueWait.ref },
+            filedBy: "plugin",
+          });
+          changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} outlived a second budget; the owner has a decide item.`, actionable: true });
+        }
       }
       // BB-329: one worker-busy predicate. Every surface reads the assessment's
       // worker state (assessment.ts `assessWorker`); the old `anyWorkerInFlight`
@@ -5322,7 +5406,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       signalNeedActionability(b, observed, ready);
-      b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
+      b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready, ...(assessment === null ? {} : { noWakeSource: assessment.liveness.stalled }) });
       // BB-54 item 4: a ticket that links a new pull request re-runs the
       // overlap check, even past its ready gate, and a new pull request clears
       // a "no more coming" report. The report path clears it too, when a
@@ -5765,12 +5849,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const hasFix = alerts.length > 0 && alerts.some((a) => a.fixedVersion !== null);
       const allowDismiss = dismissAllowed(config);
       const due = dueDate(dueAt, config.file.nightly.timezone);
+      const severities = [...new Set(alerts.map((a) => a.severity))];
       return store.fileNeed({
         bindingId: b.id,
         kind: "decide",
         url: ticket?.url ?? ticketKey,
-        what: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
+        what: adoptionNeedLine(ticketKey, repo, severities),
         how: adoptionHow(allowDismiss),
+        why: ADOPTION_WHY,
+        details: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
         data: { adoption: true, ticket: ticketKey, fingerprints, choices: adoptionChoices(hasFix, allowDismiss), dueDate: due },
         filedBy: "plugin",
       });
@@ -7372,7 +7459,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // and the previous digest's snapshot. Empty without a backlog role. The
       // ids are the ones the report was computed from, written only after the
       // send, so a look that moves in between does not move the snapshot.
-      const backlog = records === undefined ? null : backlogReports(projectId, config);
+      const backlog = records === undefined ? null : backlogReports(projectId, config, records.since);
       if (records !== undefined && backlog !== null) records.backlog = backlog.digests;
       // BB-328: the live-check findings new or changed since the last nightly
       // pass ride in the digest record, so the project steward reads them once.
@@ -7440,14 +7527,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** The backlog reports for a digest, and the issue ids each was computed from (BB-334). */
-    function backlogReports(projectId: string, config: ProjectConfig): { digests: BacklogDigest[]; snapshots: Array<{ bindingId: string; ids: string[] }> } {
+    function backlogReports(projectId: string, config: ProjectConfig, since: number): { digests: BacklogDigest[]; snapshots: Array<{ bindingId: string; ids: string[] }> } {
       const staleDays = config.file.backlog?.staleDays ?? 14;
       const at = now();
       const digests: BacklogDigest[] = [];
       const snapshots: Array<{ bindingId: string; ids: string[] }> = [];
       for (const b of store.open(projectId)) {
-        if (b.kind !== "ops" || b.backlogLook === null || parseOpsTargetKey(b.entityId)?.kind !== "backlog") continue;
-        digests.push(backlogDigest(b.backlogLook, b.backlogSnapshot, { staleDays }, at));
+        const target = parseOpsTargetKey(b.entityId);
+        if (b.kind !== "ops" || b.backlogLook === null || target?.kind !== "backlog") continue;
+        // BB-341: the triage ledger since the previous digest, so the section
+        // lists each write and counts the refusals.
+        const writes = store.backlogWrites(projectId, { team: target.team, since });
+        digests.push(backlogDigest(b.backlogLook, b.backlogSnapshot, { staleDays, writes }, at));
         // A failed read keeps the previous snapshot: the next digest still
         // compares against the last good one.
         if (b.backlogLook.error === null) snapshots.push({ bindingId: b.id, ids: b.backlogLook.issues.map((i) => i.id) });
@@ -7851,24 +7942,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function fileLessonOwnerNeed(lesson: Lesson, branch: string | null, prUrl: string | null, retire = false, boundary = false): boolean {
       if (lesson.bindingId === null) return false;
-      const kind = boundary ? "boundary lesson" : "lesson";
+      const parts = lessonDecideParts({ file: lesson.file, lessonText: lesson.text, boundary, retire, branch, prUrl });
       store.fileNeed({
         bindingId: lesson.bindingId,
         kind: "decide",
         url: lesson.id,
-        what: `Review or drop the ${retire ? "retirement of the " : ""}${kind} for ${lesson.file}`,
-        how: [
-          retire
-            ? `The nightly pass retired this ${kind}, so removing its anchored text ${boundary ? "also changes the boundary and " : ""}only you may make it permanent.`
-            : boundary
-              ? "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent."
-              : "The project steward recorded a general rule for a file the decide list makes the user's, so only you may make it permanent.",
-          "",
-          `> ${lesson.text}`,
-          "",
-          `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
-          prUrl === null ? "The pull request is not open yet." : `Review the pull request at ${prUrl}; the lesson is marked ${retire ? "dropped" : "merged"} when it merges. Drop closes it and discards the lesson.`,
-        ].join("\n"),
+        what: parts.what,
+        how: parts.how,
+        why: parts.why,
+        details: parts.details,
         data: { lessonId: lesson.id, branch, file: lesson.file, prUrl, retire, choices: ["Review PR", "Drop"], validation: "boundary-promotion" },
         filedBy: "project",
       });
@@ -7880,18 +7962,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     function fileMixedEvidenceNeed(lesson: Lesson): boolean {
       if (lesson.bindingId === null) return false;
+      const parts = mixedEvidenceDecideParts({ file: lesson.file, lessonText: lesson.text, hits: lesson.hits, corrections: lesson.corrections });
       store.fileNeed({
         bindingId: lesson.bindingId,
         kind: "decide",
         url: lesson.id,
-        what: `Keep or retire the lesson for ${lesson.file}`,
-        how: [
-          `This promoted lesson has ${lesson.hits} citation${lesson.hits === 1 ? "" : "s"} and ${lesson.corrections} correction${lesson.corrections === 1 ? "" : "s"}, so its evidence is mixed.`,
-          "",
-          `> ${lesson.text}`,
-          "",
-          `File: \`${lesson.file}\`. Keep leaves it in \`.bb\`; Retire removes its anchored text. Silence retires it on the next nightly pass.`,
-        ].join("\n"),
+        what: parts.what,
+        how: parts.how,
+        why: parts.why,
+        details: parts.details,
         data: { lessonId: lesson.id, file: lesson.file, choices: ["Keep", "Retire"], validation: "mixed-evidence" },
         filedBy: "plugin",
       });
@@ -8388,9 +8467,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // not in `assumptionIds`, so it stays open.
       const openById = new Map(store.openAssumptions(b.id).map((a) => [a.id, a]));
       const covered = assumptionIds.map((id) => openById.get(id)).filter((a): a is NonNullable<typeof a> => a !== undefined);
-      const how =
-        "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes." +
-        (covered.length === 0 ? "" : ` It covers ${covered.length} open assumption${covered.length === 1 ? "" : "s"}: ${covered.map((a) => `${a.id} — ${a.text}`).join("; ")}.`);
       // BB-249: a re-approval after an edit leads with a diff from the text the
       // last approval pinned. A prior approval with no `approvedText` (recorded
       // before the field existed) files the item as a first approval.
@@ -8406,12 +8482,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           : reapproval.changedLines === 0
             ? "Re-approve: no visible change"
             : `Re-approve: ${reapproval.changedLines} line${reapproval.changedLines === 1 ? "" : "s"} changed`;
+      const parts = approveSpecNeedParts({ what, covered: covered.map((a) => `${a.id} — ${a.text}`) });
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-spec",
         url: b.url ?? "",
-        what,
-        how,
+        what: parts.what,
+        how: parts.how,
+        why: parts.why,
+        details: parts.details,
         data: {
           specHash,
           ...(escalationId === null ? {} : { escalationId }),
@@ -8777,12 +8856,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // automatic multi-PR merge order.
               const existing = store.openNeeds(b.id).find((n) => n.kind === "merge" && n.url === url && n.filedBy === "plugin");
               const told = existing !== undefined && existing.data.workerTold === true && existing.data.sha === g.headSha;
+              const mergeParts = mergeNeedParts({ key: pull.key, lane: g.lane, note: "A parked worker owns another open pull request of this ticket, so the plugin does not merge out of order." });
               store.fileNeed({
                 bindingId: b.id,
                 kind: "merge",
                 url,
-                what: `Merge ${pull.key}`,
-                how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}, but a parked worker owns another open pull request of this ticket, so the plugin does not merge out of order. Merge squash-merges through the server's gh login and posts the merge comment.`,
+                what: mergeParts.what,
+                how: mergeParts.how,
+                why: mergeParts.why,
+                details: mergeParts.details,
                 data: { sha: g.headSha, workerTold: true },
                 filedBy: "plugin",
               });
@@ -8843,12 +8925,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 decline(b, "merge-refused", pull.key);
               }
             } else {
+              const mergeParts = mergeNeedParts({ key: pull.key, lane: g.lane });
               store.fileNeed({
                 bindingId: b.id,
                 kind: "merge",
                 url,
-                what: `Merge ${pull.key}`,
-                how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}. Merge squash-merges through the server's gh login and posts the merge comment.`,
+                what: mergeParts.what,
+                how: mergeParts.how,
+                why: mergeParts.why,
+                details: mergeParts.details,
                 data: { sha: g.headSha },
                 filedBy: "plugin",
               });
@@ -9201,12 +9286,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // forward: the owner reviews the pull request; the plugin observes the merge.
       if (refresh.state !== "pr_open") return "there is no open pull request to forward";
       if (refresh.questionId !== null) return `already with the owner (${refresh.questionId})`;
+      const refreshParts = playbookRefreshQuestionParts({ playbook: refresh.playbook, templateName: refresh.templateName, pr: refresh.pr, additive: refresh.classification === "additive", removals: refresh.removals.length });
       const question = store.ask({
         projectId: refresh.projectId,
         bindingId: null,
         escalationId: null,
-        question: `Refresh the ${refresh.playbook} playbook from template ${refresh.templateName}?`,
-        context: `The refresh pull request ${refresh.pr ?? "(none)"} is ${refresh.classification === "additive" ? "purely additive" : "not purely additive"}${refresh.removals.length === 0 ? "" : `; it removes or rewrites ${refresh.removals.length} line(s)`}. Review the diff at the pull request and merge it, or drop it.`,
+        question: refreshParts.question,
+        context: refreshParts.context,
+        why: refreshParts.why,
+        details: refreshParts.details,
         choices: ["Review PR", "Drop"],
         url: refresh.pr,
         data: { refreshId: refresh.id, file: refresh.file },
@@ -10482,6 +10570,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               workers: store.workers(b.id).filter((w) => w.status === "running").length,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              ...overdueOf(b, config),
               nonActions: b.nonActions,
               escalations: store.openEscalations(b.id).map((x) => ({ kind: x.kind, route: x.route, question: x.question })),
             })),
@@ -10531,6 +10620,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           ...(b.hold === null ? [] : [{ b, kind: "hold" as const, why: `On hold: ${b.hold}`, since: null }]),
         ]);
         const ended = store.endedSince(projectId, now() - ENDED_ON_BOARD_MS, 30);
+        const parentKeys = store.parentKeysForProject(projectId);
         const boardConfig = configs.find((c) => c.projectId === projectId) ?? null;
         const roleMap = bindingRoles(boardConfig?.roles ?? null, boardConfig?.githubLogin === null || boardConfig?.githubLogin === undefined ? null : lc(boardConfig.githubLogin), boardConfig?.repos ?? []);
         return {
@@ -10567,6 +10657,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               stage: b.kind === "ops" ? "watch" : b.stage,
               roles: rolesForBinding(roleMap, b),
               threadId: b.threadId,
+              parentKey: parentKeys.get(b.id) ?? null,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
@@ -10589,6 +10680,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              ...overdueOf(b, boardConfig),
               nonActions: b.nonActions,
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
               assumptions: store.openAssumptions(b.id).map((a) => ({ id: a.id, text: a.text, context: a.context, recordedAt: a.recordedAt, recordedBy: a.recordedBy })),
@@ -10641,7 +10733,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { projects: picker, projectId: null, projectStewardThreadId: null, roleProblem: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
         }
         const { projectId } = picked;
-        const roleProblem = configs.find((c) => c.projectId === projectId)?.problems.find((p) => p.startsWith("No role for ")) ?? null;
+        const pickedConfig = configs.find((c) => c.projectId === projectId) ?? null;
+        const roleProblem = pickedConfig?.problems.find((p) => p.startsWith("No role for ")) ?? null;
         // BB-296: the per-project section is the expensive half. Serve it from
         // the cache when the reconcile has not changed the project, so several
         // connected clients and a burst of signals share one recompute.
@@ -10700,6 +10793,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               advancedAt: b.advancedAt,
               waitingUntil: b.requeueUntil,
               wait: b.wait,
+              ...overdueOf(b, pickedConfig),
               nonActions: b.nonActions,
               workers,
             };
@@ -10803,7 +10897,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const questions = store
             .openQuestions(targetProjectId)
             .filter((q) => scoped === null || q.bindingId === scoped.id)
-            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context }));
+            .map((q) => ({ key: q.bindingId === null ? null : (store.binding(q.bindingId)?.entityKey ?? null), question: q.question, choices: q.choices, createdAt: q.createdAt, context: q.context, recommendation: q.escalationId === null ? null : (store.escalation(q.escalationId)?.recommendation ?? null) }));
           const scopeKey = scoped?.entityKey ?? null;
           const standupConfig = await loadConfig(targetProjectId);
           const brief = briefing(targetProjectId, since, scoped?.id);
@@ -11396,6 +11490,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               }
             }
           }
+          // BB-351: an overdue-wait decide item resets the budget once it is
+          // answered, so a new decide is not filed on the very next look and
+          // "Keep waiting" buys exactly one more budget.
+          if (need.data.waitBudget === true) store.patch(b.id, { waitNudgedAt: now() });
           store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
           scheduleReconcile(b.id);
           await wakeProjectOnForwardedAnswer(b, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`, forwarded);
@@ -11404,9 +11502,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
         // A `decide` item's free-text Answer must carry text, or the item
         // stays open: the sidebar opens the detail view instead of calling
-        // this with an empty answer (BB-268). An auto-filed item (BB-213) is a
-        // plain Done item with no text box, so its Done still closes it.
-        if (need.kind === "decide" && action === "done" && need.data.autoFiled !== true && needChoices(need).length === 0 && text === null) {
+        // this with an empty answer (BB-268).
+        if (need.kind === "decide" && action === "done" && needChoices(need).length === 0 && text === null) {
           return { ok: false, message: "Type an answer first." };
         }
         // `decide` is the question mechanism; a raw item of that kind just closes.
@@ -11479,8 +11576,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const target = parseOpsTargetKey(b.entityId);
         const sentry = target?.kind === "sentry-project";
         const alertmanager = target?.kind === "alertmanager";
+        // BB-341: the triage tool is offered only while the project's
+        // `backlog.triage` is true; the tool re-reads the flag itself, so
+        // turning it off refuses at once even before the selection refreshes.
+        const backlogTriage = target?.kind === "backlog" && configs.get(b.projectId)?.value?.file.backlog?.triage === true;
         return {
-          tools: ["steward_report", "steward_update"],
+          tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage"] : ["steward_report", "steward_update"],
           skills: [...STEWARDS_SKILLS],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
@@ -11714,6 +11815,154 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-341: a per-ticket promise chain for the triage tool. The comment
+     * budget and the one-open-question rule are a read-then-write across an
+     * await, so two parallel calls on one ticket must run one after the other;
+     * `store.coalescingTool` only batches change notifications.
+     */
+    const triageLocks = new Map<string, Promise<unknown>>();
+    function withTriageLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      const previous = triageLocks.get(key) ?? Promise.resolve();
+      const run = previous.then(fn, fn);
+      const done = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      triageLocks.set(key, done);
+      void done.then(() => {
+        if (triageLocks.get(key) === done) triageLocks.delete(key);
+      });
+      return run;
+    }
+
+    /**
+     * BB-341: the backlog steward's one gated write. It is offered only when
+     * `backlog.triage` is true, and the flag is re-read on every call, so
+     * turning it off refuses at once. Every accepted write and every refusal
+     * is appended to the ledger the digest reports from.
+     */
+    bb.agents.registerTool({
+      name: "backlog_triage",
+      description:
+        "Triage one un-adopted ticket in your backlog team: add kind (bug/feature/chore), repo:<name> and size:S|M|L labels; add duplicate/blockedBy/related relations; set a priority that is unset or last set by you; or post one signed comment (a question, or with proposeCancel a stale-cancel proposal). It never edits a description, changes state, assigns, cancels or closes, and it enforces the comment budget, the one-open-question rule and the stale window.",
+      presentation: { label: { pending: "Triaging a backlog ticket", completed: "Triaged a backlog ticket" } },
+      parameters: backlogTriageParamsSchema,
+      execute: store.coalescingTool(async (input, { threadId }) => {
+        const binding = store.byThread(threadId);
+        const target = binding === null || binding.kind !== "ops" ? null : parseOpsTargetKey(binding.entityId);
+        if (binding === null || target === null || target.kind !== "backlog") {
+          return toolError(new Error("backlog_triage is for a backlog steward's thread; this thread is not one."));
+        }
+        const projectId = binding.projectId;
+        const team = target.team;
+        const record = (outcome: "accepted" | "refused", kind: BacklogWrite["kind"], detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
+          store.addBacklogWrite({ id: newId("btw"), projectId, team, issueId, issueKey, at: now(), outcome, kind, detail, reason });
+        const attempted = Object.keys(input).filter((k) => k !== "key");
+        // Serialise per ticket, so the budget and the open-question rule see
+        // the other call's ledger write.
+        return withTriageLock(`${projectId}:${input.key.trim().toLowerCase()}`, async () => {
+          try {
+            const config = await loadConfig(projectId, true);
+          if (config === null) return toolError(new Error(`no ${PROJECT_FILE} for project ${projectId}`));
+          const block = config.file.backlog;
+          const triageConfig: TriageConfig = {
+            triage: block?.triage === true,
+            team,
+            commentsPerWeek: block?.commentsPerWeek ?? 1,
+            staleDays: block?.staleDays ?? 14,
+            label: config.file.label,
+            adoptedLabels: [config.file.label, INITIATIVE_LABEL, ...config.file.tickets.flatMap((t) => t.match.labels ?? [])],
+            repos: config.repos,
+          };
+          // The opt-in is read on every call, never only at registration.
+          if (!triageConfig.triage) return toolError(new Error("backlog.triage is off; the backlog steward is read-only."));
+
+          // Fail closed: a ticket that cannot be read is refused, and no
+          // Linear write happens.
+          const entity = await snapshot("linear", input.key).catch((error: unknown) => {
+            throw new Error(`${input.key} could not be read: ${errorMessage(error)}`);
+          });
+          if (entity === null) return toolError(new Error(`No Linear issue ${input.key}, or it is not visible to the connected user.`));
+          const ticket: TriageTicket = {
+            key: entity.key,
+            unit: entity.unit,
+            labels: entity.labels,
+            priority: entity.priority,
+            state: entity.state,
+            stateType: entity.stateType,
+            assignees: entity.assignees,
+            updatedAt: entity.updatedAt,
+            comments: entity.comments,
+          };
+          const bound = store.find(entity.key, projectId) !== null || store.find(entity.id, projectId) !== null;
+
+          const relatedTeams = new Map<string, string>();
+          for (const relation of input.relations ?? []) {
+            const related = await snapshot("linear", relation.issue).catch(() => null);
+            if (related !== null) relatedTeams.set(relation.issue.trim().toLowerCase(), related.unit);
+          }
+
+          let ledger: BacklogWrite[];
+          try {
+            ledger = store.backlogWrites(projectId, { team, issueId: entity.id });
+          } catch (error) {
+            return toolError(new Error(`the triage ledger could not be read: ${errorMessage(error)}`));
+          }
+
+          const signedComment = input.comment === undefined ? null : `${input.comment.trimEnd()}\n\n${signatureLine(threadId)}`;
+          const decision = decideTriage({ params: input, ticket, config: triageConfig, ledger, bound, now: now(), relatedTeams, signedComment });
+          if (!decision.ok) {
+            record("refused", "triage", { attempted }, decision.reason, entity.id, entity.key);
+            return toolError(new Error(decision.reason));
+          }
+          const plan = decision.plan;
+          if (planIsEmpty(plan)) return toolError(new Error("nothing to triage; give at least one of addLabels, relations, priority, comment."));
+
+          // Labels, priority and relations in one RPC, then the comment. A
+          // failure writes a refusal; nothing is reported as accepted that
+          // Linear refused.
+          if (plan.addLabels.length > 0 || plan.priority !== null || plan.relations.length > 0) {
+            try {
+              await sourceRpc(
+                "linear",
+                "sourceUpdateIssue",
+                { key: entity.key, addLabels: plan.addLabels, ...(plan.priority === null ? {} : { priority: plan.priority }), relations: plan.relations },
+                sourceContract.sourceUpdateIssue.output,
+              );
+            } catch (error) {
+              const reason = `the write was refused: ${errorMessage(error)}`;
+              record("refused", "triage", { attempted }, reason, entity.id, entity.key);
+              return toolError(new Error(reason));
+            }
+            if (plan.addLabels.length > 0) record("accepted", "label", { labels: plan.addLabels }, null, entity.id, entity.key);
+            if (plan.priority !== null) record("accepted", "priority", { priority: plan.priority }, null, entity.id, entity.key);
+            if (plan.relations.length > 0) record("accepted", "relation", { relations: plan.relations }, null, entity.id, entity.key);
+          }
+          if (plan.comment !== null) {
+            try {
+              await sourceRpc("linear", "sourceComment", { key: entity.key, body: plan.comment.body }, sourceContract.sourceComment.output);
+            } catch (error) {
+              const reason = `the comment was refused: ${errorMessage(error)}`;
+              record("refused", "comment", { kind: plan.comment.kind }, reason, entity.id, entity.key);
+              return toolError(new Error(reason));
+            }
+            record("accepted", "comment", { kind: plan.comment.kind }, null, entity.id, entity.key);
+          }
+          const parts = [
+            plan.addLabels.length > 0 ? `labels ${plan.addLabels.join(", ")}` : null,
+            plan.relations.length > 0 ? `relations ${plan.relations.map((r) => `${r.type} ${r.issue}`).join(", ")}` : null,
+            plan.priority !== null ? `priority ${plan.priority}` : null,
+            plan.comment !== null ? (plan.comment.kind === "stale" ? "a stale-cancel proposal" : "a question") : null,
+          ].filter((p): p is string => p !== null);
+          return `Triaged ${entity.key}: ${parts.join("; ")}.`;
+          } catch (error) {
+            return toolError(error);
+          }
+        });
+      }),
+    });
+
+    /**
      * BB-329: the worker's own park. One additive argument: the worker says
      * what it ended its turn waiting on, and the plugin keeps its row
      * unarchived and names it `parked` in the assessment. It files nothing for
@@ -11814,7 +12063,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               kind: z.enum(NEEDS_KINDS).describe("approve-spec, approve-pr, merge, decide, provide-secret, or configure."),
               url: z.string().trim().max(500).optional().describe("The link: the entity, the pull request, the external page, or the worker thread."),
               what: z.string().trim().min(1).max(300).describe("One line saying what the user must do."),
-              how: z.string().trim().max(4000).optional().describe("The steps, in Markdown."),
+              how: z.string().trim().max(4000).optional().describe("The context lines, in Markdown: what the options mean and what happens on each."),
+              why: z.string().trim().max(600).optional().describe("Why this reached the user instead of being decided, one or two sentences. Optional; the plugin fills it for its own items."),
               variable: z.string().trim().max(200).optional().describe("provide-secret: the variable name."),
               purpose: z.string().trim().max(500).optional().describe("provide-secret: what the value is for."),
               worker: z.string().trim().max(200).optional().describe("provide-secret: the worker thread that will request it; its link is used when url is left out."),
@@ -11835,8 +12085,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               .trim()
               .min(1)
               .max(240, "The question is the one line the sidebar row shows; keep it to 240 characters and put the evidence and reasoning in `context`.")
-              .describe("The one-line ask, as the sidebar row shows it. Put the why in context."),
-            context: z.string().trim().max(3000).optional().describe("What the reader needs to decide: the evidence and the reasoning. Not shown in the sidebar row."),
+              .describe("The one-line ask, as the sidebar row shows it. It is read by whoever decides, possibly the owner, so write it for a person with no view of the thread. Put the evidence in context."),
+            context: z.string().trim().max(3000).optional().describe("What the reader needs to decide: the evidence and the reasoning, written for whoever decides, possibly the owner. Not shown in the sidebar row."),
+            why: z.string().trim().max(600).optional().describe("Why this reached the user instead of being decided, one or two sentences. Optional; the project steward fills it when forwarding."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
             choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
             distinctFrom: z
@@ -12069,19 +12320,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             wait = validation.wait;
             if (validation.downgraded !== null) waitNote = ` ${WAIT_REFUSAL_MESSAGE[validation.downgraded]}`;
           }
+          // BB-333: a `date` wait is the structured form of `until`; its ref
+          // sets `requeueUntil` when the report did not also send an `until`.
+          // A past date is ignored with a note, exactly as `until` is.
+          if (wait !== null && wait.kind === "date" && untilAt === null) {
+            const parsed = parseUntil(wait.ref);
+            if (parsed === null) return toolError(new Error(WAIT_REFUSAL_MESSAGE.date_wait_without_date));
+            if (parsed <= now()) {
+              untilNote += ` The date ${iso(parsed)} is in the past, so it was ignored; the wait requeues on the playbook default.`;
+            } else {
+              untilAt = parsed;
+            }
+          }
           // `until` wins over an explicit `requeueAfter` in the same report. The
           // deployment-deadline min below is untouched; a dated wait is not
           // capped by `requeue-default`.
           const requeueMs = untilAt !== null ? untilAt - now() : Math.min(input.requeueAfter ?? playbook?.requeueDefaultMs ?? 2 * 86_400_000, followThroughUntil === null ? Infinity : Math.max(60_000, followThroughUntil - now()));
           const requeuePhrase = untilAt !== null ? `at ${iso(untilAt)}` : `in ${formatDuration(requeueMs)}`;
           // A status that waits on the user, the owner or a human has to say so
-          // with an item, not only in prose: the item is what reaches the page.
-          // An auto-filed need does not satisfy this: it is filed from prose,
-          // not the item the user acts on, so a wait naming the user still
-          // needs a real item or escalation (BB-213).
-          // Only a stored `person` wait — one that resolved to an open page item and was not downgraded — bypasses the guard: the item it names is itself what reaches the page. An `external` wait, or a `person` wait downgraded to `external`, still has to file the item.
+          // with an item, not only in prose: the item is what reaches the page,
+          // so a wait naming the user needs a real item or escalation (BB-213,
+          // BB-349).
+          // BB-333: a stored `person` wait is the structured replacement for
+          // the old free-text owner check: the open page item it names is
+          // itself what reaches the page. A typed wait that is not a valid
+          // person wait (an `external` wait, or a person ref the plugin could
+          // not resolve) and a no-kind report still may not name the owner
+          // with nothing filed (BB-213).
           const personWait = wait !== null && wait.kind === "person";
-          if (!personWait && waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).filter((n) => !isAutoFiledNeed(n)).length === 0 && (input.needs ?? []).length === 0) {
+          if (!personWait && waitingOn !== null && mentionsOwnerOrUser(waitingOn) && store.openNeeds(b.id).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
                 `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,
@@ -12143,7 +12410,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, why: input.escalate.why ?? null, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,
@@ -12173,6 +12440,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const noteBeyondMaxWait = untilAt !== null && untilAt - now() > maxWaitMs && b.requeueUntilNoted !== untilAt;
           if (noteBeyondMaxWait) untilNote += ` The date is beyond the playbook's max-wait (${formatDuration(maxWaitMs)}); the project steward is told once.`;
           const waitBefore = b.wait;
+          // BB-351: a report repeating the same kind and ref keeps the wait's
+          // start and its nudge marker; a changed or cleared wait resets both.
+          const waitChanged = (waitBefore?.kind ?? null) !== (wait?.kind ?? null) || (waitBefore?.ref ?? null) !== (wait?.ref ?? null);
           b = store.patch(b.id, {
             status,
             statusAt: now(),
@@ -12186,6 +12456,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             requeueUntil: untilAt,
             // A report replaces the typed wait; a report without one clears it.
             wait,
+            ...(wait === null ? { waitSince: null, waitNudgedAt: null } : waitChanged || b.waitSince === null ? { waitSince: now(), waitNudgedAt: null } : {}),
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
@@ -12261,6 +12532,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               url: n.url ?? n.worker ?? b.url ?? "",
               what: n.what,
               how: n.how ?? null,
+              why: n.why ?? null,
               data: {},
               filedBy: "steward",
             });
@@ -12275,18 +12547,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (mergeFiled) await stopWorkers(b);
           const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
           if (playbook !== null && b.lastSnapshot !== null) await syncNeedsFresh(b, playbook);
-          // BB-213: a report whose actor is `user` but that filed nothing for
-          // them gets one `decide` item from its `nextAction`, so the badge and
-          // the effort page's "Needs you" section agree. A re-report updates
-          // the same item; a later report with another actor, or one that files
-          // its own item, closes it. A report whose own item was refused does
-          // not get one: the refusal says the user is not the actor yet.
-          const autoFiled = reconcileAutoNeed(b, actor, refused.length > 0);
-          const autoNote =
-            autoFiled === null
-              ? ""
-              : ` Nothing else was filed for the user, so ${autoFiled.id} (${autoFiled.kind}) is on the Stewards page from your nextAction, with Done as its only button. If the real ask is a specific item (approve-pr) or an escalation, file that next time.`;
-          const filingNote = `${refusalNote}${autoNote}`;
+          // BB-349: a report whose actor is `user` no longer auto-files a
+          // `decide` item from its `nextAction`. The result tells the steward
+          // the same thing the `waitingOn` guard does: naming the user needs a
+          // real item (approve-pr, merge, approve-spec) or an escalation, which
+          // appears on the Stewards page. A report whose own item was refused,
+          // or one that already has an item, question or route-`user`
+          // escalation open for the user, is not told to file another.
+          const hasUserItem =
+            refused.length > 0 ||
+            store.openNeeds(b.id).length > 0 ||
+            store.openQuestions(b.projectId).some((q) => q.bindingId === b.id) ||
+            store.openEscalations(b.id).some((x) => x.route === "user");
+          const userNote =
+            actor === "user" && !hasUserItem
+              ? " You named the user as the next actor but filed nothing for them. Naming the user is not itself an item: file a real one (approve-pr, merge, approve-spec) or raise an escalation, and it appears on the Stewards page."
+              : "";
+          const filingNote = `${refusalNote}${userNote}`;
           // BB-154: the mark and the requeue-only run, over the report's final
           // set of sources (an escalation this turn raised, a need it filed, a
           // gate item syncNeeds filed, a worker it started).
@@ -12295,11 +12572,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // ticket's own pull request counts as a source or not by one rule.
           const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
           const liveSource = liveWakeSourceFor(current, currentOwnPulls);
+          // BB-333: liveness and stall come from the typed wait, derived by the
+          // one assessment on every reconcile. The report computes the same
+          // answer here so its reply is current in the turn the wait is set; a
+          // no-kind report keeps today's free-text rule exactly.
+          let derivedStalled: boolean | null = null;
+          if (current.wait !== null && current.lastSnapshot !== null && playbook !== null && config !== null) {
+            try {
+              const derived = assess(await buildAssessmentInput(current, current.lastSnapshot, store.workers(current.id), currentOwnPulls, playbook, specHashFor(current, current.lastSnapshot.entity), config));
+              derivedStalled = derived.liveness.stalled;
+            } catch (error) {
+              bb.log.warn(`stewards: could not derive the typed wait's liveness for ${current.entityKey}: ${errorMessage(error)}`);
+            }
+          }
           // BB-247: a dated wait is the plugin's own wake source while the date
           // is ahead, so it is not marked waiting with no source (and is listed
           // as a dated wait in the digest instead).
           const datedFuture = current.requeueUntil !== null && current.requeueUntil > now();
-          const noWakeSource = waitingOn !== null && waitingOn.trim() !== "" && !liveSource && !datedFuture;
+          const noWakeSource = derivedStalled ?? (waitingOn !== null && waitingOn.trim() !== "" && !liveSource && !datedFuture);
           // BB-339: the open bindings the free text names, in the order they
           // appeared, so the report reply can point the steward at the hold it
           // can take in this turn. A key that resolves to nothing, to an ended
@@ -12312,7 +12602,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             : [];
           const stall = advanceStall(
             { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
-            { reason: wakeReason, waitingOn, liveSource, now: now(), until: current.requeueUntil },
+            { reason: wakeReason, waitingOn, liveSource: derivedStalled !== null ? !derivedStalled : liveSource, now: now(), until: current.requeueUntil },
           );
           b = store.patch(b.id, { noWakeSource, requeueWakeCount: stall.state.count, requeueWaitText: stall.state.waitText, requeueFirstAt: stall.state.firstAt });
           const requests = [requested === null ? null : "approval", scheduling === null ? null : "scheduling"].filter((r) => r !== null);
@@ -12380,7 +12670,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             approvalNotes.push(`Approval of the spec is requested from ${holder(specEscalation.route)} (${specEscalation.id}); wait for it, and do not escalate for it.`);
           }
           for (const need of approvePrNeeds) {
-            approvalNotes.push(`Approval of ${need.what.replace(/^Approve\s+/u, "").replace(/\s+on GitHub$/u, "")} is requested from the user, on the Stewards page (${need.id}): they approve on GitHub.`);
+            approvalNotes.push(`Approval of ${need.what.replace(/^Approve\s+/u, "").replace(/:\s.*$/u, "").replace(/\s+on GitHub$/u, "")} is requested from the user, on the Stewards page (${need.id}): they approve on GitHub.`);
           }
           for (const esc of approvalEscalations.filter((x) => x.resolutionKind === "approve-decline")) {
             if (approvePrNeeds.some((n) => n.data.escalationId === esc.id)) continue;
@@ -12959,8 +13249,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     projectId: target.projectId,
                     bindingId: target.id,
                     escalationId: forwarding.id,
-                    question: forwarding.question,
-                    context: [forwarding.context, `A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                    ...forwardedQuestionParts({ question: forwarding.question, context: forwarding.context, why: forwardWhy(input.entry ?? null) }),
                     ...(forwarding.choices.length === 0 ? {} : { choices: forwarding.choices }),
                     resolutionKind,
                     ...(input.url === undefined ? {} : { url: input.url }),
@@ -13017,9 +13306,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (forwardedPull !== undefined) assessedGate(store, target, forwardedPull, now(), [], "user");
               await pushNewGateNeeds(target, before);
             }
-            // BB-213: a forward that reaches the user files the real item, so
-            // the auto-filed `nextAction` item closes rather than sit beside it.
-            if (route === "user") reconcileAutoNeed(target, target.status?.actor ?? "steward");
+            // BB-349: a forward that reaches the user files the real item
+            // itself, so there is no auto-filed `nextAction` item beside it.
             await deliverEscalation(escalationsCtx, target, store.escalation(forwarding.id)!);
             if (approvalToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-spec item: they press Approve or Decline on the Stewards page, so do not ask them in prose`);
             else if (prToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-pr item: they approve on GitHub from the Stewards page`);
@@ -13082,12 +13370,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (repeated) {
                 // The same objection came back after a revision: a third round
                 // would only repeat it, so the user decides (BB-54).
+                const objectionParts = repeatedObjectionQuestionParts({ key: target.entityKey, objections, previous });
                 const q = store.ask({
                   projectId: target.projectId,
                   bindingId: target.id,
                   escalationId: resolving.id,
-                  question: `The project steward declined ${target.entityKey}'s spec twice on the same objection: ${objections.join("; ")}. Decide how to proceed.`,
-                  context: `First declined on: ${previous.join("; ")}. The revision did not answer it, so it is forwarded to you instead of a third round.`,
+                  question: objectionParts.question,
+                  context: objectionParts.context,
+                  why: objectionParts.why,
+                  details: objectionParts.details,
                   resolutionKind: "text",
                 });
                 done.push(`forwarded the repeated objection to the user as question ${q.id}`);
@@ -13133,9 +13424,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; specDiff: string | null; specChangedLines: number | null; specCommentUrl: string | null; specFullText: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null; actions: NeedAction[]; freeText: boolean } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; why: string | null; details: string | null; specDiff: string | null; specChangedLines: number | null; specCommentUrl: string | null; specFullText: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; notActionable: string | null; actions: NeedAction[]; freeText: boolean } {
       let actionable = true;
-      let why: string | null = null;
+      let notActionable: string | null = null;
       let threadId: string | null = null;
       if (n.kind === "approve-pr" || n.kind === "merge") {
         const observed = b.lastSnapshot;
@@ -13143,14 +13434,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const gate = target === null ? null : assessedGate(store, b, target, now());
         if (n.kind === "approve-pr") {
           actionable = gate?.needsOwnerApproval ?? false;
-          why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
+          notActionable = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
         } else {
           // BB-175: only a running turn can race a push; a `finished` worker
           // is a pause, and a steward-filed merge item exists because it
           // could not merge, so it must not keep the item not actionable.
           const busy = assessWorker(store.workers(b.id)).reason;
           actionable = (gate?.gateMet ?? false) && busy === null;
-          why = actionable ? null : busy ?? (gate?.missing ?? "the pull request has not been observed yet");
+          notActionable = actionable ? null : busy ?? (gate?.missing ?? "the pull request has not been observed yet");
         }
       } else if (n.kind === "provide-secret") {
         // Always actionable: the page opens a requester thread and the form
@@ -13158,7 +13449,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
       const { actions, freeText } = needActions(n, b);
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, specDiff: typeof n.data.specDiff === "string" ? n.data.specDiff : null, specChangedLines: typeof n.data.specChangedLines === "number" ? n.data.specChangedLines : null, specCommentUrl: typeof n.data.specCommentUrl === "string" ? n.data.specCommentUrl : null, specFullText: typeof n.data.specFullText === "string" ? n.data.specFullText : null, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why, actions, freeText };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, why: n.why, details: n.details, specDiff: typeof n.data.specDiff === "string" ? n.data.specDiff : null, specChangedLines: typeof n.data.specChangedLines === "number" ? n.data.specChangedLines : null, specCommentUrl: typeof n.data.specCommentUrl === "string" ? n.data.specCommentUrl : null, specFullText: typeof n.data.specFullText === "string" ? n.data.specFullText : null, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, notActionable, actions, freeText };
     }
 
     /**
@@ -13181,19 +13472,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const flipped = needs.some((n) => {
         const before = needView(n, b);
         const next = needView(n, after);
-        return before.actionable !== next.actionable || before.why !== next.why;
+        return before.actionable !== next.actionable || before.notActionable !== next.notActionable;
       });
       if (flipped) store.signal(b.projectId, ["last_snapshot"]);
     }
 
     /**
-     * A binding's row facts from its open escalations in one read (BB-338): the
-     * blocked flag (a `stuck` escalation or the plugin's delegate wait) and the
-     * delegate wait's requested reviewers.
+     * A binding's row facts from its open escalations in one read (BB-338,
+     * BB-348): the blocked flag (a real `stuck` escalation only; a delegate wait
+     * is a wait, not a failure) and the delegate wait's requested reviewers.
      */
     function escalationRowFacts(id: string): { stuck: boolean; delegateWait: string | null } {
       const escalations = store.openEscalations(id);
-      return { stuck: escalations.some((x) => x.kind === "stuck" || isDelegateWait(x)), delegateWait: delegateWaitOf(escalations) };
+      return { stuck: escalations.some((x) => x.kind === "stuck"), delegateWait: delegateWaitOf(escalations) };
+    }
+
+    /** BB-351: a binding's overdue wait and its age, from the project's `waitBudgets`. */
+    function overdueOf(b: Binding, config: ProjectConfig | null): { overdue: boolean; overdueMs: number | null } {
+      const ms = waitOverdueMs(b.wait, b.waitSince, config?.file.waitBudgets ?? {}, now());
+      return { overdue: ms !== null, overdueMs: ms };
     }
 
     /**
@@ -13221,9 +13518,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // binding, from the rows and covered set above.
       const needsUser = needsUserIds(open, questions, allNeeds, covered, escalationsByBinding);
       // BB-296: the `stuck` flag shares the same grouped escalations, so the
-      // sidebar and board do not re-query them per binding.
+      // sidebar and board do not re-query them per binding. BB-348: only a real
+      // `stuck` escalation blocks; a delegate wait is a wait, not a failure.
       const stuck = new Set<string>();
-      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck" || isDelegateWait(x))) stuck.add(bindingId);
+      for (const [bindingId, list] of escalationsByBinding) if (list.some((x) => x.kind === "stuck")) stuck.add(bindingId);
       // BB-338: the requested reviewers of a delegate wait, from the same
       // grouped escalations, so the sidebar row can name them without another
       // read or a GitHub call.
@@ -13287,13 +13585,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function questionView(q: Question) {
       const b = q.bindingId === null ? null : store.binding(q.bindingId);
       const { actions, freeText } = questionActions(q);
-      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted, actions, freeText };
+      // BB-345: the escalation a question forwards holds the meanwhile, the
+      // project steward's recommendation and the origin the old forwarding
+      // glue concatenated; the page places them under their labels or in
+      // Details. Only a new-shape question (one whose forwarding set `why`)
+      // gets those separate fields, so an old question whose stored `context`
+      // already carries the glue renders exactly as before (BB-345).
+      const parent = q.why === null || q.escalationId === null ? null : store.escalation(q.escalationId);
+      const parentBinding = parent === null ? null : store.binding(parent.bindingId);
+      const origin = parent === null ? null : `A ${parent.kind} escalation from ${parentBinding?.entityKey ?? parent.bindingId}${parentBinding?.title === null || parentBinding?.title === undefined ? "" : ` (${parentBinding.title})`}.`;
+      return { id: q.id, question: q.question, context: q.context, why: q.why, details: q.details, meanwhile: parent?.meanwhile ?? null, recommendation: parent?.recommendation ?? null, origin, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted, actions, freeText };
     }
 
     /** The board's with-user row; the sidebar reuses it, tagged. */
     function withUserView(x: Escalation, b: Binding) {
       const { actions, freeText } = withUserActions();
-      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
+      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, why: x.why, details: x.details, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
     }
 
     /**
@@ -13343,7 +13650,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     ? `cannot read the target: ${alertmanager.error}`
                     : `looked ${iso(alertmanager.at)}: ${alertmanager.findings.length === 0 ? "nothing to do" : `${alertmanager.findings.length} alert(s) new, rung or resolved`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          // BB-350: a question forwarded from an open escalation is that
+          // escalation's ask, so the flags list it once, not under both ids.
+          const openPresent = new Set(open.map((x) => x.id));
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.filter((x) => !(x.isQuestion && x.forwardedFrom !== null && openPresent.has(x.forwardedFrom))).map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -13369,9 +13679,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-335: the binding's recorded non-actions, newest day first. Information only: they never become a need, a button or a count.
       for (const n of sortedNonActions(b.nonActions)) lines.push(`Non-action ${n.date}: ${n.text}`);
       for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
-      for (const x of store.escalations(b.id)) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+      const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
+      const shownParts = (context: string | null, why: string | null): string[] => [...(context === null || context === "" ? [] : [`  Context: ${oneLine(context)}`]), ...(why === null || why === "" ? [] : [`  Why you: ${oneLine(why)}`])];
+      // BB-350: a question forwarded from an escalation is that escalation's
+      // ask, not a second one. The escalation renders once, headed by its esc_
+      // id, with the question id, its resolution kind and the answer indented
+      // beneath it, and the question's own row is skipped. A standalone
+      // question, or one whose escalation is not in this list, renders as
+      // before.
+      const escalations = store.escalations(b.id);
+      const present = new Set(escalations.map((x) => x.id));
+      const forwardedQuestion = new Map<string, Escalation>();
+      for (const x of escalations) if (x.isQuestion && x.forwardedFrom !== null && present.has(x.forwardedFrom)) forwardedQuestion.set(x.forwardedFrom, x);
+      for (const x of escalations) {
+        if (x.isQuestion && x.forwardedFrom !== null && present.has(x.forwardedFrom)) continue;
+        const question = forwardedQuestion.get(x.id) ?? null;
+        lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${question === null && x.resolution !== null ? ` → ${x.resolution}` : ""}`);
+        lines.push(...shownParts(x.context, x.why));
+        if (question !== null) {
+          lines.push(`  Question ${question.id}`);
+          // BB-345's forwarding parts (the `why`, and any context the question
+          // did not share with the escalation) live on the question, so they
+          // print here; a part the escalation already showed is not repeated.
+          lines.push(...shownParts(question.context === x.context ? null : question.context, question.why === x.why ? null : question.why));
+          if (question.resolutionKind !== null) lines.push(`  Resolution kind: ${question.resolutionKind}`);
+          if (question.resolution !== null) lines.push(`  Answer: ${question.resolution}`);
+        }
+      }
       for (const a of store.assumptions(b.id)) lines.push(`Assumption ${a.id} (${a.state}): Assuming: ${a.text}${a.context === null ? "" : ` — ${a.context}`} (recorded ${iso(a.recordedAt)} by ${a.recordedBy})${a.answer === null ? "" : ` → ${a.answer}`}`);
-      for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
+      for (const n of store.needs(b.id, true)) {
+        lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
+        lines.push(...shownParts(n.how, n.why));
+      }
       for (const w of store.workers(b.id)) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
       for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.filedByThread === null || f.filedByThread === undefined ? "" : `, filed by ${f.filedByThread}`}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
       if (b.kind === "ops") {
@@ -13736,9 +14075,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-93: nothing hides threads any more; the first start after the
         // upgrade shows the ones the old hide path left hidden.
         await unhideOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time unhide: ${errorMessage(e)}`));
-        // BB-213: the first start after dropping the actor clause gives every
-        // open actor-`user` binding the item its badge will now stand on.
-        await backfillAutoNeedsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time auto-need backfill: ${errorMessage(e)}`));
+        // BB-349: the first start closes every open need BB-213 auto-filed, so
+        // none is left with a Done button the plugin no longer creates.
+        await closeAutoFiledNeedsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time auto-need close-out: ${errorMessage(e)}`));
         // BB-253: mute the steward trees that already exist, once.
         await muteStewardThreadsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time steward mute: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
@@ -14647,7 +14986,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                       // it cannot be acted on now (BB-283).
                       if (n.status === "done") return `${head}${n.resolution === null ? "" : ` → ${n.resolution}`}`;
                       const view = b === null ? null : needView(n, b);
-                      return `${head}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
+                      return `${head}${view !== null && !view.actionable ? ` [not actionable: ${view.notActionable}]` : ""}`;
                     })
                     .join("\n"),
                 };
@@ -14662,10 +15001,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (questions.length + withUser.length + needs.length === 0) return { exitCode: 0, stdout: "Nothing is waiting on the user." };
               const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
               const done = (id: string, choices: readonly string[]) => `bb stewards done ${id}${choices.length === 0 ? "" : ` --choice "<label>"`}`;
+              const parts = (context: string | null, why: string | null): string[] => [...(context === null ? [] : [`  Context: ${oneLine(context)}`]), ...(why === null ? [] : [`  Why you: ${oneLine(why)}`])];
               const lines = [
-                ...questions.map((q) => `${q.id} — question, ${q.key ?? "project"}: ${oneLine(q.question)}${choicesNote(q.choices)} — ${done(q.id, q.choices)}`),
-                ...withUser.map((x) => `${x.id} — ${x.kind} escalation, ${x.key}: ${oneLine(x.question)} — ${done(x.id, [])}`),
-                ...needs.map((n) => `${n.id} — ${n.kind}, ${n.key}: ${oneLine(n.what)}${choicesNote(n.choices)}${n.url === null ? "" : ` (${n.url})`}${n.actionable ? "" : ` [not actionable: ${n.why ?? "unknown"}]`} — ${done(n.id, n.choices)}`),
+                ...questions.flatMap((q) => [`${q.id} — question, ${q.key ?? "project"}: ${oneLine(q.question)}${choicesNote(q.choices)} — ${done(q.id, q.choices)}`, ...parts(q.context, q.why)]),
+                ...withUser.flatMap((x) => [`${x.id} — ${x.kind} escalation, ${x.key}: ${oneLine(x.question)} — ${done(x.id, [])}`, ...parts(x.context, x.why)]),
+                ...needs.flatMap((n) => [
+                  `${n.id} — ${n.kind}, ${n.key}: ${oneLine(n.what)}${choicesNote(n.choices)}${n.url === null ? "" : ` (${n.url})`}${n.actionable ? "" : ` [not actionable: ${n.notActionable ?? "unknown"}]`} — ${done(n.id, n.choices)}`,
+                  ...(n.how === null ? [] : [`  Context: ${oneLine(n.how)}`]),
+                  ...(n.why === null ? [] : [`  Why you: ${oneLine(n.why)}`]),
+                ]),
               ];
               return { exitCode: 0, stdout: lines.join("\n") };
             },
@@ -15102,12 +15446,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, backfillAutoNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, alertmanagerDoorbell: onAlertmanagerDoorbell, alertmanagerLeases, readCounts, reconcilePass, specHashFor });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, closeAutoFiledNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, alertmanagerDoorbell: onAlertmanagerDoorbell, alertmanagerLeases, readCounts, reconcilePass, specHashFor });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; backfillAutoNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; alertmanagerDoorbell(id: string, unit: string | null, action: string | null): void; alertmanagerLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void>; specHashFor(b: Binding, entity: EntitySnapshot): string }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; closeAutoFiledNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; alertmanagerDoorbell(id: string, unit: string | null, action: string | null): void; alertmanagerLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void>; specHashFor(b: Binding, entity: EntitySnapshot): string }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
