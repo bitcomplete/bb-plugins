@@ -11695,6 +11695,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-341: a per-ticket promise chain for the triage tool. The comment
+     * budget and the one-open-question rule are a read-then-write across an
+     * await, so two parallel calls on one ticket must run one after the other;
+     * `store.coalescingTool` only batches change notifications.
+     */
+    const triageLocks = new Map<string, Promise<unknown>>();
+    function withTriageLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      const previous = triageLocks.get(key) ?? Promise.resolve();
+      const run = previous.then(fn, fn);
+      const done = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      triageLocks.set(key, done);
+      void done.then(() => {
+        if (triageLocks.get(key) === done) triageLocks.delete(key);
+      });
+      return run;
+    }
+
+    /**
      * BB-341: the backlog steward's one gated write. It is offered only when
      * `backlog.triage` is true, and the flag is re-read on every call, so
      * turning it off refuses at once. Every accepted write and every refusal
@@ -11703,7 +11724,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "backlog_triage",
       description:
-        "Triage one un-adopted ticket in your backlog team: add kind (bug/feature/chore), repo:<owner/name> and size:S|M|L labels; add duplicate/blockedBy/related relations; set a priority that is unset or last set by you; or post one signed comment (a question, or with proposeCancel a stale-cancel proposal). It never edits a description, changes state, assigns, cancels or closes, and it enforces the comment budget, the one-open-question rule and the stale window.",
+        "Triage one un-adopted ticket in your backlog team: add kind (bug/feature/chore), repo:<name> and size:S|M|L labels; add duplicate/blockedBy/related relations; set a priority that is unset or last set by you; or post one signed comment (a question, or with proposeCancel a stale-cancel proposal). It never edits a description, changes state, assigns, cancels or closes, and it enforces the comment budget, the one-open-question rule and the stale window.",
       presentation: { label: { pending: "Triaging a backlog ticket", completed: "Triaged a backlog ticket" } },
       parameters: backlogTriageParamsSchema,
       execute: store.coalescingTool(async (input, { threadId }) => {
@@ -11717,8 +11738,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const record = (outcome: "accepted" | "refused", kind: BacklogWrite["kind"], detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
           store.addBacklogWrite({ id: newId("btw"), projectId, team, issueId, issueKey, at: now(), outcome, kind, detail, reason });
         const attempted = Object.keys(input).filter((k) => k !== "key");
-        try {
-          const config = await loadConfig(projectId, true);
+        // Serialise per ticket, so the budget and the open-question rule see
+        // the other call's ledger write.
+        return withTriageLock(`${projectId}:${input.key.trim().toLowerCase()}`, async () => {
+          try {
+            const config = await loadConfig(projectId, true);
           if (config === null) return toolError(new Error(`no ${PROJECT_FILE} for project ${projectId}`));
           const block = config.file.backlog;
           const triageConfig: TriageConfig = {
@@ -11777,12 +11801,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Labels, priority and relations in one RPC, then the comment. A
           // failure writes a refusal; nothing is reported as accepted that
           // Linear refused.
-          if (plan.addLabels.length > 0 || input.priority !== undefined || plan.relations.length > 0) {
+          if (plan.addLabels.length > 0 || plan.priority !== null || plan.relations.length > 0) {
             try {
               await sourceRpc(
                 "linear",
                 "sourceUpdateIssue",
-                { key: entity.key, addLabels: plan.addLabels, ...(input.priority === undefined ? {} : { priority: input.priority }), relations: plan.relations },
+                { key: entity.key, addLabels: plan.addLabels, ...(plan.priority === null ? {} : { priority: plan.priority }), relations: plan.relations },
                 sourceContract.sourceUpdateIssue.output,
               );
             } catch (error) {
@@ -11791,7 +11815,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return toolError(new Error(reason));
             }
             if (plan.addLabels.length > 0) record("accepted", "label", { labels: plan.addLabels }, null, entity.id, entity.key);
-            if (input.priority !== undefined) record("accepted", "priority", { priority: input.priority }, null, entity.id, entity.key);
+            if (plan.priority !== null) record("accepted", "priority", { priority: plan.priority }, null, entity.id, entity.key);
             if (plan.relations.length > 0) record("accepted", "relation", { relations: plan.relations }, null, entity.id, entity.key);
           }
           if (plan.comment !== null) {
@@ -11807,13 +11831,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const parts = [
             plan.addLabels.length > 0 ? `labels ${plan.addLabels.join(", ")}` : null,
             plan.relations.length > 0 ? `relations ${plan.relations.map((r) => `${r.type} ${r.issue}`).join(", ")}` : null,
-            input.priority !== undefined ? `priority ${input.priority}` : null,
+            plan.priority !== null ? `priority ${plan.priority}` : null,
             plan.comment !== null ? (plan.comment.kind === "stale" ? "a stale-cancel proposal" : "a question") : null,
           ].filter((p): p is string => p !== null);
           return `Triaged ${entity.key}: ${parts.join("; ")}.`;
-        } catch (error) {
-          return toolError(error);
-        }
+          } catch (error) {
+            return toolError(error);
+          }
+        });
       }),
     });
 

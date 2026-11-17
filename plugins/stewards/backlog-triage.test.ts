@@ -68,21 +68,28 @@ const decide = (over: Partial<Parameters<typeof decideTriage>[0]> = {}) =>
 const reason = (result: ReturnType<typeof decideTriage>): string => (result.ok ? "" : result.reason);
 
 describe("the backlog label vocabulary (BB-341)", () => {
-  it("is the fixed kinds, sizes and one repo:<owner/name> per repo", () => {
+  it("is the fixed kinds, sizes and one repo:<name> per repo, named after the owner", () => {
     const vocab = backlogLabelVocabulary(["bitcomplete/bb-plugins", "bitcomplete/devbox"]);
-    expect([...BACKLOG_TRIAGE_KINDS].every((k) => vocab.get(k) === k)).toBe(true);
-    expect([...BACKLOG_TRIAGE_SIZES].every((s) => vocab.get(`size:${s}`.toLowerCase()) === `size:${s}`)).toBe(true);
-    expect(vocab.get("repo:bitcomplete/bb-plugins")).toBe("repo:bitcomplete/bb-plugins");
-    expect(vocab.has("bb-managed")).toBe(false);
-    expect(vocab.has("initiative")).toBe(false);
+    expect([...BACKLOG_TRIAGE_KINDS].every((k) => vocab.labels.get(k) === k)).toBe(true);
+    expect([...BACKLOG_TRIAGE_SIZES].every((s) => vocab.labels.get(`size:${s}`.toLowerCase()) === `size:${s}`)).toBe(true);
+    expect(vocab.labels.get("repo:bb-plugins")).toBe("repo:bb-plugins");
+    expect(vocab.labels.has("bb-managed")).toBe(false);
+    expect(vocab.labels.has("initiative")).toBe(false);
   });
 
   it("matches ignoring case and never grows with the configuration", () => {
     const vocab = backlogLabelVocabulary(["bitcomplete/bb-plugins"]);
-    expect(vocab.get("size:s")).toBe("size:S");
-    expect(vocab.get("bug")).toBe("bug");
+    expect(vocab.labels.get("size:s")).toBe("size:S");
+    expect(vocab.labels.get("bug")).toBe("bug");
     // The vocabulary is fixed: no config value can add an adoption label.
-    expect(vocab.has("bb-managed")).toBe(false);
+    expect(vocab.labels.has("bb-managed")).toBe(false);
+  });
+
+  it("marks a repo name two repositories share as ambiguous", () => {
+    const vocab = backlogLabelVocabulary(["acme/web", "bitcomplete/web"]);
+    expect(vocab.ambiguous.get("repo:web")).toEqual(["acme/web", "bitcomplete/web"]);
+    expect(vocab.labels.has("repo:web")).toBe(false);
+    expect(reason(decide({ params: params({ addLabels: ["repo:web"] }), config: config({ repos: ["acme/web", "bitcomplete/web"] }) }))).toMatch(/ambiguous/u);
   });
 });
 
@@ -100,6 +107,13 @@ describe("the triage allowlist and adoption check (BB-341)", () => {
     expect(backlogTriageParamsSchema.safeParse({ key: "BB-1", description: "x" }).success).toBe(false);
   });
 
+  it("refuses a ticket outside the watched team, before anything else", () => {
+    expect(reason(decide({ ticket: ticket({ unit: "OPS" }), params: params({ addLabels: ["bug"] }) }))).toMatch(/not the watched team/u);
+    // The related end is checked against the watched team too.
+    const relatedTeams = new Map([["ops-9", "OPS"]]);
+    expect(reason(decide({ ticket: ticket({ unit: "OPS" }), params: params({ relations: [{ type: "related", issue: "OPS-9" }] }), relatedTeams }))).toMatch(/not the watched team/u);
+  });
+
   it("refuses a bound ticket, an adopted state, and a bb-managed assigned ticket", () => {
     expect(reason(decide({ bound: true }))).toMatch(/already bound/u);
     for (const stateType of ["started", "completed", "canceled"]) {
@@ -111,7 +125,7 @@ describe("the triage allowlist and adoption check (BB-341)", () => {
   });
 
   it("accepts only the fixed label vocabulary, add-only", () => {
-    expect(decide({ params: params({ addLabels: ["bug", "feature", "chore", "size:S", "size:M", "size:L", "repo:bitcomplete/bb-plugins"] }) }).ok).toBe(true);
+    expect(decide({ params: params({ addLabels: ["bug", "feature", "chore", "size:S", "size:M", "size:L", "repo:bb-plugins"] }) }).ok).toBe(true);
     expect(reason(decide({ params: params({ addLabels: ["size:XL"] }) }))).toMatch(/not in the triage vocabulary/u);
     expect(reason(decide({ params: params({ addLabels: ["repo:acme/nope"] }) }))).toMatch(/not in the triage vocabulary/u);
     expect(reason(decide({ params: params({ addLabels: ["bb-managed"] }) }))).toMatch(/adoption label/u);
@@ -136,6 +150,16 @@ describe("the priority rule (BB-341)", () => {
     expect(normalizePriority("Urgent")).toBe("urgent");
     expect(normalizePriority("No priority")).toBeNull();
     expect(normalizePriority(null)).toBeNull();
+  });
+
+  it("carries a `none` clear in the plan, so it is not swallowed as an empty plan", () => {
+    const stewardSet = [entry({ kind: "priority", detail: { priority: "high" }, at: NOW - DAY })];
+    const result = decide({ params: params({ priority: "none" }), ticket: ticket({ priority: "High" }), ledger: stewardSet });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.plan.priority).toBe("none");
+      expect(planIsEmpty(result.plan)).toBe(false);
+    }
   });
 
   it("sets a priority only when it is unset or last set by the steward", () => {
@@ -205,8 +229,9 @@ describe("the comment budget and rules (BB-341)", () => {
 });
 
 describe("the plan (BB-341)", () => {
-  it("is empty when nothing was asked for", () => {
+  it("is empty when nothing was asked for, but a priority clear is not nothing", () => {
     expect(planIsEmpty({ addLabels: [], relations: [], priority: null, comment: null })).toBe(true);
     expect(planIsEmpty({ addLabels: ["bug"], relations: [], priority: null, comment: null })).toBe(false);
+    expect(planIsEmpty({ addLabels: [], relations: [], priority: "none", comment: null })).toBe(false);
   });
 });

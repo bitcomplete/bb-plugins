@@ -93,7 +93,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   assignee, cancel or close); only un-adopted tickets are touched (nothing
   bound, nothing in a started/completed/canceled state, and no `bb-managed`
   ticket with an assignee); labels come from the fixed vocabulary (kind
-  `bug`/`feature`/`chore`, `repo:<owner/name>` from `repos.json`, and
+  `bug`/`feature`/`chore`, `repo:<name>` from `repos.json`, and
   `size:S|M|L`) and never an adoption label; relations are only `duplicate`,
   `blockedBy` and `related`, both ends in the team, add-only; a priority is
   set only when it is unset or was last set by the steward, never a hand-set

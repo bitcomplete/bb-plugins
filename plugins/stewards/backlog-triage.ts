@@ -29,18 +29,33 @@ export const FORBIDDEN_TRIAGE_FIELDS = ["description", "state", "assignee", "can
 /** The rolling comment window, in milliseconds. */
 export const BACKLOG_COMMENT_WINDOW_MS = 7 * 86_400_000;
 
+/** The fixed vocabulary and the `repo:` names two repositories share (which are refused, not guessed). */
+export type BacklogVocabulary = { labels: Map<string, string>; ambiguous: Map<string, string[]> };
+
 /**
  * The fixed label vocabulary: the three kinds, the three sizes, and one
- * `repo:<owner/name>` per repository in the project's `repos.json`. The
+ * `repo:<name>` per repository in the project's `repos.json`, where `<name>`
+ * is the repo name after the owner (the spec's `repo:<name>`). A name two
+ * repositories share is ambiguous and is refused rather than guessed. The
  * adoption label, `initiative` and any label a playbook adopts on are never
  * in it, whatever the configuration says.
  */
-export function backlogLabelVocabulary(repos: readonly string[]): Map<string, string> {
-  const vocab = new Map<string, string>();
-  for (const kind of BACKLOG_TRIAGE_KINDS) vocab.set(kind.toLowerCase(), kind);
-  for (const size of BACKLOG_TRIAGE_SIZES) vocab.set(`size:${size}`.toLowerCase(), `size:${size}`);
-  for (const repo of repos) vocab.set(`repo:${repo}`.toLowerCase(), `repo:${repo}`);
-  return vocab;
+export function backlogLabelVocabulary(repos: readonly string[]): BacklogVocabulary {
+  const labels = new Map<string, string>();
+  for (const kind of BACKLOG_TRIAGE_KINDS) labels.set(kind.toLowerCase(), kind);
+  for (const size of BACKLOG_TRIAGE_SIZES) labels.set(`size:${size}`.toLowerCase(), `size:${size}`);
+  const byName = new Map<string, string[]>();
+  for (const repo of repos) {
+    const name = repo.slice(repo.lastIndexOf("/") + 1);
+    byName.set(name.toLowerCase(), [...(byName.get(name.toLowerCase()) ?? []), repo]);
+  }
+  const ambiguous = new Map<string, string[]>();
+  for (const [name, full] of byName) {
+    const key = `repo:${name}`.toLowerCase();
+    if (full.length > 1) ambiguous.set(key, full);
+    else labels.set(key, `repo:${name}`);
+  }
+  return { labels, ambiguous };
 }
 
 export const backlogRelationSchema = z.object({ type: z.enum(BACKLOG_TRIAGE_RELATION_TYPES), issue: z.string().trim().min(1).max(200) }).strict();
@@ -112,7 +127,8 @@ export type TriageConfig = {
 export type TriagePlan = {
   addLabels: string[];
   relations: BacklogRelation[];
-  priority: BacklogPriority | null;
+  /** `null` is no priority write, `"none"` clears it, and a value sets it. */
+  priority: BacklogPriority | "none" | null;
   comment: { body: string; kind: "question" | "stale" } | null;
 };
 
@@ -196,6 +212,12 @@ export function decideTriage(input: {
     if (Object.prototype.hasOwnProperty.call(params, field)) return refuse(`a triage write may not carry ${field}; it only adds labels, relations, priority and a comment`);
   }
 
+  // The binding watches one team: a ticket in another team is never touched,
+  // even when it is visible to the same Linear user.
+  if (ticket.unit.trim().toUpperCase() !== config.team.trim().toUpperCase()) {
+    return refuse(`${ticket.key} is in ${ticket.unit}, not the watched team ${config.team}`);
+  }
+
   // The target must be un-adopted: nothing bound, nothing in an adopted state,
   // and nothing labelled for adoption that is also assigned.
   if (bound) return refuse(`${ticket.key} is already bound; the backlog steward only touches un-adopted tickets`);
@@ -216,7 +238,9 @@ export function decideTriage(input: {
     if (label === "") continue;
     const lower = label.toLowerCase();
     if (adopted.has(lower)) return refuse(`${label} is an adoption label; the triage vocabulary never adds one`);
-    const canonical = vocab.get(lower);
+    const shared = vocab.ambiguous.get(lower);
+    if (shared !== undefined) return refuse(`${label} is ambiguous: ${shared.join(", ")} share the name`);
+    const canonical = vocab.labels.get(lower);
     if (canonical === undefined) return refuse(`${label} is not in the triage vocabulary (kind, repo:<name>, size:S|M|L)`);
     if (!addLabels.includes(canonical)) addLabels.push(canonical);
   }
@@ -229,21 +253,23 @@ export function decideTriage(input: {
     if (issue.toLowerCase() === ticket.key.toLowerCase()) return refuse(`a triage write cannot relate ${ticket.key} to itself`);
     const team = relatedTeams.get(issue.toLowerCase());
     if (team === undefined) return refuse(`the ${relation.type} relation to ${issue} could not be checked (its team could not be read)`);
-    if (team.toUpperCase() !== ticket.unit.toUpperCase()) return refuse(`the ${relation.type} relation to ${issue} is in ${team}, not ${ticket.unit}; both ends must be in the team`);
+    if (team.trim().toUpperCase() !== config.team.trim().toUpperCase()) return refuse(`the ${relation.type} relation to ${issue} is in ${team}, not ${config.team}; both ends must be in the team`);
     relations.push({ type: relation.type, issue });
   }
 
   // Priority: unset or last set by the steward. Anything else was set by hand.
   // A priority the ledger did not write is hand-set and is never changed; the
   // steward may set one when it is unset, and change one it set itself.
-  let priority: BacklogPriority | null = null;
+  let priority: BacklogPriority | "none" | null = null;
   if (params.priority !== undefined) {
     const current = priorityState(ticket.priority);
     const last = lastStewardPriority(ledger);
     const stewardSet = current.state === "known" && last !== null && last !== "none" && last === current.value;
     if (current.state === "hand") return refuse(`${ticket.key} has a priority the steward did not set; it is never changed`);
     if (current.state === "known" && !stewardSet) return refuse(`${ticket.key} has a hand-set priority (${ticket.priority}); the steward never changes it`);
-    priority = params.priority === "none" ? null : params.priority;
+    // `none` is carried, not flattened to null: clearing a priority the
+    // steward set is a write, and an empty plan must not swallow it.
+    priority = params.priority;
   }
 
   // Comment: signed, within the budget, one open question, and the stale

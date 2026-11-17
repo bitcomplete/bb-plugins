@@ -12155,6 +12155,16 @@ describe("the backlog triage writes (BB-341)", () => {
     expect(ledger[0]).toMatchObject({ outcome: "refused", kind: "triage", issueKey: "BB-1" });
   });
 
+  it("carries a priority clear through to Linear, not an empty plan", async () => {
+    const { t } = await triaging({ ticket: { priority: "High" } });
+    // The steward set High, so it may clear it.
+    t.hooks.store.addBacklogWrite({ id: "btw_seed", projectId: "p1", team: "BB", issueId: "uuid-1", issueKey: "BB-1", at: 1, outcome: "accepted", kind: "priority", detail: { priority: "high" }, reason: null });
+    const result = await t.tool("backlog_triage", { key: "BB-1", priority: "none" }, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.priority).toBe("none");
+    expect(t.hooks.store.backlogWrites("p1", { team: "BB" }).filter((e) => e.kind === "priority").at(-1)).toMatchObject({ outcome: "accepted", detail: { priority: "none" } });
+  });
+
   it("fails closed when the ticket or the ledger cannot be read", async () => {
     const { t } = await triaging();
     t.setSnapshotError("BB-1", true);
@@ -12171,6 +12181,29 @@ describe("the backlog triage writes (BB-341)", () => {
     expect(result.error).toBe(true);
     expect(result.text).toMatch(/triage is off/u);
     expect(t.linearWrites).toEqual([]);
+  });
+
+  it("refuses a ticket outside the watched team and writes nothing", async () => {
+    const { t } = await triaging({ ticket: { unit: "OPS" } });
+    const result = await t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/not the watched team/u);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("serialises two parallel comments on one ticket, so the budget holds", async () => {
+    const { t } = await triaging({ block: { commentsPerWeek: 1 } });
+    const [first, second] = await Promise.all([
+      t.tool("backlog_triage", { key: "BB-1", comment: "First question?" }, "thr_backlog"),
+      t.tool("backlog_triage", { key: "BB-1", comment: "Second question?" }, "thr_backlog"),
+    ]);
+    // Exactly one comment reached Linear, and the ledger has one accepted and
+    // one refused: the second call saw the first's write.
+    expect(t.linearWrites.filter((w) => w.method === "sourceComment")).toHaveLength(1);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger.filter((e) => e.outcome === "accepted" && e.kind === "comment")).toHaveLength(1);
+    expect(ledger.filter((e) => e.outcome === "refused")).toHaveLength(1);
+    expect([first.error, second.error].filter(Boolean)).toHaveLength(1);
   });
 
   it("adds a relation only when both ends are in the team", async () => {
