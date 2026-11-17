@@ -136,15 +136,6 @@ export function mergeNeedParts(input: { key: string; lane: string | null; note?:
   return { what, how, why: MERGE_WHY, details: how };
 }
 
-/** The one line, context, why and details of the auto-filed decide item. */
-export function autoDecideParts(nextAction: string | null): { what: string; how: string; why: string; details: string } {
-  const what = clampNeedLine(nextAction === null || nextAction.trim() === "" ? "The user has the next action." : nextAction);
-  const how = "Your steward reported you as the next actor but filed no specific item.";
-  const why = "This came from the report's next action rather than a guidance rule.";
-  const details = "File the specific item (approve-pr) or raise an escalation if that is the real ask.";
-  return { what, how, why, details };
-}
-
 /** The one line, context, why and details of a lesson review/retire decide item. */
 export function lessonDecideParts(input: { file: string; lessonText: string; boundary: boolean; retire: boolean; branch: string | null; prUrl: string | null }): { what: string; how: string; why: string; details: string } {
   const what = clampNeedLine(`${input.retire ? "Retire" : "Review"} the lesson for ${input.file}`);
