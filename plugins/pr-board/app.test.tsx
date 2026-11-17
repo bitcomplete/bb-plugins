@@ -1402,9 +1402,11 @@ it("never invents asking status for old finished threads and opens live agents",
   fireEvent.click(slot.getByRole("radio", { name: "1 agent" }));
   fireEvent.click(
     within(slot.getByRole("region", { name: "Working" })).getByRole("button", {
-      name: "Open thread →",
+      name: "Open conversation →",
     }),
   );
+  expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_10");
+  fireEvent.click(slot.getByRole("button", { name: "Open in full thread" }));
   expect(slot.inspection.navigateCalls).toContainEqual({
     method: "toThread",
     threadId: "thr_10",
@@ -1672,7 +1674,10 @@ it("starts fresh candidates after completed Prepare rows and keeps finished thre
   expect(completed.queryByRole("button", { name: /agent for/ })).toBeNull();
   fireEvent.click(completed.getByRole("button", { name: "Change 60" }));
   expect(completed.queryByRole("button", { name: "Prepare fix" })).toBeNull();
-  fireEvent.click(completed.getByRole("button", { name: "Open thread" }));
+  fireEvent.click(completed.getByRole("button", { name: "Open conversation" }));
+  expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_60");
+  fireEvent.click(slot.getByRole("button", { name: "Open in full thread" }));
+  fireEvent.click(slot.getByRole("button", { name: "Close conversation" }));
   expect(slot.inspection.navigateCalls).toContainEqual({
     method: "toThread",
     threadId: "thr_60",
@@ -1847,4 +1852,105 @@ it("does not restore dialog focus to a hidden opener or after successful review 
     method: "toThread",
     threadId: "thr_review",
   });
+});
+
+
+it("shows marker reports and pending input, opens a filtered shared roster, and restores focus on close", async () => {
+  const members = [row(2), acmeRow];
+  const markers = members.map((pr) => ({ ...marker(pr.number, { status: "done", threadId: "thr_shared" }), key: pr.key }));
+  markers[0] = { ...markers[0], report: { kind: "progress", summary: "Reading the failing check", receivedAt: ago(1) } };
+  let current = state({ view: { ...view, prs: members }, markers, needsInput: { thr_shared: true } });
+  const slot = await mount({ rpc: { board_get: () => current } });
+  await chooseOrganization(slot, "parsleyhealth");
+  const item = mineRow(slot, "Change 2");
+  expect(item.getByText("Agent needs your input")).toBeTruthy();
+  expect(item.getByText("Reading the failing check")).toBeTruthy();
+  expect(item.queryByRole("button", { name: /agent for/ })).toBeNull();
+  const opener = item.getByRole("button", { name: "Open conversation →" });
+  opener.focus();
+  fireEvent.click(opener);
+  const panel = slot.getByRole("complementary", { name: "Agent conversation" });
+  expect(panel.hasAttribute("data-agent-hidden")).toBe(true);
+  expect(panel.closest("[data-prs-agent-panel]")).toBeNull();
+  expect(slot.queryByRole("dialog")).toBeNull();
+  expect(document.activeElement).toBe(within(panel).getByRole("heading"));
+  const chat = within(panel).getByTestId("bb-thread-chat");
+  expect(chat.getAttribute("data-thread-id")).toBe("thr_shared");
+  expect(chat.getAttribute("data-variant")).toBe("compact");
+  expect(chat.getAttribute("data-layout")).toBe("contained");
+  expect(chat.getAttribute("data-permission-policy")).toBe("inherit");
+  fireEvent.click(within(panel).getByRole("button", { name: "2 PRs in shared conversation · 1 shown" }));
+  expect(within(panel).getByRole("link", { name: "acme/app #20 · Change 20" })).toBeTruthy();
+  fireEvent.keyDown(chat, { key: "Escape" });
+  expect(slot.getByRole("complementary")).toBe(panel);
+  fireEvent.keyDown(within(panel).getByRole("heading"), { key: "Escape" });
+  expect(slot.queryByRole("complementary")).toBeNull();
+  expect(document.activeElement).toBe(opener);
+  await chooseOrganization(slot, "All organizations");
+  fireEvent.click(mineRow(slot, "Change 20").getByRole("button", { name: "Open conversation →" }));
+  expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_shared");
+  fireEvent.click(slot.getByRole("button", { name: "Open in full thread" }));
+  expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_shared" });
+  expect(calls(slot, "answer")).toEqual([]);
+  expect(calls(slot, "answer_interaction")).toEqual([]);
+  expect(calls(slot, "conversation_get")).toEqual([]);
+  current = { ...current, markers: [markers[0]] };
+  await slot.behavior.emitRealtime("board-changed", null);
+  const refreshed = within(slot.getByRole("complementary", { name: "Agent conversation" }));
+  fireEvent.click(await refreshed.findByRole("button", { name: "1 PR in conversation" }));
+  expect(refreshed.queryByRole("link", { name: "acme/app #20 · Change 20" })).toBeNull();
+  current = { ...current, markers: [] };
+  await slot.behavior.emitRealtime("board-changed", null);
+  await refreshed.findByRole("button", { name: "Conversation scope is unavailable" });
+  expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_shared");
+});
+
+it("opens review conversations using every queue item in the shared thread, including filtered organizations", async () => {
+  const items = [reviewA, acmeReview].map((review) => ({ ...review, segment: "agent" as const, item: { ...review.item, state: "started" as const, threadId: "thr_review_shared" } }));
+  let current: ReviewsState = { kind: "available", snapshot: { version: 1, items, lastPoll: null, lastSuccessAt: null }, needsInput: { thr_review_shared: true } };
+  const slot = await mount({ path: "to-review", rpc: { reviews_get: () => current } });
+  await chooseOrganization(slot, "parsleyhealth");
+  expect(slot.getByText("Agent needs your input")).toBeTruthy();
+  const opener = slot.getByRole("button", { name: "Open conversation" });
+  opener.focus();
+  fireEvent.click(opener);
+  const panel = slot.getByRole("complementary", { name: "Agent conversation" });
+  fireEvent.click(within(panel).getByRole("button", { name: "2 PRs in shared conversation · 1 shown" }));
+  expect(within(panel).getByRole("link", { name: "acme/app #703 · Review change 703" })).toBeTruthy();
+  expect(slot.getByTestId("bb-thread-chat").getAttribute("data-thread-id")).toBe("thr_review_shared");
+  current = { ...current, snapshot: { ...current.snapshot, items: [items[0]] } };
+  await slot.behavior.emitRealtime("board-changed", null);
+  await within(panel).findByRole("button", { name: "1 PR in conversation" });
+  expect(within(panel).queryByRole("link", { name: "acme/app #703 · Review change 703" })).toBeNull();
+  fireEvent.click(within(panel).getByRole("button", { name: "Close conversation" }));
+  expect(document.activeElement).toBe(opener);
+});
+
+it("counts pending BB interactions once per agent thread across fixes and reviews", async () => {
+  const app = await loadPluginApp(() => import("./app"));
+  const useBadge = app.navPanels[0]?.experimental_useBadge;
+  if (!useBadge) throw new Error("Missing PRs badge");
+  const slot = renderSlot({ component: () => <span>{useBadge()?.label}</span> }, {}, {
+    rpc: {
+      board_get: () => state({ view: { ...view, prs: [row(2), row(3)] }, markers: [2, 3].map((number) => marker(number, { threadId: "thr_fix" })), needsInput: { thr_fix: true } }),
+      reviews_get: () => ({ ...reviews([reviewA, reviewB].map((review) => ({ ...review, segment: "agent", item: { ...review.item, state: "started", threadId: "thr_review" } }))), needsInput: { thr_review: true } }),
+    },
+  });
+  unmounts.push(() => slot.lifecycle.unmount());
+  await slot.findByText("Across all organizations · 2 on you · 2 to review · 2 agents waiting");
+});
+
+it("shows a finished marker with pending input only in the asking group", async () => {
+  const slot = await mount({ board: state({
+    view: { ...view, prs: [row(2), row(3), row(10)] },
+    markers: [marker(2, { status: "done" }), marker(3, { status: "done" }), marker(10)],
+    needsInput: { thr_2: true },
+  }) });
+  fireEvent.click(slot.getByRole("radio", { name: "1 agent" }));
+  const asking = within(slot.getByRole("region", { name: "Finished, asking you" }));
+  const finished = within(slot.getByRole("region", { name: "PRs with finished threads" }));
+  expect(asking.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  expect(finished.queryByRole("button", { name: "Change 2" })).toBeNull();
+  expect(finished.getByRole("button", { name: "Change 3" })).toBeTruthy();
+  expect(slot.getAllByRole("button", { name: "Change 2" })).toHaveLength(1);
 });

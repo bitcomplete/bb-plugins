@@ -19,6 +19,8 @@
 - If a fix needs a judgment call about product behavior, stop and ask instead of choosing.
 
 ## Final report
+Use `prs_report` from the assigned coordinator to record progress and a final result for this PR key (`${repo}#${number}`). Progress updates have `kind: "progress"`, `key`, and `summary` (at most 300 characters). Results have `kind: "result"`, `key`, `outcome` (`prepared`, `published`, `blocked`, or `stopped`), `summary`, and `detail` (at most 4000 characters). Match the outcome to the authorized stopping point. If the tool returns `report_retryable`, retry after the start finishes. Child threads report through their coordinator.
+
 Report: what you changed and why, commits and final head SHA, test and CI results with counts (say what you did not run), the Sol review outcome, and what is still open. Confirm that you did not merge.
 
 End with a section titled exactly `## Decisions for Matt`: a numbered list of every open question or judgment call that needs Matt, each with the options and your recommendation. Write `None.` when there are none.

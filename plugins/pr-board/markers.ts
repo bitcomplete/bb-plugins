@@ -1,6 +1,7 @@
 // In-flight markers: which PRs an agent thread was started on, and when that stops being news.
 import { z } from "zod";
 import { actionSchema, questionSchema, type AgentQuestion, type MarkerView } from "./board.js";
+import { reportSchema } from "./reports.js";
 
 export const markerSchema = z.object({
   key: z.string(),
@@ -17,6 +18,7 @@ export const markerSchema = z.object({
   answeredQuestions: z.array(z.string()).default([]),
   answering: z.string().nullable().default(null),
   answerError: z.string().nullable().default(null),
+  report: reportSchema.nullable().default(null),
 });
 export type Marker = z.infer<typeof markerSchema>;
 
@@ -53,7 +55,7 @@ export function afterRefresh(
 }
 
 export function toView(m: Marker, thread: ThreadInfo | undefined): MarkerView {
-  const base = { key: m.key, threadId: m.threadId, title: m.title, reason: m.reason, question: m.question, answering: m.answering !== null, answerError: m.answerError };
+  const base = { key: m.key, threadId: m.threadId, title: m.title, reason: m.reason, question: m.question, answering: m.answering !== null, answerError: m.answerError, report: m.report };
   if (m.status !== "started") return { ...base, status: m.status, at: m.at };
   if (thread?.live) return { ...base, status: "live", at: m.at };
   if (m.question) return { ...base, status: "asking", at: thread?.updatedAt ?? m.at };

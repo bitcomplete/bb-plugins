@@ -49,6 +49,11 @@ export const reviewTone = (review: PrsReview) =>
       : review.segment === "with-authors"
         ? "purple"
         : "amber";
+export function reviewsWithPendingInput(items: PrsReview[], needsInput: Record<string, boolean>): PrsReview[] {
+  return items.map((review) => review.item.threadId && needsInput[review.item.threadId]
+    ? { ...review, segment: "on-you" }
+    : review);
+}
 const message = (cause: unknown) =>
   cause instanceof Error ? cause.message : String(cause);
 
@@ -199,15 +204,16 @@ function ReviewContext({
   review,
   start,
   startDisabled,
+  onConversation,
 }: {
   review: PrsReview;
   start: () => void;
   startDisabled: boolean;
+  onConversation: (threadId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [detail, setDetail] = useState<PrsReview | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const navigate = useBbNavigate();
   useEffect(() => {
     let active = true;
     rpc.call("reviews_detail", { key: review.item.key }).then(
@@ -324,8 +330,8 @@ function ReviewContext({
       <span className="calm-context-label">Actions</span>
       <div className="calm-actions">
         {detail.item.threadId ? (
-          <CalmButton onClick={() => navigate.toThread(detail.item.threadId!)}>
-            Open thread
+          <CalmButton onClick={() => onConversation(detail.item.threadId!)}>
+            Open conversation
           </CalmButton>
         ) : detail.item.state === "queued" ? (
           <CalmButton disabled={startDisabled} onClick={start}>
@@ -359,6 +365,8 @@ function ReviewRow({
   busy,
   startDisabled,
   unblocks,
+  onConversation,
+  needsInput,
 }: {
   review: PrsReview;
   expanded: boolean;
@@ -368,8 +376,9 @@ function ReviewRow({
   busy: boolean;
   startDisabled: boolean;
   unblocks: CalmRow[];
+  onConversation: (threadId: string) => void;
+  needsInput: boolean;
 }) {
-  const navigate = useBbNavigate();
   const days = Math.max(
     0,
     Math.floor((Date.now() - Date.parse(review.item.noticedAt)) / 86_400_000),
@@ -386,12 +395,12 @@ function ReviewRow({
       open={expanded}
       onOpenChange={onExpand}
       aria-label={`Review context for ${review.item.title} #${review.item.number}`}
-      className={`calm-pr${expanded ? " expanded" : ""}`}
+      className={`calm-pr${expanded ? " expanded" : ""}${needsInput ? " question-row" : ""}`}
       data-review-key={review.item.key}
     >
       <div className="calm-row">
         <span className="calm-dot-column">
-          <SizeDot lines={lines} tone={reviewTone(review)} />
+          <SizeDot lines={lines} tone={needsInput ? "question" : reviewTone(review)} />
           {selectable ? (
             <Checkbox
               data-prs-agent-local=""
@@ -429,9 +438,9 @@ function ReviewRow({
             <span className="calm-row-actions">
               {review.item.threadId ? (
                 <CalmButton
-                  onClick={() => navigate.toThread(review.item.threadId!)}
+                  onClick={() => onConversation(review.item.threadId!)}
                 >
-                  Open thread
+                  Open conversation
                 </CalmButton>
               ) : selectable ? (
                 <CalmButton disabled={busy || startDisabled} onClick={start}>
@@ -450,6 +459,7 @@ function ReviewRow({
               </button>
             </span>
           </div>
+          {needsInput ? <p className="calm-row-meta">Agent needs your input</p> : null}
           {unblocks.length ? (
             <p className="calm-unblocks">
               ♧ Unblocks your{" "}
@@ -470,6 +480,7 @@ function ReviewRow({
           review={review}
           start={start}
           startDisabled={busy || startDisabled}
+          onConversation={onConversation}
         />
       </CollapsiblePanel>
     </Collapsible>
@@ -485,6 +496,8 @@ export function ReviewsView({
   toggleFold,
   mine,
   refetch,
+  onConversation,
+  needsInput,
 }: {
   items: PrsReview[];
   agentModel: AgentModelChoice | null;
@@ -495,9 +508,10 @@ export function ReviewsView({
   toggleFold: (key: string) => void;
   mine: CalmRow[];
   refetch: () => void;
+  onConversation: (threadId: string) => void;
+  needsInput: Record<string, boolean>;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const navigate = useBbNavigate();
   const [picked, setPicked] = useState<string[]>([]);
   const [lastOpened, setLastOpened] = useState<string | null>(null);
   const [startKeys, setStartKeys] = useState<string[] | null>(null);
@@ -548,6 +562,8 @@ export function ReviewsView({
       dismiss={() => void dismiss(review)}
       busy={busy}
       startDisabled={!agentModel}
+      onConversation={onConversation}
+      needsInput={!!(review.item.threadId && needsInput[review.item.threadId])}
       unblocks={mine.filter((row) =>
         row.gate_links.some(
           (gate) =>
@@ -563,7 +579,7 @@ export function ReviewsView({
     const next = quick[(previous + 1) % quick.length];
     if (!next) return;
     setLastOpened(next.item.key);
-    if (next.item.threadId) navigate.toThread(next.item.threadId);
+    if (next.item.threadId) onConversation(next.item.threadId);
     else setExpanded(next.item.key);
   };
   const draftLong = long.filter(

@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { reportSchema } from "./reports.js";
 
 export const actionSchema = z.enum(["fix-feedback", "rebase", "fix-ci"]);
 export const stopSchema = z.enum(["prepare", "publish"]);
@@ -124,6 +125,7 @@ export const markerViewSchema = z.object({
   title: z.string().nullable(),
   at: z.string(),
   reason: z.string().nullable(),
+  report: reportSchema.nullable().optional(),
 });
 
 export const stateSchema = z.object({
@@ -132,6 +134,7 @@ export const stateSchema = z.object({
   lastError: z.string().nullable(),
   refreshing: z.boolean(),
   markers: z.array(markerViewSchema),
+  needsInput: z.record(z.string(), z.boolean()).optional(),
 });
 
 export type ViewModel = z.infer<typeof viewModelSchema>;

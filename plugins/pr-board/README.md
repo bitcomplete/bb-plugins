@@ -90,6 +90,16 @@ prose. Answers use the supported thread follow-up API. A failed or interrupted
 delivery keeps the question visible and directs you to the thread when its
 outcome is uncertain, preventing duplicate sends.
 
+Use **Open conversation** on a PR or review row to chat with its agent in the
+panel. Shared threads show their PR roster in the header. BB's thread chat
+handles messages and native questions; **Open in full thread** opens the same
+thread. Pending BB interactions count toward the agents waiting indicator.
+
+Fix coordinators call `prs_report` to record progress and per-PR results. The
+board keeps the latest report on each assigned marker and shows its summary
+on the PR row. Reports follow the existing marker lifecycle and do not change
+GitHub readiness or BB thread status.
+
 ## Requirements
 
 The bb server host needs authenticated `gh` and `python3` on `PATH`.

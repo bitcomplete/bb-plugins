@@ -36,6 +36,7 @@ async function host() {
   };
   const instance = createFakePluginHost({ pluginId: "pr-board" });
   const { harness } = instance;
+  harness.sdk.stub("threads.list", async () => []);
   harness.sdk.stub("projects.get", async () => ({ sources: [{ hostId: "checkout-host", path: "/synthetic", isDefault: true }] }));
   harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: "codex", available: !control.unavailable }], models: [
     { model: "gpt-6.1-sol", supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }] },

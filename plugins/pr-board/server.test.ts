@@ -61,6 +61,7 @@ async function host(runner: Runner, threadStatus: { value: "active" | "idle" } =
   const { bb, harness } = createFakePluginHost({
     pluginId: "pr-board",
     sdk: { threads: {
+      list: async () => [],
       output: async () => { const output = delivery.output; if (delivery.outputGate) await delivery.outputGate; return { output }; },
       send: async () => {
         if (delivery.gate) await delivery.gate;
@@ -220,7 +221,7 @@ it("marker lifecycle: live while the thread runs, then worked-on until the PR's 
 });
 
 it("afterRefresh keeps a live thread's marker even after its head moves", () => {
-  const marker: Marker = { key: "k", action: "fix-ci", status: "started", at: "t0", threadId: "thr", title: "T", head: "h1", move: "ci", reason: null, question: null, answeredQuestions: [], answering: null, answerError: null };
+  const marker: Marker = { key: "k", action: "fix-ci", status: "started", at: "t0", threadId: "thr", title: "T", head: "h1", move: "ci", reason: null, question: null, answeredQuestions: [], answering: null, answerError: null, report: null };
   const prs = { k: { head_oid: "h2", move: "ci" } };
   expect(afterRefresh([marker], prs, { thr: { live: true, updatedAt: "t1" } }, "t2")).toEqual([marker]);
   expect(afterRefresh([marker], prs, { thr: { live: false, updatedAt: "t1" } }, "t2")).toEqual([]);
@@ -580,6 +581,7 @@ it("imports legacy markers after prior migrations, preserves question history, a
     if (key === "markers") expect(db.prepare("SELECT body FROM marker_cache WHERE id = 1").get()).toMatchObject({ body: expect.any(String) });
     await remove(key);
   });
+  harness.sdk.stub("threads.list", async () => []);
   harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "legacy-thread", status: "idle" }));
   harness.sdk.stub("threads.output", async () => ({ output: null }));
   await createPlugin({ runner })(bb);
@@ -610,6 +612,7 @@ it("initializes concurrent activated reads once and does not replace newer SQL w
     if (key === "markers" && !held) { held = true; await gate; }
     return value;
   });
+  harness.sdk.stub("threads.list", async () => []);
   harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "newer-thread", status: "idle" }));
   harness.sdk.stub("threads.output", async () => ({ output: null }));
   await createPlugin({ runner })(bb);
@@ -637,6 +640,7 @@ it("leaves markers and legacy boards untouched in the candidate factory and impo
   await bb.storage.kv.set("markers", [original]);
   await bb.storage.kv.set("board", legacyBoard);
   const reads = vi.spyOn(bb.storage.kv, "get"), writes = vi.spyOn(bb.storage.kv, "set"), deletes = vi.spyOn(bb.storage.kv, "delete");
+  harness.sdk.stub("threads.list", async () => []);
   harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "legacy-thread", status: "idle" }));
   harness.sdk.stub("threads.output", async () => ({ output }));
   await createPlugin({ runner })(bb);
@@ -686,6 +690,7 @@ it("retries a failed activation import from durable SQL without resurrecting a s
     if (key === "markers" && refuseCleanup) { refuseCleanup = false; throw new Error("temporary cleanup failure"); }
     await remove(key);
   });
+  harness.sdk.stub("threads.list", async () => []);
   harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "legacy-thread", status: "idle" }));
   harness.sdk.stub("threads.output", async () => ({ output }));
   await createPlugin({ runner })(bb);
