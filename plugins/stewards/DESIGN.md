@@ -570,7 +570,7 @@ which writes the status record:
 |---|---|
 | phase, summary | Where the entity is, in a sentence. |
 | next action, actor | What happens next, and who does it: `user` (the server's owner has to act), `steward` (the steward itself, including its own next step such as re-checking on the next deployment wake) or `other` (someone else). The actor is a party, not a pronoun: BB-95 misread `me` as the steward and filed its own re-check as needing the user. |
-| waiting on | The party or artifact the next action waits on: checks, a review, a deployment, another team. It never marks the effort blocked; a hold, an open `stuck` escalation or a needs item does. The old name `blockedOn` is accepted as an alias for one release (BB-109). |
+| waiting on | The party or artifact the next action waits on: checks, a review, a deployment, another team. It never marks the effort blocked; an open `stuck` escalation, a failed wake, a no-wake-source wait or a needs item does, and since BB-348 neither a hold nor a delegate wait does. The old name `blockedOn` is accepted as an alias for one release (BB-109). |
 | requeue after | When to wake it if nothing else does. Defaults to the playbook's `requeue-default`. |
 | conditions | Open escalations, `stuck`. |
 | resources | Active workers, open pull requests, child stewards. |
@@ -1569,7 +1569,8 @@ The rules that hold:
   `waitingOn` names the user, the owner or a human with no open needs item is
   refused and told to file one, so the ask reaches the page instead of only
   the prose. The wait is a plain line on the card, not a block: blocked is
-  only a hold, an open `stuck` escalation or a needs item (BB-109).
+  only an open `stuck` escalation, a failed wake, a no-wake-source wait or a
+  needs item (BB-109, BB-348).
 
 ## 19. Dependency stewards
 
@@ -1878,9 +1879,10 @@ exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One
 project picker popover in the live view (BB-181, matching the host's
 `ProjectSelector`); the sections top to bottom are **Blocked**
 (needs-you rows first, then blocked), **In flight** (running before quiet),
-**Threads** (one-off threads, collapsed), **Monitors** (the `ops`, Dependabot
-and Sentry bindings, collapsed), **Recently ended** (collapsed), and the
-project steward demoted to one small row at the bottom. Rows in the **Threads**
+**Waiting** (the quiet efforts with a wait the plugin will deliver, collapsed,
+BB-348), **Threads** (one-off threads, collapsed), **Monitors** (the `ops`,
+Dependabot and Sentry bindings, collapsed), **Recently ended** (collapsed), and
+the project steward demoted to one small row at the bottom. Rows in the **Threads**
 section and their children carry bb's own thread actions context menu, so
 archive, pin, rename, split and delete still work on the user's own threads. An
 effort row, and the worker and reviewer rows nested under it, carries no thread
@@ -1889,8 +1891,8 @@ the next wake (`sendTo`), delete takes the descendants with the parent, rename
 is overwritten by the plugin's retitle, and pin and split do not apply. Held and
 waiting stewards are ordinary rows
 here: the plugin does not hide a thread between wakes (BB-93), so a steward
-waiting on someone else shows in **Blocked** or **In flight** rather than
-dropping out of the host's live feed.
+waiting on someone else shows in **Waiting**, **Blocked** or **In flight**
+rather than dropping out of the host's live feed.
 
 **Two-line effort rows and the four glyphs (BB-76).** An effort row is two
 lines. Line one is the glyph, the entity key in bold, and the title, which
@@ -1914,9 +1916,11 @@ without the thread actions menu when the thread is no longer in the live view.
 
 The glyph is one of four shapes, in precedence order `you › blocked › running ›
 quiet`: a solid yellow dot when it waits on you, an empty red ring when
-blocked (a hold or an open `stuck` escalation, BB-109 — the free-text
-`waitingOn` never blocks), a blue ring that pulses slowly while
-a worker or reviewer runs, and an empty grey ring when quiet. The pulse is CSS
+something has gone wrong (an open `stuck` escalation, a failed wake or a wait
+with no wake source, BB-154/BB-348 — the free-text `waitingOn` never blocks,
+and since BB-348 neither does a hold or a delegate wait), a blue ring that
+pulses slowly while a worker or reviewer runs, and an empty grey ring when
+quiet. The pulse is CSS
 only and stops under `prefers-reduced-motion`. One-off threads use the same four glyphs — yellow
 when unread, blue animated while their agent runs, grey otherwise — except a
 draft, which keeps bb's own `ThreadStatusGlyph`. A worker or reviewer child row
@@ -1926,35 +1930,46 @@ project steward footer row is the grey ring. Steward rows carry no
 thread-briefs ring at all: the single off switch leaves every steward thread
 with no brief, so this list's own glyph is the only one they draw.
 
-**The status phrase (BB-76, BB-109).** First match wins: `needs you`;
-`held behind <holdBehind keys>` when `holdBehind` is non-empty,
-else `on hold`; `stuck` for an open stuck escalation; `N worker(s) running`
-counting only workers whose worker-table status is `running` (a busy steward or
-reviewer with no running worker falls through, rather than reading `0 workers
-running`); `worker finished, next look <time>` when the binding has a pending
+**The status phrase (BB-76, BB-109, BB-348).** First match wins: `needs you`;
+`wake failed: <reason>` (BB-255); `waiting on review from <names>` when a
+delegate wait names its requested reviewers (BB-338 — a wait, not a failure,
+so it reads ahead of the other quiet phrases); `held behind <holdBehind keys>`
+when `holdBehind` is non-empty, else `on hold`; `stuck` for an open stuck
+escalation; `N worker(s) running` counting only workers whose worker-table
+status is `running` (a busy steward or reviewer with no running worker falls
+through, rather than reading `0 workers running`); the lost hand-off when
+`waitingOn` names a finished worker or a loud hand-off note is pending
+(BB-152); `worker finished, next look <time>` when the binding has a pending
 quiet worker-finish note and no running worker (BB-83 — the status summary a
 finished worker left behind must not keep the row, and the time is the
-binding's `requeueAt`); the newest deployment watch's state (`deploying`,
-`deployed`, `deploy failed`), ahead of the free-text `nextAction` whatever the
-actor (BB-86); the status `nextAction` verbatim, with `the other party`
-standing in for an `other` actor that has no report (an external wait is not a
-block, so its colour follows the glyph); otherwise `no report yet`. The
+binding's `requeueAt`); `waiting, no wake source` (BB-154); a dated wait as
+`waiting on <text> until <date>` (BB-247); the newest deployment watch's state
+(`deploying`, `deployed`, `deploy failed`), ahead of the free-text `nextAction`
+whatever the actor (BB-86); the status `nextAction` verbatim, with `the other
+party` standing in for an `other` actor that has no report (an external wait is
+not a block, so its colour follows the glyph); otherwise `no report yet`. The
 phrase's colour follows the
 glyph's. `sidebar.ts` derives `state`, `section`
 and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`
 covers every rule and the precedence.
 
 **Sections.** Blocked holds the needs-you (yellow) and blocked (red) efforts,
-whether stewarded or `ops`; a needs-you, held or stuck `ops`
-binding leaves Monitors for Blocked. In flight holds the rest of the stewarded,
-non-ops efforts, running before quiet, then by recency. Pinned rows stay first within their section.
-Recently ended holds the ended bindings, newest first, each built by
-`endedEffort` as a quiet effort with no children (BB-88).
-`buildSidebar` returns `blocked`, `efforts`, `threads`, `monitors` and `ended`
-separately, and the split is unit tested in `sidebar.test.ts`.
+whether stewarded or `ops`; a needs-you, stuck, no-wake-source or
+wake-failure `ops` binding leaves Monitors for Blocked. Waiting (BB-348) holds
+the top-level quiet stewarded, non-ops efforts whose wait the plugin will
+deliver (a hold, a delegate wait, a typed or dated wait, or an `other`-actor
+report with a next action), collapsed and pinned first; a parent whose nested
+child is not waiting is demoted to In flight. In flight holds the rest of the
+stewarded, non-ops efforts, running before quiet, then by recency. Pinned rows
+stay first within their section. Recently ended holds the ended bindings,
+newest first, each built by `endedEffort` as a quiet effort with no children
+(BB-88). `buildSidebar` returns `blocked`, `waiting`, `efforts`, `threads`,
+`monitors` and `ended` separately, and the split is unit tested in
+`sidebar.test.ts`.
 
 **Rows, highlighting and auto-expand (BB-85).** A stewarded effort row in
-Blocked, In flight or Monitors and a Recently ended row are real links to the
+Blocked, In flight, Waiting or Monitors and a Recently ended row are real links
+to the
 effort's detail view (`board/<project>/<key>`, §16); a worker or reviewer child
 row, a one-off thread and the project steward row still open their thread. An
 effort row is highlighted while the board shows that effort's detail, and a
@@ -1963,7 +1978,8 @@ thread row is highlighted while its thread page is the route
 anchor). When navigation lands on a row
 inside a collapsed parent, the parent expands so the row is revealed: the
 effort's row for a worker or reviewer, the **Threads** section for a one-off
-thread, and **Monitors** or **Recently ended** for their rows. An unread
+thread, and **Waiting**, **Monitors** or **Recently ended** for their rows. An
+unread
 worker or reviewer never opens its effort row (BB-131): workers are spawned
 with parent notifications off and are never marked read, so they are almost
 always unread and the row would otherwise sit open. The Stewards

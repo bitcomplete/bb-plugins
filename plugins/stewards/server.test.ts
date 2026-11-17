@@ -14336,7 +14336,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     return { ...t, project, steward, key, binding: () => t.hooks.store.find("ENG-12")! };
   }
 
-  it("waits on a requested reviewer: blocked in the sidebar and not decidable by the steward (BB-327)", async () => {
+  it("waits on a requested reviewer: quiet in the sidebar and not decidable by the steward (BB-327, BB-348)", async () => {
     const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { pullOver: { requestedReviewers: ["arashout"] } });
     const binding = t.binding();
     const esc = t.hooks.store.openEscalations(binding.id).find((x) => x.kind === "approval")!;
@@ -14344,12 +14344,13 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(esc.route).toBe("steward");
     expect(esc.meanwhile).toContain("arashout");
     expect(t.hooks.store.openNeeds(binding.id).some((n) => n.kind === "approve-pr")).toBe(false);
-    // The sidebar row reads blocked, not "needs you", and names the delegate (BB-338).
+    // BB-348: the delegate wait is a wait, not a failure, so the sidebar row is
+    // quiet (not blocked) and not "needs you", and names the delegate (BB-338).
     const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; stuck: boolean; needsUser: boolean; delegateWait: string | null }> };
-    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, needsUser: false, delegateWait: "arashout" });
-    // The board row carries the same name (BB-338).
+    expect(sidebar.bindings.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: false, needsUser: false, delegateWait: "arashout" });
+    // The board row carries the same name and the same quiet flag (BB-338, BB-348).
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; stuck: boolean; delegateWait: string | null }> } };
-    expect(board.board.stewards.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: true, delegateWait: "arashout" });
+    expect(board.board.stewards.find((x) => x.key === "ENG-12")).toMatchObject({ stuck: false, delegateWait: "arashout" });
     // The ticket steward cannot resolve the delegate wait into a decline.
     const refused = await t.tool("steward_update", { binding: "ENG-12", guidance: "no", resolve: esc.id }, t.steward);
     expect(refused.error).toBe(true);
