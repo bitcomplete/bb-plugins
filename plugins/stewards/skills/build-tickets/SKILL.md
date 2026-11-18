@@ -377,14 +377,22 @@ refuses the command (or a direct `gh pr merge`), take the hand-off path
 below. Carry on here once it is in.
 
 **4c. Dispatch the build a merge triggers.** Some projects configure a
-`mergeDispatch` in `.bb/stewards/project.json`: a workflow to run when a
-merge to a given repo succeeds. `bb stewards merge` runs it, and its
-"Merged:" comment says so — when you see that line the dispatch has happened
-and you are done. Otherwise, if the project configures a `mergeDispatch` for
-the repo and you merged with a direct `gh pr merge` in the hand-off path
-below, run that dispatch yourself, exactly once, right after the merge
-succeeds, using the repo, workflow, ref and inputs it names. When the
-project configures none, there is nothing to dispatch.
+`mergeDispatch` in `.bb/stewards/project.json`: a list of entries, each with
+a `repo` (the merged repo), a `workflow`, and optional `workflowRepo`, `ref`
+and `inputs`. `bb stewards merge` runs the entry for the repo it merged, and
+its "Merged:" comment says so — when you see that line the dispatch has
+happened and you are done. Otherwise, if the project configures a
+`mergeDispatch` for the repo and you merged with a direct `gh pr merge` in
+the hand-off path below, run that entry yourself, exactly once, right after
+the merge succeeds:
+
+```sh
+gh workflow run <workflow> --repo <workflowRepo, else repo> --ref <ref, else the default branch> [-f <key>=<value> ...]
+```
+
+The workflow runs in `workflowRepo` (falling back to `repo`), at `ref`
+(falling back to the workflow repo's default branch), with one `-f` per key
+in `inputs`. When the project configures none, there is nothing to dispatch.
 
 Say in the "Merged:" comment (or in your own signed comment when the merge
 path posted none) whether a dispatch was run. If the dispatch fails, say

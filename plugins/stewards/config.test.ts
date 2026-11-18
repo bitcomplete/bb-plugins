@@ -69,14 +69,13 @@ describe("the project file", () => {
     if (!parsed.ok) throw new Error(parsed.error);
     const projectEntries = parsed.value.bigDecisions.filter((d) => d.decide === "project");
     expect(projectEntries.length).toBeGreaterThan(0);
-    // A single-repo project's only directory is its repo's, and the old
-    // defaults named repos a project may not have. A default path may not
-    // begin with any of them.
-    const repoDirs = ["web", "api", "app", "tools"];
+    // A default path names no repo: it is a bare filename (no directory), an
+    // any-depth glob, or the fixed GitHub workflow directory. A literal
+    // leading directory (the old `bb-gate/kploy/**`, `devbox/host/**`) fails.
     for (const entry of projectEntries) {
       expect(entry.paths.length, entry.text).toBeGreaterThan(0);
       for (const path of entry.paths) {
-        expect(repoDirs, `${entry.text}: ${path}`).not.toContain(path.split("/")[0]);
+        expect(!path.includes("/") || path.startsWith("**/") || path.startsWith(".github/"), `${entry.text}: ${path}`).toBe(true);
       }
     }
   });

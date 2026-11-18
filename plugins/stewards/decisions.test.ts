@@ -360,7 +360,7 @@ describe("the default decide list is generic and layout-independent (BB-359)", (
   });
 
   it("matches a cross-repo contract by name", () => {
-    for (const file of ["source-contract.ts", "plugins/linear/source-contract.ts", "web/clients.json", "web/docs/hooks.md", "api/openapi.yaml"]) {
+    for (const file of ["source-contract.ts", "plugins/linear/source-contract.ts", "web/clients.json", "api/openapi.yaml"]) {
       expect(decideForPull([file], list()), file).toBe("project");
     }
   });

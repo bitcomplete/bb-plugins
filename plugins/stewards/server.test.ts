@@ -6989,7 +6989,7 @@ describe("needs you items", () => {
     // reviewer's diff judgment, so it must not make the pull request the
     // owner's (PR 2 adds the ticket PR's diff report).
     t.hooks.store.patch(b.id, { ready: { ...b.ready, substantial: true, approval: null } });
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     const update = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
     expect(update.error, update.text).toBe(false);
@@ -7000,7 +7000,7 @@ describe("needs you items", () => {
     const substantial = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review substantial=yes -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
     const t = await withPull([substantial]);
     const b = t.binding();
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     // The ticket passed the gate without a spec approval and the reviewer
     // judged the diff substantial, so the owner decides it: a project-steward
@@ -7701,7 +7701,7 @@ describe("needs you items", () => {
     const byWorker = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, "thr_w1");
     expect(byWorker.error).toBe(true);
     // A `user` entry is refused, pointing at a forward.
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     const userEntry = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "Granting a new credential, token or cluster access, or widening what an existing one can reach" }, t.project);
     expect(userEntry.error).toBe(true);
     expect(userEntry.text).toMatch(/forward/u);
@@ -7724,7 +7724,7 @@ describe("needs you items", () => {
   it("wakes the pull request's worker when the project steward approves, so it merges without the owner (BB-77)", async () => {
     const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
     const t = await withPull([marker, workerComment]);
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     await t.tool("worker_park", { waitingOn: "the owner's approval" }, "thr_w1");
@@ -7744,7 +7744,7 @@ describe("needs you items", () => {
   it("wakes the ticket steward when the worker has ended before the approval lands (BB-77)", async () => {
     const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
     const t = await withPull([marker, workerComment]);
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     await t.idle("thr_w1", "Done for now.");
@@ -7763,7 +7763,7 @@ describe("needs you items", () => {
   it("posts a declined marker and tells the worker to treat it as a change request (BB-77)", async () => {
     const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
     const t = await withPull([marker, workerComment]);
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     await t.created("thr_w1", t.steward, "ENG-12: Implement");
     await t.tool("worker_park", { waitingOn: "the project steward's decision" }, "thr_w1");
@@ -8416,7 +8416,7 @@ describe("needs you items", () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     const b = t.hooks.store.find("ENG-12")!;
@@ -8445,7 +8445,7 @@ describe("needs you items", () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")!;
@@ -8475,7 +8475,7 @@ describe("needs you items", () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     const [project] = t.spawns as Array<{ id: string }>;
     // The files fetch fails from now on.
@@ -8492,7 +8492,7 @@ describe("needs you items", () => {
     const t1 = await setup();
     t1.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t1.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
-    t1.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t1.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t1.ring("linear", "uuid-12");
     const b1 = t1.hooks.store.find("ENG-12")!;
     expect(t1.hooks.store.openEscalations(b1.id).find((x) => x.kind === "approval")).toMatchObject({ route: "project" });
@@ -8511,7 +8511,7 @@ describe("needs you items", () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
     const project = t.spawns[0]!.id;
@@ -8535,7 +8535,7 @@ describe("needs you items", () => {
   it("gates a review binding's own pull request, so a project entry routes to the project steward (BB-322 blocker 2)", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("github", "acme/web#7");
     const b = t.hooks.store.find("acme/web#7")!;
     expect(b.kind).toBe("review");
@@ -14529,11 +14529,11 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("names the matched decide-list entry and who decides", async () => {
-    const t = await withPull([reviewMarker("owner-reviewed")], { files: ["docs/hooks.md"] });
+    const t = await withPull([reviewMarker("owner-reviewed")], { files: ["web/openapi.yaml"] });
     const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { decision: { entry: string | null; decide: string; why: string | null; listing: string }; gateMet: boolean };
     expect(json.decision).toMatchObject({ entry: "A cross-repo contract other repos implement", decide: "project" });
     expect(json.decision.why).toMatch(/project steward's decision/u);
-    expect(json.decision.listing).toContain('"A cross-repo contract other repos implement" [project] — docs/hooks.md');
+    expect(json.decision.listing).toContain('"A cross-repo contract other repos implement" [project] — web/openapi.yaml');
     expect(json.decision.listing).toContain('Deciding entry: "A cross-repo contract other repos implement" [project].');
     expect(json.decision.listing).toContain("Rule: a `user` entry wins");
     // The project steward's approval is still needed, so the gate is not met.
@@ -14541,7 +14541,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("prints the reviewer's escalation to the owner beside the decide-list winner (BB-192)", async () => {
-    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { files: ["docs/hooks.md"] });
+    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { files: ["web/openapi.yaml"] });
     const out = await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1"]);
     expect(out.exitCode).toBe(1);
     expect(out.stdout).toMatch(/decide list: "A cross-repo contract other repos implement" \(project\)/u);
@@ -14553,7 +14553,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   });
 
   it("refuses the project steward's approve RPC when the reviewer escalated to the owner (BB-192)", async () => {
-    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { files: ["docs/hooks.md"] });
+    const t = await withPull([reviewMarkerApprover("owner-reviewed", "owner")], { files: ["web/openapi.yaml"] });
     // The decide list still matches a project entry, but the reviewer's owner
     // call binds the gate: no bb-approval may be posted.
     const update = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
@@ -14566,10 +14566,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   it("refuses a project-steward approve, with the listing, when a user entry also matched (BB-135)", async () => {
     const entries = [
       { text: "Identity and access", decide: "user", paths: ["hooks/**"] },
-      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["docs/hooks.md"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi.yaml"] },
     ];
     const t = await withPull([reviewMarker("owner-reviewed")], {
-      files: ["hooks/slack.go", "docs/hooks.md"],
+      files: ["hooks/slack.go", "web/openapi.yaml"],
       project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
     });
     // The user's lane: the files touch both entries, so the project steward
@@ -14588,10 +14588,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   it("carries the decide-list listing on the owner's approve-pr item (BB-135)", async () => {
     const entries = [
       { text: "Identity and access", decide: "user", paths: ["hooks/**"] },
-      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["docs/hooks.md"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi.yaml"] },
     ];
     const t = await withPull([reviewMarker("owner-reviewed")], {
-      files: ["hooks/slack.go", "docs/hooks.md"],
+      files: ["hooks/slack.go", "web/openapi.yaml"],
       project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
     });
     const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
@@ -14604,10 +14604,10 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   it("drops a stale decide-list listing when the head moves while checks are red (BB-135 review round 1)", async () => {
     const entries = [
       { text: "Identity and access", decide: "user", paths: ["hooks/**"] },
-      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["docs/hooks.md"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi.yaml"] },
     ];
     const t = await withPull([reviewMarker("owner-reviewed")], {
-      files: ["hooks/slack.go", "docs/hooks.md"],
+      files: ["hooks/slack.go", "web/openapi.yaml"],
       project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
     });
     const before = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
@@ -14632,7 +14632,7 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
     // The project steward records the approval under the matching entry; the
     // marker it posts is what the next fresh read sees.
-    const t2 = await withPull([reviewMarker("owner-reviewed")], { files: ["docs/hooks.md"] });
+    const t2 = await withPull([reviewMarker("owner-reviewed")], { files: ["web/openapi.yaml"] });
     const update = await t2.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t2.project);
     expect(update.error).toBe(false);
     const markerBody = t2.githubComments.at(-1)!.body.split("\n")[0]!;
@@ -16160,7 +16160,7 @@ describe("mechanical status and quiet notes (BB-203)", () => {
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ comments: [marker, workerComment] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
     // The change touches a `project` entry, so the project steward decides it.
-    t.githubFiles.set("acme/web#7", ["docs/hooks.md"]);
+    t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     await t.tool("steward_report", { phase: "In Review", summary: "Waiting on the project steward.", nextAction: "Wait", actor: "other" }, steward);

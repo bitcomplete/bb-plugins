@@ -57,7 +57,6 @@ export const DEFAULT_PROJECT_DECISIONS: readonly { text: string; paths: string[]
     paths: [
       ...atRootOrAnywhere("source-contract.ts"),
       ...atRootOrAnywhere("clients.json"),
-      ...atRootOrAnywhere("hooks.md"),
       ...atRootOrAnywhere("openapi.yaml"),
       ...atRootOrAnywhere("openapi.json"),
       ...atRootOrAnywhere("*.proto"),
@@ -92,7 +91,7 @@ export const DEFAULT_PROJECT_DECISIONS: readonly { text: string; paths: string[]
   },
   {
     text: "A store migration",
-    paths: [...atRootOrAnywhere("store.ts"), ...atRootOrAnywhere("*-store.ts"), ...atRootOrAnywhere("migration*.ts"), ...atRootOrAnywhere("migration*.sql"), ...atRootOrAnywhere("*.sql")],
+    paths: [...atRootOrAnywhere("store.ts"), ...atRootOrAnywhere("*-store.ts"), ...atRootOrAnywhere("migration*.ts"), ...atRootOrAnywhere("migration*.sql"), "**/migrations/**"],
   },
   {
     text: "A new dependency",
