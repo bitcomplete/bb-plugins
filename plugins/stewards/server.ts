@@ -2769,6 +2769,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames, ...ticketWatchNames, ...adoptedTicketNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
+      /**
+       * The "Configuration problems" line for a playbook value this image's
+       * parser does not know (BB-355). It names the file and the key or value,
+       * and says the value takes effect after the server restarts onto a newer
+       * image; the last good copy is named when bindings keep running under it.
+       */
+      const unsupportedProblem = (file: string, detail: string, fallback: Playbook | null): string =>
+        `${file}: ${JSON.stringify(detail)} is unsupported until restart; it takes effect after the server restarts onto a newer image${fallback === null ? "" : ` (bindings keep running under the last good copy, version ${fallback.version})`}.`;
       /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
       const loadPlaybook = async (name: string, kind: BindingKind, required: boolean): Promise<Playbook | null> => {
         const text = texts.get(playbookPath(name)) ?? null;
@@ -2783,12 +2791,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await bb.storage.kv.set(goodKey, text);
           return result.value;
         }
-        problems.push(result.error);
         const last = await bb.storage.kv.get<string>(goodKey);
         const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
-        if (lastParsed !== null && lastParsed.ok) {
-          problems.push(`${kind} bindings keep running under the last good ${name} (${lastParsed.value.version}).`);
-          return lastParsed.value;
+        const good = lastParsed !== null && lastParsed.ok ? lastParsed.value : null;
+        if (result.unsupported !== undefined) {
+          problems.push(unsupportedProblem(playbookPath(name), result.unsupported, good));
+          return good;
+        }
+        problems.push(result.error);
+        if (good !== null) {
+          problems.push(`${kind} bindings keep running under the last good ${name} (${good.version}).`);
+          return good;
         }
         return null;
       };
@@ -2834,12 +2847,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await bb.storage.kv.set(goodKey, text);
           return result.value;
         }
-        problems.push(result.error);
         const last = await bb.storage.kv.get<string>(goodKey);
         const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
-        if (lastParsed !== null && lastParsed.ok) {
-          problems.push(`${name} keeps running under the last good version (${lastParsed.value.version}).`);
-          return lastParsed.value;
+        const good = lastParsed !== null && lastParsed.ok ? lastParsed.value : null;
+        if (result.unsupported !== undefined) {
+          problems.push(unsupportedProblem(playbookPath(name), result.unsupported, good));
+          return good;
+        }
+        problems.push(result.error);
+        if (good !== null) {
+          problems.push(`${name} keeps running under the last good version (${good.version}).`);
+          return good;
         }
         return null;
       };
@@ -2878,7 +2896,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
           if (lastParsed !== null && lastParsed.ok) {
             watchPlaybooks.set(name, lastParsed.value);
-            problems.push(`the watch playbook ${name} keeps running under the last good version (${lastParsed.value.version}).`);
+            const unsupported = "unsupported" in result ? result.unsupported : undefined;
+            problems.push(unsupported === undefined ? `the watch playbook ${name} keeps running under the last good version (${lastParsed.value.version}).` : unsupportedProblem(playbookPath(name), unsupported, lastParsed.value));
           } else if (ticketWatchNames.has(name)) {
             // A ticket watch's failure is reported by `ticketWatchProblems`,
             // with the watch it belongs to; a pull watch's here.
