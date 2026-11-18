@@ -221,20 +221,18 @@ Two tools are yours; everything else you do with the tools every thread has.
   The worker playbooks tell a worker never to open one, so a worker that
   does has ignored its task; when you cannot answer the question yourself,
   tell the user.
-- **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
-  `linear_create_issue` sign for you: add no signature to what you pass
-  them. On a GitHub issue, comment with `gh issue comment`, move the state
-  by swapping the status label with `gh issue edit --add-label/--remove-label`,
-  and close with `gh issue close`; sign every `gh` body by hand. With `gh`,
-  end what you write with
+- **Act as the user, signed.** `ticket_comment`, `ticket_update` and
+  `ticket_file` sign for you: add no signature to what you pass them.
+  `ticket_update { key, state }` moves the state: a Linear workflow state
+  name, or on a GitHub issue a `status:<phase>` label or `closed`. `gh` stays
+  for pull requests; sign every `gh` body by hand, ending it with
   `_— from bb thread <your thread id>_`. Your thread id is in the wake and in
   `$BB_THREAD_ID`; never take it from your workspace's path, which names the
   project steward. The playbook's `may` list is what you may do.
 - **A phase keyed on a label.** A playbook phase keyed `label:<name>` is
   entered by adding that label and leaving the workflow state where it is; a
   present label matching such a key wins over the state-keyed phase. Add the
-  label with the source's own tooling (`gh issue edit --add-label <name>` on a
-  GitHub issue; the Linear label on a Linear issue). github-watcher's
+  label with `ticket_update { key, labels: [name] }`. github-watcher's
   synthesised `status:*` state is unchanged, so a GitHub playbook may key on
   either form.
 - **Comments, not description edits.** Start a spec comment with
@@ -466,26 +464,15 @@ Two tools are yours; everything else you do with the tools every thread has.
   reaches it. A report that needs nobody is marked read, so the sidebar's
   unread dot means "needs you"; a report that needs you is left unread.
 
-### Filing a child on GitHub
+### Filing a child
 
-A GitHub child is attached as a native sub-issue of its parent in the same
-action, so the parent's snapshot lists it. Create the child assigned to this
-server's login (so a later `bb-managed` promotion can adopt it), keep its
-number, and attach it, keeping a `Part of #{parent}` line in the body for a
-reader:
-
-```
-n=$(gh issue create --repo {owner}/{repo} --title "…" --body "Part of #{parent}
-
-…" --assignee @me | grep -oE '[0-9]+$')
-echo "filed child #$n"
-gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/$n --jq .id)
-```
-
-`echo` prints the child's number. `-F` sends the numeric id as an integer. A
-child missing from the parent's next wake under Sub-issues is re-attached
-with the attach command, using the child's number in place of `$n`, not
-re-filed.
+A child is filed with `ticket_file { unit, title, description, parent }`; the
+source attaches it to the parent in the same action, so the parent's snapshot
+lists it. On GitHub that is a native sub-issue, and the source assigns the
+child to this server's login so a later `bb-managed` promotion can adopt it;
+on Linear the parent must be in the same team. Keep a `Part of <parent key>`
+line in the description for a reader. A child missing from the parent's next
+wake under Sub-issues is re-filed, not attached by hand.
 
 ## If you are an ops steward
 
@@ -509,9 +496,8 @@ comment on its ticket saying it resolved, never a close from here.
 
 **Defaults.** Put every problem's fingerprint in the ticket description on a
 line of its own, ``Fingerprint: `<fingerprint>` ``. The wake names the filing
-target and its source: a Linear team, where you file with
-`linear_create_issue` and assign with `assignee: "me"`, or a GitHub repo,
-where you file with `gh issue create` and assign with `--assignee <login>`.
+target and its source: a Linear team key or a GitHub owner/repo, filed with
+`ticket_file { unit, title, description, labels, priority, assignee: "me" }`.
 Assign every ticket you file to this server's owner for that source and to no
 one else; when the wake says the login cannot be read, file it unassigned
 rather than guessing. A ticket already assigned to someone else is classified
@@ -519,20 +505,19 @@ and commented on, never reassigned. A recurrence is a comment on its ticket,
 never a second ticket. Before you file, the plugin searches the filing
 target's source for the exact `Fingerprint:` line and reports a hit as
 Recurring or Returned; if the wake says dedup is unavailable, search the
-target yourself (`linear_search`, or `gh issue list --search`) for that
-fingerprint before filing.
+target yourself (`ticket_search`) for that fingerprint before filing.
 
 On a **GitHub** target there is no priority or due-date field. Put the
 fingerprint on its own line and, for a dependency deadline, a
 `Due: YYYY-MM-DD` line beside it. Add the labels the wake names: for a
 priority or severity `autoAdopt` names, `bb-managed`, `status:todo` and
 `priority:<level>`, so adoption picks the issue up; for any other, no label,
-and the plugin files the owner's adoption decision instead. Sign every `gh`
-body by hand with `_— from bb thread <your thread id>_`.
+and the plugin files the owner's adoption decision instead. `ticket_file`
+and `ticket_comment` sign for you; add no signature to what you pass them.
 
-- **New:** file one ticket per problem with `linear_create_issue`, or with
-  `gh issue create` on a GitHub target: pod and container, since when, the
-  evidence quoted, your diagnosis, a priority, and the fingerprint line.
+- **New:** file one ticket per problem with `ticket_file`: pod and container,
+  since when, the evidence quoted, your diagnosis, a priority, and the
+  fingerprint line.
   Raise one `decision` escalation for the tickets of the turn: "Filed BB-N
   (high): …. Recommend adopting." A priority the wake says `ops.autoAdopt`
   covers you label and move to Todo (Linear) or add `bb-managed`,
@@ -723,8 +708,8 @@ comments, moves it — you are woken with the change: if it answers the
 escalation, record it with `guidance` + `resolve`; if not, leave it open.
 An ops steward's `decision` escalation is a ticket it filed about
 production: adopt it when the project's guidance says it is worth working
-(add the label, move it to Todo with `linear_update_issue`; a ticket steward
-picks it up), or decline with a reason, then resolve the escalation.
+(add the label and move it to its Todo phase with `ticket_update`; a ticket
+steward picks it up), or decline with a reason, then resolve the escalation.
 
 Everything you ask the user is a record. Forwarding a non-approval
 escalation to them makes a question for it, carrying the escalation's
@@ -802,7 +787,7 @@ and where the record disagrees with your memory, the record is right. You do not
 ended binding left work undone, reopen its entity so its steward resumes.
 
 An `@bb` mention on an issue with no steward comes to you, under the same
-rules: act through `linear_update_issue` and `steward_update`, and end with
+rules: act through `ticket_update` and `steward_update`, and end with
 exactly one `linear_session_reply`. A mention from someone other than the
 owner never reaches you until the owner confirms it by id.
 

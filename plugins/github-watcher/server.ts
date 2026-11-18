@@ -276,10 +276,10 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
      * link. A non-2xx answer throws with its status, like `restPage`; the
      * token is re-read from gh on a 401 by `asDeveloper`.
      */
-    async function restWrite(path: string, body: unknown, signal: AbortSignal): Promise<unknown> {
+    async function restWrite(path: string, body: unknown, signal: AbortSignal, method: "POST" | "PATCH" = "POST"): Promise<unknown> {
       return asDeveloper(async (token) => {
         const response = await deps.fetch(new URL(path, apiUrl), {
-          method: "POST",
+          method,
           headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "user-agent": "bb-plugin-github", "x-github-api-version": "2022-11-28", "content-type": "application/json" },
           body: JSON.stringify(body),
           signal,
@@ -1014,11 +1014,51 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { issues: [], unsupported: true, truncated: false, errors: [] };
       },
 
-      // BB-341: the backlog steward's triage writes are Linear writes; GitHub
-      // has no issue priority or relations and no signed-comment path here.
-      // Stewards only ever asks linear, so these are guards, not a path.
-      async sourceUpdateIssue() {
-        throw new Error("sourceUpdateIssue is a Linear write; the github source does not serve it");
+      // BB-360: the source-neutral ticket_update. GitHub issues carry labels
+      // and an open/closed state; a project's phases are `status:<phase>`
+      // labels, so setting one replaces the others. Priority, assignee and
+      // relations have no GitHub issue equivalent and are refused per field,
+      // as the contract documents; the assignee rule is this server's own
+      // login or none, exactly as sourceCreateIssue's.
+      async sourceUpdateIssue({ key, addLabels, priority, state, assignee, relations }) {
+        if (priority !== undefined) throw new Error("sourceUpdateIssue has no priority on the github source; GitHub issues have no priority");
+        if (relations.length > 0) throw new Error("sourceUpdateIssue has no relations on the github source; GitHub issues have no relations");
+        const ref = parseRefKey(key);
+        if (ref === null) throw new Error(`${key} is not a GitHub issue key like owner/repo#12`);
+        const snapshot = await readSnapshot(ref, checkSignal());
+        if (snapshot === null) throw new Error(`${key} does not exist, or it is not visible to the signed-in GitHub user`);
+        const body: Record<string, unknown> = {};
+        const changed: string[] = [];
+        const labels = new Set(snapshot.labels);
+        for (const label of addLabels) labels.add(label);
+        if (state !== undefined) {
+          if (state === "open" || state === "closed") {
+            body.state = state;
+            changed.push(state === "closed" ? "closed" : "reopened");
+          } else if (state.startsWith("status:")) {
+            for (const label of [...labels]) if (label.startsWith("status:")) labels.delete(label);
+            labels.add(state);
+            changed.push(`now ${state}`);
+          } else {
+            throw new Error(`sourceUpdateIssue has no state ${JSON.stringify(state)} on the github source; give open, closed, or a status:<phase> label`);
+          }
+        }
+        if (assignee !== undefined) {
+          const who = assignee.trim().toLowerCase();
+          if (who === "me" || who === "nobody") {
+            body.assignees = who === "me" ? [snapshot.viewer].filter((v): v is string => v !== null) : [];
+            changed.push(who === "me" ? `assigned to ${snapshot.viewer ?? "this server's login"}` : "unassigned");
+          } else if (snapshot.viewer !== null && who === snapshot.viewer.toLowerCase()) {
+            body.assignees = [snapshot.viewer];
+            changed.push(`assigned to ${snapshot.viewer}`);
+          } else {
+            throw new Error(`sourceUpdateIssue assigns only to this server's own login (${snapshot.viewer ?? "unknown"}), not ${JSON.stringify(assignee)}`);
+          }
+        }
+        if (addLabels.length > 0 || (state !== undefined && state.startsWith("status:"))) body.labels = [...labels];
+        if (Object.keys(body).length > 0) await restWrite(`${issuesPath(ref.repo)}/${ref.number}`, body, checkSignal(), "PATCH");
+        if (addLabels.length > 0) changed.push(`labels ${[...labels].join(", ")}`);
+        return { ok: true, changed };
       },
       async sourceComment() {
         throw new Error("sourceComment is a Linear write; the github source does not serve it");

@@ -91,7 +91,7 @@ Everything below is shared. In both modes the marker carries
 
 The spawn prompt names the repository, the PR number, the ticket key, its
 title and acceptance criteria, and the author thread id. If the prompt is
-missing the acceptance criteria, read them from the ticket (`linear_issue`)
+missing the acceptance criteria, read them from the ticket (`ticket_read`)
 or the PR body and say in your review that you did. A Dependabot
 version-update PR, or a worker's replacement for one (the project's
 `deps-prs` playbook), has no ticket: the PR body is the spec, the criteria
@@ -112,7 +112,7 @@ worker that spawned you.
    `gh api repos/<repo>/pulls/<n>/comments`): do not repeat what an
    existing `Claude Code Review` or the previous round already said, but
    do check whether the author acted on it. Read any Linear ticket the
-   title or body names (`linear_issue`).
+   title or body names (`ticket_read`).
 2. **Judge substantial, and the referenced ticket's spec.** Do this before
    the rebase push, the tests or the lane classification, and from the diff
    (`gh pr diff`), never from the pull request body. Read the review
@@ -125,7 +125,7 @@ worker that spawned you.
    threshold. Read the list from the playbook, not from memory. **A playbook
    with no `substantial` list has not opted in: nothing is substantial, so
    mark `substantial=no spec=no` and skip the Product section.** Then look
-   for a ticket the title or body references, read it (`linear_issue`) and
+   for a ticket the title or body references, read it (`ticket_read`) and
    find its binding with `bb stewards show <KEY>`: it has an approved spec
    when its `Ready:` line names an approval. A pull request whose referenced
    ticket has an approved spec cites it and is not re-asked, however large

@@ -204,9 +204,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   flight already, so two tickets going ready in the same minute schedule
   against each other rather than racing to In Progress. `bb stewards show` prints
   what a binding touches and overlaps; the project steward's wake lists
-  both for every binding. Everything else is the tools every thread has: `linear_*`, `gh`,
-  and `bb thread spawn` / `tell` for workers, which stewards recognizes as
-  workers by their lifecycle owner.
+  both for every binding. Everything else is the tools every thread has: the
+  source-neutral `ticket_*` tools, `linear_*` for Linear-specific features,
+  `gh` for pull requests, and `bb thread spawn` / `tell` for workers, which
+  stewards recognizes as workers by their lifecycle owner.
 - **Lifecycle.** A terminal state gets a wrap-up turn with its workers
   still running. The steward either ends the binding there, or keeps it open
   to follow through (`steward_report { followThrough }`) on what the state
@@ -563,7 +564,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   and the steward is then woken with it framed as the owner's confirmation.
   A vague "sure" releases nothing and is re-asked once. The three intents
   in BB-11 use tools stewards already have: "build this" is
-  `linear_update_issue` (label and Todo), "halt work" is a hold plus a move
+  `ticket_update` (label and Todo), "halt work" is a hold plus a move
   to Backlog, and a redirect is `steward_update { guidance }`. A steward may
   put its own binding on hold for this, but only its parent or the project
   steward lifts a hold.
@@ -936,7 +937,7 @@ GitHub target the issue gets `bb-managed`, `status:todo` and a
 other severity's ticket raises the owner's adoption decision, kept by the
 plugin until answered, with one overdue reminder). A GitHub filing target
 (`ops.team`, or a role's `team`, an `owner/repo` in `repos.json`) files with
-`gh issue create`, assigned to this server's GitHub login, and reads state,
+`ticket_file`, assigned to this server's GitHub login, and reads state,
 dedup and auto-adoption through the github source exactly as a Linear team
 does through linear; `bb stewards check --create-labels` creates the
 `priority:<level>` labels its `autoAdopt` names in the filing repo (and

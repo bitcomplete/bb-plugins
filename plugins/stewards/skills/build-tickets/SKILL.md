@@ -49,24 +49,22 @@ The ticket's state is how the team sees progress:
 | In Review | A PR is open; the reviewer thread and, in the owner lane, a human are reviewing it. |
 | Done | Merged and deployed; the steward sets it once the deployment source confirms it. |
 
-On a **GitHub issue** the same states are the status labels `status:todo`,
-`status:in-progress` and `status:in-review`, swapped with `gh issue edit
---add-label/--remove-label`; the terminal state is the issue closed, and only
-the steward closes it.
+Move the ticket's state with `ticket_update { key, state }`. On Linear that is
+a workflow state name. On a GitHub issue the state is a `status:<phase>`
+label (`status:todo`, `status:in-progress`, `status:in-review`) or `closed`:
+`ticket_update` swaps the status label, and `closed` closes the issue. Only
+the steward closes a GitHub issue.
 
 A worker never sets **Done**. The steward sets it, which ends the steward's
 binding and archives the steward's thread, once every pull request is
 merged and the project's deployment source confirms it is live. End at
 merge.
 
-`linear_comment` and `linear_update_issue` sign what you write; do not add
-a signature line to Linear comments yourself. On a GitHub issue, comment with
-`gh issue comment`, move state by swapping the status label with `gh issue
-edit --add-label/--remove-label`, and close with `gh issue close`. Everything
-you post with `gh` ends with `_— from bb thread ${BB_THREAD_ID:?}_`: the
-shell's `:?` makes the command fail when `BB_THREAD_ID` is unset, rather than
-writing a signature with no thread id, which the plugin would read as the
-owner's own words.
+`ticket_comment` and `ticket_update` sign for you; add no signature to what
+you pass them. `gh` stays for pull requests: everything you post with `gh`
+ends with `_— from bb thread ${BB_THREAD_ID:?}_`: the shell's `:?` makes the
+command fail when `BB_THREAD_ID` is unset, rather than writing a signature
+with no thread id, which the plugin would read as the owner's own words.
 
 ## Build
 
@@ -171,9 +169,8 @@ Sibling PR: <the pull request this is one half of, or omit when it stands alone.
 ```
 
 Mark it ready (not draft) once checks pass, move the ticket to **In
-Review**, and comment the PR URL on the ticket. On a GitHub issue, that is
-`gh issue edit --remove-label status:in-progress --add-label status:in-review`
-and a signed `gh issue comment`.
+Review** with `ticket_update { key, state }`, and comment the PR URL on the
+ticket with `ticket_comment`.
 
 ## Get it reviewed
 
@@ -424,9 +421,9 @@ merge stages a restart, say so in your final message.
 
 Do not move the ticket to **Done**: the steward closes it once every pull
 request is merged and deployed, and it is woken by the deployment source,
-not by you. Leave the ticket's state to the steward. On a GitHub issue the
-steward's close is `gh issue close <owner/repo#N> --comment "<what shipped>"`,
-and it waits for the same deployment confirmation.
+not by you. Leave the ticket's state to the steward. A GitHub issue is
+closed with `ticket_update { key, state: "closed" }` and a closing
+`ticket_comment`, and it waits for the same deployment confirmation.
 
 A docs-only or host-side change builds nothing, and host-side material
 still has to be applied on the host by hand: say so in your final message.

@@ -396,6 +396,32 @@ describe("tools", () => {
     expect(await harness.callRpc("sourceComment", { key: "ENG-123", body: "Hi there\n\n_— from bb thread thr_x_" })).toEqual({ ok: true, url: "https://linear.app/c/2" });
   });
 
+  it("sourceUpdateIssue sets the workflow state and the assignee, refusing another person (BB-360)", async () => {
+    const ref = issue();
+    let lastInput: Record<string, unknown> = {};
+    const { harness } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")) {
+            lastInput = body.variables!.input as Record<string, unknown>;
+            return { data: { issueUpdate: { success: true, issue: { identifier: "ENG-123", state: { name: "Done" }, assignee: { name: "Jane", displayName: "jane", email: "jane@acme.test" }, labels: { nodes: [] }, priority: 0 } } } };
+          }
+          if (body.query.startsWith("query($who: String!) { users")) return { data: { users: { nodes: [{ id: "u-other", name: "Other", displayName: "Other", email: "other@acme.test", active: true }] } } };
+          return { data: { issue: ref, issueLabels: { nodes: [] } } };
+        },
+      },
+    });
+    const out = (await harness.callRpc("sourceUpdateIssue", { key: "ENG-123", state: "Done", assignee: "me" })) as { ok: boolean; changed: string[] };
+    expect(out.ok).toBe(true);
+    expect(lastInput).toMatchObject({ stateId: "s-done", assigneeId: "u1" });
+    expect(out.changed).toContain("now Done");
+    expect(out.changed).toContain("assigned to jane");
+    // Another person is refused before the write; a state the team lacks too.
+    await expect(harness.callRpc("sourceUpdateIssue", { key: "ENG-123", assignee: "Other" })).rejects.toThrow(/own user/u);
+    await expect(harness.callRpc("sourceUpdateIssue", { key: "ENG-123", state: "Nope" })).rejects.toThrow(/no state named/u);
+  });
+
   it("sourceCreateIssue files a signed issue, refusing an unsigned description and anyone but this server's own user (BB-360)", async () => {
     const team = {
       id: "t-eng",

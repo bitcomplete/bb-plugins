@@ -93,6 +93,19 @@ describe("source-contract.ts", () => {
     expect(sourceContract.sourceCreateIssue.output.safeParse({ id: "uuid-1", key: "ENG-1" }).success).toBe(false);
   });
 
+  it("parses sourceUpdateIssue's ticket fields, state and assignee included (BB-360)", () => {
+    expect(sourceContract.sourceUpdateIssue.input.parse({ key: "ENG-1" })).toEqual({ key: "ENG-1", addLabels: [], relations: [] });
+    expect(sourceContract.sourceUpdateIssue.input.parse({ key: "ENG-1", addLabels: ["auth"], priority: "high", state: "Done", assignee: "me", relations: [{ type: "blockedBy", issue: "ENG-2" }] })).toMatchObject({
+      addLabels: ["auth"],
+      priority: "high",
+      state: "Done",
+      assignee: "me",
+      relations: [{ type: "blockedBy", issue: "ENG-2" }],
+    });
+    expect(sourceContract.sourceUpdateIssue.input.safeParse({ key: "ENG-1", priority: "someday" }).success).toBe(false);
+    expect(sourceContract.sourceUpdateIssue.output.parse({ ok: true, changed: ["now Done"] })).toEqual({ ok: true, changed: ["now Done"] });
+  });
+
   it("parses sourceBacklog, telling a capped read, an empty backlog and an unsupported source apart (BB-331)", () => {
     const issue = {
       id: "uuid-1",

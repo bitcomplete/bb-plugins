@@ -462,18 +462,26 @@ export const sourceContract = {
     }),
   },
   /**
-   * The backlog steward's one gated write (BB-341): add labels, set a
-   * priority, add relations. Stewards validates every field, the label
-   * vocabulary, the adoption check, the priority rule and the comment budget
-   * before it calls; the source only applies the plan. Additive and optional:
-   * a source that does not serve it is unavailable to the caller. A source
-   * that has no issue priority or relations (GitHub) answers with an error.
+   * A ticket write (BB-341, BB-360): add labels, set a priority, set the
+   * workflow state, set the assignee, add relations. Stewards validates every
+   * field, the label vocabulary, the adoption check, the priority rule and the
+   * comment budget before it calls; the source only applies the plan. Additive
+   * and optional: a source that does not serve it is unavailable to the
+   * caller, and a source that has no concept for one field answers with an
+   * error for that field (GitHub has no issue priority or relations).
+   * `state` is a workflow state's name on Linear; on GitHub it is `open`,
+   * `closed` or a `status:<phase>` label, which replaces the other status
+   * labels. `assignee` names only this server's own login, or none: `me`
+   * always means the source's own login, and any other person is refused,
+   * because no steward assigns work to someone else.
    */
   sourceUpdateIssue: {
     input: z.object({
       key: z.string().min(1).max(200),
       addLabels: z.array(z.string().min(1).max(100)).max(50).default([]),
       priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional(),
+      state: z.string().min(1).max(60).optional(),
+      assignee: z.string().min(1).max(200).optional(),
       relations: z.array(z.object({ type: z.enum(["blockedBy", "blocks", "related", "duplicate"]), issue: z.string().min(1).max(200) })).max(20).default([]),
     }),
     output: z.object({ ok: z.boolean(), changed: z.array(z.string()) }),
