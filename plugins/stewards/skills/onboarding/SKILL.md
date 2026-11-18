@@ -52,9 +52,10 @@ and list them as assumptions. Cover:
 1. **The project steward login** — the GitHub login whose server runs the
    project steward and forwards the project's big decisions.
 2. **The owner's decisions versus the project steward's.** Present the
-   defaults, then candidate `project` entries with `paths` from the survey
-   (each path prefixed with its repo directory from `repos.json`, e.g.
-   `web/src/…`).
+   defaults, then candidate `project` entries with `paths` from the survey.
+   On a multi-repo project each path is prefixed with its repo directory from
+   `repos.json` (e.g. `web/src/…`); on a native single-repo project there is
+   no `repos.json`, so the paths are relative to the repo root (e.g. `src/…`).
 3. **How a merge is known live** — the repo, environment and rule the
    playbook's `deployment` should use. Ask this when the README, docs and code
    do not already say; the default when nothing says otherwise is **merged is
@@ -132,11 +133,14 @@ issue's state is a label. Then fix every
 `problem:` line before going on; a `failed to create` line is one of them.
 A problem is a fact about the project, not a warning to explain away.
 
-Commit inside `.bb`, publish with `workspace_publish_guidance`, and open a
-pull request on the primary repo. The body lists **every assumption** you made
-— each default you took, each question you did not ask, each fact the survey
-could not read — so the owner's review is the second interview. Name the repo
-dirs and the decide-list paths so a reader can check them against `repos.json`.
+Commit inside `.bb`, then land the guidance: on a multi-repo project publish
+with `workspace_publish_guidance`; on a native single-repo project commit the
+branch and open the guidance pull request on the repo yourself (there is no
+multi-repo tool and no `repos.json`). The body lists **every assumption** you
+made — each default you took, each question you did not ask, each fact the
+survey could not read — so the owner's review is the second interview. Name
+the repo dirs and the decide-list paths so a reader can check them against
+`repos.json` on a multi-repo project, or against the repo root on a native one.
 
 Stewards read committed `origin/main` only, so **nothing is live until the
 pull request merges**. Do not run `bb stewards enable` early.

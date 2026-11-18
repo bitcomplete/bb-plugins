@@ -187,4 +187,11 @@ describe("the onboarding skill's stock-install path (BB-364)", () => {
     expect(onboardingSkill).toMatch(/run `init` with no `--teams`/u);
     expect(onboardingSkill).toMatch(/--timezone[\s\S]*?--prefix/u);
   });
+
+  it("splits the guidance landing and decide-list paths for a native single-repo project", () => {
+    expect(onboardingSkill).toMatch(/on a native single-repo project commit the\s+branch and open the guidance pull request on the repo yourself/u);
+    expect(onboardingSkill).toMatch(/the paths are relative to the repo root/u);
+    // The bare multi-repo-only instruction is gone.
+    expect(onboardingSkill).not.toMatch(/publish with `workspace_publish_guidance`, and open a\s+pull request/u);
+  });
 });
