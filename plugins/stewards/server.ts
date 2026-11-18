@@ -12418,7 +12418,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .array(z.string().trim().min(1).max(200))
           .max(40)
           .optional()
-          .describe('The repo-relative files this work changes, repo directory first ("bb-plugins/plugins/stewards/wake.ts", "acme/web/docker/Dockerfile"); the whole set, replacing what was reported before. A directory is accepted and counts as every file under it. The project steward schedules tickets whose files overlap one after another, and stacks a ticket on a pull request still being built. Report it once the spec names the affected repos; refine it as pull requests open.'),
+          .describe('The repo-relative files this work changes, repo directory first ("bb-plugins/plugins/stewards/wake.ts", "web/docker/Dockerfile"); the whole set, replacing what was reported before. A directory is accepted and counts as every file under it. The project steward schedules tickets whose files overlap one after another, and stacks a ticket on a pull request still being built. Report it once the spec names the affected repos; refine it as pull requests open.'),
         cites: z
           .array(z.string().trim().min(1).max(100))
           .max(20)

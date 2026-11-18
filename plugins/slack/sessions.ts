@@ -343,10 +343,10 @@ export function couldNotFetchLine(files: SessionFile[]): string {
   return `could not fetch ${shown.join(", ")}${more}`;
 }
 
-/** The image mime types the file endpoint forwards, mirroring web's slackImageMimes. */
+/** The image mime types the file endpoint forwards, mirroring the hooks service's slackImageMimes. */
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 /**
- * Non-`text/*` mime types the endpoint forwards, mirroring web's
+ * Non-`text/*` mime types the endpoint forwards, mirroring the hooks service's
  * slackTextMimes. Slack often labels a snippet `application/octet-stream` or
  * gives no mime type, so a code `filetype` counts too.
  */
@@ -369,7 +369,7 @@ const TEXT_MIMES = new Set([
   "application/csv",
   "application/toml",
 ]);
-/** Slack filetype labels that count as text, mirroring web's slackTextFiletypes. */
+/** Slack filetype labels that count as text, mirroring the hooks service's slackTextFiletypes. */
 const TEXT_FILETYPES = new Set([
   "text", "csv", "json", "markdown", "md", "javascript", "typescript", "python", "ruby", "go", "golang", "java", "c", "cpp", "csharp", "shell", "bash", "sh", "yaml", "yml", "xml", "html", "css", "sql", "rust", "kotlin", "swift", "php", "perl", "r", "scala", "diff", "patch", "dockerfile", "makefile", "toml", "ini", "cfg", "log", "tsv", "textile", "latex", "objectivec", "dart",
 ]);
