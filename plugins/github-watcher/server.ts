@@ -44,6 +44,7 @@ import {
   labelAlreadyExists,
   labelPath,
   parseCompare,
+  parseCreatedComment,
   parseCreatedIssue,
   parseDefaultBranch,
   parseDependabotAlerts,
@@ -1032,9 +1033,12 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const labels = new Set(snapshot.labels);
         for (const label of addLabels) labels.add(label);
         if (state !== undefined) {
-          if (state === "open" || state === "closed") {
-            body.state = state;
-            changed.push(state === "closed" ? "closed" : "reopened");
+          if (state === "open" || state === "closed" || state === "closed (not planned)") {
+            body.state = state === "open" ? "open" : "closed";
+            // GitHub records why a close happened; `closed` is completed, the
+            // playbook's other terminal state is not planned.
+            if (state !== "open") body.state_reason = state === "closed (not planned)" ? "not_planned" : "completed";
+            changed.push(state === "open" ? "reopened" : state === "closed (not planned)" ? "closed as not planned" : "closed");
           } else if (state.startsWith("status:")) {
             for (const label of [...labels]) if (label.startsWith("status:")) labels.delete(label);
             labels.add(state);
@@ -1060,8 +1064,16 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         if (addLabels.length > 0) changed.push(`labels ${[...labels].join(", ")}`);
         return { ok: true, changed };
       },
-      async sourceComment() {
-        throw new Error("sourceComment is a Linear write; the github source does not serve it");
+      // BB-360: the source-neutral ticket_comment. The caller has already
+      // signed the body with the contract's signature line; an unsigned one is
+      // refused here, exactly as sourceCreateIssue refuses an unsigned
+      // description.
+      async sourceComment({ key, body }) {
+        if (signedBy(body) === null) throw new Error("a comment must end with the bb thread signature line; nothing was posted");
+        const ref = parseRefKey(key);
+        if (ref === null) throw new Error(`${key} is not a GitHub issue key like owner/repo#12`);
+        const created = parseCreatedComment(await restWrite(`${issuesPath(ref.repo)}/${ref.number}/comments`, { body }, checkSignal()));
+        return { ok: true, url: created.url };
       },
 
       // BB-360: file an issue for the source-neutral ticket tools. The caller

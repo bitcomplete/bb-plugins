@@ -146,6 +146,8 @@ export type TicketWatcher = { threadId: string; key: string };
 export interface TicketWatches {
   add(threadId: string, ref: { source: Source; id: string; key: string }): Promise<void>;
   remove(threadId: string, source: Source, id: string): Promise<void>;
+  /** Forget every watch a thread holds, when the thread is archived or deleted. */
+  removeThread(threadId: string): Promise<void>;
   /** Every thread watching this entity, with the key to show it. */
   watchers(source: Source, id: string): Promise<TicketWatcher[]>;
   /** The watched entity ids per source, for the interest set the sources lease on. */
@@ -159,6 +161,10 @@ export function createTicketWatches(kv: PluginKvStorage): TicketWatches {
     },
     async remove(threadId, source, id) {
       await kv.delete(watchKey(source, id, threadId));
+    },
+    async removeThread(threadId) {
+      const suffix = `/${threadId}`;
+      for (const key of await kv.list(WATCH_PREFIX)) if (key.endsWith(suffix)) await kv.delete(key);
     },
     async watchers(source, id) {
       const prefix = `${WATCH_PREFIX}${source}/${id}/`;
@@ -338,11 +344,11 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
   bb.agents.registerTool({
     name: "ticket_update",
     description:
-      "Change a ticket by key: add labels, set a priority, set the workflow state, set the assignee, or add relations ({ type, issue } with type blockedBy, blocks, related or duplicate). Give only the fields to change. A source that does not support a field returns its own error, as the GitHub source does for this write. The assignee is this server's own login or nobody.",
+      "Change a ticket by key: add labels, set a priority, set the state, set the assignee, or add relations ({ type, issue } with type blockedBy, blocks, related or duplicate). Give only the fields to change; a source that has no concept for a field returns its own error. `state` is the source's own vocabulary: a Linear workflow state name, or on GitHub `open`, `closed`, `closed (not planned)` or a `status:<phase>` label, which replaces the other status labels. `priority` is Linear's (GitHub has none). The assignee is this server's own login or nobody.",
     presentation: { label: { pending: "Updating a ticket", completed: "Updated a ticket" } },
     parameters: z.object({
       key: z.string().trim().min(1).max(300).describe("The ticket key: BB-123, or owner/repo#12."),
-      state: z.string().trim().min(1).max(60).optional().describe("A workflow state name, matched ignoring case (a source with states)."),
+      state: z.string().trim().min(1).max(60).optional().describe("The state: a Linear workflow state name, or on GitHub `open`, `closed`, `closed (not planned)` or a `status:<phase>` label."),
       labels: z.array(z.string().trim().min(1).max(100)).max(50).optional().describe("Label names to add."),
       priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority. A source with no priority refuses it."),
       assignee: z.string().trim().min(1).max(200).optional().describe("'me' for this server's own login, or 'nobody' to clear. Any other person is refused."),

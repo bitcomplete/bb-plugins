@@ -57,9 +57,9 @@ const onboardingSkill = readFileSync(fileURLToPath(new URL("./skills/onboarding/
 describe("the shipped stewards skill's child filing (BB-250, BB-360)", () => {
   it("files a child through the source-neutral ticket_file, naming the parent", () => {
     expect(stewardsSkill).toContain("### Filing a child");
-    expect(stewardsSkill).toContain("ticket_file { unit, title, description, parent }");
+    expect(stewardsSkill).toContain('ticket_file { unit, title, description, parent, assignee: "me" }');
     expect(stewardsSkill).toMatch(/native sub-issue/u);
-    expect(stewardsSkill).toMatch(/assigns the\nchild to this server's login/u);
+    expect(stewardsSkill).toMatch(/assigns the\s+child to this server's login/u);
   });
 });
 

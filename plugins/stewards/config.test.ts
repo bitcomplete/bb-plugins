@@ -667,9 +667,9 @@ describe("the GitHub issue playbook (BB-234)", () => {
     expect(parsed.value.may).toContain("create-sub-issue");
     expect(parsed.value.promote).toBe("A sub-issue that needs more than one pull request, its own approval, or work in a repo the parent does not touch.");
     const todo = phaseInstructions(parsed.value, "status:todo")!;
-    expect(todo).toContain("ticket_file { unit, title, description, parent }");
+    expect(todo).toContain('ticket_file { unit, title, description, parent, assignee: "me" }');
     expect(todo).toMatch(/real sub-issue/u);
-    expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/ticket_update \{ key, state: "closed" \}/u);
+    expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/ticket_update \{ key, state \}/u);
     expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
     expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");
   });

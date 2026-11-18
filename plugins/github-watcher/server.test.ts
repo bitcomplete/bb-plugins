@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, pullList: [] as unknown[], pullListStatus: 200, pullListMessage: "Forbidden", pullListRetryAfter: "120", openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, issuePatches: [] as Array<{ repo: string; number: number; body: Record<string, unknown> }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, pullList: [] as unknown[], pullListStatus: 200, pullListMessage: "Forbidden", pullListRetryAfter: "120", openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, issuePatches: [] as Array<{ repo: string; number: number; body: Record<string, unknown> }>, commentCreates: [] as Array<{ repo: string; number: number; body: string }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -115,6 +115,15 @@ function fakeGitHub() {
       state.subIssueLinks.push({ repo, parent: Number(subIssues[3]), body });
       if (state.subIssueStatus >= 400) return Response.json({ message: state.subIssueMessage }, { status: state.subIssueStatus });
       return Response.json({ id: 999, number: state.issueCreateNumber, sub_issue_id: body.sub_issue_id });
+    }
+    const commentCreate = /\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)\/comments(?:\?|$)/u.exec(u);
+    if (commentCreate !== null && init?.method === "POST") {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      const repo = `${commentCreate[1]}/${commentCreate[2]}`;
+      const number = Number(commentCreate[3]);
+      const body = JSON.parse(String(init.body)) as { body: string };
+      state.commentCreates.push({ repo, number, body: body.body });
+      return Response.json({ id: 1, html_url: `https://github.com/${repo}/issues/${number}#issuecomment-1` }, { status: 201 });
     }
     const issuePatch = /\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:\?|$)/u.exec(u);
     if (issuePatch !== null && init?.method === "PATCH") {
@@ -899,6 +908,17 @@ describe("stewards' source contract", () => {
     await expect(w.harness.callRpc("sourceCreateIssue", { unit: "widgets", title: "x", description: "Hi\n\n_— from bb thread thr_x_" }, STEWARDS)).rejects.toThrow(/not owner\/repo/u);
   });
 
+  it("comments on a GitHub issue through sourceComment, refusing an unsigned body (BB-360)", async () => {
+    const w = await setup();
+    const out = await w.harness.callRpc("sourceComment", { key: "Acme/Widgets#7", body: "On it.\n\n_— from bb thread thr_x_" }, STEWARDS);
+    expect(out).toEqual({ ok: true, url: "https://github.com/Acme/Widgets/issues/7#issuecomment-1" });
+    expect(w.github.state.commentCreates).toEqual([{ repo: "Acme/Widgets", number: 7, body: "On it.\n\n_— from bb thread thr_x_" }]);
+    // An unsigned body never reaches GitHub; a bad key is refused first.
+    await expect(w.harness.callRpc("sourceComment", { key: "Acme/Widgets#7", body: "No signature" }, STEWARDS)).rejects.toThrow(/signature line/u);
+    await expect(w.harness.callRpc("sourceComment", { key: "nonsense", body: "Hi\n\n_— from bb thread thr_x_" }, STEWARDS)).rejects.toThrow(/not a GitHub issue key/u);
+    expect(w.github.state.commentCreates).toHaveLength(1);
+  });
+
   it("updates a GitHub issue through sourceUpdateIssue: labels, a status swap and the state (BB-360)", async () => {
     const w = await setup();
     w.github.state.node = issueNode({ labels: { nodes: [{ name: "bb-managed" }, { name: "status:todo" }] } });
@@ -907,7 +927,10 @@ describe("stewards' source contract", () => {
     expect(w.github.state.issuePatches).toEqual([{ repo: "Acme/Widgets", number: 7, body: { labels: ["bb-managed", "bug", "status:in-progress"], assignees: ["dev"] } }]);
     // Closing and reopening are the issue's own state, with no label swap.
     await w.harness.callRpc("sourceUpdateIssue", { key: "Acme/Widgets#7", state: "closed" }, STEWARDS);
-    expect(w.github.state.issuePatches.at(-1)!.body).toEqual({ state: "closed" });
+    expect(w.github.state.issuePatches.at(-1)!.body).toEqual({ state: "closed", state_reason: "completed" });
+    // A not-planned close is expressible too.
+    await w.harness.callRpc("sourceUpdateIssue", { key: "Acme/Widgets#7", state: "closed (not planned)" }, STEWARDS);
+    expect(w.github.state.issuePatches.at(-1)!.body).toEqual({ state: "closed", state_reason: "not_planned" });
     // Priority, relations and another assignee are refused, as the contract says.
     await expect(w.harness.callRpc("sourceUpdateIssue", { key: "Acme/Widgets#7", priority: "high" }, STEWARDS)).rejects.toThrow(/no priority/u);
     await expect(w.harness.callRpc("sourceUpdateIssue", { key: "Acme/Widgets#7", relations: [{ type: "blockedBy", issue: "Acme/Widgets#8" }] }, STEWARDS)).rejects.toThrow(/no relations/u);

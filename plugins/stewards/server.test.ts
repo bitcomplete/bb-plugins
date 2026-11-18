@@ -18312,9 +18312,11 @@ describe("the source-neutral ticket tools (BB-360)", () => {
     expect((await t.tool("ticket_file", { unit: "ENG", title: "New", description: "Body", assignee: "sam" }, steward)).error).toBe(true);
   });
 
-  it("ticket_watch leases the entity and the ring wakes the watching thread", async () => {
+  it("ticket_watch leases the entity, the ring wakes the thread once, and the watch ends", async () => {
     const { t, steward } = await withSteward();
-    t.entities.set("acme/web#3", githubTicket());
+    // Unlabelled, so the ring never adopts it and the interest set is the watch's alone.
+    const watched = githubTicket({ labels: [], state: "open", assignees: [] });
+    t.entities.set("acme/web#3", watched);
     const out = await t.tool("ticket_watch", { key: "acme/web#3" }, steward);
     expect(out.error).toBe(false);
     expect(out.text).toContain("acme/web#3");
@@ -18323,8 +18325,17 @@ describe("the source-neutral ticket tools (BB-360)", () => {
     expect((interest.input as { entities: string[] }).entities).toContain("acme/web#3");
     // A ring on the watched entity wakes the thread, through the same path a binding uses.
     t.sends.length = 0;
-    t.entities.set("acme/web#3", githubTicket({ title: "Changed" }));
+    t.entities.set("acme/web#3", { ...watched, title: "Changed" });
     await t.ring("github", "acme/web#3");
     expect(t.sends.some((s) => s.threadId === steward && s.text.includes("acme/web#3 changed"))).toBe(true);
+    // The watch is one-shot: a second change does not message the thread
+    // again, and the entity leaves the interest set.
+    t.sends.length = 0;
+    t.entities.set("acme/web#3", { ...watched, title: "Changed again" });
+    await t.ring("github", "acme/web#3");
+    expect(t.sends.some((s) => s.threadId === steward && s.text.includes("acme/web#3 changed"))).toBe(false);
+    await t.flush();
+    const after = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!;
+    expect((after.input as { entities: string[] }).entities).not.toContain("acme/web#3");
   });
 });

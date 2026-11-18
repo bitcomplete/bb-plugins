@@ -470,8 +470,8 @@ export const sourceContract = {
    * caller, and a source that has no concept for one field answers with an
    * error for that field (GitHub has no issue priority or relations).
    * `state` is a workflow state's name on Linear; on GitHub it is `open`,
-   * `closed` or a `status:<phase>` label, which replaces the other status
-   * labels. `assignee` names only this server's own login, or none: `me`
+   * `closed`, `closed (not planned)` or a `status:<phase>` label, which
+   * replaces the other status labels. `assignee` names only this server's own login, or none: `me`
    * always means the source's own login, and any other person is refused,
    * because no steward assigns work to someone else.
    */

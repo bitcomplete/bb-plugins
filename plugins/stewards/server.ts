@@ -7676,10 +7676,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** A ring from a source: look at the binding(s) it concerns, or consider adopting. */
     async function onRing(source: Source, id: string): Promise<void> {
       // BB-360: a thread that watched this entity with `ticket_watch` is woken
-      // here, through the same ring path a binding is. The watch row is the
-      // truth; the ring only says the entity may have changed.
-      for (const w of await ticketWatches.watchers(source, id)) {
-        await sendTo(w.threadId, `Ticket ${w.key} changed. Read it with ticket_read and carry on.`);
+      // here, through the same ring path a binding is. The watch is one-shot:
+      // it is dropped once it fires, so a later change does not message the
+      // thread again (a re-watch asks for another wake). `send`, not `sendTo`,
+      // so waking a watcher never unarchives a thread.
+      const watching = await ticketWatches.watchers(source, id);
+      if (watching.length > 0) {
+        for (const w of watching) {
+          await send(w.threadId, `Ticket ${w.key} changed. Read it with ticket_read and carry on.`);
+          await ticketWatches.remove(w.threadId, source, id);
+        }
+        // The entity may leave the interest set now no one watches it.
+        pushInterest();
       }
       const bound = store.byEntity(source, id);
       // Ring every binding of the entity, not only the one `byEntity` picks:
@@ -10156,6 +10164,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         pushInterest();
       }),
     );
+    // BB-360: a deleted thread's ticket watches are forgotten, so its id does
+    // not stay in the interest set forever.
+    bb.events.on("thread.deleted", ({ thread }) => {
+      void ticketWatches
+        .removeThread(thread.id)
+        .then(() => pushInterest())
+        .catch((error) => bb.log.warn(`stewards: could not forget ${thread.id}'s ticket watches: ${errorMessage(error)}`));
+    });
 
     // ---- @bb mentions ----------------------------------------------------------------------------------
     //

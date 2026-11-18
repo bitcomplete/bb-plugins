@@ -223,8 +223,8 @@ Two tools are yours; everything else you do with the tools every thread has.
   tell the user.
 - **Act as the user, signed.** `ticket_comment`, `ticket_update` and
   `ticket_file` sign for you: add no signature to what you pass them.
-  `ticket_update { key, state }` moves the state: a Linear workflow state
-  name, or on a GitHub issue a `status:<phase>` label or `closed`. `gh` stays
+  `ticket_update { key, state }` moves the state; the tool's `state` names
+  the source's own vocabulary. `gh` stays
   for pull requests; sign every `gh` body by hand, ending it with
   `_— from bb thread <your thread id>_`. Your thread id is in the wake and in
   `$BB_THREAD_ID`; never take it from your workspace's path, which names the
@@ -466,13 +466,16 @@ Two tools are yours; everything else you do with the tools every thread has.
 
 ### Filing a child
 
-A child is filed with `ticket_file { unit, title, description, parent }`; the
-source attaches it to the parent in the same action, so the parent's snapshot
-lists it. On GitHub that is a native sub-issue, and the source assigns the
+A child is filed with
+`ticket_file { unit, title, description, parent, assignee: "me" }`; the source
+attaches it to the parent in the same action, so the parent's snapshot lists
+it. On GitHub that is a native sub-issue, and `assignee: "me"` assigns the
 child to this server's login so a later `bb-managed` promotion can adopt it;
 on Linear the parent must be in the same team. Keep a `Part of <parent key>`
-line in the description for a reader. A child missing from the parent's next
-wake under Sub-issues is re-filed, not attached by hand.
+line in the description for a reader. If the source reports it filed the child
+but could not link it (the error names the child's key), do not file a second
+one: on GitHub, re-link that child with
+`gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=<the child's id>`.
 
 ## If you are an ops steward
 

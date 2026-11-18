@@ -27,6 +27,12 @@ export function parseCreatedIssue(payload: unknown): { id: number; number: numbe
   return { id: parsed.id, number: parsed.number, url: parsed.html_url ?? null };
 }
 
+/** The comment a REST create answered with: its URL, when GitHub returns one. */
+export function parseCreatedComment(payload: unknown): { url: string | null } {
+  const parsed = z.object({ html_url: z.string().nullish() }).parse(payload);
+  return { url: parsed.html_url ?? null };
+}
+
 /**
  * Whether a create-label response is GitHub's "this label already exists"
  * (a 422), which an idempotent create reports as `existed` rather than an

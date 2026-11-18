@@ -49,11 +49,9 @@ The ticket's state is how the team sees progress:
 | In Review | A PR is open; the reviewer thread and, in the owner lane, a human are reviewing it. |
 | Done | Merged and deployed; the steward sets it once the deployment source confirms it. |
 
-Move the ticket's state with `ticket_update { key, state }`. On Linear that is
-a workflow state name. On a GitHub issue the state is a `status:<phase>`
-label (`status:todo`, `status:in-progress`, `status:in-review`) or `closed`:
-`ticket_update` swaps the status label, and `closed` closes the issue. Only
-the steward closes a GitHub issue.
+Move the ticket's state with `ticket_update { key, state }`; the tool's
+`state` names the source's own vocabulary. Only the steward closes a GitHub
+issue.
 
 A worker never sets **Done**. The steward sets it, which ends the steward's
 binding and archives the steward's thread, once every pull request is
@@ -422,8 +420,8 @@ merge stages a restart, say so in your final message.
 Do not move the ticket to **Done**: the steward closes it once every pull
 request is merged and deployed, and it is woken by the deployment source,
 not by you. Leave the ticket's state to the steward. A GitHub issue is
-closed with `ticket_update { key, state: "closed" }` and a closing
-`ticket_comment`, and it waits for the same deployment confirmation.
+closed with `ticket_update { key, state }` and a closing `ticket_comment`,
+and it waits for the same deployment confirmation.
 
 A docs-only or host-side change builds nothing, and host-side material
 still has to be applied on the host by hand: say so in your final message.
