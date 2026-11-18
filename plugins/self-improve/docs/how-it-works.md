@@ -46,7 +46,7 @@ The intended impact screen keeps three facts distinct: **evidence**, **distribut
 
 Both complete workflows remain **pending in this preview**. Existing basic retest and draft export controls are foundations. A draft PR is submitted for review; it is not published, listed or active. This pending work remains part of the delivery scope.
 
-Portability evidence should say **Tested on**, **Requires**, and **Not yet tested**. Provider/model, plugin, skill or configuration changes can require revalidation. Prompts and reviews help reveal assumptions; testing the advertised package/configuration establishes the actual scope.
+The solution detail shows **Tested on**, **Requires**, and **Not yet tested**. New inventor and scout proposals carry an unverified declaration of dependencies, assumptions and proposed package checks. Older records without a declaration remain unknown. The panel does not claim a tested environment until package conformance evidence is available. Provider/model, plugin, skill or configuration changes can require revalidation. Prompts and reviews help reveal assumptions; testing the advertised package/configuration establishes the actual scope.
 
 ## Read performance carefully
 

@@ -48,3 +48,9 @@ Optional `runId` and `solutionId` attribute the expense. `attemptId` links a **s
 Use `replacesId` to correct the latest unreplaced charge, or a positive reported credit with `appliesToId`. Credits cannot exceed the remaining charge. Definitions and history are immutable; duplicate idempotency keys with different content are refused.
 
 Inspect the records with `bb self-improve costs` and policy with `bb self-improve budgets`. Compare observations, missing reports and failed attempts before raising a limit. Fixture tests validate the accounting rules; real-provider and long-running cost coverage still need evidence at the delivered revision.
+
+## When solutions are merged
+
+The live solution view includes costs recorded against its retained aliases. It selects the full family once, so a shared cumulative provider session is not added again for each alias. A provider session shared with other solutions remains ambiguous.
+
+Original solution IDs, failed attempts and cost records stay unchanged. Performance history includes observations from those aliases, with each observation’s original identity and cost snapshot. Historical snapshots do not change when a later charge arrives or an alias is added; inspect the current cost view for the latest accounting.

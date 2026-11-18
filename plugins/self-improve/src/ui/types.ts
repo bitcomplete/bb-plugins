@@ -1,3 +1,4 @@
+import type { PublicationApi } from "../publication-view.js";
 import type { ActivityCostView } from "../activity-view.js";
 import type { Problem, RankedSolution, Solution, Verification, Vote } from "../domain/types.js";
 
@@ -8,6 +9,7 @@ export interface RetestRecord {
 }
 export interface DashboardData {
   problems: Problem[];
+  /** Preserve the selected solution's optional portability declaration; absence means unknown. */
   solutions: Solution[];
   ranking: RankedSolution[];
   runs: Array<{ id: string; stage: string; status: string; startedAt: number; endedAt: number | null; counts: Record<string, number>; errors: string[] }>;
@@ -39,7 +41,7 @@ export interface ObjectiveInput {
   metric?: { name: string; unit: string; target: number; direction: "lower" | "higher" };
 }
 export interface ExportArtifact { artifactId: string; files: Array<{ path: string; content: string }>; status: "draft"; bundleSha256: string }
-export interface DashboardApi {
+export interface DashboardApi extends Partial<PublicationApi> {
   dashboard(input: Record<string, never>): Promise<DashboardData>;
   retest(input: { solutionId: string; expectedVersion: number; reason: string }): Promise<{ jobId: string }>;
   startChat(input: { kind: Selection["kind"]; id: string; projectId: string }): Promise<{ threadId: string }>;

@@ -1,3 +1,4 @@
+import { PublicationStatus } from "./publication-status.js";
 import { ActivityCosts } from "./activity-costs.js";
 import { useEffect, useId, useRef, useState } from "react";
 import type { Solution } from "../domain/types.js";
@@ -29,6 +30,7 @@ export function Performance({ api, solutions, refreshKey }: { api: DashboardApi;
       <div className="si-trend-grid">{ids.map(id => <Trend key={id} name={solutions.find(s => s.id === id)?.title ?? id} points={points.filter(p => p.solutionId === id)}/>)}</div>
       <div className="si-table-wrap" tabIndex={0} role="region" aria-label="Performance observations"><table><caption>Recorded observation windows</caption><thead><tr><th>Solution / observed at</th><th>Phase</th><th>Votes</th><th>Sessions</th><th>Votes / session</th><th>Snapshot cost</th><th>Confounders</th></tr></thead><tbody>{[...points].sort((a,b) => b.atMs - a.atMs).map(p => <tr key={p.id}><th scope="row">{solutions.find(s => s.id === p.solutionId)?.title ?? p.solutionId}<small>{timestamp(p.atMs)}</small></th><td>{p.phase === "baseline" ? "Baseline" : "After adoption"}</td><td>{p.votes}</td><td>{p.sessions}</td><td>{p.rate === null ? "Insufficient exposure" : rateLabel(p.rate)}</td><td>{costLabel(p.costs)}<ActivityCosts value={p.activityCosts}/></td><td>{p.confounders.length ? p.confounders.join("; ") : "None recorded"}</td></tr>)}</tbody></table></div>
     </>}
+    <PublicationStatus api={api} solutionId={selected || undefined} refreshKey={refreshKey}/>
   </div>;
 }
 

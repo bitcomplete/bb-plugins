@@ -2,6 +2,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { Dashboard } from "../../src/ui/dashboard.js";
+import type { PortabilityDeclaration } from "../../src/domain/types.js";
 import type { DashboardApi, DashboardData } from "../../src/ui/types.js";
 import { problem, solution, vote } from "../domain/fixtures.js";
 
@@ -257,4 +258,115 @@ it("resolves chat again when reopening so a revoked cached thread is not reused"
   await screen.findByText("current-policy-chat");
   expect(startChat).toHaveBeenCalledTimes(2);
   expect(screen.queryByText("old-policy-chat")).toBeNull();
+});
+
+
+function portabilityDeclaration(scope = "BB retry skill"): PortabilityDeclaration {
+  return {
+    schemaVersion: 1, status: "unverified", scope, dependencyStatus: "declared",
+    requirements: [
+      { kind: "skill", identity: "retry-helper", versionConstraint: ">=2 <3", setup: "Install the declared skill and enable its retry trigger" },
+      { kind: "capability", identity: "Persisted input storage", versionConstraint: null, setup: "Supply storage through the host; exact configuration unknown" },
+    ],
+    assumptions: ["Retry input can be serialized"],
+    testProposal: { minimalEnvironment: "Use minimal supported BB plus only retry-helper and declared storage", packagedArtifact: "Install the packaged skill and exercise its retry trigger" },
+    untestedConfigurations: ["Another provider", "A different storage configuration"],
+  };
+}
+async function openPortability(snapshot: DashboardData) {
+  setup(snapshot);
+  fireEvent.click(await screen.findByRole("tab", { name: /Established/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Open solution Retain/ }));
+  return within(screen.getByRole("region", { name: "Portability" }));
+}
+it("shows historical portability as unknown with no fabricated tested environment", async () => {
+  const view = await openPortability(data());
+  expect(view.getByText("Unknown · no declaration")).toBeTruthy();
+  for (const label of ["Requires", "Tested on", "Not yet tested"]) expect(view.getByRole("heading", { name: label })).toBeTruthy();
+  expect(view.getByText("Requirements are unknown. This record has no portability declaration.")).toBeTruthy();
+  expect(view.getByText("No verified environment is recorded.")).toBeTruthy();
+  expect(view.getByText("Untested configurations have not been specified.")).toBeTruthy();
+  expect(view.queryByText("Proposed portability checks")).toBeNull();
+});
+it("shows the exact portability scope, dependency identity, version, setup and proposed checks", async () => {
+  const snapshot = data(), declaration = portabilityDeclaration(); snapshot.solutions[0]!.portability = declaration;
+  const view = await openPortability(snapshot);
+  expect(view.getByText("Unverified declaration")).toBeTruthy();
+  expect(view.getByText(declaration.scope)).toBeTruthy();
+  for (const requirement of declaration.requirements) {
+    expect(view.getByText(requirement.identity)).toBeTruthy();
+    expect(view.getByText(requirement.setup)).toBeTruthy();
+  }
+  expect(view.getByText("Skill · Version constraint: >=2 <3")).toBeTruthy();
+  expect(view.getByText("Capability · Version requirement unknown")).toBeTruthy();
+  for (const configuration of declaration.untestedConfigurations) expect(view.getByText(configuration)).toBeTruthy();
+  fireEvent.click(view.getByText("Proposed portability checks"));
+  expect(view.getByText(declaration.testProposal.minimalEnvironment)).toBeTruthy();
+  expect(view.getByText(declaration.testProposal.packagedArtifact)).toBeTruthy();
+  expect(view.getByText(declaration.assumptions[0]!)).toBeTruthy();
+  expect(view.getByText(/Ordinary BB, provider, user and workspace context may have been available/)).toBeTruthy();
+});
+it("keeps none-known portability requirements distinct from a tested independence claim", async () => {
+  const snapshot = data();
+  snapshot.solutions[0]!.portability = { ...portabilityDeclaration(), dependencyStatus: "none-known", requirements: [], untestedConfigurations: [], assumptions: [] };
+  const view = await openPortability(snapshot);
+  expect(view.getByText("No dependencies are known to the proposer. This does not establish independence.")).toBeTruthy();
+  expect(view.getByText("Unverified declaration")).toBeTruthy();
+  expect(view.getByText("No verified environment is recorded.")).toBeTruthy();
+  expect(view.getByText("Untested configurations have not been specified.")).toBeTruthy();
+  fireEvent.click(view.getByText("Proposed portability checks"));
+  expect(view.getByText("No portability assumptions were declared.")).toBeTruthy();
+});
+it("keeps incomplete portability dependency knowledge explicit while showing declared requirements", async () => {
+  const snapshot = data(); snapshot.solutions[0]!.portability = { ...portabilityDeclaration(), dependencyStatus: "unknown" };
+  const view = await openPortability(snapshot);
+  expect(view.getByText("Dependency information is incomplete. Any known requirements are listed below.")).toBeTruthy();
+  expect(view.getByText("retry-helper")).toBeTruthy();
+  expect(view.getByText("Capability · Version requirement unknown")).toBeTruthy();
+});
+it("does not promote recorded solution success or provider identity into portability evidence", async () => {
+  const snapshot = data(), selected = snapshot.solutions[0]!;
+  selected.portability = portabilityDeclaration();
+  selected.builtWith = { provider: "build-provider", model: "build-model" };
+  selected.validatedWith = { provider: "validation-provider", model: "validation-model" };
+  selected.wiring = { location: "installed-skill", activatedAtMs: 1, executionCount: 100, undo: "Disable the skill" };
+  const view = await openPortability(snapshot);
+  expect(view.getByText("Unverified declaration")).toBeTruthy();
+  expect(view.getByText("No verified environment is recorded.")).toBeTruthy();
+  expect(view.queryByText(/build-provider|validation-provider|Measured improvement|installed-skill/)).toBeNull();
+});
+it("shows only the selected solution's portability declaration without combining other variants", async () => {
+  const snapshot = data();
+  snapshot.solutions[0]!.portability = portabilityDeclaration("Original variant scope");
+  snapshot.solutions[1]!.portability = { ...portabilityDeclaration("Alternative variant scope"), requirements: [{ kind: "plugin", identity: "different-plugin", versionConstraint: "1.x", setup: "Enable different-plugin wiring" }] };
+  const first = await openPortability(snapshot);
+  expect(first.getByText("retry-helper")).toBeTruthy();
+  expect(first.queryByText("different-plugin")).toBeNull();
+  fireEvent.click(screen.getByRole("tab", { name: /Testing/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Open solution Check/ }));
+  const second = within(screen.getByRole("region", { name: "Portability" }));
+  expect(second.getByText("Alternative variant scope")).toBeTruthy();
+  expect(second.getByText("different-plugin")).toBeTruthy();
+  expect(second.getByText("Plugin · Version constraint: 1.x")).toBeTruthy();
+  expect(second.getByText("Enable different-plugin wiring")).toBeTruthy();
+  expect(second.queryByText("retry-helper")).toBeNull();
+  expect(second.queryByText("Original variant scope")).toBeNull();
+});
+
+it("includes retained aliases once in the displayed solution cost without changing original attribution", async () => {
+  const snapshot=data(); snapshot.solutions[0]!.aliases=["old","old"];
+  snapshot.costs.events=[
+    {solutionId:"s-active",currency:"USD",amountMicros:1_000_000,basis:"reported",status:"completed"},
+    {solutionId:"old",currency:"USD",amountMicros:2_000_000,basis:"estimated",status:"completed"},
+    {solutionId:"old",currency:"USD",amountMicros:null,basis:"unknown",status:"failed"},
+    {solutionId:"s-draft",currency:"USD",amountMicros:50_000_000,basis:"reported",status:"completed"},
+  ];
+  const original=structuredClone(snapshot.costs.events); setup(snapshot);
+  fireEvent.click(await screen.findByRole("tab",{name:/Established/}));
+  fireEvent.click(screen.getByRole("button",{name:/Open solution Retain/}));
+  const section=screen.getByRole("heading",{name:"Cost of this solution"}).closest("section")!;
+  expect(within(section).getByText(/Includes retained solution aliases/)).toBeTruthy();
+  expect(within(section).getByText(new Intl.NumberFormat(undefined,{style:"currency",currency:"USD"}).format(3))).toBeTruthy();
+  expect(within(section).getByText(/1 unknown/)).toBeTruthy();
+  expect(snapshot.costs.events).toEqual(original);
 });

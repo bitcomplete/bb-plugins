@@ -57,7 +57,7 @@ The **solution ranker** considers the proposed effect, feasibility, effort and p
 
 The target impact screen offers **Promote** and **Revalidate**. Promote packages an exact verified revision, reviews its claims and dependencies, and follows submission through actual repository publication and optional marketplace listing. Revalidate turns “I'm skeptical about this claim” into measurable criteria and new tests of the unchanged revision.
 
-Those full workflows are **planned, not delivered in this preview**. The existing basic re-test and export/draft-PR controls are foundations. A draft PR is a review submission, not a published release, marketplace listing or activation. Historical direct-model proof does not validate a new BB-native environment.
+Those full workflows are **planned, not delivered in this preview**. The existing basic re-test and export/draft-PR controls are foundations. The Performance view can also [check recorded publication state](docs/publication-tracking.md). A draft PR is a review submission, not a published release, marketplace listing or activation. Historical direct-model proof does not validate a new BB-native environment.
 
 ## Count the cost of learning
 

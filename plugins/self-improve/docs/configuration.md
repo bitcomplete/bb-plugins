@@ -19,7 +19,7 @@ Read public configuration with `bb self-improve config`. The settings editor or 
 | `maxEventsPerSession` | `500` | Events per analysis, range 10–500. |
 | `redactedNames` | `[]` | Additional identifiers removed by the privacy adapter. |
 | `taskOutcomeSource` | Unset | Installed plugin ID and public RPC method for authoritative task history. |
-| `publicationRepositories` | `[]` | Allowed GitHub destinations for the existing explicit draft-PR export action. |
+| `publicationRepositories` | `[]` | Allowed GitHub destinations for explicit draft-PR submission and publication checks. |
 
 The worker project controls execution location, not all source observation scope. Ledger chat binds to its selected record, execution selection and privacy generation. Changing execution or privacy can revoke a conversation and require reopening it from the ledger; history remains preserved.
 
@@ -53,7 +53,7 @@ The `evaluationSuite` secret retains the schema `id`, `development` (1–50 case
 
 The existing export path prepares reviewable skill/plugin files and can submit a draft PR to an allowed `owner/repo`, using the BB server's existing `gh` authentication. Inspect the exact files, evidence, destination and bundle fingerprint before authorizing that external write. New directories are required; the action does not merge or install the result.
 
-This basic path is **not the completed Promote workflow**. Actual repository availability, release/listing reconciliation, later versions, claim eligibility and packaged portability validation are still being developed. Treat any legacy internal `published` label for draft-PR creation as a submission record, not a release.
+This basic path is **not the completed Promote workflow**. Read-only [publication checks](publication-tracking.md) can confirm the exact package at a merge commit or release tag. Marketplace listing, later-version submission, claim eligibility and packaged portability validation remain unfinished. Treat any legacy internal `published` label for draft-PR creation as a submission record, not a release.
 
 ## Other controls
 

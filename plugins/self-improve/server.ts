@@ -23,12 +23,14 @@ import type { Paper } from "./src/adapters/types.js";
 import type { Problem, Solution, RankedSolution, Stage, Verification } from "./src/domain/types.js";
 import type { DashboardData, PerformancePoint, RetestRecord } from "./src/ui/types.js";
 import { addObjective, listObjectives, setObjectiveFocus } from "./src/objectives.js";
-import { type PerformanceSnapshot } from "./src/performance.js";
+import { performanceView } from "./src/performance-view.js";
 import { prepareExport, type ValidatedArtifact, type TrustedEvaluation } from "./src/publication.js";
 import { createBuilder } from "./src/build.js";
 import { recoverInterruptedEvaluations, type BuiltArtifact, type EvaluationAttempt, type NativeEvaluationAttempt } from "./src/evaluation.js";
 import { registerReactive } from "./src/reactive.js";
 import { Publisher, githubTransport } from "./src/publish.js";
+import { PublicationTracker } from "./src/publication-state.js";
+import { publicationView } from "./src/publication-view.js";
 import { reviewRevisits, removeSolution } from "./src/revisit.js";
 import { preregisterStudy, createWordingGenerator, runWordingPair, ratingCards, ratePaper, experimentalCandidates, promoteExperimentalCandidate, experimentReport, recoverExperimentPairs } from "./src/experiments.js";
 import { scout, type ResearchCheckpoint } from "./src/stages/native-research.js";
@@ -91,6 +93,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     if(!config.publicationRepositories.includes(repository))throw new Error("Publication target no longer allowed");
     return github.call(method,path,body);
   }});
+  const publications = new PublicationTracker(store, () => config.publicationRepositories, github);
   bb.onDispose(()=>publicationStop.abort());
   const exporter = new Exports(store, dataDirectory(store),accounting,activity);
   let exportError: string | null = null;
@@ -120,7 +123,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return parsePapers(await client.callTool(config.dair.searchTool!, { [config.dair.queryArgument!]: query }, options?.signal),config.dair.resultsPath);
     } };
   };
-  const runtime = new Runtime({ bb, store, config: () => config, privacy, runner: nativeTasks, execution, privacyGeneration: () => privacyGeneration, accounting, activityCosts: id => activityCostView(activity.forSolution(id)), workers: getMiner, dair,
+  const runtime = new Runtime({ bb, store, config: () => config, privacy, runner: nativeTasks, execution, privacyGeneration: () => privacyGeneration, accounting, activityCosts: id => activityCostView(activity.forSolutionHistory(id)), workers: getMiner, dair,
     weeklyIssue:async()=>{if(!values.dairToken||!config.dair.weeklyTool)throw new Error("DAIR weekly tool is not configured");return parsePapers(await getDairClient().callTool(config.dair.weeklyTool,config.dair.weeklyArguments??{},publicationStop.signal),config.dair.weeklyResultsPath);},
     build: createBuilder({store,directory:dataDirectory(store),config:()=>config,runner:nativeTasks,execution,privacyGeneration:()=>privacyGeneration,suite:()=>values.evaluationSuite,privacy}),
   });
@@ -260,7 +263,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     problems: store.list<Problem>("problems"), solutions: store.list<Solution>("solutions"), votes: store.list("votes"),
     ranking: store.get<RankedSolution[]>("solution-ranking", "latest") ?? [], runs: store.runs().map(run=>({...run,costs:activity.forRun(run.id)})),
     versions: Object.fromEntries(["problems", "solutions"].flatMap(ns => store.entries(ns).map(e => [`${ns}:${e.key}`, e.version]))),
-    health: { enabled: values.enabled, issues: issues(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolution(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
+    health: { enabled: values.enabled, issues: issues(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolutionHistory(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
     activation: Object.fromEntries(store.list<ValidatedArtifact>("validated-artifacts").map(artifact => [artifact.solutionId, {
       status: "revalidation-required" as const,
       reason: "Historical validation does not establish the BB-native execution boundary. This version is not contributed to new turns; existing provider sessions may retain earlier instructions.",
@@ -280,10 +283,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     store.put("retests", requestId, { jobId, solutionId, status: "queued", atMs: Date.now(), reason: clean(reason), actor });
     return { jobId };
   });
-  const performance = (solutionId?: string): { points: PerformancePoint[] } => ({ points: store.list<PerformanceSnapshot>("performance").filter(p => !solutionId || p.solutionId === solutionId).flatMap(p => ["baseline", "after"].map(phase => {
-    const window = phase === "baseline" ? p.before : p.after;
-    return { id: `${p.id}:${phase}`, solutionId: p.solutionId, atMs: window.endMs, phase: phase as "baseline"|"after", votes: window.votes, sessions: window.sessions, rate: window.sessions ? window.votes / window.sessions : null, confounders: p.confounders, costs: p.costs, ...(p.activityCosts ? { activityCosts: p.activityCosts } : {}) };
-  })) });
+  const performance = (solutionId?: string) => performanceView(store, solutionId);
   const executionView = (): ExecutionSettingsView => ({
     revision: stableId("configuration", values.config), projectId: config.projectId, environmentId: config.environmentId,
     selection: { providerId: config.providerId, model: config.model, reasoningLevel: config.reasoningLevel ?? "medium", ...(config.serviceTier ? {serviceTier:config.serviceTier} : {}) },
@@ -340,12 +340,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return { artifactId: draft.id, status: draft.status, files: draft.files, bundleSha256:draft.bundleSha256 };
     },
     publishExport:async input=>{const result=await publisher.publish(input);changed();return result;},
+    publications: input => publicationView(store, publications, input.solutionId),
+    publicationHistory: input => ({ observations: publications.history(input.publicationId) }),
+    reconcilePublication: async input => { const observation = await publications.reconcile(input.publicationId, input.releaseTag); changed(); return observation; },
   });
   const requireChat = (threadId: string) => { const record = chats.get(threadId); if (!record?.active) throw new Error("This tool is available only in the Self improve ledger chat"); };
   bb.agents.registerTool({ name: "self_improve_read", description: "Read paginated problems, solutions, observations, costs and record versions. Model assessments are hypotheses; held-out test inputs are never exposed. For a solution ID, offset and limit page its attempts.", parameters: z.object({ kind: z.enum(["problems","solutions","costs","performance","audit"]), id: idSchema.optional(), offset:z.number().int().min(0).max(1000000).default(0), limit:z.number().int().min(1).max(50).default(20) }).strict(), execute: (input, context) => {
     requireChat(context.threadId);
     const page=<T>(rows:T[])=>({rows:rows.slice(input.offset,input.offset+input.limit),total:rows.length,nextOffset:input.offset+input.limit<rows.length?input.offset+input.limit:null});
-    const costs=input.kind==="costs"?(input.id?activity.forSolution(input.id):activity.summary()):null;
+    const costs=input.kind==="costs"?(input.id?activity.forSolutionHistory(input.id):activity.summary()):null;
     let result:unknown=input.kind==="costs"?{observations:activityCostView(costs!),legacy:{totals:costs!.legacy.totals,...page(costs!.legacy.events),pendingCount:costs!.legacy.pending.length},native:page(costs!.native.tasks),chats:page(costs!.chats),limitations:costs!.limitations}:input.kind==="performance"?page(performance(input.id).points):input.kind==="audit"?page(store.audit()):page(store.entries(input.kind));
     if(input.id&&(input.kind==="problems"||input.kind==="solutions")){
       const record=store.get<Problem|Solution>(input.kind,input.id);

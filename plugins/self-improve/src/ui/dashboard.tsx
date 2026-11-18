@@ -36,6 +36,41 @@ function SolutionStatus({solution,inactive=false}:{solution:Solution;inactive?:b
 }
 function Empty({title,children}:{title:string;children:ReactNode}) { return <div className="si-empty"><span className="si-empty-mark"><Glyph/></span><h3>{title}</h3><p>{children}</p></div>; }
 
+function Portability({declaration}:{declaration:Solution["portability"]}) {
+  const headingId = useId();
+  const requirementKinds = { capability:"Capability", plugin:"Plugin", skill:"Skill", configuration:"Configuration", provider:"Provider", environment:"Environment" };
+  return <section aria-labelledby={headingId}>
+    <h3 id={headingId}>Portability</h3>
+    <Badge>{declaration ? "Unverified declaration" : "Unknown · no declaration"}</Badge>
+    {declaration && <><h4>Declared scope</h4><p>{declaration.scope}</p></>}
+    <h4>Requires</h4>
+    {!declaration ? <p>Requirements are unknown. This record has no portability declaration.</p>
+      : <>
+        <p>{declaration.dependencyStatus === "none-known" ? "No dependencies are known to the proposer. This does not establish independence."
+          : declaration.dependencyStatus === "unknown" ? "Dependency information is incomplete. Any known requirements are listed below."
+          : "These requirements were declared by the proposer and have not been independently verified."}</p>
+        {declaration.requirements.length > 0 && <ul className="si-prose-list">{declaration.requirements.map((requirement,index)=><li key={index}>
+          <strong>{requirement.identity}</strong>
+          <small>{requirementKinds[requirement.kind]} · {requirement.versionConstraint === null ? "Version requirement unknown" : `Version constraint: ${requirement.versionConstraint}`}</small>
+          <p>{requirement.setup}</p>
+        </li>)}</ul>}
+      </>}
+    <h4>Tested on</h4>
+    <p>No verified environment is recorded.</p>
+    <p className="si-section-note">The packaged artifact and its behavior still need to be checked in the claimed environment. A successful solution attempt or a recorded provider does not establish portability.</p>
+    <h4>Not yet tested</h4>
+    {declaration?.untestedConfigurations.length ? <ul className="si-prose-list">{declaration.untestedConfigurations.map((configuration,index)=><li key={index}>{configuration}</li>)}</ul>
+      : <p>Untested configurations have not been specified.</p>}
+    {declaration && <details className="si-metadata"><summary>Proposed portability checks</summary>
+      <h4>Minimal environment</h4><p>{declaration.testProposal.minimalEnvironment}</p>
+      <h4>Packaged artifact</h4><p>{declaration.testProposal.packagedArtifact}</p>
+      <h4>Portability assumptions</h4>{declaration.assumptions.length ? <ul className="si-prose-list">{declaration.assumptions.map((assumption,index)=><li key={index}>{assumption}</li>)}</ul> : <p>No portability assumptions were declared.</p>}
+    </details>}
+    <p className="si-section-note">Ordinary BB, provider, user and workspace context may have been available during proposal generation. A declaration does not prove that all dependencies were disclosed.</p>
+  </section>;
+}
+
+
 export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread}:{
   api:DashboardApi; projectId:string|null; refreshKey:number; renderChat:(threadId:string)=>ReactNode; onOpenThread:(threadId:string)=>void;
 }) {
@@ -159,7 +194,8 @@ function SolutionDetail({api,solution:s,data,selectProblem,retest,retestBusy,que
   const retests=(data.retests??[]).filter(r=>r.solutionId===s.id).sort((a,b)=>b.atMs-a.atMs);
   const pending=retests.find(r=>r.status==="queued"||r.status==="running");
   const localPending=!!queuedJob&&!retests.some(r=>r.jobId===queuedJob);
-  const costs=data.costs.events?.filter(e=>e.solutionId===s.id)??[];
+  const historyIds=new Set([s.id,...s.aliases]);
+  const costs=data.costs.events?.filter(e=>e.solutionId!==undefined&&historyIds.has(e.solutionId))??[];
   const url=s.sourcePaper?safeUrl(s.sourcePaper.url):null;
   return <div className="si-detail-body">
     {data.activation?.[s.id] && <section><h3>Current activation</h3><Badge tone="warn">Native revalidation required</Badge><p>{data.activation[s.id]!.reason}</p></section>}
@@ -167,12 +203,13 @@ function SolutionDetail({api,solution:s,data,selectProblem,retest,retestBusy,que
     <section><h3>The idea</h3><p>{s.mechanism}</p><div className="si-origin"><Badge>{s.origin==="inventor"?"Zero-shot invention":"Paper-derived"}</Badge>{url&&<a href={url} target="_blank" rel="noopener noreferrer">Read source paper ↗</a>}{s.sourcePaper&&<span className="si-muted">Credibility: {s.sourcePaper.credibility.status}</span>}</div></section>
     <section><h3>Expected change</h3><p>{s.prediction.change}</p><dl className="si-kpi"><dt>{s.prediction.kpi.name}</dt><dd>Target {s.prediction.kpi.target} · {s.prediction.kpi.direction} is better</dd></dl><p className="si-section-note">A prediction becomes evidence only after testing and observation.</p></section>
     <section><h3>Test plan</h3><p>{s.testPlan}</p>{s.assumptions.length>0&&<details className="si-metadata"><summary>Assumptions</summary><ul className="si-prose-list">{s.assumptions.map((a,i)=><li key={i}>{a}</li>)}</ul></details>}</section>
+    <Portability declaration={s.portability}/>
     {ranking&&<section><h3>Build queue</h3><p>{ranking.rank===null?"Not currently ranked":`Position ${ranking.rank}`}{ranking.score===null?" · score unavailable":` · score ${ranking.score.toFixed(3)}`}</p>{ranking.reasons.length>0&&<ul className="si-prose-list">{ranking.reasons.map((r,i)=><li key={i}>{r}</li>)}</ul>}{ranking.missingFactors.length>0&&<p className="si-muted">Unknown factors: {ranking.missingFactors.join(", ")}</p>}</section>}
     <section><h3>Measured effect</h3>{verification?<><Badge tone={verification.verdict==="WORSE"?"bad":verification.verdict==="SOLVED"||verification.verdict==="REDUCED"?"good":"neutral"}>{verification.verdict}</Badge><dl className="si-rate-grid"><div><dt>Before · votes/session</dt><dd>{verification.beforeRate===null?"Unknown":verification.beforeRate.toFixed(3)}</dd></div><div><dt>After · votes/session</dt><dd>{verification.afterRate===null?"Unknown":verification.afterRate.toFixed(3)}</dd></div></dl>{[...verification.reasons,...verification.confounders].map((r,i)=><p className="si-muted" key={i}>{r}</p>)}</>:<p className="si-muted">No before/after verification is included in this snapshot. A successful test alone does not establish long-term improvement.</p>}</section>
     <section><h3>Problems it targets</h3><div className="si-linked-list">{s.problemIds.map(id=>{const p=data.problems.find(p=>p.id===id);return p?<button key={id} className="si-linked" aria-label={`View problem ${problemTitle(p,data)}`} onClick={()=>selectProblem(p)}><span>{problemTitle(p,data)}</span><Glyph kind="arrow"/></button>:<p key={id} className="si-muted">{id} · record unavailable</p>;})}</div></section>
     <section><h3>Attempts and re-tests</h3>{!s.attempts.length&&!retests.length?<p className="si-muted">No completed attempts recorded yet.</p>:<ol className="si-history">{[...s.attempts].sort((a,b)=>b.atMs-a.atMs).map(a=><li key={a.id}><span className={`si-history-dot${a.outcome==="failed"?" si-history-dot-bad":""}`}/><div><div className="si-history-heading"><strong>{a.outcome}</strong><time>{date(a.atMs)}</time></div><p>{a.reason}</p><small>{a.model.provider} · {a.model.model}</small>{a.evidenceIds.length>0&&<details><summary>Evidence references</summary><ul>{a.evidenceIds.map(id=><li key={id}><code>{id}</code></li>)}</ul></details>}</div></li>)}{retests.map(r=><li key={r.jobId}><span className="si-history-dot"/><div><div className="si-history-heading"><strong>Re-test · {r.status.replaceAll("-", " ")}</strong><time>{date(r.atMs)}</time></div><p>{r.reason}</p>{r.evidenceKind && <p>Exploratory development replay · {r.observationVerdict?.replaceAll("-", " ") ?? "outcome pending"}. Automatic adoption remains blocked.</p>}<code>{r.jobId}</code></div></li>)}</ol>}</section>
     {s.revisitHistory.length>0&&<section><h3>Model and provider revisits</h3><ul className="si-prose-list">{s.revisitHistory.map((r,i)=><li key={i}><strong>{r.decision}</strong> · {r.reason}<small>{r.from.provider}/{r.from.model} → {r.to.provider}/{r.to.model} · {date(r.atMs)}</small></li>)}</ul></section>}
-    <section><h3>Cost of this solution</h3>{costs.length?<><ul className="si-cost-list">{[...new Set(costs.map(c=>c.currency))].map(currency=>{const entries=costs.filter(c=>c.currency===currency);return <li key={currency}><strong>{money(entries.reduce((sum,e)=>sum+(e.amountMicros??0),0),currency)}</strong><span>owner-reported charges + estimates · {entries.filter(e=>e.amountMicros===null).length} unknown</span></li>;})}</ul><p className="si-section-note">Shared mining and scouting costs remain in the overall total.</p></>:<p className="si-muted">No directly attributed costs recorded. Shared or unknown costs may still apply.</p>}<ActivityCosts value={data.costs.activityBySolution?.[s.id]}/></section>
+    <section><h3>Cost of this solution</h3>{s.aliases.length>0&&<p className="si-section-note">Includes retained solution aliases. Original attribution stays in the ledger.</p>}{costs.length?<><ul className="si-cost-list">{[...new Set(costs.map(c=>c.currency))].map(currency=>{const entries=costs.filter(c=>c.currency===currency);return <li key={currency}><strong>{money(entries.reduce((sum,e)=>sum+(e.amountMicros??0),0),currency)}</strong><span>owner-reported charges + estimates · {entries.filter(e=>e.amountMicros===null).length} unknown</span></li>;})}</ul><p className="si-section-note">Shared mining and scouting costs remain in the overall total.</p></>:<p className="si-muted">No directly attributed costs recorded. Shared or unknown costs may still apply.</p>}<ActivityCosts value={data.costs.activityBySolution?.[s.id]}/></section>
     <details className="si-metadata"><summary>Wiring and provenance</summary><dl><dt>Wired at</dt><dd>{s.wiring?.location??"Not wired"}</dd><dt>Observed executions</dt><dd>{s.wiring?.executionCount??"Not recorded"}</dd><dt>Exact undo</dt><dd>{s.wiring?.undo??"Not recorded"}</dd><dt>Built with</dt><dd>{s.builtWith?`${s.builtWith.provider} / ${s.builtWith.model}`:"Not built"}</dd><dt>Validated with</dt><dd>{s.validatedWith?`${s.validatedWith.provider} / ${s.validatedWith.model}`:"Not validated"}</dd><dt>Aliases</dt><dd>{s.aliases.join(", ")||"None"}</dd></dl></details>
     {established(s)&&<ExportSolution api={api} repositories={data.health.publicationRepositories} solutionId={s.id} expectedVersion={data.versions[`solutions:${s.id}`]}/>}
   </div>;
