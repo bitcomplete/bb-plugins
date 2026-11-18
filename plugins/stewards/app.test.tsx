@@ -1027,7 +1027,7 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[]; lessons?: unknown[]; lessonCounts?: unknown; digest?: unknown; ended?: unknown[]; stuck?: unknown[]; sidebarThreads?: { threads?: unknown[]; status?: "error" | "loading" | "ready" }; threadId?: string | null } = {}): Promise<RenderedSlot> => {
+const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[]; lessons?: unknown[]; lessonCounts?: unknown; digest?: unknown; ended?: unknown[]; stuck?: unknown[]; sidebarThreads?: { threads?: unknown[]; status?: "error" | "loading" | "ready" }; threadId?: string | null; localTicket?: { ticket: Record<string, unknown>; comments?: unknown[] } } = {}): Promise<RenderedSlot> => {
   const captured = await loadApp();
   const panel = captured.navPanels[0]!;
   return renderSlot(panel, { subPath: over.subPath ?? "" }, {
@@ -1054,6 +1054,11 @@ const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; q
       }),
       stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
       stewardsNeedAction: () => ({ ok: true, message: "done", ...(over.threadId === undefined ? {} : { threadId: over.threadId }) }),
+      // BB-361: the local ticket detail view. Null for a non-local effort.
+      stewardsLocalTicket: () => ({ ticket: over.localTicket?.ticket ?? null, comments: over.localTicket?.comments ?? [] }),
+      stewardsLocalEditDescription: () => ({ ok: true, message: "Saved." }),
+      stewardsLocalComment: () => ({ ok: true, message: "Commented." }),
+      stewardsLocalSetState: () => ({ ok: true, message: "Done." }),
     } as never,
     ...(over.sidebarThreads === undefined ? {} : { sidebarThreads: over.sidebarThreads }),
   } as never);
@@ -1157,6 +1162,33 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(slot.getByText(/Next: On the next deployment wake, re-run the carries check \(you\)/u)).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("edits a local ticket's description and state, and comments as the owner (BB-361)", async () => {
+    const slot = await renderBoardWith({
+      subPath: "p1/LOCAL-1",
+      stewards: [boardSteward({ key: "LOCAL-1", title: "A local effort" })],
+      localTicket: {
+        ticket: { key: "LOCAL-1", title: "A local effort", description: "Old text.", state: "Backlog", parent: null, playbook: "local-tickets", createdAt: 1, updatedAt: 1 },
+        comments: [{ id: "c1", author: "Dana", owner: true, body: "**Spec:** owner words", createdAt: 2 }],
+      },
+    });
+    await waitFor(() => expect(slot.getByText("Local ticket")).toBeTruthy());
+    await waitFor(() => expect((slot.getByLabelText("Description of LOCAL-1") as HTMLTextAreaElement).value).toBe("Old text."));
+    const description = slot.getByLabelText("Description of LOCAL-1") as HTMLTextAreaElement;
+    fireEvent.change(description, { target: { value: "New text." } });
+    fireEvent.click(slot.getByRole("button", { name: "Save description" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsLocalEditDescription", input: { key: "LOCAL-1", description: "New text." } }));
+    // The state control.
+    const stateControl = slot.container.querySelector("#local-state-LOCAL-1")!;
+    fireEvent.change(stateControl, { target: { value: "Ready" } });
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsLocalSetState", input: { key: "LOCAL-1", state: "Ready" } }));
+    // The owner's comment box, and the owner's earlier comment.
+    fireEvent.change(slot.getByLabelText("Comment on LOCAL-1"), { target: { value: "**Spec:** more" } });
+    fireEvent.click(slot.getByRole("button", { name: "Comment as the owner" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsLocalComment", input: { key: "LOCAL-1", body: "**Spec:** more" } }));
+    expect(slot.getByText(/owner words/u)).toBeTruthy();
     slot.lifecycle.unmount();
   });
 

@@ -30,6 +30,16 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   of its first 96 turns on bithub, so stewards were top-level.) Grouping in
   the sidebar is bb's own: its project organization, or the stewards thread
   list; the plugin makes no sidebar sections (DESIGN.md §15).
+- **Local tickets.** A third source, `local`, keeps a ticket in the stewards
+  store rather than Linear or GitHub. `ticket_file { unit: "local" }` files
+  one under the project's prefix (`LOCAL` by default, `localPrefix` to
+  override); it is adopted by state, not by label: Backlog is parked, Ready or
+  later non-terminal is adopted, and `bb stewards detach <key>` sets it back to
+  Backlog. It has no labels or priority, its children are local tickets, and a
+  pull request's body cites its key so the merge gate resolves the local spec's
+  approval. The owner's page comments and description edits form the spec; the
+  `bb stewards tickets list|show|file|comment|update|close|export` commands are
+  the by-hand surface.
 - **Ops stewards.** Each namespace and Sentry project in a login's
   `roles.json` `ops` entry gets an `ops` steward, reporting to the project
   steward, for as long as it is listed. The plugin looks at the target with
@@ -1080,7 +1090,10 @@ copies drift. Sources serve `sourceSnapshot`, `sourceValidate`,
 `sourceEnsureLabel` (the label create `check --create-labels` uses, optional
 so a source without it is unavailable), `sourceAdoptable` and
 `sourceSetInterest`; stewards serves `stewardsRing`, and `stewardsSession`
-for linear's `@bb` mentions.
+for linear's `@bb` mentions. The third source, `local`, is served by stewards
+itself in-process (`sourceRpc("local", …)` never leaves the process), backed
+by the `local_tickets` and `local_comments` tables; a local ticket is adopted
+by state and a pull request cites its key.
 
 ## Develop
 

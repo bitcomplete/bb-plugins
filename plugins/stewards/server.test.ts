@@ -4729,7 +4729,7 @@ describe("bb stewards init", () => {
     const t = await setup();
     t.threads.set("thr_me", { status: "active", archivedAt: null });
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
-    expect(t.writes.length).toBe(7);
+    expect(t.writes.length).toBe(8);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
   });
 });
@@ -4884,8 +4884,8 @@ describe("bb stewards survey and Set up stewards", () => {
     const before = t.writes.length;
     const second = await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
     expect(second.exitCode).toBe(0);
-    expect(second.stdout.match(/kept existing/gu)?.length).toBe(7);
-    expect(t.writes.length).toBe(before + 7);
+    expect(second.stdout.match(/kept existing/gu)?.length).toBe(8);
+    expect(t.writes.length).toBe(before + 8);
   });
 
   it("accepts the skill's hand-filled project.json and roles.json in check", async () => {
@@ -9350,7 +9350,7 @@ describe("the settings page", () => {
     const t = await setup();
     const empty = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
     expect(empty.projects).toMatchObject([{ name: "Acme", configured: true, repos: ["acme/web", "acme/bb"], problems: [], projectStewardThreadId: null, stewards: [] }]);
-    expect(empty.projects[0]!.playbooks.map((p) => p.kind)).toEqual(["ticket", "pr", "review"]);
+    expect(empty.projects[0]!.playbooks.map((p) => p.kind)).toEqual(["ticket", "ticket", "pr", "review"]);
 
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -18287,14 +18287,17 @@ describe("the source-neutral ticket tools (BB-360)", () => {
     expect((await t.tool("ticket_update", { key: "ENG-12", assignee: "sam" }, steward)).error).toBe(true);
   });
 
-  it("ticket_file resolves the unit, signs the description, and refuses an unknown or missing unit", async () => {
+  it("ticket_file resolves the unit, signs the description, and refuses an unknown unit", async () => {
     const { t, steward } = await withSteward();
-    // The project lists several units: ENG, acme/bb and acme/web.
-    const refused = await t.tool("ticket_file", { title: "New", description: "Body" }, steward);
-    expect(refused.error).toBe(true);
-    expect(refused.text).toMatch(/several units/u);
-    expect(refused.text).toContain("ENG");
-    expect(refused.text).toContain("acme/web");
+    // BB-361: with no unit, a local ticket is filed in this project's store.
+    const local = await t.tool("ticket_file", { title: "New", description: "Body" }, steward);
+    expect(local.error).toBe(false);
+    expect(local.text).toContain("LOCAL-1");
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Backlog" });
+    // Naming the local unit does the same.
+    const named = await t.tool("ticket_file", { unit: "local", title: "Named", description: "Body" }, steward);
+    expect(named.error).toBe(false);
+    expect(named.text).toContain("LOCAL-2");
     expect((await t.tool("ticket_file", { unit: "OTHER", title: "New", description: "Body" }, steward)).error).toBe(true);
     // A Linear unit files through linear, with the signed description.
     t.linearWrites.length = 0;

@@ -516,6 +516,13 @@ export const sourceContract = {
       priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional(),
       parent: z.string().min(1).max(200).optional(),
       assignee: z.string().min(1).max(200).optional(),
+      /**
+       * BB-361: the playbook a local ticket runs under, `ticket` (the default,
+       * `local-tickets`) or `initiative`. Linear and github have no playbook of
+       * their own and ignore it; the local source stores it and the snapshot's
+       * optional `playbook` field carries it back.
+       */
+      playbook: z.string().min(1).max(200).optional(),
     }),
     output: z.object({ id: z.string(), key: z.string(), url: z.string().nullable() }),
   },

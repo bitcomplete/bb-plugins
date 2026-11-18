@@ -1588,6 +1588,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
   return (
     <>
       <EffortHeading board={b} effort={effort} />
+      <LocalTicketDetail effortKey={effortKey} />
       <Section title="Needs you" count={effort.items.length}>
         {effort.items.length === 0 ? (
           <None>Nothing is waiting on you for this effort.</None>
@@ -1661,6 +1662,93 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
         {lessons.length === 0 ? <None>This effort wrote no lessons.</None> : <LessonsList lessons={lessons} now={now} />}
       </Section>
     </>
+  );
+}
+
+/**
+ * BB-361: a local ticket's own controls on its detail view: the description
+ * editor (the spec hash covers the description, so the owner revises it before
+ * approving), the state control, and the owner's comment box -- the one path
+ * an owner-entered local comment counts as the user's own spec words.
+ */
+function LocalTicketDetail({ effortKey }: { effortKey: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const { data, refetch } = usePolled(useCallback(() => rpc.call("stewardsLocalTicket", { key: effortKey }), [rpc, effortKey]));
+  const [description, setDescription] = useState<string | null>(null);
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState<"idle" | "saving" | { error: string }>("idle");
+  const ticket = data?.ticket ?? null;
+  useEffect(() => {
+    setDescription(ticket === null ? null : ticket.description);
+  }, [ticket?.key, ticket?.updatedAt]);
+  if (ticket === null) return null;
+  const run = (p: Promise<unknown>) => {
+    setBusy("saving");
+    p.then(
+      () => {
+        setBusy("idle");
+        refetch();
+      },
+      (e: unknown) => setBusy({ error: message(e) }),
+    );
+  };
+  const button = "w-fit rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  return (
+    <Section title="Local ticket">
+      <div className="flex flex-col gap-2 rounded-lg border border-border p-3 text-xs">
+        <p className="text-muted-foreground">
+          {ticket.key} · playbook {ticket.playbook}
+          {ticket.parent === null ? "" : ` · parent ${ticket.parent}`}
+        </p>
+        <label className="text-muted-foreground" htmlFor={`local-state-${ticket.key}`}>State</label>
+        <select
+          id={`local-state-${ticket.key}`}
+          value={ticket.state}
+          disabled={busy === "saving"}
+          onChange={(e) => run(rpc.call("stewardsLocalSetState", { key: ticket.key, state: e.target.value }))}
+          className="w-fit rounded-md border border-input bg-transparent px-2 py-1"
+        >
+          {["Backlog", "Ready", "In Progress", "In Review", "Done", "Canceled"].map((s) => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </select>
+        <label className="text-muted-foreground" htmlFor={`local-description-${ticket.key}`}>Description</label>
+        <textarea
+          id={`local-description-${ticket.key}`}
+          value={description ?? ""}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={6}
+          aria-label={`Description of ${ticket.key}`}
+          className="min-w-0 rounded-md border border-input bg-transparent px-2 py-1"
+        />
+        <button type="button" className={button} disabled={busy === "saving" || description === null || description === ticket.description} onClick={() => run(rpc.call("stewardsLocalEditDescription", { key: ticket.key, description: description ?? "" }))}>
+          Save description
+        </button>
+        <label className="text-muted-foreground" htmlFor={`local-comment-${ticket.key}`}>Your comment</label>
+        <textarea
+          id={`local-comment-${ticket.key}`}
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          rows={2}
+          placeholder="Starts a spec comment with **Spec:**"
+          aria-label={`Comment on ${ticket.key}`}
+          className="min-w-0 rounded-md border border-input bg-transparent px-2 py-1"
+        />
+        <button type="button" className={button} disabled={busy === "saving" || comment.trim() === ""} onClick={() => run(rpc.call("stewardsLocalComment", { key: ticket.key, body: comment.trim() }).then(() => setComment("")))}>
+          Comment as the owner
+        </button>
+        {typeof busy === "object" ? <span className="text-destructive">{busy.error}</span> : null}
+        {data !== null && data.comments.length > 0 ? (
+          <ul className="flex flex-col gap-1">
+            {data.comments.map((c) => (
+              <li key={c.id}>
+                <span className="text-muted-foreground">{c.owner ? "you" : c.author}:</span> {c.body}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    </Section>
   );
 }
 

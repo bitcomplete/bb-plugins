@@ -48,40 +48,50 @@ function parseGitHubRef(input: string): { repo: string; number: number } | null 
 }
 
 /** A ticket key resolved to the source it names and the id a source reads it by. */
-export type TicketKey = { source: "linear" | "github"; id: string; key: string };
+export type TicketKey = { source: "linear" | "github" | "local"; id: string; key: string };
 
-/** The source a key names, by its shape alone; null when it is neither shape. */
-export function sourceOfTicketKey(key: string): "linear" | "github" | null {
+/** A Linear key `ENG-1` and a local key `LOCAL-1` are the same shape; the project's prefix tells them apart. */
+const localKeyRe = (prefix: string): RegExp => new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}-\\d+$`, "iu");
+
+/** The source a key names, by its shape alone; null when it is none of them. */
+export function sourceOfTicketKey(key: string, localPrefix?: string | null): "linear" | "github" | "local" | null {
   const trimmed = key.trim();
-  if (LINEAR_KEY.test(trimmed)) return "linear";
   if (parseGitHubRef(trimmed) !== null) return "github";
+  // BB-361: the project's local prefix wins over the Linear shape, since a
+  // prefix equal to a Linear team key is refused at config load.
+  if (localPrefix !== undefined && localPrefix !== null && localPrefix !== "" && localKeyRe(localPrefix).test(trimmed)) return "local";
+  if (LINEAR_KEY.test(trimmed)) return "linear";
   return null;
 }
 
 /**
  * Resolve a ticket key. A Linear key is both its own id and its own key; a
  * GitHub reference is canonicalized to `owner/repo#N`, which is the id the
- * source's snapshot and ring path use.
+ * source's snapshot and ring path use. A local key is its own id too.
  */
-export function parseTicketKey(key: string): TicketKey | null {
+export function parseTicketKey(key: string, localPrefix?: string | null): TicketKey | null {
   const trimmed = key.trim();
-  const source = sourceOfTicketKey(trimmed);
+  const source = sourceOfTicketKey(trimmed, localPrefix);
   if (source === null) return null;
+  if (source === "local") return { source, id: trimmed, key: trimmed };
   const ref = parseGitHubRef(trimmed);
   if (ref === null) return { source, id: trimmed, key: trimmed };
   const canonical = `${ref.repo}#${ref.number}`;
   return { source, id: canonical, key: canonical };
 }
 
-/** One unit a ticket may be filed in: a Linear team key, or a GitHub owner/repo. */
-export type TicketUnit = { source: "linear" | "github"; unit: string };
+/** One unit a ticket may be filed in: a Linear team key, a GitHub owner/repo, or the local project. */
+export type TicketUnit = { source: "linear" | "github" | "local"; unit: string };
 
-/** The project's units as filing targets: its Linear teams, then its GitHub repos. */
-export function ticketUnits(file: { linear: { teams: string[] } }, repos: readonly string[]): TicketUnit[] {
-  return [...file.linear.teams.map((unit): TicketUnit => ({ source: "linear", unit })), ...repos.map((unit): TicketUnit => ({ source: "github", unit }))];
+/** The project's units as filing targets: its Linear teams, then its GitHub repos, then local. */
+export function ticketUnits(file: { linear: { teams: string[] } }, repos: readonly string[], localProjectId?: string | null): TicketUnit[] {
+  return [...file.linear.teams.map((unit): TicketUnit => ({ source: "linear", unit })), ...repos.map((unit): TicketUnit => ({ source: "github", unit })), ...(localProjectId === undefined || localProjectId === null ? [] : [{ source: "local" as const, unit: localProjectId }])];
 }
 
-const listUnits = (units: readonly TicketUnit[]): string => (units.length === 0 ? "none" : units.map((u) => u.unit).join(", "));
+/** The name a person types for a unit: `local` for the local project, the unit itself otherwise. */
+const unitName = (u: TicketUnit): string => (u.source === "local" ? "local" : u.unit);
+
+const listUnits = (units: readonly TicketUnit[]): string => (units.length === 0 ? "none" : units.map(unitName).join(", "));
 
 export type UnitResolution = { ok: true; unit: TicketUnit } | { ok: false; error: string };
 
@@ -93,12 +103,16 @@ export type UnitResolution = { ok: true; unit: TicketUnit } | { ok: false; error
 export function resolveFileUnit(units: readonly TicketUnit[], requested: string | undefined): UnitResolution {
   const name = (requested ?? "").trim();
   if (name !== "") {
-    const found = units.find((u) => u.unit.toLowerCase() === name.toLowerCase());
+    const found = name.toLowerCase() === "local" ? units.find((u) => u.source === "local") : units.find((u) => u.unit.toLowerCase() === name.toLowerCase());
     return found === undefined
       ? { ok: false, error: `${JSON.stringify(name)} is not one of this project's units (${listUnits(units)}); file in one of those.` }
       : { ok: true, unit: found };
   }
-  if (units.length === 0) return { ok: false, error: "This project lists no Linear team or GitHub repo to file in." };
+  // BB-361: no unit files a local ticket, per the ticket. A project with no
+  // local unit (never one this plugin serves) falls back to the old rule.
+  const local = units.find((u) => u.source === "local");
+  if (local !== undefined) return { ok: true, unit: local };
+  if (units.length === 0) return { ok: false, error: "This project lists no Linear team, GitHub repo or local source to file in." };
   if (units.length === 1) return { ok: true, unit: units[0]! };
   return { ok: false, error: `This project lists several units (${listUnits(units)}); name the one to file in with unit.` };
 }
@@ -196,7 +210,7 @@ export function createTicketWatches(kv: PluginKvStorage): TicketWatches {
 // ---- registration ------------------------------------------------------------
 
 /** What the calling thread's project offers the ticket tools. */
-export type TicketProject = { units: TicketUnit[]; viewer: { linear: string | null; github: string | null } };
+export type TicketProject = { units: TicketUnit[]; viewer: { linear: string | null; github: string | null }; localPrefix: string };
 
 export interface TicketToolDeps {
   /** One source-contract call, to the plugin that serves the source. */
@@ -205,6 +219,13 @@ export interface TicketToolDeps {
   snapshot: (source: Source, id: string) => Promise<EntitySnapshot | null>;
   /** The calling thread's project: its filing units and this server's own logins. */
   project: (projectId: string) => Promise<TicketProject | null>;
+  /**
+   * Whether the calling thread's newest turn was started by the owner's own
+   * message (a plain client turn), not a plugin wake or a forward carrying
+   * someone else's text. A local ticket only moves to Ready on the owner's
+   * turn; anything else lands in Backlog (BB-361).
+   */
+  ownerTurn: (threadId: string) => Promise<boolean>;
   /** The watch registry the ring path wakes from. */
   watches: TicketWatches;
   /** Ask the plugin to re-send the interest set, after a watch is added. */
@@ -228,16 +249,17 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
   bb.agents.registerTool({
     name: "ticket_file",
     description:
-      "File a new ticket. Give a unit (a Linear team key such as ENG, or a GitHub owner/repo) when the project lists more than one; with a single unit it is the default. The description is signed for you. On GitHub there is no priority; a Linear ticket may carry one. The assignee is this server's own login or nobody.",
+      "File a new ticket. With no unit, a local ticket is filed in this project's store; name a unit (a Linear team key, a GitHub owner/repo, or `local`) to file elsewhere. The description is signed for you. On GitHub and local there is no priority; a local ticket has no labels either. The assignee is this server's own login or nobody.",
     presentation: { label: { pending: "Filing a ticket", completed: "Filed a ticket" } },
     parameters: z.object({
-      unit: z.string().trim().min(1).max(200).optional().describe("The unit to file in: a Linear team key or a GitHub owner/repo. Omit when the project lists exactly one."),
+      unit: z.string().trim().min(1).max(200).optional().describe("The unit to file in: a Linear team key, a GitHub owner/repo, or `local` for this project's local tickets. Omit to file a local ticket."),
       title: z.string().trim().min(1).max(500).describe("The ticket's title."),
       description: z.string().trim().min(1).max(50_000).describe("The ticket's description, in Markdown. Do not sign it; the plugin signs it."),
-      labels: z.array(z.string().trim().min(1).max(100)).max(50).optional().describe("Label names to add."),
-      priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority. A source with no priority (GitHub) refuses it."),
+      labels: z.array(z.string().trim().min(1).max(100)).max(50).optional().describe("Label names to add. A local ticket has no labels."),
+      priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority. A source with no priority (GitHub, local) refuses it."),
       parent: z.string().trim().min(1).max(200).optional().describe("The parent ticket's key, to file this as a child."),
       assignee: z.string().trim().min(1).max(200).optional().describe("'me' for this server's own login, or 'nobody'. Any other person is refused."),
+      playbook: z.string().trim().min(1).max(200).optional().describe("A local ticket's playbook: `ticket` (the default) or `initiative`. Linear and GitHub ignore it."),
     }),
     async execute(input, { threadId, projectId }) {
       try {
@@ -259,6 +281,7 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
             ...(input.priority === undefined ? {} : { priority: input.priority }),
             ...(input.parent === undefined ? {} : { parent: input.parent }),
             ...(input.assignee === undefined ? {} : { assignee: input.assignee }),
+            ...(input.playbook === undefined ? {} : { playbook: input.playbook }),
           },
           sourceContract.sourceCreateIssue.output,
         );
@@ -275,9 +298,10 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
       "Read one ticket by key: a Linear key such as BB-123, or a GitHub issue as owner/repo#12 or its URL. Returns its title, state, unit, labels, assignees, priority, parent, description and latest comments.",
     presentation: { label: { pending: "Reading a ticket", completed: "Read a ticket" } },
     parameters: z.object({ key: z.string().trim().min(1).max(300).describe("The ticket key: BB-123, or owner/repo#12.") }),
-    async execute({ key }) {
+    async execute({ key }, { projectId }) {
       try {
-        const ref = parseTicketKey(key);
+        const project = await deps.project(projectId);
+        const ref = parseTicketKey(key, project?.localPrefix);
         if (ref === null) return toolError(badKey(key));
         const entity = await deps.snapshot(ref.source, ref.id);
         return entity === null ? toolError(new Error(`No ticket ${ref.key}, or it is not visible to this server.`)) : formatTicket(entity);
@@ -303,11 +327,11 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
         let selected = project.units;
         if (units !== undefined && units.length > 0) {
           const wanted = units.map((u) => u.trim().toLowerCase());
-          const missing = units.filter((u) => !project.units.some((x) => x.unit.toLowerCase() === u.trim().toLowerCase()));
+          const missing = units.filter((u) => !project.units.some((x) => unitName(x).toLowerCase() === u.trim().toLowerCase()));
           if (missing.length > 0) return toolError(new Error(`${missing.map((u) => JSON.stringify(u)).join(", ")} ${missing.length === 1 ? "is" : "are"} not among this project's units (${listUnits(project.units)}).`));
-          selected = project.units.filter((u) => wanted.includes(u.unit.toLowerCase()));
+          selected = project.units.filter((u) => wanted.includes(unitName(u).toLowerCase()));
         }
-        const bySource = new Map<"linear" | "github", string[]>();
+        const bySource = new Map<"linear" | "github" | "local", string[]>();
         for (const u of selected) bySource.set(u.source, [...(bySource.get(u.source) ?? []), u.unit]);
         const found: SearchIssue[] = [];
         for (const [source, sourceUnits] of bySource) {
@@ -329,9 +353,10 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
       key: z.string().trim().min(1).max(300).describe("The ticket key: BB-123, or owner/repo#12."),
       body: z.string().trim().min(1).max(20_000).describe("The comment, in Markdown. Do not sign it; the plugin signs it."),
     }),
-    async execute({ key, body }, { threadId }) {
+    async execute({ key, body }, { threadId, projectId }) {
       try {
-        const ref = parseTicketKey(key);
+        const project = await deps.project(projectId);
+        const ref = parseTicketKey(key, project?.localPrefix);
         if (ref === null) return toolError(badKey(key));
         const out = await deps.sourceRpc(ref.source, "sourceComment", { key: ref.key, body: sign(threadId, body) }, sourceContract.sourceComment.output);
         return `Commented on ${ref.key}${out.url === null ? "" : `: ${out.url}`}`;
@@ -358,14 +383,18 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
         .optional()
         .describe("Relations to add."),
     }),
-    async execute(input, { projectId }) {
+    async execute(input, { projectId, threadId }) {
       try {
-        const ref = parseTicketKey(input.key);
-        if (ref === null) return toolError(badKey(input.key));
         const project = await deps.project(projectId);
+        const ref = parseTicketKey(input.key, project?.localPrefix);
+        if (ref === null) return toolError(badKey(input.key));
         if (input.assignee !== undefined && (project === null || !assigneeAllowed(input.assignee, [project.viewer.linear, project.viewer.github]))) {
           return toolError(new Error(`assignee accepts only this server's own login${project === null ? "" : ` (${project.viewer.linear ?? project.viewer.github ?? "me"})`} or 'nobody', not ${JSON.stringify(input.assignee)}.`));
         }
+        // BB-361: a local ticket may only leave Backlog or a terminal state
+        // for an adopted one on the owner's turn; the source's update enforces
+        // that, and every other turn lands it in Backlog.
+        const ownerTurn = ref.source === "local" ? await deps.ownerTurn(threadId) : false;
         const out = await deps.sourceRpc(
           ref.source,
           "sourceUpdateIssue",
@@ -376,6 +405,7 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
             ...(input.priority === undefined ? {} : { priority: input.priority }),
             ...(input.assignee === undefined ? {} : { assignee: input.assignee }),
             relations: input.relations ?? [],
+            ...(ref.source === "local" ? { ownerTurn } : {}),
           },
           sourceContract.sourceUpdateIssue.output,
         );
@@ -392,9 +422,10 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
       "Watch a ticket by key and end the turn rather than polling: this thread is messaged when the ticket changes. The source's own ring path fires the wake, so it works wherever the project's source is connected; a source that only polls wakes on its next poll.",
     presentation: { label: { pending: "Watching a ticket", completed: "Watching a ticket" } },
     parameters: z.object({ key: z.string().trim().min(1).max(300).describe("The ticket key: BB-123, or owner/repo#12.") }),
-    async execute({ key }, { threadId }) {
+    async execute({ key }, { threadId, projectId }) {
       try {
-        const ref = parseTicketKey(key);
+        const project = await deps.project(projectId);
+        const ref = parseTicketKey(key, project?.localPrefix);
         if (ref === null) return toolError(badKey(key));
         const entity = await deps.snapshot(ref.source, ref.id);
         if (entity === null) return toolError(new Error(`No ticket ${ref.key}, or it is not visible to this server.`));
