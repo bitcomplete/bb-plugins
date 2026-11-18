@@ -13,7 +13,6 @@ import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, needChoices, type Binding } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
 import { parseTemplateStamp, templateHash } from "./template-stamp.js";
-import { DEFAULT_ALERTMANAGER_URL } from "./alertmanager.js";
 import { STANDING_RULES } from "./wake.js";
 import { setup, SHIPPED_SKILLS } from "./test-world.js";
 
@@ -11891,6 +11890,7 @@ describe("Alertmanager stewards (BB-314)", () => {
   const TARGET = "alertmanager/bb-gate-production";
   const FP = "a1b2c3d4e5f6";
   const NAMESPACE = "bb-gate-production";
+  const AM_URL = "http://alertmanager.test:9093";
 
   const amAlert = (over: Record<string, unknown> = {}) => ({
     fingerprint: FP,
@@ -11926,7 +11926,7 @@ describe("Alertmanager stewards (BB-314)", () => {
   async function watching(options: { alerts?: Array<Record<string, unknown>>; env?: Record<string, string> } = {}) {
     const am = fakeAlertmanager();
     for (const a of options.alerts ?? [amAlert()]) am.alerts.set(String(a.fingerprint), a);
-    const t = await setup({ fetch: am.fetchImpl, env: options.env ?? {} });
+    const t = await setup({ fetch: am.fetchImpl, env: { ALERTMANAGER_URL: AM_URL, ...options.env } });
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "alertmanager", namespace: NAMESPACE }], autoAdopt: ["urgent"] } });
     t.files[playbookPath("ops-watch")] = OPS_WATCH;
     await t.hooks.sweep();
@@ -12009,7 +12009,7 @@ describe("Alertmanager stewards (BB-314)", () => {
     expect(ok.ok).toBe(false);
     expect(ok.lines).toContain("problem: ops now belongs in stewards/roles.json");
     expect(ok.lines.filter((l) => l.startsWith("problem:") && !l.includes("ops now belongs"))).toEqual([]);
-    expect(ok.lines).toContain(`alertmanager: reading ${DEFAULT_ALERTMANAGER_URL} (no token)`);
+    expect(ok.lines).toContain(`alertmanager: reading ${AM_URL} (no token)`);
     expect(ok.lines).toContain("alertmanager: alertmanager/bb-gate-production is readable (Alertmanager 0.27.0 (kps))");
     expect(ok.lines).toContain("alertmanager: doorbells from bb-gate-hooks: stopped");
     // A read failure is a problem line, not a crash.

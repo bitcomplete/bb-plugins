@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { classify, type FingerprintRow, type TicketState } from "./ops.js";
 import {
   ALERTMANAGER_URL_ENV,
-  DEFAULT_ALERTMANAGER_URL,
   alertOf,
   alertmanagerChanges,
   alertmanagerSightings,
@@ -102,11 +101,11 @@ describe("the reader", () => {
 });
 
 describe("the effective URL", () => {
-  it("is the setting, then ALERTMANAGER_URL, then the tailnet hostname for a non-cluster server", () => {
+  it("is the setting, then ALERTMANAGER_URL, and null when neither is set", () => {
     expect(resolveAlertmanagerUrl("http://in-cluster:9093", "http://env:9093")).toBe("http://in-cluster:9093");
     expect(resolveAlertmanagerUrl("  ", "http://env:9093")).toBe("http://env:9093");
-    expect(resolveAlertmanagerUrl(undefined, undefined)).toBe(DEFAULT_ALERTMANAGER_URL);
-    expect(resolveAlertmanagerUrl(null, "  ")).toBe(DEFAULT_ALERTMANAGER_URL);
+    expect(resolveAlertmanagerUrl(undefined, undefined)).toBeNull();
+    expect(resolveAlertmanagerUrl(null, "  ")).toBeNull();
     expect(ALERTMANAGER_URL_ENV).toBe("ALERTMANAGER_URL");
   });
 });

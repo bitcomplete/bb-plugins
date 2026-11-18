@@ -220,7 +220,7 @@ export const LINEAR_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
 const k8sNamespaceTargetSchema = z
   .object({
     kind: z.literal("k8s-namespace"),
-    name: z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production"),
+    name: z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as web-production"),
   })
   .strict();
 
@@ -236,7 +236,7 @@ export const sentrySlug = z.string().trim().toLowerCase().regex(SENTRY_SLUG, "a 
 const sentryProjectTargetSchema = z.object({ kind: z.literal("sentry-project"), org: sentrySlug, project: sentrySlug }).strict();
 
 /** A Kubernetes namespace watched for Prometheus Alertmanager alerts; read through the plugin's Alertmanager URL. */
-export const alertmanagerNamespace = z.string().trim().regex(ALERTMANAGER_NAMESPACE, "a namespace name such as bb-gate-production");
+export const alertmanagerNamespace = z.string().trim().regex(ALERTMANAGER_NAMESPACE, "a namespace name such as web-production");
 const alertmanagerTargetSchema = z.object({ kind: z.literal("alertmanager"), namespace: alertmanagerNamespace }).strict();
 
 /**
@@ -343,12 +343,12 @@ export type LessonRules = z.infer<typeof lessonRulesSchema>;
  */
 export const mergeDispatchSchema = z
   .object({
-    /** The merged pull request's repo, as GitHub spells it, e.g. bitcomplete/bb-plugins. */
-    repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-plugins"),
-    /** The workflow file or id to dispatch, e.g. bb-server.yaml. */
+    /** The merged pull request's repo, as GitHub spells it, e.g. acme/app. */
+    repo: z.string().trim().regex(REPO_NAME, "a repo such as acme/app"),
+    /** The workflow file or id to dispatch, e.g. build.yaml. */
     workflow: z.string().trim().min(1).max(300),
     /** The repo the workflow lives in; the merged repo when omitted. */
-    workflowRepo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-gate").optional(),
+    workflowRepo: z.string().trim().regex(REPO_NAME, "a repo such as acme/web").optional(),
     /** The ref to dispatch on; the workflow repo's default branch when omitted. */
     ref: z.string().trim().min(1).max(300).optional(),
     /** The workflow_dispatch inputs, as strings (a boolean input is "true"/"false"). */
@@ -428,7 +428,7 @@ export const projectFileSchema = z
       .object({
         at: clock.default("01:00"),
         timezone: z.string().refine(validTimezone, "an IANA time zone such as America/New_York").default("America/New_York"),
-        /** Nothing new is started after this; bb-gate's quiet window restarts servers at 03:00 US Eastern. */
+        /** Nothing new is started after this. */
         until: clock.default("02:45"),
         /** At most this many binding turns per night. */
         max: z.number().int().min(0).max(1000).default(100),
@@ -654,10 +654,10 @@ export const roleBacklogTargets = (role: { ops?: { backlog?: { team: string } } 
 /** The k8s namespaces to watch, which are read with kubectl. */
 export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.targets.filter((t): t is K8sTarget => t.kind === "k8s-namespace");
 
-/** The Sentry projects to watch, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
+/** The Sentry projects to watch, which are read with the plugin's Sentry token and rung by the hooks service. */
 export const sentryTargets = (project: ProjectFile): SentryTarget[] => project.ops.targets.filter((t): t is SentryTarget => t.kind === "sentry-project");
 
-/** The Alertmanager namespaces to watch, which are read with the plugin's Alertmanager URL and rung by bb-gate-hooks. */
+/** The Alertmanager namespaces to watch, which are read with the plugin's Alertmanager URL and rung by the hooks service. */
 export const alertmanagerTargets = (project: ProjectFile): AlertmanagerTarget[] => project.ops.targets.filter((t): t is AlertmanagerTarget => t.kind === "alertmanager");
 
 /**
@@ -788,7 +788,7 @@ export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
  */
 export const carriesWhenSchema = z
   .object({
-    repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-plugins"),
+    repo: z.string().trim().regex(REPO_NAME, "a repo such as acme/app"),
     paths: z.array(z.string().trim().min(1).max(300)).max(200).optional(),
   })
   .strict();
@@ -812,11 +812,11 @@ export const carriesStrategySchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("image-tag"),
-      /** The kustomization file, read at the deployment's ref, e.g. kploy/production/kustomization.yaml. */
+      /** The kustomization file, read at the deployment's ref, e.g. deploy/kustomization.yaml. */
       manifest: z.string().trim().min(1).max(500),
-      /** The image whose `newTag` names the run, e.g. bb-server. */
+      /** The image whose `newTag` names the run, e.g. app. */
       image: z.string().trim().min(1).max(200),
-      /** The workflow file whose run number the tag is, e.g. bb-server.yaml. */
+      /** The workflow file whose run number the tag is, e.g. build.yaml. */
       workflow: z.string().trim().min(1).max(300),
       /** The build job whose `started_at` the pin is read as of, when the image is built from a pin. */
       job: z.string().trim().min(1).max(200).optional(),
@@ -825,7 +825,7 @@ export const carriesStrategySchema = z.discriminatedUnion("kind", [
         .object({
           dockerfile: z.string().trim().min(1).max(500),
           pinArg: z.string().trim().min(1).max(200),
-          repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-plugins"),
+          repo: z.string().trim().regex(REPO_NAME, "a repo such as acme/app"),
         })
         .strict()
         .optional(),
@@ -858,8 +858,8 @@ export const deploymentTargetSchema = z
     /** An optional name, so a playbook with more than one target can name it in reports and wakes. */
     name: z.string().trim().min(1).max(100).optional(),
     source: z.literal("github"),
-    /** The repo the deployment is created on, as GitHub spells it, e.g. bitcomplete/bb-gate. */
-    repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-gate"),
+    /** The repo the deployment is created on, as GitHub spells it, e.g. acme/web. */
+    repo: z.string().trim().regex(REPO_NAME, "a repo such as acme/web"),
     /** The deployment environment that confirms it, matched ignoring case. */
     environment: z.string().trim().min(1).max(100),
     /**

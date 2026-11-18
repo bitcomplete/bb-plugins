@@ -105,8 +105,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   The flag is re-read on every call, so turning it off refuses at once, and
   a ticket, ledger or configuration that cannot be read refuses and writes
   nothing. The `.bb` keys land in a later, owner-reviewed pull request.
-- **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
-  project's teams and repos and for every bound entity, and ring this plugin
+- **The reconcile loop.** linear and github-watcher hold leases on the hooks
+  service for the project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
   the last observation, and the steward is woken only for an actionable
   change: a phase change, a human comment, a review, checks finishing,
@@ -480,7 +480,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   open is not raised again. The nightly digest lists marked bindings and open
   stalls.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
-  02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
+  02:45 so it finishes before the working day) gives every open
   binding a turn, runs the live half of `bb stewards check` (teams, states,
   labels, repos, target readability and hooks leases), then wakes the project
   steward for the morning digest, which carries the check findings new or
@@ -666,7 +666,7 @@ plugins baked into the `bb-server` image.)
 window of that bb server shows the same list, and the choice survives a
 reload. `bb settings ui get sidebar.threadListProvider` — a different client —
 sees the value the toggle wrote, and bb tells the other clients the preference
-changed. Each developer has their own server behind bb-gate, so in practice
+changed. Each developer has their own server, so in practice
 the choice is per developer.
 
 ## Configuration
@@ -755,17 +755,17 @@ under `holders`:
   "version": 2,
   "roles": {
     "ops": {
-      "k8sNamespaces": ["bb-gate-production"],
-      "context": "bc-prod",
+      "k8sNamespaces": ["web-production"],
+      "context": "prod",
       "team": "OPS",
       "autoAdopt": ["urgent"],
       "sentry": { "projects": [{ "org": "acme", "project": "web" }], "resolveOnDone": false },
       "dependabot": "all",
       "pulls": [
-        { "repo": "bitcomplete/bc-prod",
-          "match": { "title": "Update */bc-prod.yaml",
-                     "branch": "update-*-bc-prod-yaml-*",
-                     "paths": ["projects/*/bc-prod.yaml"] },
+        { "repo": "acme/deploy",
+          "match": { "title": "Update */config.yaml",
+                     "branch": "update-*-config-yaml-*",
+                     "paths": ["projects/*/config.yaml"] },
           "playbook": "sync-prs" }
       ]
     }
@@ -803,7 +803,7 @@ ticket a watch files is assigned to this server's owner, the login the role
 belongs to, and never to anyone else.
 `sentry.projects` watches Sentry projects with the plugin's **Sentry token**
 setting (a user auth token with `project:read`, `event:read` and
-`event:write`; `Sentry API` for a self-hosted server), rung by bb-gate-hooks
+`event:write`; `Sentry API` for a self-hosted server), rung by the hooks service
 the moment an issue is created or regresses and backed by the same periodic
 look; the Sentry issue id is the fingerprint, and the wake carries the issue's
 title, culprit, permalink, counts and latest stack trace
@@ -820,7 +820,7 @@ under a playbook, with no label: each entry is `{ repo, match, playbook }`,
 where `match` names any of `title`, `branch`, `author` and `paths` and every
 one given must match. A field is a glob in the decide list's `*` (within a
 path segment) and `**` (across segments) dialect, so `title: "Update
-*/bc-prod.yaml"` matches the sync PRs the bc-prod-github-app opens. `paths`
+*/config.yaml"` matches the sync PRs an app opens. `paths`
 means every changed file matches one of its globs; it is checked only at
 adoption, on the full snapshot (GitHub lists the first 100 changed files, so a
 pull request with 100 or more files never matches a `paths` watch — fail
@@ -830,8 +830,8 @@ permissive there and the full snapshot decides. A watch with no `match.author`
 matches only a pull request authored by the role holder's own GitHub login;
 any other author must be named, as the synthesized Dependabot watch names the
 bot logins. `match.author` may be written either as the bare GraphQL login
-(`bc-prod-bitcomplete-dev`) or with the `[bot]` suffix REST and `gh` show
-(`bc-prod-bitcomplete-dev[bot]`): the plugin strips a trailing `[bot]`
+(`deploy-bot`) or with the `[bot]` suffix REST and `gh` show
+(`deploy-bot[bot]`): the plugin strips a trailing `[bot]`
 (case-insensitively) from both the pattern and the author before the glob
 compare, so `app`, `app[bot]` and `app*` all match an app's PR. A pattern
 left as only a wildcard plus the suffix (`*[bot]`) is not stripped, since it
@@ -953,7 +953,7 @@ Merge item on a teammate's pull request too, BB-170), `deployment`.
 `deployment` names where a merge is confirmed live (BB-53, BB-132): one
 target or a list of them. A target has `name` (optional; reports and wakes
 name it when there is more than one), `source` (`github`), `repo` (the repo
-the deployment is created on, e.g. `bitcomplete/bb-gate`), `environment`,
+the deployment is created on, e.g. `acme/web`), `environment`,
 `carries`, `timeout` (how long to wait for one, 6h by default) and the
 optional `workflows` whose failure matters while it waits (BB-61). With it, a
 merged pull request is recorded as awaiting deployment for each target, the
@@ -1016,7 +1016,7 @@ a form. It is done by a thread with the **onboarding skill**
 mechanical facts about the project's repos (from `repos.json` plus the
 primary): the default branch, branch protection, languages and package
 manifests, the test and typecheck commands CI runs (from `.github/workflows`),
-Dockerfiles and deploy manifests (`kploy`, `bc-prod.yaml`), the repo's labels,
+Dockerfiles, the repo's labels,
 and which repos reference which. It emits the Linear teams and their workflow
 states, and what `.bb` already holds (project file, roles, playbooks), so
 adoption can diff rather than start over. GitHub is read through the plugin's
@@ -1082,10 +1082,8 @@ the no-worker and running-worker ones. `parkWorker` inserts the shared
 flight for delivery), so a gate-met pull request whose worker has parked is
 exercised; a change to the merge path keeps that variant passing.
 
-Deployment needs this directory added to bb-gate's
-`docker/bb-server/Dockerfile` (the sparse checkout, the `mv`, and
-`BB_PLUGIN_DIRS`), and multi-repo, linear and github-watcher at versions that serve
-the contract. Ops stewards need `kubectl` on the project's machine, with a
-kubeconfig that reaches the cluster as the developer (for bc-prod, the
-Tailscale API proxy: the machine on the tailnet as its developer, not a
-tagged node). The plugin's host entry runs it there.
+A server that bakes its plugins into an image adds this directory the way it
+adds any other plugin, and needs multi-repo, linear and github-watcher at
+versions that serve the contract. Ops stewards need `kubectl` on the
+project's machine, with a kubeconfig that reaches the cluster. The plugin's
+host entry runs it there.

@@ -1497,7 +1497,7 @@ export const STEWARDS_SETTINGS = {
   alertmanagerUrl: {
     type: "string",
     label: "Alertmanager API",
-    description: "The Alertmanager v2 API root the ops stewards of alertmanager targets read. Empty falls back to the ALERTMANAGER_URL environment variable, then to the tailnet hostname for a non-cluster server; a cluster server gets the in-cluster Service from the environment. The API takes no token.",
+    description: "The Alertmanager v2 API root the ops stewards of alertmanager targets read. Empty falls back to the ALERTMANAGER_URL environment variable; when neither is set, an alertmanager target reports a clear error. The API takes no token.",
   },
 } as const;
 
@@ -6765,12 +6765,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // Alertmanager fingerprint is the fingerprint; a resolved alert is noted
     // on its ticket as a comment, never auto-closed.
 
-    const alertmanagerUrl = async (): Promise<string> => {
+    const alertmanagerUrl = async (): Promise<string | null> => {
       const value = (await settings.get()).alertmanagerUrl;
       const setting = typeof value === "string" ? value : "";
       return resolveAlertmanagerUrl(setting, env[ALERTMANAGER_URL_ENV] ?? null);
     };
-    const alertmanagerReader = async (): Promise<AlertmanagerReader> => createAlertmanagerReader(fetchImpl, { apiUrl: await alertmanagerUrl() });
+    const alertmanagerReader = async (): Promise<AlertmanagerReader> => {
+      const url = await alertmanagerUrl();
+      if (url === null) throw new Error(`No Alertmanager URL is set: set the alertmanagerUrl setting or ${ALERTMANAGER_URL_ENV}`);
+      return createAlertmanagerReader(fetchImpl, { apiUrl: url });
+    };
     /** Fingerprints doorbells named since each binding's last look, split by action. */
     const alertmanagerRung = new Map<string, AlertmanagerRung>();
 
@@ -14786,20 +14790,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         const alertmanager = roleAlertmanagerTargets(config.role);
         if (alertmanager.length > 0) {
-          lines.push(`alertmanager: reading ${await alertmanagerUrl()} (no token)`);
-          const alertmanagerApi = await alertmanagerReader();
-          for (const target of alertmanager) {
-            const key = opsTargetKey(target);
-            const a = await alertmanagerApi.access(target);
-            lines.push(a.ok ? `alertmanager: ${key} is readable (${a.name})` : `problem: alertmanager: cannot read the target ${key}: ${a.error}`);
-            const refused = alertmanagerRefused.get(`namespace ${target.namespace}`);
-            if (refused !== undefined) lines.push(`warning: alertmanager: ${key}: bb-gate-hooks refused its namespace lease (${refused}); only the periodic look sees it`);
+          const url = await alertmanagerUrl();
+          if (url === null) {
+            lines.push(`problem: alertmanager: no Alertmanager URL is set; set the alertmanagerUrl setting or ${ALERTMANAGER_URL_ENV}`);
+          } else {
+            lines.push(`alertmanager: reading ${url} (no token)`);
+            const alertmanagerApi = await alertmanagerReader();
+            for (const target of alertmanager) {
+              const key = opsTargetKey(target);
+              const a = await alertmanagerApi.access(target);
+              lines.push(a.ok ? `alertmanager: ${key} is readable (${a.name})` : `problem: alertmanager: cannot read the target ${key}: ${a.error}`);
+              const refused = alertmanagerRefused.get(`namespace ${target.namespace}`);
+              if (refused !== undefined) lines.push(`warning: alertmanager: ${key}: bb-gate-hooks refused its namespace lease (${refused}); only the periodic look sees it`);
+            }
+            const status = alertmanagerHooks.status();
+            if (hooksUrl === "") lines.push("alertmanager: no bb-gate-hooks here (BB_HOOKS_URL is not set), so alerts are seen by the periodic look only");
+            else if (status.sourceProblem === "unknown") lines.push("problem: alertmanager: bb-gate-hooks does not know the alertmanager source yet; only the periodic look sees it until the service is updated");
+            else if (status.sourceProblem === "unconfigured") lines.push("problem: alertmanager: bb-gate-hooks has no alertmanager adapter configured (its secret is not set); only the periodic look sees it until the service is updated");
+            else lines.push(`alertmanager: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
           }
-          const status = alertmanagerHooks.status();
-          if (hooksUrl === "") lines.push("alertmanager: no bb-gate-hooks here (BB_HOOKS_URL is not set), so alerts are seen by the periodic look only");
-          else if (status.sourceProblem === "unknown") lines.push("problem: alertmanager: bb-gate-hooks does not know the alertmanager source yet; only the periodic look sees it until the service is updated");
-          else if (status.sourceProblem === "unconfigured") lines.push("problem: alertmanager: bb-gate-hooks has no alertmanager adapter configured (its secret is not set); only the periodic look sees it until the service is updated");
-          else lines.push(`alertmanager: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
         }
       }
       const deps = config.file.deps;

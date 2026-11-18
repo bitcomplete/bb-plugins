@@ -5,6 +5,10 @@ thread that manages it until it is done**. The thread, a **steward**, acts on
 the entity as you, according to a playbook the project keeps in `.bb`, and you
 steer it only from bb.
 
+> This document is history and rationale, and it names `bb-gate` and other
+> repos of one deployment of the plugin. That deployment is one project's
+> setup, not a requirement: the plugin itself is deployment-neutral.
+
 Status: built (steps 1–6 of the build order, ops stewards included). See
 [README.md](README.md) for how it runs and where it goes beyond this design.
 

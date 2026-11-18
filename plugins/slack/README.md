@@ -21,17 +21,17 @@ usual.
 
 ## How it fits together
 
-bb-gate-hooks (`bb-gate/docs/hooks.md`, "Slack agent") holds the app's
+The hooks service ("Slack agent") holds the app's
 credentials and routes each event; this plugin holds only the developer's own
 sign-in token. There is no bot token, no client secret and no cluster access
 on the pod.
 
 - **Sign-in.** Settings → Plugins → Slack → **Sign in with Slack** sends the
-  browser to Slack through bb-gate-hooks, which mints a PKCE state bound to
+  browser to Slack through the hooks service, which mints a PKCE state bound to
   this server's connection. Slack sends the browser back to this plugin's
   callback at
   `/api/v1/plugins/slack/http/signin/callback`; the router's tsjwt sends it to
-  the browser owner's own server. The plugin asks bb-gate-hooks to exchange
+  the browser owner's own server. The plugin asks the hooks service to exchange
   the code (the client secret never leaves the service), stores the returned
   user token in plugin storage, and presents it at `POST /v1/identify`. The
   service reads the token's own Slack user and binds it to this server's
@@ -56,7 +56,7 @@ on the pod.
   is hidden too; pass `--visibility visible` to a `bb thread spawn` that should
   show in the sidebar.
 - **Replies.** The plugin never holds the bot token. `slack_reply` posts
-  through bb-gate-hooks with the connection id and the text; the service posts
+  through the hooks service with the connection id and the text; the service posts
   as the app. The text may be Markdown: the plugin converts it to Slack mrkdwn
   before posting (see "Tools"). `assistant.threads.setStatus` shows a thinking
   indicator while the turn runs, and the bb thread's title is pushed with
@@ -64,7 +64,7 @@ on the pod.
 - **Ownership.** Each wake carries an opaque capability for the session, and
   the plugin echoes it to `POST /v1/subscribe` after every `hello` and at half
   the lease's life. The lease is the owner of record, so reply rights survive a
-  restart of bb-gate-hooks and a gap longer than the old 24-hour route window.
+  restart of the hooks service and a gap longer than the old 24-hour route window.
   Archiving the bb thread drops the session from the renewal set. A session the
   service says another server owns is logged and gets a best-effort backstop
   reply; the other server's live lease makes the service refuse that reply, so
@@ -106,7 +106,7 @@ server; filtering by name is local. A still-valid OpenID token from a sign-in
 before this change cannot list channels, so the picker says "Sign in again to
 search channels" and falls back to the id box. A channel the app's bot is not a
 member of gets a prompt under its row, "bb is not in #name yet. Add bb to this
-channel?", with an **Add bb** button: the plugin asks bb-gate-hooks
+channel?", with an **Add bb** button: the plugin asks the hooks service
 (`POST /v1/slack/bot/join`), which joins with the bot token it holds, so the
 pod never needs one. Slack lets a bot join only public channels by itself, so
 for a private channel the prompt says to type `/invite @bb` in Slack instead,
@@ -148,7 +148,7 @@ An untagged reply from someone other than the owner is held for the owner's
 confirmation exactly like an untrusted mention.
 
 A thread only becomes followed once bb has been tagged or mentioned in it; a
-thread bb is not part of is dropped by bb-gate-hooks, in memory, with no text,
+thread bb is not part of is dropped by the hooks service, in memory, with no text,
 user or channel logged or stored. The feature is **inert until a Slack admin
 does two by-hand steps** on the team app:
 
@@ -164,7 +164,7 @@ drops everything that is not in a followed thread.
 ## Earlier messages on the first wake
 
 When bb is first tagged partway through an existing Slack thread, the first
-wake carries the thread's earlier messages (bb-gate's `history` field,
+wake carries the thread's earlier messages (the hooks service's `history` field,
 BB-162), and the plugin opens the spawned bb thread with an "Earlier in this
 Slack thread:" transcript before the waking message. Each earlier message is
 one `Name: text` line, oldest first. A line from someone other than the owner
@@ -196,7 +196,7 @@ unchanged.
 ## Attachments
 
 An image or a small text-like file attached to a Slack message is fetched
-from bb-gate-hooks (`GET /v1/slack/sessions/{session}/files/{id}`) and
+from the hooks service (`GET /v1/slack/sessions/{session}/files/{id}`) and
 forwarded into the bb thread as an input part with the text, before the turn
 starts. Images (png, jpeg, gif, webp) up to 10 MiB and text-like files up to
 1 MiB are forwarded; a file that is not one of those, or is over its cap, is
@@ -209,13 +209,13 @@ The bytes are uploaded as a bb project attachment and sent as a
 `localImage`/`localFile` input part; the plugin writes no file itself and
 never logs a name, byte or URL. Forwarding needs the bot scope `files:read` on
 the team app, added by hand with a reinstall (the by-hand step is in
-`bb-gate/README.md`). Until that is done the endpoint answers 503
+the hooks service's documentation). Until that is done the endpoint answers 503
 `missing-scope`, and every file stays on the "not forwarded" line exactly as
 before.
 
 ## Editing and deleting a message
 
-bb-gate-hooks routes an edit or a deletion of a DM to the conversation's
+The hooks service routes an edit or a deletion of a DM to the conversation's
 owner as a correction carrying the original message's `ts`. The plugin keeps
 the last few wakes per conversation keyed by that `ts` and applies the
 correction to the wake it matches:
@@ -236,9 +236,9 @@ correction to the wake it matches:
 ## By hand (a Slack admin)
 
 The Slack app itself, its scopes, the events URL and the redirect URL are set
-up by hand as described in `bb-gate/README.md`. No agent creates or sees the
-signing secret, bot token or OAuth client secret; they are sealed with
-`bb-gate/scripts/seal-hooks`.
+up by hand as described in the hooks service's documentation. No agent
+creates or sees the signing secret, bot token or OAuth client secret; the
+operator seals them.
 
 ## Tools
 
