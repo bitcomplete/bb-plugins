@@ -37,12 +37,11 @@ describe("the onboarding survey's per-repo derivation", () => {
     expect(failed.labels).toEqual({ available: false, error: "gh is not signed in" });
   });
 
-  it("derives languages, manifests, Dockerfiles and deploy manifests from the tree", () => {
+  it("derives languages, manifests and Dockerfiles from the tree, ignoring deploy files", () => {
     const derived = deriveRepo(repo({ tree: tree("go.mod", "cmd/main.go", "Dockerfile", "docker/web.Dockerfile", "kploy/prod.yaml", "bc-prod.yaml", "docker-compose.yml") }));
     expect(derived.languages).toEqual(["Go"]);
     expect(derived.manifests).toEqual(["go.mod"]);
     expect(derived.dockerfiles).toEqual(["Dockerfile", "docker/web.Dockerfile"]);
-    expect(derived.deployManifests).toEqual(["bc-prod.yaml", "docker-compose.yml", "kploy/prod.yaml"]);
   });
 
   it("distinguishes TypeScript from JavaScript and lists every language", () => {
@@ -107,6 +106,41 @@ describe("the onboarding survey's per-repo derivation", () => {
     expect(derived.testCommands).toEqual([]);
     expect(derived.references).toEqual([]);
   });
+
+  it("emits nothing Kubernetes-shaped for a repo full of deploy manifests", () => {
+    // The survey makes no assumption about how a project deploys: a repo's
+    // kploy/ and bc-prod.yaml files, and any Kubernetes manifest, are neither
+    // read nor reported, so no deployment-shaped field or path reaches the
+    // report or its text rendering.
+    const report = buildSurvey({
+      projectId: "p1",
+      source: "multi-repo",
+      layout: "primary",
+      primary: null,
+      repos: [
+        repo({
+          tree: tree(
+            "package.json",
+            "kploy/production/kustomization.yaml",
+            "kploy/production/deployment.yaml",
+            "bc-prod.yaml",
+            "deploy/kubernetes.yaml",
+            "README.md",
+          ),
+          contents: new Map([
+            ["kploy/production/deployment.yaml", "apiVersion: apps/v1\nkind: Deployment"],
+            ["bc-prod.yaml", "namespace: bb-gate-production"],
+          ]),
+        }),
+      ],
+      linear: { available: false, error: "linear is not connected" },
+      bb: { projectFile: false, roles: false, projectSteward: null, playbooks: [], reposJson: false, error: null },
+    });
+    expect(JSON.stringify(report)).not.toMatch(/bc-prod|kploy|bb-gate|kubernetes|deployManifests/iu);
+    expect(formatSurvey(report)).not.toMatch(/bc-prod|kploy|bb-gate|kubernetes|deploy manifests/iu);
+    // It still reports the facts it did read from the same tree.
+    expect(report.repos[0]!.manifests).toEqual(["package.json"]);
+  });
 });
 
 describe("surveyWantedPaths and workflowRunCommands", () => {
@@ -115,7 +149,6 @@ describe("surveyWantedPaths and workflowRunCommands", () => {
     expect(surveyWantedPaths(tree("src/index.ts", "package.json", ".github/workflows/ci.yaml", "Dockerfile", "bc-prod.yaml", "README.md", "LICENSE"))).toEqual([
       ".github/workflows/ci.yaml",
       "Dockerfile",
-      "bc-prod.yaml",
       "package.json",
       "README.md",
     ]);

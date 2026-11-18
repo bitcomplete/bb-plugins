@@ -15014,7 +15014,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           survey: cliCommand({
             summary: "Emit the mechanical facts about a project's repos, Linear and .bb, for onboarding",
             description:
-              "Reads each repo's default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, deploy manifests, labels and cross-repo references from GitHub; the Linear teams and workflow states from the linear source; and what .bb already holds. A read that fails is reported as unavailable, never fabricated. --json is stable and is what the onboarding skill works from.",
+              "Reads each repo's default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, labels and cross-repo references from GitHub; the Linear teams and workflow states from the linear source; and what .bb already holds. A read that fails is reported as unavailable, never fabricated. --json is stable and is what the onboarding skill works from.",
             options: { project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const report = await surveyProject(projectOf(input.options.project, ctx));
