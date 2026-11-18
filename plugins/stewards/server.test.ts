@@ -4772,7 +4772,6 @@ describe("bb stewards survey and Set up stewards", () => {
       testCommands: ["npm test"],
       typecheckCommands: ["npm run typecheck"],
       dockerfiles: ["Dockerfile"],
-      deployManifests: ["bc-prod.yaml", "kploy/deployment.yaml"],
       references: [{ repo: "acme/bb", files: ["README.md"] }],
     });
     expect(report.linear.available).toBe(true);

@@ -27,15 +27,17 @@ bb stewards survey --json
 
 It emits, per repo (from `repos.json` plus the primary): the default branch,
 branch protection, languages and package manifests, the test and typecheck
-commands CI runs (from `.github/workflows`), Dockerfiles and deploy manifests
-(`kploy`, `bc-prod.yaml`), the repo's labels, and which repos reference which.
+commands CI runs (from `.github/workflows`), Dockerfiles, the repo's labels,
+and which repos reference which.
 It emits the Linear teams and their workflow states, and what `.bb` already
 holds (project file, roles, playbooks). A read that failed is marked
 `available: false` with the reason: say so, never guess.
 
 Then read each repo's `README.md` (and `AGENTS.md` if it has one) for what the
 survey cannot see: what the product is, which repo is deployed where, and how
-a change is known to be live. Do not re-derive facts the survey already has.
+a change is known to be live. Take "how a merge is known live" from the
+project's own README, docs and code; when nothing there says otherwise, the
+default is **merged is done**. Do not re-derive facts the survey already has.
 
 ## 2. One batched interview, under ten questions
 
@@ -48,11 +50,14 @@ and list them as assumptions. Cover:
 2. **The owner's decisions versus the project steward's.** Present the
    defaults, then candidate `project` entries with `paths` from the survey
    (each path prefixed with its repo directory from `repos.json`, e.g.
-   `bb-plugins/plugins/…`).
-3. **How a merge is known to be deployed** — the repo, environment and rule
-   the playbook's `deployment` should use.
+   `web/src/…`).
+3. **How a merge is known live** — the repo, environment and rule the
+   playbook's `deployment` should use. Ask this when the README, docs and code
+   do not already say; the default when nothing says otherwise is **merged is
+   done**.
 4. **The label** tickets carry (default `bb-managed`).
-5. **The nightly window and timezone.**
+5. **The nightly window and its time zone** — the time zone the window's
+   hours are in.
 6. **Ops watches** — the namespaces, Sentry projects and Dependabot repos
    each server should watch, and which login runs them.
 7. **Repos to exclude** from stewards.
@@ -79,12 +84,12 @@ Then fill in, from the survey and the interview:
 - **`stewards/roles.json`** — one entry per GitHub login, with
   `projectSteward: true` on exactly one, and the `ops` watches from the
   interview. This file is what makes the project steward run.
-- **`AGENTS.md`** — short on day one. The sections bb-gate's has, with only
-  what the survey and interview support: the repos, the dependency graph
-  (which repo consumes which), the shipping paths (what rebuilds, republishes
-  or redeploys when a repo changes, and where the trigger lives), testing (the
-  survey's test and typecheck commands), and reviews (the lane gate and who
-  merges). Do not write a bb-gate-sized guide from guesses.
+- **`AGENTS.md`** — short on day one, with only what the survey and interview
+  support: the repos and the dependency graph (which repo consumes which, for
+  example `acme/web` consumes `acme/api`), the shipping paths (what rebuilds,
+  republishes or redeploys when a repo changes, and where the trigger lives),
+  testing (the survey's test and typecheck commands), and reviews (the lane
+  gate and who merges). Do not write a guide larger than the facts support.
 - **Playbooks** — touch them only where the survey found a deviation, for
   example a project whose deployment confirmation differs from the default.
   The templates are starting points; leave the rest alone.

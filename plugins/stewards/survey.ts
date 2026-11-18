@@ -58,7 +58,6 @@ export type SurveyRepo = {
   testCommands: string[];
   typecheckCommands: string[];
   dockerfiles: string[];
-  deployManifests: string[];
   references: SurveyRepoReference[];
 };
 
@@ -153,28 +152,21 @@ const isDockerfilePath = (path: string): boolean => {
   return name === "Dockerfile" || /^Dockerfile[._-]/u.test(name) || name.endsWith(".Dockerfile");
 };
 
-const isDeployManifestPath = (path: string): boolean => {
-  const name = basename(path);
-  if (name === "bc-prod.yaml" || name === "bc-prod.yml") return true;
-  if (path === "kploy" || path.startsWith("kploy/")) return true;
-  return /^docker-compose.*\.ya?ml$/u.test(name);
-};
-
-/** A file whose text may name another repo: docs and the build/deploy files. */
-const isReferenceCandidatePath = (path: string): boolean => isManifestPath(path) || isWorkflowPath(path) || isDockerfilePath(path) || isDeployManifestPath(path) || /\.md$/u.test(path);
+/** A file whose text may name another repo: docs and the build files. */
+const isReferenceCandidatePath = (path: string): boolean => isManifestPath(path) || isWorkflowPath(path) || isDockerfilePath(path) || /\.md$/u.test(path);
 
 /**
- * The paths a caller should read for one repo: the manifests, CI workflows,
- * Dockerfiles and deploy manifests first (so a repo full of docs cannot push
- * them out of the cap), then the docs that may name another repo. Stable
- * order, capped at `MAX_SURVEY_FILES`.
+ * The paths a caller should read for one repo: the manifests, CI workflows
+ * and Dockerfiles first (so a repo full of docs cannot push them out of the
+ * cap), then the docs that may name another repo. Stable order, capped at
+ * `MAX_SURVEY_FILES`. Nothing here assumes how the project deploys.
  */
 export function surveyWantedPaths(tree: readonly RepoTreeEntry[]): string[] {
   const primary: string[] = [];
   const references: string[] = [];
   for (const entry of tree) {
     if (entry.type !== "blob") continue;
-    if (isManifestPath(entry.path) || isWorkflowPath(entry.path) || isDockerfilePath(entry.path) || isDeployManifestPath(entry.path)) primary.push(entry.path);
+    if (isManifestPath(entry.path) || isWorkflowPath(entry.path) || isDockerfilePath(entry.path)) primary.push(entry.path);
     else if (isReferenceCandidatePath(entry.path)) references.push(entry.path);
   }
   const seen = new Set<string>();
@@ -337,7 +329,6 @@ export function deriveRepo(input: SurveyRepoInput): SurveyRepo {
   const filesAvailable = input.tree !== null;
   const manifests = blobs.filter(isManifestPath).sort();
   const dockerfiles = blobs.filter(isDockerfilePath).sort();
-  const deployManifests = blobs.filter(isDeployManifestPath).sort();
   const workflows = blobs.filter(isWorkflowPath).sort();
   const tests: string[] = [];
   const typechecks: string[] = [];
@@ -362,7 +353,6 @@ export function deriveRepo(input: SurveyRepoInput): SurveyRepo {
     testCommands: tests,
     typecheckCommands: typechecks,
     dockerfiles,
-    deployManifests,
     references: filesAvailable ? referencesIn(input.contents, referencePaths, input.otherRepos) : [],
   };
 }
@@ -401,7 +391,6 @@ export function formatSurvey(report: SurveyReport): string {
     lines.push(`  test commands: ${repo.testCommands.join(" | ") || "(none)"}`);
     lines.push(`  typecheck commands: ${repo.typecheckCommands.join(" | ") || "(none)"}`);
     lines.push(`  dockerfiles: ${repo.dockerfiles.join(", ") || "(none)"}`);
-    lines.push(`  deploy manifests: ${repo.deployManifests.join(", ") || "(none)"}`);
     lines.push(repo.labels.available ? `  labels: ${repo.labels.value.join(", ") || "(none)"}` : `  labels: unavailable (${repo.labels.error})`);
     lines.push(`  references: ${repo.references.map((r) => `${r.repo} (${r.files.join(", ")})`).join("; ") || "(none)"}`);
     if (!repo.files.available) lines.push(`  files: unavailable (${repo.files.error ?? "unknown"})`);
