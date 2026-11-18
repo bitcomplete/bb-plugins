@@ -264,8 +264,8 @@ attaches it to the parent in the same action and, with \`assignee: "me"\`,
 assigns it to this server's login, so a later \`bb-managed\` promotion can
 adopt it. If the source reports it filed the child but could not link it (the
 error names the child's key), re-link that child with
-\`gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=<the child's id>\`,
-not a second child.
+\`gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/<N> --jq .id)\`,
+using the child's number \`<N>\` from the error, not a second child.
 
 ## status:in-progress
 

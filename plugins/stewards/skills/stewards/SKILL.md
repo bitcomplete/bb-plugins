@@ -475,7 +475,9 @@ on Linear the parent must be in the same team. Keep a `Part of <parent key>`
 line in the description for a reader. If the source reports it filed the child
 but could not link it (the error names the child's key), do not file a second
 one: on GitHub, re-link that child with
-`gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=<the child's id>`.
+`gh api -X POST repos/{owner}/{repo}/issues/{parent}/sub_issues -F sub_issue_id=$(gh api repos/{owner}/{repo}/issues/<N> --jq .id)`,
+using the child's number `<N>` from the error (GitHub's link wants the numeric
+REST id, not the number).
 
 ## If you are an ops steward
 
