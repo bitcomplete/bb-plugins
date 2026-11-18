@@ -193,7 +193,8 @@ export const DEPS_PRS_PLAYBOOK = "deps-prs";
 
 export const playbookName = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/u, "a playbook name: lowercase letters, digits and dashes");
 
-function validTimezone(tz: string): boolean {
+/** Whether a string is an IANA time zone the runtime accepts (BB-364: `init` validates the interview's answer before writing it). */
+export function validTimezone(tz: string): boolean {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: tz });
     return true;

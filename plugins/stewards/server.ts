@@ -33,6 +33,7 @@ import {
   ESCALATION_KINDS,
   KINDS,
   LOCAL_TICKETS_PLAYBOOK,
+  localPrefix,
   PROJECT_FILE,
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
@@ -56,6 +57,7 @@ import {
   STAGES,
   ticketWatchId,
   ticketWatchProblems,
+  validTimezone,
   waitBudgetMs,
   type BindingKind,
   type EscalationKind,
@@ -15446,6 +15448,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. A git repo is read at origin/<default>'s committed tip, so commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself). A plain project directory is read from <dir>/.bb on disk, so the files take effect on the next read and there is nothing to commit or publish.",
             options: {
               teams: { type: "string", description: "Linear team keys, comma-separated; the teams you belong to when left out" },
+              prefix: { type: "string", description: "The local ticket source's key prefix (default LOCAL)" },
+              timezone: { type: "string", description: "The IANA time zone the nightly window's hours are in (default America/New_York)" },
               dir: { type: "string", description: "The .bb directory to write into" },
               force: { type: "boolean", description: "Overwrite existing files" },
             },
@@ -15461,6 +15465,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   if (!isMissingPlugin(error)) throw new PluginCliError(`Could not ask Linear for your teams: ${errorMessage(error)}`, { code: "linear_unavailable", hint: "Pass --teams ENG,OPS." });
                 }
               }
+              // BB-364: validate the interview's answers before writing them, so
+              // a bad prefix or zone fails here rather than as a `check` problem.
+              const prefix = input.options.prefix === undefined || input.options.prefix === "" ? undefined : localPrefix.safeParse(input.options.prefix);
+              if (prefix !== undefined && !prefix.success) throw new PluginCliError(`--prefix ${JSON.stringify(input.options.prefix)} is not a local ticket prefix: a prefix such as LOCAL.`, { code: "bad_prefix" });
+              if (input.options.timezone !== undefined && input.options.timezone !== "" && !validTimezone(input.options.timezone)) throw new PluginCliError(`--timezone ${JSON.stringify(input.options.timezone)} is not an IANA time zone such as America/New_York.`, { code: "bad_timezone" });
               const dir = input.options.dir ?? (ctx.cwd === undefined ? undefined : `${ctx.cwd.replace(/\/$/u, "")}/.bb`);
               if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
               // Write on the thread's machine, else the project's: left to core, the
@@ -15471,7 +15480,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // init writes the github-issues ticket playbook too. A project
               // with Linear teams keeps the Linear ticket playbook alone.
               const templates = Object.entries(PLAYBOOK_TEMPLATES).filter(([name]) => name !== DEFAULT_GITHUB_TICKET_PLAYBOOK || teams.length === 0);
-              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...templates.map(([name, text]) => [playbookPath(name), stampedTemplate(name, text)] as [string, string])];
+              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams, { ...(prefix?.success ? { localPrefix: prefix.data } : {}), ...(input.options.timezone === undefined || input.options.timezone === "" ? {} : { timezone: input.options.timezone }) })], ...templates.map(([name, text]) => [playbookPath(name), stampedTemplate(name, text)] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {
                 const path = `${dir}/${rel}`;

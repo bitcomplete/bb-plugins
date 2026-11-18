@@ -4758,6 +4758,43 @@ describe("bb stewards init", () => {
     expect(projectFile).not.toContain("bb-managed");
     expect([...t.writtenContent.keys()].some((path) => path.endsWith(playbookPath("github-issues")))).toBe(true);
   });
+
+  // BB-364: the interview's time zone and local prefix go in the file init writes.
+  it("writes the interview's time zone and local prefix into the skeleton", async () => {
+    const t = await setup();
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    const out = await t.harness.behavior.runCli(["init", "--prefix", "ticket", "--timezone", "Europe/Berlin"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(out.exitCode).toBe(0);
+    const project = JSON.parse(t.writtenContent.get(`/w/.bb/${PROJECT_FILE}`)!);
+    expect(project.localPrefix).toBe("TICKET");
+    expect(project.nightly.timezone).toBe("Europe/Berlin");
+    // Apply what init wrote and check the project passes.
+    for (const [path, content] of t.writtenContent) if (path.startsWith("/w/.bb/")) t.files[path.slice("/w/.bb/".length)] = content;
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.exitCode).toBe(0);
+  });
+
+  it("still refuses a Linear that is installed but failing, and rejects a bad prefix or zone", async () => {
+    const t = await setup();
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear" && args.method === "sourceValidate") throw Object.assign(new Error("Linear rate limited the read"), { code: "handler_error" });
+      return original(args);
+    });
+    const failing = await t.harness.behavior.runCli(["init"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(failing.exitCode).not.toBe(0);
+    expect(failing.stderr).toContain("Could not ask Linear for your teams");
+
+    const badPrefix = await t.harness.behavior.runCli(["init", "--teams", "ENG", "--prefix", "1bad"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(badPrefix.exitCode).not.toBe(0);
+    expect(badPrefix.stderr).toContain("not a local ticket prefix");
+
+    const badZone = await t.harness.behavior.runCli(["init", "--teams", "ENG", "--timezone", "Mars/Phobos"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(badZone.exitCode).not.toBe(0);
+    expect(badZone.stderr).toContain("not an IANA time zone");
+  });
 });
 
 // BB-180: the onboarding survey, the overview's onboard flag, and the page
@@ -4836,6 +4873,21 @@ describe("bb stewards survey and Set up stewards", () => {
     const report = JSON.parse(out.stdout) as { bb: { roles: boolean; projectSteward: string | null } };
     expect(report.bb.roles).toBe(true);
     expect(report.bb.projectSteward).toBeNull();
+  });
+
+  // BB-364: a stock bb has no Linear plugin. The survey must report that as
+  // `available: false` and still emit the rest, so the onboarding interview is
+  // not derailed by the absence.
+  it("reports Linear unavailable without failing when the plugin is not installed", async () => {
+    const t = await surveyed();
+    t.setLinearUnavailable(true);
+    const out = await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    const report = JSON.parse(out.stdout) as { linear: { available: boolean; error?: string } };
+    expect(report.linear.available).toBe(false);
+    expect(report.linear.error).toBeTruthy();
+    const human = await t.harness.behavior.runCli(["survey", "--project", "p1"]);
+    expect(human.stdout).toContain("Linear: unavailable");
   });
 
   it("surveys a project with no project file at all (the skill's starting state)", async () => {
@@ -6029,6 +6081,37 @@ describe("the native project source (BB-107)", () => {
     expect((await t.harness.behavior.runCli(["check", "--project", "p1"])).stdout).toContain("Project source: native git");
     const nativeOverview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; source: string | null }> };
     expect(nativeOverview.projects.find((p) => p.projectId === "p1")?.source).toBe("native");
+  });
+
+  // BB-364: the whole stock-install onboarding on a native single-repo project
+  // with no Linear plugin and no repos.json: the survey reports Linear
+  // unavailable, init writes a local-only skeleton carrying the interview's
+  // time zone and prefix, and check passes.
+  it("onboards a native single-repo project with no Linear and no repos.json", async () => {
+    const { t } = await nativeWorld(true, { layout: "primary" });
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "multi-repo" || args.pluginId === "linear") throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
+      return original(args);
+    });
+    // A fresh project has no .bb yet; the git fake holds only the repo files.
+    for (const key of Object.keys(t.files)) if (key.startsWith("stewards/") || key === "AGENTS.md") delete t.files[key];
+    t.files["README.md"] = "# web";
+    t.hooks.forgetConfigs();
+
+    const survey = JSON.parse((await t.harness.behavior.runCli(["survey", "--json", "--project", "p1"])).stdout) as { source: string; linear: { available: boolean } };
+    expect(survey.source).toBe("native");
+    expect(survey.linear.available).toBe(false);
+
+    const init = await t.harness.behavior.runCli(["init", "--prefix", "local", "--timezone", "Europe/Berlin"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(init.exitCode).toBe(0);
+    for (const [path, content] of t.writtenContent) if (path.startsWith("/w/.bb/")) t.files[path.slice("/w/.bb/".length)] = content;
+    t.hooks.forgetConfigs();
+
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/problem:/u);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).toContain("Project source: native git");
   });
 });
 

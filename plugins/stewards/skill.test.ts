@@ -171,3 +171,20 @@ describe("the onboarding skill's label question (BB-362)", () => {
     expect(onboardingSkill).toMatch(/a\s+local-only project adopts by state and needs no label/u);
   });
 });
+
+// BB-364: the onboarding skill must work on a stock bb with no Linear plugin
+// and no repos.json: the survey reports Linear `available: false` without
+// derailing the interview, the interview asks for the time zone and the local
+// prefix, and it never asks about Linear teams or labels when there is no
+// Linear.
+describe("the onboarding skill's stock-install path (BB-364)", () => {
+  it("handles a no-Linear survey, asks for the zone and prefix, and never assumes repos.json", () => {
+    expect(onboardingSkill).toMatch(/the Linear section reads `available: false`/u);
+    expect(onboardingSkill).toMatch(/do not ask about Linear teams or\s+labels at all/u);
+    expect(onboardingSkill).toMatch(/the local ticket key prefix/u);
+    expect(onboardingSkill).toMatch(/no\s+`repos\.json`/u);
+    // init is told not to ask Linear on a stock install.
+    expect(onboardingSkill).toMatch(/run `init` with no `--teams`/u);
+    expect(onboardingSkill).toMatch(/--timezone[\s\S]*?--prefix/u);
+  });
+});
