@@ -20,7 +20,7 @@ import { z } from "zod";
 
 export const STEWARDS_PLUGIN_ID = "stewards";
 
-export const sourceSchema = z.enum(["linear", "github"]);
+export const sourceSchema = z.enum(["linear", "github", "local"]);
 export type Source = z.infer<typeof sourceSchema>;
 
 /** A repository as GitHub spells it, `owner/name`, as a repo lease and a project's unit name. */
@@ -31,7 +31,7 @@ export const REPO_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
  * bb reserves the id `github` for its bundled plugin and refuses a path
  * install under it.
  */
-export const SOURCE_PLUGIN_IDS: Record<Source, string> = { linear: "linear", github: "github-watcher" };
+export const SOURCE_PLUGIN_IDS: Record<Source, string> = { linear: "linear", github: "github-watcher", local: "stewards" };
 
 /**
  * A GitHub Deployment, as bb-gate-hooks forwards it on a `deployment`
@@ -231,6 +231,14 @@ export const entitySnapshotSchema = z.object({
   state: z.string(),
   /** Linear's state type (triage, backlog, unstarted, started, completed, canceled); null on GitHub. */
   stateType: z.string().nullable(),
+  /**
+   * The playbook the entity names, when its source names one: the local
+   * source reads `ticket` or `initiative` off the ticket. Optional and
+   * additive -- linear and github omit it, and stewards routes those by the
+   * project's label and state rules. Absent means the source has no playbook
+   * of its own, not that it named the empty string.
+   */
+  playbook: z.string().optional(),
   /** Linear: the team key. GitHub: "owner/repo". What a project lists and a lease hangs off. */
   unit: z.string(),
   labels: z.array(z.string()),
