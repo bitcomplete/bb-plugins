@@ -163,6 +163,12 @@ export class Accounting {
   }
   forRun(id:string) { bounded(id,"run-id");return this.rollup(e=>e.runId===id); }
   forSolution(id:string) { bounded(id,"solution-id");return this.rollup(e=>e.solutionId===id); }
+  /** Exact-ID union for a caller-resolved solution family. Retains every original attribution. */
+  forSolutionIds(ids:readonly string[]) {
+    if(!ids.length)throw new Error("empty-solution-history");
+    for(const id of ids)bounded(id,"solution-id");
+    const selected=new Set(ids);return this.rollup(e=>e.solutionId!==undefined&&selected.has(e.solutionId));
+  }
   summary() { return this.rollup(()=>true); }
   private rollup(filter:(record:{runId?:string;solutionId?:string})=>boolean) {
     const externalRecords=this.store.list<ExternalCostRecord>("external-costs"),effective=effectiveExternal(externalRecords);

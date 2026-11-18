@@ -223,6 +223,12 @@ export class NativeAccounting implements NativeTaskHooks {
   summary() { return this.rollup(()=>true); }
   forRun(runId:string) { id.parse(runId);return this.rollup(task=>task.runId===runId); }
   forSolution(solutionId:string) { id.parse(solutionId);return this.rollup(task=>task.solutionId===solutionId); }
+  /** Exact-ID union: one rollup keeps shared cumulative sessions deduplicated. */
+  forSolutionIds(solutionIds:readonly string[]) {
+    if(!solutionIds.length)throw new Error("empty-solution-history");
+    for(const solutionId of solutionIds)id.parse(solutionId);
+    const selected=new Set(solutionIds);return this.rollup(task=>task.solutionId!==undefined&&selected.has(task.solutionId));
+  }
   private rollup(filter:(task:{runId?:string;solutionId?:string})=>boolean) {
     const all=this.records().map(record=>this.view(record)),tasks=all.filter(filter);
     const legacyAll=this.legacy.summary(),legacy={...legacyAll,events:legacyAll.events.filter(filter),pending:legacyAll.pending.filter(filter)};

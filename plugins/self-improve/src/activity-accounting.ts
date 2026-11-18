@@ -4,6 +4,7 @@ import type { NativeTaskIdentity } from "./native-tasks.js";
 import type { NativeUsageRead } from "./native-usage.js";
 import type { Store } from "./store.js";
 import { stableJson } from "./domain/shared.js";
+import { resolveSolutionHistory } from "./solution-history.js";
 
 /** Facts from persisted BB events, never counts of inline-hook invocations. */
 export interface ActivityChatConversation {
@@ -163,12 +164,20 @@ export class ActivityAccounting {
     if(p.monthlyMicros!==null&&exhausted(amount(monthly),p.monthlyMicros))throw new Error("monthly-cost-budget-exhausted");
     for(const scope of scopes){const limit=p.scopeLimitsMicros?.[scope];if(limit!==undefined&&exhausted(amount(daily.filter(e=>e.scope===scope||`solution:${e.solutionId}`===scope)),limit))throw new Error("scope-cost-budget-exhausted");}
   }
-  summary(){return this.rollup(()=>true,"all");}
-  forRun(id:string){checkId(id);return this.rollup(item=>item.runId===id,"run",id);}
-  forSolution(id:string){checkId(id);return this.rollup(item=>item.solutionId===id,"solution",id);}
-  private rollup(filter:Filter,kind:"all"|"run"|"solution",id?:string) {
-    const state=this.snapshot(),legacy=kind==="run"?this.options.legacy().forRun(id!):kind==="solution"?this.options.legacy().forSolution(id!):state.legacy,
-      selectedNative=kind==="run"?this.options.native().forRun(id!):kind==="solution"?this.options.native().forSolution(id!):state.native;
+  summary(){return this.rollup(()=>true);}
+  forRun(id:string){checkId(id);return this.rollup(item=>item.runId===id,{runId:id});}
+  /** Exact original identity, retained for immutable historical callers. */
+  forSolution(id:string){checkId(id);return this.rollup(item=>item.solutionId===id,{solutionIds:[id]});}
+  /** Live owner view over canonical identity and aliases; never relabels stored execution facts. */
+  forSolutionHistory(id:string) {
+    return this.options.store.transaction(()=>{
+      const solutionHistory=resolveSolutionHistory(this.options.store,id),selected=new Set(solutionHistory.solutionIds);
+      return {...this.rollup(item=>item.solutionId!==undefined&&selected.has(item.solutionId),solutionHistory),solutionHistory};
+    });
+  }
+  private rollup(filter:Filter,selection?:{runId:string}|{solutionIds:readonly string[]}) {
+    const state=this.snapshot(),legacy=!selection?state.legacy:"runId" in selection?this.options.legacy().forRun(selection.runId):this.options.legacy().forSolutionIds(selection.solutionIds),
+      selectedNative=!selection?state.native:"runId" in selection?this.options.native().forRun(selection.runId):this.options.native().forSolutionIds(selection.solutionIds);
     const native={...selectedNative,
       tasks:selectedNative.tasks.map(task=>({...task,unknownReasons:[...task.unknownReasons,...(state.ambiguousOwners.has(`native:${task.taskId}`)?["provider-session-shared-between-activities"]:[])]})),
       totals:selectedNative.totals.map(total=>({...total,nativeLatestReportedSessionMicros:selectedNative.tasks.some(task=>state.ambiguousOwners.has(`native:${task.taskId}`)&&task.sessions.some(session=>session.currency===total.currency))?null:total.nativeLatestReportedSessionMicros})),

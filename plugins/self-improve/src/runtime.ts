@@ -6,6 +6,7 @@ import type { Config } from "./config.js";
 import type { Store } from "./store.js";
 import { stableId } from "./store.js";
 import type { Accounting } from "./costs.js";
+import { resolveSolutionHistory } from "./solution-history.js";
 import type { NativeExecution, NativeTaskRequest, TaskRunner } from "./native-tasks.js";
 import { Deferred, dayKey, type StageContext, type StageHandler } from "./services.js";
 import type { EvaluationWindow, ModelIdentity, Problem, ProblemRanking, RankedSolution, SessionSelection, Solution, Stage, Vote } from "./domain/types.js";
@@ -429,7 +430,7 @@ export class Runtime {
       gaps.push(...beforeGaps.map(g => `baseline: ${g}`),...afterGaps.map(g => `treatment: ${g}`));
       const model = baselineModel ?? { provider: "unobserved", model: "unobserved" };
       const confounders = ["Before/after observation is not randomized", "Denominator is fully mined selected session-days, capped at one session per task/day", "Held-out evaluation and production runtime environments can differ"];
-      const costs = this.options.accounting.forSolution(solution.id).totals;
+      const costs = this.options.accounting.forSolutionIds(resolveSolutionHistory(this.store,solution.id).solutionIds).totals;
       const performance = recordPerformance(this.store, { measurementKey: this.runId(ctx), solutionId: solution.id, solutionRevision: artifact.revision, before, after, model,
         costs: costs.map(c => ({ currency: c.currency, reportedMicros: c.reportedMicros, estimatedMicros: c.estimatedMicros, unknownAttempts: c.unknownAttempts+c.unknownExternalCosts })),
         ...(this.options.activityCosts ? { activityCosts: this.options.activityCosts(solution.id) } : {}),
