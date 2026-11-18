@@ -34,6 +34,7 @@ import type { rpcContract } from "./server";
 import type { ReviewsState } from "./reviews";
 import type { AgentModelChoice } from "./agent-model";
 import { ConversationPanel } from "./conversation-ui";
+import { useOrganization } from "./organization";
 import {
   disposePrsUiAgentBridge,
   usePrsUiAgentBridge,
@@ -72,11 +73,6 @@ import "./calm.css";
 
 const message = (cause: unknown) =>
   cause instanceof Error ? cause.message : String(cause);
-const organizationSchema = z
-  .string()
-  .regex(/^[a-z0-9][a-z0-9-]{0,38}$/i)
-  .transform((owner) => owner.toLowerCase())
-  .nullable();
 const viewSchema = z.object({
   tab: z.enum(["mine", "review"]).catch("mine"),
   mineSegment: z.enum(MINE_SEGMENTS.map((segment) => segment.id)).catch("on-you"),
@@ -167,11 +163,13 @@ function usePrsData() {
 }
 
 export function prsBadge({
+  organization,
   onYou,
   toReview,
   agentsAsking,
   overdueReviews,
 }: {
+  organization: string | null;
   onYou: number;
   toReview: number;
   agentsAsking: number;
@@ -196,7 +194,7 @@ export function prsBadge({
           ? "warning"
           : "neutral",
     label: [
-      "Across all organizations",
+      organization === null ? "Across all organizations" : `In ${organization}`,
       `${onYou} on you`,
       `${toReview} to review`,
       ...reasons,
@@ -204,13 +202,20 @@ export function prsBadge({
   };
 }
 function usePrsBadge(): ExperimentalBadge | null {
+  const { organization } = useOrganization();
   const { state, reviews, now } = usePrsData();
-  const prs = minePrs(state?.view ?? null, state?.markers ?? [], state?.needsInput ?? {});
+  const prs = minePrs(state?.view ?? null, state?.markers ?? [], state?.needsInput ?? {}).filter(
+    (pr) => organization === null || repoOwner(pr.row.repo) === organization,
+  );
   const pending =
     reviews?.kind === "available"
-      ? reviewsWithPendingInput(reviews.snapshot.items, reviews.needsInput ?? {}).filter((review) => review.segment === "on-you")
+      ? reviewsWithPendingInput(reviews.snapshot.items, reviews.needsInput ?? {}).filter(
+          (review) => review.segment === "on-you" &&
+            (organization === null || repoOwner(review.item.repo) === organization),
+        )
       : [];
   return prsBadge({
+    organization,
     onYou: prs.filter((pr) => pr.segment === "on-you").length,
     toReview: pending.length,
     agentsAsking: new Set([
@@ -576,7 +581,6 @@ export function Board({ subPath }: { subPath?: string }) {
     }
   };
   const pluginId = experimental_usePluginId();
-  const organizationKey = `${pluginId}:calm-organization`;
   const viewKey = `${pluginId}:calm-view`;
   const [savedView, setSavedView] = useState<z.infer<typeof viewSchema>>(() => {
     let saved = viewSchema.parse({});
@@ -613,15 +617,7 @@ export function Board({ subPath }: { subPath?: string }) {
     rows: CalmRow[];
     login: string | null;
   } | null>(null);
-  const [organization, setOrganization] = useState<string | null>(() => {
-    try {
-      return organizationSchema.parse(
-        JSON.parse(localStorage.getItem(organizationKey) ?? "null"),
-      );
-    } catch {
-      return null;
-    }
-  });
+  const { organization, setOrganization } = useOrganization();
   const changeOrganization = useCallback(
     (next: string | null) => {
       setOrganization(next);
@@ -632,11 +628,8 @@ export function Board({ subPath }: { subPath?: string }) {
       setReviewTarget(null);
       setPicker(null);
       setNotice(null);
-      try {
-        localStorage.setItem(organizationKey, JSON.stringify(next));
-      } catch {}
     },
-    [organizationKey],
+    [setOrganization],
   );
   const { folded, toggle } = useFolds();
   const view = state?.view ?? null;
