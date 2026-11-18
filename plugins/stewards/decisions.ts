@@ -33,16 +33,88 @@ export const DEFAULT_BIG_DECISIONS: readonly string[] = [
 ];
 
 /**
+ * A definition a project may keep at a repo's root or in any subdirectory.
+ * Both forms are listed because the glob dialect has no "zero or more
+ * segments": an any-depth glob matches a nested file but not a root one.
+ */
+function atRootOrAnywhere(name: string): string[] {
+  return [name, `**/${name}`];
+}
+
+/**
  * The owner-reviewed triggers from `.bb/AGENTS.md` ("Change classification")
  * that are not big decisions: the project steward may decide these itself.
  * They are the default `project` half of the decide list.
+ *
+ * The entries name no repo and no layout (BB-359): a fresh `bb stewards init`
+ * on any project gets a cross-repo contract, deploy manifests and CI
+ * workflows, container image definitions, store migrations and dependency
+ * manifests, wherever they sit.
  */
 export const DEFAULT_PROJECT_DECISIONS: readonly { text: string; paths: string[] }[] = [
-  { text: "A cross-repo contract other repos implement", paths: ["bb-plugins/plugins/*/source-contract.ts", "bb-gate/docs/hooks.md", "bb-gate/docker/bb-server/**", "devbox/kploy/**"] },
-  { text: "Anything that could stop every developer's server from starting or being routed to", paths: ["bb-gate/docker/bb-server/**", "bb-gate/backend.json"] },
-  { text: "Production infrastructure", paths: ["bb-gate/kploy/**", "bb-gate/bc-prod.yaml", "bb-gate/.github/workflows/**", "devbox/host/**", "devbox/image/**", "devbox/profiles/**", "devbox/bin/**", "devbox/kploy/**", "devbox/bc-prod.yaml", "devbox/.github/workflows/**"] },
-  { text: "A store migration", paths: ["bb-plugins/plugins/*/store.ts"] },
-  { text: "A new dependency", paths: ["**/package.json", "**/package-lock.json", "**/go.mod", "**/go.sum"] },
+  {
+    text: "A cross-repo contract other repos implement",
+    paths: [
+      ...atRootOrAnywhere("source-contract.ts"),
+      ...atRootOrAnywhere("clients.json"),
+      ...atRootOrAnywhere("hooks.md"),
+      ...atRootOrAnywhere("openapi.yaml"),
+      ...atRootOrAnywhere("openapi.json"),
+      ...atRootOrAnywhere("*.proto"),
+    ],
+  },
+  {
+    text: "Production infrastructure: a deploy manifest or a CI workflow",
+    paths: [
+      ".github/workflows/**",
+      "**/.github/workflows/**",
+      ...atRootOrAnywhere(".gitlab-ci.yml"),
+      ...atRootOrAnywhere("Jenkinsfile"),
+      ...atRootOrAnywhere("azure-pipelines.yml"),
+      ...atRootOrAnywhere("kustomization.yaml"),
+      ...atRootOrAnywhere("kustomization.yml"),
+      ...atRootOrAnywhere("deployment.yaml"),
+      ...atRootOrAnywhere("deployment.yml"),
+      ...atRootOrAnywhere("*.tf"),
+      ...atRootOrAnywhere("Chart.yaml"),
+      ...atRootOrAnywhere("values.yaml"),
+      "**/k8s/**",
+      "**/kubernetes/**",
+      "**/helm/**",
+      "**/charts/**",
+      "**/terraform/**",
+      "**/deploy/**",
+    ],
+  },
+  {
+    text: "A container image definition",
+    paths: [...atRootOrAnywhere("Dockerfile"), ...atRootOrAnywhere("Dockerfile.*"), ...atRootOrAnywhere("*.dockerfile")],
+  },
+  {
+    text: "A store migration",
+    paths: [...atRootOrAnywhere("store.ts"), ...atRootOrAnywhere("*-store.ts"), ...atRootOrAnywhere("migration*.ts"), ...atRootOrAnywhere("migration*.sql"), ...atRootOrAnywhere("*.sql")],
+  },
+  {
+    text: "A new dependency",
+    paths: [
+      ...atRootOrAnywhere("package.json"),
+      ...atRootOrAnywhere("package-lock.json"),
+      ...atRootOrAnywhere("yarn.lock"),
+      ...atRootOrAnywhere("pnpm-lock.yaml"),
+      ...atRootOrAnywhere("go.mod"),
+      ...atRootOrAnywhere("go.sum"),
+      ...atRootOrAnywhere("Cargo.toml"),
+      ...atRootOrAnywhere("Cargo.lock"),
+      ...atRootOrAnywhere("requirements.txt"),
+      ...atRootOrAnywhere("pyproject.toml"),
+      ...atRootOrAnywhere("Pipfile"),
+      ...atRootOrAnywhere("Pipfile.lock"),
+      ...atRootOrAnywhere("Gemfile"),
+      ...atRootOrAnywhere("Gemfile.lock"),
+      ...atRootOrAnywhere("composer.json"),
+      ...atRootOrAnywhere("composer.lock"),
+    ],
+  },
 ];
 
 /**
@@ -78,13 +150,19 @@ export const defaultDecideList = (): BigDecision[] => [
  * actions (`approvals.ts`), and the approval store (`approvals-store.ts`). A
  * stewards change to any other file — `server.ts`, `store.ts`, `reconcile.ts`,
  * `config.ts` — is placed by the decide list like any other pull request.
+ *
+ * The patterns are suffixes, not workspace paths (BB-359), so the rule does
+ * not depend on the repo's directory name or where the plugin sits: it matches
+ * `plugins/stewards/gate.ts`, `bb-plugins/plugins/stewards/gate.ts` and a file
+ * under any deeper prefix alike. `pathIsOrUnder` only ever widens the set;
+ * the glob fallback keeps every path the old prefixed list matched.
  */
 export const SELF_WIDENING_PATHS: readonly string[] = [
   ".bb/stewards/project.json",
-  "bb-plugins/plugins/stewards/decisions.ts",
-  "bb-plugins/plugins/stewards/gate.ts",
-  "bb-plugins/plugins/stewards/approvals.ts",
-  "bb-plugins/plugins/stewards/approvals-store.ts",
+  "plugins/stewards/decisions.ts",
+  "plugins/stewards/gate.ts",
+  "plugins/stewards/approvals.ts",
+  "plugins/stewards/approvals-store.ts",
 ];
 
 /** A glob with `*` (within a path segment) and `**` (across segments). */
@@ -121,9 +199,14 @@ export function touchesAny(files: readonly string[], patterns: readonly string[]
   return files.some((file) => patterns.some((pattern) => globMatches(pattern, file) || globMatches(withoutRepo(pattern), file) || globMatches(pattern, withoutRepo(file))));
 }
 
+/** Whether `file` is `pattern`, or lies under it, whatever directory precedes it. */
+function pathIsOrUnder(file: string, pattern: string): boolean {
+  return file === pattern || file.endsWith(`/${pattern}`);
+}
+
 /** Whether the change touches the decide list or the code that enforces it. */
 export function isSelfWidening(files: readonly string[]): boolean {
-  return touchesAny(files, SELF_WIDENING_PATHS);
+  return files.some((file) => SELF_WIDENING_PATHS.some((pattern) => pathIsOrUnder(file, pattern) || touchesAny([file], [pattern])));
 }
 
 /**

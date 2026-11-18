@@ -5,7 +5,7 @@ import { decideFor, decideForEntry, decideForPull, decideForRefusal, defaultDeci
 const decisions: BigDecision[] = [
   { text: "Changing what a ticket's requester asked for", decide: "user", paths: [] },
   { text: "A public API change other teams depend on", decide: "user", paths: ["bb-plugins/plugins/*/source-contract.ts"] },
-  { text: "A cross-repo contract other repos implement", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+  { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi.yaml"] },
   { text: "A store migration", decide: "project", paths: ["bb-plugins/plugins/*/store.ts"] },
   { text: "An unmarked entry", decide: undefined as unknown as "user", paths: ["bb-plugins/plugins/linear/**"] },
   { text: "An unknown mark", decide: "maybe" as unknown as "user", paths: ["bb-plugins/plugins/github-watcher/**"] },
@@ -65,11 +65,11 @@ describe("the decide list fails closed", () => {
     // An identity path no project entry names is already the user's, whether or
     // not a `user` entry lists it (BB-77).
     const identity: BigDecision[] = [
-      { text: "Identity and access", decide: "user", paths: ["bb-gate/router/**"] },
-      { text: "A cross-repo contract", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+      { text: "Identity and access", decide: "user", paths: ["web/router/**"] },
+      { text: "A cross-repo contract", decide: "project", paths: ["web/openapi.yaml"] },
     ];
-    expect(decideForPull(["bb-gate/router/routes.go"], identity)).toBe("user");
-    expect(decideForPull(["bb-gate/docs/hooks.md"], identity)).toBe("project");
+    expect(decideForPull(["web/router/routes.go"], identity)).toBe("user");
+    expect(decideForPull(["web/openapi.yaml"], identity)).toBe("project");
   });
 
   it("gives the failed files fetch its own refusal text, not the self-widening one (BB-51)", () => {
@@ -90,31 +90,31 @@ describe("the decide list fails closed", () => {
 
 describe("explainDecision names the entries that matched and the one that decides (BB-135)", () => {
   const overlap: BigDecision[] = [
-    { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
-    { text: "A cross-repo contract", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    { text: "Identity and access", decide: "user", paths: ["web/hooks/**"] },
+    { text: "A cross-repo contract", decide: "project", paths: ["web/openapi.yaml"] },
   ];
 
   it("lists every matched entry with its mark and files, and the deciding entry", () => {
-    const files = ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"];
+    const files = ["web/hooks/slack.go", "web/openapi.yaml"];
     const e = explainDecision(files, overlap);
     expect(e.matched).toEqual([
-      { text: "Identity and access", decide: "user", files: ["bb-gate/hooks/slack.go"] },
-      { text: "A cross-repo contract", decide: "project", files: ["bb-gate/docs/hooks.md"] },
+      { text: "Identity and access", decide: "user", files: ["web/hooks/slack.go"] },
+      { text: "A cross-repo contract", decide: "project", files: ["web/openapi.yaml"] },
     ]);
-    expect(e.winner).toEqual({ text: "Identity and access", decide: "user", files: ["bb-gate/hooks/slack.go"] });
+    expect(e.winner).toEqual({ text: "Identity and access", decide: "user", files: ["web/hooks/slack.go"] });
     expect(e.mark).toBe("user");
     expect(e.selfWidening).toBe(false);
     expect(e.unreadable).toBe(false);
     expect(e.rule).toBe("a `user` entry wins; self-widening is always the user's; no match is the user's");
     const listing = formatDecisionListing(e);
-    expect(listing).toContain('"Identity and access" [user] — bb-gate/hooks/slack.go');
-    expect(listing).toContain('"A cross-repo contract" [project] — bb-gate/docs/hooks.md');
+    expect(listing).toContain('"Identity and access" [user] — web/hooks/slack.go');
+    expect(listing).toContain('"A cross-repo contract" [project] — web/openapi.yaml');
     expect(listing).toContain('Deciding entry: "Identity and access" [user].');
     expect(listing).toContain("Rule: a `user` entry wins; self-widening is always the user's; no match is the user's");
   });
 
   it("names the project entry when only it matched", () => {
-    const e = explainDecision(["bb-gate/docs/hooks.md"], overlap);
+    const e = explainDecision(["web/openapi.yaml"], overlap);
     expect(e.matched.map((m) => m.text)).toEqual(["A cross-repo contract"]);
     expect(e.winner?.text).toBe("A cross-repo contract");
     expect(e.mark).toBe("project");
@@ -122,7 +122,7 @@ describe("explainDecision names the entries that matched and the one that decide
   });
 
   it("reports no match as the user's", () => {
-    const e = explainDecision(["bb-gate/README.md"], overlap);
+    const e = explainDecision(["web/README.md"], overlap);
     expect(e.matched).toEqual([]);
     expect(e.winner).toBeNull();
     expect(e.mark).toBe("user");
@@ -132,7 +132,7 @@ describe("explainDecision names the entries that matched and the one that decide
   });
 
   it("reports self-widening as the user's, with no deciding entry, and names the tripped files (BB-153)", () => {
-    const e = explainDecision(["bb-plugins/plugins/stewards/decisions.ts", "bb-gate/docs/hooks.md"], overlap);
+    const e = explainDecision(["bb-plugins/plugins/stewards/decisions.ts", "web/openapi.yaml"], overlap);
     expect(e.selfWidening).toBe(true);
     expect(e.selfWideningFiles).toEqual(["bb-plugins/plugins/stewards/decisions.ts"]);
     expect(e.winner).toBeNull();
@@ -203,18 +203,18 @@ describe("nothing the old decide-list code left to the user moves to the project
 
 describe("a user entry wins over a project entry (BB-125)", () => {
   const overlap: BigDecision[] = [
-    { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
-    { text: "A cross-repo contract", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    { text: "Identity and access", decide: "user", paths: ["web/hooks/**"] },
+    { text: "A cross-repo contract", decide: "project", paths: ["web/openapi.yaml"] },
   ];
 
   it("keeps a files-matching-only-a-project-entry pull request with the project steward", () => {
-    expect(decideForPull(["bb-gate/docs/hooks.md"], overlap)).toBe("project");
-    expect(decideFor(["bb-gate/docs/hooks.md"], "A cross-repo contract", overlap)).toBe("project");
-    expect(decideForRefusal(["bb-gate/docs/hooks.md"], "A cross-repo contract", overlap)).toBeNull();
+    expect(decideForPull(["web/openapi.yaml"], overlap)).toBe("project");
+    expect(decideFor(["web/openapi.yaml"], "A cross-repo contract", overlap)).toBe("project");
+    expect(decideForRefusal(["web/openapi.yaml"], "A cross-repo contract", overlap)).toBeNull();
   });
 
   it("makes the pull request the user's when the files also touch a user entry's paths", () => {
-    const files = ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"];
+    const files = ["web/hooks/slack.go", "web/openapi.yaml"];
     expect(decideForPull(files, overlap)).toBe("user");
     // decideFor with the project entry named still yields the user's, because
     // the files touch the user entry's paths too.
@@ -222,17 +222,17 @@ describe("a user entry wins over a project entry (BB-125)", () => {
     expect(decideForRefusal(files, "A cross-repo contract", overlap)).toContain("Identity and access");
   });
 
-  it("places bb-gate#50's file list as the user's", () => {
+  it("places acme/web#50's file list as the user's", () => {
     const entries: BigDecision[] = [
       {
-        text: "Identity and access changes (a credential, a token, cluster access, the bb-gate router, the verifier sidecar, devbox-gate auth, the bb-gate hooks adapter, or Tailscale admission)",
+        text: "Identity and access changes (a credential, a token, cluster access, the router, the verifier sidecar, the gate's auth, the hooks adapter, or network admission)",
         decide: "user",
-        paths: ["bb-gate/hooks/**"],
+        paths: ["web/hooks/**"],
       },
       {
-        text: "A cross-repo contract (source-contract.ts and its copies, hooks.md, the devbox connect API, clients.json, the devbox-provider defaults)",
+        text: "A cross-repo contract (source-contract.ts and its copies, hooks.md, the connect API, clients.json, the provider defaults)",
         decide: "project",
-        paths: ["bb-gate/docs/hooks.md"],
+        paths: ["web/openapi.yaml"],
       },
     ];
     // GitHub returns repo-relative filenames; the entries are workspace-relative.
@@ -253,7 +253,7 @@ describe("no self-widening", () => {
 
   it("does not fire for a change that touches none of them", () => {
     expect(isSelfWidening(["bb-plugins/plugins/linear/foo.ts"])).toBe(false);
-    expect(decideFor(["bb-gate/docs/hooks.md"], "A cross-repo contract other repos implement", decisions)).toBe("project");
+    expect(decideFor(["web/openapi.yaml"], "A cross-repo contract other repos implement", decisions)).toBe("project");
   });
 
   it("fires for a repo-relative filename as GitHub returns it (BB-30 review)", () => {
@@ -269,11 +269,30 @@ describe("no self-widening", () => {
   it("names exactly the gate's own files, so widening it back is a visible diff (BB-153)", () => {
     expect([...SELF_WIDENING_PATHS]).toEqual([
       ".bb/stewards/project.json",
-      "bb-plugins/plugins/stewards/decisions.ts",
-      "bb-plugins/plugins/stewards/gate.ts",
-      "bb-plugins/plugins/stewards/approvals.ts",
-      "bb-plugins/plugins/stewards/approvals-store.ts",
+      "plugins/stewards/decisions.ts",
+      "plugins/stewards/gate.ts",
+      "plugins/stewards/approvals.ts",
+      "plugins/stewards/approvals-store.ts",
     ]);
+  });
+
+  it("matches the gate's files under any repo directory, prefixed or bare (BB-359)", () => {
+    // The workspace-prefixed form and the bare, repo-relative form GitHub
+    // returns must both match, and so must a deeper prefix.
+    for (const dir of ["", "bb-plugins/", "some/nested/"]) {
+      for (const file of ["decisions.ts", "gate.ts", "approvals.ts", "approvals-store.ts"]) {
+        expect(isSelfWidening([`${dir}plugins/stewards/${file}`]), `${dir}${file}`).toBe(true);
+      }
+      expect(isSelfWidening([`${dir}.bb/stewards/project.json`]), `${dir}.bb`).toBe(true);
+    }
+  });
+
+  it("still narrows to the gate's own files, so an unrelated change falls to the decide list (BB-359)", () => {
+    for (const file of ["plugins/stewards/server.ts", "plugins/stewards/store.ts", "plugins/stewards/config.ts", "plugins/stewards/roles.ts", "web/src/index.ts"]) {
+      expect(isSelfWidening([file]), file).toBe(false);
+    }
+    // No entry matches, so it is the owner's (fail closed).
+    expect(decideForPull(["web/src/index.ts"], defaultDecideList())).toBe("user");
   });
 
   it("places a stewards pull request that does not touch the gate by the decide list (BB-153)", () => {
@@ -309,16 +328,55 @@ describe("no self-widening", () => {
   it("matches a glob across path segments", () => {
     expect(touchesAny(["bb-plugins/plugins/linear/store.ts"], ["bb-plugins/plugins/*/store.ts"])).toBe(true);
     expect(touchesAny(["bb-plugins/plugins/linear/server.ts"], ["bb-plugins/plugins/*/store.ts"])).toBe(false);
-    expect(touchesAny(["bb-gate/docker/bb-server/Dockerfile"], ["bb-gate/docker/bb-server/**"])).toBe(true);
+    expect(touchesAny(["web/docker/Dockerfile"], ["web/docker/**"])).toBe(true);
+  });
+});
+
+describe("the default decide list is generic and layout-independent (BB-359)", () => {
+  const list = () => defaultDecideList();
+
+  it("matches a dependency manifest at a repo root or anywhere beneath it", () => {
+    for (const file of ["package.json", "web/package.json", "web/apps/api/go.mod", "package-lock.json", "services/api/Cargo.toml"]) {
+      expect(decideForPull([file], list()), file).toBe("project");
+    }
+  });
+
+  it("matches a store migration, a Dockerfile and a deploy manifest or CI workflow by name", () => {
+    for (const file of [
+      "store.ts",
+      "plugins/stewards/store.ts",
+      "apps/api/migrations/001.sql",
+      "Dockerfile",
+      "web/Dockerfile",
+      "web/Dockerfile.prod",
+      ".github/workflows/ci.yaml",
+      "web/.github/workflows/ci.yaml",
+      "kustomization.yaml",
+      "infra/main.tf",
+      "web/helm/values.yaml",
+    ]) {
+      expect(decideForPull([file], list()), file).toBe("project");
+    }
+  });
+
+  it("matches a cross-repo contract by name", () => {
+    for (const file of ["source-contract.ts", "plugins/linear/source-contract.ts", "web/clients.json", "web/docs/hooks.md", "api/openapi.yaml"]) {
+      expect(decideForPull([file], list()), file).toBe("project");
+    }
+  });
+
+  it("leaves a file that matches no entry to the owner", () => {
+    expect(decideForPull(["web/src/index.ts"], list())).toBe("user");
+    expect(decideForPull(["docs/README.md"], list())).toBe("user");
   });
 });
 
 describe("globError (BB-164)", () => {
   it("accepts the * and ** dialect and rejects an empty, control-character or backslash glob", () => {
-    expect(globError("Update */bc-prod.yaml")).toBeNull();
-    expect(globError("update-*-bc-prod-yaml-*")).toBeNull();
-    expect(globError("projects/*/bc-prod.yaml")).toBeNull();
-    expect(globError("bb-gate/docker/bb-server/**")).toBeNull();
+    expect(globError("Update */release.yaml")).toBeNull();
+    expect(globError("update-*-release-yaml-*")).toBeNull();
+    expect(globError("projects/*/release.yaml")).toBeNull();
+    expect(globError("web/docker/**")).toBeNull();
     expect(globError("")).toMatch(/empty glob/);
     expect(globError("a\\b")).toMatch(/backslash/);
     expect(globError("a\nb")).toMatch(/control character/);
