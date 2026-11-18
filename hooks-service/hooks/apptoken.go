@@ -460,9 +460,12 @@ func (s *Sessions) installRedirect() string {
 }
 
 // stateKey derives the HMAC key for install state from the client secret, so
-// a state cannot be forged without the secret and survives a restart.
+// a state cannot be forged without the secret and survives a restart. The
+// label is frozen: an open install state is an HMAC over these exact bytes,
+// so renaming it invalidates every approval page already in flight.
+// TestFrozenHMACLabels pins it.
 func (s *Sessions) stateKey() []byte {
-	sum := sha256.Sum256([]byte("hooks-service linear install state\x00" + s.clientSecret()))
+	sum := sha256.Sum256([]byte("bb-gate-hooks linear install state\x00" + s.clientSecret()))
 	return sum[:]
 }
 

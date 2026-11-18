@@ -104,7 +104,11 @@ const (
 	// slackCapabilityLabel domain-separates the session capability key from
 	// the request-signature key. The capability key is
 	// HMAC(signingSecret, label), never the signing secret itself.
-	slackCapabilityLabel = "hooks-service slack session capability v1"
+	//
+	// The label is frozen: live session capabilities are HMACs over these
+	// exact bytes, so renaming it orphans every capability a running bb
+	// server already holds. TestFrozenHMACLabels pins it.
+	slackCapabilityLabel = "bb-gate-hooks slack session capability v1"
 	// maxSlackSigninFlows caps in-flight sign-in flows.
 	maxSlackSigninFlows = 1000
 	// slackReplyBody is the largest reply this service will post.
