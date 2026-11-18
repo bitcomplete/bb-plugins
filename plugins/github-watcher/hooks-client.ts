@@ -13,9 +13,22 @@
 import { z } from "zod";
 
 export const HOOKS_URL_ENV = "BB_HOOKS_URL";
+/** The subscriber bearer token the service checks, beside `BB_HOOKS_URL`. */
+export const HOOKS_TOKEN_ENV = "BB_HOOKS_TOKEN";
 export const SOURCE = "github";
 /** The service refuses more watches than this in one call (413). */
 export const SUBSCRIBE_BATCH = 100;
+
+/**
+ * The subscriber API's `Authorization` header, or nothing when
+ * `BB_HOOKS_TOKEN` is unset. With no token the request is exactly as it was
+ * before the token existed. Read at request time so a restart (or a test)
+ * can change it.
+ */
+function subscriberAuth(): Record<string, string> {
+  const token = (process.env[HOOKS_TOKEN_ENV] ?? "").trim();
+  return token === "" ? {} : { authorization: `Bearer ${token}` };
+}
 
 /**
  * What a lease hangs off. `issue` is one issue or pull request,
@@ -165,7 +178,7 @@ export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connectio
     const watches = leases.slice(i, i + SUBSCRIBE_BATCH).map(({ kind, id }) => ({ kind, id }));
     const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: { "content-type": "application/json", accept: "application/json", ...subscriberAuth() },
       body: JSON.stringify({ connection, source: SOURCE, token, watches }),
       signal,
     });
@@ -484,7 +497,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         signal.addEventListener("abort", onAbort, { once: true });
         stream = controller;
         try {
-          const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream" }, signal: controller.signal });
+          const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream", ...subscriberAuth() }, signal: controller.signal });
           if (!response.ok || response.body === null) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the event stream`, response.status);
           backoff = timing.backoffMinMs;
           await consume(response.body, controller.signal);

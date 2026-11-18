@@ -14,7 +14,20 @@
 import { z } from "zod";
 
 export const HOOKS_URL_ENV = "BB_HOOKS_URL";
+/** The subscriber bearer token the service checks, beside `BB_HOOKS_URL`. */
+export const HOOKS_TOKEN_ENV = "BB_HOOKS_TOKEN";
 export const SOURCE = "slack";
+
+/**
+ * The subscriber API's `Authorization` header, or nothing when
+ * `BB_HOOKS_TOKEN` is unset. With no token the request is exactly as it was
+ * before the token existed. Read at request time so a restart (or a test)
+ * can change it.
+ */
+function subscriberAuth(): Record<string, string> {
+  const token = (process.env[HOOKS_TOKEN_ENV] ?? "").trim();
+  return token === "" ? {} : { authorization: `Bearer ${token}` };
+}
 
 // ---- server-sent events ----------------------------------------------------
 
@@ -279,7 +292,7 @@ type FetchLike = (url: string | URL, init: RequestInit) => Promise<Response>;
 async function postJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, body: unknown, schema: z.ZodType<T>, what: string, signal: AbortSignal): Promise<T> {
   const response = await fetchImpl(new URL(path, baseUrl), {
     method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
+    headers: { "content-type": "application/json", accept: "application/json", ...subscriberAuth() },
     body: JSON.stringify(body),
     signal,
   });
@@ -288,7 +301,7 @@ async function postJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, 
 }
 
 async function getJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, schema: z.ZodType<T>, what: string, signal: AbortSignal): Promise<T> {
-  const response = await fetchImpl(new URL(path, baseUrl), { headers: { accept: "application/json" }, signal });
+  const response = await fetchImpl(new URL(path, baseUrl), { headers: { accept: "application/json", ...subscriberAuth() }, signal });
   if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to ${what}`, response.status, await response.text().catch(() => ""));
   return schema.parse(await response.json());
 }
@@ -330,7 +343,7 @@ export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connectio
     const watches = leases.slice(i, i + SUBSCRIBE_BATCH).map(({ kind, id, capability }) => ({ kind, id, capability }));
     const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: { "content-type": "application/json", accept: "application/json", ...subscriberAuth() },
       body: JSON.stringify({ connection, source: SOURCE, watches }),
       signal,
     });
@@ -459,7 +472,7 @@ export interface SessionFileBytes {
 export async function fetchSessionFile(fetchImpl: FetchLike, baseUrl: string, connection: string, session: string, id: string, signal: AbortSignal): Promise<SessionFileBytes> {
   const url = new URL(`/v1/slack/sessions/${encodeURIComponent(session)}/files/${encodeURIComponent(id)}`, baseUrl);
   url.searchParams.set("connection", connection);
-  const response = await fetchImpl(url, { headers: { accept: "*/*" }, signal });
+  const response = await fetchImpl(url, { headers: { accept: "*/*", ...subscriberAuth() }, signal });
   if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the Slack file fetch`, response.status, await response.text().catch(() => ""));
   return { bytes: new Uint8Array(await response.arrayBuffer()), mimeType: response.headers.get("content-type") ?? "" };
 }
@@ -802,7 +815,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         signal.addEventListener("abort", onAbort, { once: true });
         stream = controller;
         try {
-          const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream" }, signal: controller.signal });
+          const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream", ...subscriberAuth() }, signal: controller.signal });
           if (!response.ok || response.body === null) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the event stream`, response.status);
           backoff = timing.backoffMinMs;
           await consume(response.body, controller.signal);

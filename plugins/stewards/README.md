@@ -137,8 +137,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   actionable is kept as a quiet note and shown in "What changed" at the next
   turn something else makes due, and `bb stewards show` lists it as a pending
   note.
-- **Doorbells and polling.** The mode is chosen from `BB_HOOKS_URL`. Set, it
-  is doorbells: linear and github-watcher hold leases on the hooks service
+- **Doorbells and polling.** The mode is chosen from `BB_HOOKS_URL`, with
+  `BB_HOOKS_TOKEN` beside it when the service is configured with a
+  subscriber bearer token (every subscriber request then carries
+  `Authorization: Bearer <token>`; unset sends none). The wire contract is
+  [hooks-service/docs/hooks.md](https://github.com/bitcomplete/bb-plugins/blob/main/hooks-service/docs/hooks.md).
+  Set, it is doorbells: linear and github-watcher hold leases on the hooks service
   and ring this plugin, and `bb stewards check` prints "doorbells: from the
   hooks service". Unset, it is polling: github-watcher re-checks every open
   watch and polls the stewarded repositories on its own timer (five minutes
