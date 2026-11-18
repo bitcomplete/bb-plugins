@@ -4084,7 +4084,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // called; a source that has leased before still gets the empty set.
         if (previous === undefined && set.units.length === 0 && set.entities.length === 0 && set.dependabot.length === 0 && set.deployment.length === 0) {
           lastInterest.set(source, body);
-          await bb.storage.kv.set(`interest/${source}`, body);
           continue;
         }
         try {
@@ -4093,13 +4092,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await bb.storage.kv.set(`interest/${source}`, body);
         } catch (error) {
           // A plugin that is not installed is not a problem to warn about on
-          // every pass; record the set so the next pass does not retry it.
-          if (isMissingPlugin(error)) {
-            lastInterest.set(source, body);
-            await bb.storage.kv.set(`interest/${source}`, body);
-          } else {
-            bb.log.warn(`stewards: could not tell ${source} what to watch: ${errorMessage(error)}`);
-          }
+          // every pass; record the set in memory so the next pass does not
+          // retry it. Only a body that reached the source is persisted, so an
+          // install (or a restart) sends it afresh.
+          if (isMissingPlugin(error)) lastInterest.set(source, body);
+          else bb.log.warn(`stewards: could not tell ${source} what to watch: ${errorMessage(error)}`);
         }
       }
     }

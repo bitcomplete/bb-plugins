@@ -18514,6 +18514,39 @@ describe("no-Linear projects (BB-362)", () => {
     await t.flush();
     expect(calls).toBe(afterFirst);
     expect(t.harness.logEntries.some((e) => e.level === "warn" && /linear/i.test(e.message))).toBe(false);
+    // A body that never reached the source is not persisted, so an install or
+    // a restart sends it afresh.
+    expect(await t.bb.storage.kv.get("interest/linear")).toBeUndefined();
+  });
+
+  it("sends the set after a restart when the linear plugin was missing before (BB-362)", async () => {
+    const t = await setup();
+    let missing = true;
+    const sent: unknown[] = [];
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear" && args.method === "sourceSetInterest") {
+        if (missing) throw Object.assign(new Error("plugin linear is not installed"), { status: 404 });
+        sent.push(args.input);
+      }
+      return original(args);
+    });
+    await t.hooks.sweep();
+    await t.flush();
+    // The failed send left no kv record.
+    expect(await t.bb.storage.kv.get("interest/linear")).toBeUndefined();
+    // Restart with the plugin present: the fresh process has no in-memory
+    // record and the empty kv means the set is sent.
+    missing = false;
+    const r = await t.restart();
+    // The reload builds a fresh sdk harness; re-apply the stub before the sweep.
+    r.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear" && args.method === "sourceSetInterest") sent.push(args.input);
+      return original(args);
+    });
+    await r.hooks.sweep();
+    await r.flush();
+    expect(sent).toContainEqual({ units: ["ENG"], entities: [], dependabot: [], deployment: [] });
   });
 
   it("releases the leases after a restart that only has the persisted non-empty body", async () => {

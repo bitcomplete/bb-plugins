@@ -695,7 +695,8 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
     throw new Error("the preferences store is down");
   };
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: SHIPPED_SKILLS, settings });
-  await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
+  const pluginDeps = { now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra };
+  await createStewardsPlugin(pluginDeps)(bb);
   const hooks = testHooks.get("stewards")!;
   // The local per-project switch is off by default; tests that are not about
   // the switch itself run with p1 switched on, as a project whose owner did.
@@ -706,6 +707,21 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
       await new Promise((r) => setTimeout(r, 5));
       await hooks.settle();
     }
+  };
+  /**
+   * A plugin restart against the same persisted settings, kv and database
+   * (BB-362): the new plugin's in-memory state is fresh, the kv survives.
+   */
+  const restart = async () => {
+    const next = await harness.lifecycle.reload((nextBb) => createStewardsPlugin(pluginDeps)(nextBb));
+    const nextHooks = testHooks.get("stewards")!;
+    const nextFlush = async () => {
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+        await nextHooks.settle();
+      }
+    };
+    return { bb: next.bb, harness: next.harness, hooks: nextHooks, flush: nextFlush };
   };
   const ring = async (source: "linear" | "github", id: string) => {
     await harness.callRpc("stewardsRing", { source, id }, { experimental_caller: { kind: "plugin", pluginId: SOURCE_PLUGIN_IDS[source] } });
@@ -834,5 +850,5 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
       },
     });
   };
-  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned, createdReviewer, escalationNeed };
+  return { ...w, bb, harness, hooks, flush, restart, ring, tool, list, idle, created, createdOwned, createdReviewer, escalationNeed };
 }
