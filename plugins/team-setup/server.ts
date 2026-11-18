@@ -645,7 +645,7 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
       },
 
       async claudeSignIn() {
-        const started = await call(ACCOUNT_POOL_ID, "login.start", null, poolLoginStartSchema);
+        const started = await call(ACCOUNT_POOL_ID, "login.start", { kind: "add", label: null, priority: 100 }, poolLoginStartSchema);
         return { sessionId: started.sessionId, url: started.authorizeUrl };
       },
       async claudeComplete({ sessionId, pasted }) {
@@ -654,7 +654,7 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
         return { label: account.label };
       },
       async codexSignIn() {
-        const s = await call(ACCOUNT_POOL_ID, "codexLogin.start", null, poolCodexStartSchema);
+        const s = await call(ACCOUNT_POOL_ID, "codexLogin.start", { kind: "add", label: null, priority: 100 }, poolCodexStartSchema);
         return { sessionId: s.sessionId, url: s.verificationUri, code: s.userCode, expiresAt: s.expiresAt, intervalMs: s.intervalMs };
       },
       async codexPoll({ sessionId }) {
