@@ -133,6 +133,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { backlogTriageParamsSchema, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
+import { TICKET_TOOL_NAMES, createTicketWatches, registerTicketTools, ticketUnits } from "./ticket-tools.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -2174,6 +2175,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       readCounts.sourceCall();
       return rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
     };
+    // BB-360: the tickets a thread asked to watch (`ticket_watch`). One KV row
+    // per watcher; the ring path reads it and wakes the thread.
+    const ticketWatches = createTicketWatches(bb.storage.kv);
 
     // BB-354: whether this server can send a Slack DM, read from the Slack
     // plugin's own `status` RPC. A missing plugin, a method that predates it or
@@ -3864,10 +3868,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // while its stop turn is still running: the doorbell has nothing to wake.
       const off = new Set([...configs.values()].filter((c) => c.value !== null && !c.value.enabled).map((c) => c.value!.projectId));
       const open = store.open().filter((b) => !off.has(b.projectId));
+      // BB-360: the tickets a thread asked to watch (`ticket_watch`) join the
+      // bindings' entities, so the source leases them and rings the plugin on
+      // a change; the ring path then wakes the watching thread.
+      const watched = await ticketWatches.interest();
       const sets: Record<Source, { units: string[]; entities: string[]; dependabot: string[]; deployment: string[] }> = {
         linear: {
           units: [...new Set(projects.flatMap((p) => p.file.linear.teams))].sort(),
-          entities: [...new Set(open.filter((b) => b.source === "linear").map((b) => b.entityId))].sort(),
+          entities: [...new Set([...open.filter((b) => b.source === "linear").map((b) => b.entityId), ...watched.linear])].sort(),
           dependabot: [],
           deployment: [],
         },
@@ -3878,6 +3886,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...open.filter((b) => b.source === "github").map((b) => b.entityId),
               ...open.flatMap((b) => leasedPulls(b)),
               ...open.flatMap((b) => waitedPullKeys(b)),
+              ...watched.github,
             ]),
           ].sort(),
           // Every repo the project watches for Dependabot alerts. A server
@@ -7666,6 +7675,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** A ring from a source: look at the binding(s) it concerns, or consider adopting. */
     async function onRing(source: Source, id: string): Promise<void> {
+      // BB-360: a thread that watched this entity with `ticket_watch` is woken
+      // here, through the same ring path a binding is. The watch is one-shot:
+      // it is dropped once it fires, so a later change does not message the
+      // thread again (a re-watch asks for another wake). `send`, not `sendTo`,
+      // so waking a watcher never unarchives a thread.
+      const watching = await ticketWatches.watchers(source, id);
+      if (watching.length > 0) {
+        for (const w of watching) {
+          await send(w.threadId, `Ticket ${w.key} changed. Read it with ticket_read and carry on.`);
+          await ticketWatches.remove(w.threadId, source, id);
+        }
+        // The entity may leave the interest set now no one watches it.
+        pushInterest();
+      }
       const bound = store.byEntity(source, id);
       // Ring every binding of the entity, not only the one `byEntity` picks:
       // the open binding owns it and reconciles the doorbell, and an ended one
@@ -10141,6 +10164,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         pushInterest();
       }),
     );
+    // BB-360: a deleted thread's ticket watches are forgotten, so its id does
+    // not stay in the interest set forever.
+    bb.events.on("thread.deleted", ({ thread }) => {
+      void ticketWatches
+        .removeThread(thread.id)
+        .then(() => pushInterest())
+        .catch((error) => bb.log.warn(`stewards: could not forget ${thread.id}'s ticket watches: ${errorMessage(error)}`));
+    });
 
     // ---- @bb mentions ----------------------------------------------------------------------------------
     //
@@ -11929,7 +11960,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // steers a binding: the steward saving the user's instructions, a parent
     // or the project steward deciding an escalation, setting priority, holds
     // and models, or approving a spec. Everything else a steward does, it does
-    // with the tools every thread has: linear_*, gh, and `bb thread` for
+    // with the source-neutral ticket tools (BB-360), gh, and `bb thread` for
     // workers.
 
     type Role = { kind: "steward"; binding: Binding } | { kind: "project"; projectId: string } | null;
@@ -11961,11 +11992,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // landed yet, counts; the tool itself refuses anything else.
         const worker = store.worker(context.thread.id) !== null;
         const parent = context.thread.parentThreadId !== null && store.byThread(context.thread.parentThreadId) !== null;
-        return worker || parent ? { tools: ["worker_park"], skills: [...STEWARDS_SKILLS] } : { tools: [], skills: [...STEWARDS_SKILLS] };
+        return worker || parent ? { tools: ["worker_park", ...TICKET_TOOL_NAMES], skills: [...STEWARDS_SKILLS] } : { tools: [], skills: [...STEWARDS_SKILLS] };
       }
       if (role.kind === "project") {
         return {
-          tools: ["steward_update"],
+          tools: ["steward_update", ...TICKET_TOOL_NAMES],
           skills: [...STEWARDS_SKILLS],
           instructions:
             "You are this project's steward. Decide escalations from the project's own guidance (AGENTS.md, architecture and design docs); only the project's big decisions go to the user. Read status with `bb stewards list` and `bb stewards show <key>`; steer with steward_update. Do not do a binding's work yourself: when an ended binding left work undone, reopen its entity so its steward resumes. Read the stewards skill for the protocol.",
@@ -11981,7 +12012,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // turning it off refuses at once even before the selection refreshes.
         const backlogTriage = target?.kind === "backlog" && configs.get(b.projectId)?.value?.file.backlog?.triage === true;
         return {
-          tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage"] : ["steward_report", "steward_update"],
+          tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage", ...TICKET_TOOL_NAMES] : ["steward_report", "steward_update", ...TICKET_TOOL_NAMES],
           skills: [...STEWARDS_SKILLS],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
@@ -11995,7 +12026,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         };
       }
       return {
-        tools: ["steward_report", "steward_update"],
+        tools: ["steward_report", "steward_update", ...TICKET_TOOL_NAMES],
         skills: [...STEWARDS_SKILLS],
         instructions:
           `You are the steward of ${JSON.stringify(b.entityKey)} (binding ${b.id}, a ${b.kind} binding under playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
@@ -12360,6 +12391,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         });
       }),
+    });
+
+    // BB-360: the source-neutral ticket tools, registered for steward and
+    // worker threads beside steward_report/steward_update/worker_park. They
+    // are one thin dispatch over the source contract by key shape; the watch
+    // registry is the one piece that is the plugin's own, woken by the ring
+    // path.
+    registerTicketTools(bb, {
+      sourceRpc,
+      snapshot,
+      project: async (projectId) => {
+        const config = await loadConfig(projectId);
+        return config === null ? null : { units: ticketUnits(config.file, config.repos), viewer: { linear: config.linearLogin, github: config.githubLogin } };
+      },
+      watches: ticketWatches,
+      pushInterest,
+      log: (message) => bb.log.warn(`stewards: ${message}`),
     });
 
     /**

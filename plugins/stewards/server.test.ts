@@ -244,12 +244,16 @@ describe("a Linear ticket steward", () => {
     const [project, steward] = t.spawns.map((x) => x.id);
 
     const tools = async (id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
-    expect(await tools(steward!)).toEqual(["steward_report", "steward_update"]);
-    expect(await tools(project!)).toEqual(["steward_update"]);
+    // The tools read in registration order, and the ticket tools (BB-360) are
+    // registered before worker_park and steward_report.
+    const ticketTools = ["ticket_file", "ticket_read", "ticket_search", "ticket_comment", "ticket_update", "ticket_watch"];
+    expect(await tools(steward!)).toEqual([...ticketTools, "steward_report", "steward_update"]);
+    expect(await tools(project!)).toEqual([...ticketTools, "steward_update"]);
     expect(await tools("thr_other")).toEqual([]);
-    // BB-329: a worker gets exactly one plugin tool, its own park call.
+    // BB-329: a worker gets exactly one plugin tool, its own park call, and
+    // the source-neutral ticket tools (BB-360).
     await t.created("thr_w1", steward!, "ENG-12: Implement");
-    expect(await tools("thr_w1")).toEqual(["worker_park"]);
+    expect(await tools("thr_w1")).toEqual([...ticketTools, "worker_park"]);
 
     const report = await t.tool("steward_report", { phase: "Todo", summary: "Specifying.", nextAction: "Post acceptance criteria", actor: "steward", requeueAfter: "1d" }, steward!);
     expect(report.error).toBe(false);
@@ -12253,13 +12257,14 @@ describe("the backlog triage writes (BB-341)", () => {
   const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
 
   it("is offered only when backlog.triage is true, and absent writes nothing", async () => {
+    const ticketTools = ["ticket_file", "ticket_read", "ticket_search", "ticket_comment", "ticket_update", "ticket_watch"];
     const off = await triaging({ triage: false });
-    expect(await tools(off.t, "thr_backlog")).toEqual(["steward_report", "steward_update"]);
+    expect(await tools(off.t, "thr_backlog")).toEqual([...ticketTools, "steward_report", "steward_update"]);
     expect((await off.t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog")).error).toBe(true);
     expect(off.t.linearWrites).toEqual([]);
 
     const on = await triaging({ triage: true });
-    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", "steward_report", "steward_update"]);
+    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", ...ticketTools, "steward_report", "steward_update"]);
   });
 
   it("writes labels, a priority and a signed comment through linear, and records each in the ledger", async () => {
@@ -18201,5 +18206,136 @@ describe("playbook refreshes (BB-328 Part 2)", () => {
     expect(refused.text).toMatch(/moved since it was classified/u);
     expect(t.githubMerges).toHaveLength(0);
     expect(t.hooks.store.playbookRefreshes("p1")[0]!.state).toBe("pr_open");
+  });
+});
+
+// BB-360: the source-neutral ticket tools. One test per tool proving the
+// dispatch goes to the source the key names, and ticket_file's unit rule.
+describe("the source-neutral ticket tools (BB-360)", () => {
+  /** A project with a Linear steward already spawned, so the tools have a thread. */
+  const withSteward = async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    return { t, steward: t.spawns[1]!.id };
+  };
+  const githubTicket = (over: Partial<EntitySnapshot> = {}) => githubIssue({ id: "acme/web#3", key: "acme/web#3", url: "https://github.com/acme/web/issues/3", parent: null, children: [], ...over });
+
+  it("ticket_read dispatches to the source the key names", async () => {
+    const { t, steward } = await withSteward();
+    t.entities.set("acme/web#3", githubTicket());
+    t.rpcCalls.length = 0;
+    const linear = await t.tool("ticket_read", { key: "ENG-12" }, steward);
+    expect(linear.error).toBe(false);
+    expect(linear.text).toContain("ENG-12");
+    expect(t.rpcCalls).toContainEqual(expect.objectContaining({ pluginId: "linear", method: "sourceSnapshot", input: { id: "ENG-12" } }));
+    t.rpcCalls.length = 0;
+    const github = await t.tool("ticket_read", { key: "acme/web#3" }, steward);
+    expect(github.error).toBe(false);
+    expect(github.text).toContain("acme/web#3");
+    expect(t.rpcCalls).toContainEqual(expect.objectContaining({ pluginId: "github-watcher", method: "sourceSnapshot", input: { id: "acme/web#3" } }));
+    // A key that names no system is refused, never guessed.
+    expect((await t.tool("ticket_read", { key: "not-a-key" }, steward)).error).toBe(true);
+  });
+
+  it("ticket_search fans out over the project's units, per source", async () => {
+    const { t, steward } = await withSteward();
+    t.entities.set("acme/web#3", githubTicket({ title: "Web login", description: "login on web" }));
+    t.rpcCalls.length = 0;
+    const out = await t.tool("ticket_search", { query: "login" }, steward);
+    expect(out.error).toBe(false);
+    expect(t.rpcCalls.some((c) => c.method === "sourceSearchIssues" && c.pluginId === "linear")).toBe(true);
+    expect(t.rpcCalls.some((c) => c.method === "sourceSearchIssues" && c.pluginId === "github-watcher")).toBe(true);
+    // Naming units narrows to them.
+    t.rpcCalls.length = 0;
+    await t.tool("ticket_search", { query: "login", units: ["ENG"] }, steward);
+    expect(t.rpcCalls.some((c) => c.method === "sourceSearchIssues" && c.pluginId === "github-watcher")).toBe(false);
+    expect((await t.tool("ticket_search", { query: "login", units: ["OTHER"] }, steward)).error).toBe(true);
+  });
+
+  it("ticket_comment signs the body and dispatches to the source the key names", async () => {
+    const { t, steward } = await withSteward();
+    t.entities.set("acme/web#3", githubTicket());
+    t.linearWrites.length = 0;
+    const linear = await t.tool("ticket_comment", { key: "ENG-12", body: "On it." }, steward);
+    expect(linear.error).toBe(false);
+    const write = t.linearWrites.find((w) => w.method === "sourceComment")!;
+    expect(write.input.key).toBe("ENG-12");
+    expect(String(write.input.body)).toContain(`_— from bb thread ${steward}_`);
+    t.rpcCalls.length = 0;
+    t.linearWrites.length = 0;
+    const github = await t.tool("ticket_comment", { key: "acme/web#3", body: "On it." }, steward);
+    expect(github.error).toBe(false);
+    expect(t.rpcCalls.some((c) => c.method === "sourceComment" && c.pluginId === "github-watcher")).toBe(true);
+    expect(t.linearWrites.find((w) => w.method === "sourceComment")!.input.key).toBe("acme/web#3");
+  });
+
+  it("ticket_update passes the fields the source carries, by key shape", async () => {
+    const { t, steward } = await withSteward();
+    t.entities.set("acme/web#3", githubTicket());
+    t.linearWrites.length = 0;
+    const linear = await t.tool("ticket_update", { key: "ENG-12", labels: ["auth"], priority: "high", state: "Done", assignee: "me", relations: [{ type: "blockedBy", issue: "ENG-13" }] }, steward);
+    expect(linear.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input).toMatchObject({ key: "ENG-12", addLabels: ["auth"], priority: "high", state: "Done", assignee: "me", relations: [{ type: "blockedBy", issue: "ENG-13" }] });
+    // A GitHub key dispatches to github-watcher, where labels and a status
+    // label work and the source refuses the fields GitHub has no concept for.
+    t.rpcCalls.length = 0;
+    const github = await t.tool("ticket_update", { key: "acme/web#3", labels: ["auth"], state: "status:in-progress" }, steward);
+    expect(github.error).toBe(false);
+    expect(t.rpcCalls.some((c) => c.method === "sourceUpdateIssue" && c.pluginId === "github-watcher")).toBe(true);
+    // An assignee other than this server's own login is refused in the tool.
+    expect((await t.tool("ticket_update", { key: "ENG-12", assignee: "sam" }, steward)).error).toBe(true);
+  });
+
+  it("ticket_file resolves the unit, signs the description, and refuses an unknown or missing unit", async () => {
+    const { t, steward } = await withSteward();
+    // The project lists several units: ENG, acme/bb and acme/web.
+    const refused = await t.tool("ticket_file", { title: "New", description: "Body" }, steward);
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(/several units/u);
+    expect(refused.text).toContain("ENG");
+    expect(refused.text).toContain("acme/web");
+    expect((await t.tool("ticket_file", { unit: "OTHER", title: "New", description: "Body" }, steward)).error).toBe(true);
+    // A Linear unit files through linear, with the signed description.
+    t.linearWrites.length = 0;
+    const linear = await t.tool("ticket_file", { unit: "ENG", title: "New", description: "Body", assignee: "me" }, steward);
+    expect(linear.error).toBe(false);
+    const write = t.linearWrites.find((w) => w.method === "sourceCreateIssue")!;
+    expect(write.input.unit).toBe("ENG");
+    expect(String(write.input.description)).toContain(`_— from bb thread ${steward}_`);
+    // A GitHub unit files through github-watcher.
+    t.rpcCalls.length = 0;
+    const github = await t.tool("ticket_file", { unit: "acme/web", title: "New", description: "Body" }, steward);
+    expect(github.error).toBe(false);
+    expect(t.rpcCalls.some((c) => c.method === "sourceCreateIssue" && c.pluginId === "github-watcher")).toBe(true);
+    // An assignee other than this server's own login is refused in the tool.
+    expect((await t.tool("ticket_file", { unit: "ENG", title: "New", description: "Body", assignee: "sam" }, steward)).error).toBe(true);
+  });
+
+  it("ticket_watch leases the entity, the ring wakes the thread once, and the watch ends", async () => {
+    const { t, steward } = await withSteward();
+    // Unlabelled, so the ring never adopts it and the interest set is the watch's alone.
+    const watched = githubTicket({ labels: [], state: "open", assignees: [] });
+    t.entities.set("acme/web#3", watched);
+    const out = await t.tool("ticket_watch", { key: "acme/web#3" }, steward);
+    expect(out.error).toBe(false);
+    expect(out.text).toContain("acme/web#3");
+    await t.flush();
+    const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!;
+    expect((interest.input as { entities: string[] }).entities).toContain("acme/web#3");
+    // A ring on the watched entity wakes the thread, through the same path a binding uses.
+    t.sends.length = 0;
+    t.entities.set("acme/web#3", { ...watched, title: "Changed" });
+    await t.ring("github", "acme/web#3");
+    expect(t.sends.some((s) => s.threadId === steward && s.text.includes("acme/web#3 changed"))).toBe(true);
+    // The watch is one-shot: a second change does not message the thread
+    // again, and the entity leaves the interest set.
+    t.sends.length = 0;
+    t.entities.set("acme/web#3", { ...watched, title: "Changed again" });
+    await t.ring("github", "acme/web#3");
+    expect(t.sends.some((s) => s.threadId === steward && s.text.includes("acme/web#3 changed"))).toBe(false);
+    await t.flush();
+    const after = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!;
+    expect((after.input as { entities: string[] }).entities).not.toContain("acme/web#3");
   });
 });

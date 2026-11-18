@@ -661,17 +661,15 @@ describe("the GitHub issue playbook (BB-234)", () => {
     expect(parsed.value).toMatchObject({ kind: "ticket", source: "github" });
     expect(Object.keys(parsed.value.phases)).toEqual(["open", "status:todo", "status:in-progress", "status:in-review"]);
     expect(parsed.value.terminal).toEqual(["closed", "closed (completed)", "closed (not planned)", "closed (duplicate)"]);
-    // GitHub sub-issues (BB-250): create-sub-issue is in `may`, the promote rule is set,
-    // and the status:todo phase carries the attach commands.
+    // GitHub sub-issues (BB-250, BB-360): create-sub-issue is in `may`, the
+    // promote rule is set, and the status:todo phase files a child through the
+    // source-neutral ticket_file, naming the parent.
     expect(parsed.value.may).toContain("create-sub-issue");
     expect(parsed.value.promote).toBe("A sub-issue that needs more than one pull request, its own approval, or work in a repo the parent does not touch.");
     const todo = phaseInstructions(parsed.value, "status:todo")!;
-    expect(todo).toContain("sub_issues");
-    // The child is assigned to this server's login, so a later `bb-managed` promotion can adopt it,
-    // and its number is printed so the steward can name it and re-attach it later.
-    expect(todo).toContain("--assignee @me");
-    expect(todo).toContain('echo "filed child #$n"');
-    expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/gh issue\s+close/u);
+    expect(todo).toContain('ticket_file { unit, title, description, parent, assignee: "me" }');
+    expect(todo).toMatch(/real sub-issue/u);
+    expect(phaseInstructions(parsed.value, "status:in-review")).toMatch(/ticket_update \{ key, state \}/u);
     expect(phaseInstructions(parsed.value, "open")).toMatch(/Add `status:todo`/u);
     expect(phaseInstructions(parsed.value, "status:in-progress")).toContain("no `Fixes #N`");
   });

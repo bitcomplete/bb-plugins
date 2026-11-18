@@ -6,7 +6,7 @@ import { readdirSync } from "node:fs";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { createStewardsPlugin, SECRET_SETTING_NAMES, testHooks, type StewardsDeps } from "./server.js";
-import { SOURCE_PLUGIN_IDS, sourceContract, type EntitySnapshot } from "./source-contract.js";
+import { SOURCE_PLUGIN_IDS, signedBy, sourceContract, type EntitySnapshot } from "./source-contract.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
 
 /** The skills bb registers for this plugin: each directory under `skills/` (package.json `bb.skills`). */
@@ -290,7 +290,10 @@ export function world() {
     else if (args.method === "repoSet") out = { repos, primary, layout, error: null };
     else if (args.method === "sourceSnapshot") {
       if (snapshotErrors.has(String(input.id))) throw new Error("Linear rate limited the read");
-      const entity = entities.get(String(input.id)) ?? null;
+      // The real source accepts a Linear key as well as its UUID; the fake
+      // resolves the key too, so a ticket_* test can read by key.
+      const wanted = String(input.id);
+      const entity = entities.get(wanted) ?? [...entities.values()].find((e) => e.key.toLowerCase() === wanted.toLowerCase()) ?? null;
       // BB-322: the real source's snapshot carries the pull request's changed
       // files; the test world keeps them beside the entity. Merge them so the
       // assessment's decide-list mark reads the same files `pullChangedFiles`
@@ -331,8 +334,8 @@ export function world() {
           ? { issues: [], unsupported: false, truncated: false, errors: [backlogError] }
           : { issues: backlog.filter((i) => String(i.unit).toUpperCase() === team), unsupported: false, truncated: backlogTruncated, errors: [] };
     } else if (args.method === "sourceUpdateIssue") {
-      // The real linear validates the input; the fake does too, and remembers
-      // every write so a test can assert what was sent (BB-341).
+      // The real sources validate the input; the fake does too, and remembers
+      // every write so a test can assert what was sent (BB-341, BB-360).
       sourceContract.sourceUpdateIssue.input.parse(input);
       linearWrites.push({ method: args.method, input });
       if (linearWriteError !== null) throw new Error(linearWriteError);
@@ -342,6 +345,17 @@ export function world() {
       linearWrites.push({ method: args.method, input });
       if (linearWriteError !== null) throw new Error(linearWriteError);
       out = { ok: true, url: "https://linear.app/acme/comment/1" };
+    } else if (args.method === "sourceCreateIssue") {
+      // The real sources validate the input and refuse an unsigned description
+      // (BB-360); the fake does both so a ticket_file test proves the signing.
+      sourceContract.sourceCreateIssue.input.parse(input);
+      if (signedBy(String(input.description)) === null) throw new Error("an issue description must end with the bb thread signature line; nothing was filed");
+      linearWrites.push({ method: args.method, input });
+      if (linearWriteError !== null) throw new Error(linearWriteError);
+      const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
+      const unit = String(input.unit);
+      const key = source === "github" ? `${unit}#1` : `${unit}-1`;
+      out = { id: `${source}-new`, key, url: source === "github" ? `https://github.com/${unit}/issues/1` : `https://linear.app/acme/issue/${key}` };
     } else if (args.method === "sourceValidate") {
       // The real plugins validate the input; an empty label was once accepted here and rejected there.
       sourceContract.sourceValidate.input.parse(input);

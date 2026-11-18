@@ -1541,7 +1541,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // check, the priority rule and the comment budget -- so this only applies
     // the plan. A label or related key that does not exist is an error that
     // changes nothing.
-    async function sourceUpdateIssue(input: { key: string; addLabels: string[]; priority?: "none" | "urgent" | "high" | "medium" | "low"; relations: Array<{ type: RelationType; issue: string }> }) {
+    async function sourceUpdateIssue(input: { key: string; addLabels: string[]; priority?: "none" | "urgent" | "high" | "medium" | "low"; state?: string; assignee?: string; relations: Array<{ type: RelationType; issue: string }> }) {
       const where = await forIssue(input.key, undefined, checkSignal());
       const ref = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.key }, checkSignal()));
       if (ref === null) throw notFound(input.key, where);
@@ -1568,10 +1568,34 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
       if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
 
+      // BB-360: the source-neutral `ticket_update` writes a workflow state by
+      // name and an assignee (this server's own user, or none); both are
+      // resolved before the mutation, so a bad name changes nothing.
+      if (input.state !== undefined) {
+        const target = findState(ref.team.states, input.state);
+        if (target === null) {
+          const names = [...ref.team.states].sort((a, b) => a.position - b.position).map((s) => `${s.name} (${s.type})`);
+          throw new Error(`Team ${ref.team.key} has no state named ${JSON.stringify(input.state)}. Its states: ${names.join(", ")}.`);
+        }
+        update.stateId = target.id;
+      }
+      if (input.assignee !== undefined) {
+        if (input.assignee.trim().toLowerCase() === "nobody") {
+          update.assigneeId = null;
+        } else {
+          const resolved = await resolveAssignee(where, input.assignee, checkSignal());
+          if ("error" in resolved) throw new Error(resolved.error);
+          if (resolved.id !== where.user.id) throw new Error(`sourceUpdateIssue assigns only to this server's own user (${where.user.name}), not ${JSON.stringify(input.assignee)}`);
+          update.assigneeId = resolved.id;
+        }
+      }
+
       if (Object.keys(update).length > 0) {
         const updated = parseIssueUpdate(await query(where.key, ISSUE_UPDATE, { id: ref.id, input: update }, checkSignal()));
         if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
         if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
+        if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
+        if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
       }
       for (const relation of relations) {
         parseIssueRelationCreate(await query(where.key, ISSUE_RELATION_CREATE, { input: relationCreateInput({ type: relation.type, issueId: relation.id }, ref.id) }, checkSignal()));

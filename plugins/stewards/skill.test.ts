@@ -49,17 +49,30 @@ describe("the shipped pr-reviewer skill's product ack (BB-207)", () => {
 });
 
 // BB-250: a GitHub ticket steward files a child as a native sub-issue, so the
-// create command assigns it to this server's login (a GitHub issue is adopted
-// only when the login is an assignee) and the attach uses the REST endpoint.
+// source assigns it to this server's login (a GitHub issue is adopted only
+// when the login is an assignee). BB-360 moved the step to `ticket_file`.
 const stewardsSkill = readFileSync(fileURLToPath(new URL("./skills/stewards/SKILL.md", import.meta.url)), "utf8");
+const onboardingSkill = readFileSync(fileURLToPath(new URL("./skills/onboarding/SKILL.md", import.meta.url)), "utf8");
 
-describe("the shipped stewards skill's GitHub child filing (BB-250)", () => {
-  it("carries the create-and-attach commands and assigns the child to this server's login", () => {
-    expect(stewardsSkill).toContain("### Filing a child on GitHub");
-    expect(stewardsSkill).toContain("repos/{owner}/{repo}/issues/{parent}/sub_issues");
-    expect(stewardsSkill).toContain("--assignee @me");
-    expect(stewardsSkill).toContain('echo "filed child #$n"');
-    expect(stewardsSkill).toContain("-F sub_issue_id=");
+describe("the shipped stewards skill's child filing (BB-250, BB-360)", () => {
+  it("files a child through the source-neutral ticket_file, naming the parent", () => {
+    expect(stewardsSkill).toContain("### Filing a child");
+    expect(stewardsSkill).toContain('ticket_file { unit, title, description, parent, assignee: "me" }');
+    expect(stewardsSkill).toMatch(/native sub-issue/u);
+    expect(stewardsSkill).toMatch(/assigns the\s+child to this server's login/u);
+  });
+});
+
+// BB-360: the shipped skills take every ticket step through the source-neutral
+// tools. `linear_*` stays only for a Linear @bb session reply, which has no
+// neutral equivalent, and `gh` stays for pull requests.
+describe("the shipped skills' source-neutral ticket steps (BB-360)", () => {
+  it("names no linear_* tool or gh issue for a ticket step", () => {
+    for (const text of [stewardsSkill, buildTicketsSkill, skill, onboardingSkill]) {
+      expect(text).not.toMatch(/gh issue/u);
+      const linear = [...new Set(text.match(/linear_[a-z_]+/gu) ?? [])].filter((t) => t !== "linear_session_reply");
+      expect(linear).toEqual([]);
+    }
   });
 });
 
