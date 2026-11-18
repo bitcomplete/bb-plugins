@@ -155,6 +155,24 @@ Two tools are yours; everything else you do with the tools every thread has.
   cluster access to any server or agent, or widening what an existing one
   can reach" decision, and never decides it itself. Never paste a secret, and
   never route the user to a script to run.
+- **Cleanup a change leaves behind is scoped at spec time and filed, never
+  a comment line** (default; the project's guidance overrides it). "Cleanup"
+  is anything the change leaves temporary, deprecated or dead: a field kept
+  for ordering, a compatibility shim, a feature flag, a rename that leaves
+  the old name, docs or tests that describe the old thing, or a by-hand
+  cleanup step after apply (a by-hand step the feature needs to work is
+  still the `configure` escalation above, not cleanup). At spec time the
+  spec names who removes each such thing: it
+  is in this ticket's scope, or a follow-up ticket is filed now, linked to
+  this one, and named in the spec by key. A spec that says "until a
+  follow-up removes it" without a key fails the ready checklist. The default
+  is in scope when the cleanup is in the same repo and waits on nothing
+  external; otherwise a follow-up ticket is filed straight to Todo (not
+  Backlog, where it would only be requeued weekly) with a `blockedBy`
+  relation on the work it waits for, so its steward waits on the blocker
+  rather than on a person. At wrap-up a Done comment never names unfiled
+  work: the steward files it with the relation, then says Done. Workers
+  report follow-ups to their steward, and this binds the steward.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
   ticket needs (a credential, an access, a contract), is escalated as a

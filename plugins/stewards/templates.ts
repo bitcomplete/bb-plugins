@@ -87,6 +87,7 @@ ready:
     - Acceptance criteria are testable
     - Affected repos are named
     - Out of scope is stated
+    - Anything the change leaves temporary or deprecated has its removal in scope or in a filed ticket named here
   substantial:
     - more than one repo
     - schema or data migration
@@ -185,6 +186,7 @@ ready:
     - Acceptance criteria are testable
     - Affected repos are named
     - Out of scope is stated
+    - Anything the change leaves temporary or deprecated has its removal in scope or in a filed ticket named here
   substantial:
     - more than one repo
     - schema or data migration

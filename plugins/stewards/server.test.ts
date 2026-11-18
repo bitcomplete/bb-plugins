@@ -335,8 +335,8 @@ describe("a Linear ticket steward", () => {
     expect((await t.list())[0]!.summary).toBeNull();
 
     const partly = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3].map((item) => ({ item, met: true })), substantial: false } }, steward);
-    expect(partly.text).toMatch(/Ready gate: not passed \(unmet: 4\)/u);
-    const met = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, "Out of scope is stated"].map((item) => ({ item, met: true, note: "in the spec" })), substantial: false } }, steward);
+    expect(partly.text).toMatch(/Ready gate: not passed \(unmet: 4, 5\)/u);
+    const met = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, "Out of scope is stated", 5].map((item) => ({ item, met: true, note: "in the spec" })), substantial: false } }, steward);
     expect(met).toMatchObject({ error: false, text: expect.stringMatching(/Ready gate: passed and nothing schedules you\./u) });
 
     // Moving to a build stage now is no conflict, and the wake says the gate passed.
@@ -356,14 +356,14 @@ describe("a Linear ticket steward", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     const base = { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" as const };
-    await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward);
-    expect(t.hooks.store.find("ENG-12")!.ready.checklist).toHaveLength(4);
+    await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true } }, steward);
+    expect(t.hooks.store.find("ENG-12")!.ready.checklist).toHaveLength(5);
     // A report that only judges substantial (as a review binding's does) keeps
     // the checklist the ticket already reported rather than wiping it.
     const report = await t.tool("steward_report", { ...base, ready: { substantial: false, why: "no criterion applies" } }, steward);
     expect(report.error, report.text).toBe(false);
     const b = t.hooks.store.find("ENG-12")!;
-    expect(b.ready.checklist).toHaveLength(4);
+    expect(b.ready.checklist).toHaveLength(5);
     expect(b.ready.substantial).toBe(false);
     expect(b.ready.why).toBe("no criterion applies");
   });
@@ -374,7 +374,7 @@ describe("a Linear ticket steward", () => {
   // approval/schedule request is deciding instead.
   describe("BB-55: the ready-gate start-now reply and the backstop wake", () => {
     const base = { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" };
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: false };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: false };
     const backstop = "The ready gate passed on your last turn and nothing holds you: start the worker.";
     const startWakes = (t: Awaited<ReturnType<typeof setup>>) => t.sends.filter((s) => s.text.includes(backstop));
     const startReply = "Reported. Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.";
@@ -498,7 +498,7 @@ describe("a Linear ticket steward", () => {
 
     it("is raised when a reported checklist item is unmet, approval or not", async () => {
       const { t, steward, move } = await bound();
-      const checklist = [1, 2, 3, 4].map((item) => ({ item, met: item !== 4 }));
+      const checklist = [1, 2, 3, 4, 5].map((item) => ({ item, met: item !== 4 }));
       expect((await t.tool("steward_report", { ...base, ready: { checklist, substantial: false } }, steward)).error).toBe(false);
       expect(await move(inProgress())).toMatch(flagged);
     });
@@ -713,7 +713,7 @@ describe("a Linear ticket steward", () => {
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
     const toProject = () => t.sends.filter((s) => s.threadId === project);
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true, why: "two repos" };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true, why: "two repos" };
     const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait for approval", actor: "other", waitingOn: "project steward's approval of the new spec" };
 
     const reported = await t.tool("steward_report", { ...base, ready: met }, steward!);
@@ -769,7 +769,7 @@ describe("a Linear ticket steward", () => {
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
     const toProject = () => t.sends.filter((s) => s.threadId === project);
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" };
 
     await t.tool("steward_report", { ...base, ready: met }, steward!);
@@ -791,7 +791,7 @@ describe("a Linear ticket steward", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met, escalate: { kind: "decision", question: "Approve the spec?", meanwhile: "Wait." } }, steward!);
     const wakes = t.sends.filter((s) => s.threadId === project);
     expect(wakes).toHaveLength(1);
@@ -809,7 +809,7 @@ describe("a Linear ticket steward", () => {
     const [project, steward] = t.spawns.map((x) => x.id);
     // Record a met gate the way an older version left it: no request filed.
     const b = t.hooks.store.find("ENG-12")!;
-    t.hooks.store.patch(b.id, { ready: { ...b.ready, checklist: ["Problem and desired outcome are stated", "Acceptance criteria are testable", "Affected repos are named", "Out of scope is stated"].map((item) => ({ item, met: true, note: null })), substantial: true }, awaitingReport: false });
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, checklist: ["Problem and desired outcome are stated", "Acceptance criteria are testable", "Affected repos are named", "Out of scope is stated", "Anything the change leaves temporary or deprecated has its removal in scope or in a filed ticket named here"].map((item) => ({ item, met: true, note: null })), substantial: true }, awaitingReport: false });
     await t.ring("linear", "uuid-12");
     expect(t.sends.filter((s) => s.threadId === project).at(-1)?.text).toMatch(/approval requested for ENG-12/u);
     // Asking needs no turn of the steward's (its first wake was its spawn).
@@ -822,7 +822,7 @@ describe("a Linear ticket steward", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
-    const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Ask the user", actor: "user", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward!);
+    const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Ask the user", actor: "user", ready: { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true } }, steward!);
     expect(reported.text).toMatch(/requested from the user, on the Stewards page \(need_[\w-]+\): they press Approve or Decline there/u);
     expect(t.sends.filter((s) => s.threadId === project)).toHaveLength(0);
     t.userTurns.push({ threadId: steward!, text: "Approved, go ahead." });
@@ -1517,7 +1517,7 @@ describe("recovering a steward whose environment is gone (BB-103)", () => {
 // twice, and the escalation kept "The binding ended." instead.
 describe("scheduling overlapping work", () => {
   const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
-  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: false, why: "one repo, small" };
+  const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: false, why: "one repo, small" };
   const building = { phase: "In Progress", summary: "Worker building.", nextAction: "Wait for the pull request", actor: "steward" };
   const ready = { phase: "Todo", summary: "Spec posted.", nextAction: "Start a worker", actor: "steward", ready: met, touches: ["web/src"] };
 
@@ -1982,7 +1982,7 @@ describe("scheduling overlapping work", () => {
 });
 
 describe("declined specs converge (BB-54)", () => {
-  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+  const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
   const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" };
 
   async function requested() {
@@ -2115,7 +2115,7 @@ describe("escalations delivered once, updates safe to retry", () => {
   it("accepts guidance resolving an approval request that approve: true already closed", async () => {
     const t = await two();
     const steward = t.hooks.store.find("ENG-12")!.threadId!;
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait for approval", actor: "other", ready: met }, steward);
     const id = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.toProject().at(-1)!)![1]!;
 
@@ -4508,7 +4508,7 @@ describe("muting steward trees and pushing needs-you items (BB-253)", () => {
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met }, steward);
     const approval = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approval")!;
     const before = pushCalls(t).length;
@@ -5294,7 +5294,7 @@ describe("questions to the user", () => {
   // steward's words, an unsigned comment on the entity, and the user's own
   // amendment all approve the same gate.
   describe("one spec approval from any surface (BB-13)", () => {
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" };
 
     /** A bound, specified ticket whose approval request is with the project steward. */
@@ -6751,7 +6751,7 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
 
 describe("needs you items", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
-  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+  const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
   const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
   const head = "aaaaaaa1";
   // Existing tests predate `approver=`: their owner-reviewed marker tests the
@@ -8642,7 +8642,7 @@ describe("needs you items", () => {
     const b = t.hooks.store.find("ENG-12")!;
     const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const before = t.sends.filter((s) => s.threadId === project).length;
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { ...base, ready: met }, steward);
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
     const wakes = t.sends.filter((s) => s.threadId === project);
@@ -8700,7 +8700,7 @@ describe("needs you items", () => {
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     const b = t.hooks.store.find("ENG-12")!;
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { ...base, ready: met }, steward);
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
     const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1", origin: { threadId: steward, bindingId: b.id, chain: [] } });
@@ -9218,7 +9218,7 @@ describe("fixed choices on decide items and questions", () => {
 // Decline, not a free-text question.
 describe("forwarded spec approvals", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
-  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+  const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
   const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
 
   /** A bound ticket whose approval request is with the project steward, forwarded to the user. */
@@ -11314,7 +11314,7 @@ describe("the rationale box (BB-35 step 4)", () => {
 
   it("never asks on a gate item: a forwarded spec approval is an approve-spec item", async () => {
     const t = await adopted();
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met }, t.steward);
     const approval = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
     await t.tool("steward_update", { binding: "ENG-12", forward: approval }, t.project);
@@ -12486,7 +12486,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     const steward = t.spawns[1]!.id;
     await t.tool(
       "steward_report",
-      { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } },
+      { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward", ready: { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true } },
       steward,
     );
     expect((await t.tool("steward_update", { binding: "ENG-12", approve: true }, project)).error).toBe(false);
@@ -16125,7 +16125,7 @@ describe("recorded assumptions (BB-251)", () => {
     const { t, project, steward } = await bound();
     const first = idOf((await t.tool("steward_update", { assume: { text: "first" } }, steward)).text);
     const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { ...base, ready: met }, steward);
     const b = t.hooks.store.find("ENG-12", "p1")!;
     const approval = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval");
@@ -16151,7 +16151,7 @@ describe("recorded assumptions (BB-251)", () => {
     const [, steward] = t.spawns.map((x) => x.id) as [string, string];
     const first = idOf((await t.tool("steward_update", { assume: { text: "first" } }, steward)).text);
     const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
-    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const met = { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true };
     await t.tool("steward_report", { ...base, ready: met }, steward);
     await t.flush();
     const b = t.hooks.store.find("ENG-12", "p1")!;
@@ -17003,7 +17003,7 @@ describe("the stand-up (BB-300)", () => {
     await t.ring("linear", "uuid-12");
     await t.flush();
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
-    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward);
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: true } }, steward);
     await t.flush();
     return { ...t, project, steward };
   }
