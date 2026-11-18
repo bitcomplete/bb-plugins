@@ -95,7 +95,7 @@ import { decideForPull, explainDecision, formatDecisionListing, globMatches, typ
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
-import { ASK_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackNameCandidates, waitSlackInstruction, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
+import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
 import { ADOPTION_CHOICES, adoptionChoices, adoptionHow, adoptionQuestion, alertClockAt, alertFingerprint, batchAlert, deadlineAt, depsLookSchema, dueDate, isBatchable, overdue, priorityFor, priorityLabel, priorityLabelForSeverity, reminderText, repoOfFingerprint, sightingOf, snoozeUntil, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
@@ -2187,15 +2187,117 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the owner-reviewed lane, and a bot is not a person to DM.
         const owner = lc(config.githubLogin ?? "");
         const reviewers = (assessment.wait?.reviewers ?? []).filter((r) => owner !== "" && lc(r) !== owner && !DEPENDENCY_BOTS.has(lc(r)) && !/\[bot\]$/iu.test(r));
-        return { githubLogin: reviewers[0] ?? null, linearName: null };
+        return { githubLogin: reviewers[0] ?? null, linearName: null, linearUserId: null, email: null };
       }
       // A `person` wait names a page item. Only a delegate-approval escalation
       // names a person other than the owner; any other item is the owner's, so
       // there is no one to DM and Ask on Slack is not offered.
       const escalation = store.openEscalations(b.id).find((x) => x.id === wait.ref);
       const delegate = escalation === undefined ? null : delegateWaitNames(escalation.meanwhile);
-      if (delegate !== null) return { githubLogin: delegate.split(",")[0]?.trim() ?? null, linearName: null };
-      return { githubLogin: null, linearName: null };
+      if (delegate !== null) return { githubLogin: delegate.split(",")[0]?.trim() ?? null, linearName: null, linearUserId: null, email: null };
+      return { githubLogin: null, linearName: null, linearUserId: null, email: null };
+    }
+
+    /**
+     * BB-358: the wait's target as the rung-3 wording names it: `PR #9` for a
+     * review wait, the ticket key for a person wait.
+     */
+    function waitSlackTarget(wait: Wait, b: Binding): string {
+      if (wait.kind === "review") {
+        const parsed = parsePullRef(wait.ref);
+        return parsed === null ? wait.ref : `PR #${parsed.number}`;
+      }
+      return b.entityKey;
+    }
+
+    /** BB-358: the links to what was tried, for the rung-3 need's context. */
+    function waitSlackTriedLinks(b: Binding, wait: Wait): string {
+      const parts: string[] = [];
+      const pull = wait.kind === "review" ? parsePullRef(wait.ref) : null;
+      if (pull !== null) parts.push(`https://github.com/${pull.repo}/pull/${pull.number}`);
+      if (b.url !== null && !parts.includes(b.url)) parts.push(b.url);
+      return parts.length === 0 ? "" : ` Tried: ${parts.join(", ")}.`;
+    }
+
+    /**
+     * BB-358: the fixed follow-up ladder's one need for an overdue wait, at the
+     * rung the state calls for. Rung 2 (the Slack DM on the owner's click) is
+     * offered when this server can send and the person is not recorded as not
+     * on Slack and no DM went out to them from this steward today; the ask-once
+     * fallback asks who the person is when nothing resolves; rung 3 is the
+     * terminal need, filed immediately when the Slack rung is skipped and after
+     * a further budget when a DM went unanswered. Returns the wake line.
+     */
+    async function fileOverdueWaitNeed(b: Binding, wait: Wait, assessment: Assessment, config: ProjectConfig): Promise<string | null> {
+      const person = slackPersonFor(b, wait, assessment, config);
+      const learned = store.learnedSlack();
+      const key = slackPersonKey(person);
+      // A person the sources name: a review wait's requested reviewer, or a
+      // delegate. With no one to ask about there is no Slack rung at all.
+      const hasPerson = (person.githubLogin?.trim() ?? "") !== "" || (person.linearName?.trim() ?? "") !== "";
+      const skipped = slackPersonNotOnSlack(person, learned);
+      const capped = key !== null && store.slackDmSentToday(b.id, key);
+      const budget = waitBudgetMs(wait.kind, config.file.waitBudgets);
+      const further = b.waitSlackedAt !== null && budget !== null && now() - b.waitSlackedAt > budget;
+      const slackReady = hasPerson && !skipped && !capped && (await slackAvailable());
+      const base: Record<string, unknown> = { waitBudget: true, waitKind: wait.kind, waitRef: wait.ref, waitSince: b.waitSince };
+      if (!slackReady || further) {
+        // Rung 3, terminal: the owner pesters the person. It is always present,
+        // and it is what the ladder falls to when Slack cannot send, the person
+        // is known not to be on Slack, the cap is spent, or a DM went a further
+        // budget unanswered.
+        const what = waitSlackTerminalWhat(person, waitSlackTarget(wait, b), b.waitSince ?? now());
+        const how = `Choose what to do; Keep waiting resets the budget once.${waitSlackTriedLinks(b, wait)}`;
+        store.fileNeed({ bindingId: b.id, kind: "decide", url: wait.ref, what, how, why: "The wait outlived two budgets and the person has not answered.", data: { ...base, waitTerminal: true, choices: [...WAIT_DECIDE_CHOICES] }, filedBy: "plugin" });
+        return `The ${wait.kind} wait on ${wait.ref} reached the terminal rung; the owner has the decide item.`;
+      }
+      // The Slack rung was already offered or sent for this wait: within the
+      // next budget nothing new is filed. The terminal rung comes when the
+      // budget passes with the wait still live.
+      if (b.waitSlackedAt !== null) return null;
+      const candidates = slackNameCandidates(person, config.roles, learned);
+      if (candidates.length > 0) {
+        // Rung 2, the BB-354 offer: the owner's click wakes the steward to DM.
+        store.fileNeed({
+          bindingId: b.id,
+          kind: "decide",
+          url: wait.ref,
+          what: `The ${wait.kind} wait on ${wait.ref} is still open after a second budget.`,
+          how: "Choose what to do; Keep waiting resets the budget once.",
+          why: "The wait outlived two budgets, so it comes to the owner.",
+          data: { ...base, choices: [...WAIT_DECIDE_CHOICES, ASK_ON_SLACK_CHOICE], waitSlackCandidates: candidates, waitSlackPersonKey: key },
+          filedBy: "plugin",
+        });
+        store.patch(b.id, { waitSlackedAt: now() });
+        return `The ${wait.kind} wait on ${wait.ref} outlived a second budget; the owner has a decide item.`;
+      }
+      // Nothing resolved and there is no one to name: the ladder falls to the
+      // terminal rung. (The ask-once question is reached from a refused send,
+      // which carries the near matches; `wait-slack-refused --near-matches`.)
+      const what = waitSlackTerminalWhat(person, waitSlackTarget(wait, b), b.waitSince ?? now());
+      const how = `Choose what to do; Keep waiting resets the budget once.${waitSlackTriedLinks(b, wait)}`;
+      store.fileNeed({ bindingId: b.id, kind: "decide", url: wait.ref, what, how, why: "The wait outlived two budgets and the person has not answered.", data: { ...base, waitTerminal: true, choices: [...WAIT_DECIDE_CHOICES] }, filedBy: "plugin" });
+      return `The ${wait.kind} wait on ${wait.ref} reached the terminal rung; the owner has the decide item.`;
+    }
+
+    /**
+     * BB-358: the rung-3 terminal need, filed when the Slack rung is skipped
+     * (Not on Slack) or a DM went a further budget unanswered. It closes the
+     * ask-once need if one is open.
+     */
+    function fileWaitTerminalNeed(b: Binding, wait: Wait, person: SlackPerson): void {
+      const what = waitSlackTerminalWhat(person, waitSlackTarget(wait, b), b.waitSince ?? now());
+      const how = `Choose what to do; Keep waiting resets the budget once.${waitSlackTriedLinks(b, wait)}`;
+      store.fileNeed({
+        bindingId: b.id,
+        kind: "decide",
+        url: wait.ref,
+        what,
+        how,
+        why: "The wait outlived two budgets and the person has not answered.",
+        data: { waitBudget: true, waitTerminal: true, waitKind: wait.kind, waitRef: wait.ref, waitSince: b.waitSince, choices: [...WAIT_DECIDE_CHOICES] },
+        filedBy: "plugin",
+      });
     }
 
     /**
@@ -2207,19 +2309,37 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function revertSendingSlackNeed(need: Need): void {
       const b = store.binding(need.bindingId);
       if (b === null) return;
-      const how = "Choose what to do; Keep waiting resets the budget once. The Slack send reported no result. Add a `slack` field to the holder in stewards/roles.json, or pick another choice.";
-      const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
+      const how = "Choose what to do; Keep waiting resets the budget once. The Slack send reported no result. Pick the person on Slack again, or another choice.";
+      // BB-358: an ask-once item reverts to its candidate buttons; a rung-2 item
+      // reverts to the three original choices.
+      const askOnce = need.data.waitStage === "ask-once";
+      const choices = askOnce ? askOnceChoicesFromNeed(need) : [...WAIT_DECIDE_CHOICES];
+      const data: Record<string, unknown> = { ...need.data, choices };
       delete data.waitSlackSending;
       delete data.waitSlackPickedAt;
       delete data.waitSlackCandidates;
-      delete data.waitSince;
+      if (!askOnce) delete data.waitSince;
       try {
         store.reopenNeed(need.id, { what: need.what, how, data });
       } catch {
         return;
       }
       store.recordNonAction(b.id, "wait-slack-unsent", "no result reported", now());
-      store.note(b.id, `Ask on Slack reported no result for ${need.what}; the owner has the three original choices again.`);
+      store.note(b.id, `Ask on Slack reported no result for ${need.what}; the owner has the choices again.`);
+    }
+
+    /** BB-358: the ask-once need's stored near matches, as `{ id, label }`. */
+    function askOnceNearMatches(need: Need): Array<{ id: string; label: string }> {
+      const raw = need.data.waitSlackNearMatches;
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .filter((x): x is { id: string; label: string } => typeof x === "object" && x !== null && typeof (x as { id?: unknown }).id === "string" && typeof (x as { label?: unknown }).label === "string")
+        .map((x) => ({ id: x.id, label: x.label }));
+    }
+
+    /** BB-358: the ask-once need's current buttons: the near matches, then Not on Slack. */
+    function askOnceChoicesFromNeed(need: Need): string[] {
+      return [...askOnceNearMatches(need).map((m) => m.label), NOT_ON_SLACK_CHOICE];
     }
 
     /** BB-354: the opener context a filed overdue need carries, or null when it offers no Slack choice. */
@@ -2242,13 +2362,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * `waitSlackedAt` stays recorded, so Ask on Slack is not offered again for
      * the same wait. Called by the `wait-slack-refused` CLI command.
      */
-    function reopenWaitSlackNeed(needId: string, candidates: readonly string[]): { ok: boolean; message: string } {
+    function reopenWaitSlackNeed(needId: string, candidates: readonly string[], nearMatches: readonly SlackCandidate[] | null = null): { ok: boolean; message: string } {
       const need = store.need(needId);
       if (need === null) return { ok: false, message: "That item is gone." };
       if (need.kind !== "decide" || need.data.waitBudget !== true) return { ok: false, message: "That item is not an overdue-wait decide item." };
       const b = store.binding(need.bindingId);
       if (b === null) return { ok: false, message: "That item's binding is gone." };
       const named = candidates.map((c) => c.trim()).filter((c) => c !== "");
+      // BB-358: a hooks that named near matches (or named none at all, on an
+      // older hooks) reopens the ask-once question with one button per near
+      // match and Not on Slack. The old name-list form keeps the BB-354
+      // recovery: the three original choices with the names Slack returned.
+      if (nearMatches !== null) {
+        const matches = nearMatches.filter((m) => m.id.trim() !== "").map((m) => ({ id: m.id.trim(), label: slackCandidateLabel(m) }));
+        const data: Record<string, unknown> = { ...need.data, choices: [...matches.map((m) => m.label), NOT_ON_SLACK_CHOICE], waitStage: "ask-once", waitSlackNearMatches: matches };
+        delete data.waitSlackCandidates;
+        delete data.waitSlackSending;
+        delete data.waitSlackPickedAt;
+        try {
+          store.reopenNeed(need.id, { what: waitSlackAskOnceWhat({ githubLogin: typeof data.waitSlackPersonLabel === "string" ? data.waitSlackPersonLabel : null, linearName: null }), how: "Pick the person on Slack, or Not on Slack. The DM is sent on the owner's click.", data });
+        } catch {
+          return { ok: false, message: "Another open item already covers that wait, so it cannot be reopened." };
+        }
+        store.recordNonAction(b.id, "wait-slack-unsent", matches.length === 0 ? null : matches.map((m) => m.label).join(", "), now());
+        store.note(b.id, `Ask on Slack could not resolve the person for ${need.what}; the owner is asked who they are.`);
+        scheduleReconcile(b.id);
+        return { ok: true, message: `Reopened ${need.id}; the owner is asked who the person is on Slack.` };
+      }
       const line = named.length === 0 ? "Slack could not find the person and named no candidates." : `Slack could not find the person; it named: ${named.join(", ")}.`;
       const how = `Choose what to do; Keep waiting resets the budget once. ${line} Add a \`slack\` field to the holder in stewards/roles.json, or pick another choice.`;
       const data: Record<string, unknown> = { ...need.data, choices: [...WAIT_DECIDE_CHOICES] };
@@ -2280,6 +2420,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b === null) return { ok: false, message: "That item's binding is gone." };
       const link = permalink.trim();
       const resolution = link === "" ? "The Ask on Slack DM opened." : `The Ask on Slack DM opened: ${link}.`;
+      // BB-358: record the DM for the per-person-per-steward-per-day cap. The
+      // person key rides the need data; without one there is nothing to cap.
+      const personKey = typeof need.data.waitSlackPersonKey === "string" ? need.data.waitSlackPersonKey : null;
+      if (personKey !== null) store.recordSlackDm(b.id, personKey, now());
       store.closeNeed(need.id, resolution, "plugin");
       store.patch(b.id, { waitSlackedAt: now() });
       store.note(b.id, `Ask on Slack sent for ${need.what}. ${resolution}`);
@@ -5444,36 +5588,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // is not asked again on every look.
           const openWaitNeed = store.openNeeds(b.id).some((n) => n.kind === "decide" && n.data.waitBudget === true && n.url === overdueWait.ref);
           if (!openWaitNeed) {
-            // BB-354: Ask on Slack is offered only when this server can send and
-            // this wait has not already been slacked; otherwise the three
-            // original choices are all that changes.
-            let candidates: string[] = [];
-            if (b.waitSlackedAt === null && (await slackAvailable())) candidates = slackNameCandidates(slackPersonFor(b, overdueWait, assessment, config), config.roles);
-            const data: Record<string, unknown> = {
-              waitBudget: true,
-              choices: candidates.length > 0 ? [...WAIT_DECIDE_CHOICES, ASK_ON_SLACK_CHOICE] : [...WAIT_DECIDE_CHOICES],
-              waitKind: overdueWait.kind,
-              waitRef: overdueWait.ref,
-            };
-            if (candidates.length > 0) {
-              data.waitSlackCandidates = candidates;
-              data.waitSince = b.waitSince;
-            }
-            store.fileNeed({
-              bindingId: b.id,
-              kind: "decide",
-              url: overdueWait.ref,
-              what: `The ${overdueWait.kind} wait on ${overdueWait.ref} is still open after a second budget.`,
-              how: "Choose what to do; Keep waiting resets the budget once.",
-              why: "The wait outlived two budgets, so it comes to the owner.",
-              data,
-              filedBy: "plugin",
-            });
-            changes.push({ text: `The ${overdueWait.kind} wait on ${overdueWait.ref} outlived a second budget; the owner has a decide item.`, actionable: true });
-            // BB-354: the offer is recorded on the binding, so Ask on Slack is
-            // offered at most once per wait; Keep waiting resets the budget but
-            // not this marker. A changed wait resets it with the wait clock.
-            if (candidates.length > 0) store.patch(b.id, { waitSlackedAt: now() });
+            // BB-358: the fixed ladder picks the rung (the Slack offer, the
+            // ask-once question, or the terminal need) and files it once.
+            const line = await fileOverdueWaitNeed(b, overdueWait, assessment, config);
+            if (line !== null) changes.push({ text: line, actionable: true });
           }
         }
       }
@@ -11646,6 +11764,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (label === null) return { ok: false, message: "Pick one of the choices." };
           if (choices.length === 0) return { ok: false, message: "That item has no choices; answer it in the text box." };
           if (!choices.includes(label)) return { ok: false, message: `"${label}" is not one of the choices: ${choices.join(", ")}.` };
+          // BB-358: the ask-once need. A near-match button records the owner's
+          // answer and wakes the steward to send to that Slack user id; Not on
+          // Slack records the skip and files the terminal rung at once. Only
+          // the owner's click writes a learned mapping.
+          if (need.data.waitStage === "ask-once") {
+            const key = typeof need.data.waitSlackPersonKey === "string" ? need.data.waitSlackPersonKey : null;
+            const personLabel = typeof need.data.waitSlackPersonLabel === "string" ? need.data.waitSlackPersonLabel : "that person";
+            const wait = b.wait ?? { kind: "external" as const, ref: need.url };
+            if (label === NOT_ON_SLACK_CHOICE) {
+              if (key !== null) store.setLearnedSlack(key, { kind: "not-on-slack" });
+              store.closeNeedByKey(b.id, "decide", need.url, "Not on Slack.");
+              fileWaitTerminalNeed(b, wait, { githubLogin: personLabel, linearName: null });
+              store.note(b.id, `${personLabel} is not on Slack; the Slack rung is skipped for them from now on.`);
+              scheduleReconcile(b.id);
+              return { ok: true, message: `Recorded; ${b.entityKey}'s steward has the terminal item.` };
+            }
+            const match = askOnceNearMatches(need).find((m) => m.label === label);
+            if (match === undefined) return { ok: false, message: `"${label}" is not one of the choices: ${choices.join(", ")}.` };
+            if (key !== null) store.setLearnedSlack(key, { kind: "user", slackUserId: match.id });
+            store.fileNeed({
+              bindingId: b.id,
+              kind: "decide",
+              url: need.url,
+              what: need.what,
+              how: "Sending the DM; the steward's turn is under way.",
+              why: need.why,
+              details: need.details,
+              data: { ...need.data, waitSlackSending: true, waitSlackPickedAt: now(), waitSlackCandidates: [match.id] },
+              filedBy: "plugin",
+            });
+            const context = waitSlackContextFromNeed(b, store.need(need.id)!);
+            store.addGuidance(b.id, context === null ? `${label}` : `${label} ${waitSlackInstruction(need.id, context)}`, "user");
+            store.patch(b.id, { waitSlackedAt: now() });
+            store.note(b.id, `The user picked ${label} on Slack for ${need.what}; the steward is sending the DM.`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Sending; ${b.entityKey}'s steward has been told.` };
+          }
           const guidance = text === null ? label : `${label} — ${text}`;
           // BB-354: an Ask on Slack pick carries the tool call, the ordered
           // candidates and the opener in the guidance, so the steward's next
@@ -14968,18 +15123,49 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           "wait-slack-refused": cliCommand({
-            summary: "Reopen an overdue-wait decide item with the three original choices after Slack refused the person (BB-354)",
-            description: "Run after `slack_start_conversation` refuses every candidate on an Ask on Slack pick. The item reopens with the three original choices and a line naming the candidates Slack returned, so the owner can add a `slack` field to the holder in stewards/roles.json or pick another choice. Ask on Slack is not offered again for the same wait.",
+            summary: "Reopen an overdue-wait decide item after Slack refused the person (BB-354, BB-358)",
+            description: "Run after `slack_start_conversation` refuses every candidate on an Ask on Slack pick. With `--near-matches` (the JSON candidates the tool returned), the item reopens as the ask-once question with one button per near match and Not on Slack, so the owner teaches the plugin who the person is. Without it, the item reopens with the three original choices and a line naming the candidates Slack returned, so the owner can add a `slack` field to the holder in stewards/roles.json or pick another choice. Ask on Slack is not offered again for the same wait.",
             positionals: [{ name: "need", description: "The decide item id (need_…)", required: true }],
-            options: { candidates: { type: "string", description: "The candidates Slack returned, comma-separated" } },
+            options: {
+              candidates: { type: "string", description: "The candidates Slack returned, comma-separated (the BB-354 recovery)" },
+              "near-matches": { type: "string", description: "The JSON candidates bb-gate-hooks returned on unknown-user: [{id, name, handle}], for the ask-once question" },
+            },
             async run(input) {
               const candidates = (input.options.candidates ?? "")
                 .split(",")
                 .map((c) => c.trim())
                 .filter((c) => c !== "");
-              const result = reopenWaitSlackNeed(input.positionals.need ?? "", candidates);
+              let nearMatches: SlackCandidate[] | null = null;
+              if (input.options["near-matches"] !== undefined && input.options["near-matches"].trim() !== "") {
+                let parsed: unknown;
+                try {
+                  parsed = JSON.parse(input.options["near-matches"]);
+                } catch {
+                  throw new PluginCliError("--near-matches must be the JSON array bb-gate-hooks returned, [{id, name, handle}].", { code: "bad_near_matches" });
+                }
+                const shape = z.array(z.object({ id: z.string(), name: z.string().default(""), handle: z.string().default("") }).loose());
+                const checked = shape.safeParse(parsed);
+                if (!checked.success) throw new PluginCliError("--near-matches must be the JSON array bb-gate-hooks returned, [{id, name, handle}].", { code: "bad_near_matches" });
+                nearMatches = checked.data.map((m) => ({ id: m.id, name: m.name, handle: m.handle }));
+              }
+              const result = reopenWaitSlackNeed(input.positionals.need ?? "", candidates, nearMatches);
               if (!result.ok) throw new PluginCliError(result.message, { code: "wait_slack_refused" });
               return { exitCode: 0, stdout: result.message };
+            },
+          }),
+
+          "forget-person": cliCommand({
+            summary: "Clear a learned Slack mapping (BB-358)",
+            description: "Remove the Slack user id or the Not on Slack answer this server learned for a GitHub login or Linear user id, so the ask-once question is asked again. `bb stewards show` lists the learned mappings.",
+            positionals: [{ name: "login", description: "The GitHub login or Linear user id whose learned Slack mapping is cleared", required: true }],
+            async run(input) {
+              const raw = (input.positionals.login ?? "").trim();
+              if (raw === "") throw new PluginCliError("Give the GitHub login or Linear user id to forget.", { code: "missing_login" });
+              // The key is `gh:<login>` or `linear:<id>`; accept a bare login or
+              // an already-prefixed key so either spelling clears it.
+              const keys = [raw, `gh:${raw.toLowerCase()}`, `linear:${raw}`];
+              const removed = keys.filter((key) => store.forgetLearnedSlack(key));
+              return { exitCode: 0, stdout: removed.length === 0 ? `No learned Slack mapping for ${raw}.` : `Forgot the learned Slack mapping for ${raw}.` };
             },
           }),
 
@@ -15201,11 +15387,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           show: cliCommand({
-            summary: "One binding in full: status, ready gate, guidance, escalations, workers, action log",
-            positionals: [{ name: "key", description: "The entity key (ENG-12, owner/repo#3) or binding id", required: true }],
+            summary: "One binding in full, or the learned Slack mappings with no key (BB-358)",
+            description: "With a key, one binding in full: status, ready gate, guidance, escalations, workers, action log. With no key, the learned Slack mappings this server holds (GitHub login or Linear user id → Slack user id, or Not on Slack); clear one with `bb stewards forget-person <login>`. No email is ever shown.",
+            positionals: [{ name: "key", description: "The entity key (ENG-12, owner/repo#3) or binding id; omit to list learned Slack mappings", required: false }],
             options: { project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
-              const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
+              const key = (input.positionals.key ?? "").trim();
+              if (key === "") {
+                const learned = [...store.learnedSlack().entries()].sort(([a], [b]) => a.localeCompare(b));
+                if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(learned.map(([personKey, mapping]) => ({ personKey, slackUserId: mapping.kind === "user" ? mapping.slackUserId : null, notOnSlack: mapping.kind === "not-on-slack" }))) };
+                if (learned.length === 0) return { exitCode: 0, stdout: "No learned Slack mappings." };
+                return { exitCode: 0, stdout: ["Learned Slack mappings (clear one with `bb stewards forget-person <login>`):", ...learned.map(([personKey, mapping]) => `  ${personKey} → ${mapping.kind === "user" ? mapping.slackUserId : "Not on Slack"}`)].join("\n") };
+              }
+              const b = bindingOrThrow(key, input.options.project ?? ctx.projectId);
               const config = await loadConfig(b.projectId);
               const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id), assumptions: store.assumptions(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
