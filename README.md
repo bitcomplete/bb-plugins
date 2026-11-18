@@ -4,6 +4,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 
 | Plugin | What it does |
 |---|---|
+| [self-improve](plugins/self-improve) | Finds recurring agent problems, tests possible instructions, and tracks evidence, performance and costs in a learning ledger |
 | [workstreams](plugins/workstreams) | Maps every git checkout you have in flight into a zoomable board of cross-repo efforts |
 | [kubernetes-provider](plugins/kubernetes-provider) | Machine provider that runs each project on its own long-lived pod plus persistent volume in the bb server's namespace |
 | [devbox-provider](plugins/devbox-provider) | Machine provider that creates devboxes in your Incus project on bertha, once you connect devbox |

@@ -3,6 +3,7 @@
   "schemaVersion": 1,
   "name": "bb-plugins",
   "plugins": [
+    { "name": "self-improve", "source": "./plugins/self-improve" },
     { "name": "workstreams", "source": "./plugins/workstreams" },
     { "name": "kubernetes-provider", "source": "./plugins/kubernetes-provider" },
     { "name": "devbox-provider", "source": "./plugins/devbox-provider" },

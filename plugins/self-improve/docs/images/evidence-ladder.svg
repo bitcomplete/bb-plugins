@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="330" viewBox="0 0 1000 330" role="img" aria-labelledby="title desc">
+  <title id="title">Three different levels of evidence</title>
+  <desc id="desc">A proposed solution is a hypothesis. An active solution passed trusted held-out evaluation and was adopted. A proven solution additionally has measured efficacy. Missing or confounded evidence remains pending.</desc>
+  <rect width="1000" height="330" rx="16" fill="#14271f"/>
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+    <text x="36" y="43" fill="#a1b9ab" font-size="11" letter-spacing="1.6">CONFIDENCE IS EARNED IN STAGES</text>
+    <g fill="none" stroke="#50745f" stroke-width="2"><path d="M316 155h32m-8-6 8 6-8 6"/><path d="M648 155h32m-8-6 8 6-8 6"/></g>
+    <g><rect x="35" y="75" width="280" height="166" rx="12" fill="#21392c" stroke="#385542"/><text x="56" y="108" fill="#b6c7bd" font-size="11">PROPOSED</text><text x="56" y="146" fill="#f2f7f1" font-size="22" font-weight="600">An idea to test</text><text x="56" y="179" fill="#b6c7bd" font-size="13">A mechanism, prediction and test plan.</text><text x="56" y="202" fill="#b6c7bd" font-size="13">Expected benefit is still an estimate.</text></g>
+    <g><rect x="360" y="75" width="280" height="166" rx="12" fill="#21392c" stroke="#5d866c"/><text x="381" y="108" fill="#b6c7bd" font-size="11">ACTIVE</text><text x="381" y="146" fill="#f2f7f1" font-size="22" font-weight="600">Tested and adopted</text><text x="381" y="179" fill="#b6c7bd" font-size="13">Trusted held-out proof; wiring retained.</text><text x="381" y="202" fill="#b6c7bd" font-size="13">Long-term effect can remain pending.</text></g>
+    <g><rect x="685" y="75" width="280" height="166" rx="12" fill="#2e6149" stroke="#78ad8e"/><text x="706" y="108" fill="#c7e3d0" font-size="11">PROVEN</text><text x="706" y="146" fill="#f2f7f1" font-size="22" font-weight="600">Improvement seen</text><text x="706" y="179" fill="#c7e3d0" font-size="13">Normalized observations over time.</text><text x="706" y="202" fill="#c7e3d0" font-size="13">Uncertainty stays part of the result.</text></g>
+    <text x="36" y="283" fill="#a1b9ab" font-size="13">Re-tests preserve history. Missing evidence stays unknown. A worse result calls for attention.</text>
+  </g>
+</svg>

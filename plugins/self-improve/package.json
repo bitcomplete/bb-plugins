@@ -1,0 +1,40 @@
+{
+  "name": "bb-plugin-self-improve",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Find recurring agent failures, test possible fixes, and measure what changes.",
+  "engines": { "bb": ">=0.49", "bbPluginSdk": ">=0.6.132" },
+  "bb": {
+    "name": "Self improve",
+    "description": "Evidence-led improvement: problems, experiments, proven solutions and their costs.",
+    "branding": { "icon": "FlaskConical" },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": ["skills"]
+  },
+  "keywords": ["bb-plugin"],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "bb plugin build"
+  },
+  "dependencies": { "fast-xml-parser": "5.12.1", "zod": "4.6.7" },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.132",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.20.5",
+    "@types/react": "19.0.0",
+    "@types/react-dom": "19.0.0",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.2",
+    "better-sqlite3": "13.2.0",
+    "cron-parser": "5.10.3",
+    "hono": "4.13.16",
+    "jsdom": "29.1.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
