@@ -1458,6 +1458,13 @@ export const STEWARDS_SETTINGS = {
     description: "No steward is woken and nothing new is adopted while this is on. Changes still queue up and are delivered when it is turned off.",
     default: false,
   },
+  sweepMinutes: {
+    type: "number",
+    label: "Sweep every N minutes",
+    description:
+      "How often the mechanical sweep runs: the adoption and stuck backstop, and a look at every binding. On a server with a hooks service (BB_HOOKS_URL) doorbells are the fast path and the sweep is the backstop, so the default is 30; on a server without one the sweep is the primary signal and the default is shorter.",
+    default: 30,
+  },
   workerSpawnsPerHour: {
     type: "number",
     label: "Worker spawns per binding per hour",
@@ -1514,9 +1521,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // wake is measured without adding a read of its own.
     const readCounts = createReadCounts();
     const github = countingGithub(deps.github ?? createGhWriter(), () => readCounts.sourceCall());
-    const settings = bb.settings.define(STEWARDS_SETTINGS);
     const fetchImpl = deps.fetch ?? globalThis.fetch;
     const env = deps.env ?? process.env;
+    // With no hooks service the sweep is the primary signal, not the backstop,
+    // so its default is shorter. The setting itself is the same on every
+    // server; only the default differs, and the owner can change it either way.
+    const hooksUrl = env[HOOKS_URL_ENV]?.trim() ?? "";
+    const defaultSweepMinutes = hooksUrl === "" ? 5 : 30;
+    const settings = bb.settings.define({ ...STEWARDS_SETTINGS, sweepMinutes: { ...STEWARDS_SETTINGS.sweepMinutes, default: defaultSweepMinutes } });
+    /** The sweep interval in milliseconds, from the setting, falling back to the server's own default. */
+    async function sweepIntervalMs(): Promise<number> {
+      const value = (await settings.get()).sweepMinutes;
+      const minutes = typeof value === "number" && Number.isFinite(value) && value > 0 ? value : defaultSweepMinutes;
+      return minutes * 60_000;
+    }
 
     // BB-178: the moment this plugin started recording the texts it sends. A
     // turn older than this cannot be told from the owner's own words — the
@@ -6695,7 +6713,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // what a doorbell carries as its unit; an issue lease is the issue id.
     // Without BB_HOOKS_URL, or without a token, nothing is leased and the
     // sweeps carry the watch.
-    const hooksUrl = env[HOOKS_URL_ENV]?.trim() ?? "";
     /** The leases the hooks service refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
     let sentryRefused = new Map<string, string>();
 
@@ -14482,12 +14499,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-253: mute the steward trees that already exist, once.
         await muteStewardThreadsOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time steward mute: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
-        const sweeper = setInterval(() => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`)), timing.sweepMs);
+        // The sweep interval is a setting, so it is re-read each round rather
+        // than fixed at start: changing it in Settings takes effect on the
+        // next cycle without a restart.
+        let sweepTimer: ReturnType<typeof setTimeout> | null = null;
+        let stopping = false;
+        const runSweep = () => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`));
+        const scheduleSweep = () => {
+          void sweepIntervalMs().then((ms) => {
+            if (stopping) return;
+            sweepTimer = setTimeout(() => {
+              runSweep();
+              scheduleSweep();
+            }, ms);
+          });
+        };
+        scheduleSweep();
         // The first sweep tells linear and github what to watch after a restart.
-        void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`));
+        runSweep();
         await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        stopping = true;
         clearInterval(requeue);
-        clearInterval(sweeper);
+        if (sweepTimer !== null) clearTimeout(sweepTimer);
       },
     });
 
@@ -14658,6 +14691,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * The github-watcher poller's health, when it is in polling mode, read
+     * best-effort from its `watches` RPC. Null when github-watcher is not
+     * installed or not loaded; nothing here fails `check`.
+     */
+    async function githubPollerStatus(): Promise<{ starved: boolean; lastError: string | null; nextPollAt: number } | null> {
+      try {
+        const out = await bb.sdk.plugins.callRpc<{ hooks?: { poll?: { starved?: boolean; lastError?: string | null; nextPollAt?: number } | null } | null }>({
+          pluginId: "github-watcher",
+          method: "watches",
+          input: null,
+          outputSchema: z.object({ hooks: z.object({ poll: z.object({ starved: z.boolean(), lastError: z.string().nullable(), nextPollAt: z.number() }).nullish() }).loose().optional() }).loose(),
+        });
+        const poll = out.hooks?.poll;
+        return poll === null || poll === undefined ? null : { starved: poll.starved === true, lastError: poll.lastError ?? null, nextPollAt: poll.nextPollAt ?? 0 };
+      } catch {
+        return null;
+      }
+    }
+
     async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[]; findings: Array<{ level: "warning" | "problem"; text: string }> }> {
       const config = await loadConfig(projectId, true);
       if (config === null) {
@@ -14668,6 +14721,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`), ...config.warnings.map((w) => `warning: ${w}`), ...config.hints];
       if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
+      // The doorbell mode is information, not a problem: a server without a
+      // hooks service is a supported setup, and the sweep is its fast path.
+      const sweepMinutes = Math.max(1, Math.round((await sweepIntervalMs()) / 60_000));
+      if (hooksUrl === "") {
+        lines.push(`doorbells: polling every ${sweepMinutes} minutes (no hooks service configured)`);
+        const poll = await githubPollerStatus();
+        if (poll !== null && poll.starved) lines.push(`warning: github-watcher: the poller is rate-limited (${poll.lastError ?? "backing off"}); GitHub is read again on its own backoff`);
+      } else {
+        lines.push(`doorbells: from the hooks service (BB_HOOKS_URL)`);
+      }
       const linearTicket = config.ticketPlaybooks.linear ?? null;
       const githubTicket = config.ticketPlaybooks.github ?? null;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);

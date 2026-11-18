@@ -28,9 +28,11 @@ is blocked on an issue someone else owns.
 The tool does not read the PR for you; use `gh` for that before and after.
 Watching the same target again is harmless. A thread can watch ten; a
 watch that has not fired in a week is forgotten, so watch again if you
-are still waiting. If the tool answers that watching is not available on
-this server (no `BB_HOOKS_URL`), tell the user you cannot be woken and
-will check when they next send a message; do not poll.
+are still waiting. When the server has a hooks service the wake is a
+webhook, promptly. On a server without one (`BB_HOOKS_URL` unset) the
+plugin polls on its own timer and the tool's answer names the interval;
+a review or a comment is seen within one interval, so still end the turn
+rather than polling with `gh`.
 
 ## Sign your comments
 

@@ -938,8 +938,10 @@ project.
 | `bb stewards digest` | The latest morning digest |
 
 Settings → Plugins → Stewards has **Pause stewards** (no wakes, no adoption),
-the runaway guard (worker spawns per binding per hour), and the context size
-above which a steward is compacted after its turn.
+the runaway guard (worker spawns per binding per hour), **Sweep every N
+minutes** (30 by default with a hooks service; 5 when this server has none,
+because the sweep is then the primary signal), and the context size above
+which a steward is compacted after its turn.
 
 ## When something is wrong
 
@@ -950,9 +952,13 @@ above which a steward is compacted after its turn.
   repos, the `github-issues` ticket playbook parses, and this server's
   GitHub login is an assignee; a labelled pull request must be authored by
   its GitHub login, and a teammate's review requested from it. An
-  unassigned labelled ticket is adopted nowhere. Rings need
-  the hooks service (`BB_HOOKS_URL`); without it, adoption waits for the
-  half-hourly sweep.
+  unassigned labelled ticket is adopted nowhere. Rings arrive through the
+  hooks service (`BB_HOOKS_URL`) when this server has one; without one the
+  github-watcher plugin polls on its own timer, so adoption is a little
+  slower, not impossible. `bb stewards check` prints which mode the server
+  is in and, in polling mode, whether the poller is rate-limited. Slack and
+  Linear `@bb` sessions, and GitHub `workflow_run` failure doorbells, still
+  need the hooks service.
 - **An ops steward never wakes.** `bb stewards list` shows `cannot read the
   target` and `bb stewards check` says why: kubectl on the project's
   machine cannot reach the cluster (not installed, no route to the cluster,

@@ -9391,6 +9391,37 @@ describe("the settings page", () => {
   });
 });
 
+describe("doorbells and polling (BB-363)", () => {
+  it("defaults the sweep interval shorter without a hooks service and 30 minutes with one", async () => {
+    const noHooks = await setup({ env: {} });
+    expect((await noHooks.hooks.settings.get()).sweepMinutes).toBe(5);
+    const withHooks = await setup({ env: { BB_HOOKS_URL: "http://hooks.test:8081" } });
+    expect((await withHooks.hooks.settings.get()).sweepMinutes).toBe(30);
+    // An explicit setting wins over either default.
+    const configured = await setup({ env: {} }, { sweepMinutes: "12" });
+    expect((await configured.hooks.settings.get()).sweepMinutes).toBe(12);
+  });
+
+  it("prints the polling mode as information on a no-hooks server, and the hooks mode with one", async () => {
+    const noHooks = await setup({ env: {} });
+    const check = (await noHooks.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(check.lines).toContain("doorbells: polling every 5 minutes (no hooks service configured)");
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("hook"))).toEqual([]);
+
+    const withHooks = await setup({ env: { BB_HOOKS_URL: "http://hooks.test:8081" } });
+    const hooksCheck = (await withHooks.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(hooksCheck.lines).toContain("doorbells: from the hooks service (BB_HOOKS_URL)");
+  });
+
+  it("reports a starved github-watcher poller as a warning, not a problem", async () => {
+    const t = await setup({ env: {} });
+    t.setGithubPoller({ starved: true, lastError: "GitHub answered HTTP 403", nextPollAt: t.now() + 600_000 });
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(check.lines).toContain("warning: github-watcher: the poller is rate-limited (GitHub answered HTTP 403); GitHub is read again on its own backoff");
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("github-watcher"))).toEqual([]);
+  });
+});
+
 describe("an @bb mention", () => {
   const LINEAR = { experimental_caller: { kind: "plugin", pluginId: SOURCE_PLUGIN_IDS.linear } } as const;
   const mention = (over: Record<string, unknown> = {}) => ({

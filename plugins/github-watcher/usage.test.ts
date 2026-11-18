@@ -52,7 +52,7 @@ describe("buildUsage", () => {
       row("thr-2", "ENG-4", { recentWakes: [NOW - 1000, NOW - 2000, NOW - 3000, NOW - 4000, NOW - 5000], wakes: 5 }),
       row("thr-3", "ENG-5", { createdAt: NOW, lastActivityAt: NOW - WATCH_TTL_MS + 3600_000 }),
     ];
-    const view = buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Fix login"], ["thr-2", null]]), target, interest: none });
+    const view = buildUsage({ rows, hooks: hooks(), configured: true, poll: null, now: NOW, titles: new Map([["thr-1", "Fix login"], ["thr-2", null]]), target, interest: none });
     expect(view.watches.map((w) => [w.target.key, w.flags])).toEqual([
       ["ENG-4", ["noisy"]],
       ["ENG-3", ["idle"]],
@@ -72,7 +72,7 @@ describe("buildUsage", () => {
 
   it("marks a thread near its limit", () => {
     const rows = Array.from({ length: NEAR_LIMIT_AT }, (_, i) => row("thr-1", `ENG-${i}`));
-    const view = buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map(), target, interest: none });
+    const view = buildUsage({ rows, hooks: hooks(), configured: true, poll: null, now: NOW, titles: new Map(), target, interest: none });
     expect(view.threads).toEqual([{ threadId: "thr-1", title: null, count: NEAR_LIMIT_AT, wakes: NEAR_LIMIT_AT, nearLimit: true }]);
   });
 
@@ -91,19 +91,28 @@ describe("buildUsage", () => {
 
 describe("text", () => {
   it("describes the stream in each state", () => {
-    expect(describeHooks({ configured: false, ...hooks() }, NOW)).toContain("BB_HOOKS_URL");
-    expect(describeHooks({ configured: true, ...hooks() }, NOW)).toBe("Doorbells: connected and leased for 3m; 4 doorbells and 6 sweeps in the last 60 min; last sweep 5m (baseline).");
-    expect(describeHooks({ configured: true, ...hooks({ leased: false }) }, NOW)).toContain("leases pending");
-    expect(describeHooks({ configured: true, ...hooks({ state: "connecting", sweeps: 1, lastSweepAt: 0, lastSweepReason: null }) }, NOW)).toBe("Doorbells: reconnecting (checks fall back to a slow sweep) for 3m; 4 doorbells and 1 sweep in the last 60 min; last sweep never.");
-    expect(describeHooks({ configured: true, ...hooks({ state: "stopped" }) }, NOW)).toContain("stopped");
+    expect(describeHooks({ configured: true, poll: null, ...hooks() }, NOW)).toBe("Doorbells: connected and leased for 3m; 4 doorbells and 6 sweeps in the last 60 min; last sweep 5m (baseline).");
+    expect(describeHooks({ configured: true, poll: null, ...hooks({ leased: false }) }, NOW)).toContain("leases pending");
+    expect(describeHooks({ configured: true, poll: null, ...hooks({ state: "connecting", sweeps: 1, lastSweepAt: 0, lastSweepReason: null }) }, NOW)).toBe("Doorbells: reconnecting (checks fall back to a slow sweep) for 3m; 4 doorbells and 1 sweep in the last 60 min; last sweep never.");
+    expect(describeHooks({ configured: true, poll: null, ...hooks({ state: "stopped" }) }, NOW)).toContain("stopped");
+  });
+
+  it("describes polling mode as information, naming the interval, the next poll and a rate limit", () => {
+    const poll = { state: "idle" as const, since: NOW - 60_000, intervalMs: 5 * 60_000, lastPollAt: NOW - 60_000, nextPollAt: NOW + 4 * 60_000, polls: 3, starved: false, lastError: null, backoffUntil: 0 };
+    expect(describeHooks({ configured: false, poll: null, ...hooks() }, NOW)).toBe("Polling: every 5 minutes (no hooks service configured).");
+    expect(describeHooks({ configured: false, poll, ...hooks() }, NOW)).toBe("Polling: every 5 minutes (no hooks service configured); next poll in 4m; last poll 1m ago.");
+    const starved = { ...poll, state: "backoff" as const, starved: true, lastError: "GitHub answered HTTP 403", backoffUntil: NOW + 10 * 60_000, nextPollAt: NOW + 10 * 60_000 };
+    const line = describeHooks({ configured: false, poll: starved, ...hooks() }, NOW);
+    expect(line).toContain("Polling: every 5 minutes (no hooks service configured); rate-limited (GitHub answered HTTP 403)");
+    expect(line).toContain("next poll in 10m");
   });
 
   it("formats the view as a table with the stream line first, and says when there is nothing", () => {
-    const empty = buildUsage({ rows: [], hooks: hooks(), configured: true, now: NOW, titles: new Map(), target, interest: none });
+    const empty = buildUsage({ rows: [], hooks: hooks(), configured: true, poll: null, now: NOW, titles: new Map(), target, interest: none });
     expect(formatUsage(empty).split("\n")).toEqual([describeHooks(empty.hooks, NOW), "Stewards: nothing asked for.", "No thread watches anything."]);
 
     const rows = [row("thr-1", "ENG-1", { recentWakes: [NOW - 1000] }), row("thr-2", "ENG-22", { createdAt: NOW - IDLE_AFTER_MS, lastWokeAt: 0, lastActivityAt: NOW - IDLE_AFTER_MS })];
-    const text = formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Fix login"]]), target, interest: none }));
+    const text = formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, poll: null, now: NOW, titles: new Map([["thr-1", "Fix login"]]), target, interest: none }));
     const lines = text.split("\n");
     expect(lines[2]).toBe("2 watches across 2 threads (limit 10 per thread; a watch idle for 7 days is forgotten).");
     expect(lines.slice(4)).toEqual([
@@ -115,7 +124,7 @@ describe("text", () => {
 
   it("names threads near the limit", () => {
     const rows = Array.from({ length: NEAR_LIMIT_AT }, (_, i) => row("thr-1", `ENG-${i}`));
-    expect(formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Epic"]]), target, interest: none }))).toContain(`Near limit: thread Epic watches ${NEAR_LIMIT_AT} of ${WATCH_LIMIT}.`);
+    expect(formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, poll: null, now: NOW, titles: new Map([["thr-1", "Epic"]]), target, interest: none }))).toContain(`Near limit: thread Epic watches ${NEAR_LIMIT_AT} of ${WATCH_LIMIT}.`);
   });
 
   it("names what stewards leased, at most twenty entities, and what is not leased", () => {
