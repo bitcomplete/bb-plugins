@@ -405,6 +405,7 @@ describe("tools", () => {
       labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
     };
     let createInput: Record<string, unknown> = {};
+    let parentIssue: Record<string, unknown> | null = issue();
     const { harness, linear } = await setup({
       token: "at-0",
       linear: {
@@ -415,6 +416,7 @@ describe("tools", () => {
           }
           if (body.query.startsWith("query($key: String!) { teams")) return { data: { teams: { nodes: body.variables!.key === "ENG" ? [team] : [] }, issueLabels: { nodes: [] } } };
           if (body.query.startsWith("query($who: String!) { users")) return { data: { users: { nodes: [{ id: "u-other", name: "Other", displayName: "Other", email: "other@acme.test", active: true }] } } };
+          if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier labels")) return { data: { issue: parentIssue } };
           return { data: { issue: issue() } };
         },
       },
@@ -442,6 +444,17 @@ describe("tools", () => {
     // A parent issue is resolved and must be in the same team.
     await harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "ENG-123" });
     expect(createInput.parentId).toBe("uuid-1");
+
+    // Every refusal below happens before Linear is asked to file anything.
+    const before = creates();
+    expect(before).toBe(3);
+    await expect(harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "x", description: "Hi\n\n_— from bb thread thr_x_", labels: ["nope"] })).rejects.toThrow(/No label named "nope"/u);
+    await expect(harness.callRpc("sourceCreateIssue", { unit: "NOPE", title: "x", description: "Hi\n\n_— from bb thread thr_x_" })).rejects.toThrow(/No Linear team NOPE/u);
+    parentIssue = null;
+    await expect(harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "x", description: "Hi\n\n_— from bb thread thr_x_", parent: "ENG-999" })).rejects.toThrow(/No Linear issue ENG-999/u);
+    parentIssue = issue({ identifier: "OPS-1", team: { key: "OPS", name: "Ops", states: { nodes: [{ id: "s-ops", name: "Todo", type: "unstarted", position: 0 }] } } });
+    await expect(harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "x", description: "Hi\n\n_— from bb thread thr_x_", parent: "OPS-1" })).rejects.toThrow(/must be filed in OPS/u);
+    expect(creates()).toBe(before);
   });
 
   it("linear_comment signs the comment with the thread and reports the URL", async () => {

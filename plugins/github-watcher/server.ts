@@ -812,9 +812,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       // BB-360: file an issue for the source-neutral ticket tools. The caller
       // has already signed the description with the contract's signature line;
       // an unsigned one is refused here. GitHub issues have no priority, so a
-      // priority is refused; a sub-issue's parent must be in the same
-      // repository; and the assignee is this server's own login or none (no
-      // steward assigns work to anyone else).
+      // priority is refused; a sub-issue's parent must be a same-repository
+      // issue; and the assignee is this server's own login (me, @me or the
+      // viewer) or none, never anyone else.
       async sourceCreateIssue({ unit, title, description, labels, priority, parent, assignee }) {
         if (signedBy(description) === null) throw new Error("an issue description must end with the bb thread signature line; nothing was filed");
         if (priority !== undefined) throw new Error("sourceCreateIssue has no priority on the github source; GitHub issues have no priority");
@@ -823,16 +823,29 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const name = `${repo.owner}/${repo.name}`;
         const viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
         const who = assignee?.trim() ?? "";
-        if (who !== "" && who.toLowerCase() !== viewer.toLowerCase()) throw new Error(`sourceCreateIssue assigns only to this server's own login (${viewer}), not ${JSON.stringify(who)}`);
-        // Resolve the parent before any write, so a bad parent changes nothing.
+        const self = who === "" || who.toLowerCase() === "me" || who.toLowerCase() === "@me" || who.toLowerCase() === `@${viewer.toLowerCase()}` || who.toLowerCase() === viewer.toLowerCase();
+        if (!self) throw new Error(`sourceCreateIssue assigns only to this server's own login (${viewer}), not ${JSON.stringify(who)}`);
+        // Resolve the parent before any write, so a missing or non-issue
+        // parent changes nothing; a sub-issue is linked within one repository.
         const parentRef = parent === undefined ? null : parseRef(parent);
         if (parent !== undefined && parentRef === null) throw new Error(`parent ${JSON.stringify(parent)} is not a GitHub issue key like owner/repo#12`);
         if (parentRef !== null && parentRef.repo.toLowerCase() !== name.toLowerCase()) throw new Error(`a GitHub sub-issue's parent must be in the same repository; ${parent} is not in ${name}`);
+        if (parentRef !== null) {
+          const target = await readTarget(parentRef, checkSignal());
+          if (target === null) throw new Error(`parent ${parent} does not exist, or it is not visible to the signed-in GitHub user`);
+          if (target.kind !== "issue") throw new Error(`parent ${parent} is a pull request, not an issue; a sub-issue must be an issue`);
+        }
         const body: Record<string, unknown> = { title: title.trim(), body: description };
         if (labels.length > 0) body.labels = labels;
         if (who !== "") body.assignees = [viewer];
         const created = parseCreatedIssue(await restWrite(issuesPath(name), body, checkSignal()));
-        if (parentRef !== null) await restWrite(subIssuesPath(name, parentRef.number), { sub_issue_id: created.id }, checkSignal());
+        if (parentRef !== null) {
+          try {
+            await restWrite(subIssuesPath(name, parentRef.number), { sub_issue_id: created.id }, checkSignal());
+          } catch (error) {
+            throw new Error(`filed ${name}#${created.number}${created.url === null ? "" : ` (${created.url})`}, but could not link it under ${parent}: ${errorMessage(error)}`);
+          }
+        }
         return { id: `${name}#${created.number}`, key: `${name}#${created.number}`, url: created.url };
       },
 

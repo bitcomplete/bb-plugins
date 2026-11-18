@@ -486,10 +486,10 @@ export const sourceContract = {
    * the source refuses an unsigned description, so a bug in the caller cannot
    * file an unsigned issue. `priority` is a source capability (Linear's
    * priority; a source with none refuses it), `parent` is the parent issue's
-   * key, and `assignee` names only this server's own login, or none: a source
-   * refuses any other person, because no steward assigns work to someone else.
-   * Additive and optional: a source that does not serve it is unavailable to
-   * the caller.
+   * key, and `assignee` names only this server's own login, or none: `me`
+   * always means the source's own login, and any other person is refused,
+   * because no steward assigns work to someone else. Additive and optional: a
+   * source that does not serve it is unavailable to the caller.
    */
   sourceCreateIssue: {
     input: z.object({
