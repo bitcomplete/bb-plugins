@@ -1291,20 +1291,24 @@ describe("watching an issue", () => {
       await service.done;
     });
 
-    it("rings stewards when only a comment changed", async () => {
+    it("rings stewards when a newer comment arrives on an issue that already had one", async () => {
       const stewards = fakeStewards();
-      let commented = false;
+      let newer = false;
       const s = await setup({
         token: "at-0",
         sdk: { plugins: { callRpc: stewards.callRpc } },
         pollTiming: POLL,
+        kv: {
+          "stewards/interest": { units: ["ENG"], entities: [] },
+          "stewards/interest-cursors": { teams: { ENG: "2026-10-09T09:00:00Z" }, issues: { "uuid-1": { fp: "2026-10-09T10:00:00Z|2026-10-09T09:00:00Z", at: 0 } }, deferred: {} },
+        },
         linear: {
           answer: (body) => {
             if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
             if (body.query.startsWith("query($filter: IssueFilter, $first: Int!, $after: String) { issues(")) {
-              if (!commented) return { data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
-              // The updatedAt does not move; only the latest comment does.
-              return { data: { issues: { nodes: [{ id: "uuid-1", identifier: "ENG-123", updatedAt: "2026-10-09T10:00:00Z", comments: { nodes: [{ createdAt: "2026-10-09T12:00:00Z" }] } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
+              // The updatedAt never moves; the issue already has a comment, and a newer one arrives.
+              const comment = newer ? "2026-10-09T12:00:00Z" : "2026-10-09T09:00:00Z";
+              return { data: { issues: { nodes: [{ id: "uuid-1", identifier: "ENG-123", updatedAt: "2026-10-09T10:00:00Z", comments: { nodes: [{ createdAt: comment }] } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
             }
             return { data: {} };
           },
@@ -1312,11 +1316,10 @@ describe("watching an issue", () => {
       });
       const service = s.harness.runService("watches");
       await tick();
-      expect(await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
-      await tick();
       await tick(3000);
+      // The already-seen comment does not ring.
       expect(stewards.to("stewardsRing")).toEqual([]);
-      commented = true;
+      newer = true;
       s.advance(60_000);
       await tick(60_000);
       await tick(3000);
@@ -1399,6 +1402,41 @@ describe("watching an issue", () => {
       const ids = stewards.to("stewardsRing").map((r) => r.id);
       expect(new Set(ids)).toEqual(new Set(["uuid-a", "uuid-b"]));
       expect(ids).toHaveLength(2);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("advances the cursor on a capped read so the next round continues from there", async () => {
+      const stewards = fakeStewards();
+      const filters: unknown[] = [];
+      const s = await setup({
+        token: "at-0",
+        sdk: { plugins: { callRpc: stewards.callRpc } },
+        pollTiming: POLL,
+        linear: {
+          answer: (body) => {
+            if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
+            if (body.query.startsWith("query($filter: IssueFilter, $first: Int!, $after: String) { issues(")) {
+              filters.push(body.variables!.filter);
+              // Always one more page: the read hits the page cap.
+              return { data: { issues: { nodes: [{ id: "uuid-1", identifier: "ENG-1", updatedAt: "2026-10-09T12:00:00Z", comments: { nodes: [] } }], pageInfo: { hasNextPage: true, endCursor: `c${filters.length}` } } } };
+            }
+            return { data: {} };
+          },
+        },
+      });
+      const service = s.harness.runService("watches");
+      await tick();
+      expect(await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
+      await tick();
+      const cursorOf = (f: unknown) => (f as { or: Array<{ updatedAt: { gt: string } }> }).or[0]!.updatedAt.gt;
+      // The first read is four pages at the original cursor.
+      expect(filters).toHaveLength(4);
+      expect(new Set(filters.map(cursorOf)).size).toBe(1);
+      // The next poll continues from the last updatedAt read, not the original cursor.
+      s.advance(60_000);
+      await tick(60_000);
+      expect(cursorOf(filters[4])).toBe("2026-10-09T12:00:00Z");
       service.controller.abort();
       await service.done;
     });

@@ -1425,10 +1425,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       comments: z.object({ nodes: z.array(pollCommentSchema) }).nullish(),
     });
     type PollIssue = z.infer<typeof pollIssueSchema>;
-    /** Open issues in one team changed after a time, with only what a poll needs. */
-    const POLL_TEAM_QUERY = `query($filter: IssueFilter, $first: Int!, $after: String) { issues(filter: $filter, first: $first, after: $after, orderBy: updatedAt) { nodes { id identifier updatedAt comments(last: 1) { nodes { createdAt } } } pageInfo { hasNextPage endCursor } } }`;
+    /** Open issues in one team changed after a time, oldest first, with only what a poll needs. */
+    const POLL_TEAM_QUERY = `query($filter: IssueFilter, $first: Int!, $after: String) { issues(filter: $filter, first: $first, after: $after, sort: [{ updatedAt: { order: Ascending } }]) { nodes { id identifier updatedAt comments(first: 1) { nodes { createdAt } } } pageInfo { hasNextPage endCursor } } }`;
     /** One issue's id, updatedAt and latest comment, for an issue stewards bound on its own. */
-    const POLL_ISSUE_QUERY = "query($id: String!) { issue(id: $id) { id identifier updatedAt comments(last: 1) { nodes { createdAt } } } }";
+    const POLL_ISSUE_QUERY = "query($id: String!) { issue(id: $id) { id identifier updatedAt comments(first: 1) { nodes { createdAt } } } }";
 
     /** The newest time an issue changed by: its `updatedAt`, or its latest comment. */
     const latestCommentAt = (issue: PollIssue): string => (issue.comments?.nodes ?? []).reduce((a, c) => (c.createdAt !== null && c.createdAt !== undefined && c.createdAt > a ? c.createdAt : a), "");
@@ -1533,6 +1533,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         let pages = 0;
         let complete = false;
         let maxSeen = cursor;
+        let lastUpdated = cursor;
         try {
           do {
             const filter = { team: { key: { eq: key } }, or: [{ updatedAt: { gt: cursor } }, { comments: { some: { createdAt: { gt: cursor } } } }] };
@@ -1543,6 +1544,8 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             for (const issue of parsed.nodes) {
               const at = changedAt(issue);
               if (at > maxSeen) maxSeen = at;
+              const updated = issue.updatedAt ?? "";
+              if (updated > lastUpdated) lastUpdated = updated;
               observe(issue.id.toLowerCase(), fingerprintOf(issue));
             }
             after = parsed.pageInfo?.hasNextPage === true ? (parsed.pageInfo.endCursor ?? null) : null;
@@ -1554,9 +1557,12 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (limited !== null) noteRateLimit(limited.retryAfterMs, limited.message);
           else bb.log.warn(`linear: polling team ${key} failed: ${errorMessage(error)}`);
         }
-        // Only a complete, successful read may move the cursor; anything else
-        // is read again from the same point next round.
+        // Only a complete read may move the cursor to the newest time seen. An
+        // incomplete read (the page cap, or a rate limit) moves it only to the
+        // last `updatedAt` read: the read is oldest-first, so the unread issues
+        // are newer, and a comment-only match can be newer than they are.
         if (complete) next.teams[key] = maxSeen;
+        else if (lastUpdated > cursor) next.teams[key] = lastUpdated;
       }
 
       for (const entity of interest.entities) {
