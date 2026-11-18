@@ -13,7 +13,7 @@ export function resolveSolutionId(solutions: Solution[], id: string): string {
 const ordered = (a: Solution, b: Solution) => a.createdAtMs - b.createdAtMs || compareIds(a.id, b.id);
 const distinct = <T>(values: T[]): T[] => [...new Map(values.map(value => [stableJson(value), value])).entries()].sort(([a], [b]) => compareIds(a,b)).map(([,value]) => value);
 export const candidatePapers = (s: Solution): PaperSource[] => distinct([...(s.sourcePaper ? [s.sourcePaper] : []), ...(s.paperSources ?? [])]);
-const definition = (s: Pick<Solution, "origin" | "sourcePaper" | "mechanism" | "assumptions" | "testPlan" | "prediction">) => ({ origin:s.origin, sourcePaper:s.sourcePaper, mechanism:s.mechanism, assumptions:s.assumptions, testPlan:s.testPlan, prediction:s.prediction });
+const definition = (s: Pick<Solution, "origin" | "sourcePaper" | "mechanism" | "assumptions" | "testPlan" | "prediction" | "portability">) => ({ origin:s.origin, sourcePaper:s.sourcePaper, mechanism:s.mechanism, assumptions:s.assumptions, testPlan:s.testPlan, prediction:s.prediction, ...(s.portability === undefined ? {} : { portability:s.portability }) });
 /** Only merge code constructs these from retained originals; no model/public edit accepts them. */
 export function candidateDerivation(s: Solution): CandidateDerivation | null {
   const proof = s.sourceDerivation;
@@ -90,6 +90,9 @@ export function mergeSolutionCandidates(solutions: Solution[]): Pick<Ledgers, "s
       // Use one independently qualified derivation. Adding an uncertain citation
       // neither invalidates a real invention nor grants a paper an exemption.
       Object.assign(updated, definition(representative));
+      // The selected variant owns the whole declaration. An older undeclared
+      // representative must not inherit requirements from the canonical record.
+      if (representative.portability === undefined) delete updated.portability;
       updated.scores = { fit:null, benefit:null, testability:null, feasibility:null, safety:null, effort:null };
       updated.scoreReasons = { fit:"Merged discovery awaits independent ranking", benefit:"Untested hypothesis", testability:"Merged discovery awaits independent ranking", feasibility:"Merged discovery awaits independent ranking", safety:"Merged discovery awaits independent review", effort:"Merged discovery awaits independent ranking" };
       updated.candidateState = "proposed";

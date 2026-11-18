@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { candidateDerivation, mergeSolutionCandidates, resolveSolutionId } from "../../src/domain/candidates.js";
 import { assertLedgerIntegrity, mergeLedgers } from "../../src/domain/problems.js";
 import { candidateEligibility } from "../../src/domain/solutions.js";
-import type { PaperSource, Solution } from "../../src/domain/types.js";
+import type { PaperSource, PortabilityDeclaration, Solution } from "../../src/domain/types.js";
 import { DAY, NOW, problem, solution } from "./fixtures.js";
 
 function paper(id: string, days = 20): PaperSource {
@@ -178,5 +178,72 @@ describe("evaluated identities and failures", () => {
     expect(candidateEligibility(candidate, [p], [historic], NOW).eligible).toBe(true);
     historic.problemIds = ["old-problem"];
     expect(candidateEligibility(candidate, [p], [historic], NOW).eligible).toBe(false);
+  });
+});
+
+
+function declaration(identity: string): PortabilityDeclaration {
+  return {
+    schemaVersion: 1, status: "unverified", scope: `Scope for ${identity}`, dependencyStatus: "declared",
+    requirements: [{ kind: "skill", identity, versionConstraint: null, setup: `Install ${identity}; version requirements unknown` }],
+    assumptions: [`Assumption for ${identity}`],
+    testProposal: { minimalEnvironment: `Minimal BB plus ${identity}`, packagedArtifact: `Invoke the packaged ${identity} via its declared trigger` },
+    untestedConfigurations: [`Other configurations of ${identity}`],
+  };
+}
+describe("portability belongs to the exact representative derivation", () => {
+  it("keeps absent historical declarations unknown without synthesizing them", () => {
+    const older = draft("older", NOW - 1), later = draft("later");
+    expect(candidateDerivation(older)).not.toHaveProperty("portability");
+    const merged = only(mergeSolutionCandidates([later, older]).solutions);
+    expect(merged).not.toHaveProperty("portability");
+    expect(candidateDerivation(merged)).not.toHaveProperty("portability");
+  });
+
+  it("copies one complete declaration while retaining originals, never unioning requirements", () => {
+    const first = paperDraft("paper", 20, NOW - 1), selected = draft("inventor");
+    first.portability = declaration("paper-skill"); selected.portability = declaration("inventor-skill");
+    const before = structuredClone([first, selected]);
+    const result = mergeSolutionCandidates([first, selected]), merged = only(result.solutions);
+    expect(merged.id).toBe(first.id);
+    expect(merged.portability).toEqual(selected.portability);
+    expect(candidateDerivation(merged)?.portability).toEqual(selected.portability);
+    expect(result.solutionMerges?.[0]?.canonicalBefore.portability).toEqual(first.portability);
+    expect(result.solutionMerges?.[0]?.absorbed.portability).toEqual(selected.portability);
+    expect([first, selected]).toEqual(before);
+  });
+
+  it("clears a declaration when the selected independent representative has no declaration", () => {
+    const canonical = paperDraft("paper", 20, NOW - 1), legacy = draft("legacy-inventor");
+    canonical.portability = declaration("paper-skill");
+    const merged = only(mergeSolutionCandidates([canonical, legacy]).solutions);
+    expect(merged.id).toBe(canonical.id);
+    expect(merged).not.toHaveProperty("portability");
+    expect(candidateDerivation(merged)).toMatchObject({ originalId: legacy.id });
+    expect(candidateDerivation(merged)).not.toHaveProperty("portability");
+  });
+
+  it.each(["scope", "requirements", "assumptions", "testProposal", "untestedConfigurations", "dependencyStatus", "absence"])("invalidates the derivation when %s changes independently", field => {
+    const first = draft("first", NOW - 1), later = draft("later"); first.portability = declaration("first-skill");
+    const merged = only(mergeSolutionCandidates([first, later]).solutions);
+    expect(candidateDerivation(merged)).not.toBeNull();
+    if (field === "absence") delete merged.portability;
+    else if (field === "dependencyStatus") merged.portability!.dependencyStatus = "unknown";
+    else Object.assign(merged.portability!, { [field]: declaration("different-skill")[field as keyof PortabilityDeclaration] });
+    expect(candidateDerivation(merged)).toBeNull();
+  });
+
+  it("cannot graft a declaration onto a historical merged derivation", () => {
+    const merged = only(mergeSolutionCandidates([draft("first", NOW - 1), draft("later")]).solutions);
+    merged.portability = declaration("new-skill");
+    expect(candidateDerivation(merged)).toBeNull();
+  });
+
+  it("preserves an evaluated identity's unknown declaration when absorbing a declared variant", () => {
+    const active = draft("active"), incoming = draft("incoming", NOW - 1);
+    active.status = "active"; incoming.portability = declaration("incoming-skill");
+    const merged = only(mergeSolutionCandidates([active, incoming]).solutions);
+    expect(merged).not.toHaveProperty("portability");
+    expect(candidateDerivation(merged)).not.toHaveProperty("portability");
   });
 });

@@ -50,6 +50,23 @@ export interface CandidateScores {
   fit: number | null; benefit: number | null; testability: number | null;
   feasibility: number | null; safety: number | null; effort: number | null;
 }
+/** An inventor declaration is a hypothesis; absence on a historical record means unknown. */
+export interface PortabilityDeclaration {
+  schemaVersion: 1;
+  status: "unverified";
+  scope: string;
+  dependencyStatus: "declared" | "none-known" | "unknown";
+  requirements: Array<{
+    kind: "capability" | "plugin" | "skill" | "configuration" | "provider" | "environment";
+    identity: string;
+    /** Null means unknown, never an inferred compatibility guarantee. */
+    versionConstraint: string | null;
+    setup: string;
+  }>;
+  assumptions: string[];
+  testProposal: { minimalEnvironment: string; packagedArtifact: string };
+  untestedConfigurations: string[];
+}
 export interface Solution {
   id: string; aliases: string[]; title: string;
   origin: "paper" | "inventor";
@@ -57,6 +74,7 @@ export interface Solution {
   /** Evidence inventory; eligibility uses the selected independent derivation. */
   paperSources?: PaperSource[];
   sourceDerivation?: CandidateDerivation;
+  portability?: PortabilityDeclaration;
   provenance: Array<{ origin: "paper" | "inventor"; sourceId: string; model: ModelIdentity }>;
   problemIds: string[]; directionKey: string; mechanism: string; assumptions: string[]; testPlan: string;
   prediction: Prediction; scores: CandidateScores; scoreReasons: Record<keyof CandidateScores, string>;
@@ -71,6 +89,7 @@ export interface Solution {
 export interface CandidateDerivation {
   originalId: string; originalCreatedAtMs: number; origin: Solution["origin"]; sourcePaper: PaperSource | null; provenance: Solution["provenance"];
   mechanism: string; assumptions: string[]; testPlan: string; prediction: Prediction;
+  portability?: PortabilityDeclaration;
 }
 export interface SolutionMerge { canonicalId: string; canonicalBefore: Solution; absorbed: Solution; reason: "exact-direction-and-canonical-problems" }
 export interface Ledgers { problems: Problem[]; solutions: Solution[]; votes: Vote[]; solutionMerges?: SolutionMerge[]; solutionMergeConflicts?: Array<{ solutionIds: string[]; reason: string }> }
