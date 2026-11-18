@@ -424,9 +424,12 @@ only says so in one sentence and does not re-list anything.
 A blocker is something that would be wrong to merge: a bug, a missing
 piece of the ticket, a failing or missing test for the behaviour, a
 security, data-safety or contract problem. A missing test for behaviour
-the PR adds is a blocker, not an optional suggestion. A suggestion is a
-change you want the author to make in this PR and would not block the
-merge on. Before posting one, apply the test: post it only if you would
+the PR adds is a blocker, not an optional suggestion. A diff that
+introduces a deprecation, a compatibility path, a kept-but-ignored field
+or a TODO with no ticket reference — this ticket when the removal is in
+scope, or the filed follow-up — is a blocker, not a suggestion. A
+suggestion is a change you want the author to make in this PR and would
+not block the merge on. Before posting one, apply the test: post it only if you would
 mark the PR `changes-requested` were it the only finding and the author
 refused it without a reason. A suggestion carrying any of "optional",
 "non-blocking", "pre-existing", "predates this PR", "out of scope",

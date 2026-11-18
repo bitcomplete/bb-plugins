@@ -436,7 +436,11 @@ the PR URL and number, the lane, the approved sha, the merge commit,
 whether the merge stages a restart, and anything still open — a refused
 `bb stewards merge` (with the gate already posted on the PR, per "When the
 merge is refused"), a disputed blocker, a change that still needs applying
-by hand. If something you already saw while merging (a check, a signed
+by hand. List any cleanup the pull request leaves behind — a deprecation, a
+compatibility path, a kept-but-ignored field, a TODO, old-name docs or
+tests, a by-hand step after apply — and say whether it is in this ticket's
+scope or a filed follow-up ticket, naming its key; the steward files any
+that is not. If something you already saw while merging (a check, a signed
 comment, a failed run on the PR page) shows a build failing or hung, add
 one line starting "Build problem:" with the run URL; the steward escalates
 it at once. Do not go looking for it: you still do not watch the release.

@@ -5,6 +5,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { GITHUB_ISSUES, LINEAR_TICKETS } from "./templates.js";
 
 const skill = readFileSync(fileURLToPath(new URL("./skills/pr-reviewer/SKILL.md", import.meta.url)), "utf8");
 
@@ -102,5 +103,49 @@ describe("the shipped stewards skill's by-hand configure step (BB-267)", () => {
     expect(stewardsSkill).toMatch(/never decides it itself/u);
     expect(stewardsSkill).toMatch(/Fail checklist item 5/u);
     expect(stewardsSkill).toMatch(/must be raised again\s+rather than settling/u);
+  });
+});
+
+// BB-357: cleanup a change leaves behind (a field kept for ordering, a compat
+// shim, a flag, a rename's old name, old-name docs/tests, a by-hand step) is
+// scoped at spec time and filed as a ticket, never left as a comment line.
+const cleanupItem = "Anything the change leaves temporary or deprecated has its removal in scope or in a filed ticket named here";
+
+describe("the shipped templates' cleanup checklist item (BB-357)", () => {
+  it("is the last ready-checklist item in both stamped playbooks", () => {
+    for (const template of [LINEAR_TICKETS, GITHUB_ISSUES]) {
+      expect(template).toContain(`${cleanupItem}\n  substantial:`);
+      expect(template.indexOf(cleanupItem)).toBeGreaterThan(template.indexOf("- Out of scope is stated"));
+    }
+  });
+});
+
+describe("the shipped stewards skill's cleanup scoping (BB-357)", () => {
+  it("scopes cleanup at spec time, files the follow-up with blockedBy, and files before Done", () => {
+    expect(stewardsSkill).toContain("Cleanup a change leaves behind is scoped at spec time and filed");
+    expect(stewardsSkill).toMatch(/a field kept\s+for ordering, a compatibility shim, a feature flag, a rename that leaves\s+the old name/u);
+    expect(stewardsSkill).toMatch(/filed now, linked to\s+this one, and named in the spec by key/u);
+    expect(stewardsSkill).toMatch(/without a key fails the ready checklist/u);
+    expect(stewardsSkill).toMatch(/filed straight to Todo \(not\s+Backlog/u);
+    expect(stewardsSkill).toMatch(/`blockedBy`\s+relation on the work it waits for/u);
+    expect(stewardsSkill).toMatch(/Done comment never names unfiled\s+work/u);
+    expect(stewardsSkill).toMatch(/Workers\s+report follow-ups to their steward/u);
+    expect(stewardsSkill).toMatch(/the project's guidance overrides it\)\. "Cleanup"/u);
+  });
+});
+
+describe("the shipped pr-reviewer skill's unreferenced-deprecation blocker (BB-357)", () => {
+  it("blocks a diff that introduces a deprecation, compat path, kept-but-ignored field or TODO with no ticket reference", () => {
+    expect(skill).toMatch(/introduces a deprecation, a compatibility path, a kept-but-ignored field\s+or a TODO with no ticket reference/u);
+    expect(skill).toMatch(/is a blocker, not a suggestion\./u);
+    // The suggestion filter's "follow-up" wording is unchanged.
+    expect(skill).toContain('"follow-up", "harmless"');
+  });
+});
+
+describe("the shipped build-tickets skill's cleanup report (BB-357)", () => {
+  it("asks the worker's final message to list left-behind cleanup and whether its ticket exists", () => {
+    expect(buildTicketsSkill).toMatch(/List any cleanup the pull request leaves behind/u);
+    expect(buildTicketsSkill).toMatch(/in this ticket's\nscope or a filed follow-up ticket, naming its key/u);
   });
 });
