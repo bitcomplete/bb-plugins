@@ -15821,6 +15821,215 @@ describe("the Ask on Slack choice (BB-354)", () => {
   });
 });
 
+// BB-358: the fixed follow-up ladder. Rung 2 is the Slack DM on the owner's
+// click; the ask-once fallback asks who the person is when nothing resolves;
+// rung 3 is the terminal need, filed immediately when the Slack rung is
+// skipped and after a further budget when a DM went unanswered. One DM per
+// person per steward per day.
+describe("the fixed follow-up ladder (BB-358)", () => {
+  const base = { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const };
+  const DAY = 86_400_000;
+  const HOUR = 3_600_000;
+  type World = Awaited<ReturnType<typeof setup>>;
+  const decideNeeds = (t: World, id: string) => t.hooks.store.openNeeds(id).filter((n) => n.kind === "decide" && n.data.waitBudget === true);
+  const terminalNeeds = (t: World, id: string) => decideNeeds(t, id).filter((n) => n.data.waitTerminal === true);
+  const slackOn = (t: World) => t.setSlackStatus({ user: { id: "U1", name: "dylan" }, hooks: { configured: true, connected: true } });
+
+  /** A bound ENG-12 with a review wait on a foreign pull requested from a person. */
+  async function reviewWait(reviewers: string[] = ["arashout"]) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }, { requestedReviewers: reviewers }));
+    const report = await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    expect(report.error).toBe(false);
+    return { t, steward, b: () => t.hooks.store.find("ENG-12")! };
+  }
+
+  /** File the second-budget need for the review wait. */
+  async function secondBudgetNeed(t: World, id: string) {
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    return decideNeeds(t, id)[0]!;
+  }
+
+  it("files the terminal rung after a further budget with no reply", async () => {
+    const { t, b } = await reviewWait();
+    slackOn(t);
+    const need = await secondBudgetNeed(t, b().id);
+    expect(need.data.choices).toContain("Ask on Slack");
+    // The person's label is stored for the ask-once question and the rung-3
+    // wording (blocker 1 of round 1).
+    expect(need.data.waitSlackPersonLabel).toBe("arashout");
+    // The owner picks Ask on Slack and the steward reports the DM opened.
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    const sent = await t.harness.behavior.runCli(["wait-slack-sent", need.id, "--permalink", "https://acme.slack.com/archives/C1/p1"]);
+    expect(sent.exitCode).toBe(0);
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    // A further budget passes with the wait still live and no reply: rung 3.
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const terminal = terminalNeeds(t, b().id);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    expect(terminal[0]!.what).toContain("arashout has not answered on PR #9 or Slack since");
+    expect(terminal[0]!.what).toContain("reach them yourself");
+  });
+
+  it("files the terminal rung immediately when the Slack rung is skipped", async () => {
+    const { t, b } = await reviewWait();
+    slackOn(t);
+    // The owner recorded this person as not on Slack: the Slack rung is
+    // skipped from then on.
+    t.hooks.store.setLearnedSlack("gh:arashout", { kind: "not-on-slack" });
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const needs = decideNeeds(t, b().id);
+    expect(needs).toHaveLength(1);
+    expect(needs[0]!.data.waitTerminal).toBe(true);
+    expect(needs[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    expect(needs[0]!.what).toContain("arashout has not answered on PR #9 or Slack since");
+    expect(needs[0]!.what).toContain("reach them yourself");
+  });
+
+  it("a wait with no person to DM keeps the generic second-budget wording", async () => {
+    // A review wait whose only requested reviewer is the owner has no one to
+    // DM; the need must not claim a Slack attempt or name a phantom person.
+    const { t, b } = await reviewWait(["jane"]);
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const needs = decideNeeds(t, b().id);
+    expect(needs).toHaveLength(1);
+    expect(needs[0]!.what).toBe("The review wait on acme/web#9 is still open after a second budget.");
+    expect(needs[0]!.what).not.toContain("that person");
+    expect(needs[0]!.data.waitTerminal).toBeUndefined();
+  });
+
+  it("caps one DM per person per steward per day and does not block a different steward", async () => {
+    const t = await setup();
+    t.hooks.store.recordSlackDm("b1", "gh:arashout", t.now());
+    expect(t.hooks.store.slackDmSentToday("b1", "gh:arashout")).toBe(true);
+    // A different steward is not blocked, and neither is a different person.
+    expect(t.hooks.store.slackDmSentToday("b2", "gh:arashout")).toBe(false);
+    expect(t.hooks.store.slackDmSentToday("b1", "gh:other")).toBe(false);
+    t.advance(DAY + HOUR);
+    expect(t.hooks.store.slackDmSentToday("b1", "gh:arashout")).toBe(false);
+  });
+
+  it("a DM already sent today sends the next wait on that steward straight to the terminal rung", async () => {
+    // A short budget, so the second wait's second budget lands within the
+    // 24-hour cap window.
+    const t = await setup();
+    const file = JSON.parse(t.files[PROJECT_FILE]!) as Record<string, unknown>;
+    file.waitBudgets = { review: "1h", person: "1h" };
+    t.files[PROJECT_FILE] = JSON.stringify(file);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }, { requestedReviewers: ["arashout"] }));
+    await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#9" } }, steward);
+    slackOn(t);
+    const b = () => t.hooks.store.find("ENG-12")!;
+    // First budget: nudge. Second budget: the Slack offer.
+    t.advance(2 * HOUR + 60_000);
+    await t.hooks.reconcilePass("p1");
+    t.advance(2 * HOUR + 60_000);
+    await t.hooks.reconcilePass("p1");
+    const need = decideNeeds(t, b().id)[0]!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    await t.harness.behavior.runCli(["wait-slack-sent", need.id, "--permalink", "https://acme.slack.com/archives/C1/p1"]);
+    expect(t.hooks.store.slackDmSentToday(b().id, "gh:arashout")).toBe(true);
+    // A new wait on the same steward and person, past its second budget within
+    // the cap window: the Slack rung is skipped and the terminal need is filed.
+    t.entities.set("acme/web#10", pull({ id: "acme/web#10", key: "acme/web#10", url: "https://github.com/acme/web/pull/10", state: "open" }, { requestedReviewers: ["arashout"] }));
+    await t.tool("steward_report", { ...base, waitingOn: "the review", wait: { kind: "review", ref: "acme/web#10" } }, steward);
+    t.advance(2 * HOUR + 60_000);
+    await t.hooks.reconcilePass("p1");
+    t.advance(2 * HOUR + 60_000);
+    await t.hooks.reconcilePass("p1");
+    const terminal = terminalNeeds(t, b().id);
+    expect(terminal).toHaveLength(1);
+  });
+
+  it("the ask-once question carries the near matches and Not on Slack, and the owner's pick records the mapping", async () => {
+    const { t, b } = await reviewWait();
+    slackOn(t);
+    const need = await secondBudgetNeed(t, b().id);
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    // The tool answered unknown-user with one near match.
+    const refused = await t.harness.behavior.runCli(["wait-slack-refused", need.id, "--near-matches", JSON.stringify([{ id: "U9", name: "Arash", handle: "arashout" }])]);
+    expect(refused.exitCode).toBe(0);
+    const askOnce = t.hooks.store.need(need.id)!;
+    expect(askOnce.data.waitStage).toBe("ask-once");
+    expect(askOnce.what).toBe("Who is arashout on Slack?");
+    expect(needChoices(askOnce)).toEqual(["Arash (arashout)", "Not on Slack"]);
+    // The owner picks the near match: the mapping is recorded and the steward
+    // is woken to send to the Slack user id.
+    const picked = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Arash (arashout)" }, { experimental_caller: { kind: "client" } });
+    expect(picked).toMatchObject({ ok: true });
+    await t.flush();
+    expect(t.hooks.store.learnedSlackFor("gh:arashout")).toEqual({ kind: "user", slackUserId: "U9" });
+    expect(t.hooks.store.need(need.id)!.data.waitSlackCandidates).toEqual(["U9"]);
+    await t.harness.behavior.runCli(["wait-slack-sent", need.id, "--permalink", "https://acme.slack.com/archives/C1/p1"]);
+    expect(t.hooks.store.slackDmSentToday(b().id, "gh:arashout")).toBe(true);
+  });
+
+  it("an older hooks names no candidates: the ask-once need has only Not on Slack, and the pick skips the rung", async () => {
+    const { t, b } = await reviewWait();
+    slackOn(t);
+    const need = await secondBudgetNeed(t, b().id);
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
+    await t.flush();
+    // An older bb-gate returns unknown-user with no candidates.
+    const refused = await t.harness.behavior.runCli(["wait-slack-refused", need.id, "--near-matches", "[]"]);
+    expect(refused.exitCode).toBe(0);
+    const askOnce = t.hooks.store.need(need.id)!;
+    expect(needChoices(askOnce)).toEqual(["Not on Slack"]);
+    const picked = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Not on Slack" }, { experimental_caller: { kind: "client" } });
+    expect(picked).toMatchObject({ ok: true });
+    await t.flush();
+    expect(t.hooks.store.learnedSlackFor("gh:arashout")).toEqual({ kind: "not-on-slack" });
+    // The terminal need the Not on Slack pick files names the person.
+    const terminal = terminalNeeds(t, b().id);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]!.what).toContain("arashout has not answered on PR #9 or Slack since");
+    // The Slack rung is skipped from then on: a changed wait goes terminal.
+    await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "review", ref: "acme/web#9" } }, t.spawns[1]!.id);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    expect(terminalNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  it("bb stewards show lists learned mappings and forget-person clears one", async () => {
+    const t = await setup();
+    t.hooks.store.setLearnedSlack("gh:arashout", { kind: "user", slackUserId: "U9" });
+    t.hooks.store.setLearnedSlack("gh:sam", { kind: "not-on-slack" });
+    const shown = await t.harness.behavior.runCli(["show"]);
+    expect(shown.exitCode).toBe(0);
+    expect(shown.stdout).toContain("gh:arashout → U9");
+    expect(shown.stdout).toContain("gh:sam → Not on Slack");
+    expect(shown.stdout).not.toContain("@");
+    const forgot = await t.harness.behavior.runCli(["forget-person", "arashout"]);
+    expect(forgot.exitCode).toBe(0);
+    expect(t.hooks.store.learnedSlackFor("gh:arashout")).toBeNull();
+    const again = await t.harness.behavior.runCli(["show"]);
+    expect(again.stdout).not.toContain("gh:arashout");
+  });
+});
+
 describe("mechanical status and quiet notes (BB-203)", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
   const marker = comment({

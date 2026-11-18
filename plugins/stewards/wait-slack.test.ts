@@ -3,7 +3,23 @@
 // names, and the instruction the owner's click leaves for the steward.
 import { describe, expect, it } from "vitest";
 import { parseRolesFile } from "./roles.js";
-import { slackCanSend, slackNameCandidates, waitSlackInstruction, waitSlackOpener, ASK_ON_SLACK_CHOICE } from "./wait-slack.js";
+import {
+  ASK_ON_SLACK_CHOICE,
+  NOT_ON_SLACK_CHOICE,
+  forgetLearnedSlack,
+  recordSlackNotOnSlack,
+  recordSlackPick,
+  slackCanSend,
+  slackNameCandidates,
+  slackPersonKey,
+  slackPersonNotOnSlack,
+  waitSlackAskOnceChoices,
+  waitSlackAskOnceWhat,
+  waitSlackInstruction,
+  waitSlackOpener,
+  waitSlackTerminalWhat,
+  type LearnedSlackMap,
+} from "./wait-slack.js";
 
 const roles = (json: unknown) => {
   const parsed = parseRolesFile(JSON.stringify(json));
@@ -91,5 +107,76 @@ describe("the opener and the steward instruction (BB-354)", () => {
 
   it("words a person wait as an answer on the ticket", () => {
     expect(waitSlackOpener({ ...context, waitKind: "person", ref: "need_1" })).toContain("an answer on ENG-12");
+  });
+});
+
+// BB-358: the fixed ladder's rung 2 resolves the person first from a learned
+// mapping, then the roles.json `slack` field (the first learned source), then
+// the source's email, then an exact GitHub login or Linear name. A near match
+// never sends; the ask-once question carries the candidates and Not on Slack;
+// the owner's pick records the mapping and Not on Slack skips the rung.
+describe("the fixed follow-up ladder's Slack resolution (BB-358)", () => {
+  const file = roles({
+    version: 2,
+    roles: { ops: {} },
+    holders: { "arashout": { roles: ["ops"], slack: "arashout.slack" } },
+  });
+  const learned = (entries: Array<[string, { kind: "user"; slackUserId: string } | { kind: "not-on-slack" }]>): LearnedSlackMap => new Map(entries);
+
+  it("orders the resolution: learned mapping, then the roles.json field, then the email, then the login, then the name", () => {
+    const person = { githubLogin: "arashout", linearName: "Arash", email: "arash@acme.test" };
+    // The learned mapping wins over the roles field, the email and the names.
+    expect(slackNameCandidates(person, file, learned([["gh:arashout", { kind: "user", slackUserId: "U123" }]]))).toEqual(["U123", "arashout.slack", "arash@acme.test", "arashout", "Arash"]);
+    // The roles field is the first learned source when no mapping was taught.
+    expect(slackNameCandidates(person, file)).toEqual(["arashout.slack", "arash@acme.test", "arashout", "Arash"]);
+    // The email is used when present and nothing learned resolves.
+    expect(slackNameCandidates({ githubLogin: "carol", linearName: null, email: "carol@acme.test" }, null)).toEqual(["carol@acme.test", "carol"]);
+    // Then the exact login, then the Linear name.
+    expect(slackNameCandidates({ githubLogin: "carol", linearName: "Carol Smith" }, null)).toEqual(["carol", "Carol Smith"]);
+  });
+
+  it("keys a learned mapping by the GitHub login, else the Linear user id", () => {
+    expect(slackPersonKey({ githubLogin: "Arashout", linearName: null, linearUserId: "u1" })).toBe("gh:arashout");
+    expect(slackPersonKey({ githubLogin: null, linearName: "Arash", linearUserId: "u1" })).toBe("linear:u1");
+    expect(slackPersonKey({ githubLogin: null, linearName: "Arash" })).toBeNull();
+  });
+
+  it("never turns a near match into a send", () => {
+    // Nothing exact resolves: the near matches are only buttons, never an
+    // automatic send.
+    expect(slackNameCandidates({ githubLogin: null, linearName: null }, null)).toEqual([]);
+    const near = [{ id: "U1", name: "Alex Smith", handle: "alex" }];
+    expect(waitSlackAskOnceChoices(near)).toEqual(["Alex Smith (alex)", NOT_ON_SLACK_CHOICE]);
+    // An older hooks names none: the ask-once need has only Not on Slack.
+    expect(waitSlackAskOnceChoices([])).toEqual([NOT_ON_SLACK_CHOICE]);
+  });
+
+  it("words the ask-once question and the terminal need", () => {
+    expect(waitSlackAskOnceWhat({ githubLogin: "arashout", linearName: null })).toBe("Who is arashout on Slack?");
+    const what = waitSlackTerminalWhat({ githubLogin: "arashout", linearName: null }, "PR #9", Date.parse("2026-11-10T00:00:00Z"));
+    expect(what).toBe("arashout has not answered on PR #9 or Slack since 2026-11-10: reach them yourself");
+    expect(what).not.toContain("assign");
+  });
+
+  it("the owner's pick records the mapping and it wins thereafter", () => {
+    const person = { githubLogin: "arashout", linearName: null };
+    const before: LearnedSlackMap = new Map();
+    const after = recordSlackPick(before, person, "U123");
+    expect(after.get("gh:arashout")).toEqual({ kind: "user", slackUserId: "U123" });
+    expect(slackNameCandidates(person, null, after)[0]).toBe("U123");
+    // The original map is untouched (a pure transition).
+    expect(before.size).toBe(0);
+  });
+
+  it("Not on Slack skips the rung thereafter, and forget-person clears it", () => {
+    const person = { githubLogin: "arashout", linearName: null };
+    const skipped = recordSlackNotOnSlack(new Map(), person);
+    expect(slackPersonNotOnSlack(person, skipped)).toBe(true);
+    // The rung is skipped: no candidates at all, even with a roles field.
+    expect(slackNameCandidates(person, file, skipped)).toEqual([]);
+    // forget-person clears it, so the resolution resumes.
+    const cleared = forgetLearnedSlack(skipped, "gh:arashout");
+    expect(slackPersonNotOnSlack(person, cleared)).toBe(false);
+    expect(slackNameCandidates(person, file, cleared)).toEqual(["arashout.slack", "arashout"]);
   });
 });

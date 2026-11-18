@@ -17,6 +17,7 @@ import { backlogLookSchema, backlogSnapshotSchema, opsLookSchema, type BacklogLo
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 import { alertmanagerLookSchema, type AlertmanagerLook } from "./alertmanager.js";
 import { waitSchema, type Wait } from "./wait.js";
+import type { LearnedSlack } from "./wait-slack.js";
 import { nonActionsSchema, nonActionDay, nonActionText, type NonActionCode, type NonActions } from "./non-actions.js";
 import { backlogWriteSchema, type BacklogWrite } from "./backlog-triage.js";
 import type { GuidanceCitation } from "./guidance.js";
@@ -858,7 +859,29 @@ export const WAIT_BUDGET_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait_sin
 // rest of the wait clock.
 export const WAIT_SLACK_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN wait_slacked_at INTEGER`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS];
+// BB-358: what this server learned about a person's Slack identity from the
+// owner's answer to the ask-once question — the Slack user id for a GitHub
+// login or a Linear user id, or that the person is not on Slack — and the DM
+// log the per-person-per-steward-per-day cap reads. Additive and server-wide:
+// a store from before this step has no mappings and no DMs, so the ladder
+// asks once. No email is ever written here; the key is the login or the Linear
+// user id and the value is a Slack user id.
+export const LEARNED_SLACK_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS learned_slack (
+     person_key TEXT PRIMARY KEY,
+     slack_user_id TEXT,
+     not_on_slack INTEGER NOT NULL DEFAULT 0,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS slack_dms (
+     binding_id TEXT NOT NULL,
+     person_key TEXT NOT NULL,
+     sent_at INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS slack_dms_person_day ON slack_dms (binding_id, person_key, sent_at DESC)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -2840,6 +2863,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
     return confirmed;
   }
 
+  // BB-358: the learned Slack mappings and the DM log. The mapping is keyed by
+  // the GitHub login or Linear user id; the value is a Slack user id or the
+  // `not_on_slack` flag. No email is written. The DM log is the per-person,
+  // per-steward, per-day cap. A store built before this step has neither
+  // table (the migration tests build one at an earlier point), so the
+  // statements are prepared only when the table is there; the methods then
+  // read as no mappings and no DMs, exactly as a pre-migration build would.
+  const hasLearnedSlack = db.prepare("SELECT 1 AS one FROM sqlite_master WHERE type = 'table' AND name = 'learned_slack'").get() !== undefined;
+  const learnedSlackAll = hasLearnedSlack ? db.prepare<[], { person_key: string; slack_user_id: string | null; not_on_slack: number }>("SELECT person_key, slack_user_id, not_on_slack FROM learned_slack") : null;
+  const learnedSlackOne = hasLearnedSlack ? db.prepare<[string], { person_key: string; slack_user_id: string | null; not_on_slack: number }>("SELECT person_key, slack_user_id, not_on_slack FROM learned_slack WHERE person_key = ?") : null;
+  const learnedSlackUpsert = hasLearnedSlack ? db.prepare<[string, string | null, number, number]>("INSERT INTO learned_slack (person_key, slack_user_id, not_on_slack, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(person_key) DO UPDATE SET slack_user_id = excluded.slack_user_id, not_on_slack = excluded.not_on_slack, updated_at = excluded.updated_at") : null;
+  const learnedSlackDelete = hasLearnedSlack ? db.prepare<[string]>("DELETE FROM learned_slack WHERE person_key = ?") : null;
+  const insertSlackDm = hasLearnedSlack ? db.prepare<[string, string, number]>("INSERT INTO slack_dms (binding_id, person_key, sent_at) VALUES (?, ?, ?)") : null;
+  const countSlackDm = hasLearnedSlack ? db.prepare<[string, string, number], { n: number }>("SELECT COUNT(*) AS n FROM slack_dms WHERE binding_id = ? AND person_key = ? AND sent_at >= ?") : null;
+
   return {
     /** Run a synchronous handler as one operation, publishing at most one signal per project (BB-90). */
     coalescing,
@@ -4000,6 +4038,41 @@ export function createStore(db: Database.Database, now: () => number, options: S
      */
     recordNonAction(bindingId: string, code: NonActionCode, detail: string | null = null, at = now()): void {
       mergeNonAction(bindingId, code, detail, at);
+    },
+    // ---- learned Slack mappings (BB-358) ----
+    /** Every learned mapping on this server, keyed by `slackPersonKey`. No email is stored. */
+    learnedSlack(): Map<string, LearnedSlack> {
+      const out = new Map<string, LearnedSlack>();
+      if (learnedSlackAll === null) return out;
+      for (const row of learnedSlackAll.all()) {
+        out.set(String(row.person_key), Number(row.not_on_slack) === 1 ? { kind: "not-on-slack" } : { kind: "user", slackUserId: String(row.slack_user_id ?? "") });
+      }
+      return out;
+    },
+    /** One learned mapping, or null. */
+    learnedSlackFor(personKey: string): LearnedSlack | null {
+      if (learnedSlackOne === null) return null;
+      const row = learnedSlackOne.get(personKey);
+      if (row === undefined) return null;
+      return Number(row.not_on_slack) === 1 ? { kind: "not-on-slack" } : { kind: "user", slackUserId: String(row.slack_user_id ?? "") };
+    },
+    /** Record the owner's answer: a Slack user id, or that the person is not on Slack. */
+    setLearnedSlack(personKey: string, mapping: LearnedSlack): void {
+      if (learnedSlackUpsert === null) return;
+      learnedSlackUpsert.run(personKey, mapping.kind === "user" ? mapping.slackUserId : null, mapping.kind === "not-on-slack" ? 1 : 0, now());
+    },
+    /** Clear one learned mapping. True when a row was removed. */
+    forgetLearnedSlack(personKey: string): boolean {
+      return learnedSlackDelete === null ? false : learnedSlackDelete.run(personKey).changes > 0;
+    },
+    /** Record one DM sent to a person by a binding's steward, for the per-day cap. */
+    recordSlackDm(bindingId: string, personKey: string, at = now()): void {
+      insertSlackDm?.run(bindingId, personKey, at);
+    },
+    /** Whether this steward already sent this person a DM in the last 24 hours. */
+    slackDmSentToday(bindingId: string, personKey: string, at = now()): boolean {
+      if (countSlackDm === null) return false;
+      return (countSlackDm.get(bindingId, personKey, at - 86_400_000)?.n ?? 0) > 0;
     },
     /** The latest shadow assessment for a binding, or null. */
     assessment(bindingId: string): AssessmentRow | null {
