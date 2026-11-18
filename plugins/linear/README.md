@@ -228,7 +228,15 @@ rate); doorbell and sweep counts are in memory and start over when the
 server does.
 
 `BB_HOOKS_URL` is the address of the hooks service. It is read from the
-server's environment only; there is no setting. Set, it is doorbells:
+server's environment only; there is no setting. When the service is
+configured with a subscriber bearer token, set `BB_HOOKS_TOKEN` beside it:
+every subscriber request — the stream, `/v1/subscribe`, `/v1/identify` and
+the Linear reply — carries `Authorization: Bearer <token>`, and with it
+unset no header is sent, which is what a namespace-isolated deployment
+wants. The wire contract is
+[hooks-service/docs/hooks.md](https://github.com/bitcomplete/bb-plugins/blob/main/hooks-service/docs/hooks.md).
+
+Set, it is doorbells:
 `linear_watch_issue` leases the issue and the plugin is woken when Linear
 says it changed. Unset, it is polling: a plain timer re-checks every watch
 and polls the teams and issues stewards asked about (five minutes by
@@ -315,6 +323,7 @@ works, through the poller's re-check or the baseline re-check while leased.
 |---|---|
 | `LINEAR_CLIENT_ID` | Default for `clientId`. |
 | `BB_HOOKS_URL` | Where the hooks service listens for subscribers. With it, watches use doorbells; without it, the plugin polls. |
+| `BB_HOOKS_TOKEN` | The subscriber bearer token, when the hooks service requires one. Sent as `Authorization: Bearer` on every subscriber request; unset sends none. |
 
 ## Development
 

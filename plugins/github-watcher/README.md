@@ -146,7 +146,11 @@ a change to one belongs in the other.
 
 `BB_HOOKS_URL` is the address of the hooks service. It is read from the
 server's environment only; there is no setting. With it, `github_watch`
-leases the target on the hooks service and is woken by a doorbell.
+leases the target on the hooks service and is woken by a doorbell. When the
+service is configured with a subscriber bearer token, set `BB_HOOKS_TOKEN`
+beside it: every subscriber request carries `Authorization: Bearer <token>`,
+and with it unset none is sent. The wire contract is
+[hooks-service/docs/hooks.md](https://github.com/bitcomplete/bb-plugins/blob/main/hooks-service/docs/hooks.md).
 
 Without it the plugin runs in **polling mode**: `github_watch` still
 succeeds, and a plain timer (`poller.ts`, five minutes by default)
@@ -160,7 +164,9 @@ settings page. Polling needs no hooks service and no new credential: it
 uses the same `gh` login.
 
 The webhook itself is configured once per GitHub organization, by hand,
-in the hooks service; the hooks contract has the steps and the event list.
+in the hooks service; the [hooks
+contract](https://github.com/bitcomplete/bb-plugins/blob/main/hooks-service/docs/hooks.md)
+has the steps and the event list.
 
 ## Development
 

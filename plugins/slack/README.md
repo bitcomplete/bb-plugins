@@ -100,6 +100,14 @@ RPC.
 | Sign in with Slack / Sign out | The developer's own Slack sign-in. The token it returns proves who they are and reads the channel list they can see. |
 | Routing map | A pinned first row, **Everything else**, then a row per channel. A mention in a mapped channel starts its thread in that channel's project; everything else, DMs included, starts in the project on the first row. The channel is a Slack channel id (`C…`/`G…`), never a name, so renaming a channel does not move its entry. The editor refuses to save without a fallback. A fallback or row naming a project this server does not have is skipped at run time — the conversation falls to the personal project, or the first one — and the page warns beside the row, since one map is meant to work on every server. A row whose project has no checkout or environment on a connected machine is warned about too: its thread runs on whichever connected machine is available, which may not have the project. |
 
+The two environment variables are read from the server's environment only:
+`BB_HOOKS_URL` is the address of the hooks service, and `BB_HOOKS_TOKEN` is
+the subscriber bearer token it checks when it is configured. With
+`BB_HOOKS_TOKEN` set every subscriber request carries
+`Authorization: Bearer <token>`; with it unset none is sent. The wire
+contract is
+[hooks-service/docs/hooks.md](https://github.com/bitcomplete/bb-plugins/blob/main/hooks-service/docs/hooks.md).
+
 The channel typeahead calls Slack's `conversations.list` directly with the
 stored user token, paginated and cached in memory for a few minutes per
 server; filtering by name is local. A still-valid OpenID token from a sign-in

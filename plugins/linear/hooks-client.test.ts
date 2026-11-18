@@ -4,6 +4,11 @@ import { createHooksLoop, HooksRequestError, postActivity, readSse, SseParser, S
 const BASE = "http://hooks.test:8081";
 const MINUTE = 60_000;
 
+// No test may leak a subscriber token into the next one.
+afterEach(() => {
+  delete process.env.BB_HOOKS_TOKEN;
+});
+
 // A the hooks service whose stream and subscribe endpoint a test drives.
 function fakeHooks() {
   const encoder = new TextEncoder();
@@ -12,6 +17,7 @@ function fakeHooks() {
   const subscribes: Array<{ connection: string; source: string; token: string; watches: Array<{ kind: string; id: string }> }> = [];
   const identifies: Array<{ connection: string; source: string; token: string; teams: string[] }> = [];
   const replies: Array<{ url: string; body: Record<string, unknown>; headers: Record<string, string> }> = [];
+  const requests: Array<{ url: string; headers: Record<string, string> }> = [];
   const state = {
     eventsStatus: 200,
     silent: false,
@@ -22,6 +28,7 @@ function fakeHooks() {
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
+    requests.push({ url: u, headers: { ...(init?.headers as Record<string, string>) } });
     if (u === `${BASE}/v1/events`) {
       if (state.eventsStatus !== 200) return new Response("", { status: state.eventsStatus });
       let controller!: ReadableStreamDefaultController<Uint8Array>;
@@ -85,7 +92,7 @@ function fakeHooks() {
       at: "2026-10-10T17:02:11Z",
       ...over,
     })}\n\n`;
-  return { fetchImpl, streams, subscribes, identifies, replies, state, hello, doorbell, session, last: () => streams.at(-1)! };
+  return { fetchImpl, streams, subscribes, identifies, replies, requests, state, hello, doorbell, session, last: () => streams.at(-1)! };
 }
 
 describe("SSE parsing", () => {
@@ -172,6 +179,16 @@ describe("subscribe", () => {
     expect((error as Error).message + (error as HooksRequestError).body).not.toContain("tok-secret");
     expect(new HooksRequestError("x", 404, "not found").unknownConnection).toBe(false);
     expect(new HooksRequestError("x", 200, JSON.stringify({ error: "unknown-connection" })).unknownConnection).toBe(false);
+  });
+
+  it("adds the BB_HOOKS_TOKEN bearer when it is set, and sends nothing when it is not", async () => {
+    const hooks = fakeHooks();
+    const signal = new AbortController().signal;
+    await subscribe(hooks.fetchImpl, BASE, "c_1", "tok-1", [{ kind: "issue", id: "i" }], signal);
+    expect(hooks.requests[0]!.headers).not.toHaveProperty("authorization");
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    await subscribe(hooks.fetchImpl, BASE, "c_1", "tok-1", [{ kind: "issue", id: "i" }], signal);
+    expect(hooks.requests[1]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
   });
 });
 
@@ -265,6 +282,21 @@ describe("the loop", () => {
     s.controller.abort();
     await s.done;
     expect(hooks.last().closed).toBe(true);
+  });
+
+  it("sends BB_HOOKS_TOKEN on the stream, subscribe and identify when it is set", async () => {
+    const hooks = fakeHooks();
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    const s = start(hooks, { identity: () => ({ teams: ["t-1"] }) });
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    const auth = (url: string) => hooks.requests.find((r) => r.url === url)?.headers;
+    expect(auth(`${BASE}/v1/events`)).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(auth(`${BASE}/v1/subscribe`)).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(auth(`${BASE}/v1/identify`)).toMatchObject({ authorization: "Bearer hooks-secret" });
+    s.controller.abort();
+    await s.done;
   });
 
   it("renews at half the lease with whatever token it holds, and sweeps after a failed or late renewal", async () => {
@@ -627,5 +659,12 @@ describe("postActivity", () => {
     const hooks = fakeHooks();
     await postActivity(hooks.fetchImpl, BASE, "c_1", "sess-1", { kind: "error", body: "No." }, new AbortController().signal);
     expect(hooks.replies[0]!.body).toEqual({ connection: "c_1", kind: "error", body: "No." });
+  });
+
+  it("carries the BB_HOOKS_TOKEN bearer when it is set", async () => {
+    const hooks = fakeHooks();
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    await postActivity(hooks.fetchImpl, BASE, "c_1", "sess-1", { kind: "error", body: "No." }, new AbortController().signal);
+    expect(hooks.replies[0]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
   });
 });

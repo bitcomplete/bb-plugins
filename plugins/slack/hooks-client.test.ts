@@ -1,7 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
-import { createHooksLoop, HooksRequestError, SseParser, sessionEventSchema, startConversation, subscribe } from "./hooks-client.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHooksLoop, fetchBotChannels, fetchSessionFile, HooksRequestError, SseParser, sessionEventSchema, startConversation, subscribe } from "./hooks-client.js";
 
 const BASE = "http://hooks.test:8081";
+
+// No test may leak a subscriber token into the next one.
+afterEach(() => {
+  delete process.env.BB_HOOKS_TOKEN;
+});
 
 describe("SseParser", () => {
   it("joins data lines and dispatches on a blank line", () => {
@@ -205,6 +210,36 @@ describe("subscribe", () => {
     expect(error).toBeInstanceOf(HooksRequestError);
     expect(String((error as Error).message)).not.toContain("cap-secret");
   });
+
+  it("adds the BB_HOOKS_TOKEN bearer when it is set, and sends nothing when it is not", async () => {
+    const headers: Array<Record<string, string>> = [];
+    const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit): Promise<Response> => {
+      headers.push({ ...(init?.headers as Record<string, string>) });
+      return Response.json({ leases: [], rejected: [] });
+    }) as unknown as typeof fetch;
+    const signal = new AbortController().signal;
+    const leases = [{ kind: "session" as const, id: "D1:1", capability: "cap" }];
+    await subscribe(fetchImpl, BASE, "c_1", leases, signal);
+    expect(headers[0]).not.toHaveProperty("authorization");
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    await subscribe(fetchImpl, BASE, "c_1", leases, signal);
+    expect(headers[1]).toMatchObject({ authorization: "Bearer hooks-secret" });
+  });
+
+  it("carries the BB_HOOKS_TOKEN bearer on the bot channel list and the file fetch when it is set", async () => {
+    const requests: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      const u = String(url);
+      requests.push({ url: u, headers: { ...(init?.headers as Record<string, string>) } });
+      if (u === `${BASE}/v1/slack/bot/channels`) return Response.json({ channels: ["C1"] });
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } });
+    }) as unknown as typeof fetch;
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    await fetchBotChannels(fetchImpl, BASE, AbortSignal.timeout(1000));
+    await fetchSessionFile(fetchImpl, BASE, "c_1", "D1:1", "F1", AbortSignal.timeout(1000));
+    expect(requests[0]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(requests[1]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
+  });
 });
 
 describe("startConversation", () => {
@@ -328,6 +363,55 @@ describe("createHooksLoop", () => {
     expect(subscribes[0]).toEqual({ connection: "c_1", source: "slack", watches: [{ kind: "session", id: "D1:1", capability: "cap-secret" }] });
     expect(rejected).toEqual([[{ kind: "session", id: "D1:1", reason: "owned" }]]);
     expect(logs.join("\n")).not.toContain("cap-secret");
+    abort.abort();
+    await running;
+  });
+
+  it("sends BB_HOOKS_TOKEN on the stream, identify, subscribe and the Slack routes when it is set", async () => {
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let streamReady!: () => void;
+    const ready = new Promise<void>((resolve) => (streamReady = resolve));
+    const requests: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      const u = String(url);
+      requests.push({ url: u, headers: { ...(init?.headers as Record<string, string>) } });
+      if (u === `${BASE}/v1/events`) {
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            controller = c;
+            streamReady();
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (u === `${BASE}/v1/identify`) return Response.json({ user: { id: "U1", name: "Alice" }, teams: [], rejected: [] });
+      if (u === `${BASE}/v1/subscribe`) return Response.json({ leases: [], rejected: [] });
+      return Response.json({ ok: true });
+    }) as unknown as typeof fetch;
+    const loop = createHooksLoop({
+      fetch: fetchImpl,
+      baseUrl: BASE,
+      now: () => 1,
+      log: { info: () => undefined, warn: () => undefined },
+      identity: () => "tok",
+      leases: () => [{ kind: "session", id: "D1:1", capability: "cap" }],
+      onSession: () => undefined,
+    });
+    const abort = new AbortController();
+    const running = loop.run(abort.signal);
+    await ready;
+    controller.enqueue(encoder.encode(`event: hello\ndata: ${JSON.stringify({ connection: "c_1", leaseSeconds: 3600 })}\n\n`));
+    await vi.waitFor(() => expect(requests.filter((r) => r.url === `${BASE}/v1/subscribe`)).toHaveLength(1));
+    await vi.waitFor(() => expect(requests.filter((r) => r.url === `${BASE}/v1/identify`)).toHaveLength(1));
+    // A Slack route carries it too: the service checks every request on the listener.
+    await loop.ephemeral({ channel: "D1", user: "U1", text: "hi" }, AbortSignal.timeout(1000));
+    const auth = (url: string) => requests.find((r) => r.url === url)?.headers;
+    expect(auth(`${BASE}/v1/events`)).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(auth(`${BASE}/v1/identify`)).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(auth(`${BASE}/v1/subscribe`)).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(auth(`${BASE}/v1/slack/ephemeral`)).toMatchObject({ authorization: "Bearer hooks-secret" });
     abort.abort();
     await running;
   });
