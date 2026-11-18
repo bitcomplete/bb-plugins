@@ -3516,10 +3516,13 @@ describe("a GitHub issue ticket steward (BB-234)", () => {
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
     // No github-issues file: linear-tickets is the only ticket playbook, and
     // an existing project like this must keep passing check (BB-234 review).
+    // BB-362: with no linear.teams the project does not list Linear, so the
+    // ticket line names only the sources it does list (local here).
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.exitCode).toBe(0);
     expect(check.stdout).not.toMatch(/problem:/u);
-    expect(check.stdout).toMatch(/ticket: linear-tickets@/u);
+    expect(check.stdout).toMatch(/ticket: local-tickets@/u);
+    expect(check.stdout).not.toMatch(/linear-tickets@/u);
     expect(check.stdout).not.toMatch(/github-issues\.md does not exist/u);
   });
 
@@ -9863,7 +9866,7 @@ describe("ops stewards", () => {
     expect(first).toMatch(/### New: no ticket yet/u);
     expect(first).toMatch(/New \(no ticket found\)/u);
     expect(first).toMatch(/Dedup unavailable/u);
-    expect(first).toMatch(/linear_search/u);
+    expect(first).toMatch(/ticket_search/u);
     expect(first).toMatch(/Assignee: Jane/u);
     expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: null });
   });
@@ -10666,18 +10669,17 @@ describe("GitHub filing targets (BB-235)", () => {
     const { wakes } = await opsWatched();
     const first = wakes()[0]!;
     expect(first).toMatch(/^# Ops watch: k8s-namespace\/web-production/u);
-    expect(first).toMatch(/File issues in the GitHub repo acme\/web with `gh issue create`/u);
-    expect(first).toMatch(/Assign every issue you file to this server's GitHub login, Jane/u);
-    expect(first).toMatch(/pass `--assignee Jane` to `gh issue create`/u);
-    expect(first).toMatch(/Sign every `gh` body by hand/u);
-    expect(first).not.toMatch(/linear_create_issue/u);
+    expect(first).toMatch(/File issues in the GitHub repo acme\/web with ticket_file/u);
+    expect(first).toMatch(/Assign every ticket you file to this server's owner, Jane/u);
+    expect(first).toMatch(/pass assignee: "me" to ticket_file/u);
+    expect(first).not.toMatch(/gh issue create|linear_create_issue/u);
   });
 
   it("files unassigned when the GitHub login cannot be read, never guessing", async () => {
     const { wakes } = await opsWatched({ githubLogin: null });
     const first = wakes()[0]!;
-    expect(first).toMatch(/This server's GitHub login could not be read, so file every issue unassigned; never guess an assignee/u);
-    expect(first).not.toMatch(/Assign every issue you file to this server's GitHub login/u);
+    expect(first).toMatch(/This server's login for the filing source could not be read, so file every ticket unassigned; never guess an assignee/u);
+    expect(first).not.toMatch(/Assign every ticket you file to this server's owner/u);
   });
 
   it("adopts an unmapped fingerprint from an open GitHub issue with the exact Fingerprint line, through the github search", async () => {
@@ -10717,7 +10719,7 @@ describe("GitHub filing targets (BB-235)", () => {
   it("tells the steward to add the project, status and priority labels for an autoAdopt severity on GitHub", async () => {
     const { wakes } = await depsWatched([alert({ number: 4, severity: "critical", ghsaId: "GHSA-crit" })]);
     const first = wakes()[0]!;
-    expect(first).toMatch(/File issues in the GitHub repo acme\/web with `gh issue create`/u);
+    expect(first).toMatch(/File issues in the GitHub repo acme\/web with ticket_file/u);
     expect(first).toMatch(/add the labels `bb-managed`, `status:todo` and `priority:<level>` \(the priority the alert is filed at\)/u);
   });
 
@@ -18349,5 +18351,128 @@ describe("the source-neutral ticket tools (BB-360)", () => {
     await t.flush();
     const after = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!;
     expect((after.input as { entities: string[] }).entities).not.toContain("acme/web#3");
+  });
+});
+
+// BB-362: a project with no Linear must run clean. No Linear warning, no
+// Linear in `check` or the digest, the backlog role named Linear-only, and the
+// unassigned list fanned out over every configured source.
+describe("no-Linear projects (BB-362)", () => {
+  it("never calls or warns about the linear source for a project with no Linear teams, even when the plugin is missing", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } }, {}, undefined, undefined, (w) => {
+      w.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+      delete w.files[playbookPath("linear-tickets")];
+      w.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+      w.viewers.linear = null;
+    });
+    let linearInterest = 0;
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear") {
+        if (args.method === "sourceSetInterest") linearInterest++;
+        throw Object.assign(new Error("plugin linear is not installed"), { status: 404 });
+      }
+      return original(args);
+    });
+    // A full reconcile and the nightly pass both push the interest set.
+    await t.hooks.sweep();
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    expect(linearInterest).toBe(0);
+    const warns = t.harness.logEntries.filter((e) => e.level === "warn" && /linear/i.test(e.message));
+    expect(warns).toEqual([]);
+  });
+
+  it("records a missing linear plugin so interest is not retried on every pass", async () => {
+    const t = await setup();
+    let calls = 0;
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear" && args.method === "sourceSetInterest") {
+        calls++;
+        throw Object.assign(new Error("plugin linear is not installed"), { status: 404 });
+      }
+      return original(args);
+    });
+    await t.hooks.sweep();
+    await t.flush();
+    const afterFirst = calls;
+    expect(afterFirst).toBeGreaterThan(0);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(calls).toBe(afterFirst);
+    expect(t.harness.logEntries.some((e) => e.level === "warn" && /linear/i.test(e.message))).toBe(false);
+  });
+
+  it("names no Linear in check or the digest on a GitHub-only project", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    delete t.files[playbookPath("linear-tickets")];
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { projectSteward: true } } });
+    t.viewers.linear = null;
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/linear/i);
+    await t.hooks.sweep();
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).not.toMatch(/linear/i);
+    await t.idle(project, "All quiet.");
+    const digest = await t.harness.behavior.runCli(["digest", "--project", "p1"]);
+    expect(digest.stdout).not.toMatch(/linear/i);
+  });
+
+  it("names no Linear in check or the digest on a local-only project", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    delete t.files[playbookPath("linear-tickets")];
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { projectSteward: true } } });
+    t.viewers.linear = null;
+    t.repos.splice(0);
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).not.toMatch(/linear/i);
+    await t.hooks.sweep();
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).not.toMatch(/linear/i);
+    // The local source has no assignee concept, so it renders no unassigned list.
+    expect(wake).not.toMatch(/labelled, no assignee/u);
+    await t.idle(project, "All quiet.");
+    const digest = await t.harness.behavior.runCli(["digest", "--project", "p1"]);
+    expect(digest.stdout).not.toMatch(/linear/i);
+  });
+
+  it("lists an unassigned labelled GitHub issue in the digest, naming GitHub", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    delete t.files[playbookPath("linear-tickets")];
+    t.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+    t.files[ROLES_FILE] = JSON.stringify({ version: 1, roles: { jane: { projectSteward: true } } });
+    t.viewers.linear = null;
+    t.entities.set("acme/web#9", githubIssue({ id: "acme/web#9", key: "acme/web#9", labels: ["bb-managed"], assignees: [] }));
+    await t.hooks.sweep();
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).toMatch(/labelled, no assignee: acme\/web#9/u);
+    expect(wake).toMatch(/Assign it in GitHub/u);
+    expect(wake).not.toMatch(/linear/i);
+  });
+
+  it("reports the backlog role as Linear-only on a project with no Linear team", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: {} });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/backlog needs a Linear team; the backlog role is Linear-only/u);
   });
 });

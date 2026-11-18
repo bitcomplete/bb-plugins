@@ -162,3 +162,12 @@ describe("the shipped build-tickets skill's cleanup report (BB-357)", () => {
     expect(buildTicketsSkill).toMatch(/in this ticket's\nscope or a filed follow-up ticket, naming its key/u);
   });
 });
+
+// BB-362: a local-only project has no label, so the onboarding skill asks
+// about `bb-managed` only when a label-based source is in use.
+describe("the onboarding skill's label question (BB-362)", () => {
+  it("asks about the label only when the project lists a Linear team or a GitHub issue repo", () => {
+    expect(onboardingSkill).toMatch(/ask only when the\s+project lists a Linear team or a GitHub repo it files issues in/u);
+    expect(onboardingSkill).toMatch(/a\s+local-only project adopts by state and needs no label/u);
+  });
+});

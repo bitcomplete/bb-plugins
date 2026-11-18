@@ -55,7 +55,9 @@ and list them as assumptions. Cover:
    playbook's `deployment` should use. Ask this when the README, docs and code
    do not already say; the default when nothing says otherwise is **merged is
    done**.
-4. **The label** tickets carry (default `bb-managed`).
+4. **The label** tickets carry (default `bb-managed`) — ask only when the
+   project lists a Linear team or a GitHub repo it files issues in; a
+   local-only project adopts by state and needs no label.
 5. **The nightly window and its time zone** — the time zone the window's
    hours are in.
 6. **Ops watches** — the namespaces, Sentry projects and Dependabot repos
@@ -76,7 +78,8 @@ and add what is missing rather than replacing it.
 
 Then fill in, from the survey and the interview:
 
-- **`stewards/project.json`** — `linear.teams`, `label`, `nightly`,
+- **`stewards/project.json`** — `linear.teams`, `label` (only when a
+  label-based source is in use), `nightly`,
   `github.exclude`, `deps` (the survey's test commands do not go here; they go
   in `AGENTS.md`). The local ticket source's key prefix defaults to `LOCAL`;
   set `localPrefix` only when the project wants another one, and it must not

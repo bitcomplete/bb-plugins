@@ -52,7 +52,10 @@ export function projectFileTemplate(teams: string[]): string {
     {
       version: 1,
       linear: { teams },
-      label: DEFAULT_LABEL,
+      // BB-362: a project with no Linear team does not spell out the label; a
+      // label-based source may still take the default, and a local-only
+      // project adopts by state and needs none.
+      ...(teams.length > 0 ? { label: DEFAULT_LABEL } : {}),
       nightly: { at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 },
       projectSteward: { model: "claude/claude-opus-5-5/high" },
       bigDecisions: defaultDecideList(),

@@ -570,7 +570,7 @@ export const projectFileSchema = z
     });
     if (file.ops.targets.length === 0) return;
     // A ticket filed outside the project's teams is never adopted, so the project steward could not act on it.
-    if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a Linear team to file tickets in: set ops.team or linear.teams" });
+    if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a filing target to file tickets in: set ops.team to a Linear team key, a GitHub owner/repo, or a local unit" });
     // A repo target (BB-235) is checked against the repo set by
     // `filingTargetProblems`, which the caller runs where repos are known; a
     // team key is checked here against the project's own teams.

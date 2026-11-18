@@ -299,7 +299,7 @@ describe("ops in the project file", () => {
     expect(error({ targets: [{ kind: "pod", name: "prod" }] })).toMatch(/ops\.targets\.0\.kind/u);
     expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }, { kind: "k8s-namespace", name: "prod" }] })).toMatch(/ops\.targets\.1: k8s-namespace\/prod is listed twice/u);
     expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }], team: "SALES" })).toMatch(/ops\.team: SALES is not one of linear\.teams/u);
-    expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }] }, [])).toMatch(/ops needs a Linear team/u);
+    expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }] }, [])).toMatch(/ops needs a filing target to file tickets in: set ops\.team to a Linear team key, a GitHub owner\/repo, or a local unit/u);
     expect(error({ targets: [], autoAdopt: ["critical"] })).toMatch(/ops\.autoAdopt\.0/u);
     expect(error({ targets: [], watch: true })).toMatch(/ops/u);
     // No targets, no team needed.
@@ -1149,5 +1149,25 @@ describe("template stamps (BB-328)", () => {
     const hashes = templateHashes();
     expect([...hashes.keys()].sort()).toEqual(Object.keys(PLAYBOOK_TEMPLATES).sort());
     for (const [name, hash] of hashes) expect(parseTemplateStamp(`${name}@${hash}`)).toEqual({ name, hash });
+  });
+});
+
+// BB-362: the project file and the shipped templates a no-Linear project
+// reads must not assume Linear.
+describe("no-Linear project content (BB-362)", () => {
+  it("omits the default label from a project file with no Linear team, and keeps it when one is named", () => {
+    expect(projectFileTemplate(["ENG"])).toContain('"label": "bb-managed"');
+    expect(projectFileTemplate([])).not.toContain("bb-managed");
+    // The parsed value still takes the default, so a label-based source works.
+    const parsed = parseProjectFile(projectFileTemplate([]));
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.label).toBe("bb-managed");
+  });
+
+  it("names no source-specific tool in a shipped playbook template", () => {
+    for (const [name, text] of Object.entries(PLAYBOOK_TEMPLATES)) {
+      expect(text, name).not.toMatch(/linear_[a-z_]+/u);
+      expect(text, name).not.toMatch(/gh issue create/u);
+    }
   });
 });

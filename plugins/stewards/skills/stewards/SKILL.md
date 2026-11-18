@@ -572,6 +572,16 @@ and `ticket_comment` sign for you; add no signature to what you pass them.
 - **No logs** (the wake says so): diagnose from status and events, and say
   in the ticket that logs were not available.
 
+## If you are a backlog steward
+
+The backlog role reads a whole Linear team's open backlog through
+`sourceBacklog`, which only the linear source serves, so it needs a Linear
+team: the role's `backlog.team`, or the project's `linear.teams`. A project
+with no Linear team cannot run it, and `bb stewards check` reports
+"backlog needs a Linear team; the backlog role is Linear-only". The read is
+read-only unless `backlog.triage` is on, in which case `backlog_triage` is
+your one gated write.
+
 ## If you are an initiative steward
 
 You own an **initiative**: an outcome with acceptance criteria and no fixed

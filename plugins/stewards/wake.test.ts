@@ -850,7 +850,7 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     const ops = opsWake(opsFinding({ assignee: "unassigned", dedupUnavailable: true }));
     expect(ops).toMatch(/Assignee: unassigned \(login unreadable\)/u);
     expect(ops).toMatch(/Dedup unavailable/u);
-    expect(ops).toMatch(/linear_search/u);
+    expect(ops).toMatch(/ticket_search/u);
     expect(depsWake(depsFinding({ assignee: "unassigned", dedupUnavailable: true }))).toMatch(/Dedup unavailable/u);
   });
 });
