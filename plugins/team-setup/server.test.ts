@@ -323,11 +323,12 @@ describe("Account Pool and devbox flows", () => {
       label: "me@example.com",
     });
     expect(rpcCalls.map((c) => `${c.pluginId}:${c.method}`)).toEqual([`${ACCOUNT_POOL_ID}:login.start`, `${ACCOUNT_POOL_ID}:login.complete`]);
+    expect(rpcCalls[0].input).toEqual({ kind: "add", label: null, priority: 100 });
     expect(rpcCalls[1].input).toEqual({ sessionId: "00000000-0000-4000-8000-000000000001", pasted: "code#state" });
   });
 
   it("proxies the Codex device flow", async () => {
-    const { harness } = await setup();
+    const { harness, rpcCalls } = await setup();
     expect(await harness.callRpc("codexSignIn", null)).toEqual({
       sessionId: "00000000-0000-4000-8000-000000000002",
       url: "https://auth.openai.com/device",
@@ -335,6 +336,7 @@ describe("Account Pool and devbox flows", () => {
       expiresAt: 1_700_000_000_000,
       intervalMs: 5000,
     });
+    expect(rpcCalls[0]).toEqual({ pluginId: ACCOUNT_POOL_ID, method: "codexLogin.start", input: { kind: "add", label: null, priority: 100 } });
     expect(await harness.callRpc("codexPoll", { sessionId: "00000000-0000-4000-8000-000000000002" })).toEqual({
       status: "complete",
       label: "codex@example.com",
