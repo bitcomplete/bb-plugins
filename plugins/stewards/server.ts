@@ -720,7 +720,7 @@ export const rpcContract = defineRpcContract({
           linearTeams: z.array(z.string()),
           repos: z.array(z.string()),
           excludedRepos: z.array(z.string()),
-          playbooks: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string().nullable(), source: z.enum(["linear", "github"]).nullable() })),
+          playbooks: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string().nullable(), source: z.enum(["linear", "github", "local"]).nullable() })),
           problems: z.array(z.string()),
           nightly: z.object({ at: z.string(), timezone: z.string() }).nullable(),
           lastNight: z.string().nullable(),
@@ -3871,6 +3871,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // which it skips; stewards check says so.
           deployment: [...new Set(projects.flatMap((p) => deploymentTargets(p).map((t) => t.repo)))].sort(),
         },
+        // The local source is stewards itself: it leases nothing on
+        // bb-gate-hooks, so its set is empty and the loop below never sends
+        // it. Present only so the Record covers every Source (BB-361).
+        local: { units: [], entities: [], dependabot: [], deployment: [] },
       };
       for (const source of ["linear", "github"] as const) {
         const body = JSON.stringify(sets[source]);

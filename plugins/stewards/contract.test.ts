@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { isMissingPlugin, signatureLine, signedBy, snapshotPullSchema, sourceContract } from "./source-contract.js";
+import { SOURCE_PLUGIN_IDS, entitySnapshotSchema, isMissingPlugin, signatureLine, signedBy, snapshotPullSchema, sourceContract, sourceSchema } from "./source-contract.js";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -13,6 +13,44 @@ describe("source-contract.ts", () => {
       expect(readFileSync(path, "utf8")).toBe(readFileSync(here("./source-contract.ts"), "utf8"));
     });
   }
+
+  it("parses the local source, its plugin id and the optional playbook field (BB-361)", () => {
+    // A third source, served by stewards itself, joins the contract.
+    expect(sourceSchema.parse("local")).toBe("local");
+    expect(SOURCE_PLUGIN_IDS.local).toBe("stewards");
+    expect(SOURCE_PLUGIN_IDS).toEqual({ linear: "linear", github: "github-watcher", local: "stewards" });
+    // The playbook is optional and additive: a source that names one carries
+    // it (the local source), and a source that has none omits it rather than
+    // sending a placeholder.
+    const snapshot = {
+      source: "local" as const,
+      kind: "issue" as const,
+      id: "LOCAL-1",
+      key: "LOCAL-1",
+      url: null,
+      title: "A local ticket",
+      state: "Ready",
+      stateType: null,
+      unit: "local",
+      labels: [],
+      author: null,
+      assignees: [],
+      priority: null,
+      estimate: null,
+      description: "The spec.",
+      createdAt: null,
+      updatedAt: null,
+      comments: [],
+      parent: null,
+      children: [],
+      linkedPulls: [],
+      pull: null,
+      viewer: null,
+    };
+    expect(entitySnapshotSchema.parse({ ...snapshot, playbook: "initiative" })).toMatchObject({ source: "local", playbook: "initiative" });
+    expect(entitySnapshotSchema.parse(snapshot).playbook).toBeUndefined();
+    expect(entitySnapshotSchema.safeParse({ ...snapshot, playbook: 3 }).success).toBe(false);
+  });
 
   it("reads the last signature in a body", () => {
     expect(signedBy(`hello\n\n${signatureLine("thr_abc")}`)).toBe("thr_abc");
