@@ -1249,7 +1249,7 @@ it("sizes dots logarithmically and bounds zero and large diffs", () => {
 });
 it("uses native badge dots with count thresholds, exact counts, and urgent reasons", () => {
   const badge = (count: number, agentsAsking = 0, overdueReviews = 0) =>
-    prsBadge({ onYou: count, toReview: 0, agentsAsking, overdueReviews });
+    prsBadge({ organization: null, onYou: count, toReview: 0, agentsAsking, overdueReviews });
   expect(badge(0)).toBeNull();
   expect(badge(1)).toEqual({
     tone: "neutral",
@@ -1268,6 +1268,99 @@ it("uses native badge dots with count thresholds, exact counts, and urgent reaso
   expect(badge(1, 0, 1)?.label).toContain("queued 2+ days");
   expect(badge(15)).not.toHaveProperty("count");
   expect(badge(15)).not.toHaveProperty("text");
+});
+async function mountBadge(options: { board: BoardState; reviews: ReviewsState }) {
+  const app = await loadPluginApp(() => import("./app"));
+  const useBadge = app.navPanels[0]?.experimental_useBadge;
+  if (!useBadge) throw new Error("Missing PRs badge");
+  const slot = renderSlot(
+    { component: () => {
+      const badge = useBadge();
+      return <span role="status" data-tone={badge?.tone}>{badge?.label}</span>;
+    } },
+    {},
+    { rpc: {
+      board_get: () => options.board,
+      reviews_get: () => options.reviews,
+    } },
+  );
+  unmounts.push(() => slot.lifecycle.unmount());
+  return slot;
+}
+it("scopes badge counts and urgency to the board's organization immediately without fetching", async () => {
+  const calmReview = review(704, {
+    item: { ...review(704).item, repo: "calm/app" },
+  });
+  const options = {
+    board: state({
+      view: { ...view, prs: [
+        row(2), row(3, { repo: "ParsleyHealth/another-repo" }), acmeRow,
+        ...[30, 31, 32, 33].map((number) => row(number, { repo: "calm/app" })),
+      ] },
+      markers: [marker(20, { key: acmeRow.key, status: "asking", question })],
+    }),
+    reviews: {
+      ...reviews([reviewA, calmReview, {
+        ...acmeReview,
+        segment: "agent",
+        item: { ...acmeReview.item, state: "started", threadId: "thr_acme_review", noticedAt: ago(3 * 1440) },
+      }]),
+      needsInput: { thr_acme_review: true },
+    },
+  };
+  const badge = await mountBadge(options);
+  const all = "Across all organizations · 7 on you · 3 to review · 2 agents waiting · 1 overdue review (queued 2+ days)";
+  await badge.findByText(all);
+  expect(badge.getByRole("status").getAttribute("data-tone")).toBe("critical");
+  const board = await mount(options);
+  const badgeCalls = [...badge.inspection.rpcCalls];
+  const boardCalls = [...board.inspection.rpcCalls];
+  await chooseOrganization(board, "parsleyhealth");
+  expect(badge.getByRole("status").textContent).toBe("In parsleyhealth · 2 on you · 1 to review");
+  expect(badge.getByRole("status").getAttribute("data-tone")).toBe("neutral");
+  await chooseOrganization(board, "calm");
+  expect(badge.getByRole("status").textContent).toBe("In calm · 4 on you · 1 to review");
+  expect(badge.getByRole("status").getAttribute("data-tone")).toBe("warning");
+  await chooseOrganization(board, "acme");
+  expect(badge.getByRole("status").textContent).toBe("In acme · 1 on you · 1 to review · 2 agents waiting · 1 overdue review (queued 2+ days)");
+  expect(badge.getByRole("status").getAttribute("data-tone")).toBe("critical");
+  await chooseOrganization(board, "All organizations");
+  expect(badge.getByRole("status").textContent).toBe(all);
+  expect(badge.getByRole("status").getAttribute("data-tone")).toBe("critical");
+  expect(badge.inspection.rpcCalls).toEqual(badgeCalls);
+  expect(board.inspection.rpcCalls).toEqual(boardCalls);
+});
+it("shares validated saved organizations and storage events between the board and badge", async () => {
+  const organizationKey = "test-plugin:calm-organization";
+  localStorage.setItem(organizationKey, '"ACME"');
+  const options = {
+    board: state({ view: { ...view, prs: [row(2), acmeRow] }, markers: [] }),
+    reviews: reviews([reviewA, acmeReview]),
+  };
+  const badge = await mountBadge(options);
+  await badge.findByText("In acme · 1 on you · 1 to review");
+  const board = await mount({ ...options, waitFor: "Change 20" });
+  expect(board.getByRole("combobox", { name: "Organization" }).textContent).toContain("acme");
+  act(() => {
+    localStorage.setItem(organizationKey, '"PARSLEYHEALTH"');
+    window.dispatchEvent(new StorageEvent("storage", { key: organizationKey, storageArea: localStorage }));
+  });
+  expect(badge.getByRole("status").textContent).toBe("In parsleyhealth · 1 on you · 1 to review");
+  expect(board.queryByRole("button", { name: "Change 20" })).toBeNull();
+  expect(board.getByRole("button", { name: "Change 2" })).toBeTruthy();
+  act(() => {
+    localStorage.setItem(organizationKey, '{"invalid":true}');
+    window.dispatchEvent(new StorageEvent("storage", { key: organizationKey, storageArea: localStorage }));
+  });
+  expect(badge.getByRole("status").textContent).toBe("Across all organizations · 2 on you · 2 to review");
+  expect(board.getByRole("combobox", { name: "Organization" }).textContent).toContain("All organizations");
+  await chooseOrganization(board, "acme");
+  act(() => {
+    localStorage.clear();
+    window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  });
+  expect(badge.getByRole("status").textContent).toBe("Across all organizations · 2 on you · 2 to review");
+  expect(board.getByRole("combobox", { name: "Organization" }).textContent).toContain("All organizations");
 });
 it("hides Later groups, remembers their folds, and offers no gate or manual agent actions", async () => {
   const slot = await mount();
