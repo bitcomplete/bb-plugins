@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, pullList: [] as unknown[], pullListStatus: 200, pullListMessage: "Forbidden", pullListRetryAfter: "120", openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -76,10 +76,24 @@ function fakeGitHub() {
       if (`${deployments[1]}/${deployments[2]}`.toLowerCase() !== "acme/widgets") return Response.json({ message: "Not Found" }, { status: 404 });
       return Response.json(state.deployments);
     }
+    const pullList = /\/repos\/([^/]+)\/([^/]+)\/pulls(?:\?|$)/u.exec(u);
+    if (pullList !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      if (`${pullList[1]}/${pullList[2]}`.toLowerCase() !== "acme/widgets") return Response.json({ message: "Not Found" }, { status: 404 });
+      if (state.pullListStatus === 403) return Response.json({ message: state.pullListMessage }, { status: 403, headers: { "retry-after": state.pullListRetryAfter, "x-ratelimit-remaining": "0" } });
+      if (state.pullListStatus !== 200) return Response.json({ message: state.pullListMessage }, { status: state.pullListStatus });
+      return Response.json(state.pullList);
+    }
     const statuses = /\/repos\/([^/]+)\/([^/]+)\/deployments\/(\d+)\/statuses(?:\?|$)/u.exec(u);
     if (statuses !== null) {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
-      return Response.json(state.deploymentStatuses[Number(statuses[3])] ?? []);
+      const id = Number(statuses[3]);
+      const body = state.deploymentStatuses[id] ?? [];
+      // A fake that honours ETags, so a poller's conditional status read can be a 304.
+      const etag = `"${Buffer.from(JSON.stringify(body)).toString("base64url")}"`;
+      const ifNoneMatch = (init?.headers as Record<string, string> | undefined)?.["if-none-match"];
+      if (ifNoneMatch === etag) return new Response(null, { status: 304 });
+      return Response.json(body, { headers: { etag } });
     }
     const labelCreate = /\/repos\/([^/]+)\/([^/]+)\/labels(?:\?|$)/u.exec(u);
     if (labelCreate !== null && init?.method === "POST") {
@@ -215,6 +229,8 @@ async function setup(
     callRpc?: (args: RpcCall) => Promise<unknown>;
     /** What kv held before this load: a restart. */
     kv?: Record<string, unknown>;
+    /** The polling timer's intervals, when a test wants a short one. */
+    pollTiming?: { intervalMs?: number; backoffMinMs?: number; backoffMaxMs?: number; maxEntitiesPerPoll?: number };
   } = {},
 ) {
   const send = vi.fn((options.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
@@ -226,7 +242,7 @@ async function setup(
   let now = 1_000_000_000_000;
   const token = vi.fn(options.token ?? (async () => "gho_dev"));
   const fetchImpl = ((url, init) => (String(url).startsWith(HOOKS_URL) ? hooks.fetchImpl(url, init) : github.fetchImpl(url, init))) as typeof fetch;
-  await createGitHubPlugin({ fetch: fetchImpl, now: () => now, env: options.env ?? {}, token, apiUrl: API_URL })(bb);
+  await createGitHubPlugin({ fetch: fetchImpl, now: () => now, env: options.env ?? {}, token, apiUrl: API_URL, pollTiming: options.pollTiming })(bb);
   const tool = (args: Record<string, unknown>, ctx: { threadId: string; projectId: string } = { threadId: "thr-1", projectId: "prj-1" }) =>
     harness.behavior.callAgentTool("github_watch", args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
@@ -256,13 +272,14 @@ const issueNode = (over: Record<string, unknown> = {}) => ({
 const WITH_HOOKS = { env: { BB_HOOKS_URL: HOOKS_URL } };
 
 describe("the tool", () => {
-  it("is the one tool, and is refused with a reason on a server without the hooks service, starting no service", async () => {
-    const { harness, tool, text } = await setup();
+  it("watches in polling mode on a server without the hooks service, starting the poller", async () => {
+    const { harness, tool, text, rows } = await setup({ pollTiming: { intervalMs: 60_000 } });
     expect(harness.registrations.agentTools.map((t: { name: string }) => t.name)).toEqual(["github_watch"]);
     const result = await tool({ ref: "Acme/Widgets#12" });
-    expect(result).toMatchObject({ isError: true });
-    expect(text(result)).toContain("BB_HOOKS_URL");
-    expect(harness.registrations.services.map((s) => s.name)).toEqual([]);
+    expect(result).not.toMatchObject({ isError: true });
+    expect(text(result)).toContain("polls every 1 minutes (no hooks service configured)");
+    expect(rows()).toHaveLength(1);
+    expect(harness.registrations.services.map((s) => s.name)).toEqual(["watches"]);
   });
 
   it("records a watch under the name GitHub uses, is a no-op the second time, and stops at the limit", async () => {
@@ -553,6 +570,140 @@ describe("the service", () => {
     await tick();
     expect(w.hooks.subscribes.map((s) => s.token)).toEqual(["gho_old", "gho_new"]);
     expect(w.token).toHaveBeenCalledTimes(2);
+    service.controller.abort();
+    await service.done;
+  });
+});
+
+describe("polling mode", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+  const POLL = { intervalMs: 60_000, backoffMinMs: 10_000, backoffMaxMs: 60_000, maxEntitiesPerPoll: 100 };
+  const STEWARDS = { experimental_caller: { kind: "plugin" as const, pluginId: "stewards" } };
+  type PollView = { hooks: { configured: boolean; poll: { state: string; polls: number; starved: boolean; lastError: string | null; backoffUntil: number; nextPollAt: number } | null } };
+
+  it("re-checks a watch on the timer and wakes the thread when it changes", async () => {
+    const w = await setup({ pollTiming: POLL });
+    expect(await w.tool({ ref: "Acme/Widgets#12" })).not.toMatchObject({ isError: true });
+    const service = w.harness.runService("watches");
+    await tick();
+    // The first poll re-checks the watch; nothing changed, so no wake.
+    expect(w.send).not.toHaveBeenCalled();
+    w.github.state.node = pullNode({ updatedAt: "2026-10-09T12:00:00Z", reviewDecision: "APPROVED" });
+    w.advance(60_000);
+    await tick(60_000);
+    await tick();
+    expect(w.send).toHaveBeenCalledTimes(1);
+    expect(w.sent()[0]!.input[0]!.text).toContain("GitHub pull request Acme/Widgets#12 changed");
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("finds a new labelled pull request in a stewarded repository and rings stewards once", async () => {
+    const w = await setup({ pollTiming: POLL });
+    w.github.state.pullList = [{ number: 12, updated_at: "2026-10-09T12:00:00Z", created_at: "2026-10-01T00:00:00Z", draft: false, labels: [{ name: "bb-managed" }], user: { login: "jane" } }];
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(await w.harness.callRpc("sourceSetInterest", { units: ["acme/widgets"], entities: [], dependabot: [], deployment: [] }, STEWARDS)).toEqual({ ok: true });
+    await tick();
+    await tick(3000);
+    expect(w.rpcs()).toContainEqual({ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "acme/widgets#12" } });
+    // The unchanged fingerprint is not rung again on the next poll.
+    w.advance(60_000);
+    await tick(60_000);
+    await tick(3000);
+    expect(w.rpcs().filter((r) => r.method === "stewardsRing")).toHaveLength(1);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("backs off on a 403 and reports the starved poller in the usage view", async () => {
+    const w = await setup({ pollTiming: POLL });
+    w.github.state.pullListStatus = 403;
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(await w.harness.callRpc("sourceSetInterest", { units: ["acme/widgets"], entities: [], dependabot: [], deployment: [] }, STEWARDS)).toEqual({ ok: true });
+    await tick();
+    const starved = (await w.harness.callRpc("watches", null)) as PollView;
+    expect(starved.hooks.configured).toBe(false);
+    expect(starved.hooks.poll).toMatchObject({ state: "backoff", starved: true });
+    expect(starved.hooks.poll!.lastError).toContain("403");
+    const pollsAfterFirst = starved.hooks.poll!.polls;
+
+    // Inside the backoff (the 403 carried `retry-after: 120`) no further poll runs.
+    w.advance(60_000);
+    await tick(60_000);
+    expect(((await w.harness.callRpc("watches", null)) as PollView).hooks.poll!.polls).toBe(pollsAfterFirst);
+
+    // GitHub recovers; the poll after the backoff clears the starved state.
+    w.github.state.pullListStatus = 200;
+    w.advance(60_000);
+    await tick(60_000);
+    await tick();
+    const recovered = (await w.harness.callRpc("watches", null)) as PollView;
+    expect(recovered.hooks.poll).toMatchObject({ starved: false, lastError: null });
+    expect(recovered.hooks.poll!.polls).toBeGreaterThan(pollsAfterFirst);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("does not starve on a Dependabot 403 that is not a rate limit, and still re-checks a watch", async () => {
+    const w = await setup({ pollTiming: POLL });
+    // Alerts are off or the token has no alert access: a plain 403 with no rate-limit headers.
+    w.github.state.dependabotStatus = 403;
+    expect(await w.tool({ ref: "Acme/Widgets#12" })).not.toMatchObject({ isError: true });
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: ["acme/widgets"], deployment: [] }, STEWARDS)).toEqual({ ok: true });
+    await tick();
+    const view = (await w.harness.callRpc("watches", null)) as PollView;
+    expect(view.hooks.poll).toMatchObject({ starved: false, lastError: null });
+    expect(w.harness.logEntries.some((l) => l.message.includes("Dependabot alerts failed"))).toBe(true);
+    // The watch is still re-checked on the normal interval.
+    w.github.state.node = pullNode({ updatedAt: "2026-10-09T12:00:00Z", reviewDecision: "APPROVED" });
+    w.advance(60_000);
+    await tick(60_000);
+    await tick();
+    expect(w.send).toHaveBeenCalledTimes(1);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("reuses the cached status on a 304 so an old deployment is not rung again with an empty state", async () => {
+    const w = await setup({ pollTiming: POLL });
+    w.github.state.deployments = [{ id: 7, environment: "production", ref: "main", sha: "abc123", url: "https://api.github.com/repos/Acme/Widgets/deployments/7" }];
+    w.github.state.deploymentStatuses = { 7: [{ state: "success", log_url: "https://github.com/Acme/Widgets/actions/runs/9" }] };
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/widgets"] }, STEWARDS)).toEqual({ ok: true });
+    await tick();
+    await tick(3000);
+    const rings = () => w.rpcs().filter((r) => r.method === "stewardsRing");
+    expect(rings()).toEqual([
+      {
+        pluginId: "stewards",
+        method: "stewardsRing",
+        input: { source: "github", id: "acme/widgets#7", deployment: { id: 7, environment: "production", ref: "main", sha: "abc123", state: "success", url: "https://github.com/Acme/Widgets/actions/runs/9" } },
+      },
+    ]);
+    // The next poll's status read is a 304. With the cached status the
+    // fingerprint is unchanged, so there is no second ring (and no empty state).
+    w.advance(60_000);
+    await tick(60_000);
+    await tick(3000);
+    expect(rings()).toHaveLength(1);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("does not start the poller when a hooks service is configured", async () => {
+    const w = await setup({ ...WITH_HOOKS, pollTiming: POLL });
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(w.hooks.streams).toHaveLength(1);
+    const view = (await w.harness.callRpc("watches", null)) as PollView;
+    expect(view.hooks.poll).toBeNull();
     service.controller.abort();
     await service.done;
   });

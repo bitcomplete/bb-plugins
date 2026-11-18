@@ -55,6 +55,7 @@ import {
   parseMergeBaseIsDefaultTip,
   parseOpenIssues,
   parseOpenPulls,
+  parsePulls,
   parseRef,
   parseRefKey,
   parseRepo,
@@ -65,6 +66,7 @@ import {
   parseViewer,
   parseWorkflowJobs,
   parseWorkflowRuns,
+  pullsPath,
   refKey,
   subIssuesPath,
   workflowRunJobsPath,
@@ -73,6 +75,7 @@ import {
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
+import { createPoller, DEFAULT_POLL_TIMING, RateLimitError, type PollResult, type Poller, type PollerTiming } from "./poller.js";
 import { deploymentSchema, ringStewards, signedBy, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
@@ -99,11 +102,26 @@ export const rpcContract = defineRpcContract({
 
 /** Where the units and entities stewards wants to hear about are kept, so a restart keeps leasing them. */
 export const INTEREST_KEY = "stewards/interest";
+/** Where the poller keeps the last fingerprint it saw per interest entity, so an unchanged one is not rung again. */
+export const INTEREST_CURSORS_KEY = "stewards/interest-cursors";
 const interestSchema = z.object({ units: z.array(z.string()), entities: z.array(z.string()), dependabot: z.array(z.string()).default([]), deployment: z.array(z.string()).default([]) });
 type Interest = z.infer<typeof interestSchema>;
 
 /** How long a token read from gh is reused before gh is asked again. */
 export const TOKEN_CACHE_MS = 5 * 60 * 1000;
+
+/**
+ * The poller gives up a round once GitHub's remaining quota is at or below
+ * this and backs off until the reset: a read that would otherwise be refused
+ * is worth waiting for, and the reset is the server's own clock.
+ */
+export const RATE_LIMIT_FLOOR = 10;
+
+/** How many deployments one poll reads the status of per repository, newest first. */
+export const DEPLOYMENTS_PER_POLL = 20;
+
+/** How many entity cursors the poller remembers before it drops the oldest. */
+export const INTEREST_CURSOR_MAX = 5000;
 
 export interface GitHubPluginDeps {
   fetch: typeof fetch;
@@ -113,6 +131,8 @@ export interface GitHubPluginDeps {
   token: TokenReader;
   /** Where GraphQL is sent; GITHUB_API_URL unless a test says otherwise. */
   apiUrl?: string;
+  /** The polling timer's intervals; the defaults unless a test says otherwise. */
+  pollTiming?: Partial<PollerTiming>;
 }
 
 function errorMessage(error: unknown): string {
@@ -564,6 +584,200 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     });
     hooks.onStateChange(announceWatches);
 
+    // ---- polling, when there is no hooks service ------------------------------
+    //
+    // `BB_HOOKS_URL` unset means no doorbells: the plugin still watches, but
+    // on its own timer. Every round re-checks the open watches (the same
+    // baseline re-check the hooks client runs while leased) and polls the
+    // repositories stewards asked to hear about, ringing stewards for a new
+    // labelled pull request, a review request, a Dependabot alert or a
+    // deployment exactly as a doorbell would. The reads are REST so they can
+    // be conditional (ETag) and so a 403/429 or a near-empty quota can be
+    // seen and backed off from.
+
+    /** The last fingerprint the poller saw per interest entity, so an unchanged one is not rung again. */
+    const storedCursors = await bb.storage.kv.get<Record<string, { fp: string; at: number }>>(INTEREST_CURSORS_KEY);
+    let interestCursors: Record<string, { fp: string; at: number }> = storedCursors !== null && typeof storedCursors === "object" ? storedCursors : {};
+
+    /** The ETag the last read of a path returned, so an unchanged list answers 304. */
+    const pollEtags = new Map<string, string>();
+
+    /** The last status parsed per deployment, so a conditional 304 reuses it instead of reading as empty. */
+    const deploymentStatusCache = new Map<string, { state: string; url: string | null }>();
+
+    /**
+     * One conditional REST read for the poller. A 304 is "nothing changed".
+     * A 429, or a 403 that also carries a rate-limit signal (a near-empty
+     * quota, a `Retry-After`, or a rate-limit message), is a RateLimitError
+     * with the server's retry hint, so the poller backs off. Any other 403 is
+     * an ordinary read failure: GitHub answers 403 for a Dependabot repo
+     * whose alerts are off or whose token has no alert access, and that must
+     * not starve the whole poller. Each request gets its own timeout, so a
+     * long round does not abort the reads at its end.
+     */
+    async function pollRest(path: string): Promise<{ body: unknown; notModified: boolean; retryAfterMs: number | null }> {
+      return asDeveloper(async (token) => {
+        const headers: Record<string, string> = { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "user-agent": "bb-plugin-github", "x-github-api-version": "2022-11-28" };
+        const etag = pollEtags.get(path);
+        if (etag !== undefined) headers["if-none-match"] = etag;
+        const response = await deps.fetch(new URL(path, apiUrl), { method: "GET", headers, signal: checkSignal() });
+        if (response.status === 304) return { body: null, notModified: true, retryAfterMs: null };
+        const remainingRaw = response.headers.get("x-ratelimit-remaining");
+        const resetRaw = response.headers.get("x-ratelimit-reset");
+        const retryAfterRaw = response.headers.get("retry-after");
+        const remaining = remainingRaw === null ? Number.NaN : Number(remainingRaw);
+        const reset = resetRaw === null ? Number.NaN : Number(resetRaw);
+        const retryAfter = retryAfterRaw === null ? Number.NaN : Number(retryAfterRaw);
+        const lowQuota = Number.isFinite(remaining) && remaining <= RATE_LIMIT_FLOOR;
+        const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : lowQuota && Number.isFinite(reset) ? Math.max(0, reset * 1000 - deps.now()) : null;
+        if (response.status === 429) throw new RateLimitError(`GitHub answered HTTP 429 to ${path}`, retryAfterMs);
+        if (!response.ok) {
+          const body: unknown = await response.json().catch(() => null);
+          const message = body !== null && typeof body === "object" && typeof (body as { message?: unknown }).message === "string" ? (body as { message: string }).message : "";
+          if (response.status === 403 && (lowQuota || retryAfterMs !== null || /rate.?limit|secondary rate/iu.test(message))) {
+            throw new RateLimitError(`GitHub answered HTTP 403 to ${path}${message === "" ? "" : `: ${message}`}`, retryAfterMs);
+          }
+          throw new GitHubRequestError(`GitHub answered HTTP ${response.status}${message === "" ? "" : `: ${message}`}`, response.status);
+        }
+        const newEtag = response.headers.get("etag");
+        if (newEtag !== null && newEtag !== "") pollEtags.set(path, newEtag);
+        const body: unknown = await response.json().catch(() => null);
+        return { body, notModified: false, retryAfterMs: lowQuota ? retryAfterMs : null };
+      });
+    }
+
+    /**
+     * Poll the repositories stewards asked to hear about, ringing stewards for
+     * each entity whose fingerprint changed since the last poll. The per-poll
+     * cap bounds how many are rung in one round; the rest keep their old
+     * cursor and are rung next round.
+     */
+    async function pollInterest(): Promise<PollResult> {
+      if (interest.units.length === 0 && interest.dependabot.length === 0 && interest.deployment.length === 0) return {};
+      const changed: Array<{ id: string; fp: string; ring: () => void }> = [];
+      let rateLimited: { retryAfterMs: number | null; message: string } | undefined;
+      const noteRateLimit = (ms: number | null, message: string) => {
+        if (rateLimited === undefined) rateLimited = { retryAfterMs: ms, message };
+      };
+      const noteQuota = (ms: number | null) => noteRateLimit(ms, "GitHub's remaining rate-limit quota is nearly exhausted");
+      const seen = (id: string, fp: string): boolean => interestCursors[id]?.fp === fp;
+
+      for (const repo of interest.units) {
+        try {
+          const page = await pollRest(pullsPath(repo));
+          if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
+          if (page.notModified) continue;
+          for (const pr of parsePulls(page.body, repo)) {
+            const id = `issue ${pr.key.toLowerCase()}`;
+            const fp = pr.updatedAt ?? "";
+            if (seen(id, fp)) continue;
+            changed.push({ id, fp, ring: () => rings.ring(pr.key) });
+          }
+        } catch (error) {
+          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          else bb.log.warn(`github-watcher: polling ${repo} pull requests failed: ${errorMessage(error)}`);
+        }
+      }
+
+      for (const repo of interest.dependabot) {
+        try {
+          const page = await pollRest(dependabotAlertsPath(repo, "open"));
+          if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
+          if (page.notModified) continue;
+          for (const alert of parseDependabotAlerts(page.body, repo)) {
+            const id = `dependabot_alert ${alert.id.toLowerCase()}`;
+            const fp = alert.updatedAt ?? "";
+            if (seen(id, fp)) continue;
+            changed.push({ id, fp, ring: () => rings.ring(alert.id) });
+          }
+        } catch (error) {
+          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          else bb.log.warn(`github-watcher: polling ${repo} Dependabot alerts failed: ${errorMessage(error)}`);
+        }
+      }
+
+      for (const repo of interest.deployment) {
+        try {
+          const page = await pollRest(deploymentsPath(repo));
+          if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
+          if (page.notModified) continue;
+          const deployments = parseDeployments(page.body).slice(0, DEPLOYMENTS_PER_POLL);
+          for (const d of deployments) {
+            const key = `${repo}#${d.id}`;
+            const cached = deploymentStatusCache.get(key);
+            let state = cached?.state ?? "";
+            let url = cached?.url ?? d.url;
+            try {
+              const statusPage = await pollRest(deploymentStatusesPath(repo, d.id));
+              if (statusPage.retryAfterMs !== null) noteQuota(statusPage.retryAfterMs);
+              if (!statusPage.notModified) {
+                const status = parseDeploymentStatus(statusPage.body);
+                state = status.state;
+                url = status.url ?? d.url;
+                deploymentStatusCache.set(key, { state, url });
+              }
+            } catch (error) {
+              if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+              else bb.log.warn(`github-watcher: polling the status of deployment ${key} failed: ${errorMessage(error)}`);
+            }
+            const id = `deployment ${key.toLowerCase()}`;
+            const fp = `${d.id}:${state}`;
+            if (seen(id, fp)) continue;
+            const deployment: Deployment = { id: d.id, environment: d.environment, ref: d.ref, sha: d.sha, state, url };
+            changed.push({
+              id,
+              fp,
+              ring: () => {
+                pendingDeployments.set(key, deployment);
+                deploymentRings.ring(key);
+              },
+            });
+          }
+        } catch (error) {
+          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          else bb.log.warn(`github-watcher: polling ${repo} deployments failed: ${errorMessage(error)}`);
+        }
+      }
+
+      // Ring, in the order the reads found them, up to the cap. What is left
+      // keeps its old cursor and is rung next round.
+      const timing: PollerTiming = { ...DEFAULT_POLL_TIMING, ...deps.pollTiming };
+      let budget = timing.maxEntitiesPerPoll;
+      let capped = false;
+      const next = { ...interestCursors };
+      for (const c of changed) {
+        if (budget <= 0) {
+          capped = true;
+          break;
+        }
+        budget -= 1;
+        c.ring();
+        next[c.id] = { fp: c.fp, at: deps.now() };
+      }
+      // Bound the cursor map: drop the oldest entries once it grows past the cap.
+      const cursorIds = Object.keys(next);
+      if (cursorIds.length > INTEREST_CURSOR_MAX) {
+        cursorIds.sort((a, b) => next[a]!.at - next[b]!.at);
+        for (const id of cursorIds.slice(0, cursorIds.length - INTEREST_CURSOR_MAX)) delete next[id];
+      }
+      interestCursors = next;
+      await bb.storage.kv.set(INTEREST_CURSORS_KEY, next);
+      if (rateLimited !== undefined) return { rateLimited: true, retryAfterMs: rateLimited.retryAfterMs ?? undefined, message: rateLimited.message };
+      return { capped };
+    }
+
+    /** The polling timer: only meaningful when there is no hooks service, but harmless otherwise. */
+    const poller: Poller = createPoller({
+      now: deps.now,
+      log: bb.log,
+      timing: deps.pollTiming,
+      poll: async (reason) => {
+        await sweep(reason);
+        return pollInterest();
+      },
+    });
+    poller.onStateChange(announceWatches);
+
     /**
      * The usage view: every watch with its counters, flags and thread title,
      * and the doorbell stream's state. Titles come from bb per thread; a
@@ -586,6 +800,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         rows,
         hooks: hooks.status(),
         configured: hooksUrl !== "",
+        poll: hooksUrl === "" ? poller.status() : null,
         now: deps.now(),
         titles,
         target: (row) => {
@@ -1056,6 +1271,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         lease("issue");
         lease("dependabot_repo");
         lease("deployment_repo");
+        // With no hooks service there is nothing to lease; wake the poller so
+        // the new interest is read on the next round rather than at its timer.
+        if (hooksUrl === "") poller.poke();
         return { ok: true };
       },
     });
@@ -1091,6 +1309,15 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           await hooks.run(signal);
         },
       });
+    } else {
+      // No hooks service: the same watches and stewards interest are re-read
+      // on a plain timer. `github_watch` and the stewards setting both name
+      // the interval; the usage view shows the poller's state.
+      bb.background.service("watches", {
+        async start(signal) {
+          await poller.run(signal);
+        },
+      });
     }
 
     const forgetThread = (threadId: string) => {
@@ -1114,9 +1341,6 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       presentation: { label: { pending: "Watching on GitHub", completed: "Watching on GitHub" } },
       parameters: z.object({ ref: refInput }),
       async execute({ ref: input }, { threadId, projectId, signal }) {
-        if (hooksUrl === "") {
-          return toolError(new Error("Watching GitHub pull requests and issues is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set). Check it again later with gh instead."));
-        }
         const ref = parseRef(input);
         if (ref === null) return toolError(new Error(`${JSON.stringify(input)} does not name a pull request or issue. Give its URL, owner/repo#12, or owner/repo/pull/12.`));
         try {
@@ -1135,10 +1359,18 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
             return toolError(new Error(`This thread already watches ${added.limit} GitHub pull requests or issues, the most it can. It is still watching them; it cannot add ${target.key}.`));
           }
           if (added.outcome === "already") return `Already watching ${what}. This thread will be messaged when it changes; you can end the turn.`;
+          announceWatches();
+          if (hooksUrl === "") {
+            // No hooks service: the watch is picked up by the poller's next
+            // round. Poke it so a watch added just after a poll is not left
+            // for the whole interval.
+            poller.poke();
+            const minutes = Math.max(1, Math.round(poller.intervalMs / 60_000));
+            return `Watching ${what}. This thread will be messaged when it changes or someone else comments; this server polls every ${minutes} minutes (no hooks service configured). End the turn rather than polling.`;
+          }
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
           hooks.added("issue", target.key).catch((error: unknown) => bb.log.warn(`could not lease ${target.key} right away: ${errorMessage(error)}`));
-          announceWatches();
           return `Watching ${what}. This thread will be messaged when it changes or someone else comments; end the turn rather than polling.`;
         } catch (error) {
           return toolError(error);

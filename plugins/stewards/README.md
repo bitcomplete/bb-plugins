@@ -127,6 +127,20 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   actionable is kept as a quiet note and shown in "What changed" at the next
   turn something else makes due, and `bb stewards show` lists it as a pending
   note.
+- **Doorbells and polling.** The mode is chosen from `BB_HOOKS_URL`. Set, it
+  is doorbells: linear and github-watcher hold leases on the hooks service
+  and ring this plugin, and `bb stewards check` prints "doorbells: from the
+  hooks service". Unset, it is polling: github-watcher re-checks every open
+  watch and polls the stewarded repositories on its own timer (five minutes
+  by default), the sweep interval defaults to five minutes instead of
+  thirty, and `bb stewards check` prints "doorbells: polling every N minutes
+  (no hooks service configured)" as information, not a problem. A starved
+  (rate-limited) poller is reported there too. The sweep interval is
+  **Sweep every N minutes** on Settings → Plugins → Stewards, and in `bb
+  plugin config`. Three things stay hooks-only, because there is no polling
+  fallback for them: Linear `@bb` sessions, Slack, and `workflow_run`
+  failure doorbells. The `image-tag` strategy is unaffected: it reads a run
+  through `sourceWorkflowRun` whether or not a doorbell fired.
 - **Wakes are self-contained**: playbook instructions for the phase, the
   ready gate, guidance and holds, the snapshot, and what changed. Each
   woken turn ends with `steward_report`, the status record. A wake past
@@ -484,8 +498,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   binding a turn, runs the live half of `bb stewards check` (teams, states,
   labels, repos, target readability and hooks leases), then wakes the project
   steward for the morning digest, which carries the check findings new or
-  changed since the last pass. A half-hourly mechanical sweep is the adoption
-  and stuck backstop.
+  changed since the last pass. A mechanical sweep (every 30 minutes with a
+  hooks service, every 5 without one, both settable as **Sweep every N
+  minutes**) is the adoption and stuck backstop.
 - **The Stewards page** (a nav panel, [app.tsx](app.tsx)) is no longer the
   list (BB-85). `board/<project>` is the project view: project name and
   project-steward link, **Waiting on you** (the needs-you items with no open
@@ -825,7 +840,7 @@ means every changed file matches one of its globs; it is checked only at
 adoption, on the full snapshot (GitHub lists the first 100 changed files, so a
 pull request with 100 or more files never matches a `paths` watch — fail
 closed). `title`, `branch` and `author` are checked whenever the plugin has
-them; the half-hourly sweep's list carries only the repo and author, so it is
+them; the sweep's list carries only the repo and author, so it is
 permissive there and the full snapshot decides. A watch with no `match.author`
 matches only a pull request authored by the role holder's own GitHub login;
 any other author must be named, as the synthesized Dependabot watch names the

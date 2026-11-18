@@ -19,7 +19,7 @@ GitHub plugin and refuses a path install under it.
 
 | Tool | What it does |
 |---|---|
-| `github_watch` | Watch a pull request or issue by URL, `owner/repo#12` or `owner/repo/pull/12`: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
+| `github_watch` | Watch a pull request or issue by URL, `owner/repo#12` or `owner/repo/pull/12`: the thread is messaged when it changes or someone else comments. Doorbells with `BB_HOOKS_URL`, a polling timer without it. |
 
 ## Stewards
 
@@ -145,10 +145,19 @@ module (`usage.ts`, `format-time.ts`, `components/watches-section.tsx`);
 a change to one belongs in the other.
 
 `BB_HOOKS_URL` is the address of the hooks service. It is read from the
-server's environment only; there is no setting. Without it, `github_watch` returns an error saying watching is
-not available on this server, no background service is started, and
-nothing else changes. There is deliberately no polling fallback: reading
-the PR again later with `gh` is what the agent would do anyway.
+server's environment only; there is no setting. With it, `github_watch`
+leases the target on the hooks service and is woken by a doorbell.
+
+Without it the plugin runs in **polling mode**: `github_watch` still
+succeeds, and a plain timer (`poller.ts`, five minutes by default)
+re-checks every open watch and polls the repositories stewards asked to
+hear about, so a review, a label, a Dependabot alert or a deployment is
+found without a doorbell. The tool's answer, the usage view and the
+settings section name the interval and the poller's state. The reads are
+REST and conditional (ETag), capped per poll, and back off on a 403/429
+or a near-empty rate-limit quota; a starved poller is shown on the
+settings page. Polling needs no hooks service and no new credential: it
+uses the same `gh` login.
 
 The webhook itself is configured once per GitHub organization, by hand,
 in the hooks service; the hooks contract has the steps and the event list.
@@ -166,6 +175,7 @@ stewards' snapshot); `watch.ts` the
 snapshot, the diff, the wake message and the SQLite store;
 `hooks-client.ts` the subscriber side of the hooks service, the same as the
 linear plugin's with the source and lease kinds changed;
+`poller.ts` the timer used when there is no hooks service;
 `source-contract.ts` the shared contract with stewards; `gh.ts` reads the token;
 `usage.ts` the watches view; `server.ts` wires them to bb, and `app.tsx`
 is the settings section.

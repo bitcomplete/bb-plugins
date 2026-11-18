@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PROJECT_CHANGED } from "./channels.js";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { ROLES_FILE } from "./roles.js";
@@ -9388,6 +9388,65 @@ describe("the settings page", () => {
     expect(overview.projects[0]!.playbooks.find((p) => p.kind === "pr")!.version).toBeNull();
     const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
     expect(check.ok).toBe(false);
+  });
+});
+
+describe("doorbells and polling (BB-363)", () => {
+  it("defaults the sweep interval shorter without a hooks service and 30 minutes with one", async () => {
+    const noHooks = await setup({ env: {} });
+    expect((await noHooks.hooks.settings.get()).sweepMinutes).toBe(5);
+    const withHooks = await setup({ env: { BB_HOOKS_URL: "http://hooks.test:8081" } });
+    expect((await withHooks.hooks.settings.get()).sweepMinutes).toBe(30);
+    // An explicit setting wins over either default.
+    const configured = await setup({ env: {} }, { sweepMinutes: "12" });
+    expect((await configured.hooks.settings.get()).sweepMinutes).toBe(12);
+  });
+
+  it("prints the polling mode as information on a no-hooks server, and the hooks mode with one", async () => {
+    const noHooks = await setup({ env: {} });
+    const check = (await noHooks.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(check.lines).toContain("doorbells: polling every 5 minutes (no hooks service configured)");
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("hook"))).toEqual([]);
+
+    const withHooks = await setup({ env: { BB_HOOKS_URL: "http://hooks.test:8081" } });
+    const hooksCheck = (await withHooks.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(hooksCheck.lines).toContain("doorbells: from the hooks service (BB_HOOKS_URL)");
+  });
+
+  it("reports a starved github-watcher poller as a warning, not a problem", async () => {
+    const t = await setup({ env: {} });
+    t.setGithubPoller({ starved: true, lastError: "GitHub answered HTTP 403", nextPollAt: t.now() + 600_000 });
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(check.lines).toContain("warning: github-watcher: the poller is rate-limited (GitHub answered HTTP 403); GitHub is read again on its own backoff");
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("github-watcher"))).toEqual([]);
+  });
+
+  it("names github-watcher's own poll interval in check when it answers", async () => {
+    const t = await setup({ env: {} }, { sweepMinutes: "15" });
+    t.setGithubPoller({ starved: false, lastError: null, nextPollAt: t.now() + 300_000, intervalMs: 300_000 });
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    // The watches are polled by github-watcher every 5 minutes, whatever the
+    // stewards sweep setting says.
+    expect(check.lines).toContain("doorbells: polling every 5 minutes (no hooks service configured)");
+  });
+
+  it("sweeps on the interval the setting names, not a fixed one", async () => {
+    const t = await setup({ env: {} }, { sweepMinutes: "1" });
+    vi.useFakeTimers();
+    try {
+      const service = t.harness.runService("loop");
+      // The first sweep runs at start; let it settle, then clear the count.
+      await vi.advanceTimersByTimeAsync(10);
+      await t.hooks.settle();
+      t.rpcCalls.length = 0;
+      // One minute later, the setting's interval, the loop sweeps again.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await t.hooks.settle();
+      expect(t.rpcCalls.filter((c) => c.method === "sourceAdoptable").length).toBeGreaterThan(0);
+      service.controller.abort();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

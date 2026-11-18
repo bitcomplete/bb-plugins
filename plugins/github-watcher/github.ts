@@ -668,6 +668,43 @@ export function parseOpenPulls(payload: unknown): { viewer: string | null; entit
 /** "pull request" or "issue", for prose. */
 export const kindName = (kind: Target["kind"]): string => (kind === "pull" ? "pull request" : "issue");
 
+// ---- open pull requests, for the poller ----------------------------------------
+
+/**
+ * The REST path for a repository's open pull requests, most recently updated
+ * first. The poller reads this instead of the GraphQL list because REST
+ * supports conditional requests (ETag) and reports the rate-limit headers.
+ */
+export const pullsPath = (repo: string, perPage = 100): string => `/repos/${repo}/pulls?state=open&sort=updated&direction=desc&per_page=${perPage}`;
+
+const pullListNode = z.object({
+  number: z.number(),
+  updated_at: z.string().nullish(),
+  created_at: z.string().nullish(),
+  draft: z.boolean().nullish(),
+  labels: z.array(z.object({ name: z.string() })).nullish(),
+  user: z.object({ login: z.string() }).nullish(),
+});
+
+/** One open pull request as the poller needs it: the id to ring stewards for, and a fingerprint to tell a change. */
+export type PullSummary = { id: string; key: string; number: number; updatedAt: string | null; createdAt: string | null; labels: string[]; draft: boolean; author: string | null };
+
+/** The open pull requests GitHub returned, named the way a doorbell names them. */
+export function parsePulls(payload: unknown, repo: string): PullSummary[] {
+  const parsed = z.array(pullListNode).safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a pull request list");
+  return parsed.data.map((p) => ({
+    id: `${repo}#${p.number}`,
+    key: `${repo}#${p.number}`,
+    number: p.number,
+    updatedAt: p.updated_at ?? null,
+    createdAt: p.created_at ?? null,
+    labels: (p.labels ?? []).map((l) => l.name).sort(),
+    draft: p.draft === true,
+    author: p.user?.login ?? null,
+  }));
+}
+
 // ---- issues, for stewards -----------------------------------------------------
 
 /** One page of a repository's open issues carrying a label, oldest created first: the other half of what a nightly pass may adopt. */
