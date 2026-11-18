@@ -511,6 +511,19 @@ describe("review agent execution choice", () => {
     expect(host.harness.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject(choice);
   });
 
+  it("tells single and batch reviews to run delegated work on the model chosen for the review", async () => {
+    const first = item(96), second = item(97);
+    const host = await setup([first, second]);
+    await host.harness.behavior.callRpc("item_start", { key: first.key });
+    const choice = { providerId: "selected-provider", model: "selected-model", reasoningLevel: "high" };
+    host.harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, providers: [{ id: choice.providerId, available: true }], models: [{ model: choice.model, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] }));
+    await host.harness.behavior.callRpc("item_batch_start", { keys: [second.key], agentModel: choice });
+    const prompts = host.harness.sdk.callsTo("threads.spawn").map((call) => (call[0] as { prompt: string }).prompt);
+    expect(prompts[0]).toContain(`Captured agent execution choice: ${JSON.stringify({ providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: "xhigh" })}`);
+    expect(prompts[1]).toContain(`Captured agent execution choice: ${JSON.stringify(choice)}`);
+    for (const prompt of prompts) expect(prompt).toContain("child threads or subagents, run every one with this exact provider, model");
+  });
+
   it("retains deliberate provider settings and accepts models without reasoning controls", async () => {
     const first = item(94), second = item(95);
     const host = await setup([first, second]);
