@@ -15861,6 +15861,9 @@ describe("the fixed follow-up ladder (BB-358)", () => {
     slackOn(t);
     const need = await secondBudgetNeed(t, b().id);
     expect(need.data.choices).toContain("Ask on Slack");
+    // The person's label is stored for the ask-once question and the rung-3
+    // wording (blocker 1 of round 1).
+    expect(need.data.waitSlackPersonLabel).toBe("arashout");
     // The owner picks Ask on Slack and the steward reports the DM opened.
     await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ask on Slack" }, { experimental_caller: { kind: "client" } });
     await t.flush();
@@ -15891,7 +15894,24 @@ describe("the fixed follow-up ladder (BB-358)", () => {
     expect(needs).toHaveLength(1);
     expect(needs[0]!.data.waitTerminal).toBe(true);
     expect(needs[0]!.data.choices).toEqual(["Review it yourself", "Reassign", "Keep waiting"]);
+    expect(needs[0]!.what).toContain("arashout has not answered on PR #9 or Slack since");
     expect(needs[0]!.what).toContain("reach them yourself");
+  });
+
+  it("a wait with no person to DM keeps the generic second-budget wording", async () => {
+    // A review wait whose only requested reviewer is the owner has no one to
+    // DM; the need must not claim a Slack attempt or name a phantom person.
+    const { t, b } = await reviewWait(["jane"]);
+    slackOn(t);
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    t.advance(DAY + HOUR);
+    await t.hooks.reconcilePass("p1");
+    const needs = decideNeeds(t, b().id);
+    expect(needs).toHaveLength(1);
+    expect(needs[0]!.what).toBe("The review wait on acme/web#9 is still open after a second budget.");
+    expect(needs[0]!.what).not.toContain("that person");
+    expect(needs[0]!.data.waitTerminal).toBeUndefined();
   });
 
   it("caps one DM per person per steward per day and does not block a different steward", async () => {
@@ -15952,6 +15972,7 @@ describe("the fixed follow-up ladder (BB-358)", () => {
     expect(refused.exitCode).toBe(0);
     const askOnce = t.hooks.store.need(need.id)!;
     expect(askOnce.data.waitStage).toBe("ask-once");
+    expect(askOnce.what).toBe("Who is arashout on Slack?");
     expect(needChoices(askOnce)).toEqual(["Arash (arashout)", "Not on Slack"]);
     // The owner picks the near match: the mapping is recorded and the steward
     // is woken to send to the Slack user id.
@@ -15979,6 +16000,10 @@ describe("the fixed follow-up ladder (BB-358)", () => {
     expect(picked).toMatchObject({ ok: true });
     await t.flush();
     expect(t.hooks.store.learnedSlackFor("gh:arashout")).toEqual({ kind: "not-on-slack" });
+    // The terminal need the Not on Slack pick files names the person.
+    const terminal = terminalNeeds(t, b().id);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]!.what).toContain("arashout has not answered on PR #9 or Slack since");
     // The Slack rung is skipped from then on: a changed wait goes terminal.
     await t.tool("steward_report", { ...base, waitingOn: "the checks", wait: { kind: "review", ref: "acme/web#9" } }, t.spawns[1]!.id);
     t.advance(DAY + HOUR);

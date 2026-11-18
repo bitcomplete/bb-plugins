@@ -2241,6 +2241,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const further = b.waitSlackedAt !== null && budget !== null && now() - b.waitSlackedAt > budget;
       const slackReady = hasPerson && !skipped && !capped && (await slackAvailable());
       const base: Record<string, unknown> = { waitBudget: true, waitKind: wait.kind, waitRef: wait.ref, waitSince: b.waitSince };
+      // No person to DM (a `person` wait that is not a delegate escalation, or
+      // a review wait whose only reviewer is the owner or a bot): the Slack
+      // rung does not exist, and the wording must not name a phantom person.
+      if (!hasPerson) {
+        store.fileNeed({
+          bindingId: b.id,
+          kind: "decide",
+          url: wait.ref,
+          what: `The ${wait.kind} wait on ${wait.ref} is still open after a second budget.`,
+          how: "Choose what to do; Keep waiting resets the budget once.",
+          why: "The wait outlived two budgets, so it comes to the owner.",
+          data: { ...base, choices: [...WAIT_DECIDE_CHOICES] },
+          filedBy: "plugin",
+        });
+        return `The ${wait.kind} wait on ${wait.ref} outlived a second budget; the owner has a decide item.`;
+      }
       if (!slackReady || further) {
         // Rung 3, terminal: the owner pesters the person. It is always present,
         // and it is what the ladder falls to when Slack cannot send, the person
@@ -2265,7 +2281,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           what: `The ${wait.kind} wait on ${wait.ref} is still open after a second budget.`,
           how: "Choose what to do; Keep waiting resets the budget once.",
           why: "The wait outlived two budgets, so it comes to the owner.",
-          data: { ...base, choices: [...WAIT_DECIDE_CHOICES, ASK_ON_SLACK_CHOICE], waitSlackCandidates: candidates, waitSlackPersonKey: key },
+          data: { ...base, choices: [...WAIT_DECIDE_CHOICES, ASK_ON_SLACK_CHOICE], waitSlackCandidates: candidates, waitSlackPersonKey: key, waitSlackPersonLabel: slackPersonLabel(person) },
           filedBy: "plugin",
         });
         store.patch(b.id, { waitSlackedAt: now() });
