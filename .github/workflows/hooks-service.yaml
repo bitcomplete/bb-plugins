@@ -1,0 +1,94 @@
+name: hooks-service
+
+# CI and release for the standalone hooks service in hooks-service/. The
+# release runs on a push only: a path-filtered push to the default branch
+# publishes an image, and a hooks-service-v* tag publishes the image and a
+# binary release. Pull requests only test. Nothing here touches the plugins
+# under plugins/.
+on:
+  push:
+    branches: [main]
+    paths:
+      - hooks-service/**
+      - .github/workflows/hooks-service.yaml
+    tags:
+      - hooks-service-v*
+  pull_request:
+    paths:
+      - hooks-service/**
+      - .github/workflows/hooks-service.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hooks-service
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version-file: hooks-service/go.mod
+          cache-dependency-path: hooks-service/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  publish:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version-file: hooks-service/go.mod
+          cache-dependency-path: hooks-service/go.sum
+      - name: Build binary
+        working-directory: hooks-service
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X hooks-service/sentryx.release=${GITHUB_REF_NAME}" \
+            -o /tmp/hooks-service-linux-amd64 ./cmd/hooks-service
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          # ghcr.io/<owner>/hooks-service; the owner is the repository owner,
+          # never hardcoded, so a fork publishes under its own namespace.
+          images: ghcr.io/${{ github.repository_owner }}/hooks-service
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: hooks-service
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Release binary
+        if: startsWith(github.ref, 'refs/tags/hooks-service-v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: /tmp/hooks-service-linux-amd64
+          generate_release_notes: true

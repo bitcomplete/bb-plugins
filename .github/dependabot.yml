@@ -46,3 +46,14 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+
+  # The standalone hooks service is its own Go module.
+  - package-ecosystem: gomod
+    directory: "/hooks-service"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    groups:
+      go:
+        patterns: ["*"]
