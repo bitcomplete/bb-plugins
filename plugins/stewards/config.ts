@@ -559,6 +559,13 @@ export function zodMessage(error: z.ZodError): string {
   return error.issues.map((i) => `${i.path.length === 0 ? "" : `${i.path.join(".")}: `}${i.message}`).join("; ");
 }
 
+/** A parsed-YAML path as `a.b[0].c`, for naming a field in a problem line. */
+function pathText(path: readonly PropertyKey[]): string {
+  let out = "";
+  for (const key of path) out += typeof key === "number" ? `[${key}]` : out === "" ? String(key) : `.${String(key)}`;
+  return out;
+}
+
 /** The value at a parsed-YAML path, for naming the value a schema did not recognise. */
 function valueAtPath(root: unknown, path: readonly PropertyKey[]): unknown {
   let current: unknown = root;
@@ -575,29 +582,44 @@ function valueAtPath(root: unknown, path: readonly PropertyKey[]): unknown {
  * not know, an option a `z.enum` does not list, and a value a
  * `z.discriminatedUnion` has no branch for are all "this image's parser does
  * not know it": a newer image may, so the loader can say "unsupported until
- * restart" rather than read it as a typo. A missing field, a bad type and a
- * malformed value return null and keep the parse error's own wording.
+ * restart" rather than read it as a typo.
+ *
+ * Only a failure whose every issue is unrecognised is reported this way; a
+ * parse that also carries an ordinary failure (a missing field, a bad type, a
+ * malformed value) returns null, so the loader keeps the whole parse error and
+ * the ordinary failure is not dropped. Inside an `invalid_union` a branch
+ * counts only when all of its own issues are unrecognised, since the other
+ * branches always report the input as the wrong type.
  */
 export function unsupportedParse(error: z.ZodError, raw: unknown): string | null {
-  const walk = (issues: readonly z.core.$ZodIssue[], base: readonly PropertyKey[]): string | null => {
-    for (const issue of issues) {
-      const path = [...base, ...issue.path];
-      if (issue.code === "unrecognized_keys") return issue.keys.join(", ");
-      if (issue.code === "invalid_value") return String(valueAtPath(raw, path));
-      if (issue.code === "invalid_union") {
-        // A discriminated union with no matching branch carries the discriminator
-        // and its options and no nested issues; the value at its path is the one
-        // this image does not know.
-        if (issue.discriminator !== undefined && issue.errors.length === 0) return String(valueAtPath(raw, path));
-        for (const branch of issue.errors) {
-          const found = walk(branch, path);
-          if (found !== null) return found;
-        }
+  const one = (issue: z.core.$ZodIssue, base: readonly PropertyKey[]): string | null => {
+    const path = [...base, ...issue.path];
+    const where = pathText(path);
+    if (issue.code === "unrecognized_keys") return issue.keys.map((key) => `field ${JSON.stringify(where === "" ? key : `${where}.${key}`)}`).join(", ");
+    if (issue.code === "invalid_value") return where === "" ? `value ${JSON.stringify(valueAtPath(raw, path))}` : `value ${JSON.stringify(valueAtPath(raw, path))} for ${where}`;
+    if (issue.code === "invalid_union") {
+      // A discriminated union with no matching branch carries the discriminator
+      // and its options and no nested issues; the value at its path is the one
+      // this image does not know.
+      if (issue.discriminator !== undefined && issue.inclusive !== false && issue.errors.length === 0) return where === "" ? `value ${JSON.stringify(valueAtPath(raw, path))}` : `value ${JSON.stringify(valueAtPath(raw, path))} for ${where}`;
+      for (const branch of issue.errors) {
+        const found = all(branch, path);
+        if (found !== null) return found;
       }
     }
     return null;
   };
-  return walk(error.issues, []);
+  const all = (issues: readonly z.core.$ZodIssue[], base: readonly PropertyKey[]): string | null => {
+    if (issues.length === 0) return null;
+    const details: string[] = [];
+    for (const issue of issues) {
+      const detail = one(issue, base);
+      if (detail === null) return null;
+      details.push(detail);
+    }
+    return details.join(", ");
+  };
+  return all(error.issues, []);
 }
 
 export function parseProjectFile(text: string): Parsed<ProjectFile> {

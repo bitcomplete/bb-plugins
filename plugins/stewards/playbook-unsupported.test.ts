@@ -68,7 +68,24 @@ describe("an unsupported playbook value (BB-355)", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(/stewards\/playbooks\/linear-tickets\.md/u);
     expect(lines[0]).toContain("magic");
+    expect(lines[0]).toContain("deployment.carries[0].strategy.kind");
     expect(lines[0]).toMatch(/restarts onto a newer image/u);
+  });
+
+  it("keeps the whole parse error when an ordinary failure rides along", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    await t.hooks.loadConfig("p1", true);
+
+    // The unknown field and the bad duration fail in the same parse: the owner
+    // must still see the duration error, not only the unsupported line.
+    const mixed = unknownField(LINEAR_TICKETS).replace("requeue-default: 2d", "requeue-default: nope");
+    t.files[playbookPath("linear-tickets")] = mixed;
+    t.hooks.forgetConfigs();
+    const after = await t.hooks.loadConfig("p1", true);
+
+    expect(after!.problems.some((p) => p.includes("unsupported until restart"))).toBe(false);
+    expect(after!.problems.some((p) => p.includes("requeue-default"))).toBe(true);
+    expect(after!.problems.some((p) => p.includes("bindings keep running under the last good linear-tickets"))).toBe(true);
   });
 
   it("leaves a playbook that parses unaffected and updates the last good copy", async () => {

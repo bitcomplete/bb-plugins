@@ -2776,7 +2776,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
        * image; the last good copy is named when bindings keep running under it.
        */
       const unsupportedProblem = (file: string, detail: string, fallback: Playbook | null): string =>
-        `${file}: ${JSON.stringify(detail)} is unsupported until restart; it takes effect after the server restarts onto a newer image${fallback === null ? "" : ` (bindings keep running under the last good copy, version ${fallback.version})`}.`;
+        `${file}: ${detail} is unsupported until restart; it takes effect after the server restarts onto a newer image${fallback === null ? "" : ` (bindings keep running under the last good copy, version ${fallback.version})`}.`;
       /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
       const loadPlaybook = async (name: string, kind: BindingKind, required: boolean): Promise<Playbook | null> => {
         const text = texts.get(playbookPath(name)) ?? null;
