@@ -9425,6 +9425,15 @@ describe("doorbells and polling (BB-363)", () => {
     expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("github-watcher"))).toEqual([]);
   });
 
+  it("reports a starved linear poller as a warning, not a problem", async () => {
+    const t = await setup({ env: {} });
+    t.setLinearPoller({ starved: true, lastError: "Linear answered HTTP 429", nextPollAt: t.now() + 600_000, intervalMs: 300_000 });
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(check.lines).toContain("warning: linear: the poller is rate-limited (Linear answered HTTP 429); Linear is read again on its own backoff");
+    expect(check.lines).toContain("doorbells: polling every 5 minutes (no hooks service configured)");
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("linear"))).toEqual([]);
+  });
+
   it("names github-watcher's own poll interval in check when it answers", async () => {
     const t = await setup({ env: {} }, { sweepMinutes: "15" });
     t.setGithubPoller({ starved: false, lastError: null, nextPollAt: t.now() + 300_000, intervalMs: 300_000 });

@@ -47,10 +47,10 @@ someone else's; a parent issue is waiting on its sub-issues.
 
 Watching the same issue again is harmless. A thread can watch ten issues; a
 watch that has not fired in a week is forgotten, so watch again if you are
-still waiting. If the tool answers that watching is not available on this
-server (no `BB_HOOKS_URL`), tell the user you cannot be woken and will need
-to be asked again, or check the issue when the user next sends a message;
-do not poll.
+still waiting. On a server with no hooks service (`BB_HOOKS_URL` unset) the
+tool still works: it names the polling interval in its answer, and the
+plugin re-checks the watch on that timer. End the turn either way; do not
+poll. `linear_session_reply` and `@bb` mentions are hooks-only and say so.
 
 ## From a script
 
