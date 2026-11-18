@@ -177,13 +177,17 @@ const reviewFollowupPrompt = (item: QueueItem): string =>
     "Do not submit a GitHub review, approve, request changes, post a comment, resolve a thread, or push code. The human posts; you draft.",
   ].join("\n");
 
-function promptFor(item: QueueItem): string {
-  switch (item.rule) {
-    case "review-requested":
-      return `${reviewPrompt(item)}\n\n${draftInstructions([item])}`;
-    case "review-followup":
-      return `${reviewFollowupPrompt(item)}\n\n${draftInstructions([item])}`;
-  }
+function promptFor(item: QueueItem, agent: AgentModelChoice): string {
+  const body = item.rule === "review-requested" ? reviewPrompt(item) : reviewFollowupPrompt(item);
+  return `${body}\n\n${executionInstructions(agent)}\n\n${draftInstructions([item])}`;
+}
+
+/** Review subthreads follow the model chosen for the review, whatever other instructions prefer. */
+function executionInstructions(agent: AgentModelChoice): string {
+  return [
+    `Captured agent execution choice: ${JSON.stringify(agent)}`,
+    "If you delegate any part of this review to child threads or subagents, run every one with this exact provider, model, reasoning level, and service tier. This choice overrides model preferences in project instructions, skills, and review commands. Inspect the installed CLI or API before choosing its options; if it cannot preserve the choice, do that work in this thread.",
+  ].join("\n");
 }
 
 function draftInstructions(items: QueueItem[]): string {
@@ -196,7 +200,7 @@ function draftInstructions(items: QueueItem[]): string {
   ].join("\n");
 }
 
-function batchPrompt(items: QueueItem[]): string {
+function batchPrompt(items: QueueItem[], agent: AgentModelChoice): string {
   return [
     "Review these pull requests together from the configured project's default environment. Use `gh` to inspect every pull request, even when its repository has no local checkout.",
     ...items.flatMap((item) => [
@@ -215,6 +219,7 @@ function batchPrompt(items: QueueItem[]): string {
     "Call out coverage gaps and dependencies between pull requests.",
     "Do not post GitHub reviews or comments, approve or request changes on GitHub, or push code. Report in this thread for the human to act on.",
     "For follow-ups, identify the last submitted review's commit and compare it with the listed head. An unavailable baseline means an unknown delta; do not substitute the full PR diff.",
+    executionInstructions(agent),
     draftInstructions(items),
   ].join("\n");
 }
@@ -715,7 +720,7 @@ export default async function plugin(bb: BbPluginApi) {
 
       const thread = await bb.sdk.threads.spawn({
         projectId,
-        prompt: promptFor(item),
+        prompt: promptFor(item, agent),
         title: `Review ${item.repo}#${item.number} (${prSummary(item)})`,
         environment,
         pluginMetadata: { itemKey: item.key, repo: item.repo, number: item.number },
@@ -738,7 +743,7 @@ export default async function plugin(bb: BbPluginApi) {
       const agent = await reviewAgent(projectId, environment.hostId, agentModel);
       const thread = await bb.sdk.threads.spawn({
         projectId,
-        prompt: batchPrompt(selected),
+        prompt: batchPrompt(selected, agent),
         title: `Review ${selected.length} pull requests`,
         environment,
         pluginMetadata: { itemKeys: selected.map((item) => item.key) },
