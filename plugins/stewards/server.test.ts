@@ -4729,7 +4729,7 @@ describe("bb stewards init", () => {
     const t = await setup();
     t.threads.set("thr_me", { status: "active", archivedAt: null });
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
-    expect(t.writes.length).toBe(7);
+    expect(t.writes.length).toBe(8);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
   });
 });
@@ -4884,8 +4884,8 @@ describe("bb stewards survey and Set up stewards", () => {
     const before = t.writes.length;
     const second = await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
     expect(second.exitCode).toBe(0);
-    expect(second.stdout.match(/kept existing/gu)?.length).toBe(7);
-    expect(t.writes.length).toBe(before + 7);
+    expect(second.stdout.match(/kept existing/gu)?.length).toBe(8);
+    expect(t.writes.length).toBe(before + 8);
   });
 
   it("accepts the skill's hand-filled project.json and roles.json in check", async () => {
@@ -9350,7 +9350,7 @@ describe("the settings page", () => {
     const t = await setup();
     const empty = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
     expect(empty.projects).toMatchObject([{ name: "Acme", configured: true, repos: ["acme/web", "acme/bb"], problems: [], projectStewardThreadId: null, stewards: [] }]);
-    expect(empty.projects[0]!.playbooks.map((p) => p.kind)).toEqual(["ticket", "pr", "review"]);
+    expect(empty.projects[0]!.playbooks.map((p) => p.kind)).toEqual(["ticket", "ticket", "pr", "review"]);
 
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");

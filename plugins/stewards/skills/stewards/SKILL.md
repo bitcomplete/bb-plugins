@@ -6,14 +6,16 @@ description: Work as a steward (a long-lived thread bound to a Linear ticket or 
 # Stewards
 
 The `stewards` plugin binds a long-lived thread, a **steward**, to a Linear
-ticket or a GitHub pull request. The steward manages it until it is done, as
-the user, by a **playbook** kept in the project's `.bb`. One **project
-steward** per project sits above all of them.
+ticket, a GitHub pull request or a **local ticket**, or an ops target. The
+steward manages it until it is done, as the user, by a **playbook** kept in
+the project's `.bb`. One **project steward** per project sits above all of
+them.
 
 | Binding | Made when | Playbook |
 |---|---|---|
 | `ticket` | the label (default `bb-managed`) is on a Linear issue in a listed team and this server's Linear login is an assignee, or on a GitHub issue in a listed repo and this server's GitHub login is an assignee | `linear-tickets` on Linear, `github-issues` on GitHub |
 | `ticket` (watch) | an issue carrying the adoption label and assigned to this server matches a `tickets` watch in `project.json` | the watch's playbook |
+| `ticket` (local) | a local ticket in the project's store is Ready or later and not terminal | `local-tickets`, or the playbook the ticket named at filing (`initiative`) |
 | `pr` | the label is on a pull request in one of the project's repos and this server's GitHub login is its author | `github-prs` |
 | `pr` (watch) | a pull request matches a `pulls` watch on this server's `roles.json` role, with no label needed (BB-164) | the watch's playbook |
 | `review` | a teammate opens, or marks ready, a pull request in one of the project's repos and this server's GitHub login is a requested reviewer (checked once, at adoption) | `github-reviews` |
@@ -27,6 +29,19 @@ unassigning an adopted ticket releases the old server with one stop turn and
 stops its workers; the new assignee's server adopts it. The rule is the same
 with or without a `roles.json` project steward, and a login that cannot be
 read adopts nothing and shows one problem line.
+
+**Local tickets.** A third source, `local`, keeps a ticket in the stewards
+store instead of Linear or GitHub. `ticket_file { unit: "local" }` files one
+(the prefix is `LOCAL`, or the project's `localPrefix`), and it is adopted by
+state rather than by label: Backlog is parked, Ready or later non-terminal is
+adopted, and `bb stewards detach <key>` sets it back to Backlog (Ready again
+resumes the same binding and thread). A local ticket has no labels and no
+priority, and its children are local tickets. A pull request's body cites its
+key (`LOCAL-1`) so the merge gate resolves the local spec's approval exactly
+as it does a Linear key. The owner's comments entered on the Stewards page and
+the owner's description edits form the spec; a `ticket_comment` or
+`bb stewards tickets comment` is agent-written and never counts as the owner's
+word.
 
 ## If you are a steward
 

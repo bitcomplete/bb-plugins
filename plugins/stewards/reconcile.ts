@@ -10,7 +10,7 @@ import { isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js"
 import type { Deployments } from "./deploy.js";
 import { isMarkerComment, latestReviewMarker, reviewMarker } from "./gate.js";
 import { gateState, reportedItem } from "./ready-gate.js";
-import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
+import type { EntitySnapshot, SnapshotComment, Source } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, ReadyState, StatusRecord, Worker } from "./store.js";
 
 /**
@@ -96,8 +96,9 @@ export function productGateOptions(b: Pick<Binding, "kind" | "ready">, pull?: En
  * the user's rather than a steward, worker or the project steward; without it
  * only the steward's own comments count.
  */
-export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): boolean =>
-  c.signedBy !== null && /^\s*(\*\*)?spec\b/iu.test(c.body) && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
+export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): boolean =>
+  /^\s*(\*\*)?spec\b/iu.test(c.body) &&
+  ((c.signedBy !== null && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false))) || (c.signedBy === null && owner !== undefined && owner !== null && c.author.toLowerCase() === owner.toLowerCase()));
 
 /**
  * What an approval is pinned to: the description and the spec comments. The
@@ -117,14 +118,14 @@ export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DE
  * separator. `specHash` hashes exactly this, and BB-249 stores it as the
  * approval's `approvedText` so a later edit can be diffed against it.
  */
-export function specText(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
+export function specText(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): string {
   const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
-  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).map((c) => `${c.id}\n${c.body}`);
+  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread, owner)).map((c) => `${c.id}\n${c.body}`);
   return [description, ...specs].join("\n\u0000\n");
 }
 
-export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
-  return createHash("sha256").update(specText(entity, stewardThreadId, isUserThread)).digest("hex").slice(0, 16);
+export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): string {
+  return createHash("sha256").update(specText(entity, stewardThreadId, isUserThread, owner)).digest("hex").slice(0, 16);
 }
 
 /**
@@ -420,10 +421,10 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
 
   // A spec comment the steward just posted is its own doing; it only matters
   // once an approval is pinned to the spec it changes.
-  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread)).map((c) => c.id));
-  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread) && !beforeSpecs.has(c.id));
+  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread, ctx.owner)).map((c) => c.id));
+  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread, ctx.owner) && !beforeSpecs.has(c.id));
   if (addedSpecs.length > 0) {
-    const byUser = addedSpecs.some((c) => c.signedBy !== null && (ctx.userThread?.(c.signedBy) ?? false));
+    const byUser = addedSpecs.some((c) => (c.signedBy !== null && (ctx.userThread?.(c.signedBy) ?? false)) || (c.signedBy === null && ctx.owner !== undefined && ctx.owner !== null && c.author.toLowerCase() === ctx.owner.toLowerCase()));
     // A spec comment the user wrote is news on its own: it carries its own
     // approval when the approver is `user`, and when it is the project steward
     // the steward should know the user authored it, not wait on them.
@@ -515,6 +516,8 @@ export type ObservedDiffContext = {
   /** The stage an entity state maps to in this binding's playbook, for the build/review move (rule 1). */
   stageOf?: (state: string) => string | null;
   userThread?: (threadId: string) => boolean;
+  /** The entity's own login, so an owner-entered local comment counts as the user's spec comment (BB-361). */
+  owner?: string | null;
   /** An open need or `user` escalation: the user is being asked, so own-PR work is not quiet (BB-203). */
   userWaiting?: boolean;
 };
@@ -811,6 +814,15 @@ export type Lifecycle =
 const hasLabel = (entity: EntitySnapshot, label: string) => entity.labels.some((l) => l.toLowerCase() === label.toLowerCase());
 
 /**
+ * The adoption predicate, source-aware (BB-361): linear and github adopt a
+ * labelled entity, the local source adopts by state -- Backlog is parked,
+ * anything else non-terminal is adopted. The local source ignores the label it
+ * is handed.
+ */
+export const adoptedBySource = (source: Source, entity: EntitySnapshot, label: string): boolean =>
+  source === "local" ? entity.state.toLowerCase() !== "backlog" : hasLabel(entity, label);
+
+/**
  * Whether this server's login is one of the entity's assignees. `owner` null
  * means the login could not be read, and nothing is claimed: a ticket that
  * cannot be checked is never released (BB-115, limit a).
@@ -839,12 +851,13 @@ const assignedTo = (entity: EntitySnapshot, owner: string | null): boolean =>
  * ended binding ended here so it cannot reopen into a second open binding
  * while the new project holds it (BB-318).
  */
-export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean; owner?: string | null; projectWatches?: boolean } = {}): Lifecycle {
+export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean; owner?: string | null; projectWatches?: boolean; source?: Source } = {}): Lifecycle {
   const terminal = isTerminal(playbook, entity.state);
   // A review binding is not labelled; a binding the plugin adopts itself (a
   // dependency bot's pull request) has no label to hold it, so its label is
-  // not required either.
-  const labelled = binding.kind === "review" || opts.labelRequired === false || hasLabel(entity, label);
+  // not required either. The local source adopts by state instead of a label
+  // (BB-361).
+  const labelled = binding.kind === "review" || opts.labelRequired === false || (opts.source === "local" ? adoptedBySource("local", entity, label) : hasLabel(entity, label));
   const mine = assignedTo(entity, opts.owner ?? null);
   if (binding.endedAt !== null) {
     if (terminal || !labelled || binding.manualDetach) return { kind: "stay-ended" };
@@ -853,7 +866,7 @@ export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason
     // team now owns the entity (BB-318).
     if (opts.projectWatches === false) return { kind: "stay-ended" };
     if (binding.endReason === "terminal") return { kind: "reopen", why: `reopened: now ${entity.state}` };
-    if (binding.endReason === "detach") return { kind: "reopen", why: `the ${label} label is back` };
+    if (binding.endReason === "detach") return { kind: "reopen", why: opts.source === "local" ? `the ticket is ${entity.state} again` : `the ${label} label is back` };
     // A ticket released on reassignment comes back when it is assigned here
     // again; one still assigned elsewhere stays ended.
     if (binding.endReason === "reassigned") return mine ? { kind: "reopen", why: "reassigned to this server" } : { kind: "stay-ended" };

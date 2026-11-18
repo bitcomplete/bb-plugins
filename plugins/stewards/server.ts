@@ -24,6 +24,7 @@ import {
   DEFAULT_FOLLOW_THROUGH_MS,
   DEFAULT_GITHUB_TICKET_PLAYBOOK,
   DEFAULT_LABEL,
+  DEFAULT_LOCAL_PREFIX,
   DEFAULT_MAX_WAIT_MS,
   DEFAULT_PLAYBOOKS,
   DEPENDENCY_BOTS,
@@ -31,6 +32,7 @@ import {
   DEPS_PRS_PLAYBOOK,
   ESCALATION_KINDS,
   KINDS,
+  LOCAL_TICKETS_PLAYBOOK,
   PROJECT_FILE,
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
@@ -108,7 +110,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedTo, type EscalationsContext } from "./escalations.js";
@@ -133,7 +135,8 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { backlogTriageParamsSchema, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
-import { TICKET_TOOL_NAMES, createTicketWatches, registerTicketTools, ticketUnits } from "./ticket-tools.js";
+import { TICKET_TOOL_NAMES, createTicketWatches, formatTicket, registerTicketTools, ticketUnits } from "./ticket-tools.js";
+import { createLocalSource, isLocalState, LOCAL_PARKED, LOCAL_STATES, localStateType, type LocalSource, type LocalTicket } from "./local-source.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, newId, type Assumption, type Binding, type DepsDecision, type DivergenceRow, type Escalation, type Fingerprint, type PlaybookRefresh, type StandupNoteRow, type StandupRow, type StandupTranscriptEntry, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type WaitDivergenceRow, type WakeRetry, type Worker } from "./store.js";
 import { hasLessonAnchor, landLessonInstruction, lessonAnchor, lessonLandingMark, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -148,7 +151,7 @@ import { waitingOnNamesWorker } from "./sidebar.js";
 import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 import { WAIT_REFUSAL_MESSAGE, waitInputSchema, waitPhrase, waitSchema, validateWait, type Wait, type WaitContext, type WaitKind } from "./wait.js";
 import { PROJECT_CHANGED } from "./channels.js";
-import { LINEAR_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
+import { LINEAR_TICKETS, LOCAL_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
@@ -804,6 +807,28 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().min(1).max(100), enabled: z.boolean() }),
     output: z.object({ ok: z.boolean(), message: z.string(), enabled: z.boolean() }),
   },
+  // BB-361: the local ticket detail view. The description editor and state
+  // control, and the owner's comment box, which is the one path an owner's
+  // local comment counts as the user's own spec words.
+  stewardsLocalTicket: {
+    input: z.object({ key: z.string().min(1).max(300) }),
+    output: z.object({
+      ticket: z.object({ key: z.string(), title: z.string(), description: z.string(), state: z.string(), parent: z.string().nullable(), playbook: z.string(), createdAt: z.number(), updatedAt: z.number() }).nullable(),
+      comments: z.array(z.object({ id: z.string(), author: z.string(), owner: z.boolean(), body: z.string(), createdAt: z.number() })),
+    }),
+  },
+  stewardsLocalEditDescription: {
+    input: z.object({ key: z.string().min(1).max(300), description: z.string().max(50_000) }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
+  stewardsLocalComment: {
+    input: z.object({ key: z.string().min(1).max(300), body: z.string().min(1).max(20_000) }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
+  stewardsLocalSetState: {
+    input: z.object({ key: z.string().min(1).max(300), state: z.string().min(1).max(60) }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
   // The Stewards page's "Set up stewards": spawn an ordinary thread with the onboarding skill.
   stewardsOnboard: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
@@ -1273,6 +1298,10 @@ type ProjectConfig = {
   playbooks: Partial<Record<BindingKind, Playbook>>;
   /** The ticket playbooks by source (BB-234): a project may carry both `linear-tickets` and `github-issues`. */
   ticketPlaybooks: Partial<Record<Source, Playbook>>;
+  /** Every loaded ticket playbook by name, so a local ticket can name `initiative` or another (BB-361). */
+  ticketByName: Map<string, Playbook>;
+  /** BB-361: the local ticket source's key prefix for this project, or the `LOCAL` default. */
+  localPrefix: string;
   /** The dependency watch's alert playbook, when it parses. */
   depsAlerts: Playbook | null;
   /** The Dependabot pull request playbook, when it parses. */
@@ -1680,7 +1709,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ref = parsePullRef(key);
       if (ref !== null) return config.repos.some((repo) => lc(repo) === lc(ref.repo)) ? "github" : null;
       const team = key.split("-")[0] ?? "";
-      return config.file.linear.teams.some((t) => lc(t) === lc(team)) ? "linear" : null;
+      if (config.file.linear.teams.some((t) => lc(t) === lc(team))) return "linear";
+      // BB-361: a key carrying the project's local prefix is a local ticket.
+      return lc(team) === lc(config.localPrefix) ? "local" : null;
     }
 
     /** Whether a key is one of the project's own entities: a binding, or a key in its teams and repos. */
@@ -2168,13 +2199,99 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
+    // BB-361: the local source is served by this plugin itself, so
+    // `sourceRpc("local", …)` never leaves the process. `localSource` is
+    // assigned once the store and config cache exist (it reads both), and a
+    // call before then is a programming error, not a source failure.
+    let localSource: LocalSource | null = null;
     const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> => {
       // One GitHub/Linear source call, counted while a reconcile or wake is
       // measured (BB-297). `snapshot` and `linkedPulls` go through here, so a
       // ticket's look counts each entity it reads.
       readCounts.sourceCall();
+      if (source === "local") return localSourceRpc(method, input, outputSchema);
       return rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
     };
+    /** One call to the in-process local source, with the contract's output parsed. */
+    async function localSourceRpc<T>(method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> {
+      const src = localSource;
+      if (src === null) throw new Error("the local ticket source is not ready yet");
+      const parsed = (input ?? {}) as Record<string, unknown>;
+      let out: unknown;
+      switch (method) {
+        case "sourceSnapshot":
+          out = { snapshot: src.snapshot(String(parsed.id)) };
+          break;
+        case "sourceAdoptable":
+          out = { viewer: null, entities: src.adoptable((parsed.units as string[]) ?? [], Number(parsed.limit ?? 100)), errors: [] };
+          break;
+        case "sourceSearchIssues":
+          out = { issues: src.search((parsed.units as string[]) ?? [], String(parsed.query ?? ""), Number(parsed.limit ?? 20)), unsupported: false, errors: [] };
+          break;
+        case "sourceCreateIssue":
+          if (((parsed.labels as string[]) ?? []).length > 0) throw new Error("a local ticket has no labels");
+          if (parsed.priority !== undefined) throw new Error("a local ticket has no priority");
+          out = src.create(
+            {
+              unit: String(parsed.unit),
+              title: String(parsed.title),
+              description: String(parsed.description),
+              ...(parsed.playbook === undefined ? {} : { playbook: String(parsed.playbook) }),
+              ...(parsed.parent === undefined ? {} : { parent: String(parsed.parent) }),
+              ...(parsed.assignee === undefined ? {} : { assignee: String(parsed.assignee) }),
+            },
+            null,
+          );
+          break;
+        case "sourceUpdateIssue":
+          out = src.update({
+            key: String(parsed.key),
+            ...(parsed.state === undefined ? {} : { state: String(parsed.state) }),
+            ...(parsed.parent === undefined ? {} : { parent: parsed.parent === null ? null : String(parsed.parent) }),
+            addLabels: (parsed.addLabels as string[]) ?? [],
+            ...(parsed.priority === undefined ? {} : { priority: String(parsed.priority) }),
+            ...(parsed.assignee === undefined ? {} : { assignee: String(parsed.assignee) }),
+            relations: (parsed.relations as unknown[]) ?? [],
+          });
+          break;
+        case "sourceComment":
+          out = src.comment(String(parsed.key), String(parsed.body));
+          break;
+        case "sourceValidate":
+          out = { viewer: null, units: ((parsed.units as string[]) ?? []).map((unit) => ({ unit, found: true, labelFound: true, missingStates: ((parsed.states as string[]) ?? []).filter((s) => !isLocalState(s)) })), mine: [], error: null };
+          break;
+        case "sourceEnsureLabel":
+          out = { results: ((parsed.units as string[]) ?? []).map((unit) => ({ unit, status: "existed", error: null })) };
+          break;
+        case "sourceSetInterest":
+          out = { ok: true };
+          break;
+        case "sourceBacklog":
+          out = { issues: [], unsupported: true, truncated: false, errors: [] };
+          break;
+        case "sourceDependabotAlerts":
+          out = { viewer: null, alerts: [], errors: ["Dependabot alerts are read from github, not local"], graphEmpty: [] };
+          break;
+        case "sourceDeployments":
+          out = { deployments: [], error: "deployments are read from github, not local" };
+          break;
+        case "sourceFileAtRef":
+          out = { content: null, error: "files are read from github, not local" };
+          break;
+        case "sourceLatestCommit":
+          out = { sha: null, committedAt: null, error: "commits are read from github, not local" };
+          break;
+        case "sourceWorkflowRun":
+          out = { run: null, error: "workflow runs are read from github, not local" };
+          break;
+        case "sourceCompare":
+          out = { status: null, error: "commits are compared on github, not local" };
+          break;
+        default:
+          throw new Error(`the local ticket source does not serve ${method}`);
+      }
+      return outputSchema.parse(out);
+    }
     // BB-360: the tickets a thread asked to watch (`ticket_watch`). One KV row
     // per watcher; the ring path reads it and wakes the thread.
     const ticketWatches = createTicketWatches(bb.storage.kv);
@@ -2654,6 +2771,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     const configErrors = new Map<string, string>();
 
+    // BB-361: the in-process local ticket source. It reads the project's
+    // `localPrefix` and owner from the config cache, rings the reconcile loop
+    // on every write, and publishes the project signal so the app refetches.
+    localSource = createLocalSource({
+      db,
+      now,
+      ring: (key) => {
+        invalidateEntity("local", key);
+        debounce(`ring:local:${lc(key)}`, () => serial(`ring:local:${lc(key)}`, () => onRing("local", key)));
+      },
+      changed: (projectId) => {
+        sidebarCache.delete(projectId);
+        bb.realtime.publish(PROJECT_CHANGED, { projectId });
+      },
+      prefixFor: (projectId) => configs.get(projectId)?.value?.localPrefix ?? DEFAULT_LOCAL_PREFIX,
+      ownerFor: (projectId) => {
+        const c = configs.get(projectId)?.value ?? null;
+        return c === null ? null : (c.linearLogin ?? c.githubLogin);
+      },
+    });
+
     /** The RPC-backed multi-repo source for one project: the three RPCs as they always were. */
     function multiRepoSourceFor(projectId: string): ProjectSource {
       return multiRepoSource({
@@ -2932,7 +3070,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // `playbookFor(config, "ticket", source)` picks by source.
       const explicitTicket = file.playbooks.ticket ?? null;
       const ticketCandidates = explicitTicket !== null ? [explicitTicket] : [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK];
-      const ticketExtras = explicitTicket !== null ? [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK].filter((n) => n !== explicitTicket) : [];
+      // BB-361: `local-tickets` is shipped as a built-in default, so it is
+      // always an extra (never required): a project that has not written its
+      // own copy runs the built-in one, and one that has overrides it.
+      const ticketExtras = [...(explicitTicket !== null ? [DEFAULT_PLAYBOOKS.ticket, DEFAULT_GITHUB_TICKET_PLAYBOOK].filter((n) => n !== explicitTicket) : []), LOCAL_TICKETS_PLAYBOOK];
       // The playbooks a role's declared pull watches name (BB-164). They are
       // read with the rest so one `.bb` read serves every playbook, and parsed
       // into `watchPlaybooks` below.
@@ -2947,7 +3088,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // `unconfigured` only when that file itself is gone). No `check` problem
       // is reported for a removed watch's playbook.
       const adoptedTicketNames = new Set<string>();
-      for (const b of store.open(projectId)) if (b.kind === "ticket" && b.adoptedBy !== null) adoptedTicketNames.add(b.playbook);
+      for (const b of store.open(projectId)) if (b.kind === "ticket" && (b.adoptedBy !== null || b.source === "local")) adoptedTicketNames.add(b.playbook);
+      // BB-361: a local ticket names its playbook at filing, and the file must
+      // be loaded even before the binding exists, so `initiative.md` (or any
+      // other ticket playbook a local ticket names) is read here.
+      for (const t of localSource?.list(projectId) ?? []) adoptedTicketNames.add(t.playbook);
       const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames, ...ticketWatchNames, ...adoptedTicketNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
@@ -2961,7 +3106,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         `${file}: ${detail} is unsupported until restart; it takes effect after the server restarts onto a newer image${fallback === null ? "" : ` (bindings keep running under the last good copy, version ${fallback.version})`}.`;
       /** Parse one playbook, keeping the last good copy on a failure; null when it is missing (and not required) or unreadable. */
       const loadPlaybook = async (name: string, kind: BindingKind, required: boolean): Promise<Playbook | null> => {
-        const text = texts.get(playbookPath(name)) ?? null;
+        // BB-361: the built-in `local-tickets` playbook stands in when the
+        // project has not written its own copy; a written copy overrides it.
+        const text = texts.get(playbookPath(name)) ?? (name === LOCAL_TICKETS_PLAYBOOK ? LOCAL_TICKETS : null);
         if (text === null) {
           if (required) problems.push(`${playbookPath(name)} does not exist`);
           return null;
@@ -3002,9 +3149,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (p !== null) loaded.push(p);
         }
         // The configured/default playbook wins its source; an extra only
-        // fills the other source.
+        // fills the other source. BB-361: `local` is a ticket source too.
         for (const p of loaded) {
-          if ((p.source === "linear" || p.source === "github") && ticketPlaybooks[p.source] === undefined) ticketPlaybooks[p.source] = p;
+          if ((p.source === "linear" || p.source === "github" || p.source === "local") && ticketPlaybooks[p.source] === undefined) ticketPlaybooks[p.source] = p;
         }
         // The playbook `config.playbooks.ticket` names for display: the
         // tracked source's default when it loaded, else whichever did.
@@ -3164,7 +3311,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // that no longer exists, or no stamp at all (unknown origin). Warnings
       // never fail the check; a binding keeps running exactly as before.
       warnings.push(...templateWarnings(loadedPlaybooks, templateHashes()));
-      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, ticketPlaybooks, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
+      const ticketByName = new Map<string, Playbook>();
+      for (const p of Object.values(ticketPlaybooks)) if (p !== undefined) ticketByName.set(p.name, p);
+      // A local ticket may name any loaded ticket playbook (`initiative`, say),
+      // not only one whose own `source` is local.
+      for (const p of watchPlaybooks.values()) if (p.kind === "ticket") ticketByName.set(p.name, p);
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, ticketPlaybooks, ticketByName, localPrefix: file.localPrefix ?? DEFAULT_LOCAL_PREFIX, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -3313,9 +3465,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return (await configuredProjects(force, projects)).filter((c) => c.enabled);
     }
 
-    const playbookFor = (config: ProjectConfig, kind: BindingKind, source?: Source): Playbook | null => {
+    const playbookFor = (config: ProjectConfig, kind: BindingKind, source?: Source, named?: string | null): Playbook | null => {
       // A ticket playbook is chosen by source (BB-234): a project may carry
-      // both `linear-tickets` and `github-issues`.
+      // both `linear-tickets` and `github-issues`. A local ticket names its own
+      // playbook at filing (BB-361), defaulting to the built-in `local-tickets`.
+      if (kind === "ticket" && source === "local") return config.ticketByName.get(named ?? LOCAL_TICKETS_PLAYBOOK) ?? config.ticketPlaybooks.local ?? null;
       if (kind === "ticket" && source !== undefined) return config.ticketPlaybooks[source] ?? null;
       return config.playbooks[kind] ?? null;
     };
@@ -3371,13 +3525,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * deps-alerts playbook; a pull request or ticket a watch adopted uses the
      * playbook its watch named; everything else uses its kind's playbook.
      */
-    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId" | "adoptedBy" | "source">): Playbook | null {
+    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId" | "adoptedBy" | "source"> & { lastSnapshot?: Binding["lastSnapshot"] }): Playbook | null {
       if (b.kind === "ops") {
         const target = parseOpsTargetKey(b.entityId);
         if (target?.kind === "dependabot") return config.depsAlerts;
       }
       if (b.kind === "pr" && adoptedByWatch(config, b) !== null) return playbookForWatchName(config, b.playbook);
       if (b.kind === "ticket" && b.adoptedBy !== null) return ticketWatchPlaybook(config, b.playbook);
+      // BB-361: a local ticket reads the playbook it named at filing from its
+      // snapshot (or the binding, before the first look).
+      if (b.kind === "ticket" && b.source === "local") return playbookFor(config, "ticket", "local", b.lastSnapshot?.entity.playbook ?? b.playbook);
       return playbookFor(config, b.kind, b.source === "ops" ? undefined : b.source);
     }
 
@@ -4709,10 +4866,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- the reconcile loop ------------------------------------------------------------------
 
     /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
-    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId));
+    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.viewer);
 
     /** The text a binding's approval pins, stored as `approvedText` so BB-249 can diff a later edit against it. */
-    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId));
+    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.viewer);
 
     /** The escalation-routing helpers bound to this server's store and wakes (escalations.ts). */
     const escalationsCtx: EscalationsContext = { store, scheduleReconcile, wakeProject };
@@ -5491,13 +5648,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Linear team. Only a Linear ticket is checked; a GitHub repo is in one
       // project, so the same bug does not arise there.
       const projectWatches = entity.source === "linear" ? config.file.linear.teams.some((t) => lc(t) === lc(entity.unit)) : undefined;
-      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner, ...(projectWatches === undefined ? {} : { projectWatches }) });
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: adoptedByWatch(config, b) === null, owner, source: entity.source, ...(projectWatches === undefined ? {} : { projectWatches }) });
       // A binding with no steward thread is still awaiting adoption: a first
       // wake lost to a transient read is retried on the next reconcile, as the
       // ops, deps and sentry paths already do (BB-92).
       let reason: WakeReason | null = force ?? (b.threadId === null ? "adopted" : null);
       if (life.kind === "stay-ended") {
-        const labelled = b.kind === "review" || adoptedByWatch(config, b) !== null || hasLabel(entity, config.file.label);
+        const labelled = b.kind === "review" || adoptedByWatch(config, b) !== null || adoptedBySource(entity.source, entity, config.file.label);
         signalNeedActionability(b, observed);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
         decline(b, "stay-ended");
@@ -5654,7 +5811,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: (threadId) => isUserThread(approvalsCtx, threadId) });
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: (threadId) => isUserThread(approvalsCtx, threadId), owner: observed.entity.viewer });
       changes.push(...fresh);
       // BB-248: a label that changes the phase with no state change is news
       // on its own; a state move already carries its own actionable line. The
@@ -7313,7 +7470,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- adoption ------------------------------------------------------------------------------
 
     const projectFor = (configs: ProjectConfig[], entity: Pick<EntitySnapshot, "source" | "unit">) =>
-      configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null;
+      entity.source === "local"
+        ? (configs.find((c) => c.projectId === entity.unit) ?? null)
+        : (configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null);
 
     /** Whether one glob (or the bot logins on the synthesized watch) matches a value, ignoring case. */
     function watchPatternMatches(pattern: string | string[], value: string): boolean {
@@ -7406,10 +7565,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function adoptionKind(
       config: ProjectConfig,
-      e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string; title?: string | null; branch?: string | null; files?: string[]; assignees?: string[]; requestedReviewers?: string[] },
+      e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string; title?: string | null; branch?: string | null; files?: string[]; assignees?: string[]; requestedReviewers?: string[]; playbook?: string },
       viewer: string | null,
     ): BindingKind | null {
       const labelled = e.labels.some((l) => lc(l) === lc(config.file.label));
+      if (e.source === "local") {
+        // BB-361: a local ticket is adopted by state, not by label. Backlog is
+        // parked and a terminal state is over; anything else is adopted, under
+        // the playbook the ticket named at filing.
+        if (e.state.toLowerCase() === LOCAL_PARKED.toLowerCase()) return null;
+        const playbook = playbookFor(config, "ticket", "local", e.playbook);
+        if (playbook === null || isTerminal(playbook, e.state)) return null;
+        return "ticket";
+      }
       if (e.source === "linear") {
         const playbook = playbookFor(config, "ticket", "linear");
         if (!labelled || playbook === null || isTerminal(playbook, e.state)) return null;
@@ -7505,14 +7673,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Only an open binding claims the entity. An ended binding in another
       // project (its team moved away) must not block adoption here (BB-318).
       if (store.openByEntity(entity.source, entity.id) !== null) return null;
-      const full = { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [], title: entity.title, branch: entity.pull?.head ?? null, files: entity.pull?.files };
+      const full = { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [], title: entity.title, branch: entity.pull?.head ?? null, files: entity.pull?.files, playbook: entity.playbook };
       const kind = adoptionKind(config, full, entity.viewer);
       if (kind === null) return null;
       // BB-246: once adoption says ticket, a ticket watch (if any) chooses the
       // playbook; the pull watches only apply to a pull request.
-      const ticketWatch = kind === "ticket" ? matchTicketWatch(config, entity) : null;
+      const ticketWatch = kind === "ticket" && entity.source !== "local" ? matchTicketWatch(config, entity) : null;
       const watch = kind === "pr" ? matchPullWatch(config, { unit: entity.unit, title: entity.title, branch: entity.pull?.head ?? null, author: entity.author, files: entity.pull?.files }) : null;
-      const playbook = ticketWatch !== null ? ticketWatchPlaybook(config, ticketWatch.playbook) : watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
+      const playbook = kind === "ticket" && entity.source === "local" ? playbookFor(config, "ticket", "local", entity.playbook) : ticketWatch !== null ? ticketWatchPlaybook(config, ticketWatch.playbook) : watch !== null ? pullWatchPlaybook(config, watch) : playbookFor(config, kind, entity.source);
       if (playbook === null) return null;
       // Both sources nest: a GitHub issue with a managed parent gets its
       // `parentBindingId` like a Linear one (BB-244).
@@ -7776,6 +7944,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       await ask("linear", config.file.linear.teams);
       await ask("github", config.repos);
+      // BB-361: the local source's unit is the project itself.
+      await ask("local", [config.projectId]);
       candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       // The digest's orphan list: every labelled ticket nobody is assigned.
       // Only Linear candidates are read for it; the per-pass cap still bounds
@@ -10873,7 +11043,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               out.push({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null, source: null });
               continue;
             }
-            const loaded = (["linear", "github"] as const).filter((s) => config.ticketPlaybooks[s] !== undefined);
+            const loaded = (["linear", "github", "local"] as const).filter((s) => config.ticketPlaybooks[s] !== undefined);
             if (loaded.length === 0) out.push({ kind, name: playbookNameFor(config.file, kind), version: null, source: null });
             else for (const source of loaded) out.push({ kind, name: config.ticketPlaybooks[source]!.name, version: config.ticketPlaybooks[source]!.version, source });
           }
@@ -10957,6 +11127,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsSetProjectEnabled({ projectId, enabled }) {
         return setProjectEnabledForUser(projectId, enabled);
+      },
+      // BB-361: the local ticket detail view. Reads go to the in-process local
+      // source; the owner's comment and description edit are the page's own
+      // path, and a plugin caller is refused so no agent can forge them.
+      async stewardsLocalTicket({ key }) {
+        const t = localSource?.get(key) ?? null;
+        if (t === null) return { ticket: null, comments: [] };
+        return {
+          ticket: { key: t.id, title: t.title, description: t.description, state: t.state, parent: t.parentId, playbook: t.playbook, createdAt: t.createdAt, updatedAt: t.updatedAt },
+          comments: localSource!.comments(t.id).map((c) => ({ id: c.id, author: c.author, owner: c.threadId === null, body: c.body, createdAt: c.createdAt })),
+        };
+      },
+      async stewardsLocalEditDescription({ key, description }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a local ticket's description is edited on the Stewards page");
+        localSource!.editDescription(key, description);
+        return { ok: true, message: `Saved ${key}.` };
+      },
+      async stewardsLocalComment({ key, body }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("a local ticket's owner comment is entered on the Stewards page");
+        const t = localSource?.get(key) ?? null;
+        if (t === null) return { ok: false, message: `No local ticket ${key}.` };
+        const config = await loadConfig(t.projectId);
+        const owner = config?.linearLogin ?? config?.githubLogin ?? "owner";
+        localSource!.ownerComment(key, body, owner);
+        return { ok: true, message: `Commented on ${key}.` };
+      },
+      async stewardsLocalSetState({ key, state }) {
+        const result = localSource!.setState(key, state);
+        return { ok: true, message: `${key}: ${result.changed.join("; ") || "no change"}.` };
       },
       async stewardsOnboard({ projectId }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("Set up stewards is started from the Stewards page");
@@ -12398,13 +12597,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // are one thin dispatch over the source contract by key shape; the watch
     // registry is the one piece that is the plugin's own, woken by the ring
     // path.
+    /**
+     * BB-361: whether the newest turn in a thread is the owner's own message.
+     * A plain client turn is the owner's; the plugin's own wake, or another
+     * plugin forwarding someone else's text (a Slack participant), is not.
+     * Unreadable fails closed, so a local ticket never moves to Ready on an
+     * uncertain turn.
+     */
+    async function ownerStartedTurn(threadId: string): Promise<boolean> {
+      try {
+        const rows = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "desc", limit: "1" });
+        const data = rows[0]?.data as { initiator?: string; originPluginId?: string | null } | undefined;
+        return data !== undefined && data.initiator === "user" && (data.originPluginId === null || data.originPluginId === undefined);
+      } catch {
+        return false;
+      }
+    }
+
     registerTicketTools(bb, {
       sourceRpc,
       snapshot,
       project: async (projectId) => {
         const config = await loadConfig(projectId);
-        return config === null ? null : { units: ticketUnits(config.file, config.repos), viewer: { linear: config.linearLogin, github: config.githubLogin } };
+        return config === null ? null : { units: ticketUnits(config.file, config.repos, config.projectId), viewer: { linear: config.linearLogin, github: config.githubLogin }, localPrefix: config.localPrefix };
       },
+      ownerTurn: ownerStartedTurn,
       watches: ticketWatches,
       pushInterest,
       log: (message) => bb.log.warn(`stewards: ${message}`),
@@ -14786,13 +15003,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const linearTicket = config.ticketPlaybooks.linear ?? null;
       const githubTicket = config.ticketPlaybooks.github ?? null;
+      const localTicket = config.ticketPlaybooks.local ?? null;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
       lines.push(`roles: ${roleSummary(config)}`);
       for (const kind of KINDS.filter((k) => usesKindFor(config.file, k, config.role))) {
         if (kind === "ticket") {
           // BB-234: name each source's ticket playbook, so a project that
           // carries both does not hide the GitHub one behind the Linear one.
-          const parts = (["linear", "github"] as const)
+          const parts = (["linear", "github", "local"] as const)
             .map((source) => [source, config.ticketPlaybooks[source]] as const)
             .filter(([, p]) => p !== undefined)
             .map(([source, p]) => `${p!.name}@${p!.version} (${source})`);
@@ -14881,6 +15099,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const liveStart = lines.length;
       await validate("linear", config.file.linear.teams, linearTicket === null ? [] : playbookStates(linearTicket), linearTicket === null ? [] : playbookLabels(linearTicket));
       await validate("github", config.repos, githubTicket === null ? [] : githubStateLabels(githubTicket), githubTicket === null ? [] : playbookLabels(githubTicket));
+      // BB-361: a local ticket's states are the source's own fixed set, so
+      // this checks the local-tickets playbook names only real states.
+      await validate("local", [config.projectId], localTicket === null ? [] : playbookStates(localTicket));
       if (filingGithub !== null && priorityLabels.length > 0) await validate("github", [filingGithub], priorityLabels);
       if (usesKindFor(config.file, "ops", config.role)) {
         const auto = config.role?.ops?.autoAdopt ?? [];
@@ -15829,6 +16050,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
               if (b.endedAt !== null) return { exitCode: 0, stdout: `${b.entityKey} has already ended (${b.endReason}).` };
+              // BB-361: a local ticket's detach is Backlog; the next look ends
+              // the binding, and moving it to Ready again resumes it.
+              if (b.source === "local") {
+                localSource!.setState(b.entityKey, LOCAL_PARKED);
+                await serial(`b:${b.id}`, () => reconcileBinding(b.id, "requeue"));
+                return { exitCode: 0, stdout: `Moved ${b.entityKey} to Backlog.` };
+              }
               store.patch(b.id, { manualDetach: true });
               const config = await loadConfig(b.projectId);
               const playbook = config === null ? null : bindingPlaybook(config, b);
@@ -16019,6 +16247,108 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
+
+          // BB-361: the local ticket source's CLI. `bb stewards tickets …`
+          // operates on local tickets by key; the list, show, file, comment,
+          // update, close and export verbs mirror the source-neutral tools and
+          // are the by-hand surface for a project's own tickets.
+          "tickets list": cliCommand({
+            summary: "List this project's local tickets",
+            description: "Local tickets live in bb's stewards store, not in Linear or GitHub. --json emits the rows.",
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const rows = localSource?.list(projectId) ?? [];
+              if (input.options.json === true) return { exitCode: 0, stdout: JSON.stringify(rows, null, 2) };
+              if (rows.length === 0) return { exitCode: 0, stdout: "No local tickets." };
+              return { exitCode: 0, stdout: rows.map((t) => `${t.id}  ${t.state}  ${t.title}`).join("\n") };
+            },
+          }),
+
+          "tickets show": cliCommand({
+            summary: "Show one local ticket: its state, description and comments",
+            positionals: [{ name: "key", description: "The local ticket key, e.g. LOCAL-1", required: true }],
+            options: { project: PROJECT_OPTION },
+            async run(input) {
+              const key = input.positionals.key.trim();
+              const entity = localSource?.snapshot(key) ?? null;
+              if (entity === null) throw new PluginCliError(`No local ticket ${key}.`, { code: "not_found" });
+              return { exitCode: 0, stdout: formatTicket(entity) };
+            },
+          }),
+
+          "tickets file": cliCommand({
+            summary: "File a local ticket in this project",
+            description: "The description is signed with the invoking thread's signature line. A local ticket has no labels or priority; its playbook is `ticket` (the default) or `initiative`.",
+            options: {
+              project: PROJECT_OPTION,
+              title: { type: "string", required: true, description: "The ticket's title." },
+              description: { type: "string", required: true, description: "The ticket's description, in Markdown. Signed for you." },
+              playbook: { type: "string", description: "ticket (the default) or initiative" },
+              parent: { type: "string", description: "The parent local ticket's key" },
+            },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              if (ctx.threadId === undefined) throw new PluginCliError("bb stewards tickets file must run from a bb thread.", { code: "missing_thread" });
+              const out = localSource!.create({ unit: projectId, title: input.options.title, description: `${input.options.description.trimEnd()}\n\n${signatureLine(ctx.threadId)}`, ...(input.options.playbook === undefined ? {} : { playbook: input.options.playbook }), ...(input.options.parent === undefined ? {} : { parent: input.options.parent }) }, null);
+              return { exitCode: 0, stdout: `Filed ${out.key}.` };
+            },
+          }),
+
+          "tickets comment": cliCommand({
+            summary: "Comment on a local ticket",
+            description: "The comment is signed with the invoking thread's signature line; an unsigned body is refused.",
+            positionals: [{ name: "key", description: "The local ticket key, e.g. LOCAL-1", required: true }],
+            options: { body: { type: "string", required: true, description: "The comment, in Markdown. Signed for you." } },
+            async run(input, ctx) {
+              if (ctx.threadId === undefined) throw new PluginCliError("bb stewards tickets comment must run from a bb thread.", { code: "missing_thread" });
+              localSource!.comment(input.positionals.key.trim(), `${input.options.body.trimEnd()}\n\n${signatureLine(ctx.threadId)}`);
+              return { exitCode: 0, stdout: `Commented on ${input.positionals.key.trim()}.` };
+            },
+          }),
+
+          "tickets update": cliCommand({
+            summary: "Change a local ticket's state or parent",
+            description: "A local ticket has no labels, priority or relations. States: Backlog, Ready, In Progress, In Review, Done, Canceled.",
+            positionals: [{ name: "key", description: "The local ticket key, e.g. LOCAL-1", required: true }],
+            options: { state: { type: "string", description: "The new state" }, parent: { type: "string", description: "The new parent key, or '' to clear" } },
+            async run(input, ctx) {
+              const key = input.positionals.key.trim();
+              // BB-361: a local ticket only moves to Ready in a turn the owner
+              // started; the CLI is agent-run, so it fails closed to Backlog.
+              let state = input.options.state;
+              if (state !== undefined && state.trim().toLowerCase() === "ready" && (ctx.threadId === undefined || !(await ownerStartedTurn(ctx.threadId)))) state = "Backlog";
+              const result = localSource!.update({ key, ...(state === undefined ? {} : { state }), ...(input.options.parent === undefined ? {} : { parent: input.options.parent }) });
+              return { exitCode: 0, stdout: result.changed.length === 0 ? `${key}: no change.` : `${key}: ${result.changed.join("; ")}.` };
+            },
+          }),
+
+          "tickets close": cliCommand({
+            summary: "Move a local ticket to Done",
+            positionals: [{ name: "key", description: "The local ticket key, e.g. LOCAL-1", required: true }],
+            options: { canceled: { type: "boolean", description: "Close as Canceled instead of Done" } },
+            async run(input) {
+              const key = input.positionals.key.trim();
+              localSource!.setState(key, input.options.canceled === true ? "Canceled" : "Done");
+              return { exitCode: 0, stdout: `${key}: ${input.options.canceled === true ? "Canceled" : "Done"}.` };
+            },
+          }),
+
+          "tickets export": cliCommand({
+            summary: "Export this project's local tickets as Markdown or JSON",
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const rows = localSource?.list(projectId) ?? [];
+              if (input.options.json === true) return { exitCode: 0, stdout: JSON.stringify(rows.map((t) => ({ ...t, comments: localSource!.comments(t.id) })), null, 2) };
+              const parts: string[] = [`# Local tickets (${projectId})`, ""];
+              for (const t of rows) {
+                parts.push(`## ${t.id}: ${t.title}`, "", `State: ${t.state}${t.parentId === null ? "" : ` · Parent: ${t.parentId}`} · Playbook: ${t.playbook}`, "", t.description, "");
+                for (const c of localSource!.comments(t.id)) parts.push(`- ${c.author}${c.threadId === null ? "" : ` (bb thread ${c.threadId})`}: ${c.body}`, "");
+              }
+              return { exitCode: 0, stdout: parts.join("\n") };
+            },
+          }),
     };
     bb.cli.register(
       defineCli({
@@ -16035,12 +16365,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, closeAutoFiledNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, alertmanagerDoorbell: onAlertmanagerDoorbell, alertmanagerLeases, readCounts, reconcilePass, specHashFor });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, closeAutoFiledNeedsOnce, muteStewardThreadsOnce, signalNeedActionability: (bindingId: string, observed: Observed, ready?: ReadyState) => { const b = store.binding(bindingId); if (b !== null) signalNeedActionability(b, observed, ready); }, entityCache, store, db, settings, forgetTags, setProjectEnabled, localSource: localSource!, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases, alertmanagerDoorbell: onAlertmanagerDoorbell, alertmanagerLeases, readCounts, reconcilePass, specHashFor });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; closeAutoFiledNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; alertmanagerDoorbell(id: string, unit: string | null, action: string | null): void; alertmanagerLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void>; specHashFor(b: Binding, entity: EntitySnapshot): string }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; closeAutoFiledNeedsOnce(): Promise<void>; muteStewardThreadsOnce(): Promise<void>; signalNeedActionability(bindingId: string, observed: Observed, ready?: ReadyState): void; entityCache: EntityCache; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; localSource: LocalSource; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[]; alertmanagerDoorbell(id: string, unit: string | null, action: string | null): void; alertmanagerLeases(): Lease[]; readCounts: ReadCounts; reconcilePass(projectId: string): Promise<void>; specHashFor(b: Binding, entity: EntitySnapshot): string }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

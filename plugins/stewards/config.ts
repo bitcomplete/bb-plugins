@@ -167,6 +167,23 @@ export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-
 /** The ticket playbook a GitHub-tracked project carries; the default for a project with no Linear teams. */
 export const DEFAULT_GITHUB_TICKET_PLAYBOOK = "github-issues";
 
+/**
+ * BB-361: the built-in playbook a local ticket runs unless it names another,
+ * and the two names `ticket_file` accepts at filing. A local ticket stores the
+ * resolved playbook name in its `playbook` column and the snapshot's optional
+ * `playbook` field carries it.
+ */
+export const LOCAL_TICKETS_PLAYBOOK = "local-tickets";
+export const LOCAL_PLAYBOOK_CHOICES: Record<string, string> = { ticket: LOCAL_TICKETS_PLAYBOOK, initiative: "initiative" };
+
+/**
+ * BB-361: a local ticket's key prefix. It defaults to `LOCAL`; a project may
+ * override it with `localPrefix` in project.json, and a prefix equal to one of
+ * the project's Linear team keys is refused (the two key shapes would collide).
+ */
+export const DEFAULT_LOCAL_PREFIX = "LOCAL";
+export const localPrefix = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a prefix such as LOCAL").transform((s) => s.toUpperCase());
+
 /** The label a GitHub issue carries to mean "todo", the phase a filed autoAdopt issue starts in (BB-234, BB-235). */
 export const GITHUB_TODO_LABEL = "status:todo";
 
@@ -423,6 +440,12 @@ export const projectFileSchema = z
      * for repos in the workspace that stewards should not manage.
      */
     github: z.object({ exclude: z.array(z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u, "a repo such as acme/web")).max(64).default([]) }).strict().default({ exclude: [] }),
+    /**
+     * BB-361: the local ticket source's key prefix. Optional; absent, `LOCAL`.
+     * A prefix equal to one of `linear.teams` is refused below, because the
+     * two key shapes would collide.
+     */
+    localPrefix: localPrefix.optional(),
     label: z.string().trim().min(1).max(100).default(DEFAULT_LABEL),
     nightly: z
       .object({
@@ -537,6 +560,8 @@ export const projectFileSchema = z
   })
   .strict()
   .superRefine((file, ctx) => {
+    const prefix = file.localPrefix ?? DEFAULT_LOCAL_PREFIX;
+    if (file.linear.teams.some((t) => t.toUpperCase() === prefix.toUpperCase())) ctx.addIssue({ code: "custom", path: ["localPrefix"], message: `${prefix} is one of linear.teams, so a local key would collide with a Linear key; choose another prefix` });
     const seen = new Set<string>();
     file.ops.targets.forEach((t, i) => {
       const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "alertmanager" ? `${t.kind}/${t.namespace}` : t.kind === "dependabot" ? `${t.kind}/${t.repo.toLowerCase()}` : `${t.kind}/${t.org}/${t.project}`;
@@ -901,8 +926,8 @@ export const deploymentsFieldSchema = z
     }
   });
 
-export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry", "alertmanager"] as const;
-const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry", "alertmanager", "linear"] };
+export const PLAYBOOK_SOURCES = ["linear", "github", "local", "k8s", "sentry", "alertmanager"] as const;
+const SOURCES_OF: Record<BindingKind, readonly (typeof PLAYBOOK_SOURCES)[number][]> = { ticket: ["linear", "github", "local"], pr: ["github"], review: ["github"], ops: ["k8s", "github", "sentry", "alertmanager", "linear"] };
 
 export const frontMatterSchema = z
   .object({

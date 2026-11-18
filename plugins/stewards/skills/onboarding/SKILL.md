@@ -78,9 +78,12 @@ Then fill in, from the survey and the interview:
 
 - **`stewards/project.json`** — `linear.teams`, `label`, `nightly`,
   `github.exclude`, `deps` (the survey's test commands do not go here; they go
-  in `AGENTS.md`). Fill `bigDecisions`: keep the defaults and add the project's
-  `project` entries with repo-dir-prefixed `paths`, so the lane gate can match
-  a pull request's changed files. A `user` entry with `paths` always wins.
+  in `AGENTS.md`). The local ticket source's key prefix defaults to `LOCAL`;
+  set `localPrefix` only when the project wants another one, and it must not
+  equal a Linear team key. Fill `bigDecisions`: keep the defaults and add the
+  project's `project` entries with repo-dir-prefixed `paths`, so the lane gate
+  can match a pull request's changed files. A `user` entry with `paths` always
+  wins.
 - **`stewards/roles.json`** — one entry per GitHub login, with
   `projectSteward: true` on exactly one, and the `ops` watches from the
   interview. This file is what makes the project steward run.

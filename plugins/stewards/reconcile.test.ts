@@ -407,6 +407,20 @@ describe("the ready gate", () => {
     expect(specHash(amended, "thr_s", user)).not.toBe(base);
   });
 
+  it("counts an owner page comment as the user's spec, and never an agent's signed comment (BB-361)", () => {
+    const base = specHash(issue(), "thr_s", undefined, "Jane");
+    // A local owner comment is unsigned and authored by the viewer; it counts
+    // only when the owner is known, and it changes the hash.
+    const ownerComment = issue({ comments: [comment({ id: "o1", author: "Jane", body: "**Spec:** the owner's words", signedBy: null, createdAt: "2026-10-14T16:00:00Z" })] });
+    expect(specHash(ownerComment, "thr_s", undefined, "Jane")).not.toBe(base);
+    expect(specHash(ownerComment, "thr_s")).toBe(base);
+    // An agent-written comment carries a thread id (`ticket_comment`, the CLI)
+    // and is never the owner's, whichever thread wrote it.
+    const agent = issue({ comments: [comment({ id: "a1", author: "thr_w1", body: "**Spec:** from ticket_comment", signedBy: "thr_w1", createdAt: "2026-10-14T16:00:00Z" })] });
+    expect(specHash(agent, "thr_s", undefined, "Jane")).toBe(base);
+    expect(specHash(agent, "thr_s", (tid) => tid === "thr_user", "Jane")).toBe(base);
+  });
+
   it("marks a spec comment the user wrote as the user's, and wakes for it", () => {
     const before = { entity: issue(), pulls: [] };
     const after = { entity: issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_user" })] }), pulls: [] };
@@ -744,6 +758,21 @@ describe("the pull request gate (build-tickets)", () => {
     expect(productGateOptions(binding("ticket", { substantial: true, approval: { at: 1, specHash: "h", by: "user" } }))).toEqual({ substantial: null, ticketApprovedSpec: true });
     expect(productGateOptions(binding("ticket", { substantial: false }), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: false });
     expect(productGateOptions(binding("ticket", { substantial: false, approval: { at: 1, specHash: "h", by: "user" } }), marked("substantial=yes"))).toEqual({ substantial: true, ticketApprovedSpec: true });
+  });
+
+  it("passes the product check for a local ticket whose spec is approved, and asks the owner without one (BB-361)", () => {
+    // The gate reads the binding's approved spec, never its key: a local
+    // ticket's binding is source- and key-agnostic, so a worker's pull request
+    // citing LOCAL-1 is treated exactly as one citing ENG-12.
+    const local = { kind: "ticket" as const, entityKey: "LOCAL-1", ready: readyStateSchema.parse({}) };
+    const approved = { ...local, ready: readyStateSchema.parse({ approval: { at: 1, specHash: "h", by: "user" } }) };
+    const marked = pull({ comments: [comment({ id: "m", author: "jane", body: "<!-- bb-review round=1 sha=abc verdict=approved lane=no-review substantial=yes spec=no -->", createdAt: "2026-10-02T00:00:00Z" })] });
+    const noSpec = productGateOptions(local, marked);
+    expect(noSpec).toEqual({ substantial: true, ticketApprovedSpec: false });
+    expect(productReason(noSpec.substantial, noSpec.ticketApprovedSpec)).toBe("product");
+    const withSpec = productGateOptions(approved, marked);
+    expect(withSpec).toEqual({ substantial: true, ticketApprovedSpec: true });
+    expect(productReason(withSpec.substantial, withSpec.ticketApprovedSpec)).toBeNull();
   });
 
   it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {
