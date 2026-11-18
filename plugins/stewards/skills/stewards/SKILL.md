@@ -575,12 +575,13 @@ and `ticket_comment` sign for you; add no signature to what you pass them.
 ## If you are a backlog steward
 
 The backlog role reads a whole Linear team's open backlog through
-`sourceBacklog`, which only the linear source serves, so it needs a Linear
-team: the role's `backlog.team`, or the project's `linear.teams`. A project
-with no Linear team cannot run it, and `bb stewards check` reports
-"backlog needs a Linear team; the backlog role is Linear-only". The read is
-read-only unless `backlog.triage` is on, in which case `backlog_triage` is
-your one gated write.
+`sourceBacklog`, which only the linear source serves, so the project must
+list a Linear team (`linear.teams`); the role's `backlog.team` names which
+one is read. A project with no `linear.teams` cannot run it, and
+`bb stewards check` reports "backlog needs a Linear team; the backlog role
+is Linear-only" even when the role names a team. The read is read-only
+unless `backlog.triage` is on, in which case `backlog_triage` is your one
+gated write.
 
 ## If you are an initiative steward
 

@@ -823,11 +823,17 @@ function assignInstruction(owner: string | null): string {
     : `Defaults: ${fingerprint} Assign every ticket you file to this server's owner, ${owner}, and to no one else: pass assignee: "me" to ticket_file (it resolves to ${owner} and signs the body for you). ${recurrence}`;
 }
 
-/** Where a watcher files: a Linear team or a GitHub repo, both through the source-neutral `ticket_file` (BB-235, BB-360). */
+/**
+ * Where a watcher files: a Linear team or a GitHub repo, both through the
+ * source-neutral `ticket_file` (BB-235, BB-360). `ticket_file` carries no due
+ * date, so a dependency deadline is a `Due:` body line on GitHub and the
+ * Linear field through the Linear plugin's own update on Linear (BB-362).
+ */
 function filingInstruction(target: FilingTarget | null, due: boolean): string {
   if (target === null) return "No filing target is configured: escalate a blocked question instead of filing.";
   if (target.source === "github") return `File issues in the GitHub repo ${target.target} with ticket_file { unit: "${target.target}", ... }, and put the fingerprint${due ? " and a `Due: YYYY-MM-DD` line" : ""} in the body.`;
-  return due ? `File tickets in the Linear team ${target.target} with ticket_file { unit: "${target.target}", ... }, and set each ticket's due date to the deadline the alert names.` : `File tickets in the Linear team ${target.target} with ticket_file { unit: "${target.target}", ... }.`;
+  if (!due) return `File tickets in the Linear team ${target.target} with ticket_file { unit: "${target.target}", ... }.`;
+  return `File tickets in the Linear team ${target.target} with ticket_file { unit: "${target.target}", ... }, then set each ticket's due date to the deadline the alert names with linear_update_issue (ticket_file carries no due date).`;
 }
 
 /** The example ticket key a wake's steward_report uses: a Linear key, or a GitHub issue key. */

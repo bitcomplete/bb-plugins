@@ -523,6 +523,10 @@ describe("a Linear ticket steward", () => {
     expect(config.instructions).toContain(`your thread id is ${steward}`);
     expect(config.instructions).toContain(`_— from bb thread ${steward}_`);
     expect(config.instructions).toMatch(/add no signature to what you pass them/u);
+    // BB-362: a steward is told to use the neutral ticket tools, whatever its
+    // source.
+    expect(config.instructions).toMatch(/The ticket_ tools sign for you/u);
+    expect(config.instructions).not.toMatch(/linear_[a-z_]+/u);
   });
 
   it("says news that arrived while the steward was busy once", async () => {
@@ -4734,6 +4738,25 @@ describe("bb stewards init", () => {
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
     expect(t.writes.length).toBe(8);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
+  });
+
+  it("treats a missing linear plugin as no teams, writes no label and prints no Teams line (BB-362)", async () => {
+    const t = await setup();
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear") throw Object.assign(new Error("plugin linear is not installed"), { status: 404 });
+      return original(args);
+    });
+    const out = await t.harness.behavior.runCli(["init"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(out.exitCode).toBe(0);
+    // No Teams line naming Linear, and no default label written (BB-362).
+    expect(out.stdout).not.toMatch(/Teams:/u);
+    expect(out.stdout).not.toMatch(/add them to linear\.teams/u);
+    const projectFile = [...t.writtenContent.entries()].find(([path]) => path.endsWith(`/${PROJECT_FILE}`))?.[1] ?? "";
+    expect(projectFile).not.toContain("bb-managed");
+    expect([...t.writtenContent.keys()].some((path) => path.endsWith(playbookPath("github-issues")))).toBe(true);
   });
 });
 
@@ -10030,6 +10053,10 @@ describe("ops stewards", () => {
     const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: steward()!.id, title: null, parentThreadId: null, sourceThreadId: null } }));
     expect(config.instructions).toMatch(/You are the ops steward watching "k8s-namespace\/web-production"/u);
     expect(config.instructions).toMatch(/never change production and start no workers/u);
+    // BB-362: the ops instructions file tickets through the neutral tools, not
+    // the Linear ones, so a GitHub-only or local-only project is not misled.
+    expect(config.instructions).toMatch(/File and comment on tickets with ticket_file and ticket_comment/u);
+    expect(config.instructions).not.toMatch(/linear_[a-z_]+/u);
 
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -10099,7 +10126,8 @@ describe("dependency stewards", () => {
     expect(first).toMatch(/`lodash` \(npm\) — package-lock.json — GHSA-xxxx-yyyy-zzzz/u);
     expect(first).toMatch(/Fixed in 4\.17\.21/u);
     expect(first).toMatch(/This severity gets its own ticket\./u);
-    expect(first).toMatch(/File tickets in the Linear team ENG/u);
+    expect(first).toMatch(/File tickets in the Linear team ENG with ticket_file/u);
+    expect(first).toMatch(/set each ticket's due date to the deadline the alert names with linear_update_issue/u);
 
     // It files and reports, and the fingerprint map records the ticket.
     const ops = steward()!.id;
@@ -18403,6 +18431,26 @@ describe("no-Linear projects (BB-362)", () => {
     await t.flush();
     expect(calls).toBe(afterFirst);
     expect(t.harness.logEntries.some((e) => e.level === "warn" && /linear/i.test(e.message))).toBe(false);
+  });
+
+  it("releases the leases after a restart that only has the persisted non-empty body", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } }, {}, undefined, undefined, (w) => {
+      w.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+      delete w.files[playbookPath("linear-tickets")];
+      w.files[playbookPath("github-issues")] = GITHUB_ISSUES;
+      w.viewers.linear = null;
+    });
+    // As a previous process left it: a non-empty Linear set was leased.
+    await t.bb.storage.kv.set("interest/linear", JSON.stringify({ units: ["ENG"], entities: [], dependabot: [], deployment: [] }));
+    const interest: unknown[] = [];
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "linear" && args.method === "sourceSetInterest") interest.push(args.input);
+      return original(args);
+    });
+    await t.hooks.sweep();
+    await t.flush();
+    expect(interest).toEqual([{ units: [], entities: [], dependabot: [], deployment: [] }]);
   });
 
   it("names no Linear in check or the digest on a GitHub-only project", async () => {
