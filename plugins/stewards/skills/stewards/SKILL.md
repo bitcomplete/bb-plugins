@@ -159,8 +159,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   a comment line** (default; the project's guidance overrides it). "Cleanup"
   is anything the change leaves temporary, deprecated or dead: a field kept
   for ordering, a compatibility shim, a feature flag, a rename that leaves
-  the old name, docs or tests that describe the old thing, or a by-hand step
-  after apply. At spec time the spec names who removes each such thing: it
+  the old name, docs or tests that describe the old thing, or a by-hand
+  cleanup step after apply (a by-hand step the feature needs to work is
+  still the `configure` escalation above, not cleanup). At spec time the
+  spec names who removes each such thing: it
   is in this ticket's scope, or a follow-up ticket is filed now, linked to
   this one, and named in the spec by key. A spec that says "until a
   follow-up removes it" without a key fails the ready checklist. The default
