@@ -376,26 +376,28 @@ look for another way: fix the gate, or if the thread's permission system
 refuses the command (or a direct `gh pr merge`), take the hand-off path
 below. Carry on here once it is in.
 
-**4c. Dispatch the `bb-server` build — a `bb-plugins` merge only.** A
-`bb-plugins` merge must dispatch the `bb-server` build exactly once so it
-starts within a minute; the ten-minute tick is the backstop. `bb stewards
-merge` dispatches it when the project's `mergeDispatch` names the repo, and
+**4c. Dispatch the build a merge triggers.** Some projects configure a
+`mergeDispatch` in `.bb/stewards/project.json`: a list of entries, each with
+a `repo` (the merged repo), a `workflow`, and optional `workflowRepo`, `ref`
+and `inputs`. `bb stewards merge` runs the entry for the repo it merged, and
 its "Merged:" comment says so — when you see that line the dispatch has
-happened and you do not run the command. Otherwise (nothing configured yet,
-or you merged with a direct `gh pr merge` in the hand-off path below) run it
-yourself, exactly once, right after the merge succeeds:
+happened and you are done. Otherwise, if the project configures a
+`mergeDispatch` for the repo and you merged with a direct `gh pr merge` in
+the hand-off path below, run that entry yourself, exactly once, right after
+the merge succeeds:
 
 ```sh
-gh workflow run bb-server.yaml --repo bitcomplete/bb-gate --ref main -f only_if_moved=true
+gh workflow run <workflow> --repo <workflowRepo, else repo> --ref <ref, else the default branch> [-f <key>=<value> ...]
 ```
 
-Use `-f only_if_moved=true`, never a plain dispatch: a plain dispatch always
-builds, even when the pin is already current, while this form builds only
-when the pin moved. Say in the "Merged:" comment (or in your own signed
-comment when the merge path posted none) that the build was dispatched. If
-the dispatch fails, say that and carry on: the tick is the backstop. Never
-retry the dispatch in a loop, and never fail or undo the merge for it. Only a
-`bb-plugins` merge dispatches; `bb-gate` and `devbox` merges do not.
+The workflow runs in `workflowRepo` (falling back to `repo`), at `ref`
+(falling back to the workflow repo's default branch), with one `-f` per key
+in `inputs`. When the project configures none, there is nothing to dispatch.
+
+Say in the "Merged:" comment (or in your own signed comment when the merge
+path posted none) whether a dispatch was run. If the dispatch fails, say
+that and carry on: never retry the dispatch in a loop, and never fail or
+undo the merge for it.
 
 ### When the merge is refused
 

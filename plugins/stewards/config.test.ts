@@ -64,6 +64,22 @@ describe("the project file", () => {
     expect(usesKind(parsed.value, "ops")).toBe(false);
   });
 
+  it("writes a default decide list that names no repo the project lacks (BB-359)", () => {
+    const parsed = parseProjectFile(projectFileTemplate([]));
+    if (!parsed.ok) throw new Error(parsed.error);
+    const projectEntries = parsed.value.bigDecisions.filter((d) => d.decide === "project");
+    expect(projectEntries.length).toBeGreaterThan(0);
+    // A default path names no repo: it is a bare filename (no directory), an
+    // any-depth glob, or the fixed GitHub workflow directory. A literal
+    // leading directory (the old `bb-gate/kploy/**`, `devbox/host/**`) fails.
+    for (const entry of projectEntries) {
+      expect(entry.paths.length, entry.text).toBeGreaterThan(0);
+      for (const path of entry.paths) {
+        expect(!path.includes("/") || path.startsWith("**/") || path.startsWith(".github/"), `${entry.text}: ${path}`).toBe(true);
+      }
+    }
+  });
+
   it("fills the notifications switch on by default, and takes an explicit off (BB-253)", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);
@@ -208,9 +224,9 @@ describe("the project file", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);
     expect(defaults.value.mergeDispatch).toEqual([]);
-    const configured = parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "bitcomplete/bb-plugins", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }] }));
+    const configured = parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "acme/app", workflow: "build.yaml", workflowRepo: "acme/web", ref: "main", inputs: { only_if_moved: "true" } }] }));
     if (!configured.ok) throw new Error(configured.error);
-    expect(configured.value.mergeDispatch).toEqual([{ repo: "bitcomplete/bb-plugins", workflow: "bb-server.yaml", workflowRepo: "bitcomplete/bb-gate", ref: "main", inputs: { only_if_moved: "true" } }]);
+    expect(configured.value.mergeDispatch).toEqual([{ repo: "acme/app", workflow: "build.yaml", workflowRepo: "acme/web", ref: "main", inputs: { only_if_moved: "true" } }]);
     // workflowRepo, ref and inputs are optional; inputs defaults to empty.
     const minimal = parseProjectFile(JSON.stringify({ version: 1, mergeDispatch: [{ repo: "acme/web", workflow: "build.yaml" }] }));
     if (!minimal.ok) throw new Error(minimal.error);
@@ -229,9 +245,9 @@ describe("ops in the project file", () => {
   };
 
   it("takes namespace targets, a team and the priorities to adopt at once", () => {
-    const r = file({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "ops", autoAdopt: ["urgent"] });
+    const r = file({ targets: [{ kind: "k8s-namespace", name: "web-production" }, { kind: "k8s-namespace", name: "db-production" }], team: "ops", autoAdopt: ["urgent"] });
     if (!r.ok) throw new Error(r.error);
-    expect(r.value.ops).toEqual({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "OPS", autoAdopt: ["urgent"], sentry: { resolveOnDone: false } });
+    expect(r.value.ops).toEqual({ targets: [{ kind: "k8s-namespace", name: "web-production" }, { kind: "k8s-namespace", name: "db-production" }], team: "OPS", autoAdopt: ["urgent"], sentry: { resolveOnDone: false } });
     expect(usesKind(r.value, "ops")).toBe(true);
     expect(opsTeam(r.value)).toEqual({ target: "OPS", source: "linear" });
   });
@@ -507,14 +523,14 @@ describe("playbooks", () => {
     const withDeployment = (extra: string) =>
       LINEAR_TICKETS.replace(
         "requeue-default: 2d",
-        `requeue-default: 2d\ndeployment:\n  source: github\n  repo: bitcomplete/bb-gate\n  environment: production\n  carries: "the pin contains the merge"\n  timeout: 6h${extra}`,
+        `requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/web\n  environment: production\n  carries: "the pin contains the merge"\n  timeout: 6h${extra}`,
       );
     const none = parsePlaybook(withDeployment(""), "linear-tickets");
     if (!none.ok) throw new Error(none.error);
-    expect(none.value.deployments[0]).toMatchObject({ repo: "bitcomplete/bb-gate", environment: "production", workflows: [] });
-    const named = parsePlaybook(withDeployment("\n  workflows: [bb-server.yaml, image.yaml]"), "linear-tickets");
+    expect(none.value.deployments[0]).toMatchObject({ repo: "acme/web", environment: "production", workflows: [] });
+    const named = parsePlaybook(withDeployment("\n  workflows: [build.yaml, image.yaml]"), "linear-tickets");
     if (!named.ok) throw new Error(named.error);
-    expect(named.value.deployments[0]?.workflows).toEqual(["bb-server.yaml", "image.yaml"]);
+    expect(named.value.deployments[0]?.workflows).toEqual(["build.yaml", "image.yaml"]);
   });
 
   it("takes a list of deployment targets with structured carries rules (BB-132)", () => {
@@ -523,48 +539,48 @@ describe("playbooks", () => {
       [
         "requeue-default: 2d",
         "deployment:",
-        "  - name: bb-gate",
+        "  - name: web",
         "    source: github",
-        "    repo: bitcomplete/bb-gate",
+        "    repo: acme/web",
         "    environment: production",
         "    carries:",
-        "      - when: { repo: bitcomplete/bb-plugins }",
+        "      - when: { repo: acme/app }",
         "        strategy:",
         "          kind: image-tag",
-        "          manifest: kploy/production/kustomization.yaml",
+        "          manifest: deploy/kustomization.yaml",
         "          image: bb-server",
-        "          workflow: bb-server.yaml",
+        "          workflow: build.yaml",
         "          job: build_and_push_image",
-        "          consumer: { dockerfile: docker/bb-server/Dockerfile, pinArg: BB_PLUGINS_REF, repo: bitcomplete/bb-plugins }",
-        "      - when: { repo: bitcomplete/bb-gate, paths: [docker/bb-server/**] }",
+        "          consumer: { dockerfile: Dockerfile, pinArg: PLUGIN_REF, repo: acme/app }",
+        "      - when: { repo: acme/web, paths: [docker/bb-server/**] }",
         "        strategy: { kind: ref-contains-merge }",
-        "  - name: devbox",
+        "  - name: tools",
         "    source: github",
-        "    repo: bitcomplete/devbox",
+        "    repo: acme/tools",
         "    environment: production",
-        "    carries: [{ when: { repo: bitcomplete/devbox }, strategy: { kind: ref-contains-merge } }]",
+        "    carries: [{ when: { repo: acme/tools }, strategy: { kind: ref-contains-merge } }]",
       ].join("\n"),
     );
     const parsed = parsePlaybook(structured, "linear-tickets");
     if (!parsed.ok) throw new Error(parsed.error);
-    expect(parsed.value.deployments.map((d) => d.name)).toEqual(["bb-gate", "devbox"]);
+    expect(parsed.value.deployments.map((d) => d.name)).toEqual(["web", "tools"]);
     expect(parsed.value.deployments[0]!.carries).toHaveLength(2);
     const rules = parsed.value.deployments[0]!.carries as Array<{ strategy: { kind: string } }>;
     expect(rules[0]!.strategy.kind).toBe("image-tag");
     expect(rules[1]!.strategy.kind).toBe("ref-contains-merge");
     // A single free-text target still parses, exactly as before.
-    const singleText = LINEAR_TICKETS.replace("requeue-default: 2d", 'requeue-default: 2d\ndeployment:\n  source: github\n  repo: bitcomplete/bb-gate\n  environment: production\n  carries: "the pin contains the merge"\n  timeout: 6h');
+    const singleText = LINEAR_TICKETS.replace("requeue-default: 2d", 'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/web\n  environment: production\n  carries: "the pin contains the merge"\n  timeout: 6h');
     const single = parsePlaybook(singleText, "linear-tickets");
     if (!single.ok) throw new Error(single.error);
     expect(single.value.deployments).toHaveLength(1);
     expect(single.value.deployments[0]!.carries).toBe("the pin contains the merge");
     // An unknown strategy is refused, and so is an empty rule list.
     expect(parsePlaybook(structured.replace("kind: ref-contains-merge", "kind: magic"), "linear-tickets")).toMatchObject({ ok: false });
-    expect(parsePlaybook(structured.replace("carries: [{ when: { repo: bitcomplete/devbox }, strategy: { kind: ref-contains-merge } }]", "carries: []"), "linear-tickets")).toMatchObject({ ok: false });
+    expect(parsePlaybook(structured.replace("carries: [{ when: { repo: acme/tools }, strategy: { kind: ref-contains-merge } }]", "carries: []"), "linear-tickets")).toMatchObject({ ok: false });
     // Two targets cannot share a name: their watches would share a key.
-    const duplicate = parsePlaybook(structured.replace("name: devbox", "name: bb-gate"), "linear-tickets");
+    const duplicate = parsePlaybook(structured.replace("name: tools", "name: web"), "linear-tickets");
     expect(duplicate).toMatchObject({ ok: false });
-    if (!duplicate.ok) expect(duplicate.error).toMatch(/bb-gate is listed twice/u);
+    if (!duplicate.ok) expect(duplicate.error).toMatch(/web is listed twice/u);
   });
 
   // BB-260: the third strategy, for a merge nothing builds or applies.
@@ -575,12 +591,12 @@ describe("playbooks", () => {
         "requeue-default: 2d",
         "deployment:",
         "  source: github",
-        "  repo: bitcomplete/bb-gate",
+        "  repo: acme/web",
         "  environment: production",
         "  carries:",
-        "    - when: { repo: bitcomplete/bb-gate, paths: [kploy/**, backend.json] }",
+        "    - when: { repo: acme/web, paths: [deploy/**, config.json] }",
         "      strategy: { kind: ref-contains-merge }",
-        "    - when: { repo: bitcomplete/bb-gate, paths: [.bb/**, docs/**, '**.md'] }",
+        "    - when: { repo: acme/web, paths: [.bb/**, docs/**, '**.md'] }",
         "      strategy: { kind: live-at-merge }",
         "  timeout: 90m",
       ].join("\n"),
@@ -603,7 +619,7 @@ describe("playbooks", () => {
     if (!r.ok) expect(r.error).toMatch(/needs a ready gate/u);
     const overlap = GITHUB_PRS.replace("terminal: [merged, closed]", "terminal: [merged, closed, open]");
     expect(parsePlaybook(overlap, "github-prs")).toMatchObject({ ok: false });
-    const emptyWorkflow = LINEAR_TICKETS.replace("requeue-default: 2d", 'requeue-default: 2d\ndeployment:\n  source: github\n  repo: bitcomplete/bb-gate\n  environment: production\n  carries: "x"\n  workflows: [""]');
+    const emptyWorkflow = LINEAR_TICKETS.replace("requeue-default: 2d", 'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/web\n  environment: production\n  carries: "x"\n  workflows: [""]');
     expect(parsePlaybook(emptyWorkflow, "linear-tickets")).toMatchObject({ ok: false });
   });
 });
@@ -724,17 +740,17 @@ describe("roles.json (BB-105)", () => {
   const roles = (entries: Record<string, unknown>, extra: Record<string, unknown> = {}) => parseRolesFile(JSON.stringify({ version: 1, roles: entries, ...extra }));
 
   it("parses roles, folds logins to lower case and fills the defaults", () => {
-    const parsed = roles({ "Jane-Doe": { projectSteward: true, ops: { k8sNamespaces: ["prod"], team: "eng", sentry: { projects: [{ org: " Acme ", project: "Web-API" }] }, alertmanager: { namespaces: ["bb-gate-production"] }, dependabot: ["acme/web"] } }, Bob: {} });
+    const parsed = roles({ "Jane-Doe": { projectSteward: true, ops: { k8sNamespaces: ["prod"], team: "eng", sentry: { projects: [{ org: " Acme ", project: "Web-API" }] }, alertmanager: { namespaces: ["web-production"] }, dependabot: ["acme/web"] } }, Bob: {} });
     if (!parsed.ok) throw new Error(parsed.error);
     expect(Object.keys(parsed.value.roles)).toEqual(["jane-doe", "bob"]);
     const role = parsed.value.roles["jane-doe"]!;
     expect(role.projectSteward).toBe(true);
-    expect(role.ops).toMatchObject({ k8sNamespaces: ["prod"], team: "ENG", autoAdopt: [], sentry: { projects: [{ org: "acme", project: "web-api" }], resolveOnDone: false }, alertmanager: { namespaces: ["bb-gate-production"] }, dependabot: ["acme/web"] });
+    expect(role.ops).toMatchObject({ k8sNamespaces: ["prod"], team: "ENG", autoAdopt: [], sentry: { projects: [{ org: "acme", project: "web-api" }], resolveOnDone: false }, alertmanager: { namespaces: ["web-production"] }, dependabot: ["acme/web"] });
     expect(parsed.value.roles["bob"]).toEqual({ projectSteward: false, ops: undefined });
     // The role getters read the entry, not the legacy project.ops.
     expect(roleK8sTargets(role)).toEqual([{ kind: "k8s-namespace", name: "prod" }]);
     expect(roleSentryTargets(role)).toEqual([{ kind: "sentry-project", org: "acme", project: "web-api" }]);
-    expect(roleAlertmanagerTargets(role)).toEqual([{ kind: "alertmanager", namespace: "bb-gate-production" }]);
+    expect(roleAlertmanagerTargets(role)).toEqual([{ kind: "alertmanager", namespace: "web-production" }]);
     expect(roleDepsTargets(role, ["acme/web", "acme/other"])).toEqual([{ kind: "dependabot", repo: "acme/web" }]);
     expect(roleDepsTargets(parsed.value.roles["bob"]!, ["acme/web"])).toEqual([]);
     expect(roleUsesOps(role)).toBe(true);
@@ -780,12 +796,12 @@ describe("roles.json (BB-105)", () => {
     if (!empty.ok) throw new Error(empty.error);
     expect(legacyOpsPresent(empty.value)).toBe(false);
 
-    const legacy = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }, { kind: "alertmanager", namespace: "bb-gate-production" }], team: "eng", context: "bc-prod", autoAdopt: ["urgent"], sentry: { resolveOnDone: true } } }));
+    const legacy = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }, { kind: "alertmanager", namespace: "web-production" }], team: "eng", context: "prod", autoAdopt: ["urgent"], sentry: { resolveOnDone: true } } }));
     if (!legacy.ok) throw new Error(legacy.error);
     expect(legacyOpsPresent(legacy.value)).toBe(true);
     const role = legacyRole(legacy.value);
     expect(role.projectSteward).toBe(true);
-    expect(role.ops).toMatchObject({ team: "ENG", context: "bc-prod", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web" }], resolveOnDone: true }, alertmanager: { namespaces: ["bb-gate-production"] }, dependabot: "all" });
+    expect(role.ops).toMatchObject({ team: "ENG", context: "prod", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web" }], resolveOnDone: true }, alertmanager: { namespaces: ["web-production"] }, dependabot: "all" });
     expect(roleOpsTeam(role, legacy.value)).toEqual({ target: "ENG", source: "linear" });
     expect(usesKind(legacy.value, "ops", role)).toBe(true);
   });
@@ -825,7 +841,7 @@ describe("roles.json version 2 (BB-163)", () => {
   it("parses named roles and holders, merges a holder's roles, and keeps the built-in projectSteward", () => {
     const parsed = v2(
       {
-        ops: { k8sNamespaces: ["bb-gate-production"], team: "eng", sentry: { projects: [{ org: " Acme ", project: "Web-API" }] }, dependabot: "all" },
+        ops: { k8sNamespaces: ["web-production"], team: "eng", sentry: { projects: [{ org: " Acme ", project: "Web-API" }] }, dependabot: "all" },
         deps: { dependabot: ["acme/web"], autoAdopt: ["urgent"] },
       },
       { "Jane-Doe": ["ops", "deps", "projectSteward"], Bob: ["ops"] },
@@ -835,7 +851,7 @@ describe("roles.json version 2 (BB-163)", () => {
     expect(parsed.value.holders["jane-doe"]).toEqual(["ops", "deps", "projectSteward"]);
     const role = parsed.value.roles["jane-doe"]!;
     expect(role.projectSteward).toBe(true);
-    expect(role.ops).toMatchObject({ k8sNamespaces: ["bb-gate-production"], team: "ENG", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web-api" }], resolveOnDone: false }, dependabot: "all" });
+    expect(role.ops).toMatchObject({ k8sNamespaces: ["web-production"], team: "ENG", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web-api" }], resolveOnDone: false }, dependabot: "all" });
     // bob holds only ops: no projectSteward, and the same watches jane's ops role gives.
     expect(parsed.value.roles["bob"]!.projectSteward).toBe(false);
     expect(roleOpsTargets(parsed.value.roles["bob"]!)).toEqual(roleOpsTargets(role));
@@ -856,7 +872,7 @@ describe("roles.json version 2 (BB-163)", () => {
   });
 
   it("gives the same bindings, target keys and check result as the equivalent version 1 file", () => {
-    const entry = { k8sNamespaces: ["prod"], context: "bc-prod", team: "ENG", sentry: { projects: [{ org: "acme", project: "web" }] }, dependabot: ["acme/web"] };
+    const entry = { k8sNamespaces: ["prod"], context: "prod", team: "ENG", sentry: { projects: [{ org: "acme", project: "web" }] }, dependabot: ["acme/web"] };
     const v1 = parseRolesFile(JSON.stringify({ version: 1, roles: { jane: { projectSteward: true, ops: entry } } }));
     const modern = v2({ ops: entry }, { jane: ["ops", "projectSteward"] });
     if (!v1.ok || !modern.ok) throw new Error("parse failed");
@@ -894,12 +910,12 @@ describe("roles.json version 2 (BB-163)", () => {
   });
 
   it("reports a conflicting context or team on merge, and takes the first at runtime", () => {
-    const parsed = v2({ a: { context: "bc-prod", team: "ENG" }, b: { context: "other", team: "OPS" } }, { alice: ["a", "b"] });
+    const parsed = v2({ a: { context: "prod", team: "ENG" }, b: { context: "other", team: "OPS" } }, { alice: ["a", "b"] });
     if (!parsed.ok) throw new Error(parsed.error);
     const problems = roleProblems(parsed.value);
-    expect(problems).toContain("alice holds roles with conflicting context (bc-prod, other): a holder's roles must agree on one context");
+    expect(problems).toContain("alice holds roles with conflicting context (prod, other): a holder's roles must agree on one context");
     expect(problems).toContain("alice holds roles with conflicting team (ENG, OPS): a holder's roles must agree on one team");
-    expect(parsed.value.roles["alice"]!.ops).toMatchObject({ context: "bc-prod", team: "ENG" });
+    expect(parsed.value.roles["alice"]!.ops).toMatchObject({ context: "prod", team: "ENG" });
   });
 
   it("warns about a role no holder names", () => {
@@ -968,10 +984,10 @@ describe("role pull watches (BB-164)", () => {
   };
 
   it("parses a role's pull watches and compiles the Dependabot watch first", () => {
-    const parsed = v2({ ops: { dependabot: ["acme/web"], pulls: [{ repo: "acme/web", match: { title: "Update *", branch: "update-*", paths: ["projects/*/bc-prod.yaml"] }, playbook: "sync-prs" }] } }, { jane: ["ops"] });
+    const parsed = v2({ ops: { dependabot: ["acme/web"], pulls: [{ repo: "acme/web", match: { title: "Update *", branch: "update-*", paths: ["projects/*/prod.yaml"] }, playbook: "sync-prs" }] } }, { jane: ["ops"] });
     if (!parsed.ok) throw new Error(parsed.error);
     const role = parsed.value.roles["jane"]!;
-    expect(rolePulls(role)).toEqual([{ repo: "acme/web", match: { title: "Update *", branch: "update-*", paths: ["projects/*/bc-prod.yaml"] }, playbook: "sync-prs" }]);
+    expect(rolePulls(role)).toEqual([{ repo: "acme/web", match: { title: "Update *", branch: "update-*", paths: ["projects/*/prod.yaml"] }, playbook: "sync-prs" }]);
     const watches = rolePullWatches(role, ["acme/web", "acme/other"], "deps-prs");
     expect(watches.map((w) => pullWatchId(w))).toEqual(["deps-prs@acme/web", "sync-prs@acme/web"]);
     expect(watches[0]!.match.author).toEqual([...DEPENDENCY_BOTS]);
