@@ -179,7 +179,7 @@ describe("the adoption decision", () => {
 
   it("asks one line naming the ticket, the alerts, the fix and the due date, and says when it is overdue", () => {
     const echo = { severity: "medium" as const, package: "github.com/labstack/echo/v4", ecosystem: "go", fixedVersion: null };
-    expect(adoptionQuestion("SC-111", "bitcomplete/santaclaw", [echo, echo], "2026-11-04")).toBe("Adopt SC-111? medium Dependabot alerts (2) on bitcomplete/santaclaw: github.com/labstack/echo/v4 (go), no fixed version, due 2026-11-04.");
+    expect(adoptionQuestion("SC-111", "acme/sandbox", [echo, echo], "2026-11-04")).toBe("Adopt SC-111? medium Dependabot alerts (2) on acme/sandbox: github.com/labstack/echo/v4 (go), no fixed version, due 2026-11-04.");
     expect(adoptionQuestion("ENG-50", "acme/web", [alert()], null)).toBe("Adopt ENG-50? high Dependabot alert on acme/web: lodash (npm), fix available.");
     expect(adoptionQuestion("ENG-50", "acme/web", [alert({ severity: "low" }), alert({ severity: "medium", package: "axios", fixedVersion: null })], "2026-11-01")).toMatch(/^Adopt ENG-50\? medium\/low Dependabot alerts \(2\) on acme\/web: lodash, axios \(npm\), fix for 1 of 2, due 2026-11-01\.$/u);
     expect(adoptionQuestion("ENG-50", "acme/web", [alert()], "2026-11-04", 2)).toMatch(/due 2026-11-04\. Overdue by 2 days\.$/u);

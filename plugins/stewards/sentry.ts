@@ -1,7 +1,7 @@
 // The ops kind's Sentry source: a Sentry project read with the plugin's own
 // Sentry token (a secret setting), turned into sightings an ops steward
 // files tickets for. The issue id Sentry assigns is the fingerprint: it is
-// what a doorbell from bb-gate-hooks carries, what the Sentry API is keyed
+// what a doorbell from the hooks service carries, what the Sentry API is keyed
 // on, and stable across events, so one issue is one ticket however often it
 // fires.
 //

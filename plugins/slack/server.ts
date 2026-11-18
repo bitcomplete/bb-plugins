@@ -1,13 +1,13 @@
 // Slack: the one team Slack app routed to this developer's bb. Each Slack
 // conversation (phase 1: a DM thread) becomes one bb thread; a follow-up in
 // the same Slack thread continues it, and `slack_reply` posts back through
-// bb-gate-hooks, which holds the bot token. The pod never holds a Slack bot
+// the hooks service, which holds the bot token. The pod never holds a Slack bot
 // credential.
 //
-// Identity is per-developer "Sign in with Slack" (bb-gate/docs/hooks.md,
+// Identity is per-developer "Sign in with Slack" (hooks.md,
 // "Slack agent"): the settings page sends the browser to Slack through the
 // service, the callback below runs on this developer's own server, and the
-// exchange happens in bb-gate-hooks, which holds the OAuth client secret. The
+// exchange happens in the hooks service, which holds the OAuth client secret. The
 // user token that comes back is stored in plugin storage and presented at
 // `/v1/identify`; the service binds the Slack user to this server's stream.
 import { createHash, randomBytes } from "node:crypto";
@@ -276,7 +276,7 @@ export const rpcContract = defineRpcContract({
   },
   /**
    * Add the app's bot to a channel the developer is mapping, through
-   * bb-gate-hooks, which holds the bot token. "joined" also covers a channel
+   * the hooks service, which holds the bot token. "joined" also covers a channel
    * the bot was already in. "private" means Slack lets only a member invite
    * the bot there; the message says how. "unavailable" carries why.
    */
@@ -360,9 +360,9 @@ function userRefusalError(error: HooksRequestError): Error {
 /** What a refused `POST /v1/slack/conversations` means, for the agent. */
 function startConversationError(error: unknown): Error {
   if (!(error instanceof HooksRequestError)) return error instanceof Error ? error : new Error(String(error));
-  if (error.unknownConnection) return new Error("This bb server is reconnecting to bb-gate-hooks. Try again in a minute.");
+  if (error.unknownConnection) return new Error("This bb server is reconnecting to the hooks service. Try again in a minute.");
   if ((error.status === 404 && error.code === null) || error.status === 405) {
-    return new Error("This bb-gate-hooks is too old to open conversations: it has no POST /v1/slack/conversations endpoint (needs BB-261). Ask the operator to deploy a newer bb-gate.");
+    return new Error("This hooks service is too old to open conversations: it has no POST /v1/slack/conversations endpoint (needs BB-261). Ask the operator to deploy a newer hooks service.");
   }
   if (error.status === 400 && (error.code === "unknown-user" || error.code === "ambiguous-user")) return userRefusalError(error);
   if (error.status === 409 && error.code === "not-in-channel") {
@@ -371,11 +371,11 @@ function startConversationError(error: unknown): Error {
   if (error.status === 503 && error.code === "missing-scope") {
     return new Error("The team's Slack app was installed without the mpim:write scope, so bb cannot open a group DM yet. A Slack admin must add mpim:write and mpim:history and reinstall the app; single-person DMs and channel threads work without them.");
   }
-  if (error.status === 403 && error.code === "not-identified") return new Error("bb-gate-hooks does not know which Slack user this server is yet. Try again in a minute.");
+  if (error.status === 403 && error.code === "not-identified") return new Error("the hooks service does not know which Slack user this server is yet. Try again in a minute.");
   if (error.status === 413) return new Error("The opener is larger than Slack allows (32 KiB). Shorten it.");
   if (error.status === 502) return new Error("Slack refused to open the conversation. Nothing was opened; try again in a moment.");
-  if (error.status === 503) return new Error("bb-gate-hooks cannot reach Slack right now. Try again later.");
-  return new Error(`bb-gate-hooks answered HTTP ${error.status} to opening the conversation.`);
+  if (error.status === 503) return new Error("the hooks service cannot reach Slack right now. Try again later.");
+  return new Error(`the hooks service answered HTTP ${error.status} to opening the conversation.`);
 }
 
 function errorMessage(error: unknown): string {
@@ -386,7 +386,7 @@ function errorMessage(error: unknown): string {
  * The reply a Slack conversation gets when the target project has no machine
  * to run on. It names the project, so the developer knows which routing row
  * to fix, and is used both when nothing is connected and when core still fell
- * back to a host daemon this server does not have (a bb-gate pod).
+ * back to a host daemon this server does not have (a server-only pod).
  */
 function noMachineReply(project: Project): string {
   return `No connected machine has the ${project.name} project, so a Slack thread cannot start there. Connect a machine in bb (or add a checkout for this project), then try again.`;
@@ -633,7 +633,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // ---- identity ----------------------------------------------------------
     //
     // The token is the developer's own "Sign in with Slack" token and lives in
-    // plugin storage. The name bb-gate-hooks answered with is in kv, for the
+    // plugin storage. The name the hooks service answered with is in kv, for the
     // settings page; it is never the token.
 
     const parsedIdentity = identityRecord.safeParse(await bb.storage.kv.get(IDENTITY_KEY));
@@ -648,7 +648,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       identity = { id: who.user.id, name: who.user.name, at: deps.now() };
       void bb.storage.kv.set(IDENTITY_KEY, identity);
       const changed = before === null || before.id !== identity.id || before.name !== identity.name;
-      if (changed) bb.log.info(`bb-gate-hooks knows this server as Slack user ${who.user.name}`);
+      if (changed) bb.log.info(`the hooks service knows this server as Slack user ${who.user.name}`);
       if (changed) announceConnection(true);
     }
 
@@ -693,14 +693,14 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     /**
      * Where a Slack conversation's thread runs. A plugin has no composer to
-     * resolve "the project's default", and on a bb-gate server the pod itself
+     * resolve "the project's default", and on a server-only deployment the pod itself
      * is no machine (the local host daemon is never initialised), so the
      * thread must name a connected machine. The project's newest environment
      * says what the developer actually uses: its provider and inputs are
      * replayed on its machine when that machine is connected. Otherwise the
      * project's checkout on its default source's machine. When the project has
      * neither on a connected machine, it runs a project-checkout provider on a
-     * connected machine anyway (preferring the developer's devbox), and null
+     * connected machine anyway (preferring the developer's own machine), and null
      * only when nothing is connected, so the caller can say so instead of
      * leaving the choice to core's host daemon.
      */
@@ -732,7 +732,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * A connected machine to run a project-checkout thread on, when the
      * project has no environment or checkout on one. Prefers a machine that
      * hosts an active provider environment of any project (the developer's
-     * devbox), then any connected machine. Null when nothing is connected.
+     * own machine), then any connected machine. Null when nothing is connected.
      */
     async function fallbackHost(connected: Set<string>): Promise<string | null> {
       if (connected.size === 0) return null;
@@ -771,14 +771,14 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (rejection.reason === "owned") {
           if (!ownedNotified.has(rejection.id)) {
             ownedNotified.add(rejection.id);
-            bb.log.warn(`bb-gate-hooks says another bb server holds Slack session ${sessionLogId(rejection.id)}; this server will not renew it`);
+            bb.log.warn(`the hooks service says another bb server holds Slack session ${sessionLogId(rejection.id)}; this server will not renew it`);
             // Best effort: the other server's live lease makes the service
             // refuse this reply, so the log line above is the reliable half.
             void backstop(rejection.id, "Another bb server holds this Slack conversation now, so this one cannot answer in it.");
           }
           continue;
         }
-        bb.log.warn(`bb-gate-hooks refused the Slack session lease for ${sessionLogId(rejection.id)} (${rejection.reason})`);
+        bb.log.warn(`the hooks service refused the Slack session lease for ${sessionLogId(rejection.id)} (${rejection.reason})`);
       }
     }
 
@@ -803,7 +803,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
           .map(([id, r]) => ({ kind: "session" as const, id, capability: r.capability })),
       onRejected: (rejections) => onLeaseRejected(rejections),
       onHello: () => void prunePending(),
-      onTokenRefused: (token) => void forgetSignin("bb-gate-hooks refused the sign-in token", token),
+      onTokenRefused: (token) => void forgetSignin("the hooks service refused the sign-in token", token),
     });
 
     // ---- posting back ------------------------------------------------------
@@ -811,15 +811,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /** What a refused reply means, for the agent. */
     function replyError(error: unknown): Error {
       if (!(error instanceof HooksRequestError)) return error instanceof Error ? error : new Error(String(error));
-      if (error.status === 403 && error.code === "not-identified") return new Error("bb-gate-hooks does not know which Slack user this server is yet (it proves that on connecting, every half hour, and after sign-in). Try again in a minute.");
-      if (error.status === 403) return new Error("bb-gate-hooks refused: this Slack conversation is not routed to this server's Slack user. Nothing was posted.");
-      if (error.unknownConnection) return new Error("This bb server is reconnecting to bb-gate-hooks. Try again in a minute.");
-      if (error.status === 400) return new Error("bb-gate-hooks refused the reply as malformed.");
+      if (error.status === 403 && error.code === "not-identified") return new Error("the hooks service does not know which Slack user this server is yet (it proves that on connecting, every half hour, and after sign-in). Try again in a minute.");
+      if (error.status === 403) return new Error("the hooks service refused: this Slack conversation is not routed to this server's Slack user. Nothing was posted.");
+      if (error.unknownConnection) return new Error("This bb server is reconnecting to the hooks service. Try again in a minute.");
+      if (error.status === 400) return new Error("the hooks service refused the reply as malformed.");
       if (error.status === 413) return new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`);
       if (error.status === 502 && error.code === "channel-restricted") return new Error("The channel does not let bb post, and showing the reply only to the asker failed too. Nothing was posted. Ask a channel admin to allow posting, or use another channel.");
       if (error.status === 502) return new Error("Slack refused the message. Nothing was posted; try again in a moment.");
-      if (error.status === 503) return new Error("bb-gate-hooks cannot post to Slack right now (Slack is unreachable, or the team app's credentials are not set up there). Try again later.");
-      return new Error(`bb-gate-hooks answered HTTP ${error.status} to the reply.`);
+      if (error.status === 503) return new Error("the hooks service cannot post to Slack right now (Slack is unreachable, or the team app's credentials are not set up there). Try again later.");
+      return new Error(`the hooks service answered HTTP ${error.status} to the reply.`);
     }
 
     /**
@@ -838,7 +838,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       }
       markAnswered(session, slot);
       if (clearStatus) void hooks.status(session, "", checkSignal()).catch(() => undefined);
-      // A missing `ephemeral` is an older bb-gate-hooks that posted in the
+      // A missing `ephemeral` is an older hooks service that posted in the
       // channel; only a true field means the fallback was used.
       const ephemeral = answer.ephemeral === true;
       if (ephemeral) bb.log.warn(`the Slack reply for session ${sessionLogId(session)} was posted only to the asker: the channel does not let bb post`);
@@ -1222,7 +1222,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       try {
         thread = await bb.sdk.threads.spawn({ projectId: project.id, environment, input: [{ type: "text", text: body, mentions: [] }, ...prepared.parts], title, visibility: "hidden" });
       } catch (error) {
-        // Core can still pick its own host daemon (a bb-gate pod has none),
+        // Core can still pick its own host daemon (a server-only pod has none),
         // even though this environment names a connected machine. Answer the
         // same way as when nothing is connected rather than echoing the 502.
         if (!isLocalHostDaemonError(error)) throw error;
@@ -2198,11 +2198,11 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return channelSearch(query ?? "");
       },
       async signinStart() {
-        if (hooksUrl === "") throw new Error(`Sign in with Slack is not available on this bb server: it has no bb-gate-hooks service (${HOOKS_URL_ENV} is not set).`);
-        if (!hooks.connected) throw new Error("This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again.");
+        if (hooksUrl === "") throw new Error(`Sign in with Slack is not available on this bb server: it has no hooks service (${HOOKS_URL_ENV} is not set).`);
+        if (!hooks.connected) throw new Error("This bb server is not connected to the hooks service yet. Wait a moment and try again.");
         await prunePending();
         const connection = hooks.connectionId;
-        if (connection === null) throw new Error("This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again.");
+        if (connection === null) throw new Error("This bb server is not connected to the hooks service yet. Wait a moment and try again.");
         const { authorizeUrl, state } = await hooks.signinStart(checkSignal());
         await bb.storage.kv.set(`${PENDING_PREFIX}${state}`, { connection, createdAt: deps.now() } satisfies PendingSignin);
         return { url: authorizeUrl };
@@ -2221,7 +2221,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     });
 
     /**
-     * Ask bb-gate-hooks to have the bot join `channel`. Every refusal is an
+     * Ask the hooks service to have the bot join `channel`. Every refusal is an
      * answer the settings page can show, not an error: the developer can
      * always fall back to /invite in Slack, and the page says so.
      */
@@ -2229,8 +2229,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const id = channel.trim();
       const byHand = "Invite bb from Slack instead: open the channel and type /invite @bb.";
       if (!CHANNEL_ID.test(id)) return { state: "not-found", message: `That is not a Slack channel id; pick a channel from the list or paste its id. ${byHand}` };
-      if (hooksUrl === "") return { state: "unavailable", message: `This bb server has no bb-gate-hooks service, so it cannot add bb to channels. ${byHand}` };
-      if (!hooks.connected || hooks.connectionId === null) return { state: "unavailable", message: `This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again. ${byHand}` };
+      if (hooksUrl === "") return { state: "unavailable", message: `This bb server has no hooks service, so it cannot add bb to channels. ${byHand}` };
+      if (!hooks.connected || hooks.connectionId === null) return { state: "unavailable", message: `This bb server is not connected to the hooks service yet. Wait a moment and try again. ${byHand}` };
       try {
         await hooks.joinChannel(id, checkSignal());
       } catch (error) {
@@ -2248,12 +2248,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
             case "not-identified":
               return { state: "unavailable", message: `Sign in with Slack first, then try again. ${byHand}` };
             case "unknown-connection":
-              return { state: "unavailable", message: `bb-gate-hooks no longer knows this connection; it reconnects on its own. Try again in a minute. ${byHand}` };
+              return { state: "unavailable", message: `the hooks service no longer knows this connection; it reconnects on its own. Try again in a minute. ${byHand}` };
             default:
               break;
           }
-          // A 404 with no code is an older bb-gate-hooks without the endpoint.
-          if (error.status === 404 && error.code === null) return { state: "unavailable", message: `This bb-gate-hooks cannot add bb to channels yet. ${byHand}` };
+          // A 404 with no code is an older hooks service without the endpoint.
+          if (error.status === 404 && error.code === null) return { state: "unavailable", message: `This hooks service cannot add bb to channels yet. ${byHand}` };
         }
         bb.log.warn(`could not add the Slack bot to ${id}: ${errorMessage(error)}`);
         return { state: "unavailable", message: `Slack did not answer; try again. ${byHand}` };
@@ -2351,7 +2351,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "slack_reply",
       description:
-        "Reply in Slack on the conversation that woke this thread. Markdown is fine; it is converted to Slack mrkdwn before posting. The message is posted by bb-gate-hooks, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
+        "Reply in Slack on the conversation that woke this thread. Markdown is fine; it is converted to Slack mrkdwn before posting. The message is posted by the hooks service, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
       instructions:
         "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Markdown or Slack's mrkdwn — Markdown is fine; it is converted — and say in one line who did it. A message that needs no answer (a thanks, or something bb should not act on) is acknowledged with slack_ack instead, which posts nothing; never use slack_ack to skip work that was asked for. Do not paste secrets or tokens.",
       presentation: { label: { pending: "Replying in Slack", completed: "Replied in Slack" } },
@@ -2360,7 +2360,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         session: z.string().trim().min(1).max(200).optional().describe("The Slack session id from the wake. Leave it out: this thread's Slack conversation is used."),
       }),
       async execute({ text, session }, { threadId, signal }) {
-        if (hooksUrl === "") return toolError(new Error("Replying in Slack is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set)."));
+        if (hooksUrl === "") return toolError(new Error("Replying in Slack is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set)."));
         const id = session ?? sessionForThread(threadId);
         if (id === null) return toolError(new Error("This thread is not answering a Slack conversation, so there is nothing to reply to."));
         const r = sessions.get(id);
@@ -2416,8 +2416,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         channel: z.string().trim().min(1).max(40).optional().describe("A Slack channel id (C… or G…) to post a new top-level message in."),
       }),
       async execute({ text, users, channel }, { threadId, projectId, signal }) {
-        if (hooksUrl === "") return toolError(new Error("Starting a Slack conversation is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set)."));
-        if (!hooks.connected || hooks.connectionId === null) return toolError(new Error("This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again."));
+        if (hooksUrl === "") return toolError(new Error("Starting a Slack conversation is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set)."));
+        if (!hooks.connected || hooks.connectionId === null) return toolError(new Error("This bb server is not connected to the hooks service yet. Wait a moment and try again."));
         if (users !== undefined && channel !== undefined) return toolError(new Error("Name either `users` or `channel`, not both: `users` opens a DM or group DM, `channel` posts in a channel."));
         if (users === undefined && channel === undefined) return toolError(new Error("Name either `users` (one or more Slack names or ids) or `channel` (a C… or G… id)."));
         if (channel !== undefined && !CHANNEL_ID.test(channel)) return toolError(new Error("`channel` must be a Slack channel id (C… or G…), never a name. Open the channel in Slack and copy its id."));

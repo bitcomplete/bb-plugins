@@ -1,4 +1,4 @@
-// The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md): one SSE
+// The subscriber side of the hooks service (hooks.md): one SSE
 // stream for doorbells, a lease per watched issue or pull request (and per
 // repository stewards asks about) proven with the developer's own token,
 // renewed at half-life, and a re-check of every watch whenever coverage
@@ -24,7 +24,7 @@ export const SUBSCRIBE_BATCH = 100;
  * repository and receives every `dependabot_alert` doorbell in it. Doorbells
  * are always `issue` or `dependabot_alert`; the unit lease kinds are
  * separate because reading a repository does not entitle a token to its
- * alerts (bb-gate/docs/hooks.md).
+ * alerts (hooks.md).
  */
 export type LeaseKind = "issue" | "repo" | "dependabot_repo" | "deployment_repo";
 export type Lease = { kind: LeaseKind; id: string };
@@ -75,7 +75,7 @@ export class SseParser {
 /** The events of a stream body, until it ends or the signal aborts. */
 export class StreamIdleError extends Error {
   constructor(idleMs: number) {
-    super(`no bytes from bb-gate-hooks for ${Math.round(idleMs / 1000)} s`);
+    super(`no bytes from the hooks service for ${Math.round(idleMs / 1000)} s`);
     this.name = "StreamIdleError";
   }
 }
@@ -169,7 +169,7 @@ export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connectio
       body: JSON.stringify({ connection, source: SOURCE, token, watches }),
       signal,
     });
-    if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
+    if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
     const parsed = subscribeResponseSchema.parse(await response.json());
     merged.leases.push(...parsed.leases);
     merged.rejected.push(...parsed.rejected);
@@ -352,7 +352,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         // service's side. Refresh regardless of what the expiry says and try
         // once more; nothing was admitted or dropped.
         if (!(error instanceof HooksRequestError && error.status === 401)) throw error;
-        deps.log.warn("bb-gate-hooks says GitHub refused the token; refreshing and retrying");
+        deps.log.warn("the hooks service says GitHub refused the token; refreshing and retrying");
         result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.refreshToken(), ids, signal);
       }
       if (connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
@@ -363,7 +363,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       if (error instanceof HooksRequestError && error.status === 404) {
         if (error.unknownConnection) {
           if (connection === current) {
-            deps.log.warn("bb-gate-hooks forgot our connection; reconnecting");
+            deps.log.warn("the hooks service forgot our connection; reconnecting");
             stream?.abort();
           }
           return false;
@@ -403,13 +403,13 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         if (event.event === "hello") {
           const hello = helloSchema.safeParse(JSON.parse(event.data));
           if (!hello.success) {
-            deps.log.warn("bb-gate-hooks sent a hello this plugin does not understand; reconnecting");
+            deps.log.warn("the hooks service sent a hello this plugin does not understand; reconnecting");
             return;
           }
           connection = hello.data.connection;
           setState("connected");
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
-          deps.log.info(`GitHub watches: connected to bb-gate-hooks as ${connection}`);
+          deps.log.info(`GitHub watches: connected to the hooks service as ${connection}`);
           // Not awaited: doorbells behind the hello must not wait for GitHub.
           void renew("hello", signal);
           if (renewTimer !== null) clearInterval(renewTimer);
@@ -485,12 +485,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         stream = controller;
         try {
           const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream" }, signal: controller.signal });
-          if (!response.ok || response.body === null) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to the event stream`, response.status);
+          if (!response.ok || response.body === null) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the event stream`, response.status);
           backoff = timing.backoffMinMs;
           await consume(response.body, controller.signal);
-          if (!signal.aborted) deps.log.warn("bb-gate-hooks event stream ended; reconnecting");
+          if (!signal.aborted) deps.log.warn("the hooks service event stream ended; reconnecting");
         } catch (error) {
-          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`bb-gate-hooks event stream: ${errorMessage(error)}`);
+          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`the hooks service event stream: ${errorMessage(error)}`);
         } finally {
           signal.removeEventListener("abort", onAbort);
           controller.abort();

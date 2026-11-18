@@ -12,7 +12,7 @@ import { expiresAt, flagsFor, NEAR_LIMIT_AT, WATCH_LIMIT, WATCH_TTL_MS, wakesInW
 const flagSchema = z.enum(["idle", "noisy", "expiring"]);
 
 export const hooksViewSchema = z.object({
-  /** Whether this server has a bb-gate-hooks service at all (BB_HOOKS_URL). */
+  /** Whether this server has a hooks service at all (BB_HOOKS_URL). */
   configured: z.boolean(),
   state: z.enum(["stopped", "connecting", "connected"]),
   since: z.number(),
@@ -107,7 +107,7 @@ export function orderWatches(watches: WatchView[]): WatchView[] {
 }
 
 /**
- * Leases bb-gate-hooks refused for stewards. The service says so only in
+ * Leases the hooks service refused for stewards. The service says so only in
  * the answer to a lease, and every renewal asks again, so a refusal is
  * current until a renewal has had time to repeat it.
  */

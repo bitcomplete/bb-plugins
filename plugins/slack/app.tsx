@@ -498,7 +498,7 @@ function SlackSection() {
   return (
     <div className="flex flex-col gap-4 text-sm">
       {!status.hooks.configured ? (
-        <p className="text-muted-foreground">This bb server has no bb-gate-hooks service (BB_HOOKS_URL is not set), so the Slack app cannot reach it.</p>
+        <p className="text-muted-foreground">This bb server has no hooks service (BB_HOOKS_URL is not set), so the Slack app cannot reach it.</p>
       ) : null}
       <div className="flex items-center justify-between gap-4">
         <p className="text-muted-foreground">
@@ -530,7 +530,7 @@ function SlackSection() {
           }}
         />
       ) : null}
-      {!status.hooks.connected && status.hooks.configured ? <p className="text-muted-foreground">Connecting to bb-gate-hooks…</p> : null}
+      {!status.hooks.connected && status.hooks.configured ? <p className="text-muted-foreground">Connecting to the hooks service…</p> : null}
       {error !== null ? <p className="text-destructive">{error}</p> : null}
     </div>
   );

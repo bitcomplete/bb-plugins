@@ -59,7 +59,7 @@ export const containsStatus = (status: CompareStatus | null): boolean => status 
  * Whether one changed path falls under one of a rule's `paths`. Both the
  * carries `paths` and GitHub's changed files are repo-relative, so this is a
  * direct glob match. The decide list's `touchesAny` is deliberately not used:
- * its repo-prefix stripping turns a rule like `kploy/**` into `**` and so
+ * its repo-prefix stripping turns a rule like `deploy/**` into `**` and so
  * matches every path, which would make a rule swallow merges another rule
  * owns (BB-260).
  */

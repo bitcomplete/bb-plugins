@@ -173,7 +173,7 @@ describe("a steward's wake", () => {
       mergedAt: T,
       prRepo: "acme/web",
       files: [],
-      repo: "acme/bb-gate",
+      repo: "acme/web",
       environment: "production",
       deploymentId: null,
       deploymentState: null,
@@ -615,18 +615,18 @@ describe("the nightly prompt", () => {
 
 describe("the decide-list listing in the wakes (BB-135)", () => {
   const entries = [
-    { text: "Identity and access", decide: "user" as const, paths: ["bb-gate/hooks/**"] },
-    { text: "A cross-repo contract", decide: "project" as const, paths: ["bb-gate/docs/hooks.md"] },
+    { text: "Identity and access", decide: "user" as const, paths: ["hooks/**"] },
+    { text: "A cross-repo contract", decide: "project" as const, paths: ["hooks.md"] },
   ];
-  const listing = () => formatDecisionListing(explainDecision(["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"], entries));
+  const listing = () => formatDecisionListing(explainDecision(["hooks/slack.go", "hooks.md"], entries));
 
   it("prints the listing on an approval escalation routed to the project steward", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");
     const x = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve acme/web#7", meanwhile: "Wait for the project steward's decision.", route: "project", recommendation: null, resolutionKind: "approve-decline", url: "https://github.com/acme/web/pull/7" });
     const wake = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b, listing: listing() }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
-    expect(wake).toContain('"Identity and access" [user] — bb-gate/hooks/slack.go');
-    expect(wake).toContain('"A cross-repo contract" [project] — bb-gate/docs/hooks.md');
+    expect(wake).toContain('"Identity and access" [user] — hooks/slack.go');
+    expect(wake).toContain('"A cross-repo contract" [project] — hooks.md');
     expect(wake).toContain('Deciding entry: "Identity and access" [user].');
     expect(wake).toContain("Rule: a `user` entry wins");
   });
@@ -702,9 +702,9 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     return parsed.value;
   };
   const opsFinding = (over: Partial<OpsFinding> = {}): OpsFinding => ({
-    fingerprint: "k8s-namespace/bb-gate-production/bb-gate-router/router#CrashLoopBackOff:Error:1",
-    workload: "bb-gate-router",
-    pods: ["bb-gate-router-6d4f9c7b8-x2k4q"],
+    fingerprint: "k8s-namespace/web-production/web-router/router#CrashLoopBackOff:Error:1",
+    workload: "web-router",
+    pods: ["web-router-6d4f9c7b8-x2k4q"],
     container: "router",
     signature: "CrashLoopBackOff:Error:1",
     summary: "Container router is in CrashLoopBackOff, 7 restarts",
@@ -726,9 +726,9 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
   const opsWake = (finding: OpsFinding) =>
     formatOpsWake({
       reason: "changed",
-      binding: binding("k8s-namespace/bb-gate-production"),
+      binding: binding("k8s-namespace/web-production"),
       playbook: parsedPlaybook(OPS_WATCH, "ops-watch"),
-      look: { at, target: "k8s-namespace/bb-gate-production", error: null, pods: 1, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [finding] },
+      look: { at, target: "k8s-namespace/web-production", error: null, pods: 1, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [finding] },
       target: { target: "ENG", source: "linear" },
       label: "bb-managed",
       owner: "Jane",

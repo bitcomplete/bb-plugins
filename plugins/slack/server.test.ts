@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import serverEntry, { ARCHIVE_SWEEP_INTERVAL_MS, ARCHIVE_SWEEP_STARTUP_DELAY_MS, ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, FILE_FETCH_TIMEOUT_MS, legacySettingDescriptors, projectPromptBlocks, SET_PROJECT_ACTION, SET_PROJECT_BUTTON_ACTION } from "./server.js";
 
 const APP_URL = "https://bb.example";
-const HOOKS_URL = "http://bb-gate-hooks.test:8081";
+const HOOKS_URL = "http://hooks.test:8081";
 
 /** The shape of the searchChannels RPC's answer, for test assertions. */
 type ChannelSearchResult = {
@@ -14,7 +14,7 @@ type ChannelSearchResult = {
   message?: string;
 };
 
-// A bb-gate-hooks whose event stream a test writes to, and whose sign-in and
+// A the hooks service whose event stream a test writes to, and whose sign-in and
 // session endpoints it scripts. Every Slack call is recorded.
 function fakeHooks() {
   const encoder = new TextEncoder();
@@ -104,7 +104,7 @@ function fakeHooks() {
       return Response.json({ ok: true });
     }
     // Slack's response_url: the plugin posts the replacement here, not through
-    // bb-gate-hooks, so it arrives as a plain Slack-host POST.
+    // the hooks service, so it arrives as a plain Slack-host POST.
     if (u.startsWith("https://hooks.slack.com/")) {
       responses.push({ url: u, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
       return Response.json({ ok: true });
@@ -116,7 +116,7 @@ function fakeHooks() {
       fileFetches.push({ session, id, connection: new URL(u).searchParams.get("connection") ?? "" });
       return state.file(session, id, init?.signal);
     }
-    const route = /^http:\/\/bb-gate-hooks\.test:8081\/v1\/slack\/sessions\/([^/]+)\/(message|status|title)$/u.exec(u);
+    const route = /^http:\/\/hooks\.test:8081\/v1\/slack\/sessions\/([^/]+)\/(message|status|title)$/u.exec(u);
     if (route !== null) {
       const session = decodeURIComponent(route[1]!);
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -250,7 +250,7 @@ async function setup(
   const hooks = options.hooks ?? fakeHooks();
   const slack = options.slack ?? fakeSlack();
   // The plugin's one outbound fetch: Slack's own API goes to the Slack fake,
-  // everything else (bb-gate-hooks) to the hooks fake.
+  // everything else (the hooks service) to the hooks fake.
   const fetchImpl = vi.fn((url: string | URL, init?: RequestInit): Promise<Response> =>
     String(url).startsWith("https://slack.com/") ? slack.fetchImpl(url, init) : hooks.fetchImpl(url, init),
   ) as unknown as typeof fetch;
@@ -1454,7 +1454,7 @@ describe("Slack plugin", () => {
     // The service forgot the connection: its own message, not the generic one.
     s.hooks.state.join = () => Response.json({ error: "unknown-connection" }, { status: 404 });
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("no longer knows this connection") });
-    // An older bb-gate-hooks without the endpoint answers a bare 404.
+    // An older hooks service without the endpoint answers a bare 404.
     s.hooks.state.join = () => new Response("not found", { status: 404 });
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
     // A name is never sent: the map stores ids.
@@ -1465,7 +1465,7 @@ describe("Slack plugin", () => {
 
   it("says when the service is not connected rather than joining", async () => {
     const s = await setup({ token: "xoxp-user-1" });
-    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("not connected to bb-gate-hooks") });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("not connected to the hooks service") });
     expect(s.hooks.joins).toEqual([]);
   });
 

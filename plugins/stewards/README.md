@@ -480,7 +480,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   open is not raised again. The nightly digest lists marked bindings and open
   stalls.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
-  02:45 so it finishes before the working day) gives every open
+  02:45) gives every open
   binding a turn, runs the live half of `bb stewards check` (teams, states,
   labels, repos, target readability and hooks leases), then wakes the project
   steward for the morning digest, which carries the check findings new or
@@ -659,7 +659,7 @@ reads the preference and, when it is unset or `__automatic__`, sets it to
 `thread-list/thread-list`. An explicit value, including `stewards/sidebar`,
 is left alone. The write is best-effort: a failure is logged and the sidebar
 keeps working. (`bb.onInstall` is not usable here; it does not run for
-plugins baked into the `bb-server` image.)
+plugins baked into the `app` image.)
 
 **Per client or per server?** Checked on a dev server: the preference is
 **server-synced**, so a flip is per server, not per browser. Every open

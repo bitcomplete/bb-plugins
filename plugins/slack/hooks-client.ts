@@ -1,4 +1,4 @@
-// The subscriber side of bb-gate-hooks for Slack (bb-gate/docs/hooks.md,
+// The subscriber side of the hooks service for Slack (hooks.md,
 // "Slack agent"): one SSE stream, carrying `event: session` wakes for the one
 // server bound to a Slack user. A wake carries an opaque `capability`, and the
 // session it names is leased on `POST /v1/subscribe`, so ownership and reply
@@ -61,7 +61,7 @@ export class SseParser {
 
 export class StreamIdleError extends Error {
   constructor(idleMs: number) {
-    super(`no bytes from bb-gate-hooks for ${Math.round(idleMs / 1000)} s`);
+    super(`no bytes from the hooks service for ${Math.round(idleMs / 1000)} s`);
     this.name = "StreamIdleError";
   }
 }
@@ -163,7 +163,7 @@ export const sessionHistoryMessageSchema = z
   .loose();
 export type SessionHistoryMessage = z.infer<typeof sessionHistoryMessageSchema>;
 
-/** `event: session` as the service sends it (bb-gate/docs/hooks.md). */
+/** `event: session` as the service sends it (hooks.md). */
 export const sessionEventSchema = z
   .object({
     source: z.literal(SOURCE),
@@ -283,13 +283,13 @@ async function postJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, 
     body: JSON.stringify(body),
     signal,
   });
-  if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to ${what}`, response.status, await response.text().catch(() => ""));
+  if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to ${what}`, response.status, await response.text().catch(() => ""));
   return schema.parse(await response.json());
 }
 
 async function getJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, schema: z.ZodType<T>, what: string, signal: AbortSignal): Promise<T> {
   const response = await fetchImpl(new URL(path, baseUrl), { headers: { accept: "application/json" }, signal });
-  if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to ${what}`, response.status, await response.text().catch(() => ""));
+  if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to ${what}`, response.status, await response.text().catch(() => ""));
   return schema.parse(await response.json());
 }
 
@@ -334,7 +334,7 @@ export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connectio
       body: JSON.stringify({ connection, source: SOURCE, watches }),
       signal,
     });
-    if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
+    if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
     const parsed = subscribeResponseSchema.parse(await response.json());
     merged.leases.push(...parsed.leases);
     merged.rejected.push(...parsed.rejected);
@@ -460,7 +460,7 @@ export async function fetchSessionFile(fetchImpl: FetchLike, baseUrl: string, co
   const url = new URL(`/v1/slack/sessions/${encodeURIComponent(session)}/files/${encodeURIComponent(id)}`, baseUrl);
   url.searchParams.set("connection", connection);
   const response = await fetchImpl(url, { headers: { accept: "*/*" }, signal });
-  if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to the Slack file fetch`, response.status, await response.text().catch(() => ""));
+  if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the Slack file fetch`, response.status, await response.text().catch(() => ""));
   return { bytes: new Uint8Array(await response.arrayBuffer()), mimeType: response.headers.get("content-type") ?? "" };
 }
 
@@ -601,7 +601,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   }
 
   function requireConnection(): string {
-    if (connection === null) throw new Error("This bb server is not connected to bb-gate-hooks right now (it is reconnecting). Try again in a minute.");
+    if (connection === null) throw new Error("This bb server is not connected to the hooks service right now (it is reconnecting). Try again in a minute.");
     return connection;
   }
 
@@ -623,21 +623,21 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       if (error instanceof HooksRequestError && error.status === 401) {
         // The token itself was refused: bad, expired or revoked. Tell the
         // caller so it can stop claiming to be signed in.
-        deps.log.warn("bb-gate-hooks refused the Slack sign-in token; sign in again");
+        deps.log.warn("the hooks service refused the Slack sign-in token; sign in again");
         deps.onTokenRefused?.(token);
         return;
       }
       if (error instanceof HooksRequestError && error.status === 404) {
         if (error.unknownConnection) {
           if (connection === current) {
-            deps.log.warn("bb-gate-hooks forgot our connection; reconnecting");
+            deps.log.warn("the hooks service forgot our connection; reconnecting");
             stream?.abort();
           }
           return;
         }
         if (!identifyUnsupportedLogged) {
           identifyUnsupportedLogged = true;
-          deps.log.info("bb-gate-hooks has no /v1/identify, so Slack DMs are not routed to this server");
+          deps.log.info("the hooks service has no /v1/identify, so Slack DMs are not routed to this server");
         }
         return;
       }
@@ -668,7 +668,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       if (error instanceof HooksRequestError && error.status === 404) {
         if (error.unknownConnection) {
           if (connection === current) {
-            deps.log.warn("bb-gate-hooks forgot our connection; reconnecting");
+            deps.log.warn("the hooks service forgot our connection; reconnecting");
             stream?.abort();
           }
           return;
@@ -700,13 +700,13 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         if (event.event === "hello") {
           const hello = helloSchema.safeParse(JSON.parse(event.data));
           if (!hello.success) {
-            deps.log.warn("bb-gate-hooks sent a hello this plugin does not understand; reconnecting");
+            deps.log.warn("the hooks service sent a hello this plugin does not understand; reconnecting");
             return;
           }
           connection = hello.data.connection;
           setState("connected");
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
-          deps.log.info(`Slack: connected to bb-gate-hooks as ${connection}`);
+          deps.log.info(`Slack: connected to the hooks service as ${connection}`);
           deps.onHello?.();
           // Not awaited: wakes behind the hello must not wait for identify or
           // the leases. Identify runs first so the lease has a bound user.
@@ -722,7 +722,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           }
           const session = sessionEventSchema.safeParse(parsed);
           if (session.success) deps.onSession(session.data);
-          else deps.log.warn("bb-gate-hooks sent a Slack session event this plugin does not understand; dropped");
+          else deps.log.warn("the hooks service sent a Slack session event this plugin does not understand; dropped");
         }
       }
     } finally {
@@ -803,12 +803,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         stream = controller;
         try {
           const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream" }, signal: controller.signal });
-          if (!response.ok || response.body === null) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to the event stream`, response.status);
+          if (!response.ok || response.body === null) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the event stream`, response.status);
           backoff = timing.backoffMinMs;
           await consume(response.body, controller.signal);
-          if (!signal.aborted) deps.log.warn("bb-gate-hooks event stream ended; reconnecting");
+          if (!signal.aborted) deps.log.warn("the hooks service event stream ended; reconnecting");
         } catch (error) {
-          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`bb-gate-hooks event stream: ${errorMessage(error)}`);
+          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`the hooks service event stream: ${errorMessage(error)}`);
         } finally {
           signal.removeEventListener("abort", onAbort);
           controller.abort();

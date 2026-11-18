@@ -5,42 +5,42 @@ import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, aw
 import type { Deployment, WorkflowRun } from "./source-contract.js";
 import type { Observed } from "./store.js";
 
-const target: DeploymentTarget = { source: "github", repo: "acme/bb-gate", environment: "production", carries: "the pinned ref contains the merge", timeout: 3_600_000, workflows: [] };
-const named: DeploymentTarget = { ...target, workflows: ["bb-server.yaml"] };
+const target: DeploymentTarget = { source: "github", repo: "acme/web", environment: "production", carries: "the pinned ref contains the merge", timeout: 3_600_000, workflows: [] };
+const named: DeploymentTarget = { ...target, workflows: ["build.yaml"] };
 // The two-target playbook front matter (BB-132 follow-up): structured rules,
 // disjoint repos, so a merge is watched only where a rule can carry it.
 const bbGateTarget: DeploymentTarget = {
-  name: "bb-gate",
+  name: "web",
   source: "github",
-  repo: "bitcomplete/bb-gate",
+  repo: "acme/web",
   environment: "production",
   carries: [
-    { when: { repo: "bitcomplete/bb-plugins" }, strategy: { kind: "ref-contains-merge" } },
-    { when: { repo: "bitcomplete/bb-gate" }, strategy: { kind: "ref-contains-merge" } },
+    { when: { repo: "acme/app" }, strategy: { kind: "ref-contains-merge" } },
+    { when: { repo: "acme/web" }, strategy: { kind: "ref-contains-merge" } },
   ],
   timeout: 3_600_000,
   workflows: [],
 };
-const devboxTarget: DeploymentTarget = {
-  name: "devbox",
+const toolsTarget: DeploymentTarget = {
+  name: "tools",
   source: "github",
-  repo: "bitcomplete/devbox",
+  repo: "acme/tools",
   environment: "production",
-  carries: [{ when: { repo: "bitcomplete/devbox" }, strategy: { kind: "ref-contains-merge" } }],
+  carries: [{ when: { repo: "acme/tools" }, strategy: { kind: "ref-contains-merge" } }],
   timeout: 3_600_000,
   workflows: [],
 };
-// The split bb-gate rule (BB-260): kploy and backend.json wait for the apply,
+// The split web rule (BB-260): deploy and backend.json wait for the apply,
 // .bb/docs/markdown are live at merge, and anything else builds the router.
 const liveAtMergeTarget: DeploymentTarget = {
-  name: "bb-gate",
+  name: "web",
   source: "github",
-  repo: "bitcomplete/bb-gate",
+  repo: "acme/web",
   environment: "production",
   carries: [
-    { when: { repo: "bitcomplete/bb-gate", paths: ["kploy/**", "backend.json"] }, strategy: { kind: "ref-contains-merge" } },
-    { when: { repo: "bitcomplete/bb-gate", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" } },
-    { when: { repo: "bitcomplete/bb-gate" }, strategy: { kind: "image-tag", manifest: "kploy/production/kustomization.yaml", image: "bb-gate", workflow: "image.yaml" } },
+    { when: { repo: "acme/web", paths: ["deploy/**", "backend.json"] }, strategy: { kind: "ref-contains-merge" } },
+    { when: { repo: "acme/web", paths: [".bb/**", "docs/**", "**.md"] }, strategy: { kind: "live-at-merge" } },
+    { when: { repo: "acme/web" }, strategy: { kind: "image-tag", manifest: "deploy/kustomization.yaml", image: "web", workflow: "image.yaml" } },
   ],
   timeout: 3_600_000,
   workflows: [],
@@ -52,7 +52,7 @@ const observed = (over: { entity?: ReturnType<typeof pull>; pulls?: Array<Return
   pulls: over.pulls ?? [],
 });
 
-const deployment = (over: Partial<Deployment> = {}): Deployment => ({ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/acme/bb-gate/actions/runs/9", ...over });
+const deployment = (over: Partial<Deployment> = {}): Deployment => ({ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/acme/web/actions/runs/9", ...over });
 
 describe("recording merged pull requests", () => {
   it("records a merged pull request once, with the target and a deadline", () => {
@@ -66,7 +66,7 @@ describe("recording merged pull requests", () => {
         mergedAt: NOW,
         prRepo: "acme/web",
         files: [],
-        repo: "acme/bb-gate",
+        repo: "acme/web",
         environment: "production",
         deploymentId: null,
         deploymentState: null,
@@ -122,138 +122,138 @@ describe("recording merged pull requests", () => {
   });
 
   it("keys two targets on one pull request independently, and a single unnamed target as before", () => {
-    const devbox: DeploymentTarget = { ...target, repo: "bitcomplete/devbox", environment: "production", name: "devbox" };
-    const both = recordMerged({}, observed(), [target, devbox], NOW);
-    expect(Object.keys(both).sort()).toEqual(["acme/web#7::acme/bb-gate@production", "acme/web#7::devbox"]);
-    expect(both["acme/web#7::devbox"]).toMatchObject({ key: "acme/web#7", target: "devbox", repo: "bitcomplete/devbox" });
-    expect(both["acme/web#7::acme/bb-gate@production"]).toMatchObject({ key: "acme/web#7", target: "acme/bb-gate@production", repo: "acme/bb-gate" });
+    const tools: DeploymentTarget = { ...target, repo: "acme/tools", environment: "production", name: "tools" };
+    const both = recordMerged({}, observed(), [target, tools], NOW);
+    expect(Object.keys(both).sort()).toEqual(["acme/web#7::acme/web@production", "acme/web#7::tools"]);
+    expect(both["acme/web#7::tools"]).toMatchObject({ key: "acme/web#7", target: "tools", repo: "acme/tools" });
+    expect(both["acme/web#7::acme/web@production"]).toMatchObject({ key: "acme/web#7", target: "acme/web@production", repo: "acme/web" });
     // A single unnamed target keeps today's key.
     expect(Object.keys(recordMerged({}, observed(), [target], NOW))).toEqual(["acme/web#7"]);
   });
 
   it("migrates a legacy single-target watch to the keyed form when a second target appears", () => {
-    const devbox: DeploymentTarget = { ...target, repo: "bitcomplete/devbox", environment: "production", name: "devbox" };
+    const tools: DeploymentTarget = { ...target, repo: "acme/tools", environment: "production", name: "tools" };
     const legacy = recordMerged({}, observed(), [target], NOW);
-    const migrated = recordMerged(legacy, observed(), [target, devbox], NOW + 1000);
-    expect(Object.keys(migrated).sort()).toEqual(["acme/web#7::acme/bb-gate@production", "acme/web#7::devbox"]);
-    expect(migrated["acme/web#7::acme/bb-gate@production"]).toMatchObject({ key: "acme/web#7", target: "acme/bb-gate@production", repo: "acme/bb-gate", mergeSha: "aaaaaaa1" });
-    expect(migrated["acme/web#7::devbox"]).toMatchObject({ key: "acme/web#7", target: "devbox", repo: "bitcomplete/devbox" });
+    const migrated = recordMerged(legacy, observed(), [target, tools], NOW + 1000);
+    expect(Object.keys(migrated).sort()).toEqual(["acme/web#7::acme/web@production", "acme/web#7::tools"]);
+    expect(migrated["acme/web#7::acme/web@production"]).toMatchObject({ key: "acme/web#7", target: "acme/web@production", repo: "acme/web", mergeSha: "aaaaaaa1" });
+    expect(migrated["acme/web#7::tools"]).toMatchObject({ key: "acme/web#7", target: "tools", repo: "acme/tools" });
   });
 
   // BB-132 follow-up: a target whose structured rules do not match the merge
   // gets no watch, so it never sits in deploying, times out to failed, or
   // blocks the ticket from closing.
   it("watches only the target whose structured rules match a merge", () => {
-    const plugins = { entity: pull({ key: "bitcomplete/bb-plugins#7", unit: "bitcomplete/bb-plugins" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["plugins/stewards/deploy.ts"] }), pulls: [] };
-    const gateOnly = recordMerged({}, plugins, [bbGateTarget, devboxTarget], NOW);
-    expect(Object.keys(gateOnly)).toEqual(["bitcomplete/bb-plugins#7::bb-gate"]);
-    expect(gateOnly["bitcomplete/bb-plugins#7::bb-gate"]).toMatchObject({ key: "bitcomplete/bb-plugins#7", target: "bb-gate", repo: "bitcomplete/bb-gate", prRepo: "bitcomplete/bb-plugins" });
+    const plugins = { entity: pull({ key: "acme/app#7", unit: "acme/app" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["plugins/stewards/deploy.ts"] }), pulls: [] };
+    const gateOnly = recordMerged({}, plugins, [bbGateTarget, toolsTarget], NOW);
+    expect(Object.keys(gateOnly)).toEqual(["acme/app#7::web"]);
+    expect(gateOnly["acme/app#7::web"]).toMatchObject({ key: "acme/app#7", target: "web", repo: "acme/web", prRepo: "acme/app" });
 
-    const dev = { entity: pull({ key: "bitcomplete/devbox#9", unit: "bitcomplete/devbox" }, { merged: true, mergeCommit: "bbbbbbb2", files: ["gate/server.go"] }), pulls: [] };
-    const devboxOnly = recordMerged({}, dev, [bbGateTarget, devboxTarget], NOW);
-    expect(Object.keys(devboxOnly)).toEqual(["bitcomplete/devbox#9::devbox"]);
-    expect(devboxOnly["bitcomplete/devbox#9::devbox"]).toMatchObject({ key: "bitcomplete/devbox#9", target: "devbox", repo: "bitcomplete/devbox", prRepo: "bitcomplete/devbox" });
+    const dev = { entity: pull({ key: "acme/tools#9", unit: "acme/tools" }, { merged: true, mergeCommit: "bbbbbbb2", files: ["gate/server.go"] }), pulls: [] };
+    const toolsOnly = recordMerged({}, dev, [bbGateTarget, toolsTarget], NOW);
+    expect(Object.keys(toolsOnly)).toEqual(["acme/tools#9::tools"]);
+    expect(toolsOnly["acme/tools#9::tools"]).toMatchObject({ key: "acme/tools#9", target: "tools", repo: "acme/tools", prRepo: "acme/tools" });
   });
 
   it("drops a stored watch on a target whose structured rules do not apply", () => {
-    const plugins = { entity: pull({ key: "bitcomplete/bb-plugins#7", unit: "bitcomplete/bb-plugins" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["plugins/stewards/deploy.ts"] }), pulls: [] };
-    // A watch recorded before the filtering existed, on the devbox target.
-    const stale = recordMerged({}, plugins, [devboxTarget], NOW);
-    expect(Object.keys(stale)).toEqual(["bitcomplete/bb-plugins#7::devbox"]);
-    const fixed = recordMerged(stale, plugins, [bbGateTarget, devboxTarget], NOW + 1000);
-    expect(Object.keys(fixed)).toEqual(["bitcomplete/bb-plugins#7::bb-gate"]);
+    const plugins = { entity: pull({ key: "acme/app#7", unit: "acme/app" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["plugins/stewards/deploy.ts"] }), pulls: [] };
+    // A watch recorded before the filtering existed, on the tools target.
+    const stale = recordMerged({}, plugins, [toolsTarget], NOW);
+    expect(Object.keys(stale)).toEqual(["acme/app#7::tools"]);
+    const fixed = recordMerged(stale, plugins, [bbGateTarget, toolsTarget], NOW + 1000);
+    expect(Object.keys(fixed)).toEqual(["acme/app#7::web"]);
   });
 
   it("keeps an in-flight paths-gated watch when a later read's files list is empty", () => {
     const pathsTarget: DeploymentTarget = {
-      name: "bb-gate",
+      name: "web",
       source: "github",
-      repo: "bitcomplete/bb-gate",
+      repo: "acme/web",
       environment: "production",
-      carries: [{ when: { repo: "bitcomplete/bb-gate", paths: ["docker/bb-server/**"] }, strategy: { kind: "ref-contains-merge" } }],
+      carries: [{ when: { repo: "acme/web", paths: ["docker/app/**"] }, strategy: { kind: "ref-contains-merge" } }],
       timeout: 3_600_000,
       workflows: [],
     };
-    const withFiles = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["docker/bb-server/Dockerfile"] }), pulls: [] };
+    const withFiles = { entity: pull({ key: "acme/web#4", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["docker/app/Dockerfile"] }), pulls: [] };
     const recorded = recordMerged({}, withFiles, [pathsTarget], NOW);
-    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+    expect(Object.keys(recorded)).toEqual(["acme/web#4::web"]);
     // The stored watch's own files decide, so an empty fresh list neither
     // drops it nor brings in the other target.
-    const empty = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: [] }), pulls: [] };
-    const again = recordMerged(recorded, empty, [pathsTarget, devboxTarget], NOW + 1000);
-    expect(Object.keys(again)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
+    const empty = { entity: pull({ key: "acme/web#4", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files: [] }), pulls: [] };
+    const again = recordMerged(recorded, empty, [pathsTarget, toolsTarget], NOW + 1000);
+    expect(Object.keys(again)).toEqual(["acme/web#4::web"]);
   });
 
   it("still watches a merge no target's rules match, on the steward-decided path", () => {
-    const other = { entity: pull({ key: "bitcomplete/other#3", unit: "bitcomplete/other" }, { merged: true, mergeCommit: "ccccccc3", files: ["README.md"] }), pulls: [] };
-    const deployments = recordMerged({}, other, [bbGateTarget, devboxTarget], NOW);
-    expect(Object.keys(deployments).sort()).toEqual(["bitcomplete/other#3::bb-gate", "bitcomplete/other#3::devbox"]);
+    const other = { entity: pull({ key: "acme/other#3", unit: "acme/other" }, { merged: true, mergeCommit: "ccccccc3", files: ["README.md"] }), pulls: [] };
+    const deployments = recordMerged({}, other, [bbGateTarget, toolsTarget], NOW);
+    expect(Object.keys(deployments).sort()).toEqual(["acme/other#3::tools", "acme/other#3::web"]);
   });
 
   // BB-260: a merge nothing deploys is `deployed` the moment it is recorded,
   // with no deadline, so the steward is woken without waiting for any
   // deployment.
   it("marks a .bb-only merge deployed at merge, with no deadline", () => {
-    const bbOnly = { entity: pull({ key: "bitcomplete/bb-gate#4", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }), pulls: [] };
+    const bbOnly = { entity: pull({ key: "acme/web#4", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }), pulls: [] };
     const recorded = recordMerged({}, bbOnly, [liveAtMergeTarget], NOW);
-    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#4::bb-gate"]);
-    expect(recorded["bitcomplete/bb-gate#4::bb-gate"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
+    expect(Object.keys(recorded)).toEqual(["acme/web#4::web"]);
+    expect(recorded["acme/web#4::web"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md" });
     // Nothing times out and nothing awaits a deployment.
     expect(timeoutsDue(recorded, NOW + liveAtMergeTarget.timeout)).toEqual([]);
-    expect(awaitingOnRepo(recorded, "bitcomplete/bb-gate")).toEqual([]);
+    expect(awaitingOnRepo(recorded, "acme/web")).toEqual([]);
   });
 
   it("treats a docs-only or markdown-only merge as live at merge too", () => {
     for (const files of [["docs/design.md"], ["README.md"]]) {
-      const merged = { entity: pull({ key: "bitcomplete/bb-gate#8", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files }), pulls: [] };
+      const merged = { entity: pull({ key: "acme/web#8", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files }), pulls: [] };
       const recorded = recordMerged({}, merged, [liveAtMergeTarget], NOW);
-      expect(recorded["bitcomplete/bb-gate#8::bb-gate"]).toMatchObject({ state: "deployed" });
+      expect(recorded["acme/web#8::web"]).toMatchObject({ state: "deployed" });
     }
   });
 
-  // BB-292: the bb-gate#106 deployment scenario. #106 changed only
+  // BB-292: the web#106 deployment scenario. #106 changed only
   // `.bb/AGENTS.md` and `.bb/stewards/playbooks/linear-tickets.md`, both under
   // the split rule's live-at-merge paths, so the watch settles `deployed` the
   // moment the merge is recorded: no deadline, no deployment read, and the wake
   // that follows names it deployed rather than awaiting.
-  it("pins the bb-gate#106 scenario: a .bb-only merge is deployed at merge with the wake following it", () => {
-    const bb106 = { entity: pull({ key: "bitcomplete/bb-gate#106", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "dc8fb02", files: [".bb/AGENTS.md", ".bb/stewards/playbooks/linear-tickets.md"] }), pulls: [] };
+  it("pins the web#106 scenario: a .bb-only merge is deployed at merge with the wake following it", () => {
+    const bb106 = { entity: pull({ key: "acme/web#106", unit: "acme/web" }, { merged: true, mergeCommit: "dc8fb02", files: [".bb/AGENTS.md", ".bb/stewards/playbooks/linear-tickets.md"] }), pulls: [] };
     const recorded = recordMerged({}, bb106, [liveAtMergeTarget], NOW);
-    expect(Object.keys(recorded)).toEqual(["bitcomplete/bb-gate#106::bb-gate"]);
-    expect(recorded["bitcomplete/bb-gate#106::bb-gate"]).toMatchObject({
+    expect(Object.keys(recorded)).toEqual(["acme/web#106::web"]);
+    expect(recorded["acme/web#106::web"]).toMatchObject({
       state: "deployed",
       deadlineAt: null,
       note: "live-at-merge: nothing deploys .bb/**, docs/**, **.md",
     });
     // No deployment read is needed: nothing times out and nothing awaits.
     expect(timeoutsDue(recorded, NOW + liveAtMergeTarget.timeout)).toEqual([]);
-    expect(awaitingOnRepo(recorded, "bitcomplete/bb-gate")).toEqual([]);
+    expect(awaitingOnRepo(recorded, "acme/web")).toEqual([]);
     expect(allDeployed(recorded)).toBe(true);
     // The wake that follows prints the watch deployed, not awaiting.
-    expect(deploymentLines(recorded)).toEqual(["bitcomplete/bb-gate#106 [bb-gate]: deployed → bitcomplete/bb-gate production — live-at-merge: nothing deploys .bb/**, docs/**, **.md"]);
+    expect(deploymentLines(recorded)).toEqual(["acme/web#106 [web]: deployed → acme/web production — live-at-merge: nothing deploys .bb/**, docs/**, **.md"]);
   });
 
-  it("follows an earlier kploy rule for a mixed PR rather than live-at-merge", () => {
-    const mixed = { entity: pull({ key: "bitcomplete/bb-gate#5", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["kploy/production/kustomization.yaml", ".bb/stewards/project.json"] }), pulls: [] };
+  it("follows an earlier deploy rule for a mixed PR rather than live-at-merge", () => {
+    const mixed = { entity: pull({ key: "acme/web#5", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files: ["deploy/kustomization.yaml", ".bb/stewards/project.json"] }), pulls: [] };
     const recorded = recordMerged({}, mixed, [liveAtMergeTarget], NOW);
-    expect(recorded["bitcomplete/bb-gate#5::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + liveAtMergeTarget.timeout, note: null });
+    expect(recorded["acme/web#5::web"]).toMatchObject({ state: "merged", deadlineAt: NOW + liveAtMergeTarget.timeout, note: null });
   });
 
-  it("reaches the bb-gate image-tag rule for .bb plus router code", () => {
+  it("reaches the web image-tag rule for .bb plus router code", () => {
     for (const files of [[".bb/stewards/project.json", "cmd/router/main.go"], [".bb/stewards/project.json", "internal/gate/server.go"]]) {
-      const router = { entity: pull({ key: "bitcomplete/bb-gate#6", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files }), pulls: [] };
+      const router = { entity: pull({ key: "acme/web#6", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files }), pulls: [] };
       const recorded = recordMerged({}, router, [liveAtMergeTarget], NOW);
       // Awaiting the router image build, not deployed at merge.
-      expect(recorded["bitcomplete/bb-gate#6::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + liveAtMergeTarget.timeout, note: null });
+      expect(recorded["acme/web#6::web"]).toMatchObject({ state: "merged", deadlineAt: NOW + liveAtMergeTarget.timeout, note: null });
     }
   });
 
   it("does not deploy an empty or unreadable file list at merge", () => {
-    const liveOnly: DeploymentTarget = { ...liveAtMergeTarget, carries: [{ when: { repo: "bitcomplete/bb-gate", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
+    const liveOnly: DeploymentTarget = { ...liveAtMergeTarget, carries: [{ when: { repo: "acme/web", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
     for (const files of [[], undefined]) {
-      const merged = pull({ key: "bitcomplete/bb-gate#7", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files });
+      const merged = pull({ key: "acme/web#7", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files });
       const recorded = recordMerged({}, { entity: merged, pulls: [] }, [liveOnly], NOW);
-      expect(recorded["bitcomplete/bb-gate#7::bb-gate"]).toMatchObject({ state: "merged" });
+      expect(recorded["acme/web#7::web"]).toMatchObject({ state: "merged" });
     }
   });
 
@@ -261,9 +261,9 @@ describe("recording merged pull requests", () => {
   // hide a file outside the paths. It must not be treated as every-file.
   it("does not deploy a merge at GitHub's changed-files page limit", () => {
     const many = Array.from({ length: 100 }, (_, i) => `docs/${i}.md`);
-    const merged = pull({ key: "bitcomplete/bb-gate#9", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "aaaaaaa1", files: many });
+    const merged = pull({ key: "acme/web#9", unit: "acme/web" }, { merged: true, mergeCommit: "aaaaaaa1", files: many });
     const recorded = recordMerged({}, { entity: merged, pulls: [] }, [liveAtMergeTarget], NOW);
-    expect(recorded["bitcomplete/bb-gate#9::bb-gate"]).toMatchObject({ state: "merged" });
+    expect(recorded["acme/web#9::web"]).toMatchObject({ state: "merged" });
   });
 
   // BB-260: a stacked pull request merged into its base branch is not on main,
@@ -271,10 +271,10 @@ describe("recording merged pull requests", () => {
   // merged to main rather than carried by the base's merge, so the live check
   // reads its own base.
   it("does not mark a stacked .bb-only merge deployed before it reaches the default branch", () => {
-    const stacked = pull({ key: "bitcomplete/bb-gate#20", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] });
+    const stacked = pull({ key: "acme/web#20", unit: "acme/web" }, { merged: true, mergeCommit: "stacked1", base: "feature-base", head: "feature-stacked", files: [".bb/AGENTS.md"] });
     const isDefaultBase = (_repo: string, base: string | null) => base === "main";
     const recorded = recordMerged({}, { entity: stacked, pulls: [] }, [liveAtMergeTarget], NOW, isDefaultBase);
-    expect(recorded["bitcomplete/bb-gate#20::bb-gate"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deadlineAt: NOW + liveAtMergeTarget.timeout });
+    expect(recorded["acme/web#20::web"]).toMatchObject({ state: "merged", mergeSha: "stacked1", deadlineAt: NOW + liveAtMergeTarget.timeout });
   });
 
   // BB-286: a watch recorded under an older playbook is re-matched against
@@ -282,33 +282,33 @@ describe("recording merged pull requests", () => {
   // settles it with no deployment read. The first-record contract above still
   // holds when the rule has not changed.
   it("re-matches a pre-existing merged watch when the playbook's rule becomes live-at-merge (BB-286)", () => {
-    const refTarget: DeploymentTarget = { name: "bb-gate", source: "github", repo: "bitcomplete/bb-gate", environment: "production", carries: [{ when: { repo: "acme/web" }, strategy: { kind: "ref-contains-merge" } }], timeout: 3_600_000, workflows: [] };
+    const refTarget: DeploymentTarget = { name: "web", source: "github", repo: "acme/web", environment: "production", carries: [{ when: { repo: "acme/web" }, strategy: { kind: "ref-contains-merge" } }], timeout: 3_600_000, workflows: [] };
     const liveTarget: DeploymentTarget = { ...refTarget, carries: [{ when: { repo: "acme/web", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
     const mergedPull = { entity: pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1", files: [".bb/stewards/project.json"] }), pulls: [] };
     const before = recordMerged({}, mergedPull, [refTarget], NOW);
-    expect(before["acme/web#7::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + refTarget.timeout });
+    expect(before["acme/web#7::web"]).toMatchObject({ state: "merged", deadlineAt: NOW + refTarget.timeout });
     const after = recordMerged(before, mergedPull, [liveTarget], NOW + 1000);
-    expect(after["acme/web#7::bb-gate"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    expect(after["acme/web#7::web"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
     // No deployment read is needed: nothing times out and nothing awaits.
     expect(timeoutsDue(after, NOW + liveTarget.timeout)).toEqual([]);
-    expect(awaitingOnRepo(after, "bitcomplete/bb-gate")).toEqual([]);
+    expect(awaitingOnRepo(after, "acme/web")).toEqual([]);
   });
 
-  // BB-337: the bb-gate#106 watch was recorded under an older playbook whose
+  // BB-337: the web#106 watch was recorded under an older playbook whose
   // rule put `.bb/**` under `ref-contains-merge`. The playbook now has
   // `live-at-merge` for it, so the next read settles it `deployed` with the
   // live note, no deadline and no deployment read.
-  it("re-matches the bb-gate#106 watch from ref-contains-merge to live-at-merge (BB-337)", () => {
-    const refTarget: DeploymentTarget = { name: "bb-gate", source: "github", repo: "bitcomplete/bb-gate", environment: "production", carries: [{ when: { repo: "bitcomplete/bb-gate", paths: [".bb/**"] }, strategy: { kind: "ref-contains-merge" } }], timeout: 3_600_000, workflows: [] };
-    const liveTarget: DeploymentTarget = { ...refTarget, carries: [{ when: { repo: "bitcomplete/bb-gate", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
-    const bb106 = { entity: pull({ key: "bitcomplete/bb-gate#106", unit: "bitcomplete/bb-gate" }, { merged: true, mergeCommit: "dc8fb02", files: [".bb/AGENTS.md", ".bb/stewards/playbooks/linear-tickets.md"] }), pulls: [] };
+  it("re-matches the web#106 watch from ref-contains-merge to live-at-merge (BB-337)", () => {
+    const refTarget: DeploymentTarget = { name: "web", source: "github", repo: "acme/web", environment: "production", carries: [{ when: { repo: "acme/web", paths: [".bb/**"] }, strategy: { kind: "ref-contains-merge" } }], timeout: 3_600_000, workflows: [] };
+    const liveTarget: DeploymentTarget = { ...refTarget, carries: [{ when: { repo: "acme/web", paths: [".bb/**"] }, strategy: { kind: "live-at-merge" } }] };
+    const bb106 = { entity: pull({ key: "acme/web#106", unit: "acme/web" }, { merged: true, mergeCommit: "dc8fb02", files: [".bb/AGENTS.md", ".bb/stewards/playbooks/linear-tickets.md"] }), pulls: [] };
     const before = recordMerged({}, bb106, [refTarget], NOW);
-    expect(before["bitcomplete/bb-gate#106::bb-gate"]).toMatchObject({ state: "merged", deadlineAt: NOW + refTarget.timeout });
+    expect(before["acme/web#106::web"]).toMatchObject({ state: "merged", deadlineAt: NOW + refTarget.timeout });
     const after = recordMerged(before, bb106, [liveTarget], NOW + 1000);
-    expect(after["bitcomplete/bb-gate#106::bb-gate"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
+    expect(after["acme/web#106::web"]).toMatchObject({ state: "deployed", deadlineAt: null, note: "live-at-merge: nothing deploys .bb/**" });
     // No deployment read is needed: nothing times out and nothing awaits.
     expect(timeoutsDue(after, NOW + liveTarget.timeout)).toEqual([]);
-    expect(awaitingOnRepo(after, "bitcomplete/bb-gate")).toEqual([]);
+    expect(awaitingOnRepo(after, "acme/web")).toEqual([]);
   });
 
   it("does not record an open pull request, and reads a ticket's linked merged ones", () => {
@@ -325,11 +325,11 @@ describe("recording merged pull requests", () => {
 describe("applying a deployment doorbell", () => {
   it("matches the target repo and environment, ignoring case, and moves the watch to deploying", () => {
     const deployments = recordMerged({}, observed(), [target], NOW);
-    expect(matchesTarget(target, "Acme/BB-Gate", "Production")).toBe(true);
+    expect(matchesTarget(target, "Acme/Web", "Production")).toBe(true);
     expect(matchesTarget(target, "acme/other", "production")).toBe(false);
     const applied = applyDeployment(deployments, target, deployment(), NOW + 60_000);
     expect(applied.changed).toEqual(["acme/web#7"]);
-    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/bb-gate/actions/runs/9", deadlineAt: NOW + 60_000 + target.timeout });
+    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/web/actions/runs/9", deadlineAt: NOW + 60_000 + target.timeout });
   });
 
   it("marks a failure or error deployment failed, with the deployment's URL", () => {
@@ -376,16 +376,16 @@ describe("the no-deployment timeout", () => {
   it("puts the timeout message in front of the note a not-yet watch carried", () => {
     const notYet = reportDeployment(
       applyDeployment(recordMerged({}, observed(), [target], NOW), target, deployment(), NOW).deployments,
-      { state: "not-yet", note: "image-tag: bb-server.yaml run 2858 pinned BB_PLUGINS_REF=3c9f4ef, which does not contain merge b6957dd (behind)" },
+      { state: "not-yet", note: "image-tag: build.yaml run 2858 pinned PLUGIN_REF=3c9f4ef, which does not contain merge b6957dd (behind)" },
       NOW + 1000,
       target.timeout,
     ).deployments;
-    expect(notYet["acme/web#7"]).toMatchObject({ state: "merged", note: "image-tag: bb-server.yaml run 2858 pinned BB_PLUGINS_REF=3c9f4ef, which does not contain merge b6957dd (behind)" });
+    expect(notYet["acme/web#7"]).toMatchObject({ state: "merged", note: "image-tag: build.yaml run 2858 pinned PLUGIN_REF=3c9f4ef, which does not contain merge b6957dd (behind)" });
     const failed = timeOut(notYet, ["acme/web#7"], NOW + 1000 + target.timeout);
     expect(failed["acme/web#7"]).toMatchObject({
       state: "failed",
       deadlineAt: null,
-      note: "No matching deployment within the playbook's timeout; last: image-tag: bb-server.yaml run 2858 pinned BB_PLUGINS_REF=3c9f4ef, which does not contain merge b6957dd (behind)",
+      note: "No matching deployment within the playbook's timeout; last: image-tag: build.yaml run 2858 pinned PLUGIN_REF=3c9f4ef, which does not contain merge b6957dd (behind)",
     });
   });
 
@@ -434,7 +434,7 @@ describe("confirming from a deployment read (BB-59)", () => {
     const applied = applyDeploymentRead(deployments, target, read, NOW + 60_000);
     expect(applied.changed).toEqual(["acme/web#7"]);
     expect(applied.deployment).toMatchObject({ id: 7, state: "success" });
-    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success", ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/bb-gate/actions/runs/9", deadlineAt: NOW + 60_000 + target.timeout });
+    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success", ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/web/actions/runs/9", deadlineAt: NOW + 60_000 + target.timeout });
   });
 
   it("treats a failed newest deployment as the failure it is", () => {
@@ -478,30 +478,30 @@ describe("confirming from a deployment read (BB-59)", () => {
 // target names wakes every watch still awaiting a deployment, once per run
 // and attempt, without moving the watch's state.
 describe("a failed workflow run (BB-61)", () => {
-  const run = (over: Partial<WorkflowRun> = {}): WorkflowRun => ({ workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "ccccccc3", run_attempt: 1, startedAt: null, ...over });
+  const run = (over: Partial<WorkflowRun> = {}): WorkflowRun => ({ workflow: ".github/workflows/build.yaml", name: "app", conclusion: "failure", url: "https://github.com/acme/web/actions/runs/42", sha: "ccccccc3", run_attempt: 1, startedAt: null, ...over });
   const mergedWatch = () => recordMerged({}, observed(), [target], NOW);
 
   it("matches a workflow by path, basename or name, ignoring case, and nothing when the list is empty", () => {
     expect(matchesWorkflow(named, run())).toBe(true);
-    expect(matchesWorkflow({ workflows: [".github/workflows/bb-server.yaml"] }, run())).toBe(true);
-    expect(matchesWorkflow({ workflows: ["BB-SERVER.YAML"] }, run())).toBe(true);
-    expect(matchesWorkflow({ workflows: ["bb-server"] }, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: [".github/workflows/build.yaml"] }, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: ["BUILD.YAML"] }, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: ["app"] }, run())).toBe(true);
     expect(matchesWorkflow({ workflows: ["image.yaml"] }, run())).toBe(false);
     expect(matchesWorkflow(target, run())).toBe(false);
   });
 
   it("wakes an awaiting watch once per run and attempt, leaving its state alone", () => {
-    const first = applyWorkflowRun(mergedWatch(), "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 1000);
+    const first = applyWorkflowRun(mergedWatch(), "acme/web#42", "acme/web", run(), NOW + 1000);
     expect(first.woken).toEqual(["acme/web#7"]);
     expect(first.recorded).toEqual(["acme/web#7"]);
-    expect(first.deployments["acme/web#7"]).toMatchObject({ state: "merged", workflowRuns: ["acme/bb-gate#42#1"] });
+    expect(first.deployments["acme/web#7"]).toMatchObject({ state: "merged", workflowRuns: ["acme/web#42#1"] });
     // The same run and attempt is not news, however often it is delivered.
-    const repeat = applyWorkflowRun(first.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 2000);
+    const repeat = applyWorkflowRun(first.deployments, "acme/web#42", "acme/web", run(), NOW + 2000);
     expect(repeat.woken).toEqual([]);
     expect(repeat.recorded).toEqual([]);
     expect(repeat.deployments).toEqual(first.deployments);
     // A re-run (a higher attempt) wakes again.
-    const again = applyWorkflowRun(first.deployments, "acme/bb-gate#42", "acme/bb-gate", run({ run_attempt: 2 }), NOW + 3000);
+    const again = applyWorkflowRun(first.deployments, "acme/web#42", "acme/web", run({ run_attempt: 2 }), NOW + 3000);
     expect(again.woken).toEqual(["acme/web#7"]);
   });
 
@@ -509,41 +509,41 @@ describe("a failed workflow run (BB-61)", () => {
     const deployments = mergedWatch();
     expect(applyWorkflowRun(deployments, "acme/other#42", "acme/other", run(), NOW).woken).toEqual([]);
     const settled: Deployments = { "acme/web#7": { ...deployments["acme/web#7"]!, state: "deployed" } };
-    expect(applyWorkflowRun(settled, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
+    expect(applyWorkflowRun(settled, "acme/web#42", "acme/web", run(), NOW).woken).toEqual([]);
     // The watch was recorded after the doorbell arrived: the run cannot concern
     // it, so it is not woken, but the event is recorded on it so a repeat
     // delivery of the same run and attempt does not wake it later.
-    const late = applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW - 1);
+    const late = applyWorkflowRun(deployments, "acme/web#42", "acme/web", run(), NOW - 1);
     expect(late.woken).toEqual([]);
     expect(late.recorded).toEqual(["acme/web#7"]);
-    expect(late.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
-    expect(applyWorkflowRun(late.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
+    expect(late.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/web#42#1"]);
+    expect(applyWorkflowRun(late.deployments, "acme/web#42", "acme/web", run(), NOW).woken).toEqual([]);
   });
 
   it("skips a run that started before the watch's merge and wakes one that started after (BB-132)", () => {
     const deployments = mergedWatch();
     // The watch merged at NOW. A run that started before it cannot concern it,
     // so it is recorded but not woken, even though the doorbell arrived after.
-    const before = applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 1000, NOW - 60_000);
+    const before = applyWorkflowRun(deployments, "acme/web#42", "acme/web", run(), NOW + 1000, NOW - 60_000);
     expect(before.woken).toEqual([]);
     expect(before.recorded).toEqual(["acme/web#7"]);
-    expect(before.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    expect(before.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/web#42#1"]);
     // A run that started after the merge wakes, and a run at the merge time too.
-    expect(applyWorkflowRun(deployments, "acme/bb-gate#43", "acme/bb-gate", run(), NOW + 1000, NOW + 60_000).woken).toEqual(["acme/web#7"]);
-    expect(applyWorkflowRun(deployments, "acme/bb-gate#44", "acme/bb-gate", run(), NOW + 1000, NOW).woken).toEqual(["acme/web#7"]);
+    expect(applyWorkflowRun(deployments, "acme/web#43", "acme/web", run(), NOW + 1000, NOW + 60_000).woken).toEqual(["acme/web#7"]);
+    expect(applyWorkflowRun(deployments, "acme/web#44", "acme/web", run(), NOW + 1000, NOW).woken).toEqual(["acme/web#7"]);
   });
 
   it("lists the watches still awaiting a deployment on a repo, and keys an event by run and attempt", () => {
     const deployments = recordMerged(recordMerged({}, observed(), [target], NOW), observed({ entity: pull({ key: "acme/web#8" }, { merged: true }) }), [target], NOW);
-    expect(awaitingOnRepo(deployments, "Acme/BB-Gate").map((w) => w.key)).toEqual(["acme/web#7", "acme/web#8"]);
-    expect(workflowRunKey("Acme/BB-Gate#42", 2)).toBe("acme/bb-gate#42#2");
+    expect(awaitingOnRepo(deployments, "Acme/Web").map((w) => w.key)).toEqual(["acme/web#7", "acme/web#8"]);
+    expect(workflowRunKey("Acme/Web#42", 2)).toBe("acme/web#42#2");
   });
 });
 
 describe("the show lines", () => {
   it("names each watch's state, target, deployment facts and note", () => {
     const deployments = applyDeployment(recordMerged({}, observed(), [target], NOW), target, deployment({ state: "failure" }), NOW).deployments;
-    expect(deploymentLines(deployments)).toEqual(["acme/web#7: failed → acme/bb-gate production (deployment 7, ref main, sha bbbbbbb, https://github.com/acme/bb-gate/actions/runs/9) — Deployment 7 reported failure"]);
+    expect(deploymentLines(deployments)).toEqual(["acme/web#7: failed → acme/web production (deployment 7, ref main, sha bbbbbbb, https://github.com/acme/web/actions/runs/9) — Deployment 7 reported failure"]);
   });
 
   it("round-trips through the store schema", () => {

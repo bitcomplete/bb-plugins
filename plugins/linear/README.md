@@ -3,7 +3,7 @@
 Connect a developer's Linear account to their bb server once, with OAuth,
 and give every thread native tools that read and update issues as them.
 
-The shape is the same as [devbox-provider](../devbox-provider)'s connect:
+The connect flow is the same shape as the other connect plugins:
 Settings → Plugins → Linear → **Connect Linear** sends the browser to
 Linear, Linear sends it back to this plugin's callback with a code, and the
 plugin exchanges the code for tokens that land in secret settings. Every

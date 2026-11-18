@@ -1,4 +1,4 @@
-// The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md) for one
+// The subscriber side of the hooks service (hooks.md) for one
 // source at a time: one SSE stream for doorbells, a lease per watched entity
 // (proven with the plugin's token for a token source, or admitted without one
 // for a tokenless source such as Alertmanager), renewed at half-life, and a
@@ -25,7 +25,7 @@ export const SUBSCRIBE_BATCH = 100;
  * organization to read it) and leased under the slug, which is what its
  * doorbells carry as the unit. Alertmanager: `namespace` is a Kubernetes
  * namespace, which is what its `alert` doorbells carry as the unit
- * (bb-gate/docs/hooks.md, "Sentry" and "Alertmanager").
+ * (hooks.md, "Sentry" and "Alertmanager").
  */
 export type LeaseKind = "issue" | "project" | "namespace";
 export type Lease = { kind: LeaseKind; id: string };
@@ -76,7 +76,7 @@ export class SseParser {
 /** The events of a stream body, until it ends or the signal aborts. */
 export class StreamIdleError extends Error {
   constructor(idleMs: number) {
-    super(`no bytes from bb-gate-hooks for ${Math.round(idleMs / 1000)} s`);
+    super(`no bytes from the hooks service for ${Math.round(idleMs / 1000)} s`);
     this.name = "StreamIdleError";
   }
 }
@@ -175,7 +175,7 @@ export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connectio
       body: JSON.stringify({ connection, source, token, watches }),
       signal,
     });
-    if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
+    if (!response.ok) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
     const parsed = subscribeResponseSchema.parse(await response.json());
     merged.leases.push(...parsed.leases);
     merged.rejected.push(...parsed.rejected);
@@ -332,7 +332,7 @@ function sourceProblemOf(error: unknown, tokenless: boolean): "unknown" | "uncon
 }
 
 const sourceProblemMessage = (source: string, problem: "unknown" | "unconfigured"): string =>
-  problem === "unknown" ? `bb-gate-hooks does not know the ${source} source yet; the periodic look carries it until the service is updated` : `bb-gate-hooks has no ${source} adapter configured (its secret is not set); the periodic look carries it until the service is updated`;
+  problem === "unknown" ? `the hooks service does not know the ${source} source yet; the periodic look carries it until the service is updated` : `the hooks service has no ${source} adapter configured (its secret is not set); the periodic look carries it until the service is updated`;
 
 export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   const timing: HooksTiming = { ...DEFAULT_TIMING, ...deps.timing };
@@ -396,7 +396,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     } catch (error) {
       if (signal.aborted) return false;
       if (error instanceof HooksRequestError && error.status === 401) {
-        if (!refusedLogged) deps.log.warn(`bb-gate-hooks says ${deps.source} refused the token; check the ${deps.source} token setting of the stewards plugin`);
+        if (!refusedLogged) deps.log.warn(`the hooks service says ${deps.source} refused the token; check the ${deps.source} token setting of the stewards plugin`);
         refusedLogged = true;
         return false;
       }
@@ -409,7 +409,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       if (error instanceof HooksRequestError && error.status === 404) {
         if (error.unknownConnection) {
           if (connection === current) {
-            deps.log.warn("bb-gate-hooks forgot our connection; reconnecting");
+            deps.log.warn("the hooks service forgot our connection; reconnecting");
             stream?.abort();
           }
           return false;
@@ -449,13 +449,13 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         if (event.event === "hello") {
           const hello = helloSchema.safeParse(JSON.parse(event.data));
           if (!hello.success) {
-            deps.log.warn("bb-gate-hooks sent a hello this plugin does not understand; reconnecting");
+            deps.log.warn("the hooks service sent a hello this plugin does not understand; reconnecting");
             return;
           }
           connection = hello.data.connection;
           setState("connected");
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
-          deps.log.info(`${deps.source} watches: connected to bb-gate-hooks as ${connection}`);
+          deps.log.info(`${deps.source} watches: connected to the hooks service as ${connection}`);
           // Not awaited: doorbells behind the hello must not wait for a look.
           void renew("hello", signal);
           if (renewTimer !== null) clearInterval(renewTimer);
@@ -529,12 +529,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         stream = controller;
         try {
           const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream" }, signal: controller.signal });
-          if (!response.ok || response.body === null) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to the event stream`, response.status);
+          if (!response.ok || response.body === null) throw new HooksRequestError(`the hooks service answered HTTP ${response.status} to the event stream`, response.status);
           backoff = timing.backoffMinMs;
           await consume(response.body, controller.signal);
-          if (!signal.aborted) deps.log.warn("bb-gate-hooks event stream ended; reconnecting");
+          if (!signal.aborted) deps.log.warn("the hooks service event stream ended; reconnecting");
         } catch (error) {
-          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`bb-gate-hooks event stream: ${errorMessage(error)}`);
+          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`the hooks service event stream: ${errorMessage(error)}`);
         } finally {
           signal.removeEventListener("abort", onAbort);
           controller.abort();

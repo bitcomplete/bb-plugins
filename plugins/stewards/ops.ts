@@ -22,7 +22,7 @@ export type AlertmanagerTarget = { kind: "alertmanager"; namespace: string };
 export type BacklogTarget = { kind: "backlog"; team: string };
 export type OpsTarget = K8sTarget | DependabotTarget | SentryTarget | AlertmanagerTarget | BacklogTarget;
 
-/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production", "dependabot/acme/web", "sentry-project/acme/web", "alertmanager/bb-gate-production" or "backlog/BB". */
+/** The binding's entity id and key for a target: "k8s-namespace/web-production", "dependabot/acme/web", "sentry-project/acme/web", "alertmanager/web-production" or "backlog/BB". */
 export const opsTargetKey = (t: OpsTarget): string =>
   t.kind === "k8s-namespace"
     ? `${t.kind}/${t.name}`

@@ -121,12 +121,12 @@ describe("text", () => {
   it("names what stewards leased, at most twenty entities, and what is not leased", () => {
     const entities = Array.from({ length: 22 }, (_, i) => ({ key: `ENG-${i + 1}`, url: null }));
     expect(describeInterest({ ...none, units: ["ENG"], entities: entities.slice(0, 2) })).toEqual(["Stewards: team ENG; 2 issues (ENG-1, ENG-2)."]);
-    expect(describeInterest({ ...none, units: ["ENG", "OPS"], entities, unleased: [{ key: "OPS", reason: "refused by bb-gate-hooks (forbidden)" }] })).toEqual([
+    expect(describeInterest({ ...none, units: ["ENG", "OPS"], entities, unleased: [{ key: "OPS", reason: "refused by the hooks service (forbidden)" }] })).toEqual([
       `Stewards: teams ENG, OPS; 22 issues (${entities
         .slice(0, 20)
         .map((e) => e.key)
         .join(", ")}, and 2 more).`,
-      "Not leased for stewards: OPS: refused by bb-gate-hooks (forbidden).",
+      "Not leased for stewards: OPS: refused by the hooks service (forbidden).",
     ]);
     expect(describeInterest({ ...none, unleased: [{ key: "ENG-9", reason: "not visible to the connected Linear user" }] })).toEqual(["Stewards: nothing leased.", "Not leased for stewards: ENG-9: not visible to the connected Linear user."]);
   });

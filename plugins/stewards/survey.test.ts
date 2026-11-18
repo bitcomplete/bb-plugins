@@ -10,7 +10,7 @@ const repo = (over: Partial<SurveyRepoInput> = {}): SurveyRepoInput => ({
   defaultBranch: "main",
   branchProtection: { available: true, value: { protected: false, requiredApprovingReviewCount: null, requiresStatusChecks: null } },
   labels: { available: true, value: ["bb-managed", "bug"] },
-  tree: tree("package.json", "tsconfig.json", "src/index.ts", ".github/workflows/ci.yaml", "Dockerfile", "kploy/deployment.yaml", "bc-prod.yaml", "README.md"),
+  tree: tree("package.json", "tsconfig.json", "src/index.ts", ".github/workflows/ci.yaml", "Dockerfile", "deploy/deployment.yaml", "config.yaml", "README.md"),
   treeError: null,
   contents: new Map(),
   otherRepos: [],
@@ -38,7 +38,7 @@ describe("the onboarding survey's per-repo derivation", () => {
   });
 
   it("derives languages, manifests and Dockerfiles from the tree, ignoring deploy files", () => {
-    const derived = deriveRepo(repo({ tree: tree("go.mod", "cmd/main.go", "Dockerfile", "docker/web.Dockerfile", "kploy/prod.yaml", "bc-prod.yaml", "docker-compose.yml") }));
+    const derived = deriveRepo(repo({ tree: tree("go.mod", "cmd/main.go", "Dockerfile", "docker/web.Dockerfile", "deploy/prod.yaml", "config.yaml", "docker-compose.yml") }));
     expect(derived.languages).toEqual(["Go"]);
     expect(derived.manifests).toEqual(["go.mod"]);
     expect(derived.dockerfiles).toEqual(["Dockerfile", "docker/web.Dockerfile"]);
@@ -109,7 +109,7 @@ describe("the onboarding survey's per-repo derivation", () => {
 
   it("emits nothing Kubernetes-shaped for a repo full of deploy manifests", () => {
     // The survey makes no assumption about how a project deploys: a repo's
-    // kploy/ and bc-prod.yaml files, and any Kubernetes manifest, are neither
+    // deploy/ and config.yaml files, and any Kubernetes manifest, are neither
     // read nor reported, so no deployment-shaped field or path reaches the
     // report or its text rendering.
     const report = buildSurvey({
@@ -121,23 +121,23 @@ describe("the onboarding survey's per-repo derivation", () => {
         repo({
           tree: tree(
             "package.json",
-            "kploy/production/kustomization.yaml",
-            "kploy/production/deployment.yaml",
-            "bc-prod.yaml",
+            "deploy/kustomization.yaml",
+            "deploy/deployment.yaml",
+            "config.yaml",
             "deploy/kubernetes.yaml",
             "README.md",
           ),
           contents: new Map([
-            ["kploy/production/deployment.yaml", "apiVersion: apps/v1\nkind: Deployment"],
-            ["bc-prod.yaml", "namespace: bb-gate-production"],
+            ["deploy/deployment.yaml", "apiVersion: apps/v1\nkind: Deployment"],
+            ["config.yaml", "namespace: web-production"],
           ]),
         }),
       ],
       linear: { available: false, error: "linear is not connected" },
       bb: { projectFile: false, roles: false, projectSteward: null, playbooks: [], reposJson: false, error: null },
     });
-    expect(JSON.stringify(report)).not.toMatch(/bc-prod|kploy|bb-gate|kubernetes|deployManifests/iu);
-    expect(formatSurvey(report)).not.toMatch(/bc-prod|kploy|bb-gate|kubernetes|deploy manifests/iu);
+    expect(JSON.stringify(report)).not.toMatch(/kustomization|kubernetes|deployManifests/iu);
+    expect(formatSurvey(report)).not.toMatch(/kustomization|kubernetes|deploy manifests/iu);
     // It still reports the facts it did read from the same tree.
     expect(report.repos[0]!.manifests).toEqual(["package.json"]);
   });
@@ -146,7 +146,7 @@ describe("the onboarding survey's per-repo derivation", () => {
 describe("surveyWantedPaths and workflowRunCommands", () => {
   it("asks only for the files the derivation uses, in a stable order", () => {
     // The build files come first, so a repo full of docs cannot push them out of the cap.
-    expect(surveyWantedPaths(tree("src/index.ts", "package.json", ".github/workflows/ci.yaml", "Dockerfile", "bc-prod.yaml", "README.md", "LICENSE"))).toEqual([
+    expect(surveyWantedPaths(tree("src/index.ts", "package.json", ".github/workflows/ci.yaml", "Dockerfile", "config.yaml", "README.md", "LICENSE"))).toEqual([
       ".github/workflows/ci.yaml",
       "Dockerfile",
       "package.json",

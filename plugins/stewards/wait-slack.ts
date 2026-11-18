@@ -133,7 +133,7 @@ export type WaitSlackContext = {
 /** The fourth choice on the ask-once need: the person has no Slack account. */
 export const NOT_ON_SLACK_CHOICE = "Not on Slack";
 
-/** A near match bb-gate-hooks returned on `unknown-user`: name and handle, never an email. */
+/** A near match the hooks service returned on `unknown-user`: name and handle, never an email. */
 export type SlackCandidate = { id: string; name: string; handle: string };
 
 /** The button label for one near match: its name and handle, never an email. */

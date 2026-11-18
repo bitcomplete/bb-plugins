@@ -29,7 +29,7 @@ const config = (over: Partial<TriageConfig> = {}): TriageConfig => ({
   staleDays: 14,
   label: "bb-managed",
   adoptedLabels: ["bb-managed", "initiative"],
-  repos: ["bitcomplete/bb-plugins", "bitcomplete/devbox"],
+  repos: ["acme/app", "acme/tools"],
   ...over,
 });
 
@@ -69,16 +69,16 @@ const reason = (result: ReturnType<typeof decideTriage>): string => (result.ok ?
 
 describe("the backlog label vocabulary (BB-341)", () => {
   it("is the fixed kinds, sizes and one repo:<name> per repo, named after the owner", () => {
-    const vocab = backlogLabelVocabulary(["bitcomplete/bb-plugins", "bitcomplete/devbox"]);
+    const vocab = backlogLabelVocabulary(["acme/app", "acme/tools"]);
     expect([...BACKLOG_TRIAGE_KINDS].every((k) => vocab.labels.get(k) === k)).toBe(true);
     expect([...BACKLOG_TRIAGE_SIZES].every((s) => vocab.labels.get(`size:${s}`.toLowerCase()) === `size:${s}`)).toBe(true);
-    expect(vocab.labels.get("repo:bb-plugins")).toBe("repo:bb-plugins");
+    expect(vocab.labels.get("repo:app")).toBe("repo:app");
     expect(vocab.labels.has("bb-managed")).toBe(false);
     expect(vocab.labels.has("initiative")).toBe(false);
   });
 
   it("matches ignoring case and never grows with the configuration", () => {
-    const vocab = backlogLabelVocabulary(["bitcomplete/bb-plugins"]);
+    const vocab = backlogLabelVocabulary(["acme/app"]);
     expect(vocab.labels.get("size:s")).toBe("size:S");
     expect(vocab.labels.get("bug")).toBe("bug");
     // The vocabulary is fixed: no config value can add an adoption label.
@@ -86,10 +86,10 @@ describe("the backlog label vocabulary (BB-341)", () => {
   });
 
   it("marks a repo name two repositories share as ambiguous", () => {
-    const vocab = backlogLabelVocabulary(["acme/web", "bitcomplete/web"]);
-    expect(vocab.ambiguous.get("repo:web")).toEqual(["acme/web", "bitcomplete/web"]);
+    const vocab = backlogLabelVocabulary(["acme/web", "beta/web"]);
+    expect(vocab.ambiguous.get("repo:web")).toEqual(["acme/web", "beta/web"]);
     expect(vocab.labels.has("repo:web")).toBe(false);
-    expect(reason(decide({ params: params({ addLabels: ["repo:web"] }), config: config({ repos: ["acme/web", "bitcomplete/web"] }) }))).toMatch(/ambiguous/u);
+    expect(reason(decide({ params: params({ addLabels: ["repo:web"] }), config: config({ repos: ["acme/web", "beta/web"] }) }))).toMatch(/ambiguous/u);
   });
 });
 
@@ -125,7 +125,7 @@ describe("the triage allowlist and adoption check (BB-341)", () => {
   });
 
   it("accepts only the fixed label vocabulary, add-only", () => {
-    expect(decide({ params: params({ addLabels: ["bug", "feature", "chore", "size:S", "size:M", "size:L", "repo:bb-plugins"] }) }).ok).toBe(true);
+    expect(decide({ params: params({ addLabels: ["bug", "feature", "chore", "size:S", "size:M", "size:L", "repo:app"] }) }).ok).toBe(true);
     expect(reason(decide({ params: params({ addLabels: ["size:XL"] }) }))).toMatch(/not in the triage vocabulary/u);
     expect(reason(decide({ params: params({ addLabels: ["repo:acme/nope"] }) }))).toMatch(/not in the triage vocabulary/u);
     expect(reason(decide({ params: params({ addLabels: ["bb-managed"] }) }))).toMatch(/adoption label/u);

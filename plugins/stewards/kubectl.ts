@@ -1,8 +1,7 @@
 // The ops kind's eyes: kubectl, run on the developer's own machine, where it
-// reaches the cluster through their kubeconfig (on bc-prod, the Tailscale API
-// proxy) as them. Steward threads run there too; the plugin's server does
-// not, so it asks the machine to run kubectl (host.ts) and the wake carries
-// what came back.
+// reaches the cluster through their kubeconfig as them. Steward threads run
+// there too; the plugin's server does not, so it asks the machine to run
+// kubectl (host.ts) and the wake carries what came back.
 //
 // Every kubectl call, the plugin's and the host's, passes kubectlRefusal:
 // only get, describe, logs and auth can-i. The developer's own rights are

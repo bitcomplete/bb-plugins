@@ -139,7 +139,7 @@ describe("the validation queue (BB-35 step 5)", () => {
 });
 
 describe("the landing decision (BB-288)", () => {
-  // The decide-list entries bb-gate `main` carries (BB-280): the `user` entry
+  // The decide-list entries web `main` carries (BB-280): the `user` entry
   // for AGENTS.md and the `project` entry for the playbooks. A lesson is placed
   // by these, not by its scope, except that a boundary lesson stays the user's.
   const decisions = [

@@ -20,14 +20,14 @@ function world() {
 
 describe("touches", () => {
   it("are normalized and deduplicated", () => {
-    expect(normalizeTouches([" ./Web/src/login/ ", "web\\src\\login", "", "bb-gate//docker", "/x/"])).toEqual(["web/src/login", "bb-gate/docker", "x"]);
+    expect(normalizeTouches([" ./Web/src/login/ ", "web\\src\\login", "", "web//docker", "/x/"])).toEqual(["web/src/login", "web/docker", "x"]);
   });
 
   it("overlap when one is the other or a directory above it, never on a shared prefix of a name", () => {
     expect(touchesOverlap(["web/src"], ["web/src/login"])).toEqual(["web/src/login"]);
     expect(touchesOverlap(["web/src/login/form.ts"], ["web"])).toEqual(["web/src/login/form.ts"]);
     expect(touchesOverlap(["web/src"], ["web/srcs", "api/src"])).toEqual([]);
-    expect(touchesOverlap(["bb-plugins/plugins/stewards", "bb-gate"], ["bb-gate/docker", "bb-plugins/plugins/linear"])).toEqual(["bb-gate/docker"]);
+    expect(touchesOverlap(["bb-plugins/plugins/stewards", "web"], ["web/docker", "bb-plugins/plugins/linear"])).toEqual(["web/docker"]);
   });
 
   it("do not overlap two different files in one directory (BB-215)", () => {
@@ -43,7 +43,7 @@ describe("touches", () => {
     expect(touchesOverlap(["plugins/stewards/wake.ts"], ["bb-plugins/plugins/stewards"])).toEqual(["bb-plugins/plugins/stewards"]);
     expect(touchesOverlap(["bb-plugins/plugins/stewards"], ["plugins/stewards"])).toEqual(["bb-plugins/plugins/stewards"]);
     // Two repos' same-named tails must not meet, in either direction.
-    expect(touchesOverlap(["bb-plugins/plugins/stewards"], ["bb-gate/plugins/stewards"])).toEqual([]);
+    expect(touchesOverlap(["bb-plugins/plugins/stewards"], ["web/plugins/stewards"])).toEqual([]);
     expect(touchesOverlap(["web/src"], ["api/src"])).toEqual([]);
   });
 });

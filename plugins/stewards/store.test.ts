@@ -688,10 +688,10 @@ describe("the actor rename migration (BB-97)", () => {
   it("rewrites `me` to `user` in the stored status, leaving the rest of the record alone", () => {
     const db = legacy();
     // A pre-BB-109 record carries `blockedOn`; it reads back as `waitingOn`.
-    insert(db, "bnd_1", "ENG-12", JSON.stringify({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "me", blockedOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 }));
+    insert(db, "bnd_1", "ENG-12", JSON.stringify({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "me", blockedOn: "a production deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 }));
     for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2_000);
-    expect(s.find("ENG-12", "p1")!.status).toEqual({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", waitingOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 });
+    expect(s.find("ENG-12", "p1")!.status).toEqual({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", waitingOn: "a production deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 });
   });
 
   it("is idempotent, and leaves `steward` and `other` untouched", () => {

@@ -315,8 +315,8 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
 
 /**
  * Whether a run is one a deployment target names (BB-61). A playbook lists a
- * workflow by file path (`.github/workflows/bb-server.yaml`), its basename
- * (`bb-server.yaml`) or its name (`bb-server`), matched ignoring case. An
+ * workflow by file path (`.github/workflows/build.yaml`), its basename
+ * (`build.yaml`) or its name (`app`), matched ignoring case. An
  * empty list matches nothing, so a target with no `workflows` behaves exactly
  * as before.
  */

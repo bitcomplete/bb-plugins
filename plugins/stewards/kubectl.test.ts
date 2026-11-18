@@ -6,7 +6,7 @@ import { crashingPod } from "./fixtures.js";
 import { runKubectlHere } from "./host.js";
 import { createKubectlReader, kubectlError, kubectlRefusal, type KubectlResult } from "./kubectl.js";
 
-const target = { kind: "k8s-namespace", name: "devbox-production" } as const;
+const target = { kind: "k8s-namespace", name: "tools-production" } as const;
 const now = Date.parse("2026-10-14T15:00:00Z");
 
 describe("the kubectl gate", () => {
@@ -21,7 +21,7 @@ describe("the kubectl gate", () => {
     for (const flag of ["--kubeconfig=/tmp/admin", "--token=abc", "--as=system:admin", "--server", "--as-group=system:masters"]) {
       expect(kubectlRefusal(["get", "pods", flag]), flag).toMatch(/is not allowed: the ops kind uses the machine's own kubeconfig/u);
     }
-    expect(kubectlRefusal(["get", "pods", "--context=bc-prod", "--request-timeout=20s"])).toBeNull();
+    expect(kubectlRefusal(["get", "pods", "--context=prod", "--request-timeout=20s"])).toBeNull();
   });
 
   it("refuses --raw, which would make a get read any API path", () => {
@@ -40,9 +40,9 @@ describe("the kubectl reader", () => {
 
   it("reads a crashed run's logs, falling back to the current run when there is no previous one", async () => {
     const k = fake((a) => (a[0] === "get" ? ok(JSON.stringify({ items: a[1] === "pods" ? [crashingPod()] : [] })) : a.includes("--previous") ? { exitCode: 1, stdout: "", stderr: 'previous terminated container "router" in pod "x" not found' } : ok("boom\n")));
-    const look = await createKubectlReader(k.run, { context: "bc-prod" }).look(target, { now, since: now - 3_600_000 });
+    const look = await createKubectlReader(k.run, { context: "prod" }).look(target, { now, since: now - 3_600_000 });
     expect(look).toMatchObject({ pods: 1, healthy: 0, logs: "read", sightings: [{ logs: ["boom"], previous: false }] });
-    expect(k.calls[0]).toEqual(["get", "pods", "-n", "devbox-production", "-o", "json", "--request-timeout=20s", "--context=bc-prod"]);
+    expect(k.calls[0]).toEqual(["get", "pods", "-n", "tools-production", "-o", "json", "--request-timeout=20s", "--context=prod"]);
     expect(k.calls.every((a) => kubectlRefusal(a) === null)).toBe(true);
   });
 
@@ -56,8 +56,8 @@ describe("the kubectl reader", () => {
   it("reports an unreachable target, or one with no kubectl, as an error for check", async () => {
     const missing = fake(() => ({ exitCode: 127, stdout: "", stderr: "kubectl: not found", missing: true }));
     expect(await createKubectlReader(missing.run).access(target)).toMatchObject({ error: "kubectl is not installed on this machine, or not on its PATH" });
-    const noContext = fake(() => ({ exitCode: 1, stdout: "", stderr: 'error: context "bc-prod" does not exist' }));
-    expect((await createKubectlReader(noContext.run).access(target)).error).toBe('context "bc-prod" does not exist');
+    const noContext = fake(() => ({ exitCode: 1, stdout: "", stderr: 'error: context "prod" does not exist' }));
+    expect((await createKubectlReader(noContext.run).access(target)).error).toBe('context "prod" does not exist');
     const fine = fake((a) => (a[0] === "auth" ? (a[3] === "pods/log" ? ok("yes\n") : { exitCode: 1, stdout: "no\n", stderr: "" }) : ok("pod/a\n")));
     expect(await createKubectlReader(fine.run).access(target)).toEqual({ error: null, reads: ["pods", "events", "deployments"].map((r) => ({ what: `get ${r}`, ok: true, detail: null })), logs: true, writes: [] });
     expect(kubectlError({ exitCode: 2, stdout: "", stderr: "" })).toBe("kubectl exited 2");

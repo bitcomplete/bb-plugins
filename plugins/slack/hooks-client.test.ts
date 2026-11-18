@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHooksLoop, HooksRequestError, SseParser, sessionEventSchema, startConversation, subscribe } from "./hooks-client.js";
 
-const BASE = "http://bb-gate-hooks.test:8081";
+const BASE = "http://hooks.test:8081";
 
 describe("SseParser", () => {
   it("joins data lines and dispatches on a blank line", () => {

@@ -1,5 +1,5 @@
 // Slack's own `conversations.list`, called with the developer's own sign-in
-// token (bb-gate/docs/hooks.md, "Slack agent"). The pod holds that user token
+// token (hooks.md, "Slack agent"). The pod holds that user token
 // to prove who the developer is; this is the one Slack read it also does with
 // it, and the reason the token needs the user scopes `channels:read` and
 // `groups:read`. It returns what the signed-in developer can see, never what

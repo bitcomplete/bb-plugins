@@ -119,13 +119,13 @@ describe("source-contract.ts", () => {
   });
 
   it("parses the deployment-read RPCs and the merge commit on the pull snapshot (BB-132)", () => {
-    expect(sourceContract.sourceFileAtRef.input.parse({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" })).toEqual({ repo: "bitcomplete/bb-gate", path: "kploy/production/kustomization.yaml", ref: "main" });
+    expect(sourceContract.sourceFileAtRef.input.parse({ repo: "acme/web", path: "deploy/kustomization.yaml", ref: "main" })).toEqual({ repo: "acme/web", path: "deploy/kustomization.yaml", ref: "main" });
     expect(sourceContract.sourceFileAtRef.input.safeParse({ repo: "", path: "x", ref: "main" }).success).toBe(false);
     expect(sourceContract.sourceFileAtRef.output.parse({ content: null, error: "x" })).toEqual({ content: null, error: "x" });
     expect(sourceContract.sourceLatestCommit.output.parse({ sha: "abc", committedAt: null, error: null })).toEqual({ sha: "abc", committedAt: null, error: null });
     // A run is by workflow and number, or by id, and its output carries jobs.
-    expect(sourceContract.sourceWorkflowRun.input.parse({ repo: "bitcomplete/bb-gate", workflow: "bb-server.yaml", runNumber: 3 })).toEqual({ repo: "bitcomplete/bb-gate", workflow: "bb-server.yaml", runNumber: 3 });
-    expect(sourceContract.sourceWorkflowRun.input.parse({ repo: "bitcomplete/bb-gate", runId: 9 })).toEqual({ repo: "bitcomplete/bb-gate", runId: 9 });
+    expect(sourceContract.sourceWorkflowRun.input.parse({ repo: "acme/web", workflow: "build.yaml", runNumber: 3 })).toEqual({ repo: "acme/web", workflow: "build.yaml", runNumber: 3 });
+    expect(sourceContract.sourceWorkflowRun.input.parse({ repo: "acme/web", runId: 9 })).toEqual({ repo: "acme/web", runId: 9 });
     expect(sourceContract.sourceWorkflowRun.output.parse({ run: { id: 1, runNumber: 3, headSha: null, startedAt: null, jobs: [{ name: "build", startedAt: null, conclusion: null }] }, error: null })).toMatchObject({ run: { runNumber: 3, jobs: [{ name: "build" }] } });
     expect(sourceContract.sourceCompare.output.parse({ status: "identical", error: null })).toEqual({ status: "identical", error: null });
     expect(sourceContract.sourceCompare.output.safeParse({ status: "sideways", error: null }).success).toBe(false);
