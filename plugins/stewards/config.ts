@@ -553,10 +553,73 @@ export const projectFileSchema = z
   });
 export type ProjectFile = z.infer<typeof projectFileSchema>;
 
-export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
+export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string; /** The key or value this image's parser did not recognise (BB-355), when the failure is that. */ unsupported?: string };
 
 export function zodMessage(error: z.ZodError): string {
   return error.issues.map((i) => `${i.path.length === 0 ? "" : `${i.path.join(".")}: `}${i.message}`).join("; ");
+}
+
+/** A parsed-YAML path as `a.b[0].c`, for naming a field in a problem line. */
+function pathText(path: readonly PropertyKey[]): string {
+  let out = "";
+  for (const key of path) out += typeof key === "number" ? `[${key}]` : out === "" ? String(key) : `.${String(key)}`;
+  return out;
+}
+
+/** The value at a parsed-YAML path, for naming the value a schema did not recognise. */
+function valueAtPath(root: unknown, path: readonly PropertyKey[]): unknown {
+  let current: unknown = root;
+  for (const key of path) {
+    if (current === null || typeof current !== "object") return undefined;
+    current = (current as Record<PropertyKey, unknown>)[key];
+  }
+  return current;
+}
+
+/**
+ * The unrecognised key or value behind a parse failure, or null when the
+ * failure is anything else (BB-355). A front-matter key the strict schema does
+ * not know, an option a `z.enum` does not list, and a value a
+ * `z.discriminatedUnion` has no branch for are all "this image's parser does
+ * not know it": a newer image may, so the loader can say "unsupported until
+ * restart" rather than read it as a typo.
+ *
+ * Only a failure whose every issue is unrecognised is reported this way; a
+ * parse that also carries an ordinary failure (a missing field, a bad type, a
+ * malformed value) returns null, so the loader keeps the whole parse error and
+ * the ordinary failure is not dropped. Inside an `invalid_union` a branch
+ * counts only when all of its own issues are unrecognised, since the other
+ * branches always report the input as the wrong type.
+ */
+export function unsupportedParse(error: z.ZodError, raw: unknown): string | null {
+  const one = (issue: z.core.$ZodIssue, base: readonly PropertyKey[]): string | null => {
+    const path = [...base, ...issue.path];
+    const where = pathText(path);
+    if (issue.code === "unrecognized_keys") return issue.keys.map((key) => `field ${JSON.stringify(where === "" ? key : `${where}.${key}`)}`).join(", ");
+    if (issue.code === "invalid_value") return where === "" ? `value ${JSON.stringify(valueAtPath(raw, path))}` : `value ${JSON.stringify(valueAtPath(raw, path))} for ${where}`;
+    if (issue.code === "invalid_union") {
+      // A discriminated union with no matching branch carries the discriminator
+      // and its options and no nested issues; the value at its path is the one
+      // this image does not know.
+      if (issue.discriminator !== undefined && issue.inclusive !== false && issue.errors.length === 0) return where === "" ? `value ${JSON.stringify(valueAtPath(raw, path))}` : `value ${JSON.stringify(valueAtPath(raw, path))} for ${where}`;
+      for (const branch of issue.errors) {
+        const found = all(branch, path);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  };
+  const all = (issues: readonly z.core.$ZodIssue[], base: readonly PropertyKey[]): string | null => {
+    if (issues.length === 0) return null;
+    const details: string[] = [];
+    for (const issue of issues) {
+      const detail = one(issue, base);
+      if (detail === null) return null;
+      details.push(detail);
+    }
+    return details.join(", ");
+  };
+  return all(error.issues, []);
 }
 
 export function parseProjectFile(text: string): Parsed<ProjectFile> {
@@ -953,7 +1016,10 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
     return { ok: false, error: `${file}: the front matter is not YAML: ${error instanceof Error ? error.message : String(error)}` };
   }
   const parsed = frontMatterSchema.safeParse(raw);
-  if (!parsed.success) return { ok: false, error: `${file}: ${zodMessage(parsed.error)}` };
+  if (!parsed.success) {
+    const unsupported = unsupportedParse(parsed.error, raw);
+    return { ok: false, error: `${file}: ${zodMessage(parsed.error)}`, ...(unsupported === null ? {} : { unsupported }) };
+  }
   const fm = parsed.data;
   if (fm.name !== expectedName) return { ok: false, error: `${file} names itself ${JSON.stringify(fm.name)}; the file name says ${JSON.stringify(expectedName)}` };
   // An ops binding watches a target, not an entity in a source plugin: a
