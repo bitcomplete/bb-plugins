@@ -1532,7 +1532,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The sweep interval in milliseconds, from the setting, falling back to the server's own default. */
     async function sweepIntervalMs(): Promise<number> {
       const value = (await settings.get()).sweepMinutes;
-      const minutes = typeof value === "number" && Number.isFinite(value) && value > 0 ? value : defaultSweepMinutes;
+      const minutes = typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.max(1, value) : defaultSweepMinutes;
       return minutes * 60_000;
     }
 
@@ -14506,13 +14506,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         let stopping = false;
         const runSweep = () => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`));
         const scheduleSweep = () => {
-          void sweepIntervalMs().then((ms) => {
-            if (stopping) return;
-            sweepTimer = setTimeout(() => {
-              runSweep();
-              scheduleSweep();
-            }, ms);
-          });
+          void sweepIntervalMs()
+            .catch(() => defaultSweepMinutes * 60_000)
+            .then((ms) => {
+              if (stopping) return;
+              sweepTimer = setTimeout(() => {
+                runSweep();
+                scheduleSweep();
+              }, ms);
+            });
         };
         scheduleSweep();
         // The first sweep tells linear and github what to watch after a restart.
@@ -14696,16 +14698,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * best-effort from its `watches` RPC. Null when github-watcher is not
      * installed or not loaded; nothing here fails `check`.
      */
-    async function githubPollerStatus(): Promise<{ starved: boolean; lastError: string | null; nextPollAt: number } | null> {
+    async function githubPollerStatus(): Promise<{ starved: boolean; lastError: string | null; nextPollAt: number; intervalMs: number | null } | null> {
       try {
-        const out = await bb.sdk.plugins.callRpc<{ hooks?: { poll?: { starved?: boolean; lastError?: string | null; nextPollAt?: number } | null } | null }>({
+        const out = await bb.sdk.plugins.callRpc<{ hooks?: { poll?: { starved?: boolean; lastError?: string | null; nextPollAt?: number; intervalMs?: number | null } | null } | null }>({
           pluginId: "github-watcher",
           method: "watches",
           input: null,
-          outputSchema: z.object({ hooks: z.object({ poll: z.object({ starved: z.boolean(), lastError: z.string().nullable(), nextPollAt: z.number() }).nullish() }).loose().optional() }).loose(),
+          outputSchema: z.object({ hooks: z.object({ poll: z.object({ starved: z.boolean(), lastError: z.string().nullable(), nextPollAt: z.number(), intervalMs: z.number().nullish() }).nullish() }).loose().optional() }).loose(),
         });
         const poll = out.hooks?.poll;
-        return poll === null || poll === undefined ? null : { starved: poll.starved === true, lastError: poll.lastError ?? null, nextPollAt: poll.nextPollAt ?? 0 };
+        return poll === null || poll === undefined ? null : { starved: poll.starved === true, lastError: poll.lastError ?? null, nextPollAt: poll.nextPollAt ?? 0, intervalMs: typeof poll.intervalMs === "number" ? poll.intervalMs : null };
       } catch {
         return null;
       }
@@ -14723,10 +14725,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
       // The doorbell mode is information, not a problem: a server without a
       // hooks service is a supported setup, and the sweep is its fast path.
+      // The interval named is github-watcher's poller when it answers (that
+      // is what re-checks the watches); the sweep interval is the fallback.
       const sweepMinutes = Math.max(1, Math.round((await sweepIntervalMs()) / 60_000));
       if (hooksUrl === "") {
-        lines.push(`doorbells: polling every ${sweepMinutes} minutes (no hooks service configured)`);
         const poll = await githubPollerStatus();
+        const pollMinutes = poll?.intervalMs != null ? Math.max(1, Math.round(poll.intervalMs / 60_000)) : sweepMinutes;
+        lines.push(`doorbells: polling every ${pollMinutes} minutes (no hooks service configured)`);
         if (poll !== null && poll.starved) lines.push(`warning: github-watcher: the poller is rate-limited (${poll.lastError ?? "backing off"}); GitHub is read again on its own backoff`);
       } else {
         lines.push(`doorbells: from the hooks service (BB_HOOKS_URL)`);

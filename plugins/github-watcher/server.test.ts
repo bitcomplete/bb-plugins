@@ -87,7 +87,13 @@ function fakeGitHub() {
     const statuses = /\/repos\/([^/]+)\/([^/]+)\/deployments\/(\d+)\/statuses(?:\?|$)/u.exec(u);
     if (statuses !== null) {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
-      return Response.json(state.deploymentStatuses[Number(statuses[3])] ?? []);
+      const id = Number(statuses[3]);
+      const body = state.deploymentStatuses[id] ?? [];
+      // A fake that honours ETags, so a poller's conditional status read can be a 304.
+      const etag = `"${Buffer.from(JSON.stringify(body)).toString("base64url")}"`;
+      const ifNoneMatch = (init?.headers as Record<string, string> | undefined)?.["if-none-match"];
+      if (ifNoneMatch === etag) return new Response(null, { status: 304 });
+      return Response.json(body, { headers: { etag } });
     }
     const labelCreate = /\/repos\/([^/]+)\/([^/]+)\/labels(?:\?|$)/u.exec(u);
     if (labelCreate !== null && init?.method === "POST") {
@@ -638,6 +644,55 @@ describe("polling mode", () => {
     const recovered = (await w.harness.callRpc("watches", null)) as PollView;
     expect(recovered.hooks.poll).toMatchObject({ starved: false, lastError: null });
     expect(recovered.hooks.poll!.polls).toBeGreaterThan(pollsAfterFirst);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("does not starve on a Dependabot 403 that is not a rate limit, and still re-checks a watch", async () => {
+    const w = await setup({ pollTiming: POLL });
+    // Alerts are off or the token has no alert access: a plain 403 with no rate-limit headers.
+    w.github.state.dependabotStatus = 403;
+    expect(await w.tool({ ref: "Acme/Widgets#12" })).not.toMatchObject({ isError: true });
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: ["acme/widgets"], deployment: [] }, STEWARDS)).toEqual({ ok: true });
+    await tick();
+    const view = (await w.harness.callRpc("watches", null)) as PollView;
+    expect(view.hooks.poll).toMatchObject({ starved: false, lastError: null });
+    expect(w.harness.logEntries.some((l) => l.message.includes("Dependabot alerts failed"))).toBe(true);
+    // The watch is still re-checked on the normal interval.
+    w.github.state.node = pullNode({ updatedAt: "2026-10-09T12:00:00Z", reviewDecision: "APPROVED" });
+    w.advance(60_000);
+    await tick(60_000);
+    await tick();
+    expect(w.send).toHaveBeenCalledTimes(1);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("reuses the cached status on a 304 so an old deployment is not rung again with an empty state", async () => {
+    const w = await setup({ pollTiming: POLL });
+    w.github.state.deployments = [{ id: 7, environment: "production", ref: "main", sha: "abc123", url: "https://api.github.com/repos/Acme/Widgets/deployments/7" }];
+    w.github.state.deploymentStatuses = { 7: [{ state: "success", log_url: "https://github.com/Acme/Widgets/actions/runs/9" }] };
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/widgets"] }, STEWARDS)).toEqual({ ok: true });
+    await tick();
+    await tick(3000);
+    const rings = () => w.rpcs().filter((r) => r.method === "stewardsRing");
+    expect(rings()).toEqual([
+      {
+        pluginId: "stewards",
+        method: "stewardsRing",
+        input: { source: "github", id: "acme/widgets#7", deployment: { id: 7, environment: "production", ref: "main", sha: "abc123", state: "success", url: "https://github.com/Acme/Widgets/actions/runs/9" } },
+      },
+    ]);
+    // The next poll's status read is a 304. With the cached status the
+    // fingerprint is unchanged, so there is no second ring (and no empty state).
+    w.advance(60_000);
+    await tick(60_000);
+    await tick(3000);
+    expect(rings()).toHaveLength(1);
     service.controller.abort();
     await service.done;
   });

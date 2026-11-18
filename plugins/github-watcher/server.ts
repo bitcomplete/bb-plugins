@@ -602,18 +602,25 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     /** The ETag the last read of a path returned, so an unchanged list answers 304. */
     const pollEtags = new Map<string, string>();
 
+    /** The last status parsed per deployment, so a conditional 304 reuses it instead of reading as empty. */
+    const deploymentStatusCache = new Map<string, { state: string; url: string | null }>();
+
     /**
      * One conditional REST read for the poller. A 304 is "nothing changed".
-     * A 403/429, or a remaining quota at or below `RATE_LIMIT_FLOOR`, is a
-     * RateLimitError with the server's retry hint, so the poller backs off
-     * rather than spending the rest of the quota.
+     * A 429, or a 403 that also carries a rate-limit signal (a near-empty
+     * quota, a `Retry-After`, or a rate-limit message), is a RateLimitError
+     * with the server's retry hint, so the poller backs off. Any other 403 is
+     * an ordinary read failure: GitHub answers 403 for a Dependabot repo
+     * whose alerts are off or whose token has no alert access, and that must
+     * not starve the whole poller. Each request gets its own timeout, so a
+     * long round does not abort the reads at its end.
      */
-    async function pollRest(path: string, signal: AbortSignal): Promise<{ body: unknown; notModified: boolean; retryAfterMs: number | null }> {
+    async function pollRest(path: string): Promise<{ body: unknown; notModified: boolean; retryAfterMs: number | null }> {
       return asDeveloper(async (token) => {
         const headers: Record<string, string> = { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "user-agent": "bb-plugin-github", "x-github-api-version": "2022-11-28" };
         const etag = pollEtags.get(path);
         if (etag !== undefined) headers["if-none-match"] = etag;
-        const response = await deps.fetch(new URL(path, apiUrl), { method: "GET", headers, signal });
+        const response = await deps.fetch(new URL(path, apiUrl), { method: "GET", headers, signal: checkSignal() });
         if (response.status === 304) return { body: null, notModified: true, retryAfterMs: null };
         const remainingRaw = response.headers.get("x-ratelimit-remaining");
         const resetRaw = response.headers.get("x-ratelimit-reset");
@@ -623,11 +630,14 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const retryAfter = retryAfterRaw === null ? Number.NaN : Number(retryAfterRaw);
         const lowQuota = Number.isFinite(remaining) && remaining <= RATE_LIMIT_FLOOR;
         const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : lowQuota && Number.isFinite(reset) ? Math.max(0, reset * 1000 - deps.now()) : null;
-        if (response.status === 403 || response.status === 429) throw new RateLimitError(`GitHub answered HTTP ${response.status} to ${path}`, retryAfterMs);
+        if (response.status === 429) throw new RateLimitError(`GitHub answered HTTP 429 to ${path}`, retryAfterMs);
         if (!response.ok) {
           const body: unknown = await response.json().catch(() => null);
-          const message = body !== null && typeof body === "object" && typeof (body as { message?: unknown }).message === "string" ? `: ${(body as { message: string }).message}` : "";
-          throw new GitHubRequestError(`GitHub answered HTTP ${response.status}${message}`, response.status);
+          const message = body !== null && typeof body === "object" && typeof (body as { message?: unknown }).message === "string" ? (body as { message: string }).message : "";
+          if (response.status === 403 && (lowQuota || retryAfterMs !== null || /rate.?limit|secondary rate/iu.test(message))) {
+            throw new RateLimitError(`GitHub answered HTTP 403 to ${path}${message === "" ? "" : `: ${message}`}`, retryAfterMs);
+          }
+          throw new GitHubRequestError(`GitHub answered HTTP ${response.status}${message === "" ? "" : `: ${message}`}`, response.status);
         }
         const newEtag = response.headers.get("etag");
         if (newEtag !== null && newEtag !== "") pollEtags.set(path, newEtag);
@@ -642,7 +652,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
      * cap bounds how many are rung in one round; the rest keep their old
      * cursor and are rung next round.
      */
-    async function pollInterest(signal: AbortSignal): Promise<PollResult> {
+    async function pollInterest(): Promise<PollResult> {
       if (interest.units.length === 0 && interest.dependabot.length === 0 && interest.deployment.length === 0) return {};
       const changed: Array<{ id: string; fp: string; ring: () => void }> = [];
       let rateLimited: { retryAfterMs: number | null; message: string } | undefined;
@@ -654,7 +664,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
       for (const repo of interest.units) {
         try {
-          const page = await pollRest(pullsPath(repo), signal);
+          const page = await pollRest(pullsPath(repo));
           if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
           if (page.notModified) continue;
           for (const pr of parsePulls(page.body, repo)) {
@@ -671,7 +681,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
       for (const repo of interest.dependabot) {
         try {
-          const page = await pollRest(dependabotAlertsPath(repo, "open"), signal);
+          const page = await pollRest(dependabotAlertsPath(repo, "open"));
           if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
           if (page.notModified) continue;
           for (const alert of parseDependabotAlerts(page.body, repo)) {
@@ -688,21 +698,23 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
       for (const repo of interest.deployment) {
         try {
-          const page = await pollRest(deploymentsPath(repo), signal);
+          const page = await pollRest(deploymentsPath(repo));
           if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
           if (page.notModified) continue;
           const deployments = parseDeployments(page.body).slice(0, DEPLOYMENTS_PER_POLL);
           for (const d of deployments) {
             const key = `${repo}#${d.id}`;
-            let state = "";
-            let url = d.url;
+            const cached = deploymentStatusCache.get(key);
+            let state = cached?.state ?? "";
+            let url = cached?.url ?? d.url;
             try {
-              const statusPage = await pollRest(deploymentStatusesPath(repo, d.id), signal);
+              const statusPage = await pollRest(deploymentStatusesPath(repo, d.id));
               if (statusPage.retryAfterMs !== null) noteQuota(statusPage.retryAfterMs);
               if (!statusPage.notModified) {
                 const status = parseDeploymentStatus(statusPage.body);
                 state = status.state;
                 url = status.url ?? d.url;
+                deploymentStatusCache.set(key, { state, url });
               }
             } catch (error) {
               if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
@@ -761,7 +773,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       timing: deps.pollTiming,
       poll: async (reason) => {
         await sweep(reason);
-        return pollInterest(checkSignal());
+        return pollInterest();
       },
     });
     poller.onStateChange(announceWatches);

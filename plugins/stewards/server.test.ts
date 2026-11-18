@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PROJECT_CHANGED } from "./channels.js";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { ROLES_FILE } from "./roles.js";
@@ -9419,6 +9419,34 @@ describe("doorbells and polling (BB-363)", () => {
     const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
     expect(check.lines).toContain("warning: github-watcher: the poller is rate-limited (GitHub answered HTTP 403); GitHub is read again on its own backoff");
     expect(check.lines.filter((l) => l.startsWith("problem:") && l.toLowerCase().includes("github-watcher"))).toEqual([]);
+  });
+
+  it("names github-watcher's own poll interval in check when it answers", async () => {
+    const t = await setup({ env: {} }, { sweepMinutes: "15" });
+    t.setGithubPoller({ starved: false, lastError: null, nextPollAt: t.now() + 300_000, intervalMs: 300_000 });
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    // The watches are polled by github-watcher every 5 minutes, whatever the
+    // stewards sweep setting says.
+    expect(check.lines).toContain("doorbells: polling every 5 minutes (no hooks service configured)");
+  });
+
+  it("sweeps on the interval the setting names, not a fixed one", async () => {
+    const t = await setup({ env: {} }, { sweepMinutes: "1" });
+    vi.useFakeTimers();
+    try {
+      const service = t.harness.runService("loop");
+      // The first sweep runs at start; let it settle, then clear the count.
+      await vi.advanceTimersByTimeAsync(10);
+      await t.hooks.settle();
+      t.rpcCalls.length = 0;
+      // One minute later, the setting's interval, the loop sweeps again.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await t.hooks.settle();
+      expect(t.rpcCalls.filter((c) => c.method === "sourceAdoptable").length).toBeGreaterThan(0);
+      service.controller.abort();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
