@@ -14713,6 +14713,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * The linear poller's health, when it is in polling mode, read
+     * best-effort from its `watches` RPC. Null when linear is not installed
+     * or not loaded; nothing here fails `check`.
+     */
+    async function linearPollerStatus(): Promise<{ starved: boolean; lastError: string | null; nextPollAt: number; intervalMs: number | null } | null> {
+      try {
+        const out = await bb.sdk.plugins.callRpc<{ hooks?: { poll?: { starved?: boolean; lastError?: string | null; nextPollAt?: number; intervalMs?: number | null } | null } | null }>({
+          pluginId: "linear",
+          method: "watches",
+          input: null,
+          outputSchema: z.object({ hooks: z.object({ poll: z.object({ starved: z.boolean(), lastError: z.string().nullable(), nextPollAt: z.number(), intervalMs: z.number().nullish() }).nullish() }).loose().optional() }).loose(),
+        });
+        const poll = out.hooks?.poll;
+        return poll === null || poll === undefined ? null : { starved: poll.starved === true, lastError: poll.lastError ?? null, nextPollAt: poll.nextPollAt ?? 0, intervalMs: typeof poll.intervalMs === "number" ? poll.intervalMs : null };
+      } catch {
+        return null;
+      }
+    }
+
     async function check(projectId: string, options: { createLabels?: boolean } = {}): Promise<{ ok: boolean; lines: string[]; findings: Array<{ level: "warning" | "problem"; text: string }> }> {
       const config = await loadConfig(projectId, true);
       if (config === null) {
@@ -14730,9 +14750,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const sweepMinutes = Math.max(1, Math.round((await sweepIntervalMs()) / 60_000));
       if (hooksUrl === "") {
         const poll = await githubPollerStatus();
-        const pollMinutes = poll?.intervalMs != null ? Math.max(1, Math.round(poll.intervalMs / 60_000)) : sweepMinutes;
+        const linearPoll = await linearPollerStatus();
+        const pollMinutes = poll?.intervalMs != null ? Math.max(1, Math.round(poll.intervalMs / 60_000)) : linearPoll?.intervalMs != null ? Math.max(1, Math.round(linearPoll.intervalMs / 60_000)) : sweepMinutes;
         lines.push(`doorbells: polling every ${pollMinutes} minutes (no hooks service configured)`);
         if (poll !== null && poll.starved) lines.push(`warning: github-watcher: the poller is rate-limited (${poll.lastError ?? "backing off"}); GitHub is read again on its own backoff`);
+        if (linearPoll !== null && linearPoll.starved) lines.push(`warning: linear: the poller is rate-limited (${linearPoll.lastError ?? "backing off"}); Linear is read again on its own backoff`);
       } else {
         lines.push(`doorbells: from the hooks service (BB_HOOKS_URL)`);
       }

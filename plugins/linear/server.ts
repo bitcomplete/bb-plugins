@@ -46,6 +46,7 @@ import {
   ISSUE_RELATION_DELETE,
   ISSUE_UPDATE,
   ISSUES_QUERY,
+  GRAPHQL_PATH,
   LinearRequestError,
   MY_TEAMS_QUERY,
   PRIORITIES,
@@ -120,6 +121,7 @@ import {
   type Account,
 } from "./accounts.js";
 import { createHooksLoop, HooksRequestError, HOOKS_URL_ENV, REPLY_BODY_MAX_BYTES, REPLY_KINDS, type IdentifyResponse, type Lease, type Rejection, type ReplyKind, type SessionEvent } from "./hooks-client.js";
+import { createPoller, DEFAULT_POLL_TIMING, RateLimitError, type PollResult, type Poller, type PollerTiming } from "./poller.js";
 import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, signedBy, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type BacklogIssue, type SearchIssue, type SessionWake } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
@@ -232,6 +234,8 @@ export interface LinearPluginDeps {
   fetch: typeof fetch;
   now: () => number;
   env: Record<string, string | undefined>;
+  /** The polling timer's intervals; the defaults unless a test says otherwise. */
+  pollTiming?: Partial<PollerTiming>;
 }
 
 function errorMessage(error: unknown): string {
@@ -656,6 +660,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         // only stewards itself may set it; the app and the CLI are clients.
         if (caller.kind !== "plugin" || caller.pluginId !== STEWARDS_PLUGIN_ID) throw new Error(`sourceSetInterest is for the ${STEWARDS_PLUGIN_ID} plugin only.`);
         await setInterest(units, entities);
+        // With no hooks service there is nothing to lease; wake the poller so
+        // the new interest is read on the next round rather than at its timer.
+        if (hooksUrl === "") poller.poke();
         return { ok: true };
       },
     });
@@ -1097,11 +1104,12 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     // ---- watching an issue -----------------------------------------------
     //
-    // A watch is a row in the plugin's SQLite plus a lease on the hooks service.
-    // The row is the truth: it carries what the thread last saw, and every
-    // check compares a fresh read against it. The lease only makes the check
-    // prompt. Without BB_HOOKS_URL there is no service to lease from and the
-    // tool says so; a watch that merely polled would be a different feature.
+    // A watch is a row in the plugin's SQLite plus, when there is a hooks
+    // service, a lease on it. The row is the truth: it carries what the
+    // thread last saw, and every check compares a fresh read against it. The
+    // lease only makes the check prompt. Without BB_HOOKS_URL there is no
+    // service to lease from: a plain timer re-checks every watch and polls
+    // stewards' teams and issues, so watching works the same either way.
 
     const hooksUrl = deps.env[HOOKS_URL_ENV]?.trim() ?? "";
     const db = bb.storage.database();
@@ -1370,6 +1378,191 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         await resolveAndLease("interest changed");
       });
     }
+
+    // ---- polling, when there is no hooks service --------------------------
+    //
+    // `BB_HOOKS_URL` unset means no doorbells: the plugin still watches and
+    // still hears of stewards' teams and issues, but on its own timer. Every
+    // round re-checks the open watches (the same baseline re-check the hooks
+    // client runs while leased) and polls the teams and issues stewards asked
+    // to hear about, ringing stewards for a new labelled ticket, an assignee
+    // change or a comment exactly as a doorbell would. The reads are GraphQL
+    // with an `updatedAt` filter so an unchanged team is not re-read, and a
+    // 429, a rate-limit error or a near-empty quota backs the poller off.
+
+    /** How many issues one team poll reads; the rest are found on the next poll. */
+    const ISSUES_PER_POLL = 100;
+    /** Linear's remaining-request quota at or below which a poll backs off until the reset. */
+    const RATE_LIMIT_FLOOR = 10;
+    /** How many issue fingerprints the poller remembers before it drops the oldest. */
+    const INTEREST_CURSOR_MAX = 5000;
+    /** How far back a poll looks, so a change just before the previous poll is not missed. */
+    const POLL_OVERLAP_MS = 60_000;
+
+    /** Where the poller remembers how far it has read, so a restart does not replay everything. */
+    const INTEREST_CURSORS_KEY = "stewards/interest-cursors";
+    const interestCursorsSchema = z.object({
+      /** When the last poll started; 0 before the first, which looks only at changes after it starts. */
+      since: z.number().default(0),
+      /** Issue UUID to the last `updatedAt` the poller saw, and when. */
+      issues: z.record(z.string(), z.object({ fp: z.string(), at: z.number() })).default({}),
+    });
+    let interestCursors = interestCursorsSchema.catch({ since: 0, issues: {} }).parse(await bb.storage.kv.get(INTEREST_CURSORS_KEY));
+
+    const pollIssueSchema = z.object({ id: z.string(), identifier: z.string(), updatedAt: z.string().nullish() });
+    /** Open issues in one team updated after a time, with only what a poll needs. */
+    const POLL_TEAM_QUERY = `query($filter: IssueFilter, $first: Int!) { issues(filter: $filter, first: $first) { nodes { id identifier updatedAt } } }`;
+    /** One issue's id and updatedAt, for an issue stewards bound on its own. */
+    const POLL_ISSUE_QUERY = "query($id: String!) { issue(id: $id) { id identifier updatedAt } }";
+
+    /**
+     * One GraphQL read for the poller, with Linear's rate-limit signal read.
+     * Linear answers a rate limit with HTTP 429, or with a 400/403 whose
+     * first GraphQL error names it; a response whose remaining-request quota
+     * is at or below the floor is a rate limit too, with the reset as the
+     * retry hint. A low-quota success still returns its payload so the poll
+     * can use it, with the hint for the caller to note.
+     */
+    async function pollQuery(account: string, document: string, variables: Record<string, unknown> | undefined): Promise<{ payload: unknown; retryAfterMs: number | null }> {
+      const { apiUrl } = await settings.get();
+      const run = async (token: string) => {
+        const response = await deps.fetch(new URL(GRAPHQL_PATH, apiUrl), {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify(variables === undefined ? { query: document } : { query: document, variables }),
+          signal: checkSignal(),
+        });
+        const remainingRaw = response.headers.get("x-ratelimit-requests-remaining");
+        const resetRaw = response.headers.get("x-ratelimit-requests-reset");
+        const remaining = remainingRaw === null ? Number.NaN : Number(remainingRaw);
+        const reset = resetRaw === null ? Number.NaN : Number(resetRaw);
+        const lowQuota = Number.isFinite(remaining) && remaining <= RATE_LIMIT_FLOOR;
+        const retryAfterMs = lowQuota && Number.isFinite(reset) ? Math.max(0, reset * 1000 - deps.now()) : null;
+        const payload: unknown = await response.json().catch(() => null);
+        const first = graphqlErrors(payload)[0] ?? "";
+        const limited = response.status === 429 || ((response.status === 400 || response.status === 403) && /rate.?limit|ratelimited|too many requests/iu.test(first));
+        if (limited) throw new RateLimitError(`Linear rate-limited the poll (HTTP ${response.status}${first === "" ? "" : `: ${first}`})`, retryAfterMs);
+        if (!response.ok) throw new LinearRequestError(`Linear answered HTTP ${response.status}${first === "" ? "" : `: ${first}`}`, response.status);
+        return { payload, retryAfterMs: lowQuota ? retryAfterMs : null };
+      };
+      try {
+        return await run(await accessToken(account));
+      } catch (error) {
+        if (!(error instanceof LinearRequestError) || error.status !== 401) throw error;
+        return run(await refresh(account, "was refused"));
+      }
+    }
+
+    /**
+     * Poll the teams and issues stewards asked to hear about, ringing
+     * stewards for each entity whose `updatedAt` changed since the last poll.
+     * The first poll looks only at what changed since it started, so a
+     * restart does not replay every issue (the stewards sweep owns initial
+     * adoption). The per-poll cap bounds how many are rung in one round;
+     * what is left keeps its old fingerprint and is rung next round.
+     */
+    async function pollInterest(): Promise<PollResult> {
+      if (interest.units.length === 0 && interest.entities.length === 0) return {};
+      const changed: Array<{ id: string; fp: string; ring: () => void }> = [];
+      let rateLimited: { retryAfterMs: number | null; message: string } | undefined;
+      const noteRateLimit = (ms: number | null, message: string) => {
+        if (rateLimited === undefined) rateLimited = { retryAfterMs: ms, message };
+      };
+      const noteQuota = (ms: number | null) => noteRateLimit(ms, "Linear's remaining rate-limit quota is nearly exhausted");
+
+      const started = deps.now();
+      // The first poll has nothing to compare against, so it looks only at
+      // what changed since it started; later polls overlap the previous
+      // window a little, so a change just before it is not missed.
+      const since = interestCursors.since === 0 ? started : Math.max(0, interestCursors.since - POLL_OVERLAP_MS);
+      const sinceIso = new Date(since).toISOString();
+      const next: typeof interestCursors = { since: started, issues: { ...interestCursors.issues } };
+
+      /** Note an issue the read found, and queue a ring when it changed since the last poll. */
+      const observe = (id: string, fp: string) => {
+        if (interestCursors.issues[id]?.fp === fp) return;
+        changed.push({ id, fp, ring: () => stewardRings.ring(id) });
+      };
+
+      for (const key of interest.units) {
+        let account: Account;
+        try {
+          account = await pick({ team: key }, checkSignal());
+        } catch (error) {
+          bb.log.warn(`linear: polling team ${key} failed: ${errorMessage(error)}`);
+          continue;
+        }
+        try {
+          const filter = { team: { key: { eq: key } }, updatedAt: { gt: sinceIso } };
+          const page = await pollQuery(account.key, POLL_TEAM_QUERY, { filter, first: ISSUES_PER_POLL });
+          if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
+          const data = page.payload !== null && typeof page.payload === "object" ? (page.payload as { data?: { issues?: unknown } }).data : undefined;
+          for (const issue of z.object({ nodes: z.array(pollIssueSchema) }).parse(data?.issues).nodes) observe(issue.id.toLowerCase(), issue.updatedAt ?? "");
+        } catch (error) {
+          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          else bb.log.warn(`linear: polling team ${key} failed: ${errorMessage(error)}`);
+        }
+      }
+
+      for (const entity of interest.entities) {
+        if (!UUID.test(entity)) continue;
+        const id = entity.toLowerCase();
+        const account = accountOfEntity(id);
+        if (account === null) continue;
+        try {
+          const page = await pollQuery(account.key, POLL_ISSUE_QUERY, { id });
+          if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
+          const data = page.payload !== null && typeof page.payload === "object" ? (page.payload as { data?: unknown }).data : undefined;
+          const issue = z.object({ issue: pollIssueSchema.nullable() }).parse(data).issue;
+          if (issue === null || issue === undefined) continue;
+          observe(issue.id.toLowerCase(), issue.updatedAt ?? "");
+        } catch (error) {
+          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          else bb.log.warn(`linear: polling issue ${entity} failed: ${errorMessage(error)}`);
+        }
+      }
+
+      // Ring, in the order the reads found them, up to the cap. What is left
+      // keeps its old fingerprint and is rung next round.
+      const timing: PollerTiming = { ...DEFAULT_POLL_TIMING, ...deps.pollTiming };
+      let budget = timing.maxEntitiesPerPoll;
+      let capped = false;
+      for (const c of changed) {
+        if (budget <= 0) {
+          capped = true;
+          break;
+        }
+        budget -= 1;
+        c.ring();
+        next.issues[c.id] = { fp: c.fp, at: started };
+      }
+      // Bound the fingerprint map: drop the oldest entries once it grows past the cap.
+      const ids = Object.keys(next.issues);
+      if (ids.length > INTEREST_CURSOR_MAX) {
+        ids.sort((a, b) => next.issues[a]!.at - next.issues[b]!.at);
+        for (const id of ids.slice(0, ids.length - INTEREST_CURSOR_MAX)) delete next.issues[id];
+      }
+      interestCursors = next;
+      await bb.storage.kv.set(INTEREST_CURSORS_KEY, next);
+      if (rateLimited !== undefined) return { rateLimited: true, retryAfterMs: rateLimited.retryAfterMs ?? undefined, message: rateLimited.message };
+      return { capped };
+    }
+
+    /**
+     * The polling timer: only meaningful when there is no hooks service, but
+     * harmless otherwise. One round re-checks the watches and polls stewards'
+     * interest; a rate limit makes it back off instead of waiting the interval.
+     */
+    const poller: Poller = createPoller({
+      now: deps.now,
+      log: bb.log,
+      timing: deps.pollTiming,
+      poll: async (reason) => {
+        await sweep(reason);
+        return pollInterest();
+      },
+    });
+    poller.onStateChange(announceWatches);
 
     async function sourceSnapshot(id: string) {
       const entity = id.trim();
@@ -2007,6 +2200,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         rows,
         hooks: hooks.status(),
         configured: hooksUrl !== "",
+        poll: hooksUrl === "" ? poller.status() : null,
         now: deps.now(),
         titles,
         target: (row) => {
@@ -2109,6 +2303,15 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
         },
       });
+    } else {
+      // No hooks service: the same watches and stewards interest are re-read
+      // on a plain timer. `linear_watch_issue` and the usage view name the
+      // interval; the settings page shows the poller's state.
+      bb.background.service("watches", {
+        async start(signal) {
+          await poller.run(signal);
+        },
+      });
     }
 
     const forgetThread = (threadId: string) => {
@@ -2128,9 +2331,6 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       presentation: { label: { pending: "Watching a Linear issue", completed: "Watching a Linear issue" } },
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123."), account: accountParam }),
       async execute({ key, account }, { threadId, projectId, signal }) {
-        if (hooksUrl === "") {
-          return toolError(new Error("Watching Linear issues is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set). Read the issue again later instead."));
-        }
         try {
           const where = await forIssue(key, account, signal);
           const issue = await readIssue(where, key, signal);
@@ -2149,10 +2349,18 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             return toolError(new Error(`This thread already watches ${added.limit} Linear issues, the most it can. It is still watching them; it cannot add ${issue.identifier}.`));
           }
           if (added.outcome === "already") return `Already watching ${issue.identifier}: ${title}. This thread will be messaged when it changes; you can end the turn.`;
+          announceWatches();
+          if (hooksUrl === "") {
+            // No hooks service: the watch is picked up by the poller's next
+            // round. Poke it so a watch added just after a poll is not left
+            // for the whole interval.
+            poller.poke();
+            const minutes = Math.max(1, Math.round(poller.intervalMs / 60_000));
+            return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; this server polls every ${minutes} minutes (no hooks service configured). End the turn rather than polling.`;
+          }
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
           hooks.addedLeases([{ kind: "issue", id: issue.id, account: where.key }]).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
-          announceWatches();
           return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.`;
         } catch (error) {
           return toolError(error);
@@ -2172,7 +2380,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         externalUrl: z.string().trim().url().max(2000).optional().describe("The session's external link. Leave it out: it defaults to this thread."),
       }),
       async execute({ session, kind, body, externalUrl }, { threadId, projectId, signal }) {
-        if (hooksUrl === "") return toolError(new Error("Replying to Linear mentions is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set)."));
+        if (hooksUrl === "") return toolError(new Error("Replying to Linear mentions is hooks-only: this bb server has no hooks service (BB_HOOKS_URL is not set), so @bb mentions in Linear are not routed here and a session reply has nowhere to go. Comment on the issue instead."));
         const r = sessions.get(session);
         if (r !== undefined && answered(r)) {
           return toolError(new Error(`Every message in this session on ${r.issueKey} already has its reply; each gets exactly one. Put further progress in a comment on the issue (linear_comment). A new follow-up in the session can be answered when it arrives.`));

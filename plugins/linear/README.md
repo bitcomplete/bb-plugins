@@ -64,7 +64,7 @@ already knew, and refreshes it first if it has lapsed.
 | `linear_comment` | A Markdown comment, signed with the thread id. |
 | `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together, and add or remove relations. A new description is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
-| `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
+| `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. With `BB_HOOKS_URL` it is doorbells; without one, the plugin polls every five minutes. |
 | `linear_session_reply` | Answer an `@bb` mention: one reply on its agent session, posted by the hooks service as the bb app, linking the thread. Needs `BB_HOOKS_URL`. See "@bb mentions". |
 
 Every tool takes an optional `account`; see "Several workspaces".
@@ -201,7 +201,9 @@ ten minutes" at a glance:
 - A status line for the doorbell stream: connected and leased, reconnecting
   (checks fall back to a sweep every two minutes, so reads go up), or
   stopped, how long it has been so, and how many doorbells and sweeps the
-  last hour saw.
+  last hour saw. On a server with no hooks service the line names the
+  polling interval, its next poll and, when it is backing off, the rate
+  limit.
 - A line for what stewards asked to have leased beside the watches (see
   "Stewards"): its teams by key, and its issues counted, listed by key only
   when opened. Anything it asked for that is not leased is called out under
@@ -226,10 +228,13 @@ rate); doorbell and sweep counts are in memory and start over when the
 server does.
 
 `BB_HOOKS_URL` is the address of the hooks service. It is read from the
-server's environment only; there is no setting. Without it, `linear_watch_issue` returns an error saying watching
-is not available on this server, no background service is started, and
-the other tools work as before. There is deliberately no polling fallback:
-re-reading the issue later is what the agent would do anyway.
+server's environment only; there is no setting. Set, it is doorbells:
+`linear_watch_issue` leases the issue and the plugin is woken when Linear
+says it changed. Unset, it is polling: a plain timer re-checks every watch
+and polls the teams and issues stewards asked about (five minutes by
+default), and `linear_watch_issue` says so in its answer. The mode is shown
+in Settings → Plugins → Linear → Watches. `linear_session_reply` and `@bb`
+mentions stay hooks-only either way.
 
 ## The `bb linear` command
 
@@ -293,7 +298,7 @@ each workspace on its own; a refresh that fails is reported to the agent as
 A watch on an issue in another workspace is only as prompt as that
 workspace's webhooks: the hooks service hears of it only if the application's
 webhook delivers that workspace's events. Without them the watch still
-works, through the ten-minute baseline re-check.
+works, through the poller's re-check or the baseline re-check while leased.
 
 ## Settings
 
@@ -309,7 +314,7 @@ works, through the ten-minute baseline re-check.
 | Environment | Meaning |
 |---|---|
 | `LINEAR_CLIENT_ID` | Default for `clientId`. |
-| `BB_HOOKS_URL` | Where the hooks service listens for subscribers. Enables `linear_watch_issue`. |
+| `BB_HOOKS_URL` | Where the hooks service listens for subscribers. With it, watches use doorbells; without it, the plugin polls. |
 
 ## Development
 

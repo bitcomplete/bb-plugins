@@ -245,9 +245,20 @@ function InterestLine({ interest, open }: { interest: InterestView; open: (url: 
 function HooksLine({ view }: { view: UsageView }) {
   const h = view.hooks;
   if (!h.configured) {
+    // No hooks service: the plugin polls on its own timer, and the mode is
+    // information, not a problem. A starved poller (rate-limited) is the one
+    // state worth calling out, with the server's own words and the next try.
+    const minutes = Math.max(1, Math.round((h.poll?.intervalMs ?? 5 * 60_000) / 60_000));
+    if (h.poll !== null && h.poll.starved) {
+      return (
+        <p className="text-amber-600 dark:text-amber-400">
+          <Dot tone="warn" /> Polling every {minutes} minutes (no hooks service configured), but rate-limited{h.poll.lastError === null ? "" : `: ${h.poll.lastError}`}; next poll {until(h.poll.nextPollAt, view.now)}.
+        </p>
+      );
+    }
     return (
       <p className="text-muted-foreground">
-        <Dot tone="off" /> Doorbells unavailable: this server has no hooks service (BB_HOOKS_URL is not set), so threads cannot watch.
+        <Dot tone="ok" /> Polling every {minutes} minutes (no hooks service configured){h.poll !== null && h.poll.nextPollAt > 0 ? `; next poll ${until(h.poll.nextPollAt, view.now)}` : ""}. Threads still watch, just without doorbells.
       </p>
     );
   }

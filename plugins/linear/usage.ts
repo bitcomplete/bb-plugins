@@ -7,9 +7,27 @@
 import { z } from "zod";
 import { ago, until } from "./format-time.js";
 import { STATUS_WINDOW_MS, type HooksStatus } from "./hooks-client.js";
+import { DEFAULT_POLL_TIMING, type PollerStatus } from "./poller.js";
 import { expiresAt, flagsFor, NEAR_LIMIT_AT, WATCH_LIMIT, WATCH_TTL_MS, wakesInWindow, type WatchFlag, type WatchRow } from "./watch.js";
 
 const flagSchema = z.enum(["idle", "noisy", "expiring"]);
+
+/**
+ * The poller, when this server has no hooks service: a plain timer re-checks
+ * every watch and polls the teams and issues stewards asked to hear about.
+ * Null when doorbells are configured.
+ */
+export const pollViewSchema = z.object({
+  state: z.enum(["stopped", "idle", "polling", "backoff"]),
+  since: z.number(),
+  intervalMs: z.number(),
+  lastPollAt: z.number(),
+  nextPollAt: z.number(),
+  polls: z.number(),
+  starved: z.boolean(),
+  lastError: z.string().nullable(),
+  backoffUntil: z.number(),
+});
 
 export const hooksViewSchema = z.object({
   /** Whether this server has a hooks service at all (BB_HOOKS_URL). */
@@ -24,6 +42,8 @@ export const hooksViewSchema = z.object({
   sweeps: z.number(),
   lastSweepAt: z.number(),
   lastSweepReason: z.string().nullable(),
+  /** The polling timer, when there is no hooks service; null when there is one. */
+  poll: pollViewSchema.nullable().default(null),
 });
 
 export const watchViewSchema = z.object({
@@ -90,6 +110,7 @@ export const usageViewSchema = z.object({
 });
 
 export type HooksView = z.infer<typeof hooksViewSchema>;
+export type PollView = z.infer<typeof pollViewSchema>;
 export type WatchView = z.infer<typeof watchViewSchema>;
 export type ThreadView = z.infer<typeof threadViewSchema>;
 export type InterestView = z.infer<typeof interestViewSchema>;
@@ -126,7 +147,7 @@ export function createRefusals(now: () => number, keepMs = STATUS_WINDOW_MS) {
   };
 }
 
-export function buildUsage(input: { rows: WatchRow[]; hooks: HooksStatus; configured: boolean; now: number; titles: Map<string, string | null>; target: TargetOf; interest: InterestView }): UsageView {
+export function buildUsage(input: { rows: WatchRow[]; hooks: HooksStatus; configured: boolean; poll: PollerStatus | null; now: number; titles: Map<string, string | null>; target: TargetOf; interest: InterestView }): UsageView {
   const { rows, now } = input;
   const watches = orderWatches(
     rows.map((row) => ({
@@ -155,13 +176,22 @@ export function buildUsage(input: { rows: WatchRow[]; hooks: HooksStatus; config
     byThread.set(w.threadId, t);
   }
   const threads = [...byThread.values()].sort((a, b) => b.count - a.count || b.wakes - a.wakes || a.threadId.localeCompare(b.threadId));
-  return { now, limit: WATCH_LIMIT, ttlMs: WATCH_TTL_MS, hooks: { configured: input.configured, ...input.hooks }, interest: input.interest, threads, watches };
+  return { now, limit: WATCH_LIMIT, ttlMs: WATCH_TTL_MS, hooks: { configured: input.configured, poll: input.poll, ...input.hooks }, interest: input.interest, threads, watches };
 }
 
 // ---- text, for the CLI ---------------------------------------------------------
 
 export function describeHooks(h: HooksView, now: number): string {
-  if (!h.configured) return "Doorbells: unavailable (BB_HOOKS_URL is not set); watches cannot be added.";
+  if (!h.configured) {
+    // No hooks service: the plugin polls on its own timer. The interval is
+    // the poller's, not the hooks loop's; the mode is information, not a
+    // problem (there is nothing to configure on this server).
+    const minutes = Math.max(1, Math.round((h.poll?.intervalMs ?? DEFAULT_POLL_TIMING.intervalMs) / 60_000));
+    if (h.poll === null) return `Polling: every ${minutes} minutes (no hooks service configured).`;
+    const next = h.poll.state === "polling" ? "polling now" : h.poll.nextPollAt === 0 ? "no poll scheduled" : `next poll ${until(h.poll.nextPollAt, now)}`;
+    const starved = h.poll.starved ? `; rate-limited (${h.poll.lastError ?? "backing off"})` : "";
+    return `Polling: every ${minutes} minutes (no hooks service configured)${starved}; ${next}; last poll ${h.poll.lastPollAt === 0 ? "never" : `${ago(h.poll.lastPollAt, now)} ago`}.`;
+  }
   const state = h.state === "connected" ? (h.leased ? "connected and leased" : "connected, leases pending") : h.state === "connecting" ? "reconnecting (checks fall back to a slow sweep)" : "stopped";
   const activity = `${h.doorbells} doorbell${h.doorbells === 1 ? "" : "s"} and ${h.sweeps} sweep${h.sweeps === 1 ? "" : "s"} in the last ${Math.round(h.windowMs / 60_000)} min`;
   return `Doorbells: ${state} for ${ago(h.since, now)}; ${activity}; last sweep ${ago(h.lastSweepAt, now)}${h.lastSweepReason === null ? "" : ` (${h.lastSweepReason})`}.`;
