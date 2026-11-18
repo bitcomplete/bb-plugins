@@ -2252,6 +2252,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(parsed.priority === undefined ? {} : { priority: String(parsed.priority) }),
             ...(parsed.assignee === undefined ? {} : { assignee: String(parsed.assignee) }),
             relations: (parsed.relations as unknown[]) ?? [],
+            ownerTurn: parsed.ownerTurn === true,
           });
           break;
         case "sourceComment":
@@ -4866,10 +4867,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- the reconcile loop ------------------------------------------------------------------
 
     /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
-    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.viewer);
+    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
 
     /** The text a binding's approval pins, stored as `approvedText` so BB-249 can diff a later edit against it. */
-    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.viewer);
+    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
 
     /** The escalation-routing helpers bound to this server's store and wakes (escalations.ts). */
     const escalationsCtx: EscalationsContext = { store, scheduleReconcile, wakeProject };
@@ -5811,7 +5812,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: (threadId) => isUserThread(approvalsCtx, threadId), owner: observed.entity.viewer });
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: (threadId) => isUserThread(approvalsCtx, threadId), source: observed.entity.source, owner: observed.entity.source === "local" ? observed.entity.viewer : null });
       changes.push(...fresh);
       // BB-248: a label that changes the phase with no state change is news
       // on its own; a state move already carries its own actionable line. The
@@ -11153,8 +11154,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         localSource!.ownerComment(key, body, owner);
         return { ok: true, message: `Commented on ${key}.` };
       },
-      async stewardsLocalSetState({ key, state }) {
-        const result = localSource!.setState(key, state);
+      async stewardsLocalSetState({ key, state }, { experimental_caller: caller }) {
+        // The page is the owner; a plugin caller could otherwise move a ticket
+        // out of Backlog (BB-361 review round 1).
+        if (caller.kind !== "client") throw new Error("a local ticket's state is set on the Stewards page");
+        const result = localSource!.update({ key, state, ownerTurn: true });
         return { ok: true, message: `${key}: ${result.changed.join("; ") || "no change"}.` };
       },
       async stewardsOnboard({ projectId }, { experimental_caller: caller }) {
@@ -16314,11 +16318,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             options: { state: { type: "string", description: "The new state" }, parent: { type: "string", description: "The new parent key, or '' to clear" } },
             async run(input, ctx) {
               const key = input.positionals.key.trim();
-              // BB-361: a local ticket only moves to Ready in a turn the owner
-              // started; the CLI is agent-run, so it fails closed to Backlog.
-              let state = input.options.state;
-              if (state !== undefined && state.trim().toLowerCase() === "ready" && (ctx.threadId === undefined || !(await ownerStartedTurn(ctx.threadId)))) state = "Backlog";
-              const result = localSource!.update({ key, ...(state === undefined ? {} : { state }), ...(input.options.parent === undefined ? {} : { parent: input.options.parent }) });
+              // BB-361: the guard lives in the source's update; the CLI is
+              // agent-run, so it only allows the move on the owner's turn.
+              const ownerTurn = ctx.threadId !== undefined && (await ownerStartedTurn(ctx.threadId));
+              const result = localSource!.update({ key, ...(input.options.state === undefined ? {} : { state: input.options.state }), ...(input.options.parent === undefined ? {} : { parent: input.options.parent }), ownerTurn });
               return { exitCode: 0, stdout: result.changed.length === 0 ? `${key}: no change.` : `${key}: ${result.changed.join("; ")}.` };
             },
           }),

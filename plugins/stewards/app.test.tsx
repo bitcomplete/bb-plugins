@@ -1175,8 +1175,8 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
       },
     });
     await waitFor(() => expect(slot.getByText("Local ticket")).toBeTruthy());
+    await waitFor(() => expect((slot.getByLabelText("Description of LOCAL-1") as HTMLTextAreaElement).value).toBe("Old text."));
     const description = slot.getByLabelText("Description of LOCAL-1") as HTMLTextAreaElement;
-    expect(description.value).toBe("Old text.");
     fireEvent.change(description, { target: { value: "New text." } });
     fireEvent.click(slot.getByRole("button", { name: "Save description" }));
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsLocalEditDescription", input: { key: "LOCAL-1", description: "New text." } }));

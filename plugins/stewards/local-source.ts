@@ -64,7 +64,7 @@ export type LocalTicket = {
 export type LocalComment = { id: string; ticketId: string; author: string; threadId: string | null; body: string; createdAt: number };
 
 export type LocalCreateInput = { unit: string; title: string; description: string; playbook?: string; parent?: string; assignee?: string };
-export type LocalUpdateInput = { key: string; state?: string; parent?: string | null; addLabels?: string[]; priority?: string; assignee?: string; relations?: unknown[] };
+export type LocalUpdateInput = { key: string; state?: string; parent?: string | null; addLabels?: string[]; priority?: string; assignee?: string; relations?: unknown[]; /** Whether the calling turn is the owner's; a move out of Backlog or a terminal state into an adopted one needs it (BB-361). */ ownerTurn?: boolean };
 
 export type LocalSource = ReturnType<typeof createLocalSource>;
 
@@ -217,7 +217,15 @@ export function createLocalSource(deps: { db: Database.Database; now: () => numb
     let state = t.state;
     let parentId = t.parentId;
     if (input.state !== undefined) {
-      state = assertState(input.state);
+      const next = assertState(input.state);
+      // BB-361: a ticket may only leave Backlog or a terminal state for an
+      // adopted state (Ready/In Progress/In Review) on the owner's turn. Any
+      // other turn -- a plugin wake, a Slack participant's forward -- lands it
+      // in Backlog instead. The guard lives here so the tool, the CLI and the
+      // page RPC all pass through it.
+      const fromParked = t.state.toLowerCase() === LOCAL_PARKED.toLowerCase() || isTerminalState(t.state);
+      const toAdopted = next.toLowerCase() !== LOCAL_PARKED.toLowerCase() && !isTerminalState(next);
+      state = fromParked && toAdopted && input.ownerTurn !== true ? LOCAL_PARKED : next;
       if (state !== t.state) changedFields.push(`state ${t.state} → ${state}`);
     }
     if (input.parent !== undefined) {

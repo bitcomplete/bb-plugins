@@ -96,9 +96,15 @@ export function productGateOptions(b: Pick<Binding, "kind" | "ready">, pull?: En
  * the user's rather than a steward, worker or the project steward; without it
  * only the steward's own comments count.
  */
-export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): boolean =>
-  /^\s*(\*\*)?spec\b/iu.test(c.body) &&
-  ((c.signedBy !== null && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false))) || (c.signedBy === null && owner !== undefined && owner !== null && c.author.toLowerCase() === owner.toLowerCase()));
+export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null, source?: Source): boolean => {
+  if (!/^\s*(\*\*)?spec\b/iu.test(c.body)) return false;
+  // BB-361: a local comment counts as the user's spec only when the owner
+  // entered it on the Stewards page -- unsigned and authored by the viewer.
+  // Every signed comment (ticket_comment, the CLI, a Slack thread) is an
+  // agent's, whichever thread wrote it, so the signed branch is not used.
+  if (source === "local") return c.signedBy === null && owner !== undefined && owner !== null && c.author.toLowerCase() === owner.toLowerCase();
+  return c.signedBy !== null && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
+};
 
 /**
  * What an approval is pinned to: the description and the spec comments. The
@@ -120,7 +126,7 @@ export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DE
  */
 export function specText(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): string {
   const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
-  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread, owner)).map((c) => `${c.id}\n${c.body}`);
+  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread, owner, entity.source)).map((c) => `${c.id}\n${c.body}`);
   return [description, ...specs].join("\n\u0000\n");
 }
 
@@ -421,10 +427,10 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
 
   // A spec comment the steward just posted is its own doing; it only matters
   // once an approval is pinned to the spec it changes.
-  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread, ctx.owner)).map((c) => c.id));
-  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread, ctx.owner) && !beforeSpecs.has(c.id));
+  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread, ctx.owner, ctx.source)).map((c) => c.id));
+  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread, ctx.owner, ctx.source) && !beforeSpecs.has(c.id));
   if (addedSpecs.length > 0) {
-    const byUser = addedSpecs.some((c) => (c.signedBy !== null && (ctx.userThread?.(c.signedBy) ?? false)) || (c.signedBy === null && ctx.owner !== undefined && ctx.owner !== null && c.author.toLowerCase() === ctx.owner.toLowerCase()));
+    const byUser = addedSpecs.some((c) => (c.signedBy !== null ? (ctx.userThread?.(c.signedBy) ?? false) : ctx.source === "local" && ctx.owner !== undefined && ctx.owner !== null && c.author.toLowerCase() === ctx.owner.toLowerCase()));
     // A spec comment the user wrote is news on its own: it carries its own
     // approval when the approver is `user`, and when it is the project steward
     // the steward should know the user authored it, not wait on them.
@@ -518,6 +524,8 @@ export type ObservedDiffContext = {
   userThread?: (threadId: string) => boolean;
   /** The entity's own login, so an owner-entered local comment counts as the user's spec comment (BB-361). */
   owner?: string | null;
+  /** The entity's source, so only a local ticket reads the unsigned owner-comment rule (BB-361). */
+  source?: Source;
   /** An open need or `user` escalation: the user is being asked, so own-PR work is not quiet (BB-203). */
   userWaiting?: boolean;
 };

@@ -93,9 +93,14 @@ describe("the local ticket source through the plugin (BB-361)", () => {
   it("lands in Backlog when a non-owner turn moves it to Ready (BB-361 limit 3)", async () => {
     const { t, steward } = await withSteward();
     await t.tool("ticket_file", { unit: "local", title: "A local effort", description: "Do the thing." }, steward);
-    // No owner turn: the steward's wake is a plugin send, so Ready is refused
-    // and the ticket stays parked.
+    // No owner turn: the steward's wake is a plugin send, so a move into an
+    // adopted state is refused and the ticket stays parked -- Ready, In
+    // Progress or In Review alike.
     await t.tool("ticket_update", { key: "LOCAL-1", state: "Ready" }, steward);
+    await t.flush();
+    expect(t.hooks.localSource.get("LOCAL-1")!.state).toBe("Backlog");
+    expect(t.hooks.store.find("LOCAL-1", "p1")).toBeNull();
+    await t.tool("ticket_update", { key: "LOCAL-1", state: "In Progress" }, steward);
     await t.flush();
     expect(t.hooks.localSource.get("LOCAL-1")!.state).toBe("Backlog");
     expect(t.hooks.store.find("LOCAL-1", "p1")).toBeNull();
@@ -144,7 +149,7 @@ describe("the local ticket source through the plugin (BB-361)", () => {
     const agent = snap.comments.find((c) => c.body.includes("a worker's words"))!;
     expect(owner.signedBy).toBeNull();
     expect(agent.signedBy).not.toBeNull();
-    expect(isSpecComment(owner, "thr_s", undefined, snap.viewer)).toBe(true);
-    expect(isSpecComment(agent, "thr_s", undefined, snap.viewer)).toBe(false);
+    expect(isSpecComment(owner, "thr_s", undefined, snap.viewer, "local")).toBe(true);
+    expect(isSpecComment(agent, "thr_s", undefined, snap.viewer, "local")).toBe(false);
   });
 });

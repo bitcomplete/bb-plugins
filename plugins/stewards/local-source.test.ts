@@ -59,7 +59,7 @@ describe("the local ticket source (BB-361)", () => {
   it("adopts by state: Ready or later non-terminal, never Backlog or terminal", () => {
     const { s } = source();
     s.create({ unit: "p1", title: "A", description: signed("d") }, "Dana");
-    s.update({ key: "LOCAL-1", state: "Ready" });
+    s.update({ key: "LOCAL-1", state: "Ready", ownerTurn: true });
     expect(s.adoptable(["p1"], 10).map((e) => e.key)).toEqual(["LOCAL-1"]);
     s.update({ key: "LOCAL-1", state: "In Progress" });
     expect(s.adoptable(["p1"], 10).map((e) => e.key)).toEqual(["LOCAL-1"]);
@@ -67,8 +67,26 @@ describe("the local ticket source (BB-361)", () => {
     expect(s.adoptable(["p1"], 10)).toEqual([]);
     s.update({ key: "LOCAL-1", state: "Done" });
     expect(s.adoptable(["p1"], 10)).toEqual([]);
-    s.update({ key: "LOCAL-1", state: "Ready" });
+    s.update({ key: "LOCAL-1", state: "Ready", ownerTurn: true });
     expect(s.adoptable(["p1"], 10).map((e) => e.key)).toEqual(["LOCAL-1"]);
+  });
+
+  it("only leaves Backlog or a terminal state for an adopted one on the owner's turn (BB-361 limit 3)", () => {
+    const { s } = source();
+    s.create({ unit: "p1", title: "A", description: signed("d") }, "Dana");
+    // A non-owner turn trying to adopt the ticket lands it in Backlog.
+    expect(s.update({ key: "LOCAL-1", state: "In Progress" }).changed).toEqual([]);
+    expect(s.get("LOCAL-1")!.state).toBe("Backlog");
+    expect(s.update({ key: "LOCAL-1", state: "In Review" }).changed).toEqual([]);
+    expect(s.get("LOCAL-1")!.state).toBe("Backlog");
+    // Once adopted on the owner's turn, later moves need no owner turn.
+    s.update({ key: "LOCAL-1", state: "Ready", ownerTurn: true });
+    s.update({ key: "LOCAL-1", state: "In Progress" });
+    expect(s.get("LOCAL-1")!.state).toBe("In Progress");
+    // Done is terminal; leaving it for an adopted state needs the owner again.
+    s.update({ key: "LOCAL-1", state: "Done" });
+    s.update({ key: "LOCAL-1", state: "In Progress" });
+    expect(s.get("LOCAL-1")!.state).toBe("Backlog");
   });
 
   it("refuses labels, priority and relations on update, and accepts state and parent", () => {

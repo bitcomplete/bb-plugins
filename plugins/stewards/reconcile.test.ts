@@ -5,6 +5,7 @@ import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, co
 import { approvalMarkerLine, classifyApproval, ownerApproval, prGate, productReason, projectApprovalMarker, reviewMarker, reviewWorkerThread, UNREADABLE_VERDICT, type ProjectApprovalRecord } from "./gate.js";
 import { approvalWanted, gateState, resolveChecklistItem } from "./ready-gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
+import type { EntitySnapshot } from "./source-contract.js";
 import { GITHUB_ISSUES, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 import * as gateModule from "./gate.js";
 import * as readyGateModule from "./ready-gate.js";
@@ -407,18 +408,24 @@ describe("the ready gate", () => {
     expect(specHash(amended, "thr_s", user)).not.toBe(base);
   });
 
-  it("counts an owner page comment as the user's spec, and never an agent's signed comment (BB-361)", () => {
-    const base = specHash(issue(), "thr_s", undefined, "Jane");
+  it("counts an owner page comment as the user's spec for a local ticket, and never an agent's signed comment (BB-361)", () => {
+    const local = (over: Partial<EntitySnapshot> = {}) => issue({ source: "local", viewer: "Jane", ...over });
+    const base = specHash(local(), "thr_s", undefined, "Jane");
     // A local owner comment is unsigned and authored by the viewer; it counts
     // only when the owner is known, and it changes the hash.
-    const ownerComment = issue({ comments: [comment({ id: "o1", author: "Jane", body: "**Spec:** the owner's words", signedBy: null, createdAt: "2026-10-14T16:00:00Z" })] });
+    const ownerComment = local({ comments: [comment({ id: "o1", author: "Jane", body: "**Spec:** the owner's words", signedBy: null, createdAt: "2026-10-14T16:00:00Z" })] });
     expect(specHash(ownerComment, "thr_s", undefined, "Jane")).not.toBe(base);
     expect(specHash(ownerComment, "thr_s")).toBe(base);
     // An agent-written comment carries a thread id (`ticket_comment`, the CLI)
-    // and is never the owner's, whichever thread wrote it.
-    const agent = issue({ comments: [comment({ id: "a1", author: "thr_w1", body: "**Spec:** from ticket_comment", signedBy: "thr_w1", createdAt: "2026-10-14T16:00:00Z" })] });
-    expect(specHash(agent, "thr_s", undefined, "Jane")).toBe(base);
+    // and is never the owner's, even from a thread `isUserThread` accepts (a
+    // Slack participant's).
+    const agent = local({ comments: [comment({ id: "a1", author: "thr_user", body: "**Spec:** from ticket_comment", signedBy: "thr_user", createdAt: "2026-10-14T16:00:00Z" })] });
     expect(specHash(agent, "thr_s", (tid) => tid === "thr_user", "Jane")).toBe(base);
+    // A Linear or GitHub ticket is unchanged: an unsigned viewer comment does
+    // not count, so no in-flight approval is voided and no agent comment
+    // self-approves (BB-361 review round 1).
+    const unsignedLinear = issue({ comments: [comment({ id: "l1", author: "Jane", body: "**Spec:** unsigned linear", signedBy: null, createdAt: "2026-10-14T16:00:00Z" })] });
+    expect(specHash(unsignedLinear, "thr_s", undefined, "Jane")).toBe(specHash(issue(), "thr_s", undefined, "Jane"));
   });
 
   it("marks a spec comment the user wrote as the user's, and wakes for it", () => {

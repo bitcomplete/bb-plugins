@@ -18287,14 +18287,17 @@ describe("the source-neutral ticket tools (BB-360)", () => {
     expect((await t.tool("ticket_update", { key: "ENG-12", assignee: "sam" }, steward)).error).toBe(true);
   });
 
-  it("ticket_file resolves the unit, signs the description, and refuses an unknown or missing unit", async () => {
+  it("ticket_file resolves the unit, signs the description, and refuses an unknown unit", async () => {
     const { t, steward } = await withSteward();
-    // The project lists several units: ENG, acme/bb and acme/web.
-    const refused = await t.tool("ticket_file", { title: "New", description: "Body" }, steward);
-    expect(refused.error).toBe(true);
-    expect(refused.text).toMatch(/several units/u);
-    expect(refused.text).toContain("ENG");
-    expect(refused.text).toContain("acme/web");
+    // BB-361: with no unit, a local ticket is filed in this project's store.
+    const local = await t.tool("ticket_file", { title: "New", description: "Body" }, steward);
+    expect(local.error).toBe(false);
+    expect(local.text).toContain("LOCAL-1");
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Backlog" });
+    // Naming the local unit does the same.
+    const named = await t.tool("ticket_file", { unit: "local", title: "Named", description: "Body" }, steward);
+    expect(named.error).toBe(false);
+    expect(named.text).toContain("LOCAL-2");
     expect((await t.tool("ticket_file", { unit: "OTHER", title: "New", description: "Body" }, steward)).error).toBe(true);
     // A Linear unit files through linear, with the signed description.
     t.linearWrites.length = 0;

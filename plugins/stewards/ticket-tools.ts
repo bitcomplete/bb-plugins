@@ -108,6 +108,10 @@ export function resolveFileUnit(units: readonly TicketUnit[], requested: string 
       ? { ok: false, error: `${JSON.stringify(name)} is not one of this project's units (${listUnits(units)}); file in one of those.` }
       : { ok: true, unit: found };
   }
+  // BB-361: no unit files a local ticket, per the ticket. A project with no
+  // local unit (never one this plugin serves) falls back to the old rule.
+  const local = units.find((u) => u.source === "local");
+  if (local !== undefined) return { ok: true, unit: local };
   if (units.length === 0) return { ok: false, error: "This project lists no Linear team, GitHub repo or local source to file in." };
   if (units.length === 1) return { ok: true, unit: units[0]! };
   return { ok: false, error: `This project lists several units (${listUnits(units)}); name the one to file in with unit.` };
@@ -245,10 +249,10 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
   bb.agents.registerTool({
     name: "ticket_file",
     description:
-      "File a new ticket. Give a unit (a Linear team key such as ENG, or a GitHub owner/repo) when the project lists more than one; with a single unit it is the default. The description is signed for you. On GitHub there is no priority; a Linear ticket may carry one. The assignee is this server's own login or nobody.",
+      "File a new ticket. With no unit, a local ticket is filed in this project's store; name a unit (a Linear team key, a GitHub owner/repo, or `local`) to file elsewhere. The description is signed for you. On GitHub and local there is no priority; a local ticket has no labels either. The assignee is this server's own login or nobody.",
     presentation: { label: { pending: "Filing a ticket", completed: "Filed a ticket" } },
     parameters: z.object({
-      unit: z.string().trim().min(1).max(200).optional().describe("The unit to file in: a Linear team key, a GitHub owner/repo, or `local` for this project's local tickets. Omit when the project lists exactly one."),
+      unit: z.string().trim().min(1).max(200).optional().describe("The unit to file in: a Linear team key, a GitHub owner/repo, or `local` for this project's local tickets. Omit to file a local ticket."),
       title: z.string().trim().min(1).max(500).describe("The ticket's title."),
       description: z.string().trim().min(1).max(50_000).describe("The ticket's description, in Markdown. Do not sign it; the plugin signs it."),
       labels: z.array(z.string().trim().min(1).max(100)).max(50).optional().describe("Label names to add. A local ticket has no labels."),
@@ -387,21 +391,21 @@ export function registerTicketTools(bb: BbPluginApi, deps: TicketToolDeps): void
         if (input.assignee !== undefined && (project === null || !assigneeAllowed(input.assignee, [project.viewer.linear, project.viewer.github]))) {
           return toolError(new Error(`assignee accepts only this server's own login${project === null ? "" : ` (${project.viewer.linear ?? project.viewer.github ?? "me"})`} or 'nobody', not ${JSON.stringify(input.assignee)}.`));
         }
-        // BB-361: a local ticket only moves to Ready in a turn the owner
-        // started; a participant's forward or a plugin wake lands it in
-        // Backlog instead.
-        let state = input.state;
-        if (ref.source === "local" && state !== undefined && state.trim().toLowerCase() === "ready" && !(await deps.ownerTurn(threadId))) state = "Backlog";
+        // BB-361: a local ticket may only leave Backlog or a terminal state
+        // for an adopted one on the owner's turn; the source's update enforces
+        // that, and every other turn lands it in Backlog.
+        const ownerTurn = ref.source === "local" ? await deps.ownerTurn(threadId) : false;
         const out = await deps.sourceRpc(
           ref.source,
           "sourceUpdateIssue",
           {
             key: ref.key,
             addLabels: input.labels ?? [],
-            ...(state === undefined ? {} : { state }),
+            ...(input.state === undefined ? {} : { state: input.state }),
             ...(input.priority === undefined ? {} : { priority: input.priority }),
             ...(input.assignee === undefined ? {} : { assignee: input.assignee }),
             relations: input.relations ?? [],
+            ...(ref.source === "local" ? { ownerTurn } : {}),
           },
           sourceContract.sourceUpdateIssue.output,
         );
