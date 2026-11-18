@@ -416,9 +416,11 @@ describe("the ready gate", () => {
     const ownerComment = local({ comments: [comment({ id: "o1", author: "Jane", body: "**Spec:** the owner's words", signedBy: null, createdAt: "2026-10-14T16:00:00Z" })] });
     expect(specHash(ownerComment, "thr_s", undefined, "Jane")).not.toBe(base);
     expect(specHash(ownerComment, "thr_s")).toBe(base);
-    // An agent-written comment carries a thread id (`ticket_comment`, the CLI)
-    // and is never the owner's, even from a thread `isUserThread` accepts (a
-    // Slack participant's).
+    // A steward's own signed spec comment still counts (it carries the plan
+    // and criteria an approval pins); an agent comment from another thread --
+    // here a user thread, as a Slack participant's -- does not.
+    const steward = local({ comments: [comment({ id: "s1", author: "thr_s", body: "**Spec:** from the steward", signedBy: "thr_s", createdAt: "2026-10-14T16:00:00Z" })] });
+    expect(specHash(steward, "thr_s", undefined, "Jane")).not.toBe(base);
     const agent = local({ comments: [comment({ id: "a1", author: "thr_user", body: "**Spec:** from ticket_comment", signedBy: "thr_user", createdAt: "2026-10-14T16:00:00Z" })] });
     expect(specHash(agent, "thr_s", (tid) => tid === "thr_user", "Jane")).toBe(base);
     // A Linear or GitHub ticket is unchanged: an unsigned viewer comment does

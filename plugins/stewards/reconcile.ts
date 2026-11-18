@@ -98,11 +98,12 @@ export function productGateOptions(b: Pick<Binding, "kind" | "ready">, pull?: En
  */
 export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null, source?: Source): boolean => {
   if (!/^\s*(\*\*)?spec\b/iu.test(c.body)) return false;
-  // BB-361: a local comment counts as the user's spec only when the owner
-  // entered it on the Stewards page -- unsigned and authored by the viewer.
-  // Every signed comment (ticket_comment, the CLI, a Slack thread) is an
-  // agent's, whichever thread wrote it, so the signed branch is not used.
-  if (source === "local") return c.signedBy === null && owner !== undefined && owner !== null && c.author.toLowerCase() === owner.toLowerCase();
+  // BB-361: for a local ticket the steward's own signed spec comments still
+  // count (they carry the acceptance criteria and plan the approval pins), but
+  // an agent comment from any other thread -- a worker's, or a thread
+  // `isUserThread` accepts such as a Slack participant's -- does not. Only the
+  // owner's own unsigned page comment is the user's.
+  if (source === "local") return (c.signedBy !== null && c.signedBy === stewardThreadId) || (c.signedBy === null && owner !== undefined && owner !== null && c.author.toLowerCase() === owner.toLowerCase());
   return c.signedBy !== null && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
 };
 
