@@ -25,13 +25,17 @@ Run the survey and read it end to end:
 bb stewards survey --json
 ```
 
-It emits, per repo (from `repos.json` plus the primary): the default branch,
-branch protection, languages and package manifests, the test and typecheck
-commands CI runs (from `.github/workflows`), Dockerfiles, the repo's labels,
-and which repos reference which.
+It emits, per repo (the project's repo set — multi-repo's `repos.json` plus
+the primary, or the single repo a native project checks out): the default
+branch, branch protection, languages and package manifests, the test and
+typecheck commands CI runs (from `.github/workflows`), Dockerfiles, the repo's
+labels, and which repos reference which.
 It emits the Linear teams and their workflow states, and what `.bb` already
 holds (project file, roles, playbooks). A read that failed is marked
-`available: false` with the reason: say so, never guess.
+`available: false` with the reason: say so, never guess. On a stock bb with no
+Linear plugin, the Linear section reads `available: false` and `repos.json` is
+simply absent: that is a normal local-only project, not a failure, and it must
+not derail the interview.
 
 Then read each repo's `README.md` (and `AGENTS.md` if it has one) for what the
 survey cannot see: what the product is, which repo is deployed where, and how
@@ -48,18 +52,22 @@ and list them as assumptions. Cover:
 1. **The project steward login** — the GitHub login whose server runs the
    project steward and forwards the project's big decisions.
 2. **The owner's decisions versus the project steward's.** Present the
-   defaults, then candidate `project` entries with `paths` from the survey
-   (each path prefixed with its repo directory from `repos.json`, e.g.
-   `web/src/…`).
+   defaults, then candidate `project` entries with `paths` from the survey.
+   On a multi-repo project each path is prefixed with its repo directory from
+   `repos.json` (e.g. `web/src/…`); on a native single-repo project there is
+   no `repos.json`, so the paths are relative to the repo root (e.g. `src/…`).
 3. **How a merge is known live** — the repo, environment and rule the
    playbook's `deployment` should use. Ask this when the README, docs and code
    do not already say; the default when nothing says otherwise is **merged is
    done**.
 4. **The label** tickets carry (default `bb-managed`) — ask only when the
    project lists a Linear team or a GitHub repo it files issues in; a
-   local-only project adopts by state and needs no label.
-5. **The nightly window and its time zone** — the time zone the window's
-   hours are in.
+   local-only project adopts by state and needs no label. When the survey's
+   Linear section is `available: false`, do not ask about Linear teams or
+   labels at all.
+5. **The nightly window and its time zone**, and — when the project has no
+   Linear team — **the local ticket key prefix** (default `LOCAL`; it must
+   not equal a Linear team key).
 6. **Ops watches** — the namespaces, Sentry projects and Dependabot repos
    each server should watch, and which login runs them.
 7. **Repos to exclude** from stewards.
@@ -74,7 +82,12 @@ assumptions there.
 `bb stewards init` writes the skeleton (`stewards/project.json` and the default
 playbooks) and never overwrites an existing file. On a partial `.bb`, it keeps
 what is there, and you propose additions only: read the existing files first,
-and add what is missing rather than replacing it.
+and add what is missing rather than replacing it. Pass what the interview
+answered: `--teams ENG,OPS` for a Linear project, and `--timezone
+America/New_York` and `--prefix LOCAL` from the interview (both optional; they
+default to `America/New_York` and `LOCAL`). On a stock bb with no Linear
+plugin, run `init` with no `--teams`: it writes a local-only skeleton instead
+of asking Linear.
 
 Then fill in, from the survey and the interview:
 
@@ -83,7 +96,9 @@ Then fill in, from the survey and the interview:
   `github.exclude`, `deps` (the survey's test commands do not go here; they go
   in `AGENTS.md`). The local ticket source's key prefix defaults to `LOCAL`;
   set `localPrefix` only when the project wants another one, and it must not
-  equal a Linear team key. Fill `bigDecisions`: keep the defaults and add the
+  equal a Linear team key. On a stock bb with no Linear plugin the survey's
+  Linear section is `available: false`, `linear.teams` stays empty, and the
+  skeleton files tickets locally. Fill `bigDecisions`: keep the defaults and add the
   project's `project` entries with repo-dir-prefixed `paths`, so the lane gate
   can match a pull request's changed files. A `user` entry with `paths` always
   wins.
@@ -118,11 +133,14 @@ issue's state is a label. Then fix every
 `problem:` line before going on; a `failed to create` line is one of them.
 A problem is a fact about the project, not a warning to explain away.
 
-Commit inside `.bb`, publish with `workspace_publish_guidance`, and open a
-pull request on the primary repo. The body lists **every assumption** you made
-— each default you took, each question you did not ask, each fact the survey
-could not read — so the owner's review is the second interview. Name the repo
-dirs and the decide-list paths so a reader can check them against `repos.json`.
+Commit inside `.bb`, then land the guidance: on a multi-repo project publish
+with `workspace_publish_guidance`; on a native single-repo project commit the
+branch and open the guidance pull request on the repo yourself (there is no
+multi-repo tool and no `repos.json`). The body lists **every assumption** you
+made — each default you took, each question you did not ask, each fact the
+survey could not read — so the owner's review is the second interview. Name
+the repo dirs and the decide-list paths so a reader can check them against
+`repos.json` on a multi-repo project, or against the repo root on a native one.
 
 Stewards read committed `origin/main` only, so **nothing is live until the
 pull request merges**. Do not run `bb stewards enable` early.
@@ -147,4 +165,6 @@ A project with a partial `.bb` gets the same treatment: survey, diff what
 exists against what the survey says, and propose additions only, matching
 `init`'s never-overwrite rule. Never rewrite a file someone wrote by hand; add
 to it or leave it. This is also the flow for a native single-repo project,
-where stewards reads `.bb` from `origin`'s default branch.
+where stewards reads `.bb` from `origin`'s default branch: there is no
+`repos.json` and no multi-repo workspace, `.bb` sits at the repo root, and a
+local-only project files tickets under the local prefix rather than in Linear.
