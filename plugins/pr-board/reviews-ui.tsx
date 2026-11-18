@@ -26,6 +26,7 @@ import {
   compactLines,
   EffortGroup,
   Later,
+  SectionSelection,
   SizeDot,
   SizeLegend,
 } from "./board-ui";
@@ -585,6 +586,16 @@ export function ReviewsView({
   const draftLong = long.filter(
     (review) => review.item.state === "queued" && !review.item.threadId,
   );
+  const sectionSelection = (title: string, members: PrsReview[]) => (
+    <SectionSelection
+      title={title}
+      keys={members
+        .filter((review) => selectable.includes(review))
+        .map((review) => review.item.key)}
+      selected={picked}
+      onChange={setPicked}
+    />
+  );
   return (
     <CheckboxGroup
       data-prs-agent-local=""
@@ -613,7 +624,10 @@ export function ReviewsView({
             count={quick.length}
             effort={minutes(quick)}
             action={
-              <CalmButton onClick={openInOrder}>Open in order</CalmButton>
+              <>
+                {sectionSelection("Quick reads", quick)}
+                <CalmButton onClick={openInOrder}>Open in order</CalmButton>
+              </>
             }
           >
             <ul>{quick.map(renderRow)}</ul>
@@ -624,16 +638,19 @@ export function ReviewsView({
             tone="blue"
             effort={minutes(long)}
             action={
-              draftLong.length ? (
-                <CalmButton
-                  disabled={busy || !agentModel}
-                  onClick={() =>
-                    setStartKeys(draftLong.map((review) => review.item.key))
-                  }
-                >
-                  <span aria-hidden>▸</span> Draft first
-                </CalmButton>
-              ) : null
+              <>
+                {sectionSelection("Longer read", long)}
+                {draftLong.length ? (
+                  <CalmButton
+                    disabled={busy || !agentModel}
+                    onClick={() =>
+                      setStartKeys(draftLong.map((review) => review.item.key))
+                    }
+                  >
+                    <span aria-hidden>▸</span> Draft first
+                  </CalmButton>
+                ) : null}
+              </>
             }
           >
             <ul>{long.map(renderRow)}</ul>

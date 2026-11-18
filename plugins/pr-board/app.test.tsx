@@ -745,6 +745,7 @@ it("defaults to Sol6.1 xhigh and remembers one chosen execution selection for fi
   slot.lifecycle.unmount();
   const restored = await mount({
     rpc: { agent_model_get: () => modelContext(saved) },
+    waitFor: "Review change 701",
   });
   expect(modelInput(restored, "Model").value).toBe(saved.model);
 });
@@ -853,6 +854,133 @@ it("retries a failed preference load and refuses an older response after another
     expect(calls(slot, "start")[0]).toMatchObject({ agentModel: current }),
   );
 });
+it("restores the last tab and each tab's segment on reopen without looping navigation", async () => {
+  const settings = { reviews: reviews([reviewA, review(703, { segment: "with-authors" })]) };
+  const slot = await mount(settings);
+  fireEvent.click(slot.getByRole("radio", { name: "1 drafts" }));
+  fireEvent.click(slot.getByRole("tab", { name: /To review/ }));
+  fireEvent.click(slot.getByRole("radio", { name: "1 with authors" }));
+  slot.lifecycle.unmount();
+
+  const restored = await mount({ ...settings, waitFor: "Review change 703" });
+  expect(restored.getByRole("tab", { name: /To review/ }).getAttribute("aria-selected")).toBe("true");
+  expect(restored.getByRole("radio", { name: "1 with authors" }).getAttribute("aria-checked")).toBe("true");
+  expect(restored.inspection.navigateCalls).toEqual([
+    { method: "toPluginPanel", path: "pr-board", options: { subPath: "to-review" } },
+  ]);
+  restored.lifecycle.rerender(<Board subPath="to-review" />);
+  await restored.behavior.emitRealtime("board-changed", null);
+  expect(restored.getByRole("radio", { name: "1 with authors" }).getAttribute("aria-checked")).toBe("true");
+  expect(restored.inspection.navigateCalls).toHaveLength(1);
+  fireEvent.click(restored.getByRole("tab", { name: /Mine/ }));
+  expect(restored.getByRole("heading", { name: "Drafts" })).toBeTruthy();
+  restored.lifecycle.unmount();
+
+  const mine = await mount({ ...settings, waitFor: "Change 6" });
+  expect(mine.getByRole("tab", { name: /Mine/ }).getAttribute("aria-selected")).toBe("true");
+  expect(mine.getByRole("radio", { name: "1 drafts" }).getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(mine.getByRole("tab", { name: /To review/ }));
+  expect(mine.getByRole("radio", { name: "1 with authors" }).getAttribute("aria-checked")).toBe("true");
+  mine.lifecycle.rerender(<Board key="reopened" />);
+  expect(mine.getByRole("tab", { name: /To review/ }).getAttribute("aria-selected")).toBe("true");
+  await mine.findByRole("radio", { name: "1 with authors" });
+  expect(mine.getByRole("radio", { name: "1 with authors" }).getAttribute("aria-checked")).toBe("true");
+});
+it.each(["to-review", `to-review/${repo}%23701`])("lets an explicit %s link override the saved view", async (path) => {
+  localStorage.setItem("test-plugin:calm-view", JSON.stringify({
+    tab: "mine", mineSegment: "drafts", reviewSegment: "with-authors",
+  }));
+  const settings = { path, reviews: reviews([reviewA, reviewB, review(703, { segment: "with-authors" })]) };
+  const slot = await mount(path.includes("/") ? settings : { ...settings, waitFor: "Review change 703" });
+  expect(slot.getByRole("tab", { name: /To review/ }).getAttribute("aria-selected")).toBe("true");
+  // A link to one review moves to that review's segment; the bare tab link keeps the remembered one.
+  if (path.includes("/")) {
+    await slot.findByRole("region", { name: "Review context for Review change 701" });
+    expect(slot.getByRole("radio", { name: "2 on you" }).getAttribute("aria-checked")).toBe("true");
+  } else {
+    expect(slot.getByRole("radio", { name: "1 with authors" }).getAttribute("aria-checked")).toBe("true");
+  }
+  expect(slot.inspection.navigateCalls).toEqual([]);
+});
+it.each([
+  "not JSON",
+  JSON.stringify({ tab: "other", mineSegment: "other", reviewSegment: "other" }),
+])("falls back to today's view defaults for invalid saved values: %s", async (saved) => {
+  localStorage.setItem("test-plugin:calm-view", saved);
+  const slot = await mount();
+  expect(slot.getByRole("tab", { name: /Mine/ }).getAttribute("aria-selected")).toBe("true");
+  expect(slot.getByRole("heading", { name: "Small fixes for an agent" })).toBeTruthy();
+  fireEvent.click(slot.getByRole("tab", { name: /To review/ }));
+  expect(slot.getByRole("heading", { name: "Quick reads" })).toBeTruthy();
+});
+it("keeps a valid saved tab when its saved segment is invalid and ignores storage failures", async () => {
+  localStorage.setItem("test-plugin:calm-view", JSON.stringify({
+    tab: "review", mineSegment: "drafts", reviewSegment: "invalid",
+  }));
+  const slot = await mount({ waitFor: "Review change 701" });
+  expect(slot.getByRole("heading", { name: "Quick reads" })).toBeTruthy();
+  slot.lifecycle.unmount();
+  vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("Storage unavailable"); });
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("Storage unavailable"); });
+  const unavailable = await mount();
+  fireEvent.click(unavailable.getByRole("radio", { name: "1 drafts" }));
+  expect(unavailable.getByRole("heading", { name: "Drafts" })).toBeTruthy();
+});
+it("selects only eligible PRs in a section and clears that section without losing other selections", async () => {
+  const slot = await mount({ board: state({
+    view: { ...view, prs: [row(2), row(3, { group: "large" }), row(11), row(12), row(13, { action: null }), row(14, { gate_blocked: true }), row(15, { group: "held", action: null })] },
+    markers: [marker(12, { status: "done" })],
+  }) });
+  fireEvent.click(slot.getByRole("button", { name: /^Large fixes/ }));
+  fireEvent.click(slot.getByRole("checkbox", { name: "Select Change 3 #3" }));
+  fireEvent.click(slot.getByRole("checkbox", { name: "Select Change 2 #2" }));
+  const small = within(slot.getByRole("region", { name: "Small fixes for an agent" }));
+  const selectAll = small.getByRole("button", { name: "Select all Small fixes for an agent" });
+  expect(selectAll.hasAttribute("data-prs-agent-local")).toBe(true);
+  fireEvent.click(selectAll);
+  expect(small.getAllByRole("checkbox").map((checkbox) => checkbox.getAttribute("aria-checked"))).toEqual(["true", "true"]);
+  expect(slot.getByRole("group", { name: "Start selected agents" }).textContent).toContain("3 selected");
+  expect(small.getByRole("button", { name: "Start 2" })).toBeTruthy();
+  expect(slot.queryByRole("button", { name: "Select all Needs a manual look" })).toBeNull();
+  fireEvent.click(small.getByRole("button", { name: "Clear Small fixes for an agent" }));
+  expect(small.getAllByRole("checkbox").map((checkbox) => checkbox.getAttribute("aria-checked"))).toEqual(["false", "false"]);
+  expect(slot.getByRole("checkbox", { name: "Select Change 3 #3" }).getAttribute("aria-checked")).toBe("true");
+  expect(slot.getByRole("group", { name: "Start selected agents" }).textContent).toContain("1 selected");
+  expect(slot.getByRole("button", { name: "Clear Large fixes" })).toBeTruthy();
+  expect(calls(slot, "start")).toEqual([]);
+});
+it("selects only queued reviews without threads in its section and clears only that section", async () => {
+  const slot = await mount({ path: "to-review", reviews: reviews([
+    reviewA, reviewB, review(703, { total: { kind: "known", additions: 2000, deletions: 20, files: 20 } }),
+    review(704, { item: { ...review(704).item, state: "started", threadId: "thr_review" }, agentState: "draft-ready" }),
+    review(705, { item: { ...review(705).item, threadId: "thr_existing" } }),
+    review(706, { segment: "with-authors" }),
+  ]) });
+  const quick = within(slot.getByRole("region", { name: "Quick reads" }));
+  const long = within(slot.getByRole("region", { name: "Longer read" }));
+  fireEvent.click(long.getByRole("button", { name: "Select all Longer read" }));
+  fireEvent.click(quick.getByRole("checkbox", { name: "Select Review change 701 #701" }));
+  fireEvent.click(quick.getByRole("button", { name: "Select all Quick reads" }));
+  expect(quick.getAllByRole("checkbox").map((checkbox) => checkbox.getAttribute("aria-checked"))).toEqual(["true", "true"]);
+  expect(slot.getByRole("group", { name: "Review selected pull requests" }).textContent).toContain("3 selected");
+  expect(quick.getByRole("button", { name: "Open in order" })).toBeTruthy();
+  expect(long.getByRole("button", { name: /Draft first/ })).toBeTruthy();
+  expect(slot.queryByRole("button", { name: "Select all Back with authors" })).toBeNull();
+  fireEvent.click(quick.getByRole("button", { name: "Clear Quick reads" }));
+  expect(quick.getAllByRole("checkbox").map((checkbox) => checkbox.getAttribute("aria-checked"))).toEqual(["false", "false"]);
+  expect(long.getByRole("checkbox", { name: "Select Review change 703 #703" }).getAttribute("aria-checked")).toBe("true");
+  expect(slot.getByRole("group", { name: "Review selected pull requests" }).textContent).toContain("1 selected");
+  fireEvent.click(slot.getByRole("radio", { name: "1 with authors" }));
+  expect(slot.queryByRole("button", { name: /Select all|Clear Back with authors/ })).toBeNull();
+  expect(calls(slot, "reviews_batch")).toEqual([]);
+});
+it("hides section selection when no rows are eligible", async () => {
+  const slot = await mount({ path: "to-review", reviews: reviews([
+    review(701, { item: { ...reviewA.item, state: "started", threadId: "thr_review" }, agentState: "draft-ready" }),
+  ]) });
+  expect(slot.getByRole("heading", { name: "Quick reads" })).toBeTruthy();
+  expect(slot.queryByRole("button", { name: /Select all/ })).toBeNull();
+});
 it("uses one tab stop and links each keyboard-selected tab to its panel", async () => {
   const slot = await mount();
   const user = userEvent.setup();
@@ -934,7 +1062,7 @@ it("shares the status value between arrow navigation and bar shortcuts while ski
 it("connects effort, row, and reviewer disclosures to their panels and preserves keyboard focus", async () => {
   const slot = await mount();
   const user = userEvent.setup();
-  const fold = slot.getByRole("button", { name: /Large fixes/ });
+  const fold = slot.getByRole("button", { name: /^Large fixes/ });
   expect(fold.getAttribute("aria-expanded")).toBe("false");
   fold.focus();
   await user.keyboard(" ");
@@ -984,7 +1112,7 @@ it("keeps keyboard-selected PRs after a failure and removes only successful star
     },
   });
   const user = userEvent.setup();
-  fireEvent.click(slot.getByRole("button", { name: /Large fixes/ }));
+  fireEvent.click(slot.getByRole("button", { name: /^Large fixes/ }));
   const small = slot.getByRole("checkbox", { name: "Select Change 2 #2" });
   const large = slot.getByRole("checkbox", { name: "Select Change 3 #3" });
   for (const checkbox of [small, large]) {
@@ -1144,7 +1272,7 @@ it("uses native badge dots with count thresholds, exact counts, and urgent reaso
 it("hides Later groups, remembers their folds, and offers no gate or manual agent actions", async () => {
   const slot = await mount();
   expect(slot.queryByRole("button", { name: "Change 3" })).toBeNull();
-  fireEvent.click(slot.getByRole("button", { name: /Large fixes/ }));
+  fireEvent.click(slot.getByRole("button", { name: /^Large fixes/ }));
   expect(
     mineRow(slot, "Change 3").getByRole("button", { name: /Prepare agent/ }),
   ).toBeTruthy();
@@ -1189,7 +1317,7 @@ it("small group starts at Publish, large group at Prepare, and exposes actual sk
 });
 it("sends mixed selected actions with the explicit stop policy and no confirmation dialog", async () => {
   const slot = await mount();
-  fireEvent.click(slot.getByRole("button", { name: /Large fixes/ }));
+  fireEvent.click(slot.getByRole("button", { name: /^Large fixes/ }));
   fireEvent.click(slot.getByRole("checkbox", { name: "Select Change 2 #2" }));
   let bar = within(slot.getByRole("group", { name: "Start selected agents" }));
   expect(bar.getByRole("combobox").getAttribute("aria-label")).toBe("Stop at");
@@ -1668,7 +1796,7 @@ it("starts fresh candidates after completed Prepare rows and keeps finished thre
       markers: done.map((pr) => marker(pr.number, { status: "done" })),
     }),
   });
-  fireEvent.click(slot.getByRole("button", { name: /Large fixes/ }));
+  fireEvent.click(slot.getByRole("button", { name: /^Large fixes/ }));
   const completed = mineRow(slot, "Change 60");
   expect(completed.queryByRole("checkbox")).toBeNull();
   expect(completed.queryByRole("button", { name: /agent for/ })).toBeNull();

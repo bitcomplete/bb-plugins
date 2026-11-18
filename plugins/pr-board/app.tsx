@@ -48,6 +48,7 @@ import {
   MINE_SEGMENTS,
   MineRow,
   ReviewersView,
+  SectionSelection,
   SizeDot,
   SizeLegend,
   UnitBar,
@@ -76,6 +77,11 @@ const organizationSchema = z
   .regex(/^[a-z0-9][a-z0-9-]{0,38}$/i)
   .transform((owner) => owner.toLowerCase())
   .nullable();
+const viewSchema = z.object({
+  tab: z.enum(["mine", "review"]).catch("mine"),
+  mineSegment: z.enum(MINE_SEGMENTS.map((segment) => segment.id)).catch("on-you"),
+  reviewSegment: z.enum(REVIEW_SEGMENTS.map((segment) => segment.id)).catch("on-you"),
+});
 const repoOwner = (repo: string) => repo.split("/")[0]?.toLowerCase() ?? "";
 function usePrsData() {
   const rpc = useRpc<typeof rpcContract>();
@@ -569,11 +575,30 @@ export function Board({ subPath }: { subPath?: string }) {
       setModelSaving(false);
     }
   };
-  const [tab, setTab] = useState<"mine" | "review">(
-    subPath?.startsWith("to-review") ? "review" : "mine",
-  );
-  const [mineSegment, setMineSegment] = useState<MineSegment>("on-you");
-  const [reviewSegment, setReviewSegment] = useState<ReviewSegment>("on-you");
+  const pluginId = experimental_usePluginId();
+  const organizationKey = `${pluginId}:calm-organization`;
+  const viewKey = `${pluginId}:calm-view`;
+  const [savedView, setSavedView] = useState<z.infer<typeof viewSchema>>(() => {
+    let saved = viewSchema.parse({});
+    try {
+      saved = viewSchema.parse(JSON.parse(localStorage.getItem(viewKey) ?? "{}"));
+    } catch {}
+    return subPath
+      ? { ...saved, tab: subPath.startsWith("to-review") ? "review" : "mine" }
+      : saved;
+  });
+  const { tab, mineSegment, reviewSegment } = savedView;
+  const setTab = (tab: "mine" | "review") =>
+    setSavedView((current) => ({ ...current, tab }));
+  const setMineSegment = (mineSegment: MineSegment) =>
+    setSavedView((current) => ({ ...current, mineSegment }));
+  const setReviewSegment = (reviewSegment: ReviewSegment) =>
+    setSavedView((current) => ({ ...current, reviewSegment }));
+  useEffect(() => {
+    try {
+      localStorage.setItem(viewKey, JSON.stringify(savedView));
+    } catch {}
+  }, [viewKey, savedView]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [reviewExpanded, setReviewExpanded] = useState<string | null>(null);
   const [reviewTarget, setReviewTarget] = useState<{
@@ -588,7 +613,6 @@ export function Board({ subPath }: { subPath?: string }) {
     rows: CalmRow[];
     login: string | null;
   } | null>(null);
-  const organizationKey = `${experimental_usePluginId()}:calm-organization`;
   const [organization, setOrganization] = useState<string | null>(() => {
     try {
       return organizationSchema.parse(
@@ -673,7 +697,16 @@ export function Board({ subPath }: { subPath?: string }) {
   const toReview = reviewItems.filter(
     (review) => review.segment === "on-you",
   ).length;
+  const previousSubPath = useRef<string | undefined | null>(null);
   useEffect(() => {
+    if (previousSubPath.current === subPath) return;
+    const opening = previousSubPath.current === null;
+    previousSubPath.current = subPath;
+    if (opening && !subPath) {
+      if (subPath !== undefined && tab === "review")
+        navigate.toPluginPanel("pr-board", { subPath: "to-review" });
+      return;
+    }
     if (subPath === undefined) return;
     setTab(subPath.startsWith("to-review") ? "review" : "mine");
     if (subPath.startsWith("to-review/")) {
@@ -690,7 +723,7 @@ export function Board({ subPath }: { subPath?: string }) {
         setReviewTarget(null);
       }
     } else setReviewTarget(null);
-  }, [subPath]);
+  }, [subPath, navigate, tab]);
   useEffect(() => {
     if (!reviewTarget?.pending) return;
     const match = allReviewItems.find(
@@ -838,6 +871,25 @@ export function Board({ subPath }: { subPath?: string }) {
         reviews.snapshot.lastPoll?.ok === false
           ? (reviews.snapshot.lastPoll.error ?? "Review refresh failed")
           : null));
+  const changeSelection = (next: string[]) => {
+    if (selected.length === 0) setStopOverride(null);
+    setSelected(next);
+  };
+  const sectionAction = (
+    title: string,
+    members: MinePr[],
+    action?: React.ReactNode,
+  ) => (
+    <>
+      <SectionSelection
+        title={title}
+        keys={members.filter(isStartable).map((pr) => pr.row.key)}
+        selected={selected}
+        onChange={changeSelection}
+      />
+      {action}
+    </>
+  );
   const laterGroup = (
     title: string,
     members: MinePr[],
@@ -851,7 +903,7 @@ export function Board({ subPath }: { subPath?: string }) {
       count={members.length}
       tone={tone}
       effort={effort}
-      action={action}
+      action={sectionAction(title, members, action)}
       folded={folded(id)}
       onToggle={() => toggle(id)}
       dots={<FoldDots rows={members} />}
@@ -1019,10 +1071,7 @@ export function Board({ subPath }: { subPath?: string }) {
             data-prs-agent-local=""
             aria-label="Select pull requests for agents"
             value={selected}
-            onValueChange={(next) => {
-              if (selected.length === 0) setStopOverride(null);
-              setSelected(next);
-            }}
+            onValueChange={changeSelection}
           >
             {view ? (
               <>
@@ -1056,6 +1105,7 @@ export function Board({ subPath }: { subPath?: string }) {
                       count={questionGroups.length}
                       tone="question"
                       effort="seconds"
+                      action={sectionAction("Answer to unblock agents", asking)}
                     >
                       <ul>{questionRows}</ul>
                     </EffortGroup>
@@ -1069,7 +1119,9 @@ export function Board({ subPath }: { subPath?: string }) {
                       count={small.length}
                       tone="blue"
                       effort="~20 min"
-                      action={
+                      action={sectionAction(
+                        "Small fixes for an agent",
+                        small,
                         smallStartable.length ? (
                           <CalmButton
                             primary
@@ -1087,8 +1139,8 @@ export function Board({ subPath }: { subPath?: string }) {
                             <span aria-hidden>▸</span> Start{" "}
                             {Math.min(smallStartable.length, 100)}
                           </CalmButton>
-                        ) : null
-                      }
+                        ) : null,
+                      )}
                     >
                       <ul>{small.map(renderRow)}</ul>
                     </EffortGroup>
@@ -1160,6 +1212,7 @@ export function Board({ subPath }: { subPath?: string }) {
                       title="Finished, asking you"
                       count={questionGroups.length}
                       tone="question"
+                      action={sectionAction("Finished, asking you", asking)}
                     >
                       <ul>{questionRows}</ul>
                     </EffortGroup>

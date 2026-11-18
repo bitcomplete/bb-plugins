@@ -157,6 +157,34 @@ export function CalmButton({
     </button>
   );
 }
+export function SectionSelection({
+  title,
+  keys,
+  selected,
+  onChange,
+}: {
+  title: string;
+  keys: string[];
+  selected: string[];
+  onChange: (keys: string[]) => void;
+}) {
+  if (!keys.length) return null;
+  const allSelected = keys.every((key) => selected.includes(key));
+  const label = allSelected ? "Clear" : "Select all";
+  return (
+    <CalmButton
+      data-prs-agent-local=""
+      aria-label={`${label} ${title}`}
+      onClick={() =>
+        onChange(allSelected
+          ? selected.filter((key) => !keys.includes(key))
+          : [...new Set([...selected, ...keys])])
+      }
+    >
+      {label}
+    </CalmButton>
+  );
+}
 export function CalmDialog({
   title,
   description,
