@@ -155,6 +155,60 @@ describe("createPoller", () => {
     await done;
   });
 
+  it("clamps a server retry hint to the backoff cap, so a bad header cannot overflow the timer", async () => {
+    const w = world();
+    let first = true;
+    const poller = createPoller({
+      now: w.now,
+      log: w.log,
+      poll: async (): Promise<PollResult | void> => {
+        if (first) {
+          first = false;
+          throw new RateLimitError("Linear rate-limited the poll", Number.MAX_SAFE_INTEGER);
+        }
+      },
+      timing: { intervalMs: 60_000, backoffMinMs: 10_000, backoffMaxMs: 25_000 },
+    });
+    const controller = new AbortController();
+    const done = poller.run(controller.signal);
+    await tick(0);
+    expect(poller.status().backoffUntil - w.now()).toBe(25_000);
+    controller.abort();
+    await done;
+  });
+
+  it("does not let a poke cut a backoff short", async () => {
+    const w = world();
+    const polls: string[] = [];
+    let limited = true;
+    const poller = createPoller({
+      now: w.now,
+      log: w.log,
+      poll: async (reason): Promise<PollResult | void> => {
+        polls.push(reason);
+        if (limited) throw new RateLimitError("Linear answered HTTP 429");
+      },
+      timing: { intervalMs: 60_000, backoffMinMs: 30_000, backoffMaxMs: 120_000 },
+    });
+    const controller = new AbortController();
+    const done = poller.run(controller.signal);
+    await tick(0);
+    expect(polls).toEqual(["poll"]);
+    expect(poller.status().starved).toBe(true);
+    // A poke during the backoff does not run a round.
+    poller.poke();
+    await tick(0);
+    expect(polls).toEqual(["poll"]);
+    // The backoff still ends on its own schedule.
+    limited = false;
+    w.advance(30_000);
+    await tick(30_000);
+    expect(polls).toEqual(["poll", "poll (backoff)"]);
+    expect(poller.status().starved).toBe(false);
+    controller.abort();
+    await done;
+  });
+
   it("notifies state listeners and clears the next poll on stop", async () => {
     const w = world();
     const states: string[] = [];

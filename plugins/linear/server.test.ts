@@ -1220,7 +1220,7 @@ describe("watching an issue", () => {
         linear: {
           answer: (body) => {
             if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
-            if (body.query.startsWith("query($filter: IssueFilter, $first: Int!) { issues(")) return { data: { issues: { nodes: [{ id: "uuid-new", identifier: "ENG-9", updatedAt: "2026-10-09T12:00:00Z" }] } } };
+            if (body.query.startsWith("query($filter: IssueFilter, $first: Int!, $after: String) { issues(")) return { data: { issues: { nodes: [{ id: "uuid-new", identifier: "ENG-9", updatedAt: "2026-10-09T12:00:00Z", comments: { nodes: [] } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
             return { data: {} };
           },
         },
@@ -1269,7 +1269,7 @@ describe("watching an issue", () => {
     });
 
     it("backs off when the remaining quota is nearly exhausted", async () => {
-      const reset = Math.floor((1_000_000_000_000 + 120_000) / 1000);
+      const reset = 1_000_000_000_000 + 120_000;
       const s = await setup({
         token: "at-0",
         pollTiming: POLL,
@@ -1287,6 +1287,143 @@ describe("watching an issue", () => {
       const starved = (await s.harness.callRpc("watches", null)) as PollView;
       expect(starved.hooks.poll).toMatchObject({ state: "backoff", starved: true });
       expect(starved.hooks.poll!.lastError).toContain("quota");
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("rings stewards when only a comment changed", async () => {
+      const stewards = fakeStewards();
+      let commented = false;
+      const s = await setup({
+        token: "at-0",
+        sdk: { plugins: { callRpc: stewards.callRpc } },
+        pollTiming: POLL,
+        linear: {
+          answer: (body) => {
+            if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
+            if (body.query.startsWith("query($filter: IssueFilter, $first: Int!, $after: String) { issues(")) {
+              if (!commented) return { data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+              // The updatedAt does not move; only the latest comment does.
+              return { data: { issues: { nodes: [{ id: "uuid-1", identifier: "ENG-123", updatedAt: "2026-10-09T10:00:00Z", comments: { nodes: [{ createdAt: "2026-10-09T12:00:00Z" }] } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
+            }
+            return { data: {} };
+          },
+        },
+      });
+      const service = s.harness.runService("watches");
+      await tick();
+      expect(await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
+      await tick();
+      await tick(3000);
+      expect(stewards.to("stewardsRing")).toEqual([]);
+      commented = true;
+      s.advance(60_000);
+      await tick(60_000);
+      await tick(3000);
+      expect(stewards.to("stewardsRing")).toEqual([{ source: "linear", id: "uuid-1" }]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("re-reads a team window after a rate limit instead of losing it", async () => {
+      const stewards = fakeStewards();
+      let limited = true;
+      const s = await setup({
+        token: "at-0",
+        sdk: { plugins: { callRpc: stewards.callRpc } },
+        pollTiming: POLL,
+        linear: {
+          answer: (body) => {
+            if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
+            if (body.query.startsWith("query($filter: IssueFilter, $first: Int!, $after: String) { issues(")) {
+              return { data: { issues: { nodes: [{ id: "uuid-1", identifier: "ENG-1", updatedAt: "2026-10-09T12:00:00Z", comments: { nodes: [] } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
+            }
+            return { data: {} };
+          },
+          graphqlResponse: (body) => (limited && body.query.startsWith("query($filter: IssueFilter") ? new Response(JSON.stringify({ errors: [{ message: "Rate limit exceeded" }] }), { status: 429 }) : null),
+        },
+      });
+      const service = s.harness.runService("watches");
+      await tick();
+      expect(await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
+      await tick();
+      await tick();
+      expect(stewards.to("stewardsRing")).toEqual([]);
+      expect(((await s.harness.callRpc("watches", null)) as PollView).hooks.poll).toMatchObject({ starved: true });
+      // After the backoff, the same window is read and the change rings.
+      limited = false;
+      s.advance(60_000);
+      await tick(60_000);
+      await tick(3000);
+      expect(stewards.to("stewardsRing")).toEqual([{ source: "linear", id: "uuid-1" }]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("rings a change the ring cap deferred on the next poll", async () => {
+      const stewards = fakeStewards();
+      let ready = false;
+      const s = await setup({
+        token: "at-0",
+        sdk: { plugins: { callRpc: stewards.callRpc } },
+        pollTiming: { ...POLL, maxEntitiesPerPoll: 1 },
+        linear: {
+          answer: (body) => {
+            if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } };
+            if (body.query.startsWith("query($filter: IssueFilter, $first: Int!, $after: String) { issues(")) {
+              if (!ready) return { data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+              return { data: { issues: { nodes: [
+                { id: "uuid-a", identifier: "ENG-1", updatedAt: "2026-10-09T12:00:00Z", comments: { nodes: [] } },
+                { id: "uuid-b", identifier: "ENG-2", updatedAt: "2026-10-09T12:00:01Z", comments: { nodes: [] } },
+              ], pageInfo: { hasNextPage: false, endCursor: null } } } };
+            }
+            return { data: {} };
+          },
+        },
+      });
+      const service = s.harness.runService("watches");
+      await tick();
+      expect(await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
+      await tick();
+      await tick(3000);
+      expect(stewards.to("stewardsRing")).toEqual([]);
+      ready = true;
+      s.advance(60_000);
+      await tick(60_000);
+      await tick(3000);
+      expect(stewards.to("stewardsRing")).toHaveLength(1);
+      // The next poll rings the deferred one first.
+      s.advance(60_000);
+      await tick(60_000);
+      await tick(3000);
+      const ids = stewards.to("stewardsRing").map((r) => r.id);
+      expect(new Set(ids)).toEqual(new Set(["uuid-a", "uuid-b"]));
+      expect(ids).toHaveLength(2);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("backs off when a watch re-check is rate-limited, even with no stewards interest", async () => {
+      const live = liveLinear();
+      const send = vi.fn(async (_: unknown) => ({ kind: "sent" }));
+      let limited = false;
+      const s = await setup({
+        token: "at-0",
+        linear: {
+          answer: (body) => (body.query.startsWith("query { teams") ? { data: { teams: { nodes: [] } } } : live.answer(body, "at-0")),
+          graphqlResponse: (body) => (limited && body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier title") ? new Response(JSON.stringify({ errors: [{ message: "Rate limit exceeded" }] }), { status: 429 }) : null),
+        },
+        sdk: { threads: { send } },
+        pollTiming: POLL,
+      });
+      await s.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      limited = true;
+      const service = s.harness.runService("watches");
+      await tick();
+      await tick();
+      const starved = (await s.harness.callRpc("watches", null)) as PollView;
+      expect(starved.hooks.poll).toMatchObject({ state: "backoff", starved: true });
+      expect(starved.hooks.poll!.lastError).toContain("Rate limit exceeded");
       service.controller.abort();
       await service.done;
     });

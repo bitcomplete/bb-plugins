@@ -152,7 +152,9 @@ export function createPoller(deps: PollerDeps): Poller {
   function backOff(hint: number | null, message: string): void {
     starved = true;
     lastError = message;
-    const waited = hint !== null && hint > 0 ? hint : backoff;
+    // Clamp the server's hint too: a header in the wrong unit must not
+    // overflow the timer and turn the backoff into a tight loop.
+    const waited = Math.min(hint !== null && hint > 0 ? hint : backoff, timing.backoffMaxMs);
     backoff = Math.min(Math.max(backoff * 2, timing.backoffMinMs), timing.backoffMaxMs);
     backoffUntil = deps.now() + waited;
     deps.log.warn(`linear: poll rate-limited (${message}); backing off ${Math.round(waited / 1000)}s`);
@@ -213,6 +215,10 @@ export function createPoller(deps: PollerDeps): Poller {
     },
 
     poke() {
+      // While starved, a poke does not cut the backoff short: the rate limit
+      // is still there, and a new watch or interest change does not remove
+      // it. The round happens when the backoff ends.
+      if (starved) return;
       nextPollAt = deps.now();
       // A waiting loop wakes and polls at once. A poll already in flight has
       // no waiter; the flag makes the next delay zero so it polls again as

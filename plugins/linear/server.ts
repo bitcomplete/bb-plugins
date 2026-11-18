@@ -1145,6 +1145,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return accountForStored(watching.map((w) => w.account ?? null).find((a) => a !== null) ?? null);
     }
 
+    /** A rate limit the watch re-check hit, so the poller backs off even with no stewards interest. */
+    let sweepRateLimited: { retryAfterMs: number | null; message: string } | null = null;
+
     /** Read the issue once and settle every watch on it against what it remembers. */
     async function checkIssue(issueId: string): Promise<void> {
       const watching = watches.forIssue(issueId);
@@ -1157,7 +1160,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         issue = await readIssue(account, issueId, checkSignal());
       } catch (error) {
         // Left as it was: the cursors still point at the last thing seen, so
-        // the next doorbell or sweep reports everything since then.
+        // the next doorbell or sweep reports everything since then. A rate
+        // limit is remembered for the poller, which backs off from it.
+        const limited = rateLimitOf(error);
+        if (limited !== null) sweepRateLimited = limited;
         bb.log.warn(`could not read Linear issue ${watching[0]!.issueKey} for its watchers: ${errorMessage(error)}`);
         return;
       }
@@ -1386,42 +1392,71 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // round re-checks the open watches (the same baseline re-check the hooks
     // client runs while leased) and polls the teams and issues stewards asked
     // to hear about, ringing stewards for a new labelled ticket, an assignee
-    // change or a comment exactly as a doorbell would. The reads are GraphQL
-    // with an `updatedAt` filter so an unchanged team is not re-read, and a
-    // 429, a rate-limit error or a near-empty quota backs the poller off.
+    // change or a comment exactly as a doorbell would. A team's read is
+    // `updatedAt`/comment filtered and paged, and a 429, a rate-limit error or
+    // a near-empty quota backs the poller off.
 
-    /** How many issues one team poll reads; the rest are found on the next poll. */
+    /** How many issues one page of a team read holds. */
     const ISSUES_PER_POLL = 100;
+    /** How many pages one team read follows before it keeps its cursor and tries again next round. */
+    const ISSUES_PAGES_MAX = 4;
     /** Linear's remaining-request quota at or below which a poll backs off until the reset. */
     const RATE_LIMIT_FLOOR = 10;
     /** How many issue fingerprints the poller remembers before it drops the oldest. */
     const INTEREST_CURSOR_MAX = 5000;
-    /** How far back a poll looks, so a change just before the previous poll is not missed. */
-    const POLL_OVERLAP_MS = 60_000;
 
     /** Where the poller remembers how far it has read, so a restart does not replay everything. */
     const INTEREST_CURSORS_KEY = "stewards/interest-cursors";
     const interestCursorsSchema = z.object({
-      /** When the last poll started; 0 before the first, which looks only at changes after it starts. */
-      since: z.number().default(0),
-      /** Issue UUID to the last `updatedAt` the poller saw, and when. */
+      /** Team key to the newest `updatedAt` or comment time read completely. */
+      teams: z.record(z.string(), z.string()).default({}),
+      /** Issue UUID to the last fingerprint the poller saw, and when. */
       issues: z.record(z.string(), z.object({ fp: z.string(), at: z.number() })).default({}),
+      /** Changed issues the per-poll ring cap deferred: rung first next round. */
+      deferred: z.record(z.string(), z.string()).default({}),
     });
-    let interestCursors = interestCursorsSchema.catch({ since: 0, issues: {} }).parse(await bb.storage.kv.get(INTEREST_CURSORS_KEY));
+    let interestCursors = interestCursorsSchema.catch({ teams: {}, issues: {}, deferred: {} }).parse(await bb.storage.kv.get(INTEREST_CURSORS_KEY));
 
-    const pollIssueSchema = z.object({ id: z.string(), identifier: z.string(), updatedAt: z.string().nullish() });
-    /** Open issues in one team updated after a time, with only what a poll needs. */
-    const POLL_TEAM_QUERY = `query($filter: IssueFilter, $first: Int!) { issues(filter: $filter, first: $first) { nodes { id identifier updatedAt } } }`;
-    /** One issue's id and updatedAt, for an issue stewards bound on its own. */
-    const POLL_ISSUE_QUERY = "query($id: String!) { issue(id: $id) { id identifier updatedAt } }";
+    const pollCommentSchema = z.object({ createdAt: z.string().nullish() });
+    const pollIssueSchema = z.object({
+      id: z.string(),
+      identifier: z.string(),
+      updatedAt: z.string().nullish(),
+      comments: z.object({ nodes: z.array(pollCommentSchema) }).nullish(),
+    });
+    type PollIssue = z.infer<typeof pollIssueSchema>;
+    /** Open issues in one team changed after a time, with only what a poll needs. */
+    const POLL_TEAM_QUERY = `query($filter: IssueFilter, $first: Int!, $after: String) { issues(filter: $filter, first: $first, after: $after, orderBy: updatedAt) { nodes { id identifier updatedAt comments(last: 1) { nodes { createdAt } } } pageInfo { hasNextPage endCursor } } }`;
+    /** One issue's id, updatedAt and latest comment, for an issue stewards bound on its own. */
+    const POLL_ISSUE_QUERY = "query($id: String!) { issue(id: $id) { id identifier updatedAt comments(last: 1) { nodes { createdAt } } } }";
+
+    /** The newest time an issue changed by: its `updatedAt`, or its latest comment. */
+    const latestCommentAt = (issue: PollIssue): string => (issue.comments?.nodes ?? []).reduce((a, c) => (c.createdAt !== null && c.createdAt !== undefined && c.createdAt > a ? c.createdAt : a), "");
+    const changedAt = (issue: PollIssue): string => {
+      const updated = issue.updatedAt ?? "";
+      const comment = latestCommentAt(issue);
+      return comment > updated ? comment : updated;
+    };
+    /** What tells one read of an issue from the next: its `updatedAt` and its latest comment. */
+    const fingerprintOf = (issue: PollIssue): string => `${issue.updatedAt ?? ""}|${latestCommentAt(issue)}`;
+
+    /** A rate-limited read, as a poll result; `null` for anything else. */
+    function rateLimitOf(error: unknown): { retryAfterMs: number | null; message: string } | null {
+      if (error instanceof RateLimitError) return { retryAfterMs: error.retryAfterMs, message: error.message };
+      if (error instanceof LinearRequestError && (error.status === 429 || ((error.status === 400 || error.status === 403) && /rate.?limit|ratelimited|too many requests/iu.test(error.message)))) {
+        return { retryAfterMs: null, message: error.message };
+      }
+      return null;
+    }
 
     /**
      * One GraphQL read for the poller, with Linear's rate-limit signal read.
      * Linear answers a rate limit with HTTP 429, or with a 400/403 whose
      * first GraphQL error names it; a response whose remaining-request quota
-     * is at or below the floor is a rate limit too, with the reset as the
-     * retry hint. A low-quota success still returns its payload so the poll
-     * can use it, with the hint for the caller to note.
+     * is at or below the floor is a rate limit too. A 429's `Retry-After`
+     * (seconds) or the reset behind a near-zero quota (Linear sends epoch
+     * milliseconds) is the retry hint. A low-quota success still returns its
+     * payload so the poll can use it, with the hint for the caller to note.
      */
     async function pollQuery(account: string, document: string, variables: Record<string, unknown> | undefined): Promise<{ payload: unknown; retryAfterMs: number | null }> {
       const { apiUrl } = await settings.get();
@@ -1434,10 +1469,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         });
         const remainingRaw = response.headers.get("x-ratelimit-requests-remaining");
         const resetRaw = response.headers.get("x-ratelimit-requests-reset");
+        const retryAfterRaw = response.headers.get("retry-after");
         const remaining = remainingRaw === null ? Number.NaN : Number(remainingRaw);
         const reset = resetRaw === null ? Number.NaN : Number(resetRaw);
+        const retryAfter = retryAfterRaw === null ? Number.NaN : Number(retryAfterRaw);
         const lowQuota = Number.isFinite(remaining) && remaining <= RATE_LIMIT_FLOOR;
-        const retryAfterMs = lowQuota && Number.isFinite(reset) ? Math.max(0, reset * 1000 - deps.now()) : null;
+        // `Retry-After` is seconds; Linear's reset header is epoch milliseconds.
+        const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : lowQuota && Number.isFinite(reset) ? Math.max(0, reset - deps.now()) : null;
         const payload: unknown = await response.json().catch(() => null);
         const first = graphqlErrors(payload)[0] ?? "";
         const limited = response.status === 429 || ((response.status === 400 || response.status === 403) && /rate.?limit|ratelimited|too many requests/iu.test(first));
@@ -1455,15 +1493,16 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     /**
      * Poll the teams and issues stewards asked to hear about, ringing
-     * stewards for each entity whose `updatedAt` changed since the last poll.
-     * The first poll looks only at what changed since it started, so a
-     * restart does not replay every issue (the stewards sweep owns initial
-     * adoption). The per-poll cap bounds how many are rung in one round;
-     * what is left keeps its old fingerprint and is rung next round.
+     * stewards for each entity whose `updatedAt` or latest comment changed
+     * since the last poll. A team's cursor advances only after a complete,
+     * successful read, so a rate-limited or capped read is read again next
+     * round; changed issues the per-poll ring cap deferred are remembered and
+     * rung first next round. The first read of a team looks only at what
+     * changed since it started, so a restart does not replay every issue (the
+     * stewards sweep owns initial adoption).
      */
     async function pollInterest(): Promise<PollResult> {
       if (interest.units.length === 0 && interest.entities.length === 0) return {};
-      const changed: Array<{ id: string; fp: string; ring: () => void }> = [];
       let rateLimited: { retryAfterMs: number | null; message: string } | undefined;
       const noteRateLimit = (ms: number | null, message: string) => {
         if (rateLimited === undefined) rateLimited = { retryAfterMs: ms, message };
@@ -1471,17 +1510,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       const noteQuota = (ms: number | null) => noteRateLimit(ms, "Linear's remaining rate-limit quota is nearly exhausted");
 
       const started = deps.now();
-      // The first poll has nothing to compare against, so it looks only at
-      // what changed since it started; later polls overlap the previous
-      // window a little, so a change just before it is not missed.
-      const since = interestCursors.since === 0 ? started : Math.max(0, interestCursors.since - POLL_OVERLAP_MS);
-      const sinceIso = new Date(since).toISOString();
-      const next: typeof interestCursors = { since: started, issues: { ...interestCursors.issues } };
-
-      /** Note an issue the read found, and queue a ring when it changed since the last poll. */
+      const startedIso = new Date(started).toISOString();
+      const next: typeof interestCursors = { teams: { ...interestCursors.teams }, issues: { ...interestCursors.issues }, deferred: {} };
+      // The changed issues to ring: what the ring cap deferred last round
+      // first, then whatever this round's reads find.
+      const changed = new Map<string, string>(Object.entries(interestCursors.deferred));
       const observe = (id: string, fp: string) => {
         if (interestCursors.issues[id]?.fp === fp) return;
-        changed.push({ id, fp, ring: () => stewardRings.ring(id) });
+        changed.set(id, fp);
       };
 
       for (const key of interest.units) {
@@ -1492,16 +1528,35 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           bb.log.warn(`linear: polling team ${key} failed: ${errorMessage(error)}`);
           continue;
         }
+        const cursor = interestCursors.teams[key] ?? startedIso;
+        let after: string | null = null;
+        let pages = 0;
+        let complete = false;
+        let maxSeen = cursor;
         try {
-          const filter = { team: { key: { eq: key } }, updatedAt: { gt: sinceIso } };
-          const page = await pollQuery(account.key, POLL_TEAM_QUERY, { filter, first: ISSUES_PER_POLL });
-          if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
-          const data = page.payload !== null && typeof page.payload === "object" ? (page.payload as { data?: { issues?: unknown } }).data : undefined;
-          for (const issue of z.object({ nodes: z.array(pollIssueSchema) }).parse(data?.issues).nodes) observe(issue.id.toLowerCase(), issue.updatedAt ?? "");
+          do {
+            const filter = { team: { key: { eq: key } }, or: [{ updatedAt: { gt: cursor } }, { comments: { some: { createdAt: { gt: cursor } } } }] };
+            const page = await pollQuery(account.key, POLL_TEAM_QUERY, { filter, first: ISSUES_PER_POLL, after });
+            if (page.retryAfterMs !== null) noteQuota(page.retryAfterMs);
+            const data = page.payload !== null && typeof page.payload === "object" ? (page.payload as { data?: { issues?: unknown } }).data : undefined;
+            const parsed = z.object({ nodes: z.array(pollIssueSchema), pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullish() }).nullish() }).parse(data?.issues);
+            for (const issue of parsed.nodes) {
+              const at = changedAt(issue);
+              if (at > maxSeen) maxSeen = at;
+              observe(issue.id.toLowerCase(), fingerprintOf(issue));
+            }
+            after = parsed.pageInfo?.hasNextPage === true ? (parsed.pageInfo.endCursor ?? null) : null;
+            pages += 1;
+          } while (after !== null && pages < ISSUES_PAGES_MAX);
+          complete = after === null;
         } catch (error) {
-          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          const limited = rateLimitOf(error);
+          if (limited !== null) noteRateLimit(limited.retryAfterMs, limited.message);
           else bb.log.warn(`linear: polling team ${key} failed: ${errorMessage(error)}`);
         }
+        // Only a complete, successful read may move the cursor; anything else
+        // is read again from the same point next round.
+        if (complete) next.teams[key] = maxSeen;
       }
 
       for (const entity of interest.entities) {
@@ -1515,26 +1570,28 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           const data = page.payload !== null && typeof page.payload === "object" ? (page.payload as { data?: unknown }).data : undefined;
           const issue = z.object({ issue: pollIssueSchema.nullable() }).parse(data).issue;
           if (issue === null || issue === undefined) continue;
-          observe(issue.id.toLowerCase(), issue.updatedAt ?? "");
+          observe(issue.id.toLowerCase(), fingerprintOf(issue));
         } catch (error) {
-          if (error instanceof RateLimitError) noteRateLimit(error.retryAfterMs, error.message);
+          const limited = rateLimitOf(error);
+          if (limited !== null) noteRateLimit(limited.retryAfterMs, limited.message);
           else bb.log.warn(`linear: polling issue ${entity} failed: ${errorMessage(error)}`);
         }
       }
 
-      // Ring, in the order the reads found them, up to the cap. What is left
-      // keeps its old fingerprint and is rung next round.
+      // Ring, deferred first, up to the cap. What is left is remembered and
+      // rung next round.
       const timing: PollerTiming = { ...DEFAULT_POLL_TIMING, ...deps.pollTiming };
       let budget = timing.maxEntitiesPerPoll;
       let capped = false;
-      for (const c of changed) {
+      for (const [id, fp] of changed) {
         if (budget <= 0) {
           capped = true;
-          break;
+          next.deferred[id] = fp;
+          continue;
         }
         budget -= 1;
-        c.ring();
-        next.issues[c.id] = { fp: c.fp, at: started };
+        stewardRings.ring(id);
+        next.issues[id] = { fp, at: started };
       }
       // Bound the fingerprint map: drop the oldest entries once it grows past the cap.
       const ids = Object.keys(next.issues);
@@ -1558,8 +1615,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       log: bb.log,
       timing: deps.pollTiming,
       poll: async (reason) => {
+        // A rate limit from the watch re-check must reach the poll result too,
+        // so a server with watches but no stewards interest still backs off.
+        sweepRateLimited = null;
         await sweep(reason);
-        return pollInterest();
+        const result = await pollInterest();
+        const swept = sweepRateLimited as { retryAfterMs: number | null; message: string } | null;
+        if (result.rateLimited === true || swept === null) return result;
+        return { rateLimited: true, retryAfterMs: swept.retryAfterMs ?? undefined, message: swept.message };
       },
     });
     poller.onStateChange(announceWatches);
