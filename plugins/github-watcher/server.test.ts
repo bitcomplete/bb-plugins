@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -92,6 +92,24 @@ function fakeGitHub() {
       const key = repo.toLowerCase();
       state.labels[key] = [...(state.labels[key] ?? []), body.name];
       return Response.json({ id: 1, name: body.name }, { status: 201 });
+    }
+    const subIssues = /\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)\/sub_issues(?:\?|$)/u.exec(u);
+    if (subIssues !== null && init?.method === "POST") {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      const repo = `${subIssues[1]}/${subIssues[2]}`;
+      const body = JSON.parse(String(init.body)) as { sub_issue_id: number };
+      state.subIssueLinks.push({ repo, parent: Number(subIssues[3]), body });
+      if (state.subIssueStatus >= 400) return Response.json({ message: state.subIssueMessage }, { status: state.subIssueStatus });
+      return Response.json({ id: 999, number: state.issueCreateNumber, sub_issue_id: body.sub_issue_id });
+    }
+    const issueCreate = /\/repos\/([^/]+)\/([^/]+)\/issues(?:\?|$)/u.exec(u);
+    if (issueCreate !== null && init?.method === "POST") {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      const repo = `${issueCreate[1]}/${issueCreate[2]}`;
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      state.issueCreates.push({ repo, body });
+      if (state.issueCreateStatus >= 400) return Response.json({ message: state.issueCreateMessage }, { status: state.issueCreateStatus });
+      return Response.json({ id: 999, number: state.issueCreateNumber, html_url: `https://github.com/${repo}/issues/${state.issueCreateNumber}` }, { status: 201 });
     }
     const dependabot = /\/repos\/([^/]+)\/([^/]+)\/dependabot\/alerts(?:\?|$)/u.exec(u);
     if (dependabot !== null) {
@@ -686,6 +704,48 @@ describe("stewards' source contract", () => {
   it("answers sourceBacklog as unsupported, distinct from an empty backlog (BB-331)", async () => {
     const w = await setup();
     expect(await w.harness.callRpc("sourceBacklog", { team: "ENG" }, STEWARDS)).toEqual({ issues: [], unsupported: true, truncated: false, errors: [] });
+  });
+
+  it("files a GitHub issue through sourceCreateIssue, refusing an unsigned description, a priority and anyone but the viewer (BB-360)", async () => {
+    const w = await setup();
+    const out = await w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Add retries", description: "Calls fail once in a while.\n\n_— from bb thread thr_x_", labels: ["bb-managed"], assignee: "me" }, STEWARDS);
+    expect(out).toEqual({ id: "Acme/Widgets#124", key: "Acme/Widgets#124", url: "https://github.com/Acme/Widgets/issues/124" });
+    expect(w.github.state.issueCreates).toEqual([{ repo: "Acme/Widgets", body: { title: "Add retries", body: "Calls fail once in a while.\n\n_— from bb thread thr_x_", labels: ["bb-managed"], assignees: ["dev"] } }]);
+
+    // An unsigned description never reaches GitHub.
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "x", description: "No signature" }, STEWARDS)).rejects.toThrow(/signature line/u);
+    expect(w.github.state.issueCreates).toHaveLength(1);
+
+    // GitHub issues have no priority.
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "x", description: "Hi\n\n_— from bb thread thr_x_", priority: "high" }, STEWARDS)).rejects.toThrow(/no priority/u);
+
+    // Only the viewer's own login (me, @me or the login) may be assigned.
+    expect(await w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Mine", description: "Hi\n\n_— from bb thread thr_x_", assignee: "@me" }, STEWARDS)).toMatchObject({ key: "Acme/Widgets#124" });
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "x", description: "Hi\n\n_— from bb thread thr_x_", assignee: "someone" }, STEWARDS)).rejects.toThrow(/own login/u);
+
+    // A parent is read before the create: it must be a same-repository issue.
+    w.github.state.node = issueNode();
+    await w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "Acme/Widgets#7" }, STEWARDS);
+    expect(w.github.state.subIssueLinks).toEqual([{ repo: "Acme/Widgets", parent: 7, body: { sub_issue_id: 999 } }]);
+    const before = w.github.state.issueCreates.length;
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "Other/Repo#7" }, STEWARDS)).rejects.toThrow(/same repository/u);
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "nonsense" }, STEWARDS)).rejects.toThrow(/not a GitHub issue key/u);
+    w.github.state.node = pullNode({ number: 12 });
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "Acme/Widgets#12" }, STEWARDS)).rejects.toThrow(/pull request/u);
+    w.github.state.node = null;
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "Acme/Widgets#7" }, STEWARDS)).rejects.toThrow(/does not exist/u);
+    expect(w.github.state.issueCreates).toHaveLength(before);
+
+    // A unit that is not owner/repo is an error, not a silent create.
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "widgets", title: "x", description: "Hi\n\n_— from bb thread thr_x_" }, STEWARDS)).rejects.toThrow(/not owner\/repo/u);
+  });
+
+  it("names the filed issue when a sub-issue link fails after the create (BB-360)", async () => {
+    const w = await setup();
+    w.github.state.node = issueNode();
+    w.github.state.subIssueStatus = 500;
+    await expect(w.harness.callRpc("sourceCreateIssue", { unit: "Acme/Widgets", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "Acme/Widgets#7" }, STEWARDS)).rejects.toThrow(/filed Acme\/Widgets#124 .*could not link it under Acme\/Widgets#7/u);
+    expect(w.github.state.issueCreates).toHaveLength(1);
   });
 
   it("reads a repository's Dependabot alerts, naming a repository or a repo the token cannot read rather than failing", async () => {

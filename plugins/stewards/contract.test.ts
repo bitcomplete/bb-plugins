@@ -39,6 +39,22 @@ describe("source-contract.ts", () => {
     expect(sourceContract.sourceEnsureLabel.output.safeParse({ results: [{ unit: "ENG", status: "failed" }] }).success).toBe(false);
   });
 
+  it("parses sourceCreateIssue, whose description already carries the signature line (BB-360)", () => {
+    const description = `Fix login.\n\n${signatureLine("thr_x")}`;
+    expect(sourceContract.sourceCreateIssue.input.parse({ unit: "ENG", title: "Fix login", description })).toEqual({ unit: "ENG", title: "Fix login", description, labels: [] });
+    // A unit, a title and a signed description are required; priority is one of the five.
+    expect(sourceContract.sourceCreateIssue.input.safeParse({ unit: "ENG", title: "x" }).success).toBe(false);
+    expect(sourceContract.sourceCreateIssue.input.safeParse({ unit: "ENG", title: "x", description: "x", priority: "someday" }).success).toBe(false);
+    expect(sourceContract.sourceCreateIssue.input.parse({ unit: "acme/web", title: "x", description: "x", labels: ["bb-managed"], priority: "high", parent: "acme/web#1", assignee: "me" })).toMatchObject({
+      labels: ["bb-managed"],
+      priority: "high",
+      parent: "acme/web#1",
+      assignee: "me",
+    });
+    expect(sourceContract.sourceCreateIssue.output.parse({ id: "uuid-1", key: "ENG-1", url: null })).toEqual({ id: "uuid-1", key: "ENG-1", url: null });
+    expect(sourceContract.sourceCreateIssue.output.safeParse({ id: "uuid-1", key: "ENG-1" }).success).toBe(false);
+  });
+
   it("parses sourceBacklog, telling a capped read, an empty backlog and an unsupported source apart (BB-331)", () => {
     const issue = {
       id: "uuid-1",

@@ -480,6 +480,30 @@ export const sourceContract = {
     output: z.object({ ok: z.boolean(), url: z.string().nullable() }),
   },
   /**
+   * File a new issue in a unit: a Linear team key, or a GitHub owner/repo.
+   * The caller hands in a `description` that already carries the bb thread
+   * signature line (`signatureLine`), exactly as `sourceComment`'s body does;
+   * the source refuses an unsigned description, so a bug in the caller cannot
+   * file an unsigned issue. `priority` is a source capability (Linear's
+   * priority; a source with none refuses it), `parent` is the parent issue's
+   * key, and `assignee` names only this server's own login, or none: `me`
+   * always means the source's own login, and any other person is refused,
+   * because no steward assigns work to someone else. Additive and optional: a
+   * source that does not serve it is unavailable to the caller.
+   */
+  sourceCreateIssue: {
+    input: z.object({
+      unit: z.string().min(1).max(200),
+      title: z.string().min(1).max(500),
+      description: z.string().min(1).max(50_000),
+      labels: z.array(z.string().min(1).max(100)).max(50).default([]),
+      priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional(),
+      parent: z.string().min(1).max(200).optional(),
+      assignee: z.string().min(1).max(200).optional(),
+    }),
+    output: z.object({ id: z.string(), key: z.string(), url: z.string().nullable() }),
+  },
+  /**
    * A team's whole open backlog, read-only: every open issue, unlabelled and
    * unassigned included. One team per call -- there is no all-teams mode --
    * and the source pages with a fixed page size up to a hard cap. When the
