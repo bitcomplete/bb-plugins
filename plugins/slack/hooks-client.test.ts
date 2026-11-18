@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHooksLoop, HooksRequestError, SseParser, sessionEventSchema, startConversation, subscribe } from "./hooks-client.js";
+import { createHooksLoop, fetchBotChannels, fetchSessionFile, HooksRequestError, SseParser, sessionEventSchema, startConversation, subscribe } from "./hooks-client.js";
 
 const BASE = "http://hooks.test:8081";
 
@@ -224,6 +224,21 @@ describe("subscribe", () => {
     process.env.BB_HOOKS_TOKEN = "hooks-secret";
     await subscribe(fetchImpl, BASE, "c_1", leases, signal);
     expect(headers[1]).toMatchObject({ authorization: "Bearer hooks-secret" });
+  });
+
+  it("carries the BB_HOOKS_TOKEN bearer on the bot channel list and the file fetch when it is set", async () => {
+    const requests: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      const u = String(url);
+      requests.push({ url: u, headers: { ...(init?.headers as Record<string, string>) } });
+      if (u === `${BASE}/v1/slack/bot/channels`) return Response.json({ channels: ["C1"] });
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } });
+    }) as unknown as typeof fetch;
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    await fetchBotChannels(fetchImpl, BASE, AbortSignal.timeout(1000));
+    await fetchSessionFile(fetchImpl, BASE, "c_1", "D1:1", "F1", AbortSignal.timeout(1000));
+    expect(requests[0]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
+    expect(requests[1]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
   });
 });
 

@@ -660,4 +660,11 @@ describe("postActivity", () => {
     await postActivity(hooks.fetchImpl, BASE, "c_1", "sess-1", { kind: "error", body: "No." }, new AbortController().signal);
     expect(hooks.replies[0]!.body).toEqual({ connection: "c_1", kind: "error", body: "No." });
   });
+
+  it("carries the BB_HOOKS_TOKEN bearer when it is set", async () => {
+    const hooks = fakeHooks();
+    process.env.BB_HOOKS_TOKEN = "hooks-secret";
+    await postActivity(hooks.fetchImpl, BASE, "c_1", "sess-1", { kind: "error", body: "No." }, new AbortController().signal);
+    expect(hooks.replies[0]!.headers).toMatchObject({ authorization: "Bearer hooks-secret" });
+  });
 });
