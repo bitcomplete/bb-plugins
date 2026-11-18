@@ -39,10 +39,12 @@ import {
   deploymentStatusesPath,
   deploymentsPath,
   graphql,
+  issuesPath,
   kindName,
   labelAlreadyExists,
   labelPath,
   parseCompare,
+  parseCreatedIssue,
   parseDefaultBranch,
   parseDependabotAlerts,
   parseDependencyGraphCount,
@@ -64,13 +66,14 @@ import {
   parseWorkflowJobs,
   parseWorkflowRuns,
   refKey,
+  subIssuesPath,
   workflowRunJobsPath,
   workflowRunPath,
   workflowRunsPath,
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
-import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
+import { deploymentSchema, ringStewards, signedBy, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -245,6 +248,28 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const link = response.headers.get("link") ?? "";
         const next = /<([^>]+)>;\s*rel="next"/u.exec(link)?.[1] ?? null;
         return { body, next };
+      });
+    }
+
+    /**
+     * One REST write with the token, for the issue create and its sub-issue
+     * link. A non-2xx answer throws with its status, like `restPage`; the
+     * token is re-read from gh on a 401 by `asDeveloper`.
+     */
+    async function restWrite(path: string, body: unknown, signal: AbortSignal): Promise<unknown> {
+      return asDeveloper(async (token) => {
+        const response = await deps.fetch(new URL(path, apiUrl), {
+          method: "POST",
+          headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "user-agent": "bb-plugin-github", "x-github-api-version": "2022-11-28", "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal,
+        });
+        const payload: unknown = await response.json().catch(() => null);
+        if (!response.ok) {
+          const message = payload !== null && typeof payload === "object" && typeof (payload as { message?: unknown }).message === "string" ? (payload as { message: string }).message : "";
+          throw new GitHubRequestError(`GitHub answered HTTP ${response.status}${message === "" ? "" : `: ${message}`}`, response.status);
+        }
+        return payload;
       });
     }
 
@@ -782,6 +807,33 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       },
       async sourceComment() {
         throw new Error("sourceComment is a Linear write; the github source does not serve it");
+      },
+
+      // BB-360: file an issue for the source-neutral ticket tools. The caller
+      // has already signed the description with the contract's signature line;
+      // an unsigned one is refused here. GitHub issues have no priority, so a
+      // priority is refused; a sub-issue's parent must be in the same
+      // repository; and the assignee is this server's own login or none (no
+      // steward assigns work to anyone else).
+      async sourceCreateIssue({ unit, title, description, labels, priority, parent, assignee }) {
+        if (signedBy(description) === null) throw new Error("an issue description must end with the bb thread signature line; nothing was filed");
+        if (priority !== undefined) throw new Error("sourceCreateIssue has no priority on the github source; GitHub issues have no priority");
+        const repo = parseRepo(unit);
+        if (repo === null) throw new Error(`${unit}: not owner/repo`);
+        const name = `${repo.owner}/${repo.name}`;
+        const viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
+        const who = assignee?.trim() ?? "";
+        if (who !== "" && who.toLowerCase() !== viewer.toLowerCase()) throw new Error(`sourceCreateIssue assigns only to this server's own login (${viewer}), not ${JSON.stringify(who)}`);
+        // Resolve the parent before any write, so a bad parent changes nothing.
+        const parentRef = parent === undefined ? null : parseRef(parent);
+        if (parent !== undefined && parentRef === null) throw new Error(`parent ${JSON.stringify(parent)} is not a GitHub issue key like owner/repo#12`);
+        if (parentRef !== null && parentRef.repo.toLowerCase() !== name.toLowerCase()) throw new Error(`a GitHub sub-issue's parent must be in the same repository; ${parent} is not in ${name}`);
+        const body: Record<string, unknown> = { title: title.trim(), body: description };
+        if (labels.length > 0) body.labels = labels;
+        if (who !== "") body.assignees = [viewer];
+        const created = parseCreatedIssue(await restWrite(issuesPath(name), body, checkSignal()));
+        if (parentRef !== null) await restWrite(subIssuesPath(name, parentRef.number), { sub_issue_id: created.id }, checkSignal());
+        return { id: `${name}#${created.number}`, key: `${name}#${created.number}`, url: created.url };
       },
 
       // A repository's Dependabot alerts, read with the token through the

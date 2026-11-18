@@ -396,6 +396,54 @@ describe("tools", () => {
     expect(await harness.callRpc("sourceComment", { key: "ENG-123", body: "Hi there\n\n_— from bb thread thr_x_" })).toEqual({ ok: true, url: "https://linear.app/c/2" });
   });
 
+  it("sourceCreateIssue files a signed issue, refusing an unsigned description and anyone but this server's own user (BB-360)", async () => {
+    const team = {
+      id: "t-eng",
+      key: "ENG",
+      name: "Engineering",
+      states: { nodes: [{ id: "s-todo", name: "Todo", type: "unstarted", position: 0 }] },
+      labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
+    };
+    let createInput: Record<string, unknown> = {};
+    const { harness, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($input: IssueCreateInput!)")) {
+            createInput = body.variables!.input as Record<string, unknown>;
+            return { data: { issueCreate: { success: true, issue: { id: "uuid-124", identifier: "ENG-124", url: "https://linear.app/acme/issue/ENG-124" } } } };
+          }
+          if (body.query.startsWith("query($key: String!) { teams")) return { data: { teams: { nodes: body.variables!.key === "ENG" ? [team] : [] }, issueLabels: { nodes: [] } } };
+          if (body.query.startsWith("query($who: String!) { users")) return { data: { users: { nodes: [{ id: "u-other", name: "Other", displayName: "Other", email: "other@acme.test", active: true }] } } };
+          return { data: { issue: issue() } };
+        },
+      },
+    });
+
+    const out = await harness.callRpc("sourceCreateIssue", { unit: "eng", title: "Add retries", description: "Calls fail once in a while.\n\n_— from bb thread thr_x_", labels: ["bug"], priority: "high" });
+    expect(out).toEqual({ id: "uuid-124", key: "ENG-124", url: "https://linear.app/acme/issue/ENG-124" });
+    expect(createInput).toMatchObject({ teamId: "t-eng", title: "Add retries", labelIds: ["l-bug"], priority: 2 });
+    expect(createInput.description).toBe("Calls fail once in a while.\n\n_— from bb thread thr_x_");
+
+    // An unsigned description never reaches Linear.
+    const creates = () => linear.calls.filter((c) => c.body?.query.startsWith("mutation($input: IssueCreateInput!)")).length;
+    expect(creates()).toBe(1);
+    await expect(harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "x", description: "No signature" })).rejects.toThrow(/signature line/u);
+    expect(creates()).toBe(1);
+
+    // Assigning to anyone but this server's own user is refused before the write.
+    await expect(harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "x", description: "Hi\n\n_— from bb thread thr_x_", assignee: "Other" })).rejects.toThrow(/own user/u);
+    expect(creates()).toBe(1);
+
+    // This server's own user is accepted (the connected account is Jane <jane@acme.test>).
+    expect(await harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "Mine", description: "Hi\n\n_— from bb thread thr_x_", assignee: "me" })).toMatchObject({ key: "ENG-124" });
+    expect(createInput.assigneeId).toBe("u1");
+
+    // A parent issue is resolved and must be in the same team.
+    await harness.callRpc("sourceCreateIssue", { unit: "ENG", title: "Child", description: "Hi\n\n_— from bb thread thr_x_", parent: "ENG-123" });
+    expect(createInput.parentId).toBe("uuid-1");
+  });
+
   it("linear_comment signs the comment with the thread and reports the URL", async () => {
     const { tool, text, linear } = await setup({
       token: "at-0",

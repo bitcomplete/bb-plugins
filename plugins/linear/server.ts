@@ -624,6 +624,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       // unsigned comment body.
       sourceUpdateIssue: (input) => sourceUpdateIssue(input),
       sourceComment: (input) => sourceComment(input),
+      // BB-360: file an issue through the source contract. The caller signs
+      // the description (as sourceComment's body is signed), and the assignee
+      // is this server's own user or none, never anyone else.
+      sourceCreateIssue: (input) => sourceCreateIssue(input),
       // Dependabot alerts are a GitHub thing; linear has none. Stewards only
       // asks github, so this is a plain answer rather than a throw.
       async sourceDependabotAlerts() {
@@ -1586,6 +1590,51 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       if (ref === null) throw notFound(input.key, where);
       const created = parseCommentCreate(await query(where.key, COMMENT_CREATE, { input: { issueId: ref.id, body: input.body } }, checkSignal()));
       return { ok: true, url: created.url };
+    }
+
+    // BB-360: file an issue for the source-neutral ticket tools. The caller
+    // has already signed the description with the contract's signature line
+    // (the same way sourceComment's body is signed); an unsigned one is
+    // refused here. The assignee is this server's own user or none: no steward
+    // assigns work to anyone else, so a value that resolves to another user is
+    // refused.
+    async function sourceCreateIssue(input: { unit: string; title: string; description: string; labels: string[]; priority?: "none" | "urgent" | "high" | "medium" | "low"; parent?: string; assignee?: string }) {
+      if (signedBy(input.description) === null) throw new Error("an issue description must end with the bb thread signature line; nothing was filed");
+      const teamKey = input.unit.trim().toUpperCase();
+      const where = await pick({ team: teamKey }, checkSignal());
+      const team = parseTeam(await query(where.key, TEAM_QUERY, { key: teamKey }, checkSignal()));
+      if (team === null) throw new Error(`No Linear team ${teamKey}, or it is not visible to the connected user.`);
+
+      const create: Record<string, unknown> = { teamId: team.id, title: input.title.trim(), description: input.description };
+      if (input.labels.length > 0) {
+        const found = findLabels(team.labels, input.labels);
+        if (found.missing.length > 0) {
+          const names = team.labels.map((l) => l.name);
+          throw new Error(`No label named ${found.missing.map((m) => JSON.stringify(m)).join(", ")} for team ${team.key}. Its labels: ${names.length > 0 ? names.join(", ") : "(none)"}.`);
+        }
+        create.labelIds = found.ids;
+      }
+      if (input.priority !== undefined) create.priority = PRIORITIES[input.priority];
+      if (input.assignee !== undefined) {
+        const who = input.assignee.trim();
+        if (who !== "") {
+          const self = who.toLowerCase() === "me" || who.toLowerCase() === where.user.name.toLowerCase() || (where.user.email !== null && who.toLowerCase() === where.user.email.toLowerCase());
+          if (!self) {
+            const resolved = await resolveAssignee(where, who, checkSignal());
+            if ("error" in resolved) throw new Error(resolved.error);
+            if (resolved.id !== where.user.id) throw new Error(`sourceCreateIssue assigns only to this server's own user (${where.user.name}), not ${JSON.stringify(who)}`);
+          }
+          create.assigneeId = where.user.id;
+        }
+      }
+      if (input.parent !== undefined) {
+        const parent = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.parent }, checkSignal()));
+        if (parent === null) throw notFound(input.parent, where);
+        if (parent.team.key !== team.key) throw new Error(`${parent.identifier} is in team ${parent.team.key}, so a sub-issue of it must be filed in ${parent.team.key}, not ${team.key}.`);
+        create.parentId = parent.id;
+      }
+      const created = parseIssueCreate(await query(where.key, ISSUE_CREATE, { input: create }, checkSignal()));
+      return { id: created.id, key: created.identifier, url: created.url };
     }
 
     /** An issue as the search contract wants it: the description the caller matches the fingerprint line in. */

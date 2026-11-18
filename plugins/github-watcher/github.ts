@@ -17,6 +17,16 @@ export const dependabotAlertPath = (repo: string, number: number): string => `/r
 /** The create-label REST path for one repository. */
 export const labelPath = (repo: string): string => `/repos/${repo}/labels`;
 
+/** The create-issue REST path for one repository, and the sub-issue link path under a parent. */
+export const issuesPath = (repo: string): string => `/repos/${repo}/issues`;
+export const subIssuesPath = (repo: string, parent: number): string => `/repos/${repo}/issues/${parent}/sub_issues`;
+
+/** The issue a REST create answered with: its database id (what a sub-issue link names), number and URL. */
+export function parseCreatedIssue(payload: unknown): { id: number; number: number; url: string | null } {
+  const parsed = z.object({ id: z.number(), number: z.number(), html_url: z.string().nullish() }).parse(payload);
+  return { id: parsed.id, number: parsed.number, url: parsed.html_url ?? null };
+}
+
 /**
  * Whether a create-label response is GitHub's "this label already exists"
  * (a 422), which an idempotent create reports as `existed` rather than an
