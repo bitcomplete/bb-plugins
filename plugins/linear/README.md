@@ -3,7 +3,7 @@
 Connect a developer's Linear account to their bb server once, with OAuth,
 and give every thread native tools that read and update issues as them.
 
-The shape is the same as [devbox-provider](../devbox-provider)'s connect:
+The connect flow is the same shape as the other connect plugins:
 Settings → Plugins → Linear → **Connect Linear** sends the browser to
 Linear, Linear sends it back to this plugin's callback with a code, and the
 plugin exchanges the code for tokens that land in secret settings. Every
@@ -40,7 +40,7 @@ for `account`, not a guess. With one workspace connected none of this
 costs anything: every call goes to it and no teams are listed.
 
 Watches remember the workspace the issue was read in, and leases on
-bb-gate-hooks are proven per workspace: one stream, one subscribe call per
+the hooks service are proven per workspace: one stream, one subscribe call per
 workspace with that workspace's token. Disconnecting one workspace leaves
 its watches in place but unchecked and unleased until it is connected
 again. Stewards' teams are leased in the workspace that has them, and a
@@ -65,7 +65,7 @@ already knew, and refreshes it first if it has lapsed.
 | `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together, and add or remove relations. A new description is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
-| `linear_session_reply` | Answer an `@bb` mention: one reply on its agent session, posted by bb-gate-hooks as the bb app, linking the thread. Needs `BB_HOOKS_URL`. See "@bb mentions". |
+| `linear_session_reply` | Answer an `@bb` mention: one reply on its agent session, posted by the hooks service as the bb app, linking the thread. Needs `BB_HOOKS_URL`. See "@bb mentions". |
 
 Every tool takes an optional `account`; see "Several workspaces".
 
@@ -100,7 +100,7 @@ thread, and reads Linear through this plugin. The contract is
 - `sourceAdoptable` — open issues carrying the label in those teams, oldest
   first, for the nightly pass.
 - `sourceSetInterest` — the teams and issues stewards manages. Only
-  stewards may call it. The set is kept in kv, leased on bb-gate-hooks (a
+  stewards may call it. The set is kept in kv, leased on the hooks service (a
   `team` lease per team, an `issue` lease per issue, beside the watches'),
   and every doorbell for one of those issues, or for any issue in one of
   those teams, is passed on to stewards as a ring, debounced per issue.
@@ -111,7 +111,7 @@ A steward writes through the same tools as any thread, signed the same way.
 ## @bb mentions
 
 Mentioning `@bb` in a Linear comment opens an *agent session* on the issue.
-[bb-gate-hooks](../../bb-gate/docs/hooks.md) ("Agent sessions") acknowledges
+The hooks service ("Agent sessions") acknowledges
 it, routes it to the server of the issue's assignee or else of the person
 who asked, and sends that server an `event: session` on the stream this
 plugin already holds. This plugin's side:
@@ -139,7 +139,7 @@ plugin already holds. This plugin's side:
 - **The reply.** The steward ends the turn that handled the mention with
   `linear_session_reply { session, kind, body }`. `kind` is `response`,
   `elicitation` or `error`. The tool signs the body, adds a link to the
-  thread, and sets the session's external link to it. bb-gate-hooks posts
+  thread, and sets the session's external link to it. The hooks service posts
   it on Linear as the bb app. The app's token never reaches this server: the
   request carries the stream's connection id and the reply, nothing else.
   Each mention gets one reply. A second reply to the same event is refused,
@@ -168,7 +168,7 @@ since the thread last looked, however many webhooks it took.
 
 How it wakes: the plugin keeps a durable watch per thread and issue in its
 SQLite (what it last saw, and cursors on `updatedAt` and the newest comment),
-and subscribes to [bb-gate-hooks](../../bb-gate/docs/hooks.md), the one
+and subscribes to the hooks service, the one
 public endpoint that receives Linear's webhooks. It proves each watch with
 the developer's own access token, renews the lease every 30 minutes, and
 when the service rings for an issue it re-reads it as the developer,
@@ -206,7 +206,7 @@ ten minutes" at a glance:
   "Stewards"): its teams by key, and its issues counted, listed by key only
   when opened. Anything it asked for that is not leased is called out under
   it with the reason: a team the connected user cannot see, an issue key not
-  resolved yet or not visible, or a lease bb-gate-hooks refused in the last
+  resolved yet or not visible, or a lease the hooks service refused in the last
   hour. The CLI names at most twenty issues; `--json` has them all.
 - One row per watch: the issue (linking to Linear, with the state the watch
   last saw), the thread (linking to it), age, how many times it has been
@@ -225,10 +225,8 @@ Checks and wakes are counted in the watch's row (`checks`, `wakes`,
 rate); doorbell and sweep counts are in memory and start over when the
 server does.
 
-`BB_HOOKS_URL` is the cluster-internal address of bb-gate-hooks
-(`http://bb-gate-hooks.bb-gate-production.svc:8081` in bb-gate's backend
-template). It is read from the server's environment only; there is no
-setting. Without it, `linear_watch_issue` returns an error saying watching
+`BB_HOOKS_URL` is the address of the hooks service. It is read from the
+server's environment only; there is no setting. Without it, `linear_watch_issue` returns an error saying watching
 is not available on this server, no background service is started, and
 the other tools work as before. There is deliberately no polling fallback:
 re-reading the issue later is what the agent would do anyway.
@@ -269,18 +267,18 @@ is signed and visible in that thread's timeline.
 
 ## The OAuth application
 
-One Linear OAuth application serves every developer, because bb-gate puts
-every server behind one hostname. Create it once in Linear under Settings →
+One Linear OAuth application can serve every developer when the servers
+share one hostname. Create it once in Linear under Settings →
 API → OAuth applications:
 
 | Field | Value |
 |---|---|
-| Callback URL | `https://<bb host>/api/v1/plugins/linear/http/connect/callback` — for the team, `https://bb.boreray-eel.ts.net/api/v1/plugins/linear/http/connect/callback` |
+| Callback URL | `https://<bb host>/api/v1/plugins/linear/http/connect/callback` |
 | Public | Yes. The plugin uses PKCE and sends no client secret. A developer can connect a workspace other than the one that owns the application only if the application allows installs from other workspaces. |
 
 Then give every server the application's client ID through the
 `LINEAR_CLIENT_ID` environment variable, the way thread-briefs takes
-`THREAD_BRIEFS_BASE_URL` (in bb-gate, a plain value in the backend template).
+`THREAD_BRIEFS_BASE_URL`.
 The plugin reads it as the `clientId` setting's default, so nobody types it;
 a stored setting still wins for a server that connects through a different
 application. The ID is not a secret: the application is public and PKCE
@@ -293,7 +291,7 @@ each workspace on its own; a refresh that fails is reported to the agent as
 "connect again". Disconnect revokes the token at Linear.
 
 A watch on an issue in another workspace is only as prompt as that
-workspace's webhooks: bb-gate-hooks hears of it only if the application's
+workspace's webhooks: the hooks service hears of it only if the application's
 webhook delivers that workspace's events. Without them the watch still
 works, through the ten-minute baseline re-check.
 
@@ -311,7 +309,7 @@ works, through the ten-minute baseline re-check.
 | Environment | Meaning |
 |---|---|
 | `LINEAR_CLIENT_ID` | Default for `clientId`. |
-| `BB_HOOKS_URL` | Where bb-gate-hooks listens for subscribers. Enables `linear_watch_issue`. |
+| `BB_HOOKS_URL` | Where the hooks service listens for subscribers. Enables `linear_watch_issue`. |
 
 ## Development
 

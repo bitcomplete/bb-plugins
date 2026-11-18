@@ -142,7 +142,7 @@ Two tools are yours; everything else you do with the tools every thread has.
   credential, even when the ticket or spec says the owner produces or seals
   it by hand; such spec wording is corrected at spec approval, never
   followed. A by-hand step outside the repos the feature needs to work — an
-  app scope, a webhook, a registry entry, a tailnet rule — is a `configure`
+  app scope, a webhook, a registry entry, a firewall rule — is a `configure`
   escalation raised in the spec turn (`steward_report { escalate: { kind:
   "decision", … } }`, which the project steward forwards with `resolution:
   "done"`), never a README line or a closing-comment follow-up; at wrap-up a
@@ -150,7 +150,7 @@ Two tools are yours; everything else you do with the tools every thread has.
   provide-secret whose form answer is "unchanged" has not provided the
   value: raise that step again with `steward_report { escalate: { kind:
   "decision", … } }` rather than settling it. A step that adds or
-  widens an app scope, a token or a tailnet rule is the user's to grant: the
+  widens an app scope, a token or a firewall rule is the user's to grant: the
   project steward forwards it under the "Granting a new credential, token or
   cluster access to any server or agent, or widening what an existing one
   can reach" decision, and never decides it itself. Never paste a secret, and
@@ -670,11 +670,11 @@ you as an `approval` escalation the plugin files: approve it with
 `steward_update { binding, approve: true }`, which closes it, or decline
 with `guidance` + `resolve` saying what must change. Fail checklist item 5
 when the spec leaves a by-hand step outside the repos the feature needs —
-an app scope, a webhook, a registry entry, a tailnet rule — as a README line
+an app scope, a webhook, a registry entry, a firewall rule — as a README line
 or a follow-up rather than a `configure` escalation raised in the spec
 turn, and decline until it is one; a provide-secret whose form answer is
 "unchanged" has not provided the value, so the step must be raised again
-rather than settling. When that step adds or widens an app scope, a token or a tailnet
+rather than settling. When that step adds or widens an app scope, a token or a firewall
 rule, forward it to the user under the "Granting a new credential, token or
 cluster access to any server or agent, or widening what an existing one can
 reach" decision; never decide it yourself. Your approval wake
@@ -836,7 +836,7 @@ when asked to "set up stewards".
    ```json
    {
      "version": 2,
-     "roles": { "ops": { "k8sNamespaces": ["bb-gate-production"], "sentry": { "projects": [{ "org": "acme", "project": "web" }] }, "alertmanager": { "namespaces": ["bb-gate-production"] }, "dependabot": "all", "pulls": [{ "repo": "bitcomplete/bc-prod", "match": { "title": "Update */bc-prod.yaml", "branch": "update-*-bc-prod-yaml-*", "paths": ["projects/*/bc-prod.yaml"] }, "playbook": "sync-prs" }] } },
+     "roles": { "ops": { "k8sNamespaces": ["web-production"], "sentry": { "projects": [{ "org": "acme", "project": "web" }] }, "alertmanager": { "namespaces": ["web-production"] }, "dependabot": "all", "pulls": [{ "repo": "acme/deploy", "match": { "title": "Update */config.yaml", "branch": "update-*-config-yaml-*", "paths": ["projects/*/config.yaml"] }, "playbook": "sync-prs" }] } },
      "holders": { "alice": ["ops", "projectSteward"] }
    }
    ```
@@ -927,7 +927,7 @@ project.
 |---|---|
 | `bb stewards brief [<binding>] [--project <id>]` | The invariants for a steward: thread id, allowed actions, phase instructions, ready gate, guidance and holds, standing rules, and the worker spawn command. Defaults to the binding of the invoking thread |
 | `bb stewards spawn-flags [<binding>] [--project <id>]` | The full runnable `bb thread spawn …` command for a steward's workers, from the playbook's `models.worker` and the project environment |
-| `bb stewards survey [--json] [--project <id>]` | The mechanical facts onboarding works from: per repo the default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, deploy manifests, labels and cross-repo references; the Linear teams and workflow states; and what `.bb` already holds. A failed read is `available: false` |
+| `bb stewards survey [--json] [--project <id>]` | The mechanical facts onboarding works from: per repo the default branch, branch protection, languages, manifests, CI test and typecheck commands, Dockerfiles, labels and cross-repo references; the Linear teams and workflow states; and what `.bb` already holds. A failed read is `available: false` |
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
 | `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
 | `bb stewards needs [--all] [--json]` | What waits on the user, in the sidebar's order: open questions, escalations with the user, then needs; each line ends with the `bb stewards done` command that answers it. `--all` is the closed-needs diagnostic |
@@ -951,17 +951,16 @@ above which a steward is compacted after its turn.
   GitHub login is an assignee; a labelled pull request must be authored by
   its GitHub login, and a teammate's review requested from it. An
   unassigned labelled ticket is adopted nowhere. Rings need
-  bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
+  the hooks service (`BB_HOOKS_URL`); without it, adoption waits for the
   half-hourly sweep.
 - **An ops steward never wakes.** `bb stewards list` shows `cannot read the
   target` and `bb stewards check` says why: kubectl on the project's
-  machine cannot reach the cluster (not installed, the machine not on the
-  tailnet as the developer or a tagged node, no kubeconfig or context for
-  it; the role's `ops.context` picks one), or it may not list pods there. For a Sentry
+  machine cannot reach the cluster (not installed, no route to the cluster,
+  no kubeconfig or context for it; the role's `ops.context` picks one), or it may not list pods there. For a Sentry
   project: no token in the plugin's settings (the steward is woken once to
   ask for it), or the token cannot read the project. For an Alertmanager
   namespace: the Alertmanager API is unreachable at the plugin's URL (the
-  `alertmanagerUrl` setting, `ALERTMANAGER_URL`, or the tailnet hostname),
+  `alertmanagerUrl` setting or `ALERTMANAGER_URL`),
   or the hooks service predates the `alertmanager` source.
   Otherwise it takes a turn every `requeue-default`, healthy or not.
 - **A repo should not be stewarded.** Every GitHub repo in `repos.json` is,

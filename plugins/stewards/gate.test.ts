@@ -196,7 +196,7 @@ describe("a requested reviewer is the owner's delegation (BB-327)", () => {
   it("does not treat bots, teams or the viewer as delegates (criterion 8)", () => {
     // A team is `org/slug` as the source now emits it; a bot or the viewer is
     // never a delegate either.
-    for (const reviewers of [["dependabot[bot]"], ["bitcomplete/backend"], ["Platform Team"], ["jane"]]) {
+    for (const reviewers of [["dependabot[bot]"], ["acme/backend"], ["Platform Team"], ["jane"]]) {
       const g = prGate(delegatePull(reviewers));
       expect(g.delegates).toEqual([]);
       expect(g.needsOwnerApproval).toBe(true);

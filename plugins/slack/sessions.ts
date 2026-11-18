@@ -343,10 +343,10 @@ export function couldNotFetchLine(files: SessionFile[]): string {
   return `could not fetch ${shown.join(", ")}${more}`;
 }
 
-/** The image mime types the file endpoint forwards, mirroring bb-gate's slackImageMimes. */
+/** The image mime types the file endpoint forwards, mirroring the hooks service's slackImageMimes. */
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 /**
- * Non-`text/*` mime types the endpoint forwards, mirroring bb-gate's
+ * Non-`text/*` mime types the endpoint forwards, mirroring the hooks service's
  * slackTextMimes. Slack often labels a snippet `application/octet-stream` or
  * gives no mime type, so a code `filetype` counts too.
  */
@@ -369,7 +369,7 @@ const TEXT_MIMES = new Set([
   "application/csv",
   "application/toml",
 ]);
-/** Slack filetype labels that count as text, mirroring bb-gate's slackTextFiletypes. */
+/** Slack filetype labels that count as text, mirroring the hooks service's slackTextFiletypes. */
 const TEXT_FILETYPES = new Set([
   "text", "csv", "json", "markdown", "md", "javascript", "typescript", "python", "ruby", "go", "golang", "java", "c", "cpp", "csharp", "shell", "bash", "sh", "yaml", "yml", "xml", "html", "css", "sql", "rust", "kotlin", "swift", "php", "perl", "r", "scala", "diff", "patch", "dockerfile", "makefile", "toml", "ini", "cfg", "log", "tsv", "textile", "latex", "objectivec", "dart",
 ]);
@@ -381,7 +381,7 @@ export const TEXT_MAX_BYTES = 1 * 1024 * 1024;
 /**
  * How the file endpoint would treat a file, from the wake's metadata alone: an
  * `image` or `text` within its cap is worth fetching, `other` is not forwarded.
- * Mirrors `slackFileLimit` in bb-gate/hooks/slack.go, so the plugin and the
+ * Mirrors `slackFileLimit` in hooks/slack.go, so the plugin and the
  * endpoint agree on what to ask for and a doomed fetch is never sent.
  */
 export function fileKind(file: SessionFile): "image" | "text" | "other" {

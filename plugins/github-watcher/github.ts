@@ -902,7 +902,7 @@ const deploymentStatusNode = z.object({
 
 /**
  * The newest deployment status's state and the best link a person can open,
- * exactly as bb-gate-hooks builds a `deployment` doorbell's `url`: the
+ * exactly as the hooks service builds a `deployment` doorbell's `url`: the
  * status's `log_url`, then `environment_url`, then `target_url`, then the
  * status's own API URL; null when it set none (the caller then falls back to
  * the deployment's API URL). "" state when no status has been reported.

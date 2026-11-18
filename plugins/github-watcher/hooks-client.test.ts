@@ -4,7 +4,7 @@ import { createHooksLoop, HooksRequestError, readSse, SseParser, StreamIdleError
 const BASE = "http://hooks.test:8081";
 const MINUTE = 60_000;
 
-// A bb-gate-hooks whose stream and subscribe endpoint a test drives.
+// A the hooks service whose stream and subscribe endpoint a test drives.
 function fakeHooks() {
   const encoder = new TextEncoder();
   type Stream = { send(text: string): void; end(): void; closed: boolean };
@@ -218,16 +218,16 @@ describe("the loop", () => {
     hooks.last().send(hooks.doorbell("i-1"));
     hooks.last().send(hooks.doorbell("acme/widgets", { kind: "repo" }));
     hooks.last().send(hooks.doorbell("acme/widgets#4", { kind: "dependabot_alert" }));
-    const workflowRun = { workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "abc123", run_attempt: 1 };
-    hooks.last().send(hooks.doorbell("acme/bb-gate#42", { kind: "workflow_run", unit: "acme/bb-gate", workflow_run: workflowRun }));
+    const workflowRun = { workflow: ".github/workflows/build.yaml", name: "app", conclusion: "failure", url: "https://github.com/acme/web/actions/runs/42", sha: "abc123", run_attempt: 1 };
+    hooks.last().send(hooks.doorbell("acme/web#42", { kind: "workflow_run", unit: "acme/web", workflow_run: workflowRun }));
     hooks.last().send(hooks.doorbell("i-9", { source: "linear" }));
     hooks.last().send("event: doorbell\ndata: not json\n\n");
     hooks.last().send(hooks.doorbell("i-2", { action: "remove", unit: "" }));
     await tick();
-    expect(s.doorbells).toEqual(["i-1", "acme/widgets#4", "acme/bb-gate#42", "i-2"]);
+    expect(s.doorbells).toEqual(["i-1", "acme/widgets#4", "acme/web#42", "i-2"]);
     expect(s.doorbellKinds).toEqual(["issue", "dependabot_alert", "workflow_run", "issue"]);
     // The unit comes along when the service names one, and the run object with it.
-    expect(s.units).toEqual(["acme/widgets", "acme/widgets", "acme/bb-gate", null]);
+    expect(s.units).toEqual(["acme/widgets", "acme/widgets", "acme/web", null]);
     expect(s.workflowRuns).toEqual([undefined, undefined, workflowRun, undefined]);
     expect(s.logs.join("\n")).not.toContain("tok-1");
 
@@ -436,7 +436,7 @@ describe("the loop", () => {
     await tick(1);
     expect(hooks.streams[0]!.closed).toBe(true);
     expect(s.loop.connected).toBe(false);
-    expect(s.logs.some((l) => l.includes("no bytes from bb-gate-hooks for 60 s"))).toBe(true);
+    expect(s.logs.some((l) => l.includes("no bytes from the hooks service for 60 s"))).toBe(true);
     await tick(1000);
     expect(hooks.streams).toHaveLength(2);
     s.controller.abort();

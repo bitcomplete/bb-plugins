@@ -8,7 +8,7 @@
 // - `sourceContract` is served by a source plugin and called by stewards: a
 //   snapshot of one entity, validation of a project's configuration against
 //   the source, the entities a nightly pass may adopt, and the set of units
-//   and entities the source should lease on bb-gate-hooks and ring stewards
+//   and entities the source should lease on the hooks service and ring stewards
 //   about.
 // - `stewardsContract` is served by stewards and called by a source plugin:
 //   a ring when something stewards cares about may have changed, and an
@@ -34,8 +34,8 @@ export const REPO_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
 export const SOURCE_PLUGIN_IDS: Record<Source, string> = { linear: "linear", github: "github-watcher", local: "stewards" };
 
 /**
- * A GitHub Deployment, as bb-gate-hooks forwards it on a `deployment`
- * doorbell (bb-gate/docs/hooks.md). The doorbell's entity id is
+ * A GitHub Deployment, as the hooks service forwards it on a `deployment`
+ * doorbell (hooks.md). The doorbell's entity id is
  * `owner/repo#<id>` and its unit is the repository; this object is the one
  * piece of a doorbell that is not in the entity name, because a deployment's
  * ref and state are what a subscriber decides on. `state` is empty on a bare
@@ -55,8 +55,8 @@ export const deploymentSchema = z
 export type Deployment = z.infer<typeof deploymentSchema>;
 
 /**
- * A GitHub Actions workflow run, as bb-gate-hooks forwards it on a
- * `workflow_run` doorbell (bb-gate/docs/hooks.md). The doorbell's entity id
+ * A GitHub Actions workflow run, as the hooks service forwards it on a
+ * `workflow_run` doorbell (hooks.md). The doorbell's entity id
  * is `owner/repo#<run id>` and its unit is the repository, leased the same
  * way as a deployment (`deployment_repo`). `workflow` is the workflow's file
  * path and `name` its name, either of which a playbook may match;
@@ -556,13 +556,13 @@ export const sourceContract = {
   },
   /**
    * The units and entities stewards wants to hear about. Replaces the
-   * previous set. The source leases them on bb-gate-hooks and rings stewards
+   * previous set. The source leases them on the hooks service and rings stewards
    * for every doorbell that names one of the entities or falls in one of the
    * units. Only stewards may call it.
    *
    * `dependabot` names repositories whose Dependabot alert doorbells stewards
    * wants. It is separate from `units` because a repository lease does not
-   * receive alert doorbells (bb-gate/docs/hooks.md): the github plugin leases
+   * receive alert doorbells (hooks.md): the github plugin leases
    * each as a `dependabot_repo`. Linear ignores it.
    *
    * `deployment` names repositories whose GitHub Deployment doorbells
@@ -684,8 +684,8 @@ export const SESSION_TEXT_CHARS = 20_000;
 const personSchema = z.object({ id: z.string().max(200), name: z.string().max(200) });
 
 /**
- * An `@bb` mention on a Linear issue, as bb-gate-hooks routed it to this
- * server (bb-gate/docs/hooks.md, "The wake"). linear passes it to stewards,
+ * An `@bb` mention on a Linear issue, as the hooks service routed it to this
+ * server (hooks.md, "The wake"). linear passes it to stewards,
  * which hands it to a steward; the steward answers on the session with
  * linear's `linear_session_reply`.
  */

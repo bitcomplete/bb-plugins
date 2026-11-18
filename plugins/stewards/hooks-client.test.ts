@@ -4,7 +4,7 @@ import { createHooksLoop, HooksRequestError, readSse, SseParser, StreamIdleError
 const BASE = "http://hooks.test:8081";
 const MINUTE = 60_000;
 
-// A bb-gate-hooks whose stream and subscribe endpoint a test drives.
+// A the hooks service whose stream and subscribe endpoint a test drives.
 function fakeHooks() {
   const encoder = new TextEncoder();
   type Stream = { send(text: string): void; end(): void; closed: boolean };
@@ -421,12 +421,12 @@ describe("the loop", () => {
     const hooks = fakeHooks();
     // The pre-BB-314 service rejects a tokenless subscribe with `bad request` before it looks up the source.
     hooks.state.answer = () => new Response("bad request\n", { status: 400 });
-    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "bb-gate-production" }] });
+    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "web-production" }] });
     await tick();
     hooks.last().send(hooks.hello("c_1"));
     await tick();
     // The subscribe body carries no token at all, and the source is named.
-    expect(hooks.subscribes).toEqual([{ connection: "c_1", source: "alertmanager", token: "", watches: [{ kind: "namespace", id: "bb-gate-production" }] }]);
+    expect(hooks.subscribes).toEqual([{ connection: "c_1", source: "alertmanager", token: "", watches: [{ kind: "namespace", id: "web-production" }] }]);
     expect(s.loop.connected).toBe(false);
     expect(s.loop.status().sourceProblem).toBe("unknown");
     expect(s.logs.filter((l) => l.includes("does not know the alertmanager source"))).toHaveLength(1);
@@ -448,7 +448,7 @@ describe("the loop", () => {
   it("says once when the service has no adapter configured (503), then leases when it does", async () => {
     const hooks = fakeHooks();
     hooks.state.answer = () => new Response("not configured\n", { status: 503 });
-    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "bb-gate-production" }] });
+    const s = start(hooks, { source: "alertmanager", token: null, watchIds: () => [{ kind: "namespace", id: "web-production" }] });
     await tick();
     hooks.last().send(hooks.hello("c_1"));
     await tick();
@@ -526,7 +526,7 @@ describe("the loop", () => {
     await tick(1);
     expect(hooks.streams[0]!.closed).toBe(true);
     expect(s.loop.connected).toBe(false);
-    expect(s.logs.some((l) => l.includes("no bytes from bb-gate-hooks for 60 s"))).toBe(true);
+    expect(s.logs.some((l) => l.includes("no bytes from the hooks service for 60 s"))).toBe(true);
     await tick(1000);
     expect(hooks.streams).toHaveLength(2);
     s.controller.abort();

@@ -1,8 +1,8 @@
 // The ops kind's Alertmanager source (BB-314): a Kubernetes namespace's
 // Prometheus Alertmanager alerts, read from the v2 API through the plugin's
 // Alertmanager URL. The API has no authentication and no per-user tokens, so
-// this reader holds no token and the bb-gate-hooks `alertmanager` source
-// admits a namespace lease without one (bb-gate/docs/hooks.md, "Alertmanager").
+// this reader holds no token and the hooks service's `alertmanager` source
+// admits a namespace lease without one (the hooks contract, "Alertmanager").
 //
 // Two halves. The reader (`createAlertmanagerReader`) is the only thing that
 // talks to Alertmanager: the namespace's current alerts and one alert by
@@ -20,24 +20,19 @@ import { z } from "zod";
 import { redactLine, type AlertmanagerTarget, type FingerprintRow, type OpsTarget, type Sighting, type TicketState } from "./ops.js";
 import type { Change } from "./reconcile.js";
 
-/**
- * The Alertmanager v2 API root a non-cluster server reads: the tailnet
- * hostname. A cluster server reaches the in-cluster Service instead, which
- * `ALERTMANAGER_URL` (bb-gate's backend template) sets.
- */
-export const DEFAULT_ALERTMANAGER_URL = "https://alertmanager.boreray-eel.ts.net";
-/** The environment variable a setting-less server falls back to, like voice-transcription's key. */
+/** The environment variable a server with no setting reads its Alertmanager URL from, like voice-transcription's key. */
 export const ALERTMANAGER_URL_ENV = "ALERTMANAGER_URL";
 
 /**
  * The effective Alertmanager URL: the plugin setting when it is set, else
- * `ALERTMANAGER_URL`, else the tailnet hostname. A cluster server gets the
- * in-cluster Service from the env; a developer's non-cluster server gets the
- * tailnet hostname. There is no token anywhere.
+ * `ALERTMANAGER_URL`, else null. A server reads whatever URL its operator
+ * configured; there is no built-in default, so an Alertmanager target with
+ * neither the setting nor the env var reports a clear error. There is no
+ * token anywhere.
  */
-export function resolveAlertmanagerUrl(setting: string | null | undefined, env: string | null | undefined): string {
+export function resolveAlertmanagerUrl(setting: string | null | undefined, env: string | null | undefined): string | null {
   const chosen = (setting ?? "").trim() || (env ?? "").trim();
-  return chosen === "" ? DEFAULT_ALERTMANAGER_URL : chosen;
+  return chosen === "" ? null : chosen;
 }
 
 /** Alerts read per look; the rest are counted. */

@@ -5,7 +5,7 @@ import { createGitHubPlugin, TOKEN_CACHE_MS } from "./server.js";
 import { signature, WATCH_LIMIT } from "./watch.js";
 
 const API_URL = "https://api.github.test";
-const HOOKS_URL = "http://bb-gate-hooks.test:8081";
+const HOOKS_URL = "http://hooks.test:8081";
 
 // A pull request as GitHub currently has it; tests change it and ring the doorbell.
 const pullNode = (over: Record<string, unknown> = {}) => ({
@@ -163,7 +163,7 @@ function fakeGitHub() {
   return { fetchImpl, calls, state };
 }
 
-// A bb-gate-hooks whose event stream a test writes to and whose subscribe answers it scripts.
+// A the hooks service whose event stream a test writes to and whose subscribe answers it scripts.
 function fakeHooks() {
   const encoder = new TextEncoder();
   const streams: Array<{ send(text: string): void; closed: boolean }> = [];
@@ -256,7 +256,7 @@ const issueNode = (over: Record<string, unknown> = {}) => ({
 const WITH_HOOKS = { env: { BB_HOOKS_URL: HOOKS_URL } };
 
 describe("the tool", () => {
-  it("is the one tool, and is refused with a reason on a server without bb-gate-hooks, starting no service", async () => {
+  it("is the one tool, and is refused with a reason on a server without the hooks service, starting no service", async () => {
     const { harness, tool, text } = await setup();
     expect(harness.registrations.agentTools.map((t: { name: string }) => t.name)).toEqual(["github_watch"]);
     const result = await tool({ ref: "Acme/Widgets#12" });
@@ -819,7 +819,7 @@ describe("stewards' source contract", () => {
   it("reads a repository's deployments for one environment, newest first, each with its latest status and a person's link (BB-59)", async () => {
     const w = await setup();
     // GitHub's deployment object carries its own API URL; the link a person
-    // opens is on the status (`log_url`), exactly as bb-gate-hooks builds a
+    // opens is on the status (`log_url`), exactly as the hooks service builds a
     // doorbell.
     w.github.state.deployments = [
       { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", url: "https://api.github.com/repos/Acme/Widgets/deployments/6" },
@@ -847,12 +847,12 @@ describe("stewards' source contract", () => {
 
   it("reads a file at a ref, the newest commit for a path as of a time, a workflow run by number or id, and a compare (BB-132)", async () => {
     const w = await setup();
-    w.github.state.files["refs/heads/main:kploy/production/kustomization.yaml"] = 'images:\n  - name: bb-server\n    newTag: "7"\n';
-    w.github.state.commits["refs/heads/main docker/bb-server/Dockerfile 2026-10-30T18:05:00Z"] = "asofsha1";
-    expect(await w.harness.callRpc("sourceFileAtRef", { repo: "Acme/Widgets", path: "kploy/production/kustomization.yaml", ref: "refs/heads/main" }, STEWARDS)).toEqual({ content: 'images:\n  - name: bb-server\n    newTag: "7"\n', error: null });
+    w.github.state.files["refs/heads/main:deploy/kustomization.yaml"] = 'images:\n  - name: app\n    newTag: "7"\n';
+    w.github.state.commits["refs/heads/main docker/app/Dockerfile 2026-10-30T18:05:00Z"] = "asofsha1";
+    expect(await w.harness.callRpc("sourceFileAtRef", { repo: "Acme/Widgets", path: "deploy/kustomization.yaml", ref: "refs/heads/main" }, STEWARDS)).toEqual({ content: 'images:\n  - name: app\n    newTag: "7"\n', error: null });
     expect(await w.harness.callRpc("sourceFileAtRef", { repo: "Acme/Widgets", path: "missing", ref: "main" }, STEWARDS)).toEqual({ content: null, error: null });
     expect(await w.harness.callRpc("sourceFileAtRef", { repo: "widgets", path: "x", ref: "main" }, STEWARDS)).toMatchObject({ content: null, error: "widgets: not owner/repo" });
-    expect(await w.harness.callRpc("sourceLatestCommit", { repo: "Acme/Widgets", branch: "main", path: "docker/bb-server/Dockerfile", until: "2026-10-30T18:05:00Z" }, STEWARDS)).toEqual({ sha: "asofsha1", committedAt: null, error: null });
+    expect(await w.harness.callRpc("sourceLatestCommit", { repo: "Acme/Widgets", branch: "main", path: "docker/app/Dockerfile", until: "2026-10-30T18:05:00Z" }, STEWARDS)).toEqual({ sha: "asofsha1", committedAt: null, error: null });
     // An empty path asks for the branch tip: the fake answers defaultBranchRef when the qualified name is HEAD.
     w.github.state.commits["refs/heads/HEAD  2026-10-30T18:05:00Z"] = "tipsha00";
     expect(await w.harness.callRpc("sourceLatestCommit", { repo: "Acme/Widgets", branch: "HEAD", path: "", until: "2026-10-30T18:05:00Z" }, STEWARDS)).toEqual({ sha: "tipsha00", committedAt: null, error: null });
@@ -860,10 +860,10 @@ describe("stewards' source contract", () => {
     w.github.state.workflowRuns = [{ id: 11, run_number: 7, head_sha: "runhead1", run_started_at: "2026-10-30T18:00:00Z" }];
     w.github.state.jobs = [{ name: "build_and_push_image", started_at: "2026-10-30T18:05:00Z", conclusion: "success" }];
     const expectedRun = { id: 11, runNumber: 7, headSha: "runhead1", startedAt: "2026-10-30T18:00:00Z", jobs: [{ name: "build_and_push_image", startedAt: "2026-10-30T18:05:00Z", conclusion: "success" }] };
-    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", workflow: "bb-server.yaml", runNumber: 7 }, STEWARDS)).toEqual({ run: expectedRun, error: null });
+    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", workflow: "build.yaml", runNumber: 7 }, STEWARDS)).toEqual({ run: expectedRun, error: null });
     w.github.state.workflowRun = { id: 11, run_number: 7, head_sha: "runhead1", run_started_at: "2026-10-30T18:00:00Z" };
     expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", runId: 11 }, STEWARDS)).toEqual({ run: expectedRun, error: null });
-    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", workflow: "bb-server.yaml", runNumber: 999 }, STEWARDS)).toEqual({ run: null, error: null });
+    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", workflow: "build.yaml", runNumber: 999 }, STEWARDS)).toEqual({ run: null, error: null });
     // A compare, and a compare GitHub has no answer for.
     w.github.state.compares["mergesha1...main"] = "identical";
     expect(await w.harness.callRpc("sourceCompare", { repo: "Acme/Widgets", base: "mergesha1", head: "main" }, STEWARDS)).toEqual({ status: "identical", error: null });
@@ -916,8 +916,8 @@ describe("stewards' source contract", () => {
       expect(w.harness.logEntries.some((l) => l.message.includes("refused a lease on repository Acme/Gadgets for stewards (forbidden)"))).toBe(true);
       // The usage view says so too, under the name stewards asked for.
       expect((await interestOf()).unleased).toEqual([
-        { key: "Acme/Gadgets", reason: "refused by bb-gate-hooks (forbidden)" },
-        { key: "Acme/Widgets#12", reason: "refused by bb-gate-hooks (forbidden)" },
+        { key: "Acme/Gadgets", reason: "refused by the hooks service (forbidden)" },
+        { key: "Acme/Widgets#12", reason: "refused by the hooks service (forbidden)" },
       ]);
       expect(w.send).not.toHaveBeenCalled();
       service.controller.abort();
@@ -952,20 +952,20 @@ describe("stewards' source contract", () => {
       await tick();
       w.hooks.last().send(w.hooks.hello("c_1"));
       await tick();
-      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/web"] }, STEWARDS)).toEqual({ ok: true });
       await tick();
-      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "deployment_repo", id: "acme/bb-gate" }]]);
-      const deployment = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "success", url: "https://github.com/acme/bb-gate/actions/runs/9" };
-      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment })}\n\n`);
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "deployment_repo", id: "acme/web" }]]);
+      const deployment = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "success", url: "https://github.com/acme/web/actions/runs/9" };
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/web#7", unit: "Acme/web", deployment })}\n\n`);
       w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/Other#7", unit: "Acme/Other", deployment })}\n\n`);
       await tick(3000);
-      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#7", deployment } }]);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/web#7", deployment } }]);
       // A refused deployment_repo lease is a skip, logged as one.
       w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
       await tick(30 * 60_000);
       expect(w.harness.logEntries.some((l) => l.message.includes("this server skips deployment and workflow-run doorbells there"))).toBe(true);
       const interest = ((await w.harness.callRpc("watches", null)) as { interest: { unleased: Array<{ key: string; reason: string }> } }).interest;
-      expect(interest.unleased).toEqual([{ key: "acme/bb-gate", reason: "refused by bb-gate-hooks (forbidden); deployment and workflow-run doorbells are skipped" }]);
+      expect(interest.unleased).toEqual([{ key: "acme/web", reason: "refused by the hooks service (forbidden); deployment and workflow-run doorbells are skipped" }]);
       service.controller.abort();
       await service.done;
     });
@@ -976,14 +976,14 @@ describe("stewards' source contract", () => {
       await tick();
       w.hooks.last().send(w.hooks.hello("c_1"));
       await tick();
-      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/web"] }, STEWARDS)).toEqual({ ok: true });
       await tick();
-      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "deployment_repo", id: "acme/bb-gate" }]]);
-      const workflow_run = { workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "abc123", run_attempt: 1 };
-      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/bb-gate#42", unit: "Acme/bb-gate", workflow_run })}\n\n`);
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "deployment_repo", id: "acme/web" }]]);
+      const workflow_run = { workflow: ".github/workflows/build.yaml", name: "app", conclusion: "failure", url: "https://github.com/acme/web/actions/runs/42", sha: "abc123", run_attempt: 1 };
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/web#42", unit: "Acme/web", workflow_run })}\n\n`);
       w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/Other#42", unit: "Acme/Other", workflow_run })}\n\n`);
       await tick(3000);
-      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#42", workflow_run: { ...workflow_run, startedAt: null } } }]);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/web#42", workflow_run: { ...workflow_run, startedAt: null } } }]);
       service.controller.abort();
       await service.done;
     });
@@ -997,12 +997,12 @@ describe("stewards' source contract", () => {
       await tick();
       w.hooks.last().send(w.hooks.hello("c_1"));
       await tick();
-      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/web"] }, STEWARDS)).toEqual({ ok: true });
       await tick();
       // A new connection re-checks; the deployment interest is rung once.
       w.hooks.last().send(w.hooks.hello("c_2"));
       await tick(3000);
-      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "acme/bb-gate" } }]);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "acme/web" } }]);
       service.controller.abort();
       await service.done;
     });
@@ -1016,14 +1016,14 @@ describe("stewards' source contract", () => {
       await tick();
       w.hooks.last().send(w.hooks.hello("c_1"));
       await tick();
-      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/web"] }, STEWARDS)).toEqual({ ok: true });
       await tick();
-      const inProgress = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "in_progress", url: "https://github.com/acme/bb-gate/actions/runs/9" };
+      const inProgress = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "in_progress", url: "https://github.com/acme/web/actions/runs/9" };
       const success = { ...inProgress, state: "success" };
-      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment: inProgress })}\n\n`);
-      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment: success })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/web#7", unit: "Acme/web", deployment: inProgress })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/web#7", unit: "Acme/web", deployment: success })}\n\n`);
       await tick(3000);
-      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#7", deployment: success } }]);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/web#7", deployment: success } }]);
       service.controller.abort();
       await service.done;
     });

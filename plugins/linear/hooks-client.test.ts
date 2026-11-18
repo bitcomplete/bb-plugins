@@ -4,7 +4,7 @@ import { createHooksLoop, HooksRequestError, postActivity, readSse, SseParser, S
 const BASE = "http://hooks.test:8081";
 const MINUTE = 60_000;
 
-// A bb-gate-hooks whose stream and subscribe endpoint a test drives.
+// A the hooks service whose stream and subscribe endpoint a test drives.
 function fakeHooks() {
   const encoder = new TextEncoder();
   type Stream = { send(text: string): void; end(): void; closed: boolean };
@@ -495,7 +495,7 @@ describe("the loop", () => {
     await tick(1);
     expect(hooks.streams[0]!.closed).toBe(true);
     expect(s.loop.connected).toBe(false);
-    expect(s.logs.some((l) => l.includes("no bytes from bb-gate-hooks for 60 s"))).toBe(true);
+    expect(s.logs.some((l) => l.includes("no bytes from the hooks service for 60 s"))).toBe(true);
     await tick(1000);
     expect(hooks.streams).toHaveLength(2);
     s.controller.abort();
@@ -602,7 +602,7 @@ describe("the loop", () => {
     it("replies over the current connection with no token, and refuses without one", async () => {
       const hooks = fakeHooks();
       const s = start(hooks);
-      await expect(s.loop.reply("sess-1", { kind: "response", body: "Done." }, new AbortController().signal)).rejects.toThrow(/not connected to bb-gate-hooks/u);
+      await expect(s.loop.reply("sess-1", { kind: "response", body: "Done." }, new AbortController().signal)).rejects.toThrow(/not connected to the hooks service/u);
       await tick();
       hooks.last().send(hooks.hello("c_1"));
       await tick();

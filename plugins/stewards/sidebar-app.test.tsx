@@ -980,7 +980,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
   it("keeps a waiting effort in In flight, grey, reading the next action (BB-109)", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ waitingOn: "bb-gate#88", phase: "In Progress", status: { actor: "steward", nextAction: "Wait for checks", at: 1 } })] }) } as never,
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ waitingOn: "web#88", phase: "In Progress", status: { actor: "steward", nextAction: "Wait for checks", at: 1 } })] }) } as never,
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(lineTwo(slot, "Fix login")).toBe("ticket · In Progress · Wait for checks");

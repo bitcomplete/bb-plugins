@@ -477,8 +477,8 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "a", needsUser: true, waitingOn: "x" }))).toBe("needs you");
     // 2. a free-text wait is not a prefix (BB-109): it reads the next action
     // verbatim, and a running worker reads the count, never `blocked on …`.
-    expect(effortPhrase(effort({ key: "b", waitingOn: "bb-gate#88", statusNextAction: "Wait for checks" }))).toBe("Wait for checks");
-    expect(effortPhrase(effort({ key: "b2", waitingOn: "bb-gate#88" }))).toBe("no report yet");
+    expect(effortPhrase(effort({ key: "b", waitingOn: "web#88", statusNextAction: "Wait for checks" }))).toBe("Wait for checks");
+    expect(effortPhrase(effort({ key: "b2", waitingOn: "web#88" }))).toBe("no report yet");
     expect(effortPhrase(effort({ key: "b3", waitingOn: "a review", runningWorkers: 1 }))).toBe("1 worker running");
     // 3. hold
     expect(effortPhrase(effort({ key: "c", hold: "a freeze", holdBehind: ["BB-57", "BB-61"] }))).toBe("held behind BB-57, BB-61");
@@ -499,7 +499,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "i", deployment: "merged" }))).toBe("deploying");
     expect(effortPhrase(effort({ key: "j", deployment: "deployed" }))).toBe("deployed");
     expect(effortPhrase(effort({ key: "k", deployment: "failed" }))).toBe("deploy failed");
-    expect(effortPhrase(effort({ key: "i2", statusActor: "other", deployment: "merged", statusNextAction: "Wait for a bb-server build" }))).toBe("deploying");
+    expect(effortPhrase(effort({ key: "i2", statusActor: "other", deployment: "merged", statusNextAction: "Wait for an app build" }))).toBe("deploying");
     expect(effortPhrase(effort({ key: "i3", statusActor: "other", runningWorkers: 1, deployment: "merged" }))).toBe("1 worker running");
     // 7. nextAction, verbatim for every actor (BB-86): the external wait is not a prefix.
     expect(effortPhrase(effort({ key: "l", statusNextAction: "wait for the review" }))).toBe("wait for the review");

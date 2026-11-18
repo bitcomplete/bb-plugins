@@ -39,7 +39,7 @@ describe("the readability checker", () => {
   it("accepts a clean set of the three shown parts", () => {
     expect(
       readabilityProblems({
-        need: "Approve bb-gate#74: Slack bot join endpoint",
+        need: "Approve web#74: Slack bot join endpoint",
         context: "What it changes: Slack bot join endpoint. Reviewer's verdict: approved.",
         why: "The decide list marks this the user's: Production infrastructure.",
       }),
@@ -70,7 +70,7 @@ describe("the readability checker", () => {
 describe("every plugin-composed item reads in three plain parts", () => {
   it("an approve-pr item names the title, verdict and deciding entry", () => {
     const parts = approvePrNeedParts({
-      key: "bitcomplete/bb-gate#74",
+      key: "acme/web#74",
       title: "Slack bot join endpoint",
       shortSha: "abc1234",
       verdict: "approved",
@@ -93,12 +93,12 @@ describe("every plugin-composed item reads in three plain parts", () => {
   });
 
   it("a merge item states the gate rule", () => {
-    const parts = mergeNeedParts({ key: "bitcomplete/bb-gate#74", lane: "no-review" });
+    const parts = mergeNeedParts({ key: "acme/web#74", lane: "no-review" });
     expect(readabilityProblems({ need: parts.what, context: parts.how, why: parts.why })).toEqual([]);
   });
 
   it("a deps adoption decide item is short and readable", () => {
-    const need = adoptionNeedLine("SC-111", "bitcomplete/santaclaw", ["medium", "high"]);
+    const need = adoptionNeedLine("SC-111", "acme/sandbox", ["medium", "high"]);
     expect(readabilityProblems({ need, context: adoptionHow(true), why: ADOPTION_WHY })).toEqual([]);
   });
 

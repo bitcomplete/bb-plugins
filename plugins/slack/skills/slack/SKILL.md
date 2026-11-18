@@ -8,7 +8,7 @@ description: Reply in Slack on the conversation that woke a bb thread, or diagno
 The `slack` plugin lets a developer talk to their own bb from Slack. A DM to
 the team's `bb` app reaches the server of the Slack user who sent it as an
 `event: session` wake; the plugin starts (or continues) one bb thread per
-Slack conversation and posts the reply back through bb-gate-hooks, which holds
+Slack conversation and posts the reply back through the hooks service, which holds
 the app's bot token. The pod never holds a Slack bot credential. Opening the
 assistant pane only posts a canned one-line greeting and starts no bb thread;
 the first real message starts it. A message sent while bb is working **steers
@@ -34,7 +34,7 @@ An untagged reply arrives only after a Slack admin subscribes the app to
 until then bb never sees it.
 
 An image or a small text-like file attached to a Slack message is fetched from
-bb-gate-hooks (`GET /v1/slack/sessions/{session}/files/{id}`) and arrives in
+the hooks service (`GET /v1/slack/sessions/{session}/files/{id}`) and arrives in
 the thread as an attachment part alongside the text, before the turn starts:
 images (png, jpeg, gif, webp) up to 10 MiB and text-like files up to 1 MiB.
 Anything else — a binary, a video, a file over its cap, or a file whose fetch
@@ -65,7 +65,7 @@ silently when it is clearly between other people.
 | `slack_ack` | Acknowledge a message that needs no answer without posting anything, so no error reply fires for the quiet turn. Pass `session` only when a thread has more than one conversation. |
 | `slack_start_conversation` | Open a new Slack DM, group DM or channel thread as the owner and make this thread its watcher, so replies land back here. Pass `text` and exactly one of `users` (Slack names or ids) or `channel` (a `C…`/`G…` id). |
 
-- The reply is posted by bb-gate-hooks as the app; the tool sends only the
+- The reply is posted by the hooks service as the app; the tool sends only the
   connection id and the text, so never put a token or secret in it.
 - Write the reply in Markdown if that is what comes naturally: `**bold**`,
   `*italic*`, `~~strike~~`, `# Heading`, `- item`, `[label](url)` and fenced
@@ -85,7 +85,7 @@ silently when it is clearly between other people.
   error reply.
 - The session is leased to this server: the wake carries an opaque capability
   that the plugin echoes to `POST /v1/subscribe`, and the lease is renewed at
-  half its life. Reply rights therefore survive a restart of bb-gate-hooks and
+  half its life. Reply rights therefore survive a restart of the hooks service and
   are not limited to a day.
 - If the turn that handled a tagged wake ends without calling `slack_reply`
   or `slack_ack`, the plugin posts one error reply itself, so the developer is
@@ -149,13 +149,13 @@ the app reinstalled; until then a multi-user DM is refused with
 - "This thread is not answering a Slack conversation": the wake has no session
   mapped to this thread, or the bb thread it was mapped to was deleted and the
   mapping was forgotten. A new Slack message starts a new thread.
-- "bb-gate-hooks refused: this Slack conversation is not routed to this
+- "the hooks service refused: this Slack conversation is not routed to this
   server's Slack user": the service did not route the session here and no
   live lease holds it. Nothing was posted.
-- "bb-gate-hooks says another bb server holds …": the session is leased to
+- "the hooks service says another bb server holds …": the session is leased to
   another server, so this one cannot renew or answer in it. The notice reply
   is best-effort; the server's log line is the reliable half.
-- "not connected to bb-gate-hooks": the server's stream is reconnecting, or
+- "not connected to the hooks service": the server's stream is reconnecting, or
   the server has no `BB_HOOKS_URL`. Try again, or ask the developer to check
   Settings → Plugins → Slack.
 - Settings → Plugins → Slack shows the connection as "Signed in as …" and the

@@ -11,7 +11,7 @@ import { templateHash } from "./template-stamp.js";
  * user sees.
  */
 const SECRET_REQUEST =
-  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, naming the variable and what it is for in `context`. The question is one line, as the sidebar row shows it, and is read by whoever decides, possibly the owner: write it for a person with no view of the thread; the evidence and reasoning go in `context`, and a question longer than 240 characters is refused. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. `secret` is the only resolution for a credential, even when the ticket or spec says the owner produces or seals it by hand; such spec wording is corrected at spec approval, never followed. A by-hand step outside the repos the feature needs to work — an app scope, a webhook, a registry entry, a tailnet rule — is a `configure` escalation raised in the spec turn (`steward_report { escalate: { kind: \"decision\", … } }`; the project steward forwards it with `resolution: \"done\"`), never a README line or a closing-comment follow-up; a step that adds or widens an app scope, a token or a tailnet rule is the user's to grant, forwarded under the project's \"new credential, token or access, or widening what an existing one can reach\" decision, never the project steward's; at wrap-up a still-open step keeps the binding open with `followThrough`, and a provide-secret whose form answer is \"unchanged\" has not provided the value: raise that step again with `steward_report { escalate: { kind: \"decision\", … } }` rather than settling it. Never paste the secret, and never a script for the user to run.";
+  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, naming the variable and what it is for in `context`. The question is one line, as the sidebar row shows it, and is read by whoever decides, possibly the owner: write it for a person with no view of the thread; the evidence and reasoning go in `context`, and a question longer than 240 characters is refused. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. `secret` is the only resolution for a credential, even when the ticket or spec says the owner produces or seals it by hand; such spec wording is corrected at spec approval, never followed. A by-hand step outside the repos the feature needs to work — an app scope, a webhook, a registry entry, a firewall rule — is a `configure` escalation raised in the spec turn (`steward_report { escalate: { kind: \"decision\", … } }`; the project steward forwards it with `resolution: \"done\"`), never a README line or a closing-comment follow-up; a step that adds or widens an app scope, a token or a firewall rule is the user's to grant, forwarded under the project's \"new credential, token or access, or widening what an existing one can reach\" decision, never the project steward's; at wrap-up a still-open step keeps the binding open with `followThrough`, and a provide-secret whose form answer is \"unchanged\" has not provided the value: raise that step again with `steward_report { escalate: { kind: \"decision\", … } }` rather than settling it. Never paste the secret, and never a script for the user to run.";
 
 /**
  * Every playbook that can start a worker carries this, next to its other
@@ -490,7 +490,7 @@ or an edit, so never run one. Where logs could not be read, diagnose from
 status and events, and say so in the ticket.
 
 For a Sentry project, the plugin reads it with its own Sentry token and
-bb-gate-hooks rings it the moment an issue is created or regresses; each
+the hooks service rings it the moment an issue is created or regresses; each
 wake carries the issues that are new, regressed or rung since the last
 look, with the title, culprit, permalink, event and user counts, first and
 last seen, and the latest event's stack trace. Your thread holds no Sentry
@@ -500,7 +500,7 @@ the wake says there is no token, raise the escalation it describes
 and nothing else.
 
 For an Alertmanager namespace, the plugin reads the Alertmanager v2 API
-through its own URL and bb-gate-hooks rings it the moment an alert fires or
+through its own URL and the hooks service rings it the moment an alert fires or
 resolves; each wake carries the alerts that are new, rung or resolved since
 the last look, with their labels, annotations and generator URL. Your
 thread holds no Alertmanager URL, so you cannot query Alertmanager: diagnose

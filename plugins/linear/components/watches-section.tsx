@@ -247,7 +247,7 @@ function HooksLine({ view }: { view: UsageView }) {
   if (!h.configured) {
     return (
       <p className="text-muted-foreground">
-        <Dot tone="off" /> Doorbells unavailable: this server has no bb-gate-hooks service (BB_HOOKS_URL is not set), so threads cannot watch.
+        <Dot tone="off" /> Doorbells unavailable: this server has no hooks service (BB_HOOKS_URL is not set), so threads cannot watch.
       </p>
     );
   }

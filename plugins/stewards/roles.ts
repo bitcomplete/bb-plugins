@@ -89,7 +89,7 @@ export function stripAuthorBotSuffix(pattern: string): string {
 /** A role's watches: namespaces, Sentry projects, Dependabot repos, pull watches, and where its tickets file. */
 export const roleOpsSchema = z
   .object({
-    k8sNamespaces: z.array(z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production")).max(50).default([]),
+    k8sNamespaces: z.array(z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as web-production")).max(50).default([]),
     /** The kubeconfig context kubectl uses on this person's machine; its current context when left out. */
     context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
     /** Where this person's ops tickets are filed (the first of linear.teams when left out): a Linear team key or a GitHub owner/repo. */
@@ -288,10 +288,10 @@ export function parseRolesFile(text: string): Parsed<RolesFile> {
 /** The k8s namespaces a role watches, which are read with kubectl. */
 export const roleK8sTargets = (role: Role | null): K8sTarget[] => (role?.ops?.k8sNamespaces ?? []).map((name) => ({ kind: "k8s-namespace", name }));
 
-/** The Sentry projects a role watches, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
+/** The Sentry projects a role watches, which are read with the plugin's Sentry token and rung by the hooks service. */
 export const roleSentryTargets = (role: Role | null): SentryTarget[] => (role?.ops?.sentry?.projects ?? []).map((p) => ({ kind: "sentry-project", org: p.org, project: p.project }));
 
-/** The Kubernetes namespaces a role watches for Alertmanager alerts, which are read through the plugin's Alertmanager URL and rung by bb-gate-hooks. */
+/** The Kubernetes namespaces a role watches for Alertmanager alerts, which are read through the plugin's Alertmanager URL and rung by the hooks service. */
 export const roleAlertmanagerTargets = (role: Role | null): AlertmanagerTarget[] => (role?.ops?.alertmanager?.namespaces ?? []).map((namespace) => ({ kind: "alertmanager", namespace }));
 
 /** The namespace, Sentry and Alertmanager targets a role watches; the Dependabot watch is separate because it defaults to every repo. */

@@ -157,10 +157,10 @@ describe("the single stored-gate read (BB-322)", () => {
   it("re-derives the decide mark from the changed files when the head moves", () => {
     const { s, b } = store();
     const decisions: BigDecision[] = [
-      { text: "A user entry", decide: "user", paths: ["bb-gate/hooks/hooks.go"] },
-      { text: "A project entry", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+      { text: "A user entry", decide: "user", paths: ["hooks/hooks.go"] },
+      { text: "A project entry", decide: "project", paths: ["hooks.md"] },
     ];
-    const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: head, ...green, files: ["bb-gate/docs/hooks.md"] });
+    const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: head, ...green, files: ["hooks.md"] });
     s.recordProjectApproval({ bindingId: b.id, headSha: head, entry: null, byThread: "thr_project", commentId: "pa1", verdict: "approved" });
     const i = input({
       binding: binding({ id: b.id, kind: "review" }),
@@ -175,7 +175,7 @@ describe("the single stored-gate read (BB-322)", () => {
     // The head moves and the changed files now match a `user` entry: the mark
     // is re-derived, the recorded project approval no longer counts, and the
     // gate is not met.
-    const moved = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: "ccccccc3", ...green, files: ["bb-gate/hooks/hooks.go"] });
+    const moved = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [ownerMarker, projectApprovalMarker("pa1")] }, { headSha: "ccccccc3", ...green, files: ["hooks/hooks.go"] });
     expect(assessedGate(s, b, moved, i.now + 1, decisions)).toMatchObject({ gateMet: false, decision: "user" });
   });
 

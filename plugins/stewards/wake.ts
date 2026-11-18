@@ -265,7 +265,7 @@ function deploymentInstructions(input: WakeInput): string | undefined {
   if (settled) {
     return (
       `Every pull request is merged and deployed (${where}). This is the last turn of the work: post one closing comment saying it is live and move the ticket to its terminal state, then end with steward_report without followThrough. ` +
-      `A by-hand step outside the repos that the feature needs to work — an app scope, a webhook, a registry entry, a tailnet rule — is not folded into the closing comment: keep the binding open with followThrough until its \`configure\` escalation is done, and if the spec turn never raised one, raise it now with \`steward_report { escalate: { kind: "decision", … } }\` for the project steward to forward with \`resolution: "done"\`. A provide-secret whose form answer is "unchanged" has not provided the value: raise that step again with \`steward_report { escalate: { kind: "decision", … } }\` rather than settling it. ` +
+      `A by-hand step outside the repos that the feature needs to work — an app scope, a webhook, a registry entry, a firewall rule — is not folded into the closing comment: keep the binding open with followThrough until its \`configure\` escalation is done, and if the spec turn never raised one, raise it now with \`steward_report { escalate: { kind: "decision", … } }\` for the project steward to forward with \`resolution: "done"\`. A provide-secret whose form answer is "unchanged" has not provided the value: raise that step again with \`steward_report { escalate: { kind: "decision", … } }\` rather than settling it. ` +
       `If a playbook says otherwise, keep it open with followThrough as usual.`
     );
   }
@@ -1758,7 +1758,7 @@ export function formatSessionWake(input: {
     "",
     confirmed === null
       ? `${w.action === "created" ? `${w.asker.name} mentioned @bb on ${w.issue.key}` : `${w.asker.name} followed up in the @bb session on ${w.issue.key}`}. ` +
-        `bb-gate-hooks routed it to this server because ${w.routedAs === "assignee" ? `${owner}, the issue's assignee, runs it` : `${w.asker.name}, who asked, runs it`}. This server acts as ${owner}.`
+        `the hooks service routed it to this server because ${w.routedAs === "assignee" ? `${owner}, the issue's assignee, runs it` : `${w.asker.name}, who asked, runs it`}. This server acts as ${owner}.`
       : `${owner} confirmed request ${confirmed.id} in the @bb session on ${w.issue.key}. This server acts as ${owner}.`,
   );
   out.push(

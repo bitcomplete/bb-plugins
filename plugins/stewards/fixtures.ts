@@ -116,11 +116,11 @@ export const parkedWorker = (over: Partial<Worker> = {}): Worker => ({
 });
 
 /** A Deployment's pod as the Kubernetes API lists it, its one container in a crash loop. */
-export const crashingPod = (name = "bb-gate-router-6d4f9c7b8-x2k4q", over: { restarts?: number; exitCode?: number; finishedAt?: string } = {}) => ({
+export const crashingPod = (name = "web-router-6d4f9c7b8-x2k4q", over: { restarts?: number; exitCode?: number; finishedAt?: string } = {}) => ({
   metadata: {
     name,
-    labels: { app: "bb-gate-router", "pod-template-hash": "6d4f9c7b8" },
-    ownerReferences: [{ kind: "ReplicaSet", name: "bb-gate-router-6d4f9c7b8", controller: true }],
+    labels: { app: "web-router", "pod-template-hash": "6d4f9c7b8" },
+    ownerReferences: [{ kind: "ReplicaSet", name: "web-router-6d4f9c7b8", controller: true }],
   },
   status: {
     phase: "Running",
@@ -137,8 +137,8 @@ export const crashingPod = (name = "bb-gate-router-6d4f9c7b8-x2k4q", over: { res
   },
 });
 
-export const healthyPod = (name = "bb-gate-hooks-7f8d9-abcde") => ({
-  metadata: { name, labels: { "pod-template-hash": "7f8d9" }, ownerReferences: [{ kind: "ReplicaSet", name: "bb-gate-hooks-7f8d9", controller: true }] },
+export const healthyPod = (name = "hooks-7f8d9-abcde") => ({
+  metadata: { name, labels: { "pod-template-hash": "7f8d9" }, ownerReferences: [{ kind: "ReplicaSet", name: "hooks-7f8d9", controller: true }] },
   status: {
     phase: "Running",
     conditions: [{ type: "Ready", status: "True", lastTransitionTime: "2026-10-14T10:00:00Z" }],

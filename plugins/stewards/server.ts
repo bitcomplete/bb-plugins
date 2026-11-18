@@ -5,7 +5,7 @@
 // The model is a controller. The spec (the playbook, the entity's own
 // description and spec comments, standing guidance) is the desired state; a
 // snapshot read through the linear and github-watcher plugins is the observed state;
-// a steward's turn is one reconcile. Rings from those plugins (bb-gate-hooks
+// a steward's turn is one reconcile. Rings from those plugins (the hooks service
 // doorbells, forwarded) and timers only say "look again". The mechanical tier
 // below looks, compares with the last observation, and wakes the steward only
 // when something actionable changed.
@@ -286,7 +286,7 @@ export interface StewardsDeps {
   git?: (input: { projectId: string; hostId: string | null; path: string; files: string[]; fetch: boolean }) => Promise<NativeGitRead>;
   /** The GitHub writer the page's Approve and Merge buttons use; the server's gh login by default. */
   github?: GithubWriter;
-  /** What reads Sentry and subscribes to bb-gate-hooks for it; global fetch by default. */
+  /** What reads Sentry and subscribes to the hooks service for it; global fetch by default. */
   fetch?: typeof fetch;
   /** Where BB_HOOKS_URL is read from; the process environment by default. */
   env?: Record<string, string | undefined>;
@@ -316,7 +316,7 @@ export const NAVIGATION_RESTORE_KEY = "sidebar.navigationRestore";
  * moment the image rolls, for people with the stewards list off too. Set each
  * preference to the bundled id on load; an explicit value (including the
  * stewards ids the footer toggle writes) is left alone. `bb.onInstall` does
- * not run for plugins baked into the `bb-server` image, so this runs on load.
+ * not run for plugins baked into a server image, so this runs on load.
  * Best-effort: a failure is logged and the sidebar keeps working.
  */
 export async function pinSidebarThreadListProvider(bb: BbPluginApi): Promise<void> {
@@ -1486,7 +1486,7 @@ export const STEWARDS_SETTINGS = {
     type: "string",
     secret: true,
     label: "Sentry token",
-    description: `A Sentry user auth token with the scopes ${TOKEN_SCOPES.join(" and ")}, for the ops stewards of sentry-project targets: the plugin reads each project's issues with it and proves its bb-gate-hooks leases with it. Created at Settings → Account → API → Auth Tokens in Sentry.`,
+    description: `A Sentry user auth token with the scopes ${TOKEN_SCOPES.join(" and ")}, for the ops stewards of sentry-project targets: the plugin reads each project's issues with it and proves its leases on the hooks service with it. Created at Settings → Account → API → Auth Tokens in Sentry.`,
   },
   sentryApiUrl: {
     type: "string",
@@ -1497,7 +1497,7 @@ export const STEWARDS_SETTINGS = {
   alertmanagerUrl: {
     type: "string",
     label: "Alertmanager API",
-    description: "The Alertmanager v2 API root the ops stewards of alertmanager targets read. Empty falls back to the ALERTMANAGER_URL environment variable, then to the tailnet hostname for a non-cluster server; a cluster server gets the in-cluster Service from the environment. The API takes no token.",
+    description: "The Alertmanager v2 API root the ops stewards of alertmanager targets read. Empty falls back to the ALERTMANAGER_URL environment variable; when neither is set, an alertmanager target reports a clear error. The API takes no token.",
   },
 } as const;
 
@@ -2385,7 +2385,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const b = store.binding(need.bindingId);
       if (b === null) return { ok: false, message: "That item's binding is gone." };
       const named = candidates.map((c) => c.trim()).filter((c) => c !== "");
-      // BB-358: a hooks that named near matches (or named none at all, on an
+      // BB-358: a hooks service that named near matches (or named none at all, on an
       // older hooks) reopens the ask-once question with one button per near
       // match and Not on Slack. The old name-list form keeps the BB-354
       // recovery: the three original choices with the names Slack returned.
@@ -3872,7 +3872,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           deployment: [...new Set(projects.flatMap((p) => deploymentTargets(p).map((t) => t.repo)))].sort(),
         },
         // The local source is stewards itself: it leases nothing on
-        // bb-gate-hooks, so its set is empty and the loop below never sends
+        // the hooks service, so its set is empty and the loop below never sends
         // it. Present only so the Record covers every Source (BB-361).
         local: { units: [], entities: [], dependabot: [], deployment: [] },
       };
@@ -4007,8 +4007,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The machine a project's threads run on: the host of its checkout.
      *
      * `{ type: "project-default" }` would leave it to core, which picks the
-     * server's own machine; a server with no host daemon of its own (bb-gate's)
-     * then fails every spawn with "Local host daemon is not initialized".
+     * server's own machine; a server with no host daemon of its own (a
+     * server-only deployment) then fails every spawn with "Local host daemon is not initialized".
      * A connected machine is preferred, then the default source. Null when the
      * project has no checkout bb knows of, and core's default is all there is.
      *
@@ -6498,7 +6498,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     //
     // A sentry-project target is read with the plugin's own Sentry token (a
     // secret setting), not through a source plugin: there is no sentry plugin,
-    // and the source contract has no use for one. bb-gate-hooks rings the
+    // and the source contract has no use for one. The hooks service rings the
     // binding the moment Sentry sees a new issue or a regression (the loop
     // below holds a `project` lease per target and an `issue` lease per issue
     // with a ticket); the look at every sweep and requeue is the backstop
@@ -6689,14 +6689,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
-    // The subscriber: one stream to bb-gate-hooks for the `sentry` source,
-    // proven with the plugin's token (bb-gate/docs/hooks.md, "Sentry"). A
+    // The subscriber: one stream to the hooks service for the `sentry` source,
+    // proven with the plugin's token (hooks.md, "Sentry"). A
     // project lease is sent as org/slug and leased under the slug, which is
     // what a doorbell carries as its unit; an issue lease is the issue id.
     // Without BB_HOOKS_URL, or without a token, nothing is leased and the
     // sweeps carry the watch.
     const hooksUrl = env[HOOKS_URL_ENV]?.trim() ?? "";
-    /** The leases bb-gate-hooks refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
+    /** The leases the hooks service refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
     let sentryRefused = new Map<string, string>();
 
     function sentryLeases(): Lease[] {
@@ -6745,7 +6745,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async onRejected(rejected: Rejection[]) {
         sentryRefused = new Map(rejected.map((r) => [`${r.kind} ${r.id}`, r.reason]));
-        for (const r of rejected) bb.log.warn(`stewards: bb-gate-hooks refused a Sentry ${r.kind} lease on ${r.id} (${r.reason}); only the periodic look sees it`);
+        for (const r of rejected) bb.log.warn(`stewards: the hooks service refused a Sentry ${r.kind} lease on ${r.id} (${r.reason}); only the periodic look sees it`);
       },
       async sweep() {
         // Coverage cannot be proven: every Sentry binding looks for itself.
@@ -6759,18 +6759,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // An alertmanager target is a Kubernetes namespace watched for Prometheus
     // Alertmanager alerts, read from the v2 API through the plugin's
     // Alertmanager URL. The API has no authentication and no per-user tokens,
-    // so the plugin holds no token: bb-gate-hooks admits a `namespace` lease
-    // without one (bb-gate/docs/hooks.md, "Alertmanager"), and the look at
+    // so the plugin holds no token: the hooks service admits a `namespace` lease
+    // without one (hooks.md, "Alertmanager"), and the look at
     // every sweep and requeue is the backstop when hooks are down. The
     // Alertmanager fingerprint is the fingerprint; a resolved alert is noted
     // on its ticket as a comment, never auto-closed.
 
-    const alertmanagerUrl = async (): Promise<string> => {
+    const alertmanagerUrl = async (): Promise<string | null> => {
       const value = (await settings.get()).alertmanagerUrl;
       const setting = typeof value === "string" ? value : "";
       return resolveAlertmanagerUrl(setting, env[ALERTMANAGER_URL_ENV] ?? null);
     };
-    const alertmanagerReader = async (): Promise<AlertmanagerReader> => createAlertmanagerReader(fetchImpl, { apiUrl: await alertmanagerUrl() });
+    const alertmanagerReader = async (): Promise<AlertmanagerReader> => {
+      const url = await alertmanagerUrl();
+      if (url === null) throw new Error(`No Alertmanager URL is set: set the alertmanagerUrl setting or ${ALERTMANAGER_URL_ENV}`);
+      return createAlertmanagerReader(fetchImpl, { apiUrl: url });
+    };
     /** Fingerprints doorbells named since each binding's last look, split by action. */
     const alertmanagerRung = new Map<string, AlertmanagerRung>();
 
@@ -6905,12 +6909,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
-    // The subscriber: one stream to bb-gate-hooks for the `alertmanager`
+    // The subscriber: one stream to the hooks service for the `alertmanager`
     // source. Its namespace leases are admitted without a token (the API has
     // none), and a doorbell carries the alert's fingerprint, its namespace as
     // the unit, and firing or resolved as the action. Without BB_HOOKS_URL the
     // sweeps carry the watch.
-    /** The namespace leases bb-gate-hooks refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
+    /** The namespace leases the hooks service refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
     let alertmanagerRefused = new Map<string, string>();
 
     function alertmanagerLeases(): Lease[] {
@@ -6955,7 +6959,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async onRejected(rejected: Rejection[]) {
         alertmanagerRefused = new Map(rejected.map((r) => [`${r.kind} ${r.id}`, r.reason]));
-        for (const r of rejected) bb.log.warn(`stewards: bb-gate-hooks refused an Alertmanager ${r.kind} lease on ${r.id} (${r.reason}); only the periodic look sees it`);
+        for (const r of rejected) bb.log.warn(`stewards: the hooks service refused an Alertmanager ${r.kind} lease on ${r.id} (${r.reason}); only the periodic look sees it`);
       },
       async sweep() {
         // Coverage cannot be proven: every Alertmanager binding looks for itself.
@@ -7294,7 +7298,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * Whether an author pattern matches a login, ignoring case and a trailing
      * `[bot]` (BB-342). A GitHub App actor's GraphQL `author { login }` is the
-     * bare slug (`bc-prod-bitcomplete-dev`), while REST and `gh` show the
+     * bare slug (`deploy-bot`), while REST and `gh` show the
      * `[bot]` form; a declared `match.author` copied from either place must
      * match the other. The suffix is stripped from the pattern (unless that
      * would leave only wildcards, so `*[bot]` keeps matching nothing) and from
@@ -10123,7 +10127,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- @bb mentions ----------------------------------------------------------------------------------
     //
-    // linear hands over a mention bb-gate-hooks routed to this server. It
+    // linear hands over a mention the hooks service routed to this server. It
     // goes to the issue's ticket steward when the issue has an open binding,
     // else to the project steward of the project whose file lists the
     // issue's team; with neither, linear answers the session itself. The
@@ -12414,7 +12418,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .array(z.string().trim().min(1).max(200))
           .max(40)
           .optional()
-          .describe('The repo-relative files this work changes, repo directory first ("bb-plugins/plugins/stewards/wake.ts", "bb-gate/docker/bb-server/Dockerfile"); the whole set, replacing what was reported before. A directory is accepted and counts as every file under it. The project steward schedules tickets whose files overlap one after another, and stacks a ticket on a pull request still being built. Report it once the spec names the affected repos; refine it as pull requests open.'),
+          .describe('The repo-relative files this work changes, repo directory first ("bb-plugins/plugins/stewards/wake.ts", "web/docker/Dockerfile"); the whole set, replacing what was reported before. A directory is accepted and counts as every file under it. The project steward schedules tickets whose files overlap one after another, and stacks a ticket on a pull request still being built. Report it once the spec names the affected repos; refine it as pull requests open.'),
         cites: z
           .array(z.string().trim().min(1).max(100))
           .max(20)
@@ -14779,27 +14783,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const a = await sentryApi.access(target);
             lines.push(a.ok ? `sentry: ${key} is readable (${a.name})` : `problem: sentry: cannot read the target ${key}: ${a.error}`);
             const refused = sentryRefused.get(`project ${target.org}/${target.project}`);
-            if (refused !== undefined) lines.push(`warning: sentry: ${key}: bb-gate-hooks refused its project lease (${refused}); only the periodic look sees it`);
+            if (refused !== undefined) lines.push(`warning: sentry: ${key}: the hooks service refused its project lease (${refused}); only the periodic look sees it`);
           }
           const status = sentryHooks.status();
-          lines.push(hooksUrl === "" ? "sentry: no bb-gate-hooks here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only" : `sentry: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
+          lines.push(hooksUrl === "" ? "sentry: no hooks service here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only" : `sentry: doorbells from the hooks service: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
         }
         const alertmanager = roleAlertmanagerTargets(config.role);
         if (alertmanager.length > 0) {
-          lines.push(`alertmanager: reading ${await alertmanagerUrl()} (no token)`);
-          const alertmanagerApi = await alertmanagerReader();
-          for (const target of alertmanager) {
-            const key = opsTargetKey(target);
-            const a = await alertmanagerApi.access(target);
-            lines.push(a.ok ? `alertmanager: ${key} is readable (${a.name})` : `problem: alertmanager: cannot read the target ${key}: ${a.error}`);
-            const refused = alertmanagerRefused.get(`namespace ${target.namespace}`);
-            if (refused !== undefined) lines.push(`warning: alertmanager: ${key}: bb-gate-hooks refused its namespace lease (${refused}); only the periodic look sees it`);
+          const url = await alertmanagerUrl();
+          if (url === null) {
+            lines.push(`problem: alertmanager: no Alertmanager URL is set; set the alertmanagerUrl setting or ${ALERTMANAGER_URL_ENV}`);
+          } else {
+            lines.push(`alertmanager: reading ${url} (no token)`);
+            const alertmanagerApi = await alertmanagerReader();
+            for (const target of alertmanager) {
+              const key = opsTargetKey(target);
+              const a = await alertmanagerApi.access(target);
+              lines.push(a.ok ? `alertmanager: ${key} is readable (${a.name})` : `problem: alertmanager: cannot read the target ${key}: ${a.error}`);
+              const refused = alertmanagerRefused.get(`namespace ${target.namespace}`);
+              if (refused !== undefined) lines.push(`warning: alertmanager: ${key}: the hooks service refused its namespace lease (${refused}); only the periodic look sees it`);
+            }
+            const status = alertmanagerHooks.status();
+            if (hooksUrl === "") lines.push("alertmanager: no hooks service here (BB_HOOKS_URL is not set), so alerts are seen by the periodic look only");
+            else if (status.sourceProblem === "unknown") lines.push("problem: alertmanager: the hooks service does not know the alertmanager source yet; only the periodic look sees it until the service is updated");
+            else if (status.sourceProblem === "unconfigured") lines.push("problem: alertmanager: the hooks service has no alertmanager adapter configured (its secret is not set); only the periodic look sees it until the service is updated");
+            else lines.push(`alertmanager: doorbells from the hooks service: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
           }
-          const status = alertmanagerHooks.status();
-          if (hooksUrl === "") lines.push("alertmanager: no bb-gate-hooks here (BB_HOOKS_URL is not set), so alerts are seen by the periodic look only");
-          else if (status.sourceProblem === "unknown") lines.push("problem: alertmanager: bb-gate-hooks does not know the alertmanager source yet; only the periodic look sees it until the service is updated");
-          else if (status.sourceProblem === "unconfigured") lines.push("problem: alertmanager: bb-gate-hooks has no alertmanager adapter configured (its secret is not set); only the periodic look sees it until the service is updated");
-          else lines.push(`alertmanager: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
         }
       }
       const deps = config.file.deps;
@@ -15048,7 +15057,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const dir = input.options.dir ?? (ctx.cwd === undefined ? undefined : `${ctx.cwd.replace(/\/$/u, "")}/.bb`);
               if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
               // Write on the thread's machine, else the project's: left to core, the
-              // write lands on the server's own daemon, which bb-gate's servers lack.
+              // write lands on the server's own daemon, which a server-only deployment lacks.
               const threadHost = ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null);
               const hostId = threadHost ?? (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ?? undefined;
               // BB-234: a project with no Linear teams is GitHub-tracked, so
@@ -15148,7 +15157,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             positionals: [{ name: "need", description: "The decide item id (need_…)", required: true }],
             options: {
               candidates: { type: "string", description: "The candidates Slack returned, comma-separated (the BB-354 recovery)" },
-              "near-matches": { type: "string", description: "The JSON candidates bb-gate-hooks returned on unknown-user: [{id, name, handle}], for the ask-once question" },
+              "near-matches": { type: "string", description: "The JSON candidates the hooks service returned on unknown-user: [{id, name, handle}], for the ask-once question" },
             },
             async run(input) {
               const candidates = (input.options.candidates ?? "")
@@ -15161,11 +15170,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 try {
                   parsed = JSON.parse(input.options["near-matches"]);
                 } catch {
-                  throw new PluginCliError("--near-matches must be the JSON array bb-gate-hooks returned, [{id, name, handle}].", { code: "bad_near_matches" });
+                  throw new PluginCliError("--near-matches must be the JSON array the hooks service returned, [{id, name, handle}].", { code: "bad_near_matches" });
                 }
                 const shape = z.array(z.object({ id: z.string(), name: z.string().default(""), handle: z.string().default("") }).loose());
                 const checked = shape.safeParse(parsed);
-                if (!checked.success) throw new PluginCliError("--near-matches must be the JSON array bb-gate-hooks returned, [{id, name, handle}].", { code: "bad_near_matches" });
+                if (!checked.success) throw new PluginCliError("--near-matches must be the JSON array the hooks service returned, [{id, name, handle}].", { code: "bad_near_matches" });
                 nearMatches = checked.data.map((m) => ({ id: m.id, name: m.name, handle: m.handle }));
               }
               const result = reopenWaitSlackNeed(input.positionals.need ?? "", candidates, nearMatches);

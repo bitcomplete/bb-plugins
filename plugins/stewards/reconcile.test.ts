@@ -855,7 +855,7 @@ describe("the pull request gate (build-tickets)", () => {
     expect(prGate(recorded, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ projectApproved: true, gateMet: true });
   });
 
-  // BB-151: the worker's gate comment on bb-gate#60 (id 6533066554) was signed
+  // BB-151: the worker's gate comment on web#60 (id 6533066554) was signed
   // `_— from bb thread ` with no thread id and no closing `_`, because its
   // shell's `$BB_THREAD_ID` was empty. `signedBy()` reads that as unsigned, and
   // the text approves, so the plugin took it as the owner's LGTM and closed the
@@ -864,10 +864,10 @@ describe("the pull request gate (build-tickets)", () => {
     const broken = comment({
       id: "6533066554",
       author: "jane",
-      body: "Owner-reviewed lane. Independent review approved on cbba8a8 (round 2, 0 blockers); `test` and `bc-prod.yaml schema` are green and the branch is clean. @trotterdylan, this needs your approval before I merge.\n\n_— from bb thread \n",
+      body: "Owner-reviewed lane. Independent review approved on cbba8a8 (round 2, 0 blockers); `test` and `config.yaml schema` are green and the branch is clean. @trotterdylan, this needs your approval before I merge.\n\n_— from bb thread \n",
       signedBy: null,
       createdAt: "2026-10-30T20:43:23Z",
-      url: "https://github.com/bitcomplete/bb-gate/pull/60#issuecomment-6533066554",
+      url: "https://github.com/acme/web/pull/60#issuecomment-6533066554",
     });
     // It would approve on its words alone, which is why it must be read as a thread's.
     expect(classifyApproval(broken.body)).toBe("approve");

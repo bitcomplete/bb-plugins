@@ -5,12 +5,12 @@
 // server host, bb core forwards that login to every machine, and this
 // plugin reads the same token with `gh auth token` whenever it needs one:
 // to read the target as the developer, and to prove each watch to
-// bb-gate-hooks. A thread sees results, never the token.
+// the hooks service. A thread sees results, never the token.
 //
 // Everything else a thread wants from GitHub it does with `gh` on its
 // machine. What `gh` cannot do is wake a thread later, and that is the heart
 // of this plugin: a watch (watch.ts) is a row in the plugin's SQLite plus a
-// lease on bb-gate-hooks (hooks-client.ts); when GitHub's webhook rings, the
+// lease on the hooks service (hooks-client.ts); when GitHub's webhook rings, the
 // target is re-read here and the thread is messaged with what changed.
 //
 // The stewards plugin (../stewards/DESIGN.md) reads GitHub through this
@@ -399,7 +399,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     let interestEntities = new Set(interest.entities.map((e) => e.toLowerCase()));
     let interestDependabot = new Set(interest.dependabot.map((r) => r.toLowerCase()));
     let interestDeployment = new Set(interest.deployment.map((r) => r.toLowerCase()));
-    /** Stewards' leases bb-gate-hooks refused, by `<kind> <lowercased id>`. */
+    /** Stewards' leases the hooks service refused, by `<kind> <lowercased id>`. */
     const refusals = createRefusals(deps.now);
 
     /** Every lease to hold: the watches, then stewards' entities, repositories and Dependabot repositories, each once. */
@@ -494,18 +494,18 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           // A login that cannot read alerts gets `forbidden` here. That is a
           // skip, not an error: the server keeps running without Dependabot
           // doorbells, and `bb stewards check` says which repos it skips.
-          if (interestDependabot.has(r.id.toLowerCase())) bb.log.info(`bb-gate-hooks refused a dependabot_repo lease on ${r.id} (${r.reason}); this server skips Dependabot alerts there`);
+          if (interestDependabot.has(r.id.toLowerCase())) bb.log.info(`the hooks service refused a dependabot_repo lease on ${r.id} (${r.reason}); this server skips Dependabot alerts there`);
           continue;
         }
         if (r.kind === "deployment_repo") {
           // Reading a repository's deployments needs `deployments:read` (or
           // the `repo` scope); a token without it is refused here, which is a
           // skip: the server keeps running without deployment doorbells.
-          if (interestDeployment.has(r.id.toLowerCase())) bb.log.info(`bb-gate-hooks refused a deployment_repo lease on ${r.id} (${r.reason}); this server skips deployment and workflow-run doorbells there`);
+          if (interestDeployment.has(r.id.toLowerCase())) bb.log.info(`the hooks service refused a deployment_repo lease on ${r.id} (${r.reason}); this server skips deployment and workflow-run doorbells there`);
           continue;
         }
         if (r.kind === "repo" || (watching.length === 0 && interestEntities.has(r.id.toLowerCase()))) {
-          bb.log.warn(`bb-gate-hooks refused a lease on ${r.kind === "repo" ? `repository ${r.id}` : r.id} for stewards (${r.reason}); stewards will not be rung for it`);
+          bb.log.warn(`the hooks service refused a lease on ${r.kind === "repo" ? `repository ${r.id}` : r.id} for stewards (${r.reason}); stewards will not be rung for it`);
           continue;
         }
         if (r.kind !== "issue" || r.reason !== "forbidden") continue;
@@ -513,7 +513,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const ref = parseRefKey(r.id);
         try {
           if (ref !== null && (await readTarget(ref, checkSignal())) !== null) {
-            bb.log.warn(`bb-gate-hooks refused a lease on ${r.id} that the signed-in user can read; keeping the watch`);
+            bb.log.warn(`the hooks service refused a lease on ${r.id} that the signed-in user can read; keeping the watch`);
             continue;
           }
         } catch (error) {
@@ -530,7 +530,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       now: deps.now,
       log: bb.log,
       token: accessToken,
-      refreshToken: () => refreshToken("was refused by bb-gate-hooks"),
+      refreshToken: () => refreshToken("was refused by the hooks service"),
       watchIds: leases,
       onDoorbell: (kind, key, unit, deployment, workflowRun) => {
         if (kind === "issue") checks.ring(key);
@@ -597,25 +597,25 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       });
     }
 
-    /** Stewards' interest as a person reads it, with whatever bb-gate-hooks refused of it. */
+    /** Stewards' interest as a person reads it, with whatever the hooks service refused of it. */
     function interestView(): InterestView {
       const refused = refusals.current();
       const unleased: InterestView["unleased"] = [];
       for (const repo of interest.units) {
         const reason = refused.get(`repo ${repo.toLowerCase()}`);
-        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason})` });
+        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by the hooks service (${reason})` });
       }
       for (const key of interest.entities) {
         const reason = refused.get(`issue ${key.toLowerCase()}`);
-        if (reason !== undefined) unleased.push({ key, reason: `refused by bb-gate-hooks (${reason})` });
+        if (reason !== undefined) unleased.push({ key, reason: `refused by the hooks service (${reason})` });
       }
       for (const repo of interest.dependabot) {
         const reason = refused.get(`dependabot_repo ${repo.toLowerCase()}`);
-        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason}); Dependabot alerts are skipped` });
+        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by the hooks service (${reason}); Dependabot alerts are skipped` });
       }
       for (const repo of interest.deployment) {
         const reason = refused.get(`deployment_repo ${repo.toLowerCase()}`);
-        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason}); deployment and workflow-run doorbells are skipped` });
+        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by the hooks service (${reason}); deployment and workflow-run doorbells are skipped` });
       }
       return {
         nouns: { unit: ["repository", "repositories"], entity: ["pull request", "pull requests"] },
@@ -853,7 +853,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       // REST API. Each repository the token cannot read (no alert access,
       // alerts disabled, not visible) is named in `errors`; the rest are
       // still returned. Reading alerts needs more than read access to the
-      // repository (bb-gate/docs/hooks.md, "Admission, alerts").
+      // repository (hooks.md, "Admission, alerts").
       //
       // One GraphQL read of `dependencyGraphManifests(first: 1) { totalCount }`
       // per repository says whether an empty alert list is the truth or a
@@ -1115,7 +1115,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       parameters: z.object({ ref: refInput }),
       async execute({ ref: input }, { threadId, projectId, signal }) {
         if (hooksUrl === "") {
-          return toolError(new Error("Watching GitHub pull requests and issues is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set). Check it again later with gh instead."));
+          return toolError(new Error("Watching GitHub pull requests and issues is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set). Check it again later with gh instead."));
         }
         const ref = parseRef(input);
         if (ref === null) return toolError(new Error(`${JSON.stringify(input)} does not name a pull request or issue. Give its URL, owner/repo#12, or owner/repo/pull/12.`));

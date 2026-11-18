@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { classify, type FingerprintRow, type TicketState } from "./ops.js";
 import {
   ALERTMANAGER_URL_ENV,
-  DEFAULT_ALERTMANAGER_URL,
   alertOf,
   alertmanagerChanges,
   alertmanagerSightings,
@@ -25,7 +24,7 @@ const since = now - 3_600_000;
 const apiAlert = (over: Record<string, unknown> = {}) => ({
   fingerprint: "a1b2c3d4e5f6",
   status: { state: "active", silencedBy: [], inhibitedBy: [] },
-  labels: { alertname: "KubePodCrashLooping", namespace: "bb-gate-production", severity: "warning", pod: "bb-gate-abc" },
+  labels: { alertname: "KubePodCrashLooping", namespace: "web-production", severity: "warning", pod: "web-abc" },
   annotations: { summary: "Pod is crash looping", description: "Back-off restarting failed container token=sk_live_abc", runbook_url: "https://runbooks.example/crashloop" },
   startsAt: "2026-10-20T14:30:00Z",
   endsAt: "0001-01-01T00:00:00Z",
@@ -37,11 +36,11 @@ const apiAlert = (over: Record<string, unknown> = {}) => ({
 describe("reading Alertmanager's JSON", () => {
   it("reduces an alert to what a look reads, with credentials redacted and the labels and annotations sorted", () => {
     const alert = alertOf(apiAlert())!;
-    expect(alert).toMatchObject({ fingerprint: "a1b2c3d4e5f6", alertname: "KubePodCrashLooping", namespace: "bb-gate-production", severity: "warning", status: "active", summary: "Pod is crash looping" });
+    expect(alert).toMatchObject({ fingerprint: "a1b2c3d4e5f6", alertname: "KubePodCrashLooping", namespace: "web-production", severity: "warning", status: "active", summary: "Pod is crash looping" });
     expect(alert.description).toBe("Back-off restarting failed container token=[redacted]");
-    expect(alert.labels).toEqual(["alertname=KubePodCrashLooping", "namespace=bb-gate-production", "pod=bb-gate-abc", "severity=warning"]);
+    expect(alert.labels).toEqual(["alertname=KubePodCrashLooping", "namespace=web-production", "pod=web-abc", "severity=warning"]);
     expect(alert.annotations).toContain("description=Back-off restarting failed container token=[redacted]");
-    expect(alertmanagerSummary(alert)).toBe("KubePodCrashLooping (warning) in bb-gate-production");
+    expect(alertmanagerSummary(alert)).toBe("KubePodCrashLooping (warning) in web-production");
     // A status object is optional; no fingerprint means the entry is dropped.
     expect(alertOf(apiAlert({ status: {}, labels: {} }))).toMatchObject({ status: "active", alertname: "(no alertname)", namespace: "" });
     expect(alertOf({ labels: { alertname: "x" } })).toBeNull();
@@ -76,14 +75,14 @@ describe("the reader", () => {
       "/api/v2/status": () => Response.json({ cluster: { name: "kps" }, versionInfo: { version: "0.27.0" } }),
     });
     const reader = createAlertmanagerReader(fetchImpl, { apiUrl: "http://kps-alertmanager.monitoring.svc:9093/" });
-    expect((await reader.alerts({ kind: "alertmanager", namespace: "bb-gate-production" })).map((a) => a.fingerprint)).toEqual(["a1b2c3d4e5f6"]);
+    expect((await reader.alerts({ kind: "alertmanager", namespace: "web-production" })).map((a) => a.fingerprint)).toEqual(["a1b2c3d4e5f6"]);
     // The filter is URL-encoded and carries the namespace; no token header is sent.
     const first = String(fetchImpl.mock.calls[0]![0]);
-    expect(first).toContain("filter=namespace%3D%22bb-gate-production%22");
+    expect(first).toContain("filter=namespace%3D%22web-production%22");
     expect((fetchImpl.mock.calls[0]![1] as RequestInit).headers).toEqual({ accept: "application/json" });
     expect((await reader.alert("other"))?.fingerprint).toBe("other");
     expect(await reader.alert("missing")).toBeNull();
-    expect(await reader.access({ kind: "alertmanager", namespace: "bb-gate-production" })).toEqual({ ok: true, name: "Alertmanager 0.27.0 (kps)" });
+    expect(await reader.access({ kind: "alertmanager", namespace: "web-production" })).toEqual({ ok: true, name: "Alertmanager 0.27.0 (kps)" });
   });
 
   it("reports a read failure rather than throwing, and never names a token it does not have", async () => {
@@ -102,11 +101,11 @@ describe("the reader", () => {
 });
 
 describe("the effective URL", () => {
-  it("is the setting, then ALERTMANAGER_URL, then the tailnet hostname for a non-cluster server", () => {
+  it("is the setting, then ALERTMANAGER_URL, and null when neither is set", () => {
     expect(resolveAlertmanagerUrl("http://in-cluster:9093", "http://env:9093")).toBe("http://in-cluster:9093");
     expect(resolveAlertmanagerUrl("  ", "http://env:9093")).toBe("http://env:9093");
-    expect(resolveAlertmanagerUrl(undefined, undefined)).toBe(DEFAULT_ALERTMANAGER_URL);
-    expect(resolveAlertmanagerUrl(null, "  ")).toBe(DEFAULT_ALERTMANAGER_URL);
+    expect(resolveAlertmanagerUrl(undefined, undefined)).toBeNull();
+    expect(resolveAlertmanagerUrl(null, "  ")).toBeNull();
     expect(ALERTMANAGER_URL_ENV).toBe("ALERTMANAGER_URL");
   });
 });
@@ -157,7 +156,7 @@ describe("what changed between two looks", () => {
   const finding = (over: Partial<AlertmanagerFinding> = {}): AlertmanagerFinding => ({
     fingerprint: "a1b2c3d4e5f6",
     alertname: "KubePodCrashLooping",
-    namespace: "bb-gate-production",
+    namespace: "web-production",
     severity: "warning",
     status: "active",
     summary: "Pod is crash looping",
@@ -177,12 +176,12 @@ describe("what changed between two looks", () => {
     lastCommentedAt: null,
     ...over,
   });
-  const look = (findings: AlertmanagerFinding[], error: string | null = null): AlertmanagerLook => ({ at: now, target: "alertmanager/bb-gate-production", error, active: findings.filter((f) => !f.resolved).length, notes: [], findings });
+  const look = (findings: AlertmanagerFinding[], error: string | null = null): AlertmanagerLook => ({ at: now, target: "alertmanager/web-production", error, active: findings.filter((f) => !f.resolved).length, notes: [], findings });
   const hour = 3_600_000;
 
   it("makes a new, returned or resolved alert worth a turn, and a rung one once per requeue", () => {
     const fresh = look([finding()]);
-    expect(alertmanagerChanges(null, fresh, hour)).toEqual([{ text: "New alert: a1b2c3d4e5f6 — KubePodCrashLooping (warning) in bb-gate-production", actionable: true }]);
+    expect(alertmanagerChanges(null, fresh, hour)).toEqual([{ text: "New alert: a1b2c3d4e5f6 — KubePodCrashLooping (warning) in web-production", actionable: true }]);
     expect(alertmanagerChanges(fresh, fresh, hour)).toEqual([]);
     const filed = look([finding({ class: "recurring", ticket: "OPS-5", ticketState: "In Progress", reasons: ["ongoing"] })]);
     expect(alertmanagerChanges(fresh, filed, hour)).toEqual([]);
@@ -192,20 +191,20 @@ describe("what changed between two looks", () => {
     expect(alertmanagerChanges(runged, commented, hour)).toEqual([{ text: "Alertmanager rang for KubePodCrashLooping under OPS-5: active, warning", actionable: false }]);
     // Resolved: a comment on the ticket, never a close; the transition is one shot, so it is always actionable.
     const resolved = look([finding({ class: "recurring", ticket: "OPS-5", reasons: ["resolved"], resolved: true, status: "resolved", summary: null })]);
-    expect(alertmanagerChanges(filed, resolved, hour)).toEqual([{ text: "Resolved under OPS-5: KubePodCrashLooping in bb-gate-production", actionable: true }]);
+    expect(alertmanagerChanges(filed, resolved, hour)).toEqual([{ text: "Resolved under OPS-5: KubePodCrashLooping in web-production", actionable: true }]);
     // The next look has no resolved finding left: the alert is simply gone.
     expect(alertmanagerChanges(resolved, look([]), hour)).toEqual([{ text: "No longer firing: KubePodCrashLooping (OPS-5)", actionable: false }]);
     const back = look([finding({ class: "returned", ticket: "OPS-5", ticketState: "Done", reasons: ["ongoing"] })]);
-    expect(alertmanagerChanges(filed, back, hour)).toEqual([{ text: "Back after OPS-5 was resolved (Done): a1b2c3d4e5f6 — KubePodCrashLooping (warning) in bb-gate-production", actionable: true }]);
+    expect(alertmanagerChanges(filed, back, hour)).toEqual([{ text: "Back after OPS-5 was resolved (Done): a1b2c3d4e5f6 — KubePodCrashLooping (warning) in web-production", actionable: true }]);
     expect(alertmanagerChanges(filed, look([]), hour)).toEqual([{ text: "No longer firing: KubePodCrashLooping (OPS-5)", actionable: false }]);
     expect(alertmanagerChanges(null, filed, hour)).toEqual([{ text: "Seen again under OPS-5: a1b2c3d4e5f6 — KubePodCrashLooping", actionable: false }]);
   });
 
   it("is quiet about a read failure", () => {
     const down = look([], "Alertmanager answered HTTP 503 to GET /api/v2/alerts");
-    expect(alertmanagerChanges(null, down, hour)).toEqual([{ text: "Cannot read alertmanager/bb-gate-production: Alertmanager answered HTTP 503 to GET /api/v2/alerts", actionable: false }]);
+    expect(alertmanagerChanges(null, down, hour)).toEqual([{ text: "Cannot read alertmanager/web-production: Alertmanager answered HTTP 503 to GET /api/v2/alerts", actionable: false }]);
     expect(alertmanagerChanges(down, down, hour)).toEqual([]);
-    expect(alertmanagerChanges(down, look([]), hour)).toEqual([{ text: "alertmanager/bb-gate-production is readable again", actionable: false }]);
+    expect(alertmanagerChanges(down, look([]), hour)).toEqual([{ text: "alertmanager/web-production is readable again", actionable: false }]);
   });
 
   it("classifies against the fingerprint map like any ops sighting", () => {
@@ -221,7 +220,7 @@ describe("the wake", () => {
   const playbook = { name: "ops-watch", version: "v1", general: "", may: ["file-ticket"], requeueDefaultMs: 3_600_000, sections: {} } as unknown as Playbook;
   const look: AlertmanagerLook = {
     at: now,
-    target: "alertmanager/bb-gate-production",
+    target: "alertmanager/web-production",
     error: null,
     active: 1,
     notes: [],
@@ -229,7 +228,7 @@ describe("the wake", () => {
       {
         fingerprint: "a1b2c3d4e5f6",
         alertname: "KubePodCrashLooping",
-        namespace: "bb-gate-production",
+        namespace: "web-production",
         severity: "warning",
         status: "active",
         summary: "Pod is crash looping",

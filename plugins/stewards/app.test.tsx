@@ -357,14 +357,14 @@ describe("the Stewards page's data commits (BB-91)", () => {
 });
 
 describe("the Stewards page's need links (BB-29)", () => {
-  const pr = "https://github.com/bitcomplete/bb-gate/pull/17";
+  const pr = "https://github.com/acme/web/pull/17";
   const ticket = "https://linear.app/bit-complete/issue/BB-28";
 
   it("links the key to the ticket and offers Open PR for approve-pr and merge", async () => {
     const slot = await renderBoard(
       [
-        need({ kind: "approve-pr", key: "BB-28", url: pr, entityUrl: ticket, what: "Approve bitcomplete/bb-gate#17 on GitHub" }),
-        need({ id: "need_2", kind: "merge", key: "BB-29", url: pr, entityUrl: "https://linear.app/bit-complete/issue/BB-29", what: "Merge bitcomplete/bb-gate#17" }),
+        need({ kind: "approve-pr", key: "BB-28", url: pr, entityUrl: ticket, what: "Approve acme/web#17 on GitHub" }),
+        need({ id: "need_2", kind: "merge", key: "BB-29", url: pr, entityUrl: "https://linear.app/bit-complete/issue/BB-29", what: "Merge acme/web#17" }),
       ],
       [],
     );
@@ -1196,11 +1196,11 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
   it("shows the waiting, hold and stuck lines in the status", async () => {
     const slot = await renderBoardWith({
       subPath: "p1/ENG-1",
-      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", waitingOn: "bb-gate#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", waitingOn: "web#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
       stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", kind: "stuck", why: "waiting on a decision", since: 1 }],
     });
     // The wait is a plain muted line, not a destructive one (BB-109).
-    const waiting = await waitFor(() => slot.getByText("Waiting on bb-gate#88"));
+    const waiting = await waitFor(() => slot.getByText("Waiting on web#88"));
     expect(waiting.className).toContain("text-muted-foreground");
     expect(waiting.className).not.toContain("text-destructive");
     expect(slot.getByText(/On hold: a freeze \(behind ENG-9\)/u)).toBeTruthy();
@@ -1307,7 +1307,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     const bindings = [
       sidebarBinding({ key: "ENG-1", threadId: "thr_1", needsUser: true, phase: "In Review" }),
       sidebarBinding({ key: "ENG-2", threadId: "thr_2", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
-      sidebarBinding({ key: "ENG-3", threadId: "thr_3", waitingOn: "bb-gate#88" }),
+      sidebarBinding({ key: "ENG-3", threadId: "thr_3", waitingOn: "web#88" }),
       sidebarBinding({ key: "ENG-4", threadId: "thr_4", deployment: "deployed" }),
     ];
     const captured = await loadApp();
@@ -1344,10 +1344,10 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
 
   it("shows a with-user escalation's context under its question (BB-79)", async () => {
     const slot = await renderBoardWith({
-      withUser: [{ id: "esc_1", kind: "blocked", question: "Need cluster access", context: "The staging cluster is not on the tailnet.", recommendation: null, key: "ENG-1", url: null, threadId: null, createdAt: 1_000, rationaleWanted: null }],
+      withUser: [{ id: "esc_1", kind: "blocked", question: "Need cluster access", context: "The staging cluster is not on the private network.", recommendation: null, key: "ENG-1", url: null, threadId: null, createdAt: 1_000, rationaleWanted: null }],
     });
     await waitFor(() => expect(slot.getByText("Need cluster access")).toBeTruthy());
-    expect(slot.getByText("The staging cluster is not on the tailnet.")).toBeTruthy();
+    expect(slot.getByText("The staging cluster is not on the private network.")).toBeTruthy();
     slot.lifecycle.unmount();
   });
 });

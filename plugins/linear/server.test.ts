@@ -41,9 +41,9 @@ function fakeLinear(options: { answer?: Answer; tokens?: () => Record<string, un
   return { fetchImpl, calls };
 }
 
-const HOOKS_URL = "http://bb-gate-hooks.test:8081";
+const HOOKS_URL = "http://hooks.test:8081";
 
-// A bb-gate-hooks whose event stream a test writes to and whose subscribe answers it scripts.
+// A the hooks service whose event stream a test writes to and whose subscribe answers it scripts.
 function fakeHooks() {
   const encoder = new TextEncoder();
   const streams: Array<{ send(text: string): void; closed: boolean }> = [];
@@ -80,7 +80,7 @@ function fakeHooks() {
       identifies.push(body);
       return Response.json({ user: { id: "u1", name: "Jane" }, teams: body.teams, rejected: [] });
     }
-    const reply = /^http:\/\/bb-gate-hooks\.test:8081\/v1\/linear\/sessions\/([^/]+)\/activity$/u.exec(u);
+    const reply = /^http:\/\/hooks\.test:8081\/v1\/linear\/sessions\/([^/]+)\/activity$/u.exec(u);
     if (reply !== null) {
       replies.push({ session: decodeURIComponent(reply[1]!), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
       return state.reply();
@@ -907,7 +907,7 @@ describe("watching an issue", () => {
     return { ...s, live, hooks, send, rows, sent };
   }
 
-  it("is refused, with a reason, on a server without bb-gate-hooks, and starts no service", async () => {
+  it("is refused, with a reason, on a server without the hooks service, and starts no service", async () => {
     const { tool, text, harness } = await setup({ token: "at-0", linear: { answer: () => ({ data: { issue: issue() } }) } });
     const result = await tool("linear_watch_issue", { key: "ENG-123" });
     expect(result).toMatchObject({ isError: true });
@@ -1537,7 +1537,7 @@ describe("the source contract", () => {
       expect(leased).toEqual(expect.arrayContaining([{ kind: "issue", id: UUID_1 }, { kind: "issue", id: UUID_2 }, { kind: "team", id: "t-eng" }]));
       expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG"], entities: [UUID_1, UUID_2] });
       expect(s.harness.logEntries.some((l) => l.level === "warn" && l.message.includes("refused a lease on Linear team ENG (forbidden)"))).toBe(true);
-      expect((await interestOf(s)).unleased).toEqual([{ key: "ENG", reason: "refused by bb-gate-hooks (forbidden)" }]);
+      expect((await interestOf(s)).unleased).toEqual([{ key: "ENG", reason: "refused by the hooks service (forbidden)" }]);
       service.controller.abort();
       await service.done;
     });
@@ -1713,7 +1713,7 @@ describe("agent sessions", () => {
   const STEWARDS = { kind: "plugin", pluginId: "stewards" } as const;
   const answer: Answer = (body) => (body.query.startsWith("query { teams") ? { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } } : { data: { issue: null } });
 
-  /** A connected server with bb-gate-hooks, whose stewards answers stewardsSession as `route` says. */
+  /** A connected server with the hooks service, whose stewards answers stewardsSession as `route` says. */
   async function sessions(route: (input: Record<string, unknown>) => unknown = () => ({ routed: "ticket", threadId: "thr-steward", projectId: "prj-1" })) {
     const hooks = fakeHooks();
     const handed: Array<Record<string, unknown>> = [];
@@ -1988,7 +1988,7 @@ describe("agent sessions", () => {
     await s.stop();
   });
 
-  it("is refused on a server without bb-gate-hooks", async () => {
+  it("is refused on a server without the hooks service", async () => {
     const s = await setup({ token: "at-0" });
     expect(s.text(await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "Hi" }, { threadId: "thr-1" }))).toMatch(/BB_HOOKS_URL is not set/u);
   });

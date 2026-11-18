@@ -15,7 +15,7 @@
 // without a credential of its own.
 //
 // A thread can also watch an issue (watch.ts, hooks-client.ts): when the
-// deployment runs bb-gate-hooks, Linear's webhooks reach it and it rings
+// deployment runs the hooks service, Linear's webhooks reach it and it rings
 // this plugin, which re-reads the issue as the developer and messages the
 // thread with what changed. The thread ends its turn instead of polling.
 //
@@ -23,8 +23,8 @@
 // snapshots, validation, adoption, and doorbells for the issues and teams it
 // manages, forwarded as rings.
 //
-// And `@bb` mentions (bb-gate/docs/hooks.md, "Agent sessions"): this server
-// proves to bb-gate-hooks which Linear user it acts for, receives the
+// And `@bb` mentions (hooks.md, "Agent sessions"): this server
+// proves to the hooks service which Linear user it acts for, receives the
 // mentions routed to it, hands each to stewards, and posts the steward's one
 // reply through the service with linear_session_reply. The app token that
 // posts it never comes here.
@@ -1097,7 +1097,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     // ---- watching an issue -----------------------------------------------
     //
-    // A watch is a row in the plugin's SQLite plus a lease on bb-gate-hooks.
+    // A watch is a row in the plugin's SQLite plus a lease on the hooks service.
     // The row is the truth: it carries what the thread last saw, and every
     // check compares a fresh read against it. The lease only makes the check
     // prompt. Without BB_HOOKS_URL there is no service to lease from and the
@@ -1247,7 +1247,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     const issueKeys = new Map<string, string>();
     /** Issue keys stewards asked about that the connected user cannot see, as of the last resolution. */
     let invisible: string[] = [];
-    /** Stewards' leases bb-gate-hooks refused: `team:<uuid>` or an issue UUID. */
+    /** Stewards' leases the hooks service refused: `team:<uuid>` or an issue UUID. */
     const refusals = createRefusals(deps.now);
 
     /** Every lease the stream holds: watched issues, stewards' issues, stewards' teams; each proven in its own workspace. */
@@ -1685,7 +1685,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       for (const r of rejected) {
         if (r.kind === "team") {
           refusals.add(`team:${r.id}`, r.reason);
-          bb.log.warn(`bb-gate-hooks refused a lease on Linear team ${teamKeyOf(r.id)} (${r.reason}); stewards hears of its issues only through their own leases until a renewal succeeds`);
+          bb.log.warn(`the hooks service refused a lease on Linear team ${teamKeyOf(r.id)} (${r.reason}); stewards hears of its issues only through their own leases until a renewal succeeds`);
           continue;
         }
         if (r.kind === "issue" && ringFor.issues.has(r.id)) refusals.add(r.id, r.reason);
@@ -1696,7 +1696,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         if (account === null) continue;
         try {
           if ((await readIssue(account, r.id, checkSignal())) !== null) {
-            bb.log.warn(`bb-gate-hooks refused a lease on ${watching[0]!.issueKey} that the connected user can read; keeping the watch`);
+            bb.log.warn(`the hooks service refused a lease on ${watching[0]!.issueKey} that the connected user can read; keeping the watch`);
             continue;
           }
         } catch (error) {
@@ -1710,7 +1710,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // ---- agent sessions ---------------------------------------------------
     //
     // A mention of @bb on a Linear issue opens an agent session, and
-    // bb-gate-hooks routes it to the server of the issue's assignee or of
+    // the hooks service routes it to the server of the issue's assignee or of
     // the person who asked (hooks.md, "Routing"). This server proves who it
     // is with the developer's own token, beside every lease renewal; the
     // teams it names are the ones stewards asked about, in the workspace
@@ -1759,7 +1759,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     }
     const answered = (r: SessionRecord) => (r.answered ?? 0) >= r.events;
 
-    /** Who bb-gate-hooks last said this server is, for the reply tool's errors and the logs. */
+    /** Who the hooks service last said this server is, for the reply tool's errors and the logs. */
     let identified: (IdentifyResponse & { account?: string }) | null = null;
 
     /**
@@ -1793,16 +1793,16 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     function replyError(error: unknown): Error {
       if (!(error instanceof HooksRequestError)) return error instanceof Error ? error : new Error(String(error));
       const code = error.code;
-      if (error.status === 403 && code === "not-identified") return new Error("bb-gate-hooks does not know which Linear user this server is yet (it proves that on connecting, every half hour, and when stewards' teams change). Try again in a minute.");
+      if (error.status === 403 && code === "not-identified") return new Error("the hooks service does not know which Linear user this server is yet (it proves that on connecting, every half hour, and when stewards' teams change). Try again in a minute.");
       if (error.status === 403)
         return new Error(
-          `bb-gate-hooks refused: this session was not routed to ${identified === null ? "this server's Linear user" : identified.user.name}, or its last event was more than a day ago, or the service restarted since. Nothing was posted. If it still needs an answer, comment on the issue instead.`,
+          `the hooks service refused: this session was not routed to ${identified === null ? "this server's Linear user" : identified.user.name}, or its last event was more than a day ago, or the service restarted since. Nothing was posted. If it still needs an answer, comment on the issue instead.`,
         );
-      if (error.unknownConnection) return new Error("This bb server is reconnecting to bb-gate-hooks. Try again in a minute.");
-      if (error.status === 400) return new Error("bb-gate-hooks refused the reply as malformed (a missing field, an unknown kind, or an external link that is not http(s)).");
+      if (error.unknownConnection) return new Error("This bb server is reconnecting to the hooks service. Try again in a minute.");
+      if (error.status === 400) return new Error("the hooks service refused the reply as malformed (a missing field, an unknown kind, or an external link that is not http(s)).");
       if (error.status === 502) return new Error("Linear refused the reply. Nothing was posted; comment on the issue instead.");
-      if (error.status === 503) return new Error("bb-gate-hooks cannot post to Linear right now (Linear is unreachable, or the bb app's credentials are not set up there). Try again later, or comment on the issue instead.");
-      return new Error(`bb-gate-hooks answered HTTP ${error.status} to the reply.`);
+      if (error.status === 503) return new Error("the hooks service cannot post to Linear right now (Linear is unreachable, or the bb app's credentials are not set up there). Try again later, or comment on the issue instead.");
+      return new Error(`the hooks service answered HTTP ${error.status} to the reply.`);
     }
 
     /** Post on a session and record it as answered. Throws what replyError makes. */
@@ -1963,7 +1963,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       log: bb.log,
       // A lease names its workspace; one without falls back to the default.
       token: (account) => accessToken(account ?? defaultKey() ?? ""),
-      refreshToken: (account) => refresh(account ?? defaultKey() ?? "", "was refused by bb-gate-hooks"),
+      refreshToken: (account) => refresh(account ?? defaultKey() ?? "", "was refused by the hooks service"),
       leases,
       // A watch check reads the issue only when a thread watches it, so every
       // doorbell goes to it; stewards hears of the ones it asked about.
@@ -1977,7 +1977,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       onIdentified: (who) => {
         const changed = identified === null || identified.user.id !== who.user.id || identified.teams.join() !== who.teams.join();
         identified = who;
-        if (changed) bb.log.info(`bb-gate-hooks knows this server as Linear user ${who.user.name}, covering ${who.teams.length} team${who.teams.length === 1 ? "" : "s"} for @bb mentions`);
+        if (changed) bb.log.info(`the hooks service knows this server as Linear user ${who.user.name}, covering ${who.teams.length} team${who.teams.length === 1 ? "" : "s"} for @bb mentions`);
       },
       onSession: (event) => void onSession(event).catch((error: unknown) => bb.log.warn(`Linear agent session ${event.session} failed: ${errorMessage(error)}`)),
     });
@@ -2047,8 +2047,8 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       for (const key of invisible) unleased.push({ key, reason: "not visible to the connected Linear user" });
       for (const [id, reason] of refusals.current()) {
         if (id.startsWith("team:")) {
-          if (ringFor.teams.has(id.slice(5))) unleased.push({ key: teamKeyOf(id.slice(5)), reason: `refused by bb-gate-hooks (${reason})` });
-        } else if (ringFor.issues.has(id)) unleased.push({ key: keyOf(id), reason: `refused by bb-gate-hooks (${reason})` });
+          if (ringFor.teams.has(id.slice(5))) unleased.push({ key: teamKeyOf(id.slice(5)), reason: `refused by the hooks service (${reason})` });
+        } else if (ringFor.issues.has(id)) unleased.push({ key: keyOf(id), reason: `refused by the hooks service (${reason})` });
       }
       return {
         nouns: { unit: ["team", "teams"], entity: ["issue", "issues"] },
@@ -2129,7 +2129,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123."), account: accountParam }),
       async execute({ key, account }, { threadId, projectId, signal }) {
         if (hooksUrl === "") {
-          return toolError(new Error("Watching Linear issues is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set). Read the issue again later instead."));
+          return toolError(new Error("Watching Linear issues is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set). Read the issue again later instead."));
         }
         try {
           const where = await forIssue(key, account, signal);
@@ -2172,7 +2172,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         externalUrl: z.string().trim().url().max(2000).optional().describe("The session's external link. Leave it out: it defaults to this thread."),
       }),
       async execute({ session, kind, body, externalUrl }, { threadId, projectId, signal }) {
-        if (hooksUrl === "") return toolError(new Error("Replying to Linear mentions is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set)."));
+        if (hooksUrl === "") return toolError(new Error("Replying to Linear mentions is not available on this bb server: it has no hooks service (BB_HOOKS_URL is not set)."));
         const r = sessions.get(session);
         if (r !== undefined && answered(r)) {
           return toolError(new Error(`Every message in this session on ${r.issueKey} already has its reply; each gets exactly one. Put further progress in a comment on the issue (linear_comment). A new follow-up in the session can be answered when it arrives.`));
