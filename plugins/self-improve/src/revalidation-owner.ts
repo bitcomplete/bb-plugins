@@ -3,7 +3,7 @@ import type { Store } from "./store.js";
 import type { createRevalidation } from "./revalidation.js";
 import type { createRevalidationWorkloads } from "./revalidation-workload.js";
 import type { createRevalidationDraftEditor } from "./revalidation-edit.js";
-import { revalidationObservationGaps, type createRevalidationEnvironmentObserver } from "./revalidation-environment.js";
+import type { createRevalidationEnvironmentObserver } from "./revalidation-environment.js";
 import { stableJson } from "./domain/shared.js";
 import type { createRevalidationRunner } from "./revalidation-runner.js";
 import type { ExecutionSelection } from "./native-execution.js";
@@ -80,11 +80,8 @@ export function createRevalidationOwnerApi(options:RevalidationOwnerOptions){
       // Only the configured worker project/environment is observed; a draft cannot direct reads elsewhere.
       const configured=options.selection();
       if(!configured||stableJson(selected.definition.environment.execution)!==stableJson(configured))throw new Error("revalidation-environment-not-configured-worker");
-      const observed=await options.observer.observe(selected.definition.environment,signal);
+      await options.observer.observe(selected.definition.environment,signal);
       if(signal?.aborted)throw new Error("revalidation-freeze-cancelled");
-      // An unfingerprinted dependency could change unnoticed between runs, so it cannot be frozen as tested.
-      const gaps=revalidationObservationGaps(observed);
-      if(gaps.length)throw new Error(`revalidation-dependencies-not-observed: ${gaps.slice(0,10).join(", ")}`);
       const result=domain.plans.freeze(input,owner);options.changed();return result;
     },
     queue(raw:Parameters<typeof domain.plans.queue>[0]){

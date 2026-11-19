@@ -44,7 +44,7 @@ it.each(["project", "status", "host", "phase"])("requires exact ready/active env
   await expect(f.observer.observe(environment)).rejects.toThrow("not-ready-or-mismatched"); expect(f.methods.system.version).not.toHaveBeenCalled();
 });
 it("reports a failed read as an unavailable observation, never as a changed or unknown fact", async () => {
-  const f = fixture(); f.methods.system.version.mockRejectedValue(new Error("unavailable"));
+  const f = fixture(); f.methods.plugins.list.mockRejectedValue(new Error("unavailable"));
   await expect(f.observer.observe(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
   await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
   expect(f.store.list("revalidation-observed-environments")).toEqual([]);
@@ -110,4 +110,11 @@ it("compares without recording when used as a drift check",async()=>{
   const f=fixture(),recorded=await f.observer.observe(environment),before=f.store.list("revalidation-observed-environments");
   for(let i=0;i<5;i++)expect((await f.observer.check(environment)).digest).toBe(recorded.digest);
   expect(f.store.list("revalidation-observed-environments")).toEqual(before);expect(f.observer.resolve(environment).digest).toBe(recorded.digest);
+});
+it("treats a failed environment read as unavailable and an unreadable BB version as a stable unknown", async () => {
+  const f = fixture(); f.methods.environments.get.mockRejectedValueOnce(new Error("boom"));
+  await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
+  f.methods.system.version.mockRejectedValue(new Error("offline"));
+  const first = await f.observer.check(environment), second = await f.observer.check(environment);
+  expect(first.bbVersion).toBeNull(); expect(first.unknowns).toContain("bb-version-not-observed"); expect(second.digest).toBe(first.digest);
 });

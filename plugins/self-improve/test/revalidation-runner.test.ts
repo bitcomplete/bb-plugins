@@ -217,4 +217,30 @@ describe("BB-native revalidation runner",()=>{
     const restarted=createRevalidationRunner(f.options);expect(()=>restarted.recover("next-boot")).not.toThrow();expect(interrupt).toHaveBeenCalled();
     interrupt.mockRestore();resolve({output:"fixture-answer-one"});f.setHook(async()=>({output:"fixture-answer-two"}));await pending;
   });
+  it("is inconclusive, not supported, when no baseline answer was readable",async()=>{
+    const f=await fixture();f.setHook(async()=>"```json\n{\"output\":\"fixture-answer-one\"}\n```");
+    await f.runner.handle(f.ctx);
+    const state=f.core.plans.getRun(f.queued.id);
+    expect(state.run.status).toBe("completed");expect(state.run.verdict).not.toBe("supported");expect(state.result?.verdict).toBe("inconclusive");
+  });
+  it("keeps the stop reason when the condition clears before the arm ends",async()=>{
+    const f=await fixture();f.setHook((_r,signal)=>new Promise((_resolve,reject)=>{signal?.addEventListener("abort",()=>reject(Object.assign(new Error("x"),{code:"native-task-aborted"})));}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    let allowed=false;f.options.allowed=()=>allowed;f.runner.enforce();allowed=true;await pending;
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-execution-disabled (case case-a, baseline)"});
+  });
+  it("labels the runner's own admission refusal rather than blaming BB's shared budget",async()=>{
+    const f=await fixture(),execute=f.native.execute.getMockImplementation()!;
+    f.native.execute.mockImplementation(async(request,signal)=>{f.setCost(1_000_000);try{return await execute(request,signal);}catch{throw Object.assign(new Error("x"),{code:"native-task-admission-denied"});}});
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-observed-cost-threshold (case case-a, baseline)"});
+  });
+  it("retries a failed setup read instead of discarding the run",async()=>{
+    const f=await fixture();vi.useFakeTimers({toFake:["setTimeout"]});
+    try{
+      f.observeEnvironment.mockRejectedValueOnce(new Error("revalidation-environment-observation-unavailable"));
+      const pending=f.runner.handle(f.ctx);await vi.advanceTimersByTimeAsync(5000);await pending;
+      expect(f.core.plans.getRun(f.queued.id).run.status).toBe("completed");
+    }finally{vi.useRealTimers();}
+  });
 });

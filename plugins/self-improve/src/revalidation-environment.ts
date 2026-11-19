@@ -59,7 +59,7 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 /** Unknown entries are bounded text; a long dependency name must not make a plan impossible to freeze. */
-const unknown = (prefix: string, name: string) => `${prefix}:${name}`.slice(0, 500);
+const unknown = (prefix: string, name: string) => `${prefix}:${name}`.slice(0, 500).trimEnd();
 const snapshots = "revalidation-observed-environments", heads = "revalidation-environment-observation-heads", cursors = "revalidation-environment-observation-cursors";
 /** Observes selected declarations only. Metadata/content fingerprints do not attest isolation or tool availability. */
 export function createRevalidationEnvironmentObserver(options: { sdk: RevalidationEnvironmentSdk; store: Store; redact: (value: string) => string; now?: () => number }) {
@@ -92,14 +92,17 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
     const sdk = options.sdk, unknowns = new Set(["provider-context-not-observed", "hidden-configuration-not-observed", "workspace-cleanliness-not-observed", "tool-side-effects-not-observed", "snapshot-is-not-an-atomic-lock"]);
     const read = <T>(operation: () => Promise<T>) => { signal.throwIfAborted(); return bounded(operation(), signal); };
     // A read that errors is not an observation: report it as unavailable instead of folding it into the digest as "unknown".
-    const optional = async <T>(operation: () => Promise<T>): Promise<T | null> => { try { return await read(operation); } catch { signal.throwIfAborted(); throw new Error("revalidation-environment-observation-unavailable"); } };
-    const rawEnvironment = await read(() => sdk.environments.get({ environmentId: selection.environmentId, signal }));
+    const optional = async <T>(operation: () => Promise<T>): Promise<T | null> => { try { return await read(operation); } catch (error) { if (signal.aborted) throw error; throw new Error("revalidation-environment-observation-unavailable"); } };
+    let rawEnvironment: unknown;
+    try { rawEnvironment = await read(() => sdk.environments.get({ environmentId: selection.environmentId, signal })); }
+    catch (error) { if (signal.aborted) throw error; throw new Error("revalidation-environment-observation-unavailable"); }
     const ready = z.object({ id: text, projectId: text, status: z.literal("ready"), hostLifecycle: z.literal("active"), lifecycle: z.object({ phase: z.literal("active") }) }).safeParse(rawEnvironment);
     if (!ready.success || ready.data.id !== selection.environmentId || ready.data.projectId !== selection.projectId) throw new Error("revalidation-environment-not-ready-or-mismatched");
     const pluginIds = [...new Set(environment.dependencies.filter(item => item.kind === "plugin").map(item => item.name))].sort();
     const skillIds = [...new Set(environment.dependencies.filter(item => item.kind === "skill").map(item => item.name))].sort();
     const [versionResult, pluginsResult, skillsResult] = await Promise.all([
-      optional(() => sdk.system.version({ signal })), pluginIds.length ? optional(() => sdk.plugins.list({ signal })) : null,
+      // The BB version is context, not a declared dependency: a host that cannot report it records a stable unknown.
+      read(() => sdk.system.version({ signal })).catch(error => { if (signal.aborted) throw error; return null; }), pluginIds.length ? optional(() => sdk.plugins.list({ signal })) : null,
       skillIds.length ? optional(() => sdk.skills.list({ projectId: selection.projectId, environmentId: selection.environmentId, signal })) : null,
     ]);
     let bbVersion: string | null = null;
@@ -171,6 +174,14 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
     if (current.digest !== expectedDigest) throw new Error("revalidation-environment-drift"); return current;
   }
   /** Read-only observation for drift comparison; nothing is stored. */
-  const check = (environment: RevalidationEnvironment, signal?: AbortSignal) => observe(environment, signal, false);
-  return { observe: (environment: RevalidationEnvironment, signal?: AbortSignal) => observe(environment, signal), check, resolve, verify };
+  /** The observer's own 10-second limit is an unavailable observation; only the caller's abort is an abort. */
+  const run = async (environment: RevalidationEnvironment, signal: AbortSignal | undefined, persist: boolean) => {
+    try { return await observe(environment, signal, persist); }
+    catch (error) {
+      if (!signal?.aborted && error instanceof Error && (error.message === "revalidation-environment-observation-aborted" || error.name === "TimeoutError" || error.name === "AbortError")) throw new Error("revalidation-environment-observation-unavailable");
+      throw error;
+    }
+  };
+  const check = (environment: RevalidationEnvironment, signal?: AbortSignal) => run(environment, signal, false);
+  return { observe: (environment: RevalidationEnvironment, signal?: AbortSignal) => run(environment, signal, true), check, resolve, verify };
 }

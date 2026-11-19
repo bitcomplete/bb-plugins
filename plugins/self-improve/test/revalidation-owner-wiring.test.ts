@@ -14,6 +14,7 @@ async function fixture(){
   const {bb,harness}=createFakePluginHost({pluginId:"self-improve",settings:{config:JSON.stringify({...defaultConfig(),...selection})},sdk:{
     environments:{get:async()=>({id:"environment",projectId:"project",status:"ready",hostLifecycle:"active",lifecycle:{phase:"active"}} as any)},
     system:{version:async()=>({currentVersion:"0.49.0",upgradeCommand:"unused"} as any)},threads:{spawn},
+    skills:{list:async()=>({skills:[]} as any)},
   }});
   await plugin(bb);const store=new Store(bb.storage.database());
   const content="Preserve each field of the original payload.",artifactDigest=createHash("sha256").update(content).digest("hex");
@@ -59,6 +60,9 @@ it("refuses owner actions from another plugin",async()=>{
   const f=await fixture();try{
     const asPlugin={experimental_caller:{kind:"plugin" as const,pluginId:"other-plugin"}};
     await expect(f.harness.behavior.callRpc("editRevalidationDraft",f.input,asPlugin)).rejects.toThrow("available only to the owner");
+    for(const [method,input] of [["dashboard",{}],["getExecution",{}],["revalidationOverview",{}]] as const)
+      await expect(f.harness.behavior.callRpc(method,input,asPlugin)).rejects.toThrow("available only to the owner");
+    await expect(f.harness.behavior.callRpc("dashboard",{})).resolves.toBeDefined();
     expect(f.store.list("revalidation-plans")).toEqual([]);
   }finally{await f.harness.lifecycle.dispose();}
 });
@@ -73,5 +77,13 @@ it("observes only the configured worker environment and returns an existing free
     const snapshots=f.store.list("revalidation-observed-environments").length;
     expect(await f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1})).toEqual(frozen);
     expect(f.store.list("revalidation-observed-environments")).toHaveLength(snapshots);
+  }finally{await f.harness.lifecycle.dispose();}
+});
+it("refuses to freeze a declared dependency it cannot fingerprint",async()=>{
+  const f=await fixture();try{
+    const withSkill={...f.input,requestId:"with-skill",definition:{...f.input.definition,environment:{...f.input.definition.environment!,dependencies:[{kind:"skill" as const,name:"absent-skill",version:"any",setup:"Installed in the worker project"}]}}};
+    const draft=await f.harness.behavior.callRpc("editRevalidationDraft",withSkill) as ReturnType<RevalidationOwnerApi["edit"]>;
+    await expect(f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1})).rejects.toThrow("revalidation-dependencies-not-observed");
+    expect(f.store.list("revalidation-frozen")).toEqual([]);
   }finally{await f.harness.lifecycle.dispose();}
 });

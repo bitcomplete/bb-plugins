@@ -13,7 +13,7 @@ import { revalidationIdSchema as id, revalidationProseSchema as prose, revalidat
 } from "./revalidation-contract.js";
 export * from "./revalidation-contract.js";
 import { validateWorkloadSnapshot } from "./revalidation-workload.js";
-import { validateObservedRevalidationEnvironment, type ObservedRevalidationEnvironment } from "./revalidation-environment.js";
+import { revalidationObservationGaps, validateObservedRevalidationEnvironment, type ObservedRevalidationEnvironment } from "./revalidation-environment.js";
 export interface RevalidationOptions { redact: (value: string) => string; now?: () => number;
   workloads?: { resolve(reference: RevalidationWorkloadRef): RevalidationWorkloadSnapshot };
   environmentSnapshots?: { resolve(environment: RevalidationEnvironment): ObservedRevalidationEnvironment } }
@@ -70,9 +70,14 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
     if (prior && contentDigest(prior.artifact.content) === target.artifactDigest) { privateText(prior.artifact.content); return prior.artifact; }
     throw new Error("revalidation-artifact-missing");
   }
+  // Frozen records are written once; a record whose store version is unchanged since it was verified needs no rehash.
+  // This keeps the check cheap inside BB's dispatch hook, where it runs before every arm.
+  const verifiedFrozen = new Map<string, number>();
   function freezeRecord(planId: string, version: number): FrozenRevalidationPlan {
-    const frozen = store.get<FrozenRevalidationPlan>("revalidation-frozen", versionKey(planId, version));
+    const key = versionKey(planId, version), frozen = store.get<FrozenRevalidationPlan>("revalidation-frozen", key);
     if (!frozen) throw new Error("revalidation-plan-not-frozen");
+    const storedVersion = store.version("revalidation-frozen", key);
+    if (verifiedFrozen.get(key) === storedVersion) return frozen;
     // Version 1 digests remain interpretable, but never gain executable capabilities.
     if (frozen.schemaVersion !== undefined && frozen.schemaVersion !== 2) throw new Error("revalidation-frozen-version-unsupported");
     if (frozen.schemaVersion === 2) {
@@ -86,6 +91,7 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
       workload: frozen.workload, observedEnvironment: frozen.observedEnvironment }) : hash({ planId, version, definition: frozen.definition, artifact: frozen.artifact });
     if (frozen.planDigest !== expected || contentDigest(frozen.artifact.content) !== frozen.definition.target.artifactDigest ||
       frozen.environmentDigest !== revalidationEnvironmentDigest(frozen.definition.environment!) || frozen.workloadDigest !== frozen.definition.workload?.manifestDigest) throw new Error("revalidation-frozen-input-changed");
+    verifiedFrozen.set(key, storedVersion);
     return frozen;
   }
   function run(runId: string): RevalidationRun {
@@ -176,6 +182,9 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
         const observedEnvironment = validateObservedRevalidationEnvironment(options.environmentSnapshots.resolve(def.environment));
         const environmentDigest = revalidationEnvironmentDigest(def.environment);
         if (observedEnvironment.declaredEnvironmentDigest !== environmentDigest) throw new Error("revalidation-environment-observation-changed");
+        // Checked on the exact snapshot being frozen: an unfingerprinted dependency could change unnoticed between runs.
+        const gaps = revalidationObservationGaps(observedEnvironment);
+        if (gaps.length) throw new Error(`revalidation-dependencies-not-observed: ${gaps.slice(0, 10).join(", ")}`);
         privateText(observedEnvironment);
         // Observed identity is also immutable within a plan: re-freezing a revision
         // must not move an unresolved contradiction to a newly observed environment.
