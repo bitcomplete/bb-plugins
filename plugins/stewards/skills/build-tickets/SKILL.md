@@ -114,7 +114,16 @@ the default branch:
   rewrote the base's commits), resolve any conflicts, and push; then retarget
   it (`gh pr edit <n> --base <default>`). Rebase and push first, so the
   plugin never merges the un-rebased head while the old head's checks are
-  still green. The plugin then merges yours through the normal gate; your
+  still green. This push can land while the base branch is already deleted
+  (the base merged with `delete_branch_on_merge`), so GitHub fires no
+  `synchronize` run for it, and the retarget is only an `edited` event, which
+  the default `on: pull_request` types omit. So **before waiting on checks,
+  confirm a run exists for the new head** with
+  `gh run list -R <repo> --commit <sha>`. If none appears within about two
+  minutes, re-trigger without changing the head:
+  `gh pr close <n> && gh pr reopen <n>` (the `reopened` event is a default
+  `pull_request` type). If still none, tell the steward rather than keep
+  waiting. The plugin then merges yours through the normal gate; your
   reviewer's verdict and the owner's approval carry across the rebase.
 - If the base pull request closes without merging, retarget yours to the
   default branch (`gh pr edit <n> --base <default>`, rebasing or merging the
@@ -342,7 +351,11 @@ saying in a line what changed since the approval.
 **A conflict with the base branch is yours to clear, not a question for
 anyone.** When the merge is refused because the PR is not mergeable, merge
 the base branch into the branch (or rebase), resolve the conflicts however
-they need resolving, push, wait for the checks, and merge. Neither
+they need resolving, push, **confirm a run exists for the new head**
+(`gh run list -R <repo> --commit <sha>`; if none appears within about two
+minutes, re-trigger without changing the head with
+`gh pr close <n> && gh pr reopen <n>`, and if still none tell the steward),
+wait for the checks, and merge. Neither
 approval needs renewing for that, and the reviewer does not need another
 round. Do not post asking how to proceed and do not wait for the queue of
 other PRs to drain. If the base branch moves again before you merge, do it
