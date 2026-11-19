@@ -20,6 +20,7 @@ export const rpcContract = defineRpcContract({
   getExecution: { input: z.object({}).strict(), output: z.custom<ExecutionSettingsView>() },
   workerOptions: { input: z.object({}).strict(), output: z.custom<{ projects: Array<{ id: string; name: string }>; environments: Array<{ id: string; projectId: string; label: string }> }>() },
   findProblems: { input: z.object({}).strict(), output: z.object({ jobId: z.string() }) },
+  problemReport: { input: z.object({ problemId: id }).strict(), output: z.custom<{ title: string; body: string; issueUrl: string | null }>() },
   applyImprovement: { input: z.object({ solutionId: id }).strict(), output: z.custom<AppliedImprovement>() },
   setImprovementEnabled: { input: z.object({ solutionId: id, enabled: z.boolean() }).strict(), output: z.custom<AppliedImprovement>() },
   setAutoApply: { input: z.object({ autoApply: z.boolean() }).strict(), output: z.object({ autoApply: z.boolean() }) },

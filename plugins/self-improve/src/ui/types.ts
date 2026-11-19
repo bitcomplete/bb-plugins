@@ -55,6 +55,7 @@ export interface DashboardApi extends Partial<PublicationApi>, Partial<Revalidat
   dashboard(input: Record<string, never>): Promise<DashboardData>;
   retest(input: { solutionId: string; expectedVersion: number; reason: string }): Promise<{ jobId: string }>;
   findProblems?(input: Record<string, never>): Promise<{ jobId: string }>;
+  problemReport?(input: { problemId: string }): Promise<{ title: string; body: string; issueUrl: string | null }>;
   applyImprovement?(input: { solutionId: string }): Promise<unknown>;
   setImprovementEnabled?(input: { solutionId: string; enabled: boolean }): Promise<unknown>;
   setAutoApply?(input: { autoApply: boolean }): Promise<{ autoApply: boolean }>;

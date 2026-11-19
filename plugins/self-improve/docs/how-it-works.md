@@ -42,6 +42,10 @@ The **Improvements** panel on the dashboard lists each applied improvement, how 
 
 Records from earlier versions of the plugin stay readable and show **revalidation required**; they are not applied.
 
+## Problems outside the agent
+
+The search also notes where each problem's cause seems to be: how the agent worked, a plugin, a skill, BB itself, or a setting. Self improve only changes the instructions it adds to turns, so for a cause in a plugin, skill, BB or a setting it can work around the problem but not fix it. The problem view then offers **Write a report**: what happens, where, the likely cause, the evidence, any workaround in use and suggested fixes, ready to copy. For a plugin installed from GitHub it also links **Open an issue** in that plugin's repository. Self improve never edits code or files it doesn't own.
+
 A basic **Re-test solution** request preserves previous evidence and reuses an already-pending job for the same revision. Successful job execution does not mean the claim passed. Native exploratory results remain **needs review** with the adoption gate blocked; failures and inconclusive work stay separate.
 
 ## The full target lifecycle

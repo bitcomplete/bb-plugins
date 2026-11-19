@@ -15,6 +15,7 @@ export interface MiningSession extends SessionRecord { events: MiningEvent[] }
 export interface MiningFailure {
   eventId: string; kind: "owner_correction" | "tool_error" | "tool_retry";
   symptom: string; rootCauseHypothesis: string; category: string; matchedProblemId: string | null;
+  location?: import("../domain/types.js").ProblemLocation;
 }
 export interface MiningAnalysis {
   failures: MiningFailure[];
@@ -90,6 +91,8 @@ function ensureObservation(ledgers: Ledgers, failure: MiningFailure, evidence: E
   if (!cause) { cause = { id: stableId("cause", [id, failure.rootCauseHypothesis]), text: failure.rootCauseHypothesis }; problem.causes.push(cause); }
   let symptom = problem.symptoms.find(s => s.causeId === cause.id && s.text === failure.symptom);
   if (!symptom) { symptom = { id: stableId("symptom", [cause.id, failure.symptom]), causeId: cause.id, text: failure.symptom }; problem.symptoms.push(symptom); }
+  // A known location replaces an unknown one; a known one is not overwritten by later guesses.
+  if (failure.location && (!problem.location || problem.location.kind === "unknown")) problem.location = failure.location;
   // New observed failures reopen a resolved problem, without erasing historical solution outcomes.
   problem.status = "open";
   ledgers.votes = appendVotes(ledgers.votes, [makeVote({ problemId: problem.id, symptomId: symptom.id, kind, evidence, day, occurredAtMs, originPluginId })]);

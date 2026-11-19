@@ -17,7 +17,10 @@ export interface Problem {
   solutionIds: string[];
   createdAtMs: number;
   parentId?: string;
+  /** Where the cause seems to be. Self improve only fixes agent behaviour itself; other locations get a report. */
+  location?: ProblemLocation;
 }
+export interface ProblemLocation { kind: "agent" | "plugin" | "skill" | "bb" | "configuration" | "unknown"; name: string | null }
 export interface Vote {
   id: string;
   problemId: string;

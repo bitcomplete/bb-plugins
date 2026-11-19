@@ -91,6 +91,7 @@ export function mergeLedgers(input: Ledgers): Ledgers {
     merged.push({ ...base, id, aliases: unique(group.flatMap(p => [p.id, ...p.aliases])).filter(a => a !== id),
       causes: [...causesByText.values()].sort((a, b) => compareIds(a.id, b.id)), symptoms,
       solutionIds: unique(group.flatMap(p => p.solutionIds)), createdAtMs: Math.min(...group.map(p => p.createdAtMs)),
+      ...((group.find(p => p.location && p.location.kind !== "unknown") ?? group.find(p => p.location))?.location ? { location: (group.find(p => p.location && p.location.kind !== "unknown") ?? group.find(p => p.location))!.location } : {}),
       status: group.some(p => p.status === "open") ? "open" : group.some(p => p.status === "monitoring") ? "monitoring" : "resolved",
       ...(canonicalParent && canonicalParent !== id ? { parentId: canonicalParent } : { parentId: undefined }) });
   }

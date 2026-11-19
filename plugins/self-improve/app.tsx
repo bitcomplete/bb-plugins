@@ -38,6 +38,7 @@ function SelfImprovePage() {
     dashboard: input => rpc.call("dashboard", input),
     retest: input => rpc.call("retest", input),
     findProblems: input => rpc.call("findProblems", input),
+    problemReport: input => rpc.call("problemReport", input),
     applyImprovement: input => rpc.call("applyImprovement", input),
     setImprovementEnabled: input => rpc.call("setImprovementEnabled", input),
     setAutoApply: input => rpc.call("setAutoApply", input),

@@ -2,6 +2,7 @@ import { ActivityCosts, RecentAgentRuns } from "./activity-costs.js";
 import { SetupGuide } from "./setup-guide.js";
 import { ImprovementsPanel } from "./improvements-panel.js";
 import { LoopIcon } from "./loop-icon.js";
+import { ProblemLocationSection } from "./problem-location.js";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Problem, Solution, Vote } from "../domain/types.js";
 import type { DashboardApi, DashboardData, Selection } from "./types.js";
@@ -172,7 +173,7 @@ export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread,sett
           <article ref={detailRef} tabIndex={-1} className="si-detail" aria-label="Selected record details">
             {selectedGone?<Empty title="This record changed">Refresh or choose another record to continue.</Empty>:!title?<Empty title="A little curiosity goes a long way">Choose a record to follow the evidence, explore related ideas, or start a conversation.</Empty>:<>
               <header className="si-detail-header"><button className="si-button si-button-quiet si-back-button" onClick={()=>{recordsRef.current?.focus({preventScroll:true});recordsRef.current?.scrollIntoView?.({block:"start"});}}>Back to records</button><div className="si-eyebrow">{selection?.kind==="problem"?"Problem":"Solution"} <span>{selection?.id}</span></div><h2>{title}</h2><div className="si-detail-actions">{selectedSolution&&<SolutionStatus solution={selectedSolution} inactive={!!data.activation?.[selectedSolution.id]}/>}<button className="si-button si-button-primary" onClick={()=>void startChat()} disabled={!chatProjectId||!!busy[`chat:${activeKey}`]}><Glyph kind="chat"/>{busy[`chat:${activeKey}`]?"Opening chat…":"Explore and edit in chat"}</button>{!chatProjectId&&<span className="si-muted">Configure a worker project to start an editing chat.</span>}</div>{messages[`chat:${activeKey}`]?.text&&<p role="alert" className="si-action-error">{messages[`chat:${activeKey}`]!.text}</p>}</header>
-              {selectedProblem&&<ProblemDetail problem={selectedProblem} data={data} selectSolution={selectSolution} onOpenThread={onOpenThread}/>}
+              {selectedProblem&&<ProblemDetail api={api} problem={selectedProblem} data={data} selectSolution={selectSolution} onOpenThread={onOpenThread}/>}
               {selectedSolution&&<SolutionDetail key={selectedSolution.id} api={api} solution={selectedSolution} data={data} selectProblem={selectProblem} retest={()=>void retest(selectedSolution)} retestBusy={!!busy[`retest:${selectedSolution.id}`]} queuedJob={queued[selectedSolution.id]} message={messages[`retest:${selectedSolution.id}`]}/>}
             </>}
           </article>
@@ -185,12 +186,13 @@ export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread,sett
   </main>;
 }
 
-function ProblemDetail({problem,data,selectSolution,onOpenThread}:{problem:Problem;data:DashboardData;selectSolution:(s:Solution)=>void;onOpenThread:(id:string)=>void}) {
+function ProblemDetail({api,problem,data,selectSolution,onOpenThread}:{api:DashboardApi;problem:Problem;data:DashboardData;selectSolution:(s:Solution)=>void;onOpenThread:(id:string)=>void}) {
   const objective=data.objectives?.find(o=>o.problemId===problem.id);
   const votes=(data.votes??[]).filter(v=>v.problemId===problem.id).sort((a,b)=>b.occurredAtMs-a.occurredAtMs);
   return <div className="si-detail-body">
     {objective&&<section><h3>{objective.kind==="goal"?"Owner optimization goal":"Owner-reported problem"}</h3><p>{objective.description}</p><Badge>{objective.focus&&objective.focus.priority>0?"Owner focus":"Normal exploration"}</Badge>{objective.metric&&<dl className="si-kpi"><dt>{objective.metric.name}</dt><dd>Target {objective.metric.target} {objective.metric.unit} · {objective.metric.direction} is better</dd></dl>}<p className="si-section-note">This is an owner request. It does not count as observed failure evidence.</p></section>}
     <section><h3>What happened</h3><ul className="si-prose-list">{problem.symptoms.map(s=><li key={s.id}>{s.text}</li>)}</ul></section>
+    <ProblemLocationSection api={api} problem={problem}/>
     <section><h3>Working hypotheses</h3><p className="si-section-note">Explanations to test, not established causes.</p>{problem.causes.map(c=><div className="si-hypothesis" key={c.id}>{c.text}</div>)}</section>
     <section><h3>Linked solutions <span>{problem.solutionIds.length}</span></h3>{problem.solutionIds.length?<div className="si-linked-list">{problem.solutionIds.map(id=>{const s=data.solutions.find(s=>s.id===id);return s?<button key={id} className="si-linked" aria-label={`View solution ${s.title}`} onClick={()=>selectSolution(s)}><span>{s.title}<small>{s.origin==="inventor"?"Invented hypothesis":"Research-inspired hypothesis"}</small></span><Glyph kind="arrow"/></button>:<p key={id} className="si-muted">{id} · record unavailable</p>;})}</div>:<p className="si-muted">No solution is linked yet.</p>}</section>
     <section><h3>Evidence <span>{votes.length}</span></h3>{data.votes===undefined?<p className="si-muted">Evidence pointers were not included in this snapshot.</p>:!votes.length?<p className="si-muted">No vote evidence recorded for this problem.</p>:<ol className="si-evidence">{votes.slice(0,20).map(v=><Evidence key={v.id} vote={v} onOpenThread={onOpenThread}/>)}</ol>}{votes.length>20&&<p className="si-muted">Showing the latest 20 pointers. Ledger exports retain all {votes.length}.</p>}</section>

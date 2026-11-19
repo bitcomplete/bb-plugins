@@ -20,7 +20,7 @@ import { rpcContract } from "./src/contract.js";
 import { redact, modelLedgerRead } from "./src/adapters/privacy.js";
 import { DairClient } from "./src/adapters/research.js";
 import type { Paper } from "./src/adapters/types.js";
-import type { Problem, Solution, RankedSolution, Stage, Verification } from "./src/domain/types.js";
+import type { Problem, Solution, RankedSolution, Stage, Verification, Vote } from "./src/domain/types.js";
 import type { DashboardData, PerformancePoint, RetestRecord } from "./src/ui/types.js";
 import { addObjective, listObjectives, setObjectiveFocus } from "./src/objectives.js";
 import { performanceView } from "./src/performance-view.js";
@@ -38,6 +38,7 @@ import { mineRetrospective, listRetrospectives, readRetrospective } from "./src/
 import { checkAdoption } from "./src/domain/solutions.js";
 
 import { createRevalidation } from "./src/revalidation.js";
+import { problemReport } from "./src/problem-report.js";
 import { applyImprovement, setImprovementEnabled, listImprovements, improvementUsage, improvementsForTurn, improvementInstructions, recordImprovementDelivery, projectReceivesImprovements } from "./src/improvements.js";
 import { extractMiningEvent, MINED_TYPES } from "./src/sources.js";
 import { chatAuditRow } from "./src/chat-audit.js";
@@ -371,6 +372,20 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         environments: (environments as Array<Record<string, unknown>>).filter(e => text(e.status) === "ready" && text(e.projectId))
           .map(e => ({ id: text(e.id), projectId: text(e.projectId), label: [text(e.name), text(e.kind) || text(e.workspaceKind), text(e.path)].filter(Boolean).join(" · ") || text(e.id) })),
       };
+    },
+    problemReport: async input => {
+      // A report for a problem whose cause is outside what Self improve changes; the owner decides where it goes.
+      const problem = store.list<Problem>("problems").find(p => p.id === input.problemId || p.aliases.includes(input.problemId));
+      if (!problem) throw new Error("Problem not found");
+      let sourceUrl: string | null = null;
+      if (problem.location?.kind === "plugin" && problem.location.name) {
+        const plugins = await bb.sdk.plugins.list().catch(() => null) as unknown;
+        const rows = Array.isArray(plugins) ? plugins : (plugins as { plugins?: unknown[] } | null)?.plugins ?? [];
+        const match = (rows as Array<Record<string, unknown>>).find(p => p.id === problem.location!.name || p.name === problem.location!.name);
+        const resolved = match?.resolvedSource as { kind?: string; url?: unknown } | undefined;
+        sourceUrl = resolved?.kind === "git" && typeof resolved.url === "string" ? resolved.url : null;
+      }
+      return problemReport({ problem, votes: store.list<Vote>("votes"), solutions: store.list<Solution>("solutions"), applied: listImprovements(store), sourceUrl });
     },
     applyImprovement: input => {
       // Owner applies a fix whose test passed (used when automatic applying is off, or to re-apply a newer revision).
