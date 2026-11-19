@@ -322,4 +322,31 @@ describe("BB-native revalidation runner",()=>{
     expect(f.store.get("revalidation-progress",f.queued.id)).toBeNull();
     release();await pending;
   });
+  it("caps total waiting for concurrency room at thirty minutes per run",async()=>{
+    const f=await fixture(d=>{d.limits!.maxDurationMs=7_200_000;});let full=true,clock=NOW;
+    f.options.hasCapacity=()=>!full;const runner=createRevalidationRunner(f.options);
+    f.setHook(async()=>{full=true;return {output:"x"};});
+    vi.useFakeTimers({toFake:["setTimeout"]});
+    try{
+      const pending=runner.handle(f.ctx);
+      // Each arm waits about 9.5 minutes (under the 10-minute per-wait cap) before room appears.
+      for(let tick=0;tick<4*120&&f.core.plans.getRun(f.queued.id).run.status==="running";tick++){
+        clock+=5000;f.setTime(clock);if(tick%115===114)full=false;await vi.advanceTimersByTimeAsync(5000);
+      }
+      await pending;
+      expect(f.requests.length).toBeLessThan(4);
+      expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:expect.stringMatching(/^revalidation-shared-concurrency-unavailable/)});
+    }finally{vi.useRealTimers();}
+  });
+  it("completes as inconclusive when the only unreadable baseline is the final arm",async()=>{
+    const f=await fixture();f.setHook(async request=>{
+      const input=JSON.parse(request.input).input,treatment=request.instructions.includes(f.content);
+      if(!treatment&&input==="Second test task")return "```json\n{}\n```";
+      return {output:input==="First test task"?"fixture-answer-one":"fixture-answer-two"};
+    });
+    await f.runner.handle(f.ctx);
+    const state=f.core.plans.getRun(f.queued.id);
+    expect(f.requests).toHaveLength(4);expect(state.run.status).toBe("completed");expect(state.result?.verdict).toBe("inconclusive");
+    expect(state.result?.criteria.every(c=>c.reason==="baseline-answer-format-invalid")).toBe(true);
+  });
 });
