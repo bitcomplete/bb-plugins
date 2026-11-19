@@ -36,6 +36,8 @@ const row = (threadId: string, key: string, over: Partial<WatchRow> = {}): Watch
   lastCheckedAt: NOW - 60_000,
   lastWokeAt: NOW - DAY,
   recentWakes: [],
+  noChecksSince: null,
+  noChecksWoken: null,
   ...over,
 });
 

@@ -79,7 +79,7 @@ import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./ho
 import { createPoller, DEFAULT_POLL_TIMING, RateLimitError, type PollResult, type Poller, type PollerTiming } from "./poller.js";
 import { deploymentSchema, ringStewards, signedBy, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
-import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
+import { compare, createCheckQueue, createWatchStore, initialCursors, initialNoChecks, NO_CHECKS_GRACE_MS, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
 export { WATCHES_CHANGED };
 
@@ -355,7 +355,10 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     /** Read the target once and settle every watch on it against what it remembers. */
     async function checkKey(key: string): Promise<void> {
       const watching = watches.forKey(key);
-      if (watching.length === 0) return;
+      if (watching.length === 0) {
+        clearNoChecksTimer(key);
+        return;
+      }
       const ref = parseRefKey(key);
       let target: Target | null;
       try {
@@ -371,7 +374,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           await dropInvisible(watch);
           continue;
         }
-        const outcome = compare(watch, target);
+        const outcome = compare(watch, target, deps.now());
         if (outcome.message === null) {
           watches.advance(watch.threadId, watch.key, outcome, false);
           continue;
@@ -381,10 +384,64 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         else if (sent === "sent") watches.advance(watch.threadId, watch.key, outcome, true);
         if (sent !== "failed") announceWatches();
       }
+      scheduleNoChecks(key);
     }
 
     const checks = createCheckQueue(checkKey, { onError: (key, error) => bb.log.warn(`GitHub watch check of ${key} failed: ${errorMessage(error)}`) });
     bb.onDispose(() => checks.stop());
+
+    // A head with no checks produces no doorbell after the push, and the
+    // baseline sweep can be up to ten minutes late, so a one-shot timer rings
+    // the key at `since + grace`. It is re-armed after every check from the
+    // stored rows, and at start for any row already pending; the baseline and
+    // down sweeps are the backstop when the timer has already fired and the
+    // wake could not be sent.
+    const noChecksTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+    function clearNoChecksTimer(key: string): void {
+      const timer = noChecksTimers.get(key);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        noChecksTimers.delete(key);
+      }
+    }
+
+    /** The soonest `since + grace` among a key's watches with a pending, unwoken no-checks head. */
+    function noChecksDue(key: string): number | null {
+      let due: number | null = null;
+      for (const watch of watches.forKey(key)) {
+        const since = watch.noChecksSince;
+        if (since === null || watch.noChecksWoken === since.sha) continue;
+        const at = since.at + NO_CHECKS_GRACE_MS;
+        if (due === null || at < due) due = at;
+      }
+      return due;
+    }
+
+    /** Arm the one-shot check at the grace. `past` arms a stored row already past it (plugin start). */
+    function scheduleNoChecks(key: string, past = false): void {
+      clearNoChecksTimer(key);
+      const due = noChecksDue(key);
+      if (due === null) return;
+      const now = deps.now();
+      if (!past && now >= due) return; // the grace was just checked; the sweep is the backstop
+      noChecksTimers.set(
+        key,
+        setTimeout(() => {
+          noChecksTimers.delete(key);
+          checks.ring(key);
+        }, Math.max(0, due - now)),
+      );
+    }
+
+    bb.onDispose(() => {
+      for (const timer of noChecksTimers.values()) clearTimeout(timer);
+      noChecksTimers.clear();
+    });
+
+    // A row that was already waiting when the server restarted: ring it now
+    // when its grace has passed, or at the grace when it has not.
+    for (const key of watches.keys()) scheduleNoChecks(key, true);
 
     async function sweep(reason: string): Promise<void> {
       const expired = watches.expire();
@@ -1387,7 +1444,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "github_watch",
       description:
-        "Watch a GitHub pull request or issue from this thread: when it is merged, closed or reopened, when a review is submitted or requested, when its checks finish or fail, when commits are pushed, when labels, assignees or title change, or when someone else comments, this thread is sent a message describing the change (which starts a new turn if the thread is idle). Use it when there is nothing to do until the PR or issue moves, then end the turn instead of polling. A thread can watch up to 10; a watch nobody has woken in a week is dropped.",
+        "Watch a GitHub pull request or issue from this thread: when it is merged, closed or reopened, when a review is submitted or requested, when its checks finish or fail, when an open head has had no checks for a while, when commits are pushed, when labels, assignees or title change, or when someone else comments, this thread is sent a message describing the change (which starts a new turn if the thread is idle). Use it when there is nothing to do until the PR or issue moves, then end the turn instead of polling. A thread can watch up to 10; a watch nobody has woken in a week is dropped.",
       instructions:
         "This bb server is signed in to GitHub as the user; use gh on the machine for reading and writing GitHub. When nothing can be done until a pull request or issue changes (a review you asked for, checks you are waiting on, a question you asked in a comment), call github_watch with its URL or owner/repo#number and end the turn rather than polling: the thread is messaged when it changes.",
       presentation: { label: { pending: "Watching on GitHub", completed: "Watching on GitHub" } },
@@ -1404,6 +1461,8 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
             key: target.key,
             kind: target.kind,
             snapshot: snapshotOf(target),
+            noChecksSince: initialNoChecks(target, deps.now()),
+            noChecksWoken: null,
             ...initialCursors(target, new Date(deps.now()).toISOString()),
           });
           const what = `${kindName(target.kind)} ${target.key}: ${target.title ?? "(untitled)"}`;
@@ -1412,6 +1471,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           }
           if (added.outcome === "already") return `Already watching ${what}. This thread will be messaged when it changes; you can end the turn.`;
           announceWatches();
+          scheduleNoChecks(target.key);
           if (hooksUrl === "") {
             // No hooks service: the watch is picked up by the poller's next
             // round. Poke it so a watch added just after a poll is not left

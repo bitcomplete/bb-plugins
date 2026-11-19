@@ -10,12 +10,20 @@
 // the thread hears about it.
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import { ago } from "./format-time.js";
 import { kindName, type Target } from "./github.js";
 
 /** How many targets one thread may watch. Enough for a PR and the ones it depends on; not a feed. */
 export const WATCH_LIMIT = 10;
 /** A watch nobody has woken in this long is forgotten. */
 export const WATCH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * How long an open pull request's head may sit with no check runs and no
+ * statuses before the thread is woken about it. GitHub queues runs within
+ * seconds; a head still empty after this is one the `pull_request` workflow
+ * probably never ran.
+ */
+export const NO_CHECKS_GRACE_MS = 5 * 60 * 1000;
 /** How much of a new comment the wake message carries. */
 export const WAKE_COMMENT_CHARS = 1000;
 
@@ -51,6 +59,11 @@ export const WATCH_MIGRATIONS = [
   `ALTER TABLE watches ADD COLUMN last_checked_at INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE watches ADD COLUMN last_woke_at INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE watches ADD COLUMN recent_wakes TEXT NOT NULL DEFAULT '[]'`,
+  // BB-371: when a head sha was first seen with an empty check rollup, and
+  // the head sha the no-checks wake was already sent for. `no_checks_since`
+  // is a JSON `{ sha, at }` or the empty string for none.
+  `ALTER TABLE watches ADD COLUMN no_checks_since TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE watches ADD COLUMN no_checks_woken TEXT NOT NULL DEFAULT ''`,
 ];
 
 // ---- usage ---------------------------------------------------------------------
@@ -93,6 +106,9 @@ export function flagsFor(usage: Usage, now: number): WatchFlag[] {
 }
 
 // ---- what a watch remembers ---------------------------------------------------
+
+/** The head sha first seen with an empty check rollup, and when (ms since the epoch); null when it has any check or status, or is not an open pull request. */
+export type NoChecksSince = { sha: string; at: number } | null;
 
 /**
  * The fields a wake message reports on. Strings and string lists only, so a
@@ -234,6 +250,10 @@ export type WatchRow = {
   lastWokeAt: number;
   /** The newest wake times, oldest first; at most RECENT_WAKES_KEPT. */
   recentWakes: number[];
+  /** The head sha first seen with no checks or statuses, and when; null when it has some or is not an open pull request. */
+  noChecksSince: NoChecksSince;
+  /** The head sha the no-checks wake was already sent for; null when none. */
+  noChecksWoken: string | null;
 };
 
 export type CheckOutcome = {
@@ -243,15 +263,60 @@ export type CheckOutcome = {
   updatedAt: string;
   lastCommentAt: string;
   kind: Target["kind"];
+  /** The no-checks state after this read. */
+  noChecksSince: NoChecksSince;
+  /** The head sha already woken for after this read. */
+  noChecksWoken: string | null;
 };
 
+/** The open pull request behind a target, or null when it is an issue, closed or merged. */
+function openPull(target: Target): NonNullable<Target["pull"]> | null {
+  return target.kind === "pull" && target.pull !== null && target.state.startsWith("open") ? target.pull : null;
+}
+
+/**
+ * The no-checks state a brand-new watch starts from: an open pull request
+ * whose head has no check runs and no statuses begins its grace now, so the
+ * timer runs from when the watch was added rather than from the push.
+ */
+export function initialNoChecks(target: Target, now: number): NoChecksSince {
+  const p = openPull(target);
+  return p !== null && p.headSha !== null && p.checks === null ? { sha: p.headSha, at: now } : null;
+}
+
+/**
+ * What an empty check rollup on an open pull request means for one watch:
+ * the head sha first seen without checks and when, the sha the no-checks wake
+ * was already sent for, and the wake message once the grace has passed. Any
+ * check or status appearing, a new head, a closed or merged pull request or
+ * an issue resets the timer; the wake fires once per head sha.
+ */
+export function noChecksAfter(watch: WatchRow, target: Target, now: number): { since: NoChecksSince; woken: string | null; message: string | null } {
+  const p = openPull(target);
+  const sha = p?.headSha ?? null;
+  if (p === null || sha === null || p.checks !== null) {
+    // The episode is over. The woken sha is kept while the head is the same,
+    // so a head that loses its checks again is not reported twice.
+    return { since: null, woken: sha !== null && watch.noChecksWoken === sha ? sha : null, message: null };
+  }
+  const since = watch.noChecksSince !== null && watch.noChecksSince.sha === sha ? watch.noChecksSince : { sha, at: now };
+  const woken = watch.noChecksWoken === sha ? sha : null;
+  const elapsed = now - since.at;
+  if (woken === sha || elapsed < NO_CHECKS_GRACE_MS) return { since, woken, message: null };
+  return { since, woken: sha, message: `head \`${sha.slice(0, 7)}\` on \`${target.key}\` has had no checks for ${ago(since.at, now)}; the \`pull_request\` workflow may not have run` };
+}
+
 /** What a fresh read of the target means for one watch. Pure: the caller fetches and sends. */
-export function compare(watch: WatchRow, target: Target): CheckOutcome {
+export function compare(watch: WatchRow, target: Target, now: number): CheckOutcome {
   const snapshot = snapshotOf(target);
   const changes = diffSnapshots(watch.snapshot, snapshot);
   const { comments, cursor } = newComments(target, watch.lastCommentAt, watch.threadId);
-  const message = changes.length === 0 && comments.length === 0 ? null : formatWake(target, changes, comments);
-  return { message, snapshot, updatedAt: target.updatedAt ?? watch.updatedAt, lastCommentAt: cursor, kind: target.kind };
+  const changed = changes.length === 0 && comments.length === 0 ? null : formatWake(target, changes, comments);
+  const noChecks = noChecksAfter(watch, target, now);
+  // One wake carries both: a head with no checks can also have a comment or a
+  // review land in the same interval.
+  const message = [changed, noChecks.message].filter((m): m is string => m !== null).join("\n\n") || null;
+  return { message, snapshot, updatedAt: target.updatedAt ?? watch.updatedAt, lastCommentAt: cursor, kind: target.kind, noChecksSince: noChecks.since, noChecksWoken: noChecks.woken };
 }
 
 /** The cursors a brand-new watch starts from: nothing that exists now is news. */
@@ -277,6 +342,8 @@ type Row = {
   last_checked_at: number;
   last_woke_at: number;
   recent_wakes: string;
+  no_checks_since: string;
+  no_checks_woken: string;
 };
 
 function parseRecentWakes(raw: string): number[] {
@@ -287,6 +354,22 @@ function parseRecentWakes(raw: string): number[] {
     return [];
   }
 }
+
+/** A stored `{ sha, at }`, or null when the column is empty or unreadable. */
+function parseNoChecksSince(raw: string): NoChecksSince {
+  if (raw === "") return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed !== null && typeof parsed === "object" && typeof (parsed as { sha?: unknown }).sha === "string" && typeof (parsed as { at?: unknown }).at === "number") {
+      return { sha: (parsed as { sha: string }).sha, at: (parsed as { at: number }).at };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+const storedNoChecksSince = (since: NoChecksSince): string => (since === null ? "" : JSON.stringify(since));
 
 function rowToWatch(row: Row): WatchRow {
   const parsed = snapshotSchema.safeParse(JSON.parse(row.snapshot));
@@ -307,6 +390,8 @@ function rowToWatch(row: Row): WatchRow {
     lastCheckedAt: row.last_checked_at,
     lastWokeAt: row.last_woke_at,
     recentWakes: parseRecentWakes(row.recent_wakes),
+    noChecksSince: parseNoChecksSince(row.no_checks_since),
+    noChecksWoken: row.no_checks_woken === "" ? null : row.no_checks_woken,
   };
 }
 
@@ -332,8 +417,8 @@ export interface WatchStore {
 
 export function createWatchStore(db: Database.Database, now: () => number): WatchStore {
   const insert = db.prepare(
-    `INSERT INTO watches (thread_id, project_id, key, kind, snapshot, updated_at, last_comment_at, created_at, last_activity_at)
-     VALUES (@thread_id, @project_id, @key, @kind, @snapshot, @updated_at, @last_comment_at, @created_at, @last_activity_at)`,
+    `INSERT INTO watches (thread_id, project_id, key, kind, snapshot, updated_at, last_comment_at, created_at, last_activity_at, no_checks_since, no_checks_woken)
+     VALUES (@thread_id, @project_id, @key, @kind, @snapshot, @updated_at, @last_comment_at, @created_at, @last_activity_at, @no_checks_since, @no_checks_woken)`,
   );
   const countForThread = db.prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM watches WHERE thread_id = ?");
   const selectOne = db.prepare<[string, string], Row>("SELECT * FROM watches WHERE thread_id = ? AND key = ?");
@@ -341,9 +426,9 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
   const selectKey = db.prepare<[string], Row>("SELECT * FROM watches WHERE key = ? ORDER BY created_at");
   const selectKeys = db.prepare<[], { key: string }>("SELECT DISTINCT key FROM watches ORDER BY key");
   const touch = db.prepare("UPDATE watches SET last_activity_at = ? WHERE thread_id = ? AND key = ?");
-  const update = db.prepare("UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, kind = ?, checks = checks + 1, last_checked_at = ? WHERE thread_id = ? AND key = ?");
+  const update = db.prepare("UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, kind = ?, checks = checks + 1, last_checked_at = ?, no_checks_since = ?, no_checks_woken = ? WHERE thread_id = ? AND key = ?");
   const updateWoke = db.prepare(
-    "UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, kind = ?, checks = checks + 1, last_checked_at = ?, wakes = wakes + 1, last_woke_at = ?, recent_wakes = ?, last_activity_at = ? WHERE thread_id = ? AND key = ?",
+    "UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, kind = ?, checks = checks + 1, last_checked_at = ?, wakes = wakes + 1, last_woke_at = ?, recent_wakes = ?, last_activity_at = ?, no_checks_since = ?, no_checks_woken = ? WHERE thread_id = ? AND key = ?",
   );
   const selectRecent = db.prepare<[string, string], { recent_wakes: string }>("SELECT recent_wakes FROM watches WHERE thread_id = ? AND key = ?");
   const deleteOne = db.prepare("DELETE FROM watches WHERE thread_id = ? AND key = ?");
@@ -367,6 +452,8 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
       last_comment_at: watch.lastCommentAt,
       created_at: now(),
       last_activity_at: now(),
+      no_checks_since: storedNoChecksSince(watch.noChecksSince),
+      no_checks_woken: watch.noChecksWoken ?? "",
     });
     return { outcome: "added" };
   });
@@ -383,12 +470,14 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
     advance: (threadId, key, outcome, woke) => {
       const snapshot = JSON.stringify(outcome.snapshot);
       const at = now();
+      const since = storedNoChecksSince(outcome.noChecksSince);
+      const woken = outcome.noChecksWoken ?? "";
       if (!woke) {
-        update.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.kind, at, threadId, key);
+        update.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.kind, at, since, woken, threadId, key);
         return;
       }
       const recent = [...parseRecentWakes(selectRecent.get(threadId, key)?.recent_wakes ?? "[]"), at].slice(-RECENT_WAKES_KEPT);
-      updateWoke.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.kind, at, at, JSON.stringify(recent), at, threadId, key);
+      updateWoke.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.kind, at, at, JSON.stringify(recent), at, since, woken, threadId, key);
     },
     remove: (threadId, key) => {
       deleteOne.run(threadId, key);
