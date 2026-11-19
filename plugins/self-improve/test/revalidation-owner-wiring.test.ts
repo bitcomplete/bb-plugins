@@ -37,7 +37,7 @@ it("edits, freezes and queues the exact plan through public owner RPC with one d
     const queued=await f.harness.behavior.callRpc("queueRevalidation",request) as ReturnType<RevalidationOwnerApi["queue"]>;
     expect(await f.harness.behavior.callRpc("queueRevalidation",request)).toEqual(queued);
     const jobs=f.store.db.prepare("SELECT input FROM jobs WHERE stage='builder'").all() as {input:string}[];
-    expect(jobs.map(row=>JSON.parse(row.input))).toEqual([{kind:"revalidation",revalidationRunId:queued.run.id}]);
+    expect(jobs.map(row=>JSON.parse(row.input))).toEqual([{kind:"revalidation",revalidationRunId:queued.run.id,solutionId:`revalidation-run:${queued.run.id}`}]);
     const detail=await f.harness.behavior.callRpc("revalidationPlan",{planId:first.plan.id}) as ReturnType<RevalidationOwnerApi["detail"]>;
     expect(detail.results).toEqual([]);expect(detail.runs[0]!.verdict).toBeNull();expect(f.spawn).not.toHaveBeenCalled();
     expect(f.harness.inspection.registrations.services).toHaveLength(7);
@@ -53,5 +53,25 @@ it("cancels queued owner work without making a result or reopening it on a lost-
     expect(cancelled).toMatchObject({status:"cancelled",verdict:null});
     expect(await f.harness.behavior.callRpc("queueRevalidation",request)).toMatchObject({run:{status:"cancelled",verdict:null},jobId:null});
     expect(f.store.list("revalidation-results")).toEqual([]);expect(f.spawn).not.toHaveBeenCalled();
+  }finally{await f.harness.lifecycle.dispose();}
+});
+it("refuses owner actions from another plugin",async()=>{
+  const f=await fixture();try{
+    const asPlugin={experimental_caller:{kind:"plugin" as const,pluginId:"other-plugin"}};
+    await expect(f.harness.behavior.callRpc("editRevalidationDraft",f.input,asPlugin)).rejects.toThrow("available only to the owner");
+    expect(f.store.list("revalidation-plans")).toEqual([]);
+  }finally{await f.harness.lifecycle.dispose();}
+});
+it("observes only the configured worker environment and returns an existing freeze on retry",async()=>{
+  const f=await fixture();try{
+    const elsewhere={...f.input,requestId:"elsewhere",definition:{...f.input.definition,environment:{...f.input.definition.environment!,execution:{...f.input.definition.environment!.execution,projectId:"other-project"}}}};
+    const other=await f.harness.behavior.callRpc("editRevalidationDraft",elsewhere) as ReturnType<RevalidationOwnerApi["edit"]>;
+    await expect(f.harness.behavior.callRpc("freezeRevalidation",{planId:other.plan.id,expectedVersion:1})).rejects.toThrow("revalidation-environment-not-configured-worker");
+    expect(f.store.list("revalidation-observed-environments")).toEqual([]);
+    const draft=await f.harness.behavior.callRpc("editRevalidationDraft",f.input) as ReturnType<RevalidationOwnerApi["edit"]>;
+    const frozen=await f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1});
+    const snapshots=f.store.list("revalidation-observed-environments").length;
+    expect(await f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1})).toEqual(frozen);
+    expect(f.store.list("revalidation-observed-environments")).toHaveLength(snapshots);
   }finally{await f.harness.lifecycle.dispose();}
 });

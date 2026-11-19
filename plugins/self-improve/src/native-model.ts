@@ -23,8 +23,8 @@ export function parseJsonReply(text: string): unknown {
   if (typeof text !== "string" || text.length > 200_000) throw new AdapterError("invalid-model-json", "Model JSON exceeds its limit");
   try { return JSON.parse(text); } catch { throw new AdapterError("invalid-model-json", "Model must return only valid JSON"); }
 }
-/** BB owns agent execution, authentication and usage; this boundary only parses a structured proposal. */
-export async function completeJson(runner: TaskRunner, request: NativeJsonRequest, signal?: AbortSignal): Promise<NativeTaskReceipt & { value: unknown }> {
+/** Runs a native task and checks the receipt matches the request; the reply text is returned unparsed. */
+export async function completeText(runner: TaskRunner, request: NativeJsonRequest, signal?: AbortSignal): Promise<NativeTaskReceipt> {
   signal?.throwIfAborted();
   const result = await runner.execute(request, signal);
   signal?.throwIfAborted();
@@ -32,6 +32,11 @@ export async function completeJson(runner: TaskRunner, request: NativeJsonReques
     result.providerId !== request.execution.providerId || result.model !== request.execution.model || result.modelIdentitySource !== "requested-selection") {
     throw new AdapterError("native-receipt-mismatch", "Native task receipt does not match the requested execution");
   }
+  return result;
+}
+/** BB owns agent execution, authentication and usage; this boundary only parses a structured proposal. */
+export async function completeJson(runner: TaskRunner, request: NativeJsonRequest, signal?: AbortSignal): Promise<NativeTaskReceipt & { value: unknown }> {
+  const result = await completeText(runner, request, signal);
   return { ...result, value: parseJsonReply(result.text) };
 }
 export function parseInventions(value: unknown, policy: PrivacyPolicy = {}): Invention[] {

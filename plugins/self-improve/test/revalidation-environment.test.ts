@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { createRevalidationEnvironmentObserver, observedRevalidationEnvironmentDigest, validateObservedRevalidationEnvironment, type RevalidationEnvironmentSdk } from "../src/revalidation-environment.js";
+import { revalidationObservationGaps, createRevalidationEnvironmentObserver, observedRevalidationEnvironmentDigest, validateObservedRevalidationEnvironment, type RevalidationEnvironmentSdk } from "../src/revalidation-environment.js";
 import { revalidationEnvironmentSchema, type RevalidationEnvironment } from "../src/revalidation-contract.js";
 import { stableJson } from "../src/domain/shared.js";
 import { MIGRATIONS, Store } from "../src/store.js";
@@ -43,8 +43,23 @@ it.each(["project", "status", "host", "phase"])("requires exact ready/active env
   if (field === "host") f.state.environment.hostLifecycle = "removing"; if (field === "phase") f.state.environment.lifecycle.phase = "teardown";
   await expect(f.observer.observe(environment)).rejects.toThrow("not-ready-or-mismatched"); expect(f.methods.system.version).not.toHaveBeenCalled();
 });
-it("retains missing or unavailable facts as unknown instead of using declared versions or inventory presence", async () => {
-  const f = fixture(); f.methods.system.version.mockRejectedValue(new Error("unavailable")); f.state.plugins = [];
+it("reports a failed read as an unavailable observation, never as a changed or unknown fact", async () => {
+  const f = fixture(); f.methods.system.version.mockRejectedValue(new Error("unavailable"));
+  await expect(f.observer.observe(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
+  await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
+  expect(f.store.list("revalidation-observed-environments")).toEqual([]);
+});
+it("fingerprints skill content the privacy filter would rewrite, since only its digest is stored", async () => {
+  const f = fixture(); f.options.redact = (value: string) => value.replaceAll("https://", "[url]");
+  const observer = createRevalidationEnvironmentObserver(f.options);
+  f.state.content = "See https://example.test for details";
+  const first = await observer.check(environment);
+  expect(first.skills[0]).toMatchObject({ complete: true }); expect(revalidationObservationGaps(first)).toEqual([]);
+  f.state.content = "See https://example.test/changed for details";
+  expect((await observer.check(environment)).digest).not.toBe(first.digest);
+});
+it("retains missing facts as unknown instead of using declared versions or inventory presence", async () => {
+  const f = fixture(); f.methods.system.version.mockResolvedValue({} as never); f.state.plugins = [];
   f.methods.skills.listFiles.mockResolvedValue({ files: ["SKILL.md"], truncated: true });
   const observed = await f.observer.observe({ ...environment, dependencies: [...environment.dependencies, { kind: "tool", name: "compiler", version: "declared-3", setup: "Install it" }] });
   expect(observed.bbVersion).toBeNull(); expect(observed.plugins[0]).toMatchObject({ presence: "missing", version: null, metadataDigest: null });

@@ -27,6 +27,8 @@ Native usage records retain task, thread, requested provider/model, public reque
 | `scopeLimitsMicros` | Optional daily stage or `solution:<id>` thresholds. |
 | `prices` | Versioned price inputs for retained legacy/detector estimates; they do not price native subscription usage. |
 
+Revalidation runs count as `builder` work for the solution being retested, so they draw on the same `builder` and `solution:<id>` thresholds as its builds and retests. A large revalidation can use up that solution's daily allowance. A run is refused before any call when `allowUnknown` is `false`.
+
 One currency unit is 1,000,000 micros. Native agent work requires `allowUnknown:true` even if `prices` names the selected model. That setting is a spending decision, not evidence that the operation is free.
 
 Native task admissions have durable identity, call and concurrency checks. Manual chat uses observed-budget preflight: BB's inline dispatch hook has no stable request ID, so repeated hook checks are not counted as new turns. Initial conversation admission is recorded once; later requests/root turns come from public events. Reporting lag, concurrent turns, Send-now overrides, edits and compaction limit enforcement.

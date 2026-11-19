@@ -82,12 +82,34 @@ describe("BB-native revalidation runner",()=>{
     await f.runner.handle(f.ctx);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"completed",verdict:"contradicted"});
     expect(f.core.plans.getRun(f.queued.id).result?.observations[1]!.treatment).toBe(2);
   });
-  it("retains partial receipts and unknown usage for malformed output; replaying the service job never retries models",async()=>{
+  it("scores a malformed answer as a failed case without storing its text; replaying the service job never retries models",async()=>{
     const f=await fixture();f.setHook(async()=>f.requests.length===1?{output:"wrong"}:"not JSON private-secret");
-    await f.runner.handle(f.ctx);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"failed",verdict:null});
-    expect(f.store.list("revalidation-receipts")).toHaveLength(1);expect(f.core.plans.usage(f.queued.id).length).toBeGreaterThan(0);
-    expect(JSON.stringify(f.store.list("revalidation-runs"))).not.toContain("private-secret");
-    await f.runner.handle(f.ctx);expect(f.requests).toHaveLength(2);
+    await f.runner.handle(f.ctx);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"completed"});
+    const receipts=f.store.list<{answerFormat:string;passed:boolean}>("revalidation-receipts");
+    expect(receipts).toHaveLength(4);expect(receipts.filter(r=>r.answerFormat==="invalid")).toHaveLength(3);expect(receipts.every(r=>!r.passed)).toBe(true);
+    expect(JSON.stringify(f.store.list("revalidation-runs"))+JSON.stringify(receipts)).not.toContain("private-secret");
+    await f.runner.handle(f.ctx);expect(f.requests).toHaveLength(4);
+  });
+  it("names the error code, case and arm when native execution fails",async()=>{
+    const f=await fixture();f.setHook(async()=>{if(f.requests.length===2)throw Object.assign(new Error("x"),{code:"native-task-timeout"});return {output:"fixture-answer-one"};});
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"failed",verdict:null,reason:"revalidation-native-execution-failed: native-task-timeout (case case-a, treatment)"});
+  });
+  it("blocks with the shared admission code when BB's budget or concurrency limit refuses an arm",async()=>{
+    const f=await fixture();f.setHook(async()=>{throw Object.assign(new Error("x"),{code:"native-task-admission-denied"});});
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-shared-admission-denied (case case-a, baseline)"});
+  });
+  it("refuses before any call when unknown native costs are not allowed",async()=>{
+    const f=await fixture();f.options.allowUnknownCost=()=>false;const runner=createRevalidationRunner(f.options);await runner.handle(f.ctx);
+    expect(f.requests).toHaveLength(0);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-unknown-cost-not-allowed"});
+  });
+  it("stops the in-flight arm when the run may no longer proceed",async()=>{
+    const f=await fixture();f.setHook((_r,signal)=>new Promise((_resolve,reject)=>{signal?.addEventListener("abort",()=>reject(Object.assign(new Error("x"),{code:"native-task-aborted"})));}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    f.disable();f.runner.enforce();await pending;
+    expect(f.native.revoke).toHaveBeenCalledWith(expect.any(Array),"revalidation-execution-disabled");
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:expect.stringMatching(/^revalidation-execution-disabled/)});
   });
   it.each(["calls","sample","exposure","units","hard-money","unknown-money","observational"])("blocks unsupported %s requirements before any dispatch",async mode=>{
     const f=await fixture(d=>{if(mode==="calls")d.limits!.maxCalls=3;else if(mode==="sample")d.sample!.minimumPairs=3;else if(mode==="exposure"){d.sample!.minimumExposure=1;d.sample!.exposureUnit="session-days";}else if(mode==="units")d.criteria[0]!.unit="seconds";else if(mode==="hard-money")d.limits!.moneyLimitMode="hard";else if(mode==="unknown-money")d.limits!.allowUnknownCost=false;else d.claim.requiredEvidence="observational";});
@@ -165,7 +187,7 @@ describe("BB-native revalidation runner",()=>{
   it("reports a guard refusal inside native admission by its own code, not as a native failure",async()=>{
     const f=await fixture();f.setHook(async()=>{f.changePrivacy();throw new Error("native-task-sdk-unavailable");});
     await f.runner.handle(f.ctx);
-    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-privacy-changed",verdict:null});
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-privacy-changed (case case-a, baseline)",verdict:null});
   });
   it("treats the service stopping before plugin disposal as an interruption",async()=>{
     const f=await fixture();let resolve!:(value:unknown)=>void;f.setHook(()=>new Promise(r=>{resolve=r;}));

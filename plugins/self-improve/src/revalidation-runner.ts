@@ -8,28 +8,43 @@ import type { ObservedRevalidationEnvironment } from "./revalidation-environment
 import { nativeExecution } from "./native-execution.js";
 import type { NativeExecution, NativeTaskIdentity, NativeTaskRecord, NativeTaskRunner } from "./native-tasks.js";
 import type { ActivityAccounting } from "./activity-accounting.js";
-import { completeJson } from "./native-model.js";
+import { completeText } from "./native-model.js";
 import { Deferred, type StageContext } from "./services.js";
 
 const JOURNALS="revalidation-executions", OPERATIONS="revalidation-operations", RECEIPTS="revalidation-receipts";
 const hash=(value:unknown)=>createHash("sha256").update(stableJson(value)).digest("hex");
 const sha=(value:string)=>createHash("sha256").update(value).digest("hex");
 const same=(a:unknown,b:unknown)=>stableJson(a)===stableJson(b);
-const inputSchema=z.object({kind:z.literal("revalidation"),revalidationRunId:z.string().min(1).max(200)}).strict();
+const answerSchema=z.object({output:z.string().max(8000)}).strict();
+const inputSchema=z.object({kind:z.literal("revalidation"),revalidationRunId:z.string().min(1).max(200),solutionId:z.string().max(250).optional()}).strict();
 class RunnerFailure extends Error { constructor(readonly code:string){super(code);} }
 function fail(code:string):never{throw new RunnerFailure(code);}
+/** A bounded, fixed-vocabulary code from a native, adapter or observer error; free-form messages are never recorded. */
+function errorCode(error:unknown):string|null{
+  if(error instanceof Error&&error.name==="TimeoutError")return "observation-timeout";
+  const code=error&&typeof error==="object"&&"code" in error&&typeof (error as {code:unknown}).code==="string"?(error as {code:string}).code:error instanceof Error?error.message:null;
+  return code!==null&&/^[a-z0-9][a-z0-9-]{0,79}$/.test(code)?code:null;
+}
+const BLOCKING_CODES:Record<string,string>={
+  "native-task-admission-denied":"revalidation-shared-admission-denied",
+  "revalidation-environment-observation-unavailable":"revalidation-environment-observation-unavailable",
+  "revalidation-environment-not-ready-or-mismatched":"revalidation-environment-not-ready",
+  "observation-timeout":"revalidation-environment-observation-unavailable",
+};
 const TASK_INSTRUCTIONS="Perform the supplied test task. Return only JSON {output:string} with your exact answer. This is an exploratory paired prompt test. Ordinary BB context and tools may remain.";
 /** Native tasks refuse longer instructions; checked before any paid arm. */
 const MAX_NATIVE_INSTRUCTIONS=32768;
 const treatmentInstructions=(artifact:string)=>`${TASK_INSTRUCTIONS}\n\nAdditional instruction:\n${artifact}`;
-/** Ended runs keep reconciling late native reports for this long, then stop being scanned. */
-const USAGE_RECONCILE_WINDOW_MS=30*24*60*60*1000;
+/** Ended runs keep reconciling late native reports for this long, at this interval, then stop being scanned. */
+const USAGE_RECONCILE_WINDOW_MS=7*24*60*60*1000,USAGE_RECONCILE_INTERVAL_MS=15*60*1000;
 interface ExecutionJournal { runId:string;binding:RevalidationBinding;boot:string;serviceJobId:string;serviceRunId:string|null;lease:string;privacyGeneration:string;startedAtMs:number;deadlineAtMs:number;taskIds:string[] }
 interface Operation {taskId:string;runId:string;caseId:string;arm:"baseline"|"treatment";binding:RevalidationBinding;requestDigest:string;promptHash:string;admittedAtMs:number|null}
 export interface RevalidationCaseReceipt {
   id:string;runId:string;taskId:string;caseId:string;arm:"baseline"|"treatment";binding:RevalidationBinding;
   threadId:string;requestId:string;turnId:string;promptHash:string;nativeRequestDigest:string;outputDigest:string;
   passed:boolean;providerId:string;model:string;modelIdentitySource:"requested-selection";observedAtMs:number;
+  /** "invalid" when the reply was not the required {output} JSON; scored as a failed case, never an operational error. */
+  answerFormat?:"valid"|"invalid";
 }
 export interface RevalidationRunnerOptions {
   store:Store; revalidation:ReturnType<typeof createRevalidation>;
@@ -38,6 +53,8 @@ export interface RevalidationRunnerOptions {
   execution:()=>NativeExecution;privacyGeneration:()=>string;redact:(value:string)=>string;
   observeEnvironment:(environment:RevalidationEnvironment,signal?:AbortSignal)=>Promise<ObservedRevalidationEnvironment>;
   allowed:()=>boolean;taskTimeoutMs:()=>number;now?:()=>number;
+  /** Global budgets.allowUnknown; native work is refused by shared admission without it. */
+  allowUnknownCost?:()=>boolean;
 }
 
 /** Trusted server executor only. None of these capabilities belong in RPC or chat inputs. */
@@ -45,6 +62,9 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
   const {store,revalidation,runner}=options,now=options.now??Date.now;
   const active=new Map<string,AbortController>(),locks=new Map<string,Promise<Record<string,number>>>();
   let disposed=false;
+  const cleaned=new Set<string>(),lastReconciled=new Map<string,number>();
+  /** Case and arm in flight per run, so an operational failure names where it happened. */
+  const position=new Map<string,{caseId:string;arm:"baseline"|"treatment"}>();
   const journal=(runId:string)=>store.get<ExecutionJournal>(JOURNALS,runId);
   const operations=(runId:string)=>{
     const j=journal(runId);
@@ -71,7 +91,9 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     if(options.privacyGeneration()!==j.privacyGeneration)fail("revalidation-privacy-changed");
     if(!same(options.execution(),nativeExecution(value.definition.environment!.execution)))fail("revalidation-selection-changed");
     if(checkDeadline&&now()>=j.deadlineAtMs)fail("revalidation-time-limit");
-    clean(value.definition);clean(value.workload);clean(value.artifact.content);
+    // Runs inside BB's dispatch hook: check the frozen text once per run, plan version and privacy generation.
+    const cleanKey=`${j.runId}:${state.planVersion}:${j.privacyGeneration}`;
+    if(!cleaned.has(cleanKey)){clean(value.definition);clean(value.workload);clean(value.artifact.content);cleaned.add(cleanKey);}
     return value;
   }
   function costState(runId:string,currency:string){
@@ -82,6 +104,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
   }
   function checkMoney(runId:string,limits:NonNullable<FrozenRevalidationPlan["definition"]["limits"]>){
     if(limits.moneyLimitMode!=="observed-admission"||!limits.allowUnknownCost)fail("revalidation-native-cost-mode-unsupported");
+    if(limits.maxCostMicros===null)return;
     const state=costState(runId,limits.currency);
     if(limits.maxCostMicros!==null&&(state.ambiguous||state.otherCurrency))fail("revalidation-cost-attribution-unavailable");
     if(limits.maxCostMicros!==null&&state.known>=limits.maxCostMicros)fail("revalidation-observed-cost-threshold");
@@ -143,6 +166,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     if(def.sample!.minimumExposure!==null||def.sample!.exposureUnit!==null)fail("revalidation-exposure-capability-unavailable");
     if(def.sample!.minimumPairs>workload.definition.cases.length)fail("revalidation-insufficient-planned-pairs");
     if(def.limits!.maxCalls<workload.definition.cases.length*2)fail("revalidation-insufficient-planned-calls");
+    if(options.allowUnknownCost&&!options.allowUnknownCost())fail("revalidation-unknown-cost-not-allowed");
     if(treatmentInstructions(value.artifact.content).length>MAX_NATIVE_INSTRUCTIONS)fail("revalidation-artifact-too-large-for-native-task");
     if(!Number.isSafeInteger(def.limits!.maxDurationMs)||def.limits!.maxDurationMs>2_147_000_000)fail("revalidation-duration-unsupported");
     if(workload.definition.measurements.length!==def.criteria.length)fail("revalidation-measurement-binding-mismatch");
@@ -178,6 +202,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       for(const [index,c] of value.workload!.definition.cases.entries()){
         const arms=(index%2?["treatment","baseline"]:["baseline","treatment"]) as Array<"baseline"|"treatment">;
         for(const arm of arms){
+          position.set(runId,{caseId:c.id,arm});
           await environment(j,signal);
           const instructions=arm==="treatment"?treatmentInstructions(value.artifact.content):TASK_INSTRUCTIONS;
           const input=JSON.stringify({input:c.input}),taskId=stableId("revalidation-task",[runId,c.id,arm]);
@@ -187,10 +212,13 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
           const requestDigest=sha(stableJson({execution:request.execution,promptHash,stage:request.stage,runId,solutionId:request.solutionId,privacyGeneration:request.privacyGeneration,timeoutMs,maxReplyCharacters:request.maxReplyCharacters}));
           const op:Operation={taskId,runId,caseId:c.id,arm,binding:j.binding,requestDigest,promptHash,admittedAtMs:null};
           current(j);checkMoney(runId,value.definition.limits!);if(!store.insert(OPERATIONS,taskId,op))fail("revalidation-operation-already-recorded");
-          const response=await completeJson(runner,request,signal);current(j);signal.throwIfAborted();
-          const parsed=z.object({output:z.string().max(8000)}).strict().parse(response.value),native=runner.get(response.threadId),registered=store.get<Operation>(OPERATIONS,taskId);
+          const response=await completeText(runner,request,signal);current(j);signal.throwIfAborted();
+          // A reply in the wrong shape is an answer that fails the case: a treatment that breaks the format is a regression to measure.
+          let answer:string|null=null;
+          try{answer=answerSchema.parse(JSON.parse(response.text)).output;}catch{answer=null;}
+          const native=runner.get(response.threadId),registered=store.get<Operation>(OPERATIONS,taskId);
           if(!registered||registered.admittedAtMs===null||!native||native.taskId!==taskId||native.state!=="completed"||native.outputDigest!==sha(response.text)||native.requestDigest!==requestDigest||native.promptHash!==promptHash||response.promptHash!==promptHash||native.resolvedEnvironmentId!==value.definition.environment!.execution.environmentId||native.projectId!==request.execution.projectId||native.privacyGeneration!==j.privacyGeneration||native.runId!==runId||native.solutionId!==request.solutionId||native.stage!==request.stage||native.providerId!==response.providerId||native.model!==response.model||!response.requestId||!response.turnId||native.endedAtMs!==response.endedAtMs)fail("revalidation-native-receipt-mismatch");
-          const receipt:RevalidationCaseReceipt={id:stableId("revalidation-receipt",taskId),runId,taskId,caseId:c.id,arm,binding:j.binding,threadId:response.threadId,requestId:response.requestId,turnId:response.turnId,promptHash,nativeRequestDigest:requestDigest,outputDigest:sha(parsed.output),passed:parsed.output===c.expected,providerId:response.providerId,model:response.model,modelIdentitySource:"requested-selection",observedAtMs:now()};
+          const receipt:RevalidationCaseReceipt={id:stableId("revalidation-receipt",taskId),runId,taskId,caseId:c.id,arm,binding:j.binding,threadId:response.threadId,requestId:response.requestId,turnId:response.turnId,promptHash,nativeRequestDigest:requestDigest,outputDigest:sha(answer??response.text),passed:answer!==null&&answer===c.expected,answerFormat:answer===null?"invalid":"valid",providerId:response.providerId,model:response.model,modelIdentitySource:"requested-selection",observedAtMs:now()};
           if(receipts.some(r=>r.threadId===receipt.threadId||r.requestId===receipt.requestId||r.turnId===receipt.turnId))fail("revalidation-reused-native-receipt");
           current(j);if(!store.insert(RECEIPTS,receipt.id,receipt))fail("revalidation-receipt-already-recorded");receipts.push(receipt);usage(runId,"partial-or-complete-native-observations");
         }
@@ -214,7 +242,12 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       if(guardCode===null&&j!==null&&!shutdown){
         try{const value=current(j);checkMoney(runId,value.definition.limits!);}catch(guard){if(guard instanceof RunnerFailure)guardCode=guard.code;}
       }
-      const reason=shutdown?"interrupted-needs-new-run":timedOut?"revalidation-time-limit":guardCode??(controller?.signal.aborted?"revalidation-execution-aborted":"revalidation-native-execution-failed");
+      // Operational causes that are not the hypothesis failing: blocked with their own code so the owner can act on them.
+      const code=errorCode(error);
+      if(guardCode===null&&code!==null&&BLOCKING_CODES[code])guardCode=BLOCKING_CODES[code]!;
+      const at=position.get(runId),where=at?` (case ${at.caseId}, ${at.arm})`:"";
+      const reason=shutdown?"interrupted-needs-new-run":timedOut?"revalidation-time-limit":guardCode!==null?guardCode+where
+        :controller?.signal.aborted?"revalidation-execution-aborted"+where:`revalidation-native-execution-failed: ${code??"unexpected-error"}${where}`;
       // Shutdown follows the restart rule: blocked, needing an explicit new run, never a failed hypothesis.
       if(shutdown&&state.run.status==="running"){try{revalidation.executor.interrupt({runId,expectedVersion:state.version});}catch{/* recovery on next boot */}}
       else if(["queued","running"].includes(state.run.status)){
@@ -224,30 +257,42 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       }
       revoke(runId,"revalidation-terminal");usage(runId,reason);
       return {revalidation:1,operationalFailure:1};
-    } finally {if(controller)controller.abort();active.delete(runId);}
+    } finally {if(controller)controller.abort();active.delete(runId);position.delete(runId);}
   }
   return {
     admissionGuard,dispatchGuard,
     handle(ctx:StageContext){const {revalidationRunId:runId}=inputSchema.parse(ctx.job.input);const previous=locks.get(runId);if(previous)return previous;
       const operation=execute(ctx,runId);locks.set(runId,operation);void operation.finally(()=>{if(locks.get(runId)===operation)locks.delete(runId);}).catch(()=>{});return operation;},
     cancel(runId:string){if(revalidation.plans.getRun(runId).run.status!=="cancelled")fail("revalidation-owner-cancellation-required");revoke(runId,"revalidation-owner-cancelled");usage(runId,"owner-cancelled");},
+    /** Returns how many interrupted runs could not be recovered (retried on the next boot). */
     recover(boot:string){
+      let failed=0;
       // Runs at startup: one damaged run must not prevent the plugin from starting or other runs from recovering.
       for(const entry of store.entries<RevalidationRun>("revalidation-runs")){
         if(entry.value.status!=="running"||active.has(entry.key))continue;
         try{const j=journal(entry.key);if(j?.boot===boot)continue;revalidation.executor.interrupt({runId:entry.key,expectedVersion:entry.version});revoke(entry.key,"revalidation-interrupted");usage(entry.key,"interrupted");}
-        catch{/* left running; retried on the next boot */}
+        catch{failed++;}
       }
+      return failed;
     },
+    /** Late native reports for recently ended runs, each at most every 15 minutes. Returns how many runs could not be reconciled. */
     reconcileUsage(){
-      // Late native reports for ended runs; running runs record usage after every receipt. One bad run does not stop the sweep.
+      let failed=0;
       for(const j of store.list<ExecutionJournal>(JOURNALS)){
-        if(active.has(j.runId))continue;
+        if(active.has(j.runId)||now()-(lastReconciled.get(j.runId)??-Infinity)<USAGE_RECONCILE_INTERVAL_MS)continue;
         try{
           const run=revalidation.plans.getRun(j.runId).run;
           if(["queued","running"].includes(run.status)||(run.endedAtMs!=null&&now()-run.endedAtMs>USAGE_RECONCILE_WINDOW_MS))continue;
-          usage(j.runId,"reconciled-native-usage");
-        }catch{/* retried next sweep */}
+          lastReconciled.set(j.runId,now());usage(j.runId,"reconciled-native-usage");
+        }catch{failed++;}
+      }
+      return failed;
+    },
+    /** Stop in-flight work for any active run that may no longer proceed (disabled, selection or plan changed). */
+    enforce(){
+      for(const [runId,controller] of active){
+        const j=journal(runId);if(!j)continue;
+        try{current(j);}catch(error){if(error instanceof RunnerFailure){controller.abort();revoke(runId,error.code);}}
       }
     },
     dispose(){disposed=true;for(const runId of active.keys())revoke(runId,"revalidation-disposed");},
