@@ -8,7 +8,7 @@
   "bb": {
     "name": "Self improve",
     "description": "Evidence-led improvement: problems, experiments, proven solutions and their costs.",
-    "branding": { "icon": "FlaskConical" },
+    "branding": { "icon": "./icons/self-improve.svg" },
     "server": "./server.ts",
     "app": "./app.tsx",
     "skills": ["skills"]
