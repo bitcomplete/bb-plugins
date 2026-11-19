@@ -1,384 +1,189 @@
-import { createHash, randomUUID } from "node:crypto";
-import { z } from "zod";
+import { createHash } from "node:crypto";
 import type { Actor, Store } from "./store.js";
 import { stableId, stableJson } from "./domain/shared.js";
-import { revalidationIdSchema as id, revalidationProseSchema as prose, revalidationDigestSchema as digest,
-  revalidationCountSchema as count, revalidationRequirementSchema as requirement, revalidationDefinitionSchema,
-  revalidationEnvironmentSchema, revalidationTargetSchema, createRevalidationSchema, reviseRevalidationSchema,
-  freezeRevalidationSchema, queueRevalidationSchema, REVALIDATION_PROTOCOL, revalidationWorkloadRefSchema, revalidationUsageJournalInputSchema,
-  type RevalidationTarget, type RevalidationDefinition, type RevalidationEnvironment, type EvidenceRequirement,
-  type RevalidationPlan, type FrozenRevalidationPlan, type RevalidationBinding, type RevalidationRun,
-  type RevalidationObservation, type RevalidationEvidence, type RevalidationUsage, type CriterionAssessment,
-  type ClaimVerdict, type RevalidationResult, type RevalidationWorkloadRef, type RevalidationWorkloadSnapshot, type RevalidationUsageJournalInput, type RevalidationUsageJournalEntry,
+import {
+  revalidationIdSchema as id, revalidationProseSchema as prose, createRevalidationSchema, reviseRevalidationSchema,
+  freezeRevalidationSchema, queueRevalidationSchema, cancelRevalidationSchema, executionSelectionSchema,
+  type RevalidationTarget, type RevalidationDefinition, type RevalidationPlan, type FrozenRevalidationPlan,
+  type RevalidationRun, type RevalidationResult, type RevalidationRunStatus, type ClaimVerdict,
 } from "./revalidation-contract.js";
+import type { ExecutionSelection } from "./native-execution.js";
 export * from "./revalidation-contract.js";
-import { validateWorkloadSnapshot } from "./revalidation-workload.js";
-import { revalidationObservationGaps, validateObservedRevalidationEnvironment, type ObservedRevalidationEnvironment } from "./revalidation-environment.js";
-export interface RevalidationOptions { redact: (value: string) => string; now?: () => number;
-  workloads?: { resolve(reference: RevalidationWorkloadRef): RevalidationWorkloadSnapshot };
-  environmentSnapshots?: { resolve(environment: RevalidationEnvironment): ObservedRevalidationEnvironment } }
-const observationSchema = z.object({ criterionId: id, metric: prose, unit: prose, baseline: z.number().finite().nullable(), treatment: z.number().finite().nullable(),
-  pairs: count, exposure: z.number().finite().nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100),
-  /** Set when the measurement cannot be compared, e.g. an unreadable baseline answer for a baseline-dependent statistic. */
-  unusable: z.enum(["baseline-answer-format-invalid"]).nullable().optional() }).strict();
-const evidenceSchema = z.object({ kind: z.enum(["exploratory-replay", "exploratory-challenge", "observational"]),
-  receiptRefs: z.array(prose).min(1).max(100), limitations: z.array(prose).min(1).max(100) }).strict();
-const usageSchema = z.object({ calls: count, elapsedMs: count, costMicros: count.nullable(), currency: z.string().regex(/^[A-Z]{3}$/) }).strict();
-const hash = (value: unknown): string => createHash("sha256").update(stableJson(value)).digest("hex");
-const contentDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
-export const revalidationEnvironmentDigest = (environment: RevalidationEnvironment): string => hash(revalidationEnvironmentSchema.parse(environment));
+
+const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 const versionKey = (planId: string, version: number) => `${planId}:${version}`;
-const same = (a: unknown, b: unknown) => stableJson(a) === stableJson(b);
-function editor(actor: Actor, ownerOnly = false): void {
-  if (ownerOnly ? actor.kind !== "owner" : !["owner", "chat"].includes(actor.kind)) throw new Error("revalidation-owner-action-required");
+const ACTIVE: RevalidationRunStatus[] = ["queued", "running"];
+export const REVALIDATION_NAMESPACES = { plans: "revalidation-plans", heads: "revalidation-heads", frozen: "revalidation-frozen", runs: "revalidation-runs", results: "revalidation-results", receipts: "revalidation-receipts", requests: "revalidation-requests" } as const;
+const NS = REVALIDATION_NAMESPACES;
+
+function requireActor(actor: Actor, ownerOnly: boolean): void {
+  if (ownerOnly ? actor.kind !== "owner" : actor.kind !== "owner" && actor.kind !== "chat") throw new Error("revalidation-owner-action-required");
   id.parse(actor.id);
 }
-function qualifies(kind: RevalidationEvidence["kind"], needed: EvidenceRequirement): boolean {
-  return needed === "exploratory" ? kind.startsWith("exploratory-") : needed === "observational" && kind === "observational";
-}
 
-/** Keep executor private to server-owned code. Only `plans` belongs in RPC/chat adapters.
- * No method here writes trusted-evaluations, validated-artifacts or activation state.
+/**
+ * Revalidation plans, runs and results. `plans` is the owner/chat domain; `executor` is used only by the server's runner.
+ * Rules this module enforces are listed in reviews/revalidation-must-hold.md (owner authority, frozen integrity, honest verdicts).
  */
-export function createRevalidation(store: Store, options: RevalidationOptions) {
-  const now = () => { const value = options.now?.() ?? Date.now(); count.parse(value); return value; };
+export function createRevalidation(store: Store, options: { redact: (value: string) => string; now?: () => number }) {
+  const now = () => options.now?.() ?? Date.now();
+  /** Text the current privacy policy would rewrite is refused rather than silently changed. */
   function privateText(value: unknown): void {
     if (typeof value === "string" && options.redact(value) !== value) throw new Error("revalidation-private-input");
     if (Array.isArray(value)) value.forEach(privateText);
     else if (value && typeof value === "object") Object.values(value).forEach(privateText);
   }
-  function definition(raw: unknown): RevalidationDefinition {
-    const value = revalidationDefinitionSchema.parse(raw); privateText(value);
-    if (value.environment?.configuration.some(c => /secret|password|token|credential|authorization|api.?key|private.?key/i.test(c.name) || /-----BEGIN .*PRIVATE KEY-----|\bBearer\s+\S+|:\/\/[^/\s]+:[^/@\s]+@/i.test(c.value))) throw new Error("revalidation-secret-configuration");
-    return value;
-  }
-  function head(planId: string) {
-    const value = store.get<{ version: number }>("revalidation-heads", id.parse(planId));
-    if (!value) throw new Error("revalidation-plan-missing"); return value;
-  }
-  function plan(planId: string, version = head(planId).version): RevalidationPlan {
-    const value = store.get<RevalidationPlan>("revalidation-plans", versionKey(planId, version));
+  const head = (planId: string) => {
+    const value = store.get<{ version: number }>(NS.heads, id.parse(planId));
+    if (!value) throw new Error("revalidation-plan-missing"); return value.version;
+  };
+  const plan = (planId: string, version = head(planId)) => {
+    const value = store.get<RevalidationPlan>(NS.plans, versionKey(planId, version));
     if (!value) throw new Error("revalidation-version-missing"); return value;
-  }
+  };
+  const run = (runId: string) => {
+    const value = store.get<RevalidationRun>(NS.runs, id.parse(runId));
+    if (!value) throw new Error("revalidation-run-missing"); return value;
+  };
+  const frozenPlan = (planId: string, version: number) => {
+    const value = store.get<FrozenRevalidationPlan>(NS.frozen, versionKey(planId, version));
+    if (!value) throw new Error("revalidation-plan-not-frozen"); return value;
+  };
+  const runs = (planId: string) => store.list<RevalidationRun>(NS.runs).filter(r => r.planId === planId).sort((a, b) => a.sequence - b.sequence);
   function artifact(target: RevalidationTarget): FrozenRevalidationPlan["artifact"] {
     if (!store.get("solutions", target.solutionId)) throw new Error("revalidation-solution-missing");
-    const saved = store.get<{ solutionId: string; revision: string; content: string; artifactDigest: string; kind: string }>(target.namespace, target.artifactId);
-    if (saved?.solutionId === target.solutionId && saved.revision === target.revision) {
-      if (saved.kind !== "instruction" || typeof saved.content !== "string" || saved.artifactDigest !== target.artifactDigest || contentDigest(saved.content) !== target.artifactDigest) throw new Error("revalidation-artifact-changed");
-      privateText(saved.content); return { target, content: saved.content };
-    }
-    // A historical validated-artifacts pointer may advance. Previously frozen bytes remain exact.
-    const prior = store.list<FrozenRevalidationPlan>("revalidation-frozen").find(p => same(p.artifact.target, target));
-    if (prior && contentDigest(prior.artifact.content) === target.artifactDigest) { privateText(prior.artifact.content); return prior.artifact; }
-    throw new Error("revalidation-artifact-missing");
+    const saved = store.get<{ solutionId: string; revision: string; content: string; kind: string }>(target.namespace, target.artifactId);
+    if (!saved || saved.solutionId !== target.solutionId || saved.revision !== target.revision || saved.kind !== "instruction" || typeof saved.content !== "string" || sha(saved.content) !== target.artifactDigest) throw new Error("revalidation-artifact-changed");
+    privateText(saved.content); return { target, content: saved.content };
   }
-  // Frozen records are written once; a record whose store version is unchanged since it was verified needs no rehash.
-  // This keeps the check cheap inside BB's dispatch hook, where it runs before every arm.
-  const verifiedFrozen = new Map<string, string>();
-  function freezeRecord(planId: string, version: number): FrozenRevalidationPlan {
-    const key = versionKey(planId, version), frozen = store.get<FrozenRevalidationPlan>("revalidation-frozen", key);
-    if (!frozen) throw new Error("revalidation-plan-not-frozen");
-    const verifiedAs = `${store.version("revalidation-frozen", key)}:${frozen.planDigest}`;
-    if (verifiedFrozen.get(key) === verifiedAs) return frozen;
-    // Version 1 digests remain interpretable, but never gain executable capabilities.
-    if (frozen.schemaVersion !== undefined && frozen.schemaVersion !== 2) throw new Error("revalidation-frozen-version-unsupported");
-    if (frozen.schemaVersion === 2) {
-      if (frozen.protocol !== REVALIDATION_PROTOCOL || !frozen.workload || !frozen.observedEnvironment) throw new Error("revalidation-frozen-capability-missing");
-      validateWorkloadSnapshot(frozen.workload); validateObservedRevalidationEnvironment(frozen.observedEnvironment);
-      const ref = revalidationWorkloadRefSchema.parse(frozen.definition.workload);
-      if (frozen.workload.id !== ref.id || frozen.workload.version !== ref.version || frozen.workload.manifestDigest !== ref.manifestDigest || frozen.workload.definition.description !== ref.description ||
-        frozen.observedEnvironment.declaredEnvironmentDigest !== frozen.environmentDigest || frozen.environmentObservationDigest !== frozen.observedEnvironment.digest) throw new Error("revalidation-frozen-input-changed");
-    }
-    const expected = frozen.schemaVersion === 2 ? hash({ schemaVersion: 2, protocol: frozen.protocol, planId, version, definition: frozen.definition, artifact: frozen.artifact,
-      workload: frozen.workload, observedEnvironment: frozen.observedEnvironment }) : hash({ planId, version, definition: frozen.definition, artifact: frozen.artifact });
-    if (frozen.planDigest !== expected || contentDigest(frozen.artifact.content) !== frozen.definition.target.artifactDigest ||
-      frozen.environmentDigest !== revalidationEnvironmentDigest(frozen.definition.environment!) || frozen.workloadDigest !== frozen.definition.workload?.manifestDigest) throw new Error("revalidation-frozen-input-changed");
-    verifiedFrozen.set(key, verifiedAs);
-    return frozen;
+  function update(value: RevalidationRun, actor: Actor, reason: string): RevalidationRun {
+    store.edit(NS.runs, value.id, store.version(NS.runs, value.id), value, actor, reason); return value;
   }
-  function run(runId: string): RevalidationRun {
-    const value = store.get<RevalidationRun>("revalidation-runs", id.parse(runId));
-    if (!value) throw new Error("revalidation-run-missing"); return value;
-  }
-  function binding(frozen: FrozenRevalidationPlan): RevalidationBinding {
-    return { ...(frozen.schemaVersion === 2 ? {protocol:frozen.protocol,environmentObservationDigest:frozen.environmentObservationDigest} : {}), planDigest: frozen.planDigest, artifactDigest: frozen.definition.target.artifactDigest, environmentDigest: frozen.environmentDigest, workloadDigest: frozen.workloadDigest };
-  }
-  function updateRun(value: RevalidationRun, actor: Actor, reason: string): RevalidationRun {
-    store.edit("revalidation-runs", value.id, store.version("revalidation-runs", value.id), value, actor, reason); return value;
-  }
-  function finishOperational(runId: string, status: "blocked" | "failed" | "cancelled", reason: string, actor: Actor, lease?: string): RevalidationRun {
+  function end(runId: string, status: "blocked" | "failed" | "cancelled", reason: string, actor: Actor): RevalidationRun {
     prose.parse(reason); privateText(reason);
     return store.transaction(() => {
       const current = run(runId);
-      // plans.cancel authenticates the owner and checks the optimistic version in
-      // this transaction. Only executor writes require the private worker lease.
-      const ownerCancellation = status === "cancelled" && actor.kind === "owner";
-      if (current.status === "running" && !ownerCancellation && (lease === undefined || store.get<{ lease: string }>("revalidation-leases", runId)?.lease !== lease)) throw new Error("revalidation-stale-executor");
-      if (!["queued", "running"].includes(current.status)) {
-        if (current.status === status && current.reason === reason) return current;
-        throw new Error("revalidation-run-terminal");
-      }
-      const next = updateRun({ ...current, status, verdict: null, reason, endedAtMs: now() }, actor, reason);
-      store.remove("revalidation-leases", runId); return next;
+      if (!ACTIVE.includes(current.status)) return current;
+      return update({ ...current, status, verdict: null, reason, endedAtMs: now() }, actor, reason);
     });
   }
-  function workloadCapabilityIssue(frozen: FrozenRevalidationPlan): string | null {
-    const workload=frozen.workload!.definition, def=frozen.definition;
-    if (def.sample!.minimumExposure !== null) return "exposure-measurement-unavailable";
-    if (def.sample!.minimumPairs > workload.cases.length) return "insufficient-planned-pairs";
-    if (def.limits!.maxCalls < workload.cases.length * 2) return "insufficient-planned-calls";
-    if (workload.measurements.length !== def.criteria.length) return "workload-measurement-mismatch";
-    for (const criterion of def.criteria) {
-      const measurement=workload.measurements.find(m=>m.criterionId===criterion.id);
-      if (!measurement || measurement.kind === "exact-pass-rate" && criterion.unit !== "proportion" ||
-        measurement.kind === "regression-count" && (criterion.unit !== "cases" || criterion.statistic !== "treatment")) return "workload-measurement-mismatch";
-    }
-    return null;
-  }
+
   const plans = {
-    create(raw: z.infer<typeof createRevalidationSchema>, actor: Actor): RevalidationPlan {
-      editor(actor); const input = createRevalidationSchema.parse(raw), def = definition(input.definition);
+    create(raw: unknown, actor: Actor): RevalidationPlan {
+      requireActor(actor, false); const input = createRevalidationSchema.parse(raw); privateText(input.definition);
       return store.transaction(() => {
-        const planId = stableId("revalidation", input.requestId);
-        const existing = store.get<{ fingerprint: string }>("revalidation-requests", input.requestId);
-        if (existing) { if (existing.fingerprint !== hash(def)) throw new Error("revalidation-request-conflict"); return plan(planId, 1); }
-        artifact(def.target);
-        const value: RevalidationPlan = { id: planId, version: 1, previousVersion: null, definition: def, createdAtMs: now(), actor: { ...actor } };
-        store.createAudited("revalidation-plans", versionKey(planId, 1), value, actor, "Create a revalidation draft; claim is under review");
-        store.createAudited("revalidation-heads", planId, { version: 1 }, actor, "Select initial revalidation version");
-        store.put("revalidation-requests", input.requestId, { fingerprint: hash(def) }); return value;
+        const planId = stableId("revalidation", [actor.kind, actor.id, input.requestId]), fingerprint = sha(stableJson(input.definition));
+        const previous = store.get<{ fingerprint: string }>(NS.requests, planId);
+        if (previous) { if (previous.fingerprint !== fingerprint) throw new Error("revalidation-request-conflict"); return plan(planId, 1); }
+        artifact(input.definition.target);
+        const value: RevalidationPlan = { id: planId, version: 1, previousVersion: null, definition: input.definition, createdAtMs: now(), actor: { ...actor } };
+        store.createAudited(NS.plans, versionKey(planId, 1), value, actor, "Create a revalidation draft");
+        store.createAudited(NS.heads, planId, { version: 1 }, actor, "Select the first plan version");
+        store.put(NS.requests, planId, { fingerprint }); return value;
       });
     },
-    revise(raw: z.infer<typeof reviseRevalidationSchema>, actor: Actor): RevalidationPlan {
-      editor(actor); const input = reviseRevalidationSchema.parse(raw), def = definition(input.definition);
+    revise(raw: unknown, actor: Actor): RevalidationPlan {
+      requireActor(actor, false); const input = reviseRevalidationSchema.parse(raw); privateText(input.definition);
       return store.transaction(() => {
-        if (head(input.planId).version !== input.expectedVersion) throw new Error("revalidation-version-conflict");
+        if (head(input.planId) !== input.expectedVersion) throw new Error("revalidation-version-conflict");
         const old = plan(input.planId);
-        // Chat cannot cancel, so its draft edits must not supersede a frozen run that is queued or spending.
-        // The owner may supersede deliberately; the run is then blocked as plan-superseded.
-        if (actor.kind === "chat" && store.list<RevalidationRun>("revalidation-runs").some(r => r.planId === input.planId && r.planVersion === old.version && (r.status === "queued" || r.status === "running"))) throw new Error("revalidation-run-active-cancel-first");
-        if (!same(old.definition.target, def.target) || !same(old.definition.claim, def.claim)) throw new Error("revalidation-new-claim-needs-new-plan");
-        // A different environment is a separate question, not a way to move an unresolved
-        // contradiction out of its original scope. Null drafts may still be clarified.
-        if (old.definition.environment !== null && !same(old.definition.environment, def.environment)) throw new Error("revalidation-new-environment-needs-new-plan");
-        artifact(def.target);
-        const value: RevalidationPlan = { ...old, version: old.version + 1, previousVersion: old.version, definition: def, createdAtMs: now(), actor: { ...actor } };
-        store.createAudited("revalidation-plans", versionKey(value.id, value.version), value, actor, "Revise criteria in a new immutable plan version");
-        store.edit("revalidation-heads", value.id, store.version("revalidation-heads", value.id), { version: value.version }, actor, "Select revised plan; prior plans and results are retained"); return value;
+        if (stableJson(old.definition) === stableJson(input.definition)) return old;
+        if (stableJson(old.definition.target) !== stableJson(input.definition.target) || old.definition.claim.id !== input.definition.claim.id) throw new Error("revalidation-new-claim-needs-new-plan");
+        // The chat cannot cancel, so it must not replace a version the owner has queued or is running.
+        if (actor.kind === "chat" && runs(input.planId).some(r => r.planVersion === old.version && ACTIVE.includes(r.status))) throw new Error("revalidation-run-active-cancel-first");
+        artifact(input.definition.target);
+        const value: RevalidationPlan = { ...old, version: old.version + 1, previousVersion: old.version, definition: input.definition, createdAtMs: now(), actor: { ...actor } };
+        store.createAudited(NS.plans, versionKey(value.id, value.version), value, actor, "Revise the plan in a new version");
+        store.edit(NS.heads, value.id, store.version(NS.heads, value.id), { version: value.version }, actor, "Select the revised version"); return value;
       });
     },
-    freeze(raw: z.infer<typeof freezeRevalidationSchema>, actor: Actor): FrozenRevalidationPlan {
-      editor(actor, true); const input = freezeRevalidationSchema.parse(raw);
+    /** Owner only. Snapshots the instruction bytes and the worker settings the plan will run with. */
+    freeze(raw: unknown, testedOn: ExecutionSelection, actor: Actor): FrozenRevalidationPlan {
+      requireActor(actor, true); const input = freezeRevalidationSchema.parse(raw), selection = executionSelectionSchema.parse(testedOn);
       return store.transaction(() => {
-        if (head(input.planId).version !== input.expectedVersion) throw new Error("revalidation-version-conflict");
-        const value = plan(input.planId), def = definition(value.definition), key = versionKey(value.id, value.version);
-        if (store.get("revalidation-frozen", key)) return freezeRecord(value.id, value.version);
-        if (!def.comparator || !def.workload || !def.environment || !def.sample || !def.limits || !def.criteria.some(c => c.role === "primary" && c.required)) throw new Error("revalidation-plan-incomplete");
-        const reference = revalidationWorkloadRefSchema.safeParse(def.workload);
-        if (!reference.success || !options.workloads) throw new Error("revalidation-workload-unavailable-create-new-version");
-        if (!def.limits.moneyLimitMode) throw new Error("revalidation-money-mode-required-create-new-version");
-        if (!options.environmentSnapshots) throw new Error("revalidation-environment-observation-unavailable");
-        const snapshot = artifact(def.target), workload = validateWorkloadSnapshot(options.workloads.resolve(reference.data));
-        if (workload.id !== reference.data.id || workload.version !== reference.data.version || workload.manifestDigest !== reference.data.manifestDigest || workload.definition.description !== reference.data.description) throw new Error("revalidation-workload-reference-changed");
-        privateText(workload.definition);
-        const observedEnvironment = validateObservedRevalidationEnvironment(options.environmentSnapshots.resolve(def.environment));
-        const environmentDigest = revalidationEnvironmentDigest(def.environment);
-        if (observedEnvironment.declaredEnvironmentDigest !== environmentDigest) throw new Error("revalidation-environment-observation-changed");
-        // Checked on the exact snapshot being frozen: an unfingerprinted dependency could change unnoticed between runs.
-        const gaps = revalidationObservationGaps(observedEnvironment);
-        if (gaps.length) throw new Error(`revalidation-dependencies-not-observed: ${gaps.slice(0, 10).join(", ")}`);
-        privateText(observedEnvironment);
-        // Observed identity is also immutable within a plan: re-freezing a revision
-        // must not move an unresolved contradiction to a newly observed environment.
-        const previousObservations = store.list<FrozenRevalidationPlan>("revalidation-frozen").filter(p=>p.planId===value.id && p.schemaVersion===2);
-        if (previousObservations.some(p=>p.environmentObservationDigest!==observedEnvironment.digest)) throw new Error("revalidation-new-observed-environment-needs-new-plan");
-        const frozen: FrozenRevalidationPlan = { schemaVersion:2, protocol:REVALIDATION_PROTOCOL, planId: value.id, version: value.version, definition: def, artifact: snapshot, workload, observedEnvironment,
-          planDigest: hash({ schemaVersion:2, protocol:REVALIDATION_PROTOCOL, planId: value.id, version: value.version, definition: def, artifact: snapshot, workload, observedEnvironment }),
-          environmentDigest, environmentObservationDigest:observedEnvironment.digest, workloadDigest:workload.manifestDigest, frozenAtMs: now() };
-        store.createAudited("revalidation-frozen", key, frozen, actor, "Freeze criteria and exact artifact before execution"); return frozen;
+        if (head(input.planId) !== input.expectedVersion) throw new Error("revalidation-version-conflict");
+        const value = plan(input.planId), key = versionKey(value.id, value.version);
+        const existing = store.get<FrozenRevalidationPlan>(NS.frozen, key);
+        if (existing) return existing;
+        const def: RevalidationDefinition = value.definition;
+        if (!def.cases.length || !def.criteria.some(c => c.required)) throw new Error("revalidation-plan-incomplete");
+        privateText(def);
+        const snapshot = artifact(def.target);
+        const content = { planId: value.id, version: value.version, definition: def, artifact: snapshot, testedOn: selection };
+        const frozen: FrozenRevalidationPlan = { ...content, planDigest: sha(stableJson(content)), frozenAtMs: now() };
+        store.createAudited(NS.frozen, key, frozen, actor, "Freeze the plan and the exact instruction under test"); return frozen;
       });
     },
-    queue(raw: z.infer<typeof queueRevalidationSchema>, actor: Actor): RevalidationRun {
-      editor(actor, true); const input = queueRevalidationSchema.parse(raw);
+    /** Owner only. Queues the latest frozen version; a repeated request returns the same run. */
+    queue(raw: unknown, actor: Actor): RevalidationRun {
+      requireActor(actor, true); const input = queueRevalidationSchema.parse(raw);
       return store.transaction(() => {
-        const runId = stableId("revalidation-run", input.requestId), existing = store.get<RevalidationRun>("revalidation-runs", runId);
+        const runId = stableId("revalidation-run", input.requestId), existing = store.get<RevalidationRun>(NS.runs, runId);
         if (existing) { if (existing.planId !== input.planId || existing.planVersion !== input.version) throw new Error("revalidation-run-request-conflict"); return existing; }
-        if (head(input.planId).version !== input.version) throw new Error("revalidation-version-conflict");
-        const frozen = freezeRecord(input.planId, input.version); privateText(frozen.definition); privateText(frozen.artifact.content);
+        if (head(input.planId) !== input.version) throw new Error("revalidation-version-conflict");
+        const frozen = frozenPlan(input.planId, input.version);
         const sequence = (store.get<number>("revalidation-sequence", "latest") ?? 0) + 1;
-        const value: RevalidationRun = { id: runId, requestId: input.requestId, planId: input.planId, planVersion: input.version, sequence,
-          binding: binding(frozen), status: "queued", verdict: null, createdAtMs: now(), startedAtMs: null, endedAtMs: null, reason: null };
-        store.createAudited("revalidation-runs", runId, value, actor, "Queue a frozen revalidation plan"); store.put("revalidation-sequence", "latest", sequence); return value;
+        const value: RevalidationRun = { id: runId, requestId: input.requestId, planId: input.planId, planVersion: input.version, planDigest: frozen.planDigest, sequence,
+          status: "queued", verdict: null, reason: null, createdAtMs: now(), startedAtMs: null, endedAtMs: null };
+        store.createAudited(NS.runs, runId, value, actor, "Queue a frozen revalidation plan"); store.put("revalidation-sequence", "latest", sequence); return value;
       });
     },
-    cancel(input: { runId: string; expectedVersion: number; reason: string }, actor: Actor): RevalidationRun {
-      editor(actor, true); return store.transaction(() => {
-        if (store.version("revalidation-runs", input.runId) !== input.expectedVersion) throw new Error("revalidation-run-version-conflict");
-        return finishOperational(input.runId, "cancelled", input.reason, actor);
-      });
+    /** Owner only. A call already in flight may finish, but the run ends without a verdict. */
+    cancel(raw: unknown, actor: Actor): RevalidationRun {
+      requireActor(actor, true); const input = cancelRevalidationSchema.parse(raw);
+      return end(input.runId, "cancelled", input.reason, actor);
     },
-    markStale(input: { planId: string; expectedVersion: number; reason: string }, actor: Actor): void {
-      editor(actor); prose.parse(input.reason); privateText(input.reason);
-      store.transaction(() => {
-        if (head(input.planId).version !== input.expectedVersion) throw new Error("revalidation-version-conflict");
-        const key = versionKey(input.planId, input.expectedVersion);
-        if (!store.get("revalidation-stale", key)) store.createAudited("revalidation-stale", key, { reason: input.reason, atMs: now() }, actor, "Mark this claim scope stale; a new plan version is required");
-      });
+    get(planId: string, version?: number) { const value = plan(planId, version); return { plan: value, frozen: store.get<FrozenRevalidationPlan>(NS.frozen, versionKey(value.id, value.version)) }; },
+    list(solutionId?: string) { return store.entries<{ version: number }>(NS.heads).map(e => plan(e.key, e.value.version)).filter(p => !solutionId || p.definition.target.solutionId === solutionId); },
+    history(planId: string) {
+      head(planId);
+      const planRuns = runs(planId);
+      return { versions: store.list<RevalidationPlan>(NS.plans).filter(p => p.id === planId).sort((a, b) => a.version - b.version),
+        runs: planRuns, results: planRuns.flatMap(r => { const result = store.get<RevalidationResult>(NS.results, r.id); return result ? [result] : []; }) };
     },
-    get(planId: string, version?: number) { const value = plan(planId, version); return { plan: value, frozen: store.get<FrozenRevalidationPlan>("revalidation-frozen", versionKey(value.id, value.version)) }; },
-    list(solutionId?: string) { return store.entries<{ version: number }>("revalidation-heads").map(e => plan(e.key, e.value.version)).filter(p => !solutionId || p.definition.target.solutionId === solutionId); },
-    history(planId: string) { head(planId); return { versions: store.list<RevalidationPlan>("revalidation-plans").filter(p => p.id === planId).sort((a, b) => a.version - b.version),
-      runs: store.list<RevalidationRun>("revalidation-runs").filter(r => r.planId === planId).sort((a, b) => a.sequence - b.sequence),
-      results: store.list<RevalidationResult>("revalidation-results").filter(r => run(r.runId).planId === planId) }; },
-    usage(runId: string) { run(runId); return store.list<RevalidationUsageJournalEntry>("revalidation-run-usage").filter(e=>e.runId===runId).sort((a,b)=>a.sequence-b.sequence); },
-    getRun(runId: string) { return { run: run(runId), version: store.version("revalidation-runs", runId), result: store.get<RevalidationResult>("revalidation-results", runId) }; },
-    promotionGate(input: { target: RevalidationTarget; claims: Array<{ id: string; scope: string; requiredEvidence: EvidenceRequirement }>; environmentDigest: string; environmentObservationDigest?: string }) {
-      if (input.environmentObservationDigest !== undefined) digest.parse(input.environmentObservationDigest);
-      revalidationTargetSchema.parse(input.target); digest.parse(input.environmentDigest);
-      const reasons: string[] = [];
-      if (!input.claims.length) reasons.push("no-claims-selected");
-      for (const claim of input.claims) {
-        id.parse(claim.id); prose.parse(claim.scope); requirement.parse(claim.requiredEvidence);
-        const relevant = plans.list(input.target.solutionId).filter(p => same(p.definition.target, input.target) && p.definition.claim.id === claim.id && p.definition.claim.scope === claim.scope);
-        const reasonsBefore = reasons.length;
-        let supportedEnvironment = false;
-        for (const current of relevant) {
-          const key = versionKey(current.id, current.version), frozen = store.get<FrozenRevalidationPlan>("revalidation-frozen", key);
-          const history = plans.history(current.id);
-          const environment = current.definition.environment;
-          const matchesEnvironment = environment !== null && revalidationEnvironmentDigest(environment) === input.environmentDigest;
-          // Testing environment B does not invalidate A. A general challenge is
-          // different: its concern applies to the whole claim, even if its test
-          // runs in one environment. Revisions cannot silently narrow it away.
-          const generalChallenge = history.versions.some(p => p.definition.mode === "challenge");
-          if (environment !== null && !matchesEnvironment && !generalChallenge) continue;
-          const matchesObservation = frozen?.schemaVersion === 2 && frozen.environmentObservationDigest === input.environmentObservationDigest;
-          // A known different observed environment is its own scope. Unfrozen
-          // drafts and general concerns still apply until resolved.
-          if (matchesEnvironment && frozen?.schemaVersion === 2 && input.environmentObservationDigest !== undefined && !matchesObservation && !generalChallenge) continue;
-          if (store.get("revalidation-stale", key)) { reasons.push(`${claim.id}:stale`); continue; }
-          const latest = history.runs.filter(r => r.planVersion === current.version).at(-1);
-          if (!frozen || !latest) {
-            reasons.push(`${claim.id}:${environment === null ? "pending-unspecified-environment" : generalChallenge ? "pending-general-challenge" : "pending"}`); continue;
-          }
-          if (latest.status !== "completed") { reasons.push(`${claim.id}:${latest.status}`); continue; }
-          const result = store.get<RevalidationResult>("revalidation-results", latest.id);
-          if (!result || !same(result.binding, binding(freezeRecord(current.id, current.version)))) { reasons.push(`${claim.id}:missing-evidence`); continue; }
-          if (result.verdict !== "supported") reasons.push(`${claim.id}:${result.verdict}`);
-          // A resolved general challenge supplies positive evidence only for its
-          // actual frozen environment; another advertised environment needs its own.
-          if (matchesEnvironment) {
-            if (frozen.schemaVersion !== 2) reasons.push(`${claim.id}:legacy-evidence-needs-revalidation`);
-            else if (input.environmentObservationDigest === undefined) reasons.push(`${claim.id}:environment-observation-required`);
-            else if (!matchesObservation) { /* A resolved general concern proves only its tested observation. */ }
-            else if (!qualifies(result.evidence.kind, claim.requiredEvidence)) reasons.push(`${claim.id}:insufficient-evidence-class`);
-            else if (result.verdict === "supported") supportedEnvironment = true;
-          }
-        }
-        if (!supportedEnvironment && reasons.length === reasonsBefore) reasons.push(`${claim.id}:${relevant.length ? "untested-environment" : "unassessed"}`);
+    getRun(runId: string) { return { run: run(runId), result: store.get<RevalidationResult>(NS.results, runId) }; },
+    /** The latest completed run of the latest frozen version decides a claim's standing; earlier results stay in the history. */
+    standing(solutionId: string, claimId: string): { verdict: ClaimVerdict | null; planId: string | null; runId: string | null } {
+      let latest: { verdict: ClaimVerdict; planId: string; runId: string; frozenAtMs: number } | null = null;
+      for (const p of plans.list(solutionId).filter(p => p.definition.claim.id === claimId)) {
+        const frozenVersions = store.list<FrozenRevalidationPlan>(NS.frozen).filter(f => f.planId === p.id).sort((a, b) => b.version - a.version);
+        const newest = frozenVersions[0]; if (!newest) continue;
+        const completed = runs(p.id).filter(r => r.planVersion === newest.version && r.status === "completed").at(-1);
+        if (completed?.verdict && (!latest || newest.frozenAtMs >= latest.frozenAtMs)) latest = { verdict: completed.verdict, planId: p.id, runId: completed.id, frozenAtMs: newest.frozenAtMs };
       }
-      return { eligible: reasons.length === 0, reasons: [...new Set(reasons)] };
+      return latest ? { verdict: latest.verdict, planId: latest.planId, runId: latest.runId } : { verdict: null, planId: null, runId: null };
     },
   };
 
-  // These operations are capabilities for the trusted server executor, never RPC/chat input handlers.
+  /** Used only by the server's runner. Never exposed through RPC or chat tools. */
+  const service: Actor = { kind: "service", id: "revalidation-runner" };
   const executor = {
-    start(input: { runId: string; expectedVersion: number }): { run: RevalidationRun; lease: string | null } {
+    frozen(current: RevalidationRun): FrozenRevalidationPlan {
+      const value = frozenPlan(current.planId, current.planVersion);
+      if (value.planDigest !== current.planDigest) throw new Error("revalidation-frozen-plan-changed");
+      return value;
+    },
+    run,
+    /** Moves a queued run to running exactly once; returns null if it is not queued (already started, ended or cancelled). */
+    start(runId: string): RevalidationRun | null {
       return store.transaction(() => {
-        if (store.version("revalidation-runs", input.runId) !== input.expectedVersion) throw new Error("revalidation-run-version-conflict");
-        const current = run(input.runId);
-        if (current.status !== "queued") throw new Error("revalidation-run-not-queued");
-        const frozen = freezeRecord(current.planId, current.planVersion); privateText(frozen.definition); privateText(frozen.artifact.content);
-        const reason = head(current.planId).version !== current.planVersion ? "plan-superseded" : store.get("revalidation-stale", versionKey(current.planId, current.planVersion)) ? "claim-scope-stale" :
-          frozen.definition.criteria.some(c => c.evaluator === "unsupported") ? "unsupported-criterion" :
-          frozen.definition.claim.requiredEvidence !== "exploratory" ? "required-evidence-capability-unavailable" :
-          frozen.schemaVersion !== 2 || frozen.protocol !== REVALIDATION_PROTOCOL || !frozen.workload || !frozen.observedEnvironment ? "legacy-plan-needs-new-version-and-workload" :
-          !frozen.definition.limits?.moneyLimitMode ? "money-mode-unavailable-create-new-version" :
-          frozen.definition.limits.moneyLimitMode === "hard" ? "hard-cost-limit-unavailable" :
-          !frozen.definition.limits.allowUnknownCost ? "unknown-native-cost-not-authorized" : workloadCapabilityIssue(frozen);
-        if (reason) return { run: finishOperational(current.id, "blocked", reason, { kind: "service", id: "revalidation-executor" }), lease: null };
-        const lease = randomUUID(); store.put("revalidation-leases", current.id, { lease });
-        return { run: updateRun({ ...current, status: "running", startedAtMs: now() }, { kind: "service", id: "revalidation-executor" }, "Start exact frozen revalidation"), lease };
+        const current = run(runId);
+        if (current.status !== "queued") return null;
+        return update({ ...current, status: "running", startedAtMs: now() }, service, "Start the frozen plan");
       });
     },
-    assertActive(input: {runId:string;lease:string}) {
-      const current=run(input.runId);
-      if (current.status !== "running" || store.get<{lease:string}>("revalidation-leases",input.runId)?.lease !== input.lease) throw new Error("revalidation-stale-executor");
-      return {run:current,frozen:freezeRecord(current.planId,current.planVersion)};
-    },
-    interrupt(input: {runId:string;expectedVersion:number;reason?:string}): RevalidationRun {
-      return store.transaction(()=>{
-        if (store.version("revalidation-runs",input.runId)!==input.expectedVersion) throw new Error("revalidation-run-version-conflict");
-        const current=run(input.runId),reason=input.reason??"interrupted-needs-new-run";
-        if (current.status === "blocked" && current.reason === reason) return current;
+    stop(runId: string, status: "blocked" | "failed", reason: string): RevalidationRun { return end(runId, status, reason, service); },
+    complete(runId: string, result: Omit<RevalidationResult, "runId" | "planDigest" | "completedAtMs">): RevalidationResult {
+      return store.transaction(() => {
+        const current = run(runId);
         if (current.status !== "running") throw new Error("revalidation-run-not-running");
-        const lease=store.get<{lease:string}>("revalidation-leases",input.runId)?.lease;
-        if (!lease) throw new Error("revalidation-stale-executor");
-        return finishOperational(input.runId,"blocked",reason,{kind:"service",id:"revalidation-recovery"},lease);
-      });
-    },
-    recordUsage(raw: RevalidationUsageJournalInput): RevalidationUsageJournalEntry {
-      const input=revalidationUsageJournalInputSchema.parse(raw); privateText(input);
-      return store.transaction(()=>{
-        const current=run(input.runId);
-        if (!same(input.binding,current.binding)) throw new Error("revalidation-usage-binding-mismatch");
-        const frozen=freezeRecord(current.planId,current.planVersion);
-        if (input.usage.currency !== frozen.definition.limits!.currency) throw new Error("revalidation-usage-currency-mismatch");
-        const entryId=stableId("revalidation-usage",[input.runId,input.requestId]), existing=store.get<RevalidationUsageJournalEntry>("revalidation-run-usage",entryId);
-        if (existing) {
-          const {id:_,sequence:__,recordedAtMs:___,...previous}=existing;
-          if (!same(previous,input)) throw new Error("revalidation-usage-request-conflict"); return existing;
-        }
-        const sequence=(store.get<number>("revalidation-usage-sequence",input.runId)??0)+1;
-        const value:RevalidationUsageJournalEntry={...input,id:entryId,sequence,recordedAtMs:now()};
-        store.createAudited("revalidation-run-usage",entryId,value,{kind:"service",id:"revalidation-accounting"},"Append usage observation; scientific results remain unchanged");
-        store.put("revalidation-usage-sequence",input.runId,sequence);return value;
-      });
-    },
-    block(input: { runId: string; reason: string; lease?: string }) { return finishOperational(input.runId, "blocked", input.reason, { kind: "service", id: "revalidation-executor" }, input.lease); },
-    fail(input: { runId: string; reason: string; lease: string }) { return finishOperational(input.runId, "failed", input.reason, { kind: "service", id: "revalidation-executor" }, input.lease); },
-    cancel(input: { runId: string; reason: string; lease: string }) { return finishOperational(input.runId, "cancelled", input.reason, { kind: "service", id: "revalidation-executor" }, input.lease); },
-    complete(input: { runId: string; lease: string; binding: RevalidationBinding; observations: RevalidationObservation[]; evidence: RevalidationEvidence; usage: RevalidationUsage }): RevalidationResult {
-      const observations = z.array(observationSchema).max(100).parse(input.observations), evidence = evidenceSchema.parse(input.evidence), usage = usageSchema.parse(input.usage);
-      privateText({ observations, evidence });
-      return store.transaction(() => {
-        const current = run(input.runId), frozen = freezeRecord(current.planId, current.planVersion);
-        if (!same(input.binding, current.binding) || !same(current.binding, binding(frozen))) throw new Error("revalidation-result-binding-mismatch");
-        const existing = store.get<RevalidationResult>("revalidation-results", current.id);
-        const completionDigest = hash({ ...input, observations, evidence, usage });
-        if (existing) {
-          if (store.get("revalidation-completions", current.id) !== completionDigest) throw new Error("revalidation-result-immutable"); return existing;
-        }
-        if (current.status !== "running" || store.get<{ lease: string }>("revalidation-leases", current.id)?.lease !== input.lease) throw new Error("revalidation-stale-executor");
-        privateText(frozen.definition); privateText(frozen.artifact.content);
-        if (evidence.kind === "exploratory-replay" && frozen.definition.mode !== "replay" || evidence.kind === "exploratory-challenge" && frozen.definition.mode === "replay") throw new Error("revalidation-evidence-mode-mismatch");
-        if (new Set(observations.map(o => o.criterionId)).size !== observations.length || observations.some(o => !frozen.definition.criteria.some(c => c.id === o.criterionId))) throw new Error("revalidation-observation-identity-mismatch");
-        const limits = frozen.definition.limits!;
-        if (usage.calls > limits.maxCalls || usage.elapsedMs > limits.maxDurationMs || now() - current.startedAtMs! > limits.maxDurationMs || usage.currency !== limits.currency ||
-          usage.costMicros === null && !limits.allowUnknownCost || usage.costMicros !== null && limits.maxCostMicros !== null && usage.costMicros > limits.maxCostMicros) throw new Error("revalidation-execution-limit-exceeded");
-        const criteria: CriterionAssessment[] = frozen.definition.criteria.map(c => {
-          const o = observations.find(row => row.criterionId === c.id), sample = frozen.definition.sample!;
-          let value: number | null = null, reason: string | null = null;
-          if (c.evaluator !== "numeric-comparison-v1") reason = "unsupported-criterion";
-          else if (!o) reason = "missing-observation";
-          else if (o.metric !== c.metric || o.unit !== c.unit) throw new Error("revalidation-metric-unit-mismatch");
-          else if (o.receiptRefs.some(ref => !evidence.receiptRefs.includes(ref))) throw new Error("revalidation-observation-receipt-mismatch");
-          else if (o.unusable) reason = o.unusable;
-          else if (o.pairs < sample.minimumPairs || sample.minimumExposure !== null && (o.exposure === null || o.exposure < sample.minimumExposure || o.exposureUnit !== sample.exposureUnit)) reason = "insufficient-exposure";
-          else if (o.baseline === null || o.treatment === null) reason = "missing-comparison";
-          else if (c.statistic === "relative-change" && o.baseline === 0) reason = "zero-comparator";
-          else { value = c.statistic === "treatment" ? o.treatment : c.statistic === "difference" ? o.treatment - o.baseline : (o.treatment - o.baseline) / Math.abs(o.baseline); if (!Number.isFinite(value)) { value = null; reason = "nonfinite-comparison"; } }
-          return { criterionId: c.id, value, reason, status: reason ? "inconclusive" : (c.threshold.operator === "at-least" ? value! >= c.threshold.value : value! <= c.threshold.value) ? "threshold-met" : "threshold-not-met" };
-        });
-        const required = criteria.filter(c => frozen.definition.criteria.find(d => d.id === c.criterionId)!.required);
-        // Optional unsupported/missing measures remain visible and never silently increase confidence.
-        const verdict: ClaimVerdict = !qualifies(evidence.kind, frozen.definition.claim.requiredEvidence) || criteria.some(c => c.status === "inconclusive") ? "inconclusive" : required.some(c => c.status === "threshold-not-met") ? "contradicted" : "supported";
-        const result: RevalidationResult = { runId: current.id, binding: current.binding, verdict, observations, criteria, evidence, usage, observedAtMs: now() };
-        store.insert("revalidation-results", current.id, result); store.put("revalidation-completions", current.id, completionDigest);
-        updateRun({ ...current, status: "completed", verdict, endedAtMs: result.observedAtMs }, { kind: "service", id: "revalidation-executor" }, "Record scoped evidence; artifact and previous assessments remain unchanged");
-        store.remove("revalidation-leases", current.id); return result;
+        const value: RevalidationResult = { ...result, runId, planDigest: current.planDigest, completedAtMs: now() };
+        store.createAudited(NS.results, runId, value, service, "Record the scored result");
+        update({ ...current, status: "completed", verdict: value.verdict, endedAtMs: value.completedAtMs }, service, "Record the verdict");
+        return value;
       });
     },
   };
   return { plans, executor };
 }
+export type Revalidation = ReturnType<typeof createRevalidation>;

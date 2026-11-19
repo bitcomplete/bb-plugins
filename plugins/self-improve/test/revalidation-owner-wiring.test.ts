@@ -8,82 +8,45 @@ import { solution } from "./domain/fixtures.js";
 import type { EditRevalidationDraft } from "../src/revalidation-edit-contract.js";
 import type { RevalidationOwnerApi } from "../src/revalidation-owner.js";
 
-async function fixture(){
-  const selection={providerId:"codex",model:"owner-selected",projectId:"project",environmentId:"environment",permissionMode:"accept-edits" as const};
-  const spawn=vi.fn(async()=>{throw new Error("No model dispatch is expected in an owner draft test");});
-  const {bb,harness}=createFakePluginHost({pluginId:"self-improve",settings:{config:JSON.stringify({...defaultConfig(),...selection})},sdk:{
-    environments:{get:async()=>({id:"environment",projectId:"project",status:"ready",hostLifecycle:"active",lifecycle:{phase:"active"}} as any)},
-    system:{version:async()=>({currentVersion:"0.49.0",upgradeCommand:"unused"} as any)},threads:{spawn},
-    skills:{list:async()=>({skills:[]} as any)},
-  }});
-  await plugin(bb);const store=new Store(bb.storage.database());
-  const content="Preserve each field of the original payload.",artifactDigest=createHash("sha256").update(content).digest("hex");
-  store.put("solutions","solution",solution("solution"));store.put("native-evaluation-artifacts","artifact",{id:"artifact",solutionId:"solution",revision:"r1",kind:"instruction",content,artifactDigest});
-  const input:EditRevalidationDraft={action:"create",requestId:"owner-intent",definition:{target:{solutionId:"solution",namespace:"native-evaluation-artifacts",artifactId:"artifact",revision:"r1",artifactDigest},mode:"challenge",concern:"Does it preserve whitespace?",claim:{id:"payload-preserved",text:"Keep payload fields",scope:"These prompt cases",originalEvidenceRefs:[],requiredEvidence:"exploratory"},comparator:"No additional instruction",workload:null,
-    criteria:[{id:"primary",role:"primary",required:true,evaluator:"numeric-comparison-v1",metric:"Exact answer pass rate",unit:"proportion",statistic:"difference",threshold:{operator:"at-least",value:0},unsupportedReason:null}],sample:{minimumPairs:1,minimumExposure:null,exposureUnit:null},
-    environment:{declaredNonsecret:true,dependencies:[],configuration:[],untested:["Package installation"],execution:selection},limits:{maxDurationMs:120000,maxCalls:2,maxCostMicros:null,currency:"USD",allowUnknownCost:true,moneyLimitMode:"observed-admission"}},
-    workload:{schemaVersion:1,kind:"paired-exact-instruction-v1",description:"Whitespace preservation",cases:[{id:"case",familyId:"payload",input:"Return two leading spaces then field",expected:"  field"}],measurements:[{criterionId:"primary",kind:"exact-pass-rate"}],normalization:"none",baseline:"no-added-instruction",orderPolicy:"alternating-arms-v1",response:"json-output-string-v1"}};
-  return {harness,store,input,spawn};
+async function fixture() {
+  const selection = { providerId: "codex", model: "owner-selected", projectId: "project", environmentId: "environment", permissionMode: "accept-edits" as const };
+  const spawn = vi.fn(async () => { throw new Error("No model dispatch is expected in an owner draft test"); });
+  const { bb, harness } = createFakePluginHost({ pluginId: "self-improve", settings: { config: JSON.stringify({ ...defaultConfig(), ...selection }) }, sdk: { threads: { spawn } } });
+  await plugin(bb); const store = new Store(bb.storage.database());
+  const content = "Preserve each field of the original payload.", artifactDigest = createHash("sha256").update(content).digest("hex");
+  store.put("solutions", "solution", solution("solution"));
+  store.put("native-evaluation-artifacts", "artifact", { solutionId: "solution", revision: "r1", kind: "instruction", content, artifactDigest });
+  const input: EditRevalidationDraft = { action: "create", requestId: "owner-intent", definition: {
+    target: { solutionId: "solution", namespace: "native-evaluation-artifacts", artifactId: "artifact", revision: "r1", artifactDigest },
+    concern: "Does it preserve whitespace?", claim: { id: "payload-preserved", text: "Keep payload fields" },
+    cases: [{ id: "case", input: "Return two leading spaces then field", expected: "  field" }],
+    criteria: [{ id: "primary", measure: "pass-rate", statistic: "difference", operator: "at-least", value: 0, required: true }],
+    limits: { maxDurationMs: 600_000 } } };
+  return { harness, store, input, spawn, selection, call: (method: string, value: unknown, options?: object) => harness.behavior.callRpc(method, value, options) };
 }
-it("edits, freezes and queues the exact plan through public owner RPC with one durable retry identity",async()=>{
-  const f=await fixture();try{
-    const overview=await f.harness.behavior.callRpc("revalidationOverview",{solutionId:"solution"}) as ReturnType<RevalidationOwnerApi["overview"]>;
-    expect(overview.artifacts[0]!.target).toEqual(f.input.definition.target);expect(overview.selection?.providerId).toBe("codex");
-    const first=await f.harness.behavior.callRpc("editRevalidationDraft",f.input) as ReturnType<RevalidationOwnerApi["edit"]>;
-    expect(await f.harness.behavior.callRpc("editRevalidationDraft",f.input)).toEqual(first);
-    const frozen=await f.harness.behavior.callRpc("freezeRevalidation",{planId:first.plan.id,expectedVersion:1}) as Awaited<ReturnType<RevalidationOwnerApi["freeze"]>>;
-    expect(frozen.artifact.content).toBe(overview.artifacts[0]!.content);expect(frozen.workload?.definition.cases[0]!.expected).toBe("  field");
-    expect(frozen.observedEnvironment?.environment.id).toBe("environment");
-    const request={planId:first.plan.id,version:1,requestId:"queue-intent"};
-    const queued=await f.harness.behavior.callRpc("queueRevalidation",request) as ReturnType<RevalidationOwnerApi["queue"]>;
-    expect(await f.harness.behavior.callRpc("queueRevalidation",request)).toEqual(queued);
-    const jobs=f.store.db.prepare("SELECT input FROM jobs WHERE stage='builder'").all() as {input:string}[];
-    expect(jobs.map(row=>JSON.parse(row.input))).toEqual([{kind:"revalidation",revalidationRunId:queued.run.id,solutionId:`revalidation-run:${queued.run.id}`}]);
-    const detail=await f.harness.behavior.callRpc("revalidationPlan",{planId:first.plan.id}) as ReturnType<RevalidationOwnerApi["detail"]>;
-    expect(detail.results).toEqual([]);expect(detail.runs[0]!.verdict).toBeNull();expect(f.spawn).not.toHaveBeenCalled();
-    expect(f.harness.inspection.registrations.services).toHaveLength(7);
-  }finally{await f.harness.lifecycle.dispose();}
+it("drafts, freezes and queues through the owner RPCs with one durable retry identity", async () => {
+  const f = await fixture(); try {
+    const overview = await f.call("revalidationOverview", { solutionId: "solution" }) as ReturnType<RevalidationOwnerApi["overview"]>;
+    expect(overview.artifacts[0]!.target).toEqual(f.input.definition.target);
+    const plan = await f.call("editRevalidationDraft", f.input) as ReturnType<RevalidationOwnerApi["edit"]>;
+    const frozen = await f.call("freezeRevalidation", { planId: plan.id, expectedVersion: 1 }) as ReturnType<RevalidationOwnerApi["freeze"]>;
+    expect(frozen.testedOn).toMatchObject(f.selection); expect(frozen.definition.cases[0]!.expected).toBe("  field");
+    const request = { planId: plan.id, version: 1, requestId: "queue-intent" };
+    const queued = await f.call("queueRevalidation", request) as ReturnType<RevalidationOwnerApi["queue"]>;
+    expect(await f.call("queueRevalidation", request)).toEqual(queued);
+    const jobs = f.store.db.prepare("SELECT input FROM jobs WHERE stage='builder'").all() as { input: string }[];
+    expect(jobs.map(row => JSON.parse(row.input))).toEqual([{ kind: "revalidation", revalidationRunId: queued.run.id, solutionId: `revalidation-run:${queued.run.id}` }]);
+    const cancelled = await f.call("cancelRevalidation", { runId: queued.run.id, reason: "Revise the cases first" });
+    expect(cancelled).toMatchObject({ status: "cancelled", verdict: null });
+    expect(f.spawn).not.toHaveBeenCalled();
+  } finally { await f.harness.lifecycle.dispose(); }
 });
-it("cancels queued owner work without making a result or reopening it on a lost-response retry",async()=>{
-  const f=await fixture();try{
-    const draft=await f.harness.behavior.callRpc("editRevalidationDraft",f.input) as ReturnType<RevalidationOwnerApi["edit"]>;
-    await f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1});
-    const request={planId:draft.plan.id,version:1,requestId:"queue-once"};
-    const queued=await f.harness.behavior.callRpc("queueRevalidation",request) as ReturnType<RevalidationOwnerApi["queue"]>;
-    const cancelled=await f.harness.behavior.callRpc("cancelRevalidation",{runId:queued.run.id,expectedVersion:f.store.version("revalidation-runs",queued.run.id),reason:"Revise the cases first"});
-    expect(cancelled).toMatchObject({status:"cancelled",verdict:null});
-    expect(await f.harness.behavior.callRpc("queueRevalidation",request)).toMatchObject({run:{status:"cancelled",verdict:null},jobId:null});
-    expect(f.store.list("revalidation-results")).toEqual([]);expect(f.spawn).not.toHaveBeenCalled();
-  }finally{await f.harness.lifecycle.dispose();}
-});
-it("refuses owner actions from another plugin",async()=>{
-  const f=await fixture();try{
-    const asPlugin={experimental_caller:{kind:"plugin" as const,pluginId:"other-plugin"}};
-    await expect(f.harness.behavior.callRpc("editRevalidationDraft",f.input,asPlugin)).rejects.toThrow("available only to the owner");
-    for(const [method,input] of [["dashboard",{}],["getExecution",{}],["revalidationOverview",{}]] as const)
-      await expect(f.harness.behavior.callRpc(method,input,asPlugin)).rejects.toThrow("available only to the owner");
-    await expect(f.harness.behavior.callRpc("dashboard",{})).resolves.toBeDefined();
+it("refuses every dashboard RPC from another plugin", async () => {
+  const f = await fixture(); try {
+    const asPlugin = { experimental_caller: { kind: "plugin" as const, pluginId: "other-plugin" } };
+    for (const [method, value] of [["editRevalidationDraft", f.input], ["dashboard", {}], ["getExecution", {}], ["revalidationOverview", {}]] as const)
+      await expect(f.call(method, value, asPlugin)).rejects.toThrow("available only to the owner");
     expect(f.store.list("revalidation-plans")).toEqual([]);
-  }finally{await f.harness.lifecycle.dispose();}
-});
-it("observes only the configured worker environment and returns an existing freeze on retry",async()=>{
-  const f=await fixture();try{
-    const elsewhere={...f.input,requestId:"elsewhere",definition:{...f.input.definition,environment:{...f.input.definition.environment!,execution:{...f.input.definition.environment!.execution,projectId:"other-project"}}}};
-    const other=await f.harness.behavior.callRpc("editRevalidationDraft",elsewhere) as ReturnType<RevalidationOwnerApi["edit"]>;
-    await expect(f.harness.behavior.callRpc("freezeRevalidation",{planId:other.plan.id,expectedVersion:1})).rejects.toThrow("revalidation-environment-not-configured-worker");
-    expect(f.store.list("revalidation-observed-environments")).toEqual([]);
-    const draft=await f.harness.behavior.callRpc("editRevalidationDraft",f.input) as ReturnType<RevalidationOwnerApi["edit"]>;
-    const frozen=await f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1});
-    const snapshots=f.store.list("revalidation-observed-environments").length;
-    expect(await f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1})).toEqual(frozen);
-    expect(f.store.list("revalidation-observed-environments")).toHaveLength(snapshots);
-  }finally{await f.harness.lifecycle.dispose();}
-});
-it("refuses to freeze a declared dependency it cannot fingerprint",async()=>{
-  const f=await fixture();try{
-    const withSkill={...f.input,requestId:"with-skill",definition:{...f.input.definition,environment:{...f.input.definition.environment!,dependencies:[{kind:"skill" as const,name:"absent-skill",version:"any",setup:"Installed in the worker project"}]}}};
-    const draft=await f.harness.behavior.callRpc("editRevalidationDraft",withSkill) as ReturnType<RevalidationOwnerApi["edit"]>;
-    await expect(f.harness.behavior.callRpc("freezeRevalidation",{planId:draft.plan.id,expectedVersion:1})).rejects.toThrow("revalidation-dependencies-not-observed");
-    expect(f.store.list("revalidation-frozen")).toEqual([]);
-  }finally{await f.harness.lifecycle.dispose();}
+    await expect(f.call("dashboard", {})).resolves.toBeDefined();
+  } finally { await f.harness.lifecycle.dispose(); }
 });

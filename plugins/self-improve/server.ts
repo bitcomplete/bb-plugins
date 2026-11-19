@@ -39,8 +39,6 @@ import { checkAdoption } from "./src/domain/solutions.js";
 
 import { createRevalidation } from "./src/revalidation.js";
 import { chatAuditRow } from "./src/chat-audit.js";
-import { createRevalidationWorkloads } from "./src/revalidation-workload.js";
-import { createRevalidationEnvironmentObserver } from "./src/revalidation-environment.js";
 import { createRevalidationRunner } from "./src/revalidation-runner.js";
 import { createRevalidationDraftEditor } from "./src/revalidation-edit.js";
 import { createRevalidationOwnerApi } from "./src/revalidation-owner.js";
@@ -81,18 +79,15 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       permissionMode: config.permissionMode, reasoningLevel: config.reasoningLevel, serviceTier: config.serviceTier }); }
     catch { throw new Deferred("configure-bb-provider-model-project-environment"); }
   };
-  const revalidationWorkloads = createRevalidationWorkloads(store,{redact:clean});
-  const revalidationEnvironment = createRevalidationEnvironmentObserver({sdk:bb.sdk,store,redact:clean});
-  const revalidation = createRevalidation(store,{redact:clean,workloads:revalidationWorkloads,environmentSnapshots:revalidationEnvironment});
-  const editRevalidationDraft = createRevalidationDraftEditor(store,revalidation.plans,revalidationWorkloads);
-  let revalidationRunner:ReturnType<typeof createRevalidationRunner>|undefined;
+  const revalidation = createRevalidation(store,{redact:clean});
+  const editRevalidationDraft = createRevalidationDraftEditor(revalidation.plans);
   let activity: ActivityAccounting;
   const accounting = new Accounting(store, () => config.budgets, admission => activity.legacyGuard(admission));
   accounting.recoverInterrupted();
   const nativeAccounting = new NativeAccounting({ store, sdk: bb.sdk, legacy: accounting,
     policy: () => config.budgets, maxConcurrent: () => config.concurrency,
-    admissionGuard: (admission, atMs) => {activity.nativeGuard(admission, atMs);revalidationRunner?.admissionGuard(admission,atMs);} });
-  const nativeTasks = new NativeTaskRunner({ store, sdk: bb.sdk, currentPrivacyGeneration: () => privacyGeneration, hooks: {...nativeAccounting.hooks(),beforeDispatch:record=>revalidationRunner?.dispatchGuard(record)} });
+    admissionGuard: (admission, atMs) => activity.nativeGuard(admission, atMs) });
+  const nativeTasks = new NativeTaskRunner({ store, sdk: bb.sdk, currentPrivacyGeneration: () => privacyGeneration, hooks: nativeAccounting.hooks() });
   const chats = new NativeChatManager({ store, sdk: bb.sdk, execution, privacy,
     privacyGeneration: () => privacyGeneration, hooks: { beforeDispatch: async admission => { activity.admitChat(admission); } } });
   activity = new ActivityAccounting({ store, policy: () => config.budgets,
@@ -189,19 +184,17 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       runId: ctx.job.runId ?? `${ctx.job.id}:${ctx.job.attempts}`, signal: ctx.signal, privacy: privacy() });
     return {...counts,...revisits};
   };
-  revalidationRunner=createRevalidationRunner({store,revalidation,runner:nativeTasks,activity,execution,
-    privacyGeneration:()=>privacyGeneration,redact:clean,observeEnvironment:revalidationEnvironment.check,
-    allowed:()=>values.enabled&&configurationError===null&&!publicationStop.signal.aborted,taskTimeoutMs:()=>config.taskTimeoutMs,
-    allowUnknownCost:()=>config.budgets.allowUnknown,hasCapacity:()=>nativeAccounting.hasCapacity()});
+  const workerSelection=()=>{const parsed=executionSelectionSchema.safeParse({providerId:config.providerId,model:config.model,projectId:config.projectId,
+    environmentId:config.environmentId,permissionMode:config.permissionMode,...(config.reasoningLevel===undefined?{}:{reasoningLevel:config.reasoningLevel}),...(config.serviceTier===undefined?{}:{serviceTier:config.serviceTier})});return parsed.success?parsed.data:null;};
+  const revalidationRunner=createRevalidationRunner({store,revalidation,runner:nativeTasks,selection:workerSelection,
+    allowed:()=>values.enabled&&configurationError===null&&config.budgets.allowUnknown&&!publicationStop.signal.aborted,
+    privacyGeneration:()=>privacyGeneration,taskTimeoutMs:()=>config.taskTimeoutMs});
   const ordinaryBuilder=runtime.handlers.builder;
-  runtime.handlers.builder=ctx=>ctx.job.input.kind==="revalidation"?revalidationRunner!.handle(ctx):ordinaryBuilder(ctx);
+  runtime.handlers.builder=ctx=>ctx.job.input.kind==="revalidation"?revalidationRunner.handle(ctx):ordinaryBuilder(ctx);
   const services = new Services(bb, store, runtime.handlers, async () => values.enabled && configurationError === null, changed);
-  const revalidationOwner=createRevalidationOwnerApi({store,domain:revalidation,workloads:revalidationWorkloads,editDraft:editRevalidationDraft,
-    observer:revalidationEnvironment,runner:revalidationRunner,redact:clean,changed,currency:()=>config.budgets.currency,
-    selection:()=>{const parsed=executionSelectionSchema.safeParse({providerId:config.providerId,model:config.model,projectId:config.projectId,
-      environmentId:config.environmentId,permissionMode:config.permissionMode,...(config.reasoningLevel===undefined?{}:{reasoningLevel:config.reasoningLevel}),...(config.serviceTier===undefined?{}:{serviceTier:config.serviceTier})});return parsed.success?parsed.data:null;}});
-  if(revalidationRunner.recover(services.boot))store.put("native-execution-health","revalidation-recovery",{atMs:Date.now(),issue:"revalidation-recovery-pending"});
-  else store.remove("native-execution-health","revalidation-recovery");
+  const revalidationOwner=createRevalidationOwnerApi({store,domain:revalidation,editDraft:editRevalidationDraft,runner:revalidationRunner,
+    selection:workerSelection,redact:clean,changed,costs:runId=>activityCostView(activity.forRun(runId))});
+  revalidationRunner.recover();
   revalidationOwner.repairQueuedJobs();
   services.register();
   // Reactive hints coalesce separately from the 15-minute sweep, including after that sweep completed.
@@ -214,8 +207,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       await chats.reconcile();
       await chats.reconcileUsage({ maxChats: 100, signal: publicationStop.signal });
       await nativeAccounting.reconcileUsage({ maxTasks: 100, signal: publicationStop.signal });
-      if(revalidationRunner?.reconcileUsage())store.put("native-execution-health","revalidation-usage",{atMs:Date.now(),issue:"revalidation-usage-reconciliation-pending"});
-      else store.remove("native-execution-health","revalidation-usage");
       store.remove("native-execution-health", "latest");
     })().catch(() => {
       store.put("native-execution-health", "latest", { atMs: Date.now(), issue: "native-reconciliation-pending" });
@@ -226,12 +217,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   void reconcile();
   settings.onChange(next => {
     values = next; applyConfig(); privacyGeneration = syncWorkerPrivacy(store, privacy()); miner = null; dairClient = null;
-    // A disabled plugin or changed worker selection stops revalidation work already in flight.
-    revalidationRunner?.enforce();
     changed(); void reconcile(); void bb.experimental_hooks.recheck("message.dispatch");
   });
   bb.onDispose(async () => {
-    revalidationRunner?.dispose();
     await nativeTasks.dispose(); await chats.dispose();
     if (reconciliation) await reconciliation;
     await exporter.flush();
@@ -251,8 +239,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   });
   const issues = () => [
     configurationError, exportError, store.get<{issue:string}>("native-execution-health","latest")?.issue,
-    store.get<{issue:string}>("native-execution-health","revalidation-recovery") && "Some interrupted revalidation runs could not be recovered; they are retried on the next start",
-    store.get<{issue:string}>("native-execution-health","revalidation-usage") && "Some revalidation runs' late cost reports could not be reconciled; retrying",
     !config.providerId && "Choose a BB provider", !config.model && "Choose a model",
     !config.projectId && "Choose a worker project", !config.environmentId && "Choose a worker environment",
     !config.budgets.allowUnknown && "Allow unknown native costs before starting agent work; BB reports are not final invoices",
@@ -340,7 +326,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     revalidationOverview: input=>revalidationOwner.overview(input.solutionId),
     revalidationPlan: input=>revalidationOwner.detail(input.planId),
     editRevalidationDraft: input=>revalidationOwner.edit(input),
-    freezeRevalidation: (input,context)=>revalidationOwner.freeze(input,context.experimental_signal),
+    freezeRevalidation: input=>revalidationOwner.freeze(input),
     queueRevalidation: input=>revalidationOwner.queue(input),
     cancelRevalidation: input=>revalidationOwner.cancel(input),
     startRevalidationChat: async (input,context)=>{
@@ -359,7 +345,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       await settings.experimental_set({config:JSON.stringify(next)});
       values = await settings.get(); applyConfig();
       privacyGeneration = syncWorkerPrivacy(store, privacy()); miner = null;
-      revalidationRunner?.enforce();
       changed(); void reconcile(); void bb.experimental_hooks.recheck("message.dispatch");
       return executionView();
     }),
@@ -429,17 +414,18 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   };
   bb.agents.registerTool({name:"self_improve_revalidation_read",description:"Read a selected solution's revalidation draft, frozen criteria and retained results. Expected answers are planned test inputs, never observed outcomes. Use the current plan version before edits.",
     parameters:z.object({planId:idSchema,history:z.boolean().default(false),offset:z.number().int().min(0).default(0),limit:z.number().int().min(1).max(20).default(10)}).strict(),execute:(input,context)=>{
-      const detail=revalidationOwner.detail(input.planId,{usage:false});requireRevalidationChat(context.threadId,detail.plan.definition.target.solutionId);
+      const detail=revalidationOwner.detail(input.planId);requireRevalidationChat(context.threadId,detail.plan.definition.target.solutionId);
       const page=<T>(rows:T[])=>({rows:rows.slice(input.offset,input.offset+input.limit),total:rows.length});
-      const result={plan:detail.plan,frozen:detail.frozen,workload:detail.workload,...(input.history?{versions:page(detail.versions),runs:page(detail.runs),results:page(detail.results)}:{})};
+      const result={plan:detail.plan,frozen:detail.frozen,...(input.history?{versions:page(detail.versions),runs:page(detail.runs),results:page(detail.results)}:{})};
       const text=JSON.stringify(modelLedgerRead(result,privacy()));
       return Buffer.byteLength(text)<=200000?text:JSON.stringify({error:"Plan exceeds the chat response limit; inspect or simplify its tests in the owner interface."});
     }});
-  bb.agents.registerTool({name:"self_improve_revalidation_edit",description:"Create or revise a skeptical claim's draft criteria and planned exact-answer tests for this solution. The workload field supplies planned tests; on revision omit it to keep the current tests, or pass null to detach them. definition.workload must be null because the server assigns its immutable identity. Preserve the current claim and environment on revision; a different claim or environment needs a new plan. Cannot freeze, run or write outcomes.",
+  bb.agents.registerTool({name:"self_improve_revalidation_edit",description:"Create or revise a draft revalidation plan for this solution: the claim being doubted, exact-answer test cases (input and expected output) and pass criteria. A revision keeps the target and claim and replaces the cases and criteria. Cannot freeze, run or record results; the owner does those.",
     parameters:editRevalidationDraftSchema,execute:(input,context)=>{
-      requireRevalidationChat(context.threadId,input.definition.target.solutionId);
+      const solutionId=input.action==="create"?input.definition.target.solutionId:revalidation.plans.get(input.planId).plan.definition.target.solutionId;
+      requireRevalidationChat(context.threadId,solutionId);requireRevalidationChat(context.threadId,input.definition.target.solutionId);
       const result=editRevalidationDraft(input,{kind:"chat",id:context.threadId});changed();
-      return JSON.stringify(modelLedgerRead({planId:result.plan.id,version:result.plan.version,workload:result.workload?{id:result.workload.id,version:result.workload.version,manifestDigest:result.workload.manifestDigest}:null},privacy()));
+      return JSON.stringify({planId:result.id,version:result.version});
     }});
   bb.agents.configure(context => {
     const chat = chats.get(context.thread.id);

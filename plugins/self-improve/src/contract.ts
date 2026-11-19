@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { DashboardData, PerformancePoint, ExportArtifact } from "./ui/types.js";
 import type { PublicationObservation } from "./publication-state.js";
 import type { PublicationSummary } from "./publication-view.js";
-import { freezeRevalidationSchema, queueRevalidationSchema } from "./revalidation-contract.js";
+import { freezeRevalidationSchema, queueRevalidationSchema, cancelRevalidationSchema } from "./revalidation-contract.js";
 import { editRevalidationDraftSchema } from "./revalidation-edit-contract.js";
 import type { RevalidationOwnerApi } from "./revalidation-owner.js";
 const id = z.string().min(1).max(200);
@@ -12,9 +12,9 @@ export const rpcContract = defineRpcContract({
   revalidationOverview: { input: z.object({solutionId:id.optional()}).strict(), output:z.custom<ReturnType<RevalidationOwnerApi["overview"]>>() },
   revalidationPlan: { input:z.object({planId:id}).strict(), output:z.custom<ReturnType<RevalidationOwnerApi["detail"]>>() },
   editRevalidationDraft: { input:editRevalidationDraftSchema, output:z.custom<ReturnType<RevalidationOwnerApi["edit"]>>() },
-  freezeRevalidation: { input:freezeRevalidationSchema, output:z.custom<Awaited<ReturnType<RevalidationOwnerApi["freeze"]>>>() },
+  freezeRevalidation: { input:freezeRevalidationSchema, output:z.custom<ReturnType<RevalidationOwnerApi["freeze"]>>() },
   queueRevalidation: { input:queueRevalidationSchema, output:z.custom<ReturnType<RevalidationOwnerApi["queue"]>>() },
-  cancelRevalidation: { input:z.object({runId:id,expectedVersion:z.number().int().positive(),reason:z.string().min(1).max(4000)}).strict(), output:z.custom<ReturnType<RevalidationOwnerApi["cancel"]>>() },
+  cancelRevalidation: { input:cancelRevalidationSchema, output:z.custom<ReturnType<RevalidationOwnerApi["cancel"]>>() },
   startRevalidationChat: { input:z.object({planId:id,projectId:id}).strict(), output:z.object({threadId:id}) },
   getExecution: { input: z.object({}).strict(), output: z.custom<ExecutionSettingsView>() },
   setExecution: { input: z.object({expectedRevision:z.string().min(1).max(200),selection:executionSelectionSchema}).strict(), output: z.custom<ExecutionSettingsView>() },

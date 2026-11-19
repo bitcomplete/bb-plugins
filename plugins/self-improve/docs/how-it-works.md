@@ -44,11 +44,11 @@ The intended impact screen keeps three facts distinct: **evidence**, **distribut
 
 **Revalidate** will start with a skeptical claim, help clarify measurable criteria in BB chat, freeze a versioned plan, and test the unchanged artifact. It will distinguish replay, new challenges and independent held-out proof, then record supported/contradicted/inconclusive outcomes separately from execution failures. Fixing the artifact creates a new revision needing new validation.
 
-The revalidation engine is in place on the server; its dashboard wizard is not built yet. Each test case runs twice in fresh BB threads, once without the solution's instruction and once with it, and the server scores exact answers. A result covers only the frozen plan, test cases and setup it ran on:
+The revalidation engine is in place on the server; its dashboard wizard is not built yet. You (or the editing chat) write test cases, each an input and the exact expected answer, plus pass criteria. You freeze the plan, which records the exact instruction and your worker settings, and queue it. Each case runs twice in fresh BB threads, once without the instruction and once with it, and the server scores the answers:
 
-- A run blocked or failed for an operational reason (a setup change, a budget or concurrency limit, the plugin being turned off) has no verdict.
-- An answer that isn't the required JSON counts as a failed case. If the answer without the instruction is unreadable, comparisons against it are inconclusive.
-- The latest run of the latest plan version decides the claim's standing. A later passing run replaces an earlier failed one; both stay in the history.
+- Answers must be JSON `{"output": "..."}`, optionally in one code fence. Anything else counts as a failed case, and the result shows how many answers were unreadable.
+- A verdict is recorded only when every call finished. If you cancel, the plugin is turned off, the worker settings change, the time limit passes or a call fails, the run stops with a reason and no verdict.
+- The latest completed run of the latest frozen plan decides the claim's standing. Earlier results stay in the history.
 
 Both complete workflows remain **pending in this preview**. Existing basic retest and draft export controls are foundations. A draft PR is submitted for review; it is not published, listed or active. This pending work remains part of the delivery scope.
 
