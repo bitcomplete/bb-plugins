@@ -20,7 +20,11 @@ end the turn. The plugin wakes this thread with one message naming the
 target, each changed field as `old → new` (state, review decision,
 reviews, requested reviewers, checks and which are failing, head commit,
 labels, assignees, title), and any new comment, review or inline review
-comment with its author, what they did, and body. Typical moments: you
+comment with its author, what they did, and body. It also wakes once per
+head commit when an open pull request's head has had no check runs and no
+statuses for five minutes — naming the head and how long it has been, and
+saying the `pull_request` workflow may not have run — so a head whose CI
+never started does not sit silent. Typical moments: you
 opened a PR and the next step is a reviewer's; checks are running and
 you will act on the result; you asked a question in a comment; your work
 is blocked on an issue someone else owns.

@@ -1,8 +1,10 @@
+import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NotSignedInError } from "./gh.js";
+import { parseTarget } from "./github.js";
 import { createGitHubPlugin, TOKEN_CACHE_MS } from "./server.js";
-import { signature, WATCH_LIMIT } from "./watch.js";
+import { initialCursors, NO_CHECKS_GRACE_MS, signature, snapshotOf, WATCH_LIMIT, WATCH_MIGRATIONS } from "./watch.js";
 
 const API_URL = "https://api.github.test";
 const HOOKS_URL = "http://hooks.test:8081";
@@ -248,12 +250,15 @@ async function setup(
     kv?: Record<string, unknown>;
     /** The polling timer's intervals, when a test wants a short one. */
     pollTiming?: { intervalMs?: number; backoffMinMs?: number; backoffMaxMs?: number; maxEntitiesPerPoll?: number };
+    /** Runs after the fake host exists and before the plugin loads: a row left by a previous server. */
+    beforeLoad?: (bb: BbPluginApi) => void;
   } = {},
 ) {
   const send = vi.fn((options.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
   const callRpc = vi.fn((options.callRpc ?? (async () => ({ ok: true }))) as (args: unknown) => Promise<unknown>);
   const { bb, harness } = createFakePluginHost({ pluginId: "github-watcher", sdk: { threads: { send, ...(options.get === undefined ? {} : { get: options.get }) }, plugins: { callRpc } } });
   for (const [key, value] of Object.entries(options.kv ?? {})) await bb.storage.kv.set(key, value);
+  options.beforeLoad?.(bb);
   const github = fakeGitHub();
   const hooks = fakeHooks();
   let now = 1_000_000_000_000;
@@ -590,6 +595,47 @@ describe("the service", () => {
     service.controller.abort();
     await service.done;
   });
+
+  it("wakes once when an open head has had no checks for the grace", async () => {
+    const w = await setup(WITH_HOOKS);
+    const empty = pullNode({ commits: { nodes: [{ commit: { oid: "0123456789abcdef", statusCheckRollup: null } }] } });
+    w.github.state.node = empty;
+    await w.tool({ ref: "Acme/Widgets#12" });
+    expect(w.send).not.toHaveBeenCalled();
+    // The timer is armed at the grace, not before.
+    await tick(NO_CHECKS_GRACE_MS - 1);
+    expect(w.send).not.toHaveBeenCalled();
+    w.advance(NO_CHECKS_GRACE_MS);
+    await tick(1);
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(1);
+    expect(w.sent()[0]!.input[0]!.text).toBe("head `0123456` on `Acme/Widgets#12` has had no checks for 5m; the `pull_request` workflow may not have run");
+    const row = w.bb.storage.database().prepare("SELECT no_checks_since, no_checks_woken FROM watches").get() as { no_checks_since: string; no_checks_woken: string };
+    expect(JSON.parse(row.no_checks_since)).toEqual({ sha: "0123456789abcdef", at: 1_000_000_000_000 });
+    expect(row.no_checks_woken).toBe("0123456789abcdef");
+  });
+
+  it("arms the grace timer at start for a stored no-checks head, ringing at once when it already passed", async () => {
+    const empty = pullNode({ commits: { nodes: [{ commit: { oid: "0123456789abcdef", statusCheckRollup: null } }] } });
+    const target = parseTarget({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: empty } } })!;
+    const cursors = initialCursors(target, new Date(1_000_000_000_000).toISOString());
+    const w = await setup({
+      ...WITH_HOOKS,
+      beforeLoad: (bb) => {
+        const db = bb.storage.database();
+        bb.storage.migrate(db, WATCH_MIGRATIONS);
+        db.prepare(
+          "INSERT INTO watches (thread_id, project_id, key, kind, snapshot, updated_at, last_comment_at, created_at, last_activity_at, no_checks_since, no_checks_woken) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ).run("thr-1", "prj-1", target.key, "pull", JSON.stringify(snapshotOf(target)), cursors.updatedAt, cursors.lastCommentAt, 1_000_000_000_000, 1_000_000_000_000, JSON.stringify({ sha: target.pull!.headSha, at: 1_000_000_000_000 - 2 * NO_CHECKS_GRACE_MS }), "");
+      },
+    });
+    w.github.state.node = empty;
+    // The stored grace has passed, so the start-up timer rings on the next tick.
+    await tick();
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(1);
+    expect(w.sent()[0]!.input[0]!.text).toContain("head `0123456` on `Acme/Widgets#12` has had no checks for 10m");
+  });
 });
 
 describe("polling mode", () => {
@@ -710,6 +756,23 @@ describe("polling mode", () => {
     await tick(60_000);
     await tick(3000);
     expect(rings()).toHaveLength(1);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("fires the no-checks grace timer in polling mode without a doorbell", async () => {
+    const w = await setup({ pollTiming: { intervalMs: 10 * 60_000 } });
+    const empty = pullNode({ commits: { nodes: [{ commit: { oid: "0123456789abcdef", statusCheckRollup: null } }] } });
+    w.github.state.node = empty;
+    expect(await w.tool({ ref: "Acme/Widgets#12" })).not.toMatchObject({ isError: true });
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(w.send).not.toHaveBeenCalled();
+    w.advance(NO_CHECKS_GRACE_MS);
+    await tick(NO_CHECKS_GRACE_MS);
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(1);
+    expect(w.sent()[0]!.input[0]!.text).toContain("has had no checks for 5m");
     service.controller.abort();
     await service.done;
   });

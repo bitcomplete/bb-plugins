@@ -11,7 +11,10 @@ import {
   formatWake,
   IDLE_AFTER_MS,
   initialCursors,
+  initialNoChecks,
   newComments,
+  noChecksAfter,
+  NO_CHECKS_GRACE_MS,
   NOISY_WAKES_PER_WINDOW,
   RATE_WINDOW_MS,
   RECENT_WAKES_KEPT,
@@ -25,6 +28,9 @@ import {
   type Usage,
   type WatchRow,
 } from "./watch.js";
+
+/** A fixed clock for the pure comparisons; the no-checks tests use their own t0. */
+const NOW = 1_700_000_000_000;
 
 const pull = (over: Partial<Target> = {}, pullOver: Partial<NonNullable<Target["pull"]>> = {}): Target => ({
   kind: "pull",
@@ -47,7 +53,7 @@ const pull = (over: Partial<Target> = {}, pullOver: Partial<NonNullable<Target["
 
 const comment = (body: string, createdAt: string, who = "bob", did = "commented") => ({ author: who, did, body, createdAt, url: `https://github.com/c/${createdAt}` });
 
-const watchOf = (t: Target, threadId = "thr-1"): WatchRow => ({ threadId, projectId: "prj-1", key: t.key, kind: t.kind, snapshot: snapshotOf(t), ...initialCursors(t, "2026-10-09T12:00:00Z"), createdAt: 0, lastActivityAt: 0, checks: 0, wakes: 0, lastCheckedAt: 0, lastWokeAt: 0, recentWakes: [] });
+const watchOf = (t: Target, threadId = "thr-1"): WatchRow => ({ threadId, projectId: "prj-1", key: t.key, kind: t.kind, snapshot: snapshotOf(t), ...initialCursors(t, "2026-10-09T12:00:00Z"), createdAt: 0, lastActivityAt: 0, checks: 0, wakes: 0, lastCheckedAt: 0, lastWokeAt: 0, recentWakes: [], noChecksSince: null, noChecksWoken: null });
 
 describe("snapshots", () => {
   it("report each changed field with both values, in a fixed order", () => {
@@ -99,7 +105,7 @@ describe("new comments", () => {
 describe("compare", () => {
   it("has nothing to say when nothing changed, and still moves the cursors", () => {
     const w = watchOf(pull());
-    const out = compare(w, pull({ updatedAt: "2026-10-09T13:00:00Z", comments: [comment(`mine${signature("thr-1")}`, "2026-10-09T12:30:00Z")] }));
+    const out = compare(w, pull({ updatedAt: "2026-10-09T13:00:00Z", comments: [comment(`mine${signature("thr-1")}`, "2026-10-09T12:30:00Z")] }), NOW);
     expect(out.message).toBeNull();
     expect(out.updatedAt).toBe("2026-10-09T13:00:00Z");
     expect(out.lastCommentAt).toBe("2026-10-09T12:30:00Z");
@@ -108,7 +114,7 @@ describe("compare", () => {
   it("writes one Markdown message with the target, the changes, and each new comment", () => {
     const w = watchOf(pull());
     const long = "x".repeat(WAKE_COMMENT_CHARS + 5);
-    const out = compare(w, pull({ state: "merged", comments: [comment("Ship it", "2026-10-09T12:30:00Z", "carol", "approved"), comment(long, "2026-10-09T12:40:00Z"), comment("", "2026-10-09T12:50:00Z", "dan", "requested changes")] }, { checks: { state: "success", failing: [] } }));
+    const out = compare(w, pull({ state: "merged", comments: [comment("Ship it", "2026-10-09T12:30:00Z", "carol", "approved"), comment(long, "2026-10-09T12:40:00Z"), comment("", "2026-10-09T12:50:00Z", "dan", "requested changes")] }, { checks: { state: "success", failing: [] } }), NOW);
     expect(out.message).toBe(
       [
         "GitHub pull request Acme/Widgets#12 changed: Add widgets",
@@ -138,6 +144,74 @@ describe("compare", () => {
   });
 });
 
+describe("the no-checks wake", () => {
+  const t0 = 1_700_000_000_000;
+  const empty = (sha: string, over: Partial<Target> = {}) => pull(over, { headSha: sha, checks: null });
+
+  it("wakes once per head sha after the grace, and a later checks wake replaces it", () => {
+    const w = watchOf(empty("0123456789abcdef"));
+    // First sight starts the timer and says nothing.
+    let d = noChecksAfter(w, empty("0123456789abcdef"), t0);
+    expect(d.message).toBeNull();
+    expect(d.since).toEqual({ sha: "0123456789abcdef", at: t0 });
+    expect(d.woken).toBeNull();
+
+    const waiting: WatchRow = { ...w, noChecksSince: d.since, noChecksWoken: d.woken };
+    d = noChecksAfter(waiting, empty("0123456789abcdef"), t0 + NO_CHECKS_GRACE_MS);
+    expect(d.message).toBe("head `0123456` on `Acme/Widgets#12` has had no checks for 5m; the `pull_request` workflow may not have run");
+    expect(d.woken).toBe("0123456789abcdef");
+
+    // Already woken for this head: no second no-checks wake, however long it sits.
+    const woken: WatchRow = { ...waiting, noChecksSince: d.since, noChecksWoken: d.woken };
+    expect(noChecksAfter(woken, empty("0123456789abcdef"), t0 + 10 * NO_CHECKS_GRACE_MS).message).toBeNull();
+
+    // Checks appear: the ordinary diff reports them and the no-checks state clears.
+    const pending = pull({}, { headSha: "0123456789abcdef", checks: { state: "pending", failing: [] } });
+    const outcome = compare(woken, pending, t0 + 10 * NO_CHECKS_GRACE_MS);
+    expect(outcome.message).toContain("- Checks: (none) → pending");
+    expect(outcome.message).not.toContain("has had no checks");
+    expect(outcome.noChecksSince).toBeNull();
+    expect(outcome.noChecksWoken).toBe("0123456789abcdef");
+  });
+
+  it("starts a fresh timer for a new head sha", () => {
+    const w: WatchRow = { ...watchOf(empty("0123456789abcdef")), noChecksSince: { sha: "0123456789abcdef", at: t0 }, noChecksWoken: "0123456789abcdef" };
+    const d = noChecksAfter(w, empty("fedcba9876543210"), t0 + 60_000);
+    expect(d.message).toBeNull();
+    expect(d.since).toEqual({ sha: "fedcba9876543210", at: t0 + 60_000 });
+    expect(d.woken).toBeNull();
+    const next: WatchRow = { ...w, noChecksSince: d.since, noChecksWoken: d.woken };
+    expect(noChecksAfter(next, empty("fedcba9876543210"), t0 + 60_000 + NO_CHECKS_GRACE_MS).message).toContain("head `fedcba9`");
+  });
+
+  it("never wakes for a head that already has checks", () => {
+    const withChecks = pull({}, { checks: { state: "pending", failing: [] } });
+    expect(initialNoChecks(withChecks, t0)).toBeNull();
+    const d = noChecksAfter(watchOf(withChecks), withChecks, t0 + 10 * NO_CHECKS_GRACE_MS);
+    expect(d.message).toBeNull();
+    expect(d.since).toBeNull();
+  });
+
+  it("never wakes for a closed or merged pull request, or an issue", () => {
+    for (const state of ["merged", "closed"]) {
+      const t = empty("0123456789abcdef", { state });
+      expect(initialNoChecks(t, t0)).toBeNull();
+      const w: WatchRow = { ...watchOf(t), noChecksSince: { sha: "0123456789abcdef", at: t0 }, noChecksWoken: null };
+      expect(noChecksAfter(w, t, t0 + NO_CHECKS_GRACE_MS).message).toBeNull();
+      expect(noChecksAfter(w, t, t0 + NO_CHECKS_GRACE_MS).since).toBeNull();
+    }
+    const issue = pull({ kind: "issue", state: "open", pull: null });
+    expect(initialNoChecks(issue, t0)).toBeNull();
+    const w: WatchRow = { ...watchOf(issue), noChecksSince: { sha: "0123456789abcdef", at: t0 }, noChecksWoken: null };
+    expect(noChecksAfter(w, issue, t0 + NO_CHECKS_GRACE_MS).message).toBeNull();
+  });
+
+  it("starts a new watch's timer from an open head with an empty rollup", () => {
+    expect(initialNoChecks(empty("0123456789abcdef"), t0)).toEqual({ sha: "0123456789abcdef", at: t0 });
+    expect(initialNoChecks(pull({ state: "open (draft)" }, { checks: null }), t0)).toEqual({ sha: "0123456789abcdef", at: t0 });
+  });
+});
+
 describe("the store", () => {
   let db: Database.Database;
   let now = 1_000_000;
@@ -148,7 +222,7 @@ describe("the store", () => {
   });
   afterEach(() => db.close());
 
-  const row = (threadId: string, key: string) => ({ threadId, projectId: "prj", key, kind: "pull" as const, snapshot: snapshotOf(pull()), updatedAt: "u", lastCommentAt: "c" });
+  const row = (threadId: string, key: string) => ({ threadId, projectId: "prj", key, kind: "pull" as const, snapshot: snapshotOf(pull()), updatedAt: "u", lastCommentAt: "c", noChecksSince: null, noChecksWoken: null });
 
   it("caps a thread at the limit, treats a repeat as already watched, and keeps threads apart", () => {
     const store = createWatchStore(db, () => now);
@@ -169,8 +243,8 @@ describe("the store", () => {
     store.add(row("thr-1", "a/b#1"));
     store.add(row("thr-1", "a/b#2"));
     now += WATCH_TTL_MS - 1000;
-    store.advance("thr-1", "a/b#2", compare(store.get("thr-1", "a/b#2")!, pull({ state: "merged" })), true);
-    store.advance("thr-1", "a/b#1", compare(store.get("thr-1", "a/b#1")!, pull({ updatedAt: "later" })), false);
+    store.advance("thr-1", "a/b#2", compare(store.get("thr-1", "a/b#2")!, pull({ state: "merged" }), NOW), true);
+    store.advance("thr-1", "a/b#1", compare(store.get("thr-1", "a/b#1")!, pull({ updatedAt: "later" }), NOW), false);
     now += 2000;
     expect(store.expire()).toBe(1);
     expect(store.get("thr-1", "a/b#2")!.snapshot.state).toBe("merged");
@@ -183,7 +257,23 @@ describe("the store", () => {
     db.prepare("UPDATE watches SET snapshot = '{\"old\": true}'").run();
     const w = store.get("thr-1", "a/b#1")!;
     expect(w.snapshot.state).toBeNull();
-    expect(compare(w, pull()).message).toContain("- State: (none) → open");
+    expect(compare(w, pull(), NOW).message).toContain("- State: (none) → open");
+  });
+
+  it("keeps a pending no-checks head across a store reopen", () => {
+    const store = createWatchStore(db, () => now);
+    store.add({ ...row("thr-1", "a/b#1"), noChecksSince: { sha: "abc123", at: now }, noChecksWoken: null });
+    // A second store over the same handle is a reopen.
+    const reopened = createWatchStore(db, () => now);
+    const w = reopened.get("thr-1", "a/b#1")!;
+    expect(w.noChecksSince).toEqual({ sha: "abc123", at: now });
+    expect(w.noChecksWoken).toBeNull();
+    // A wake records the woken sha and clears the timer state on the next read.
+    now += 1000;
+    const empty = pull({}, { headSha: "abc123", checks: null });
+    const waiting: WatchRow = { ...w, noChecksSince: { sha: "abc123", at: 0 }, noChecksWoken: null };
+    reopened.advance("thr-1", "a/b#1", compare(waiting, empty, now), true);
+    expect(reopened.get("thr-1", "a/b#1")!.noChecksWoken).toBe("abc123");
   });
 });
 
@@ -199,19 +289,19 @@ describe("usage", () => {
 
   it("counts checks and wakes, remembers when each last happened, and keeps the newest wake times", () => {
     const store = createWatchStore(db, () => now);
-    store.add({ threadId: "thr-1", projectId: "prj", key: "a/b#1", kind: "pull", snapshot: snapshotOf(pull()), updatedAt: "u", lastCommentAt: "c" });
+    store.add({ threadId: "thr-1", projectId: "prj", key: "a/b#1", kind: "pull", snapshot: snapshotOf(pull()), updatedAt: "u", lastCommentAt: "c", noChecksSince: null, noChecksWoken: null });
     const fresh = store.get("thr-1", "a/b#1")!;
     expect([fresh.checks, fresh.wakes, fresh.lastCheckedAt, fresh.lastWokeAt, fresh.recentWakes]).toEqual([0, 0, 0, 0, []]);
 
     now += 1000;
-    store.advance("thr-1", "a/b#1", compare(fresh, pull({ updatedAt: "later" })), false);
+    store.advance("thr-1", "a/b#1", compare(fresh, pull({ updatedAt: "later" }), NOW), false);
     let w = store.get("thr-1", "a/b#1")!;
     expect([w.checks, w.wakes, w.lastCheckedAt, w.lastWokeAt, w.recentWakes]).toEqual([1, 0, now, 0, []]);
     expect(w.lastActivityAt).toBe(1_000_000);
 
     for (let i = 0; i < RECENT_WAKES_KEPT + 3; i++) {
       now += 1000;
-      store.advance("thr-1", "a/b#1", compare(w, pull({ title: `T${i}` })), true);
+      store.advance("thr-1", "a/b#1", compare(w, pull({ title: `T${i}` }), NOW), true);
       w = store.get("thr-1", "a/b#1")!;
     }
     expect([w.checks, w.wakes, w.lastCheckedAt, w.lastWokeAt, w.lastActivityAt]).toEqual([RECENT_WAKES_KEPT + 4, RECENT_WAKES_KEPT + 3, now, now, now]);

@@ -75,6 +75,13 @@ what they did (commented, approved, requested changes, commented on
 `path`) and body (long bodies trimmed). One message carries everything
 since the thread last looked, however many webhooks it took.
 
+A head with no CI: an open pull request whose head commit has had no
+check runs and no statuses for five minutes wakes the thread once, with a
+message naming the head and how long it has been and saying the
+`pull_request` workflow may not have run. A check or status appearing, or
+a new head, resets it; a closed or merged pull request and an issue never
+wake this way. The grace is a fixed five minutes.
+
 A thread's own comments: `gh` comments as the developer, so the plugin
 cannot tell a thread's comment from the developer's by author. The skill
 asks a thread to end any comment it posts with
