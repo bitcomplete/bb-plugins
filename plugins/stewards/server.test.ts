@@ -7760,6 +7760,81 @@ describe("needs you items", () => {
     expect(t.githubMerges).toHaveLength(1);
   });
 
+  it("declines a gate-met draft without a merge attempt and merges it once it is marked ready (BB-373)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: true }));
+    await t.ring("linear", "uuid-12");
+    // A draft is not sent to GitHub: no merge PUT, no refusal, no stuck.
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(0);
+    expect(t.hooks.store.binding(b.id)!.nonActions["pull-draft"]).toBeDefined();
+    // The same head and marker, now ready: the next look merges.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("clears a pre-BB-373 draft refusal once the pull request is ready (BB-373)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // A refusal recorded by the pre-BB-373 code, under the old three-field
+    // key, whose cause was the draft state.
+    t.hooks.store.escalate({
+      bindingId: b.id,
+      kind: "stuck",
+      question: "Could not merge acme/web#7: PUT /repos/acme/web/pulls/7/merge failed: 405 Pull Request is still a draft",
+      meanwhile: "The plugin does not retry the same gate; the pull request stays open.",
+      route: "steward",
+      recommendation: null,
+      url: "https://github.com/acme/web/pull/7",
+      headSha: "aaaaaaa1",
+      data: { mergeRefusal: true, mergeKey: ["aaaaaaa1", "1:aaaaaaa1", "owner-reviewed"].join("|") },
+    });
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("keeps blocking a pre-BB-373 conflict refusal on the same head (BB-373)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // A real refusal recorded before the change: the head has not moved, so
+    // it still blocks the merge.
+    t.hooks.store.escalate({
+      bindingId: b.id,
+      kind: "stuck",
+      question: "Could not merge acme/web#7: Pull request is not mergeable: the merge conflict must be resolved",
+      meanwhile: "The plugin does not retry the same gate; the pull request stays open.",
+      route: "steward",
+      recommendation: null,
+      url: "https://github.com/acme/web/pull/7",
+      headSha: "aaaaaaa1",
+      data: { mergeRefusal: true, mergeKey: ["aaaaaaa1", "1:aaaaaaa1", "owner-reviewed"].join("|") },
+    });
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.binding(b.id)!.nonActions["merge-refused"]).toBeDefined();
+  });
+
+  it("records no refusal when GitHub still sees a draft, then merges once it clears (BB-373)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // The snapshot says ready, but the merge races a draft mark: GitHub
+    // refuses with 405. No refusal is recorded and no stuck is raised.
+    t.setMergePullError("PUT /repos/acme/web/pulls/7/merge failed: 405 Pull Request is still a draft");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(0);
+    expect(t.hooks.store.binding(b.id)!.nonActions["pull-draft"]).toBeDefined();
+    // The same head and marker on the next look retries and merges.
+    t.setMergePullError(null);
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
   it("does not merge while stewards are paused; it files the plugin's Merge item instead", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
@@ -16886,6 +16961,27 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     // A new round requests changes: the gate is no longer met, so it clears.
     const changed = comment({ id: "r2", author: "jane", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
     t.entities.set("acme/web#7", pull({ comments: [noReview, changed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(0);
+  });
+
+  it("does not raise the gate-met stuck for a draft pull request, and clears an open one when it becomes a draft (BB-373)", async () => {
+    const t = await setup();
+    // The review binding is made while the pull request is ready; a draft is
+    // not adopted for review, so the scenario is a ready pull request that is
+    // then marked a draft.
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(1);
+    // Marked a draft: the open episode is resolved and no new one is raised.
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] }, draft: true }));
+    await t.ring("github", "acme/web#7");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(2 * 60 * 60_000);
     await t.ring("github", "acme/web#7");
     expect(stuckOf()).toHaveLength(0);
   });
