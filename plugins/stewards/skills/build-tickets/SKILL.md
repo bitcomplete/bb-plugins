@@ -116,11 +116,13 @@ the default branch:
   plugin never merges the un-rebased head while the old head's checks are
   still green. This push can land while the base branch is already deleted
   (the base merged with `delete_branch_on_merge`), so GitHub fires no
-  `synchronize` run for it, and the retarget is only an `edited` event, which
-  the default `on: pull_request` types omit. So **before waiting on checks,
-  confirm a run exists for the new head** with
-  `gh run list -R <repo> --commit <sha>`. If none appears within about two
-  minutes, re-trigger without changing the head:
+  `pull_request synchronize` run for it, and the retarget is only an `edited`
+  event, which the default `on: pull_request` types omit. So **before waiting
+  on checks, confirm a `pull_request` run exists for the new head** with
+  `gh run list -R <repo> --commit <sha> --event pull_request` (without the
+  event filter the `push` runs, which fire whatever the base, would mask the
+  missing one). If none appears within about two minutes, re-trigger without
+  changing the head:
   `gh pr close <n> && gh pr reopen <n>` (the `reopened` event is a default
   `pull_request` type). If still none, tell the steward rather than keep
   waiting. The plugin then merges yours through the normal gate; your
@@ -351,9 +353,9 @@ saying in a line what changed since the approval.
 **A conflict with the base branch is yours to clear, not a question for
 anyone.** When the merge is refused because the PR is not mergeable, merge
 the base branch into the branch (or rebase), resolve the conflicts however
-they need resolving, push, **confirm a run exists for the new head**
-(`gh run list -R <repo> --commit <sha>`; if none appears within about two
-minutes, re-trigger without changing the head with
+they need resolving, push, **confirm a `pull_request` run exists for the new
+head** (`gh run list -R <repo> --commit <sha> --event pull_request`; if none
+appears within about two minutes, re-trigger without changing the head with
 `gh pr close <n> && gh pr reopen <n>`, and if still none tell the steward),
 wait for the checks, and merge. Neither
 approval needs renewing for that, and the reviewer does not need another
