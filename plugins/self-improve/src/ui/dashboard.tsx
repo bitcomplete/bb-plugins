@@ -1,5 +1,6 @@
 import { ActivityCosts, RecentAgentRuns } from "./activity-costs.js";
 import { SetupGuide } from "./setup-guide.js";
+import { LoopIcon } from "./loop-icon.js";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Problem, Solution, Vote } from "../domain/types.js";
 import type { DashboardApi, DashboardData, Selection } from "./types.js";
@@ -72,10 +73,13 @@ function Portability({declaration}:{declaration:Solution["portability"]}) {
 }
 
 
-export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread}:{
+export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread,settings}:{
   api:DashboardApi; projectId:string|null; refreshKey:number; renderChat:(threadId:string)=>ReactNode; onOpenThread:(threadId:string)=>void;
+  /** Execution settings: shown inside Get started until set up, then behind the header's Settings button. */
+  settings?:ReactNode;
 }) {
   const [data,setData] = useState<DashboardData|null>(null);
+  const [settingsOpen,setSettingsOpen] = useState(false);
   const [loading,setLoading] = useState(true), [loadError,setLoadError] = useState("");
   const [tab,setTab] = useState<Tab>("problems"), [search,setSearch] = useState(""), [filter,setFilter] = useState("all");
   const [selection,setSelection] = useState<Selection|null>(null);
@@ -126,6 +130,7 @@ export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread}:{
     catch(e){if(live.current)setMessages(x=>({...x,[key]:{text:errorText(e),error:true}}));}
     finally{inFlight.current.delete(key);if(live.current)setBusy(x=>({...x,[key]:false}));}
   };
+  const setupReady=!!data?.setup?.worker&&!!data?.setup?.model;
   const groups=useMemo(()=>data ? {problems:data.problems,testing:data.solutions.filter(s=>!established(s)),established:data.solutions.filter(established)} : {problems:[],testing:[],established:[]},[data]);
   const query=search.trim().toLocaleLowerCase();
   const items = tab==="problems" ? groups.problems.filter(p=>(filter==="all"||p.status===filter)&&[p.id,p.category,problemTitle(p,data??undefined),...p.causes.map(c=>c.text),...p.symptoms.map(s=>s.text)].join(" ").toLocaleLowerCase().includes(query))
@@ -136,13 +141,15 @@ export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread}:{
   const title=selectedProblem?problemTitle(selectedProblem,data):selectedSolution?.title;
   useEffect(()=>{if(selection&&window.innerWidth<=760){detailRef.current?.focus({preventScroll:true});detailRef.current?.scrollIntoView?.({block:"start"});}},[selection,title]);
   return <main className="si-root" data-bb-plugin="self-improve" aria-label="Self improve ledgers">
-    <header className="si-header"><div className="si-brand"><span className="si-brand-icon"><Glyph/></span><div><h1>Self improve</h1><p>Find patterns. Test ideas. Keep the evidence.</p></div></div><div className="si-header-actions">{data&&<Badge tone={data.health.issues.length?"warn":data.health.enabled?"good":"neutral"}>{data.health.issues.length?"Needs attention":data.health.enabled?"Learning enabled":"Learning paused"}</Badge>}<button className="si-button si-button-quiet" onClick={()=>void reload()} disabled={loading}>{loading?"Refreshing…":"Refresh"}</button><button className="si-button si-button-primary" onClick={()=>{setIntakeOpen(true);setIntakeNotice("");}} disabled={intakeOpen}>Add problem / goal</button></div></header>
-    {data&&<SetupGuide data={data} api={api} onQueued={()=>void reload()}/>}
+    <header className="si-header"><div className="si-brand"><span className="si-brand-icon"><LoopIcon size={26}/></span><div><h1>Self improve</h1><p>Find patterns. Test ideas. Keep the evidence.</p></div></div><div className="si-header-actions">{data&&<Badge tone={data.health.issues.length?"warn":data.health.enabled?"good":"neutral"}>{data.health.issues.length?"Needs attention":data.health.enabled?"Learning enabled":"Learning paused"}</Badge>}{setupReady&&settings&&<button className="si-button si-button-quiet" aria-expanded={settingsOpen} onClick={()=>setSettingsOpen(open=>!open)}>Settings</button>}<button className="si-button si-button-quiet" onClick={()=>void reload()} disabled={loading}>{loading?"Refreshing…":"Refresh"}</button><button className="si-button si-button-primary" onClick={()=>{setIntakeOpen(true);setIntakeNotice("");}} disabled={intakeOpen}>Add problem / goal</button></div></header>
+    {data&&<SetupGuide data={data} api={api} onQueued={()=>void reload()} settings={settings}/>}
+    {settingsOpen&&setupReady&&<section className="si-settings-panel" aria-label="Self improve settings">{settings}</section>}
     {intakeOpen&&<ObjectiveForm api={api} onClose={()=>setIntakeOpen(false)} onCreated={recordId=>{setIntakeOpen(false);setIntakeNotice("Added to the ledger. It is ready to explore.");setTab("problems");setSearch("");setFilter("all");choose({kind:"problem",id:recordId});void reload();}}/>}
     {intakeNotice&&<p role="status" className="si-notice">{intakeNotice}</p>}
     {loadError&&<div className="si-notice si-notice-bad" role="alert"><span>{loadError}{data?" Showing the last loaded snapshot.":""}</span><button className="si-button" onClick={()=>void reload()}>Try again</button></div>}
     {!data ? <div className="si-loading" role="status">{loading?"Loading your learning history…":"The ledgers could not be loaded."}</div> : <>
-      {data.health.issues.length>0&&<details className="si-health"><summary>{data.health.issues.length} configuration or evidence {data.health.issues.length===1?"issue":"issues"}</summary><ul>{data.health.issues.map((issue,i)=><li key={i}>{issue}</li>)}</ul></details>}
+      {data.health.issues.length>0&&<details className="si-health" open><summary>{data.health.issues.length} {data.health.issues.length===1?"thing needs":"things need"} your attention</summary><ul>{data.health.issues.map((issue,i)=><li key={i}>{issue}</li>)}</ul></details>}
+      {!!data.health.notes?.length&&<details className="si-health si-health-notes"><summary>Notes about what Self improve can see</summary><ul>{data.health.notes.map((note,i)=><li key={i}>{note}</li>)}</ul></details>}
       <section className="si-metrics" aria-label="Ledger summary">
         <div><span className="si-metric-label"><Glyph kind="problem"/>Problems and goals</span><strong>{groups.problems.length}</strong><small>Observed patterns and owner requests</small></div>
         <div><span className="si-metric-label"><Glyph kind="flask"/>Solutions to explore</span><strong>{groups.testing.length}</strong><small>Proposals, tests and retained history</small></div>

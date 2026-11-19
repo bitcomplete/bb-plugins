@@ -19,9 +19,14 @@ export function buildInventorPrompt(problem: InventorProblem, policy: PrivacyPol
     rootCauseHypothesis: redact(problem.rootCause, { ...policy, maxCharacters: 2000 }),
   }) };
 }
+/** Models often wrap JSON in one Markdown code fence; accept that, and nothing looser. */
+export function unfenceJson(text: string): string {
+  const fenced = /^\s*```[a-zA-Z]*\s*\n([\s\S]*?)\n?\s*```\s*$/.exec(text);
+  return fenced ? fenced[1]! : text;
+}
 export function parseJsonReply(text: string): unknown {
   if (typeof text !== "string" || text.length > 200_000) throw new AdapterError("invalid-model-json", "Model JSON exceeds its limit");
-  try { return JSON.parse(text); } catch { throw new AdapterError("invalid-model-json", "Model must return only valid JSON"); }
+  try { return JSON.parse(unfenceJson(text)); } catch { throw new AdapterError("invalid-model-json", "Model must return only valid JSON"); }
 }
 /** Runs a native task and checks the receipt matches the request; the reply text is returned unparsed. */
 export async function completeText(runner: TaskRunner, request: NativeJsonRequest, signal?: AbortSignal): Promise<NativeTaskReceipt> {

@@ -7,7 +7,8 @@ import { problem, vote } from "../domain/fixtures.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
-const snapshot = (): DashboardData => ({ problems: [problem()], solutions: [], ranking: [], runs: [], versions: {}, health: { enabled: false, issues: [] }, costs: { totals: [] }, votes: [vote()] });
+const snapshot = (): DashboardData => ({ problems: [problem()], solutions: [], ranking: [], runs: [], versions: {}, health: { enabled: false, issues: [] }, costs: { totals: [] }, votes: [vote()],
+  setup: { worker: true, model: true, mined: true, scheduled: false, testCases: false, minerQueued: false } });
 async function page(context = { projectId: "project-1" as string | null }, overrides: Record<string, (input: any) => unknown> = {}) {
   const app = await loadPluginApp(() => import("../../app.js"));
   const panel = app.navPanels.find(p => p.id === "self-improve");
@@ -51,6 +52,9 @@ it("requires explicit project context before creating a chat", async () => {
 
 it("routes the shared provider/model and permission pickers to the worker environment",async()=>{
   const slot=await page();
+  // Once set up, execution settings live behind the header's Settings button.
+  expect(slot.queryByTestId("bb-provider-model-picker")).toBeNull();
+  fireEvent.click(await slot.findByRole("button",{name:"Settings"}));
   const picker=await slot.findByTestId("bb-provider-model-picker");
   await waitFor(()=>expect(picker.getAttribute("data-routing-id")).toBe("worker-env"));
   expect(picker.getAttribute("data-routing-kind")).toBe("environment");

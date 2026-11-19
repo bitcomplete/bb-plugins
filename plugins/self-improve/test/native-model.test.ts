@@ -18,7 +18,9 @@ describe("native structured model proposals", () => {
     expect(prompt.instructions).toContain("plugins, skills");
   });
   it("rejects unstructured or oversized replies without accepting a partial proposal", () => {
-    expect(() => parseJsonReply('```json\n[]\n```')).toThrow("Model must return only valid JSON");
+    expect(parseJsonReply('```json\n[]\n```')).toEqual([]);
+    expect(() => parseJsonReply('Here you go: ```json\n[]\n```')).toThrow("Model must return only valid JSON");
+    expect(() => parseJsonReply('```json\n[]\n``` and more')).toThrow("Model must return only valid JSON");
     expect(() => parseJsonReply(" ".repeat(200_001))).toThrow("exceeds its limit");
     expect(() => parseInventions([{ mechanism: "a", prediction: "b", test: "c", assumptions: [], effort: 1, risk: 1 }])).toThrow("Declare assumptions and dependencies");
   });

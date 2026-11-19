@@ -6,6 +6,8 @@ import { stableId, stableJson } from "./domain/shared.js";
 const id = z.string().min(1).max(500);
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const timestamp = count.max(8_640_000_000_000_000);
+/** BB serves at most 100 thread events per page; a larger request is refused. */
+export const EVENT_PAGE = 100;
 const bindingSchema = z.object({ taskId:id, threadId:id, providerId:id, requestedModel:id }).strict();
 export type NativeUsageBinding = z.infer<typeof bindingSchema>;
 const tokensSchema = z.object({
@@ -129,17 +131,17 @@ export class NativeUsageLedger {
       options.signal?.throwIfAborted();const cursor=this.cursor(binding);
       let rows:unknown;
       try{
-        rows=await sdk.threads.events.list({threadId:binding.threadId,...(cursor.sequence>=0?{afterSeq:String(cursor.sequence)}:{}),limit:"200",order:"asc",
+        rows=await sdk.threads.events.list({threadId:binding.threadId,...(cursor.sequence>=0?{afterSeq:String(cursor.sequence)}:{}),limit:String(EVENT_PAGE),order:"asc",
           types:["thread/tokenUsage/updated","thread/contextWindowUsage/updated"],signal:options.signal});
       }catch{options.signal?.throwIfAborted();return finish(cursor.sequence,false,"native-usage-source-unavailable");}
       options.signal?.throwIfAborted();
-      if(!Array.isArray(rows)||rows.length>200)return finish(cursor.sequence,false,"native-usage-invalid-page");
+      if(!Array.isArray(rows)||rows.length>EVENT_PAGE)return finish(cursor.sequence,false,"native-usage-invalid-page");
       try{
         if(rows.some(row=>!row||typeof row!=="object"||typeof row.seq!=="number"||row.seq<=cursor.sequence))throw new Error("native-usage-cursor-did-not-advance");
         this.ingest(binding,rows);
         observedThrough=rows.length?rows.at(-1)!.seq:cursor.sequence;
       }catch{return finish(cursor.sequence,false,"native-usage-invalid-page");}
-      if(rows.length<200)return finish(observedThrough,true,null);
+      if(rows.length<EVENT_PAGE)return finish(observedThrough,true,null);
     }
     return finish(observedThrough,false,"native-usage-page-limit");
   }

@@ -17,8 +17,10 @@ export interface DashboardData {
   versions: Record<string, number>;
   activation?: Record<string, { status: "revalidation-required"; reason: string }>;
   /** First-run checklist state. */
-  setup?: { worker: boolean; model: boolean; mined: boolean; scheduled: boolean; testCases: boolean; minerQueued: boolean };
-  health: { enabled: boolean; issues: string[]; workerProjectId?: string; publicationRepositories?: string[] };
+  setup?: { worker: boolean; model: boolean; mined: boolean; scheduled: boolean; testCases: boolean; minerQueued: boolean;
+    /** How the most recent search for problems ended. */
+    lastSearch?: { status: "succeeded" | "failed"; endedAtMs: number; sessions: number; problems: number; votes: number; error: string | null } | null };
+  health: { enabled: boolean; issues: string[]; notes?: string[]; workerProjectId?: string; publicationRepositories?: string[] };
   costs: {
     totals: Array<{ currency: string; reportedMicros: number; estimatedMicros: number; unknownAttempts: number; unknownExternalCosts?: number; attempts: number }>;
     events?: Array<{ solutionId?: string; currency: string; amountMicros: number | null; basis: string; status: string }>;

@@ -1,4 +1,5 @@
 import { ExecutionSettings } from "./src/ui/execution-settings.js";
+import { LoopIcon } from "./src/ui/loop-icon.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { definePluginApp, ThreadChat, useBbContext, useBbNavigate, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./src/contract.js";
@@ -46,11 +47,13 @@ function SelfImprovePage() {
     publicationHistory: input => rpc.call("publicationHistory", input),
     reconcilePublication: input => rpc.call("reconcilePublication", input),
   }), [rpc]);
-  return <><ExecutionSettings refreshKey={refreshKey} onSaved={refresh}/><Dashboard key={projectId ?? "no-project"} api={api} projectId={projectId} refreshKey={refreshKey}
+  return <Dashboard key={projectId ?? "no-project"} api={api} projectId={projectId} refreshKey={refreshKey}
+    settings={<ExecutionSettings refreshKey={refreshKey} onSaved={refresh}/>}
     onOpenThread={id => navigate.toThread(id)}
-    renderChat={threadId => <ThreadChat key={threadId} threadId={threadId} variant="compact" layout="contained" permissionPolicy="inherit"/>}/></>;
+    renderChat={threadId => <ThreadChat key={threadId} threadId={threadId} variant="compact" layout="contained" permissionPolicy="inherit"/>}/>;
 }
 
 export default definePluginApp(app => {
-  app.slots.navPanel({ id: "self-improve", title: "Self improve", icon: "FlaskConical", path: "self-improve", component: SelfImprovePage });
+  app.experimental_icons.register({ name: "self-improve-loop", component: LoopIcon });
+  app.slots.navPanel({ id: "self-improve", title: "Self improve", icon: "self-improve-loop", path: "self-improve", component: SelfImprovePage });
 });

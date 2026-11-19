@@ -237,16 +237,29 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       return chat?.active ? { action: "proceed" } : { action: "reject", message: "Self improve conversation is inactive; reopen it from the ledger" };
     } catch { return { action: "reject", message: "Self improve execution is unavailable or its settings changed" }; }
   });
-  const issues = () => [
+  const present = (values: unknown[]) => values.filter((v): v is string => typeof v === "string" && v.trim().length > 0).slice(0, 100);
+  const coverageGaps = () => store.get<{coverage:Array<{complete:boolean;source:string;reason:string|null}>}>("source-coverage","latest")?.coverage.filter(c => !c.complete) ?? [];
+  /** Things the owner must act on before agent work can run. */
+  const issues = () => present([
     configurationError, exportError, store.get<{issue:string}>("native-execution-health","latest")?.issue,
     !config.providerId && "Choose a BB provider", !config.model && "Choose a model",
     !config.projectId && "Choose a worker project", !config.environmentId && "Choose a worker environment",
     !config.budgets.allowUnknown && "Agent work is paused because unknown native costs are not allowed in budgets",
-    "Native tests are exploratory. Automatic adoption requires independently verified held-out isolation, which this BB execution path does not provide",
-    !values.evaluationSuite && "Configure development cases to run build experiments",
-    !config.taskOutcomeSource && "No structured task-outcome provider configured; terminal task history is unavailable",
-    ...(store.get<{coverage:Array<{complete:boolean;source:string;reason:string|null}>}>("source-coverage","latest")?.coverage.filter(c => !c.complete).map(c => `${c.source}: ${c.reason}`) ?? []),
-  ].filter((v): v is string => typeof v === "string" && v.trim().length > 0).slice(0,100);
+  ]);
+  /** Plain-language context about what Self improve can see and claim; nothing here needs action. */
+  const notes = () => {
+    const gaps = coverageGaps(), partialThreads = gaps.filter(g => g.source.startsWith("thread:")).length;
+    const partialSources = gaps.filter(g => !g.source.startsWith("thread:")).length;
+    return present([
+      partialThreads && `${partialThreads} long ${partialThreads === 1 ? "thread was" : "threads were"} only partly read in the last search for problems.`,
+      partialSources && "Task and schedule history from other plugins is only partly available, so some failures may be missed.",
+      !config.taskOutcomeSource && "No task-outcome source is connected, so problems come from thread activity only.",
+      "Test results are exploratory: test runs share ordinary BB context, so they are not isolated proof.",
+    ]);
+  };
+  /** Everything, with source-level detail, for the CLI doctor and status commands. */
+  const diagnostics = () => present([...issues(), ...notes(), !values.evaluationSuite && "No development test cases are configured; builds cannot run experiments.",
+    ...coverageGaps().map(c => `${c.source}: ${c.reason}`)]);
   const retestStatus = (record:RetestRecord):RetestRecord["status"] => {
     const status=store.jobStatus(record.jobId);
     if(status==="queued"||status==="running"||status==="failed") return status;
@@ -285,8 +298,11 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     versions: Object.fromEntries(["problems", "solutions"].flatMap(ns => store.entries(ns).map(e => [`${ns}:${e.key}`, e.version]))),
     setup: { worker: !!config.projectId && !!config.environmentId, model: !!config.providerId && !!config.model,
       mined: store.get("source-coverage", "latest") !== null, scheduled: values.enabled, testCases: !!values.evaluationSuite,
-      minerQueued: store.db.prepare("SELECT 1 FROM jobs WHERE stage='miner' AND status IN ('queued','running') LIMIT 1").get() !== undefined },
-    health: { enabled: values.enabled, issues: issues(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),recentRuns:recentAgentRuns(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolutionHistory(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
+      minerQueued: store.db.prepare("SELECT 1 FROM jobs WHERE stage='miner' AND status IN ('queued','running') LIMIT 1").get() !== undefined,
+      lastSearch: (() => { const run = store.runs().filter(r => r.stage === "miner" && r.endedAt).at(-1); if (!run) return null;
+        return { status: run.status === "succeeded" ? "succeeded" as const : "failed" as const, endedAtMs: run.endedAt!, sessions: run.counts.sessionsAnalyzed ?? 0,
+          problems: run.counts.problemsAdded ?? 0, votes: run.counts.votesAdded ?? 0, error: run.errors[0] ?? null }; })() },
+    health: { enabled: values.enabled, issues: issues(), notes: notes(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),recentRuns:recentAgentRuns(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolutionHistory(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
     activation: Object.fromEntries(store.list<ValidatedArtifact>("validated-artifacts").map(artifact => [artifact.solutionId, {
       status: "revalidation-required" as const,
       reason: "Historical validation does not establish the BB-native execution boundary. This version is not contributed to new turns; existing provider sessions may retain earlier instructions.",
@@ -481,8 +497,8 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   });
   const json = (value: unknown) => ({ exitCode: 0, stdout: JSON.stringify(value,null,2) });
   const cli=defineCli({ name:"self-improve", summary:"Observe failures, test possible improvements and inspect their evidence", commands:{
-    doctor:cliCommand({summary:"Configuration, source coverage and adoption prerequisites",options:{"research-tools":{type:"boolean",description:"Discover the configured authenticated DAIR MCP tools"}},run:async input=>json({issues:issues(),execution:{providerId:config.providerId,model:config.model,permissionMode:config.permissionMode,projectId:config.projectId,environmentId:config.environmentId},nativeTasks:store.list("native-tasks").slice(-20),sourceCoverage:store.get("source-coverage","latest"),runs:store.runs().slice(-50).map(run=>({...run,costs:activity.forRun(run.id)})),...(input.options["research-tools"]?{researchTools:await getDairClient().tools(publicationStop.signal)}:{})})}),
-    status:cliCommand({summary:"Services, pending work and latest runs",run:async()=>json({enabled:values.enabled,pending:store.pending(),runs:store.runs().slice(-50).map(run=>({...run,costs:activity.forRun(run.id)})),issues:issues()})}),
+    doctor:cliCommand({summary:"Configuration, source coverage and adoption prerequisites",options:{"research-tools":{type:"boolean",description:"Discover the configured authenticated DAIR MCP tools"}},run:async input=>json({issues:diagnostics(),execution:{providerId:config.providerId,model:config.model,permissionMode:config.permissionMode,projectId:config.projectId,environmentId:config.environmentId},nativeTasks:store.list("native-tasks").slice(-20),sourceCoverage:store.get("source-coverage","latest"),runs:store.runs().slice(-50).map(run=>({...run,costs:activity.forRun(run.id)})),...(input.options["research-tools"]?{researchTools:await getDairClient().tools(publicationStop.signal)}:{})})}),
+    status:cliCommand({summary:"Services, pending work and latest runs",run:async()=>json({enabled:values.enabled,pending:store.pending(),runs:store.runs().slice(-50).map(run=>({...run,costs:activity.forRun(run.id)})),issues:diagnostics()})}),
     run:cliCommand({summary:"Queue one service with a unique manual run key",options:{stage:{type:"enum",values:STAGES,required:true,description:"Service to run"}},run:async input=>json({jobId:services.enqueue(input.options.stage as Stage,`manual:${randomUUID()}`)})}),
     "scratch-fault":cliCommand({summary:"Throw once in a scratch-only service to verify BB restart handling",options:{stage:{type:"enum",values:STAGES,required:true,description:"Service to fail once"}},run:async input=>{const stage=input.options.stage as Stage;services.injectFault(stage);return json({jobId:services.enqueue(stage,`fault:${randomUUID()}`)});}}),
     config:cliCommand({summary:"Read or update public configuration; credentials use secret settings",options:{value:{type:"string",description:"Complete configuration JSON"}},run:async input=>{if(input.options.value){const value=input.options.value;parseConfig(value);await updateConfiguration(async()=>{await settings.experimental_set({config:value});values=await settings.get();applyConfig();});}return json(config);}}),

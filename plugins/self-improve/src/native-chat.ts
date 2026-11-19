@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { Store } from "./store.js";
 import type { ActivityChatConversation } from "./activity-accounting.js";
 import type { NativeExecution, NativeTaskSdk, NativeTaskThread } from "./native-tasks.js";
-import { NativeUsageLedger, type NativeUsageRead, type NativeUsageObservation } from "./native-usage.js";
+import { EVENT_PAGE, NativeUsageLedger, type NativeUsageRead, type NativeUsageObservation } from "./native-usage.js";
 import { redact, type PrivacyPolicy } from "./adapters/privacy.js";
 import { stableId, stableJson } from "./domain/shared.js";
 
@@ -301,9 +301,9 @@ export class NativeChatManager {
     for (let page = 0; page < 10; page++) {
       const prior = this.options.store.get<{ sequence: number }>(COUNTS, record.threadId!)?.sequence ?? -1;
       let rows: unknown;
-      try { rows = await bounded(this.options.sdk.threads.events.list({ threadId: record.threadId!, ...(prior >= 0 ? { afterSeq: String(prior) } : {}), limit: "200", order: "asc", types: ["client/turn/requested", "turn/started", "turn/completed"], signal }), signal); }
+      try { rows = await bounded(this.options.sdk.threads.events.list({ threadId: record.threadId!, ...(prior >= 0 ? { afterSeq: String(prior) } : {}), limit: String(EVENT_PAGE), order: "asc", types: ["client/turn/requested", "turn/started", "turn/completed"], signal }), signal); }
       catch { signal.throwIfAborted(); this.countStatus(record, prior, false, "native-chat-counts-unavailable"); return; }
-      const parsed = z.array(countEventSchema).max(200).safeParse(rows);
+      const parsed = z.array(countEventSchema).max(EVENT_PAGE).safeParse(rows);
       if (!parsed.success || parsed.data.some((row, index, all) => row.threadId !== record.threadId || row.seq <= (index ? all[index - 1]!.seq : prior))) { this.countStatus(record, prior, false, "native-chat-counts-invalid"); return; }
       const next = parsed.data.at(-1)?.seq ?? prior;
       this.options.store.transaction(() => {
@@ -318,9 +318,9 @@ export class NativeChatManager {
           if (!old) this.options.store.put(EVENTS, key, value);
         }
         const current = this.options.store.get<{ sequence: number }>(COUNTS, record.threadId!)?.sequence ?? -1;
-        this.options.store.put(COUNTS, record.threadId!, { sequence: Math.max(current, next), complete: current <= next && parsed.data.length < 200, issue: current > next ? "native-chat-counts-concurrent" : parsed.data.length === 200 ? "native-chat-counts-page-limit" : null });
+        this.options.store.put(COUNTS, record.threadId!, { sequence: Math.max(current, next), complete: current <= next && parsed.data.length < EVENT_PAGE, issue: current > next ? "native-chat-counts-concurrent" : parsed.data.length === 200 ? "native-chat-counts-page-limit" : null });
       });
-      if (parsed.data.length < 200) return;
+      if (parsed.data.length < EVENT_PAGE) return;
     }
   }
   private countStatus(record: NativeChatRecord, sequence: number, complete: boolean, issue: string): void {

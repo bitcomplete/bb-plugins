@@ -65,29 +65,30 @@ describe("BB-native usage observations",()=>{
   });
   it("resumes a bounded event read from its durable cursor after source interruption",async()=>{
     const {store,ledger,binding}=fixture();
-    const first=Array.from({length:200},(_,i)=>usage(i,100+i));
+    const first=Array.from({length:100},(_,i)=>usage(i,100+i));
     const list=vi.fn().mockResolvedValueOnce(first).mockRejectedValueOnce(new Error("private upstream details"));
     const partial=await ledger.collect(sdk(list),binding);
     expect(partial.historyCaughtUp).toBe(false);expect(partial.retrievalIssue).toBe("native-usage-source-unavailable");
-    expect(partial.throughSequence).toBe(199);
+    expect(partial.throughSequence).toBe(99);
+    expect(list.mock.calls[0]![0]).toMatchObject({limit:"100"});
     const reloaded=new NativeUsageLedger(store);
-    list.mockResolvedValueOnce([cost(201,{amount:1,currency:"USD"})]);
+    list.mockResolvedValueOnce([cost(101,{amount:1,currency:"USD"})]);
     const complete=await reloaded.collect(sdk(list),binding);
-    expect(list.mock.calls[2]![0]).toMatchObject({afterSeq:"199",types:["thread/tokenUsage/updated","thread/contextWindowUsage/updated"]});
+    expect(list.mock.calls[2]![0]).toMatchObject({afterSeq:"99",types:["thread/tokenUsage/updated","thread/contextWindowUsage/updated"]});
     expect(complete.historyCaughtUp).toBe(true);expect(complete.retrievalIssue).toBeNull();
-    expect(complete.sessions[0]!.tokens!.totalTokens).toBe(299);
-    expect(store.list("native-usage-observations")).toHaveLength(201);
+    expect(complete.sessions[0]!.tokens!.totalTokens).toBe(199);
+    expect(store.list("native-usage-observations")).toHaveLength(101);
     expect(JSON.stringify(store.list("native-usage-reads"))).not.toContain("private upstream details");
   });
   it("keeps empty, limited and malformed retrieval distinct from completed accounting",async()=>{
     const {ledger,binding}=fixture();
     const empty=await ledger.collect(sdk(vi.fn().mockResolvedValue([])),binding);
     expect(empty.historyCaughtUp).toBe(true);expect(empty.sessions).toEqual([]);
-    const limited=await ledger.collect(sdk(vi.fn().mockResolvedValue(Array.from({length:200},(_,i)=>usage(i)))),binding,{maxPages:1});
+    const limited=await ledger.collect(sdk(vi.fn().mockResolvedValue(Array.from({length:100},(_,i)=>usage(i)))),binding,{maxPages:1});
     expect(limited.historyCaughtUp).toBe(false);expect(limited.retrievalIssue).toBe("native-usage-page-limit");
-    const invalid=await ledger.collect(sdk(vi.fn().mockResolvedValue([usage(199)])),binding);
+    const invalid=await ledger.collect(sdk(vi.fn().mockResolvedValue([usage(99)])),binding);
     expect(invalid.historyCaughtUp).toBe(false);expect(invalid.retrievalIssue).toBe("native-usage-invalid-page");
-    expect(invalid.throughSequence).toBe(199);
+    expect(invalid.throughSequence).toBe(99);
   });
   it("does not consume a response returned after cancellation",async()=>{
     const {ledger,binding}=fixture(),controller=new AbortController();
@@ -107,11 +108,11 @@ describe("BB-native usage observations",()=>{
     const oldResponse=new Promise<unknown[]>(resolve=>{answer=resolve;});
     const oldRead=ledger.collect(sdk(vi.fn(()=>oldResponse)),binding);
     const otherReader=new NativeUsageLedger(store);
-    const partial=await otherReader.collect(sdk(vi.fn().mockResolvedValue(Array.from({length:200},(_,i)=>usage(i+200,300+i)))),binding,{maxPages:1});
-    expect(partial.retrievalIssue).toBe("native-usage-page-limit");expect(partial.throughSequence).toBe(399);
+    const partial=await otherReader.collect(sdk(vi.fn().mockResolvedValue(Array.from({length:100},(_,i)=>usage(i+200,300+i)))),binding,{maxPages:1});
+    expect(partial.retrievalIssue).toBe("native-usage-page-limit");expect(partial.throughSequence).toBe(299);
     answer([]);
     const stale=await oldRead;
     expect(stale.historyCaughtUp).toBe(false);expect(stale.retrievalIssue).toBe("native-usage-concurrent-update");
-    expect(ledger.read(binding)).toMatchObject({throughSequence:399,historyCaughtUp:false,retrievalIssue:"native-usage-page-limit"});
+    expect(ledger.read(binding)).toMatchObject({throughSequence:299,historyCaughtUp:false,retrievalIssue:"native-usage-page-limit"});
   });
 });

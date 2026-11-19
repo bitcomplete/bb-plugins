@@ -5,7 +5,7 @@ import { stableId, stableJson } from "./domain/shared.js";
 import { REVALIDATION_NAMESPACES as NS, type Revalidation, type FrozenRevalidationPlan, type RevalidationReceipt, type RevalidationResult, type CriterionAssessment } from "./revalidation.js";
 import { nativeExecution, type ExecutionSelection } from "./native-execution.js";
 import type { NativeTaskRunner } from "./native-tasks.js";
-import { completeText } from "./native-model.js";
+import { completeText, unfenceJson } from "./native-model.js";
 import type { StageContext } from "./services.js";
 
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -23,8 +23,7 @@ export const revalidationJobInput = (runId: string) => ({ kind: "revalidation" a
 
 /** Reads `{"output": string}`, allowing one surrounding code fence. Anything else is unreadable. */
 export function readAnswer(text: string): string | null {
-  const fenced = /^\s*```[a-zA-Z]*\s*\n([\s\S]*?)\n?\s*```\s*$/.exec(text);
-  try { return answerSchema.parse(JSON.parse(fenced ? fenced[1]! : text)).output; } catch { return null; }
+  try { return answerSchema.parse(JSON.parse(unfenceJson(text))).output; } catch { return null; }
 }
 
 /** Server-side scoring over every case. Unreadable answers count as failures on either arm. */
