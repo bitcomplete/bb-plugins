@@ -73,16 +73,28 @@ bb stewards init --dir "$WORK/fixture/.bb" --prefix LOCAL --timezone America/New
 PROJECT_FILE="$WORK/fixture/.bb/stewards/project.json"
 [ -f "$PROJECT_FILE" ] || fail "init wrote no project.json"
 jq -e '.bigDecisions | length > 0' "$PROJECT_FILE" >/dev/null || fail "init wrote an empty decide list"
-if jq -r '.bigDecisions[].paths[]' "$PROJECT_FILE" | grep -Eq '(^/|\.\.)'; then
-  fail "the decide list names a path outside the repository"
-fi
+# Every path is a bare name at the repo root, an anywhere-glob (`**/…`), or
+# rooted at a real top-level entry. A repo-dir-prefixed path such as
+# `bb-gate/kploy/**` (the pre-BB-359 shape) fails, which is the regression
+# this guards. The loop reads from a process substitution, so `fail` exits
+# the script rather than a pipe subshell.
+while IFS= read -r path; do
+  if [[ "$path" != */* ]]; then continue; fi
+  if [[ "$path" == "**/"* ]]; then continue; fi
+  first="${path%%/*}"
+  [ -e "$WORK/fixture/$first" ] || fail "the decide list names a path outside the repository: $path"
+done < <(jq -r '.bigDecisions[].paths[]?' "$PROJECT_FILE")
 
-# 6. check reads the committed `.bb`: polling mode, and no problem lines.
+# 6. check reads the committed `.bb`: polling mode, the fixture repository is
+#    resolved, and no problem lines. Fetch and push go to the local mirror
+#    while `remote.origin.url` stays the GitHub URL (project-git.ts reads the
+#    raw config), so the public repository never receives a push and `check`
+#    still validates the GitHub side the guide describes.
 say "check"
 cd "$WORK/fixture"
 git add -A
 git -c user.email=ci@example.com -c user.name=ci commit --quiet -m "Add the .bb skeleton"
-git remote set-url origin "$WORK/origin.git"
+git config url."$WORK/origin.git".insteadOf "https://github.com/$FIXTURE_REPO.git"
 git push --quiet origin main
 git fetch --quiet origin
 set +e
@@ -91,6 +103,7 @@ STATUS=$?
 set -e
 printf '%s\n' "$CHECK"
 [ "$STATUS" -eq 0 ] || fail "check exited $STATUS"
+printf '%s\n' "$CHECK" | grep -q "repos: $FIXTURE_REPO" || fail "check did not resolve the fixture repository"
 printf '%s\n' "$CHECK" | grep -q 'doorbells: polling every' || fail "check did not report polling mode"
 if printf '%s\n' "$CHECK" | grep -q 'problem:'; then
   fail "check reported a problem"

@@ -133,7 +133,10 @@ survey reads the repository's labels so the interview can confirm them.
    the callback.
 4. Install the `linear` plugin, open Settings → Plugins → Linear, and press
    **Connect Linear**. The survey then lists the workspace's teams and their
-   workflow states, and `init --teams ENG` writes the Linear ticket playbook.
+   workflow states. Add the team keys to `linear.teams` in
+   `.bb/stewards/project.json`, land the guidance, and run
+   `bb stewards check --create-labels`; `init` already wrote
+   `linear-tickets.md`, and it never rewrites an existing `project.json`.
 
 ## Optional: multi-repo projects
 
