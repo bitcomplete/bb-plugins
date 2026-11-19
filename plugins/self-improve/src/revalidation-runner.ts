@@ -9,7 +9,7 @@ import { nativeExecution } from "./native-execution.js";
 import type { NativeExecution, NativeTaskIdentity, NativeTaskRecord, NativeTaskRunner } from "./native-tasks.js";
 import type { ActivityAccounting } from "./activity-accounting.js";
 import { completeJson } from "./native-model.js";
-import type { StageContext } from "./services.js";
+import { Deferred, type StageContext } from "./services.js";
 
 const JOURNALS="revalidation-executions", OPERATIONS="revalidation-operations", RECEIPTS="revalidation-receipts";
 const hash=(value:unknown)=>createHash("sha256").update(stableJson(value)).digest("hex");
@@ -18,6 +18,12 @@ const same=(a:unknown,b:unknown)=>stableJson(a)===stableJson(b);
 const inputSchema=z.object({kind:z.literal("revalidation"),revalidationRunId:z.string().min(1).max(200)}).strict();
 class RunnerFailure extends Error { constructor(readonly code:string){super(code);} }
 function fail(code:string):never{throw new RunnerFailure(code);}
+const TASK_INSTRUCTIONS="Perform the supplied test task. Return only JSON {output:string} with your exact answer. This is an exploratory paired prompt test. Ordinary BB context and tools may remain.";
+/** Native tasks refuse longer instructions; checked before any paid arm. */
+const MAX_NATIVE_INSTRUCTIONS=32768;
+const treatmentInstructions=(artifact:string)=>`${TASK_INSTRUCTIONS}\n\nAdditional instruction:\n${artifact}`;
+/** Ended runs keep reconciling late native reports for this long, then stop being scanned. */
+const USAGE_RECONCILE_WINDOW_MS=30*24*60*60*1000;
 interface ExecutionJournal { runId:string;binding:RevalidationBinding;boot:string;serviceJobId:string;serviceRunId:string|null;lease:string;privacyGeneration:string;startedAtMs:number;deadlineAtMs:number;taskIds:string[] }
 interface Operation {taskId:string;runId:string;caseId:string;arm:"baseline"|"treatment";binding:RevalidationBinding;requestDigest:string;promptHash:string;admittedAtMs:number|null}
 export interface RevalidationCaseReceipt {
@@ -40,7 +46,12 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
   const active=new Map<string,AbortController>(),locks=new Map<string,Promise<Record<string,number>>>();
   let disposed=false;
   const journal=(runId:string)=>store.get<ExecutionJournal>(JOURNALS,runId);
-  const operations=(runId:string)=>store.list<Operation>(OPERATIONS).filter(o=>o.runId===runId);
+  const operations=(runId:string)=>{
+    const j=journal(runId);
+    // The journal names every planned task, so a run's operations are point reads rather than a table scan.
+    if(j)return j.taskIds.map(id=>store.get<Operation>(OPERATIONS,id)).filter((o):o is Operation=>o!==null&&o.runId===runId);
+    return store.list<Operation>(OPERATIONS).filter(o=>o.runId===runId);
+  };
   function frozen(run:RevalidationRun):FrozenRevalidationPlan {
     const value=revalidation.plans.get(run.planId,run.planVersion).frozen;
     if(!value||value.schemaVersion!==2||value.protocol!==REVALIDATION_PROTOCOL||!value.workload||!value.observedEnvironment||!value.environmentObservationDigest)fail("revalidation-executable-snapshot-unavailable");
@@ -132,6 +143,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     if(def.sample!.minimumExposure!==null||def.sample!.exposureUnit!==null)fail("revalidation-exposure-capability-unavailable");
     if(def.sample!.minimumPairs>workload.definition.cases.length)fail("revalidation-insufficient-planned-pairs");
     if(def.limits!.maxCalls<workload.definition.cases.length*2)fail("revalidation-insufficient-planned-calls");
+    if(treatmentInstructions(value.artifact.content).length>MAX_NATIVE_INSTRUCTIONS)fail("revalidation-artifact-too-large-for-native-task");
     if(!Number.isSafeInteger(def.limits!.maxDurationMs)||def.limits!.maxDurationMs>2_147_000_000)fail("revalidation-duration-unsupported");
     if(workload.definition.measurements.length!==def.criteria.length)fail("revalidation-measurement-binding-mismatch");
     for(const c of def.criteria){
@@ -147,6 +159,8 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     if(state.run.status==="running"){
       revalidation.executor.interrupt({runId,expectedVersion:state.version});revoke(runId,"revalidation-interrupted");usage(runId,"interrupted");return {revalidation:1,blocked:1};
     }
+    // A disabled plugin leaves queued runs queued; Services retries deferred jobs with backoff.
+    if(disposed||!options.allowed())throw new Deferred("revalidation-execution-disabled");
     let j:ExecutionJournal|null=null,controller:AbortController|null=null,deadline:AbortSignal|null=null;
     try {
       const value=frozen(state.run);validateProtocol(value,runId);
@@ -165,7 +179,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
         const arms=(index%2?["treatment","baseline"]:["baseline","treatment"]) as Array<"baseline"|"treatment">;
         for(const arm of arms){
           await environment(j,signal);
-          const instructions="Perform the supplied test task. Return only JSON {output:string} with your exact answer. This is an exploratory paired prompt test. Ordinary BB context and tools may remain."+(arm==="treatment"?`\n\nAdditional instruction:\n${value.artifact.content}`:"");
+          const instructions=arm==="treatment"?treatmentInstructions(value.artifact.content):TASK_INSTRUCTIONS;
           const input=JSON.stringify({input:c.input}),taskId=stableId("revalidation-task",[runId,c.id,arm]);
           const timeoutMs=Math.min(900000,options.taskTimeoutMs(),Math.max(1,j.deadlineAtMs-now()));
           const request={id:taskId,instructions,input,stage:"builder",runId,solutionId:value.definition.target.solutionId,execution:nativeExecution(value.definition.environment!.execution),privacyGeneration:j.privacyGeneration,timeoutMs,maxReplyCharacters:64000};
@@ -193,11 +207,18 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     } catch(error){
       state=revalidation.plans.getRun(runId);
       const timedOut=deadline?.aborted===true||(j!==null&&now()>=j.deadlineAtMs);
-      const reason=disposed?"interrupted-needs-new-run":timedOut?"revalidation-time-limit":error instanceof RunnerFailure?error.code:ctx.signal.aborted||controller?.signal.aborted?"revalidation-execution-aborted":"revalidation-native-execution-failed";
+      // Plugin disposal or the service stopping is a shutdown, whichever is observed first.
+      const shutdown=disposed||ctx.signal.aborted;
+      // Run guards fire inside native admission/dispatch and arrive wrapped as native errors; recover their real code.
+      let guardCode:string|null=error instanceof RunnerFailure?error.code:null;
+      if(guardCode===null&&j!==null&&!shutdown){
+        try{const value=current(j);checkMoney(runId,value.definition.limits!);}catch(guard){if(guard instanceof RunnerFailure)guardCode=guard.code;}
+      }
+      const reason=shutdown?"interrupted-needs-new-run":timedOut?"revalidation-time-limit":guardCode??(controller?.signal.aborted?"revalidation-execution-aborted":"revalidation-native-execution-failed");
       // Shutdown follows the restart rule: blocked, needing an explicit new run, never a failed hypothesis.
-      if(disposed&&state.run.status==="running"){try{revalidation.executor.interrupt({runId,expectedVersion:state.version});}catch{/* recovery on next boot */}}
+      if(shutdown&&state.run.status==="running"){try{revalidation.executor.interrupt({runId,expectedVersion:state.version});}catch{/* recovery on next boot */}}
       else if(["queued","running"].includes(state.run.status)){
-        if(error instanceof RunnerFailure||timedOut)revalidation.executor.block({runId,reason,...(j?{lease:j.lease}:{})});
+        if(guardCode!==null||timedOut||shutdown)revalidation.executor.block({runId,reason,...(j?{lease:j.lease}:{})});
         else if(j)revalidation.executor.fail({runId,reason,lease:j.lease});
         else revalidation.executor.block({runId,reason});
       }
@@ -210,12 +231,23 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     handle(ctx:StageContext){const {revalidationRunId:runId}=inputSchema.parse(ctx.job.input);const previous=locks.get(runId);if(previous)return previous;
       const operation=execute(ctx,runId);locks.set(runId,operation);void operation.finally(()=>{if(locks.get(runId)===operation)locks.delete(runId);}).catch(()=>{});return operation;},
     cancel(runId:string){if(revalidation.plans.getRun(runId).run.status!=="cancelled")fail("revalidation-owner-cancellation-required");revoke(runId,"revalidation-owner-cancelled");usage(runId,"owner-cancelled");},
-    recover(boot:string){for(const entry of store.entries<RevalidationRun>("revalidation-runs")){if(entry.value.status!=="running"||active.has(entry.key))continue;const j=journal(entry.key);if(j?.boot===boot)continue;revalidation.executor.interrupt({runId:entry.key,expectedVersion:entry.version});revoke(entry.key,"revalidation-interrupted");usage(entry.key,"interrupted");}},
+    recover(boot:string){
+      // Runs at startup: one damaged run must not prevent the plugin from starting or other runs from recovering.
+      for(const entry of store.entries<RevalidationRun>("revalidation-runs")){
+        if(entry.value.status!=="running"||active.has(entry.key))continue;
+        try{const j=journal(entry.key);if(j?.boot===boot)continue;revalidation.executor.interrupt({runId:entry.key,expectedVersion:entry.version});revoke(entry.key,"revalidation-interrupted");usage(entry.key,"interrupted");}
+        catch{/* left running; retried on the next boot */}
+      }
+    },
     reconcileUsage(){
       // Late native reports for ended runs; running runs record usage after every receipt. One bad run does not stop the sweep.
       for(const j of store.list<ExecutionJournal>(JOURNALS)){
         if(active.has(j.runId))continue;
-        try{if(!["queued","running"].includes(revalidation.plans.getRun(j.runId).run.status))usage(j.runId,"reconciled-native-usage");}catch{/* retried next sweep */}
+        try{
+          const run=revalidation.plans.getRun(j.runId).run;
+          if(["queued","running"].includes(run.status)||(run.endedAtMs!=null&&now()-run.endedAtMs>USAGE_RECONCILE_WINDOW_MS))continue;
+          usage(j.runId,"reconciled-native-usage");
+        }catch{/* retried next sweep */}
       }
     },
     dispose(){disposed=true;for(const runId of active.keys())revoke(runId,"revalidation-disposed");},

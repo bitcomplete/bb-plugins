@@ -189,7 +189,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     return {...counts,...revisits};
   };
   revalidationRunner=createRevalidationRunner({store,revalidation,runner:nativeTasks,activity,execution,
-    privacyGeneration:()=>privacyGeneration,redact:clean,observeEnvironment:revalidationEnvironment.observe,
+    privacyGeneration:()=>privacyGeneration,redact:clean,observeEnvironment:revalidationEnvironment.check,
     allowed:()=>values.enabled&&configurationError===null&&!publicationStop.signal.aborted,taskTimeoutMs:()=>config.taskTimeoutMs});
   const ordinaryBuilder=runtime.handlers.builder;
   runtime.handlers.builder=ctx=>ctx.job.input.kind==="revalidation"?revalidationRunner!.handle(ctx):ordinaryBuilder(ctx);

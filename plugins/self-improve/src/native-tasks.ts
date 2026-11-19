@@ -113,6 +113,9 @@ export class NativeTaskRunner implements TaskRunner {
             const parsed = retirementSchema.safeParse(previous);
             if (!parsed.success || parsed.data.taskId !== taskId) return fail("native-task-retirement-invalid");
           } else this.options.store.put(RETIREMENTS, taskId, { taskId, retiredAtMs: this.now(), neverDispatched: true, reasonCode }, this.now());
+        } else if (record.state === "uncertain") {
+          // An uncertain dispatch may have run; keep its identity and state for settlement, only stop local work.
+          if (record.active) this.write({ ...record, active: false });
         } else if (!["completed", "failed", "cancelled"].includes(record.state)) {
           this.write({ ...record, active: false, state: "cancelled", error: reasonCode, endedAtMs: this.now() });
           revokedNow.add(taskId);

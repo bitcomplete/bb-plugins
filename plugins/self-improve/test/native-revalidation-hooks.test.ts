@@ -68,3 +68,9 @@ it("keeps failed cancellation cleanup durable across reload and leaves completed
   f.methods.stop.mockResolvedValue({ ok: true }); await f.create().reconcileCleanup({ timeoutMs: 100 });
   expect(f.store.get<NativeTaskRecord>("native-tasks", "pending-cleanup")).toMatchObject({ state: "cancelled", active: false, cleanupPending: false });
 });
+it("keeps an uncertain dispatch uncertain when its run is revoked",()=>{
+  const f=fixture();f.seed("unclear",{state:"uncertain",active:false,error:"native-task-spawn-uncertain",endedAtMs:1000});
+  const before=f.store.get<NativeTaskRecord>("native-tasks","unclear");
+  f.runner.revoke(["unclear"],"revalidation-terminal");
+  expect(f.store.get<NativeTaskRecord>("native-tasks","unclear")).toEqual(before);
+});

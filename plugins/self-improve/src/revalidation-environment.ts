@@ -72,11 +72,12 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
     if (saved.digest !== observed.digest || observed.declaredEnvironmentDigest !== declaredDigest || observed.environment.id !== environment.execution.environmentId || observed.environment.projectId !== environment.execution.projectId) throw new Error("revalidation-environment-observation-binding-mismatch");
     return observed;
   }
-  async function observe(raw: RevalidationEnvironment, parentSignal?: AbortSignal): Promise<ObservedRevalidationEnvironment> {
+  async function observe(raw: RevalidationEnvironment, parentSignal?: AbortSignal, persist = true): Promise<ObservedRevalidationEnvironment> {
     const { environment, declaredDigest } = declaration(raw), selection = environment.execution;
     const signal = AbortSignal.any([AbortSignal.timeout(10000), ...(parentSignal ? [parentSignal] : [])]);
     signal.throwIfAborted();
-    const sequence = options.store.transaction(() => {
+    // Drift checks during a run compare only; recording every arm's observation would grow storage without bound.
+    const sequence = !persist ? 0 : options.store.transaction(() => {
       const previous = options.store.get<number>(cursors, declaredDigest) ?? 0;
       if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) throw new Error("revalidation-observation-cursor-invalid");
       options.store.put(cursors, declaredDigest, previous + 1); return previous + 1;
@@ -147,6 +148,7 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
       bbVersion, plugins, skills, unobservedDependencies, unknowns: [...unknowns].sort() });
     const capturedAtMs = options.now?.() ?? Date.now(), observed = validateObservedRevalidationEnvironment({ ...content, digest: observedRevalidationEnvironmentDigest(content), capturedAtMs });
     signal.throwIfAborted();
+    if (!persist) return observed;
     return options.store.transaction(() => {
       const snapshotId = `${observed.digest}:${sequence}`;
       if (!options.store.insert(snapshots, snapshotId, observed, capturedAtMs)) throw new Error("revalidation-observation-already-recorded");
@@ -158,5 +160,7 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
     digest.parse(expectedDigest); const current = await observe(environment, signal);
     if (current.digest !== expectedDigest) throw new Error("revalidation-environment-drift"); return current;
   }
-  return { observe, resolve, verify };
+  /** Read-only observation for drift comparison; nothing is stored. */
+  const check = (environment: RevalidationEnvironment, signal?: AbortSignal) => observe(environment, signal, false);
+  return { observe: (environment: RevalidationEnvironment, signal?: AbortSignal) => observe(environment, signal), check, resolve, verify };
 }

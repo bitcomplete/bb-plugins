@@ -91,3 +91,8 @@ it("validates persisted fingerprint content and prepared-head binding", async ()
   f.store.put("revalidation-environment-observation-heads",result.declaredEnvironmentDigest,{...head,digest:"0".repeat(64)});
   expect(() => f.observer.resolve(environment)).toThrow("observation-binding-mismatch");
 });
+it("compares without recording when used as a drift check",async()=>{
+  const f=fixture(),recorded=await f.observer.observe(environment),before=f.store.list("revalidation-observed-environments");
+  for(let i=0;i<5;i++)expect((await f.observer.check(environment)).digest).toBe(recorded.digest);
+  expect(f.store.list("revalidation-observed-environments")).toEqual(before);expect(f.observer.resolve(environment).digest).toBe(recorded.digest);
+});

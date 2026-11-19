@@ -18,11 +18,11 @@ afterEach(()=>databases.splice(0).forEach(db=>db.close()));
 const sha=(text:string)=>createHash("sha256").update(text).digest("hex");
 const owner={kind:"owner" as const,id:"owner"};
 
-async function fixture(change?:(definition:RevalidationDefinition)=>void){
+async function fixture(change?:(definition:RevalidationDefinition)=>void,artifactContent="Use lowercase words in answers."){
   const db=new Database(":memory:");databases.push(db);MIGRATIONS.forEach(s=>db.exec(s));const store=new Store(db);
   const selected={providerId:"codex",model:"model",permissionMode:"accept-edits" as const,projectId:"project",environmentId:"environment"};
   const s=solution();store.put("solutions",s.id,s);
-  const content="Use lowercase words in answers.";store.put("native-evaluation-artifacts","artifact",{id:"artifact",solutionId:s.id,revision:"r1",kind:"instruction",content,artifactDigest:sha(content)});
+  const content=artifactContent;store.put("native-evaluation-artifacts","artifact",{id:"artifact",solutionId:s.id,revision:"r1",kind:"instruction",content,artifactDigest:sha(content)});
   let time=NOW,generation="privacy-1",allowed=true,costFloor:number|null=null,foreignCost=false,ambiguous=false;
   const redact=(text:string)=>text.replaceAll("private-secret","[redacted]");
   const workloads=createRevalidationWorkloads(store,{redact,now:()=>time});
@@ -107,6 +107,9 @@ describe("BB-native revalidation runner",()=>{
       return {output:"wrong"};
     });
     await f.runner.handle(f.ctx);expect(f.requests).toHaveLength(1);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",verdict:null});
+    // Drift detected after the completed arm keeps its receipt; drift caught before the receipt write keeps none. Usage is always retained.
+    expect(f.store.list("revalidation-receipts")).toHaveLength(["privacy","selection","deadline"].includes(mode)?0:1);
+    expect(f.core.plans.usage(f.queued.id).at(-1)).toMatchObject({usage:{calls:1,costMicros:null}});
   });
   it("rejects a native receipt whose persisted execution does not match the frozen request",async()=>{
     const f=await fixture(),get=f.native.get;f.native.get=id=>{const row=get(id);return row?{...row,resolvedEnvironmentId:"different"}:null;};
@@ -158,5 +161,38 @@ describe("BB-native revalidation runner",()=>{
     const f=await fixture();await f.runner.handle(f.ctx);
     f.runner.reconcileUsage();const before=f.core.plans.usage(f.queued.id);
     f.setTime(NOW+120000);f.runner.reconcileUsage();expect(f.core.plans.usage(f.queued.id)).toEqual(before);
+  });
+  it("reports a guard refusal inside native admission by its own code, not as a native failure",async()=>{
+    const f=await fixture();f.setHook(async()=>{f.changePrivacy();throw new Error("native-task-sdk-unavailable");});
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-privacy-changed",verdict:null});
+  });
+  it("treats the service stopping before plugin disposal as an interruption",async()=>{
+    const f=await fixture();let resolve!:(value:unknown)=>void;f.setHook(()=>new Promise(r=>{resolve=r;}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    f.controller.abort();resolve({output:"fixture-answer-one"});await pending;
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"interrupted-needs-new-run",verdict:null});
+  });
+  it("leaves a queued run queued while the plugin is disabled",async()=>{
+    const f=await fixture();f.disable();
+    await expect(f.runner.handle(f.ctx)).rejects.toThrow("revalidation-execution-disabled");
+    expect(f.requests).toHaveLength(0);expect(f.core.plans.getRun(f.queued.id).run.status).toBe("queued");
+  });
+  it("refuses an artifact too large for a native task before paying for any arm",async()=>{
+    const f=await fixture(undefined,"x".repeat(33000));await f.runner.handle(f.ctx);
+    expect(f.requests).toHaveLength(0);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-artifact-too-large-for-native-task"});
+  });
+  it("skips a running run when reconciling usage",async()=>{
+    const f=await fixture();let resolve!:(value:unknown)=>void;f.setHook(()=>new Promise(r=>{resolve=r;}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    const before=f.core.plans.usage(f.queued.id);f.runner.reconcileUsage();expect(f.core.plans.usage(f.queued.id)).toEqual(before);
+    resolve({output:"fixture-answer-one"});f.setHook(async()=>({output:"fixture-answer-two"}));await pending;
+  });
+  it("keeps recovering other runs when one interrupted run cannot be recovered",async()=>{
+    const f=await fixture();let resolve!:(value:unknown)=>void;f.setHook(()=>new Promise(r=>{resolve=r;}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    const interrupt=vi.spyOn(f.core.executor,"interrupt").mockImplementationOnce(()=>{throw new Error("damaged-run");});
+    const restarted=createRevalidationRunner(f.options);expect(()=>restarted.recover("next-boot")).not.toThrow();expect(interrupt).toHaveBeenCalled();
+    interrupt.mockRestore();resolve({output:"fixture-answer-one"});f.setHook(async()=>({output:"fixture-answer-two"}));await pending;
   });
 });
