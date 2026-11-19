@@ -1,0 +1,48 @@
+name: stewards-fixture
+
+# The stock-bb onboarding smoke test (BB-364): install the stewards plugin
+# from this checkout into a bb with no multi-repo, no Linear and no hooks
+# service, point it at the public fixture repository, and run the path the
+# getting-started guide describes. This is the regression guard for the
+# no-Linear, local-ticket, polling path (BB-359, BB-362, BB-363); the plugin
+# suite's unit tests cover the same behaviour against the fake host.
+on:
+  push:
+    branches: [main]
+    paths:
+      - plugins/stewards/**
+      - .github/workflows/stewards-fixture.yaml
+  pull_request:
+    paths:
+      - plugins/stewards/**
+      - .github/workflows/stewards-fixture.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    env:
+      # `gh` reads the GitHub source, the fixture repository is public, and
+      # the job needs no write scope anywhere.
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BB_SERVER_URL: http://127.0.0.1:38886
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - name: Install bb
+        run: npm install -g bb-app@0.49.0
+      - name: Start a stock bb and run the fixture smoke
+        run: |
+          bb-app --data-dir "$RUNNER_TEMP/bb-data" \
+            --server-port 38886 --host-daemon-port 38887 \
+            --no-in-app-updates --bundled > "$RUNNER_TEMP/bb.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:38886/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:38886/health >/dev/null || { cat "$RUNNER_TEMP/bb.log"; exit 1; }
+          plugins/stewards/scripts/fixture-check.sh
