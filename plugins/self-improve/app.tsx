@@ -36,6 +36,7 @@ function SelfImprovePage() {
     startRevalidationChat: input => rpc.call("startRevalidationChat", input),
     dashboard: input => rpc.call("dashboard", input),
     retest: input => rpc.call("retest", input),
+    findProblems: input => rpc.call("findProblems", input),
     startChat: input => rpc.call("startChat", input),
     createObjective: input => rpc.call("createObjective", input),
     performance: input => rpc.call("performance", input),

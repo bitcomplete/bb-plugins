@@ -223,3 +223,13 @@
 .si-execution summary { cursor: pointer; font-weight: 600; }
 .si-execution p { font-size: 13px; line-height: 1.5; }
 .si-native-costs { font-size: 12px; font-weight: 400; }
+
+[data-bb-plugin="self-improve"] .si-setup { border: 1px solid var(--si-border); border-radius: 14px; padding: 18px 22px; margin: 0 0 18px; background: var(--si-surface, transparent); }
+[data-bb-plugin="self-improve"] .si-setup h2 { margin: 0 0 10px; font-size: 1.05rem; }
+[data-bb-plugin="self-improve"] .si-setup ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+[data-bb-plugin="self-improve"] .si-setup li { display: grid; grid-template-columns: 22px 1fr; gap: 10px; align-items: start; }
+[data-bb-plugin="self-improve"] .si-setup li > span { font-weight: 700; color: var(--si-muted); }
+[data-bb-plugin="self-improve"] .si-setup li p { margin: 2px 0 6px; color: var(--si-muted); }
+[data-bb-plugin="self-improve"] .si-setup .si-setup-done strong { color: var(--si-muted); text-decoration: line-through; }
+[data-bb-plugin="self-improve"] .si-setup .si-setup-done > span { color: var(--si-accent, #245f49); }
+[data-bb-plugin="self-improve"] .si-setup-quiet { display: flex; gap: 12px; align-items: center; justify-content: flex-end; margin: 0 0 12px; color: var(--si-muted); font-size: .9rem; }

@@ -283,6 +283,9 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     problems: store.list<Problem>("problems"), solutions: store.list<Solution>("solutions"), votes: store.list("votes"),
     ranking: store.get<RankedSolution[]>("solution-ranking", "latest") ?? [], runs: store.runs().map(run=>({...run,costs:activity.forRun(run.id)})),
     versions: Object.fromEntries(["problems", "solutions"].flatMap(ns => store.entries(ns).map(e => [`${ns}:${e.key}`, e.version]))),
+    setup: { worker: !!config.projectId && !!config.environmentId, model: !!config.providerId && !!config.model,
+      mined: store.get("source-coverage", "latest") !== null, scheduled: values.enabled, testCases: !!values.evaluationSuite,
+      minerQueued: store.db.prepare("SELECT 1 FROM jobs WHERE stage='miner' AND status IN ('queued','running') LIMIT 1").get() !== undefined },
     health: { enabled: values.enabled, issues: issues(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),recentRuns:recentAgentRuns(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolutionHistory(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
     activation: Object.fromEntries(store.list<ValidatedArtifact>("validated-artifacts").map(artifact => [artifact.solutionId, {
       status: "revalidation-required" as const,
@@ -336,11 +339,29 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
         context:`Help clarify revalidation plan ${plan.id}. Read it with self_improve_revalidation_read. Help the owner formulate measurable criteria and counterexamples. Edit only a new draft version; the owner freezes and runs it. Do not invent test results.`});
     },
     getExecution: () => executionView(),
+    workerOptions: async () => {
+      // Projects and their ready environments, for choosing where agent work runs.
+      const [projects, environments] = await Promise.all([bb.sdk.projects.list({ includePersonal: true }), bb.sdk.environments.list({ limit: 500 })]);
+      const text = (value: unknown) => typeof value === "string" ? value : "";
+      return {
+        projects: (projects as Array<Record<string, unknown>>).map(p => ({ id: text(p.id), name: text(p.name) || text(p.id) })).filter(p => p.id),
+        environments: (environments as Array<Record<string, unknown>>).filter(e => text(e.status) === "ready" && text(e.projectId))
+          .map(e => ({ id: text(e.id), projectId: text(e.projectId), label: [text(e.name), text(e.kind) || text(e.workspaceKind), text(e.path)].filter(Boolean).join(" · ") || text(e.id) })),
+      };
+    },
+    findProblems: () => {
+      if (!config.projectId || !config.environmentId || !config.providerId || !config.model) throw new Error("Choose where agent work runs under Execution first");
+      const jobId = services.enqueue("miner", `manual:${randomUUID()}`); changed(); return { jobId };
+    },
     setExecution: input => updateConfiguration(async () => {
       const current = await settings.get();
       if (stableId("configuration", current.config) !== input.expectedRevision) throw new Error("Configuration changed; reload execution settings before saving");
       const existing = parseConfig(current.config);
-      if (input.selection.projectId !== existing.projectId || input.selection.environmentId !== existing.environmentId) throw new Error("Worker environment changed; reload execution settings");
+      // The worker project and environment are chosen here too; the environment must belong to the project and be ready.
+      if (input.selection.projectId !== existing.projectId || input.selection.environmentId !== existing.environmentId) {
+        const environment = await bb.sdk.environments.get({ environmentId: input.selection.environmentId }).catch(() => null) as { projectId?: string; status?: string } | null;
+        if (!environment || environment.projectId !== input.selection.projectId) throw new Error("Choose an environment that belongs to the selected project");
+      }
       const next = parseConfig(JSON.stringify({...existing, reasoningLevel:undefined, serviceTier:undefined, ...input.selection}));
       await settings.experimental_set({config:JSON.stringify(next)});
       values = await settings.get(); applyConfig();

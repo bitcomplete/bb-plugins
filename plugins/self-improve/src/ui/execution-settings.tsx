@@ -9,25 +9,33 @@ export function ExecutionSettings({ refreshKey, onSaved }: { refreshKey: number;
   const [selection,setSelection]=useState<ExperimentalProviderModelPickerValue>({providerId:"",model:"",reasoningLevel:"medium"});
   const [permission,setPermission]=useState<"accept-edits"|"auto"|"full">("accept-edits");
   const [busy,setBusy]=useState(false),[dirty,setDirty]=useState(false),[notice,setNotice]=useState(""),[stale,setStale]=useState(false);
+  const [target,setTarget]=useState({projectId:"",environmentId:""});
+  const [options,setOptions]=useState<{projects:Array<{id:string;name:string}>;environments:Array<{id:string;projectId:string;label:string}>}|null>(null);
+  useEffect(()=>{let live=true;void rpc.call("workerOptions",{}).then(value=>{if(live)setOptions(value);}).catch(()=>{if(live)setOptions({projects:[],environments:[]});});return ()=>{live=false;};},[rpc,refreshKey]);
   useEffect(()=>{
     let live=true;
-    void rpc.call("getExecution",{}).then(value=>{if(!live)return;if(dirty){if(saved?.revision !== value.revision){setStale(true);setError("Configuration changed while you were editing. Reload before saving.");}return;}setSaved(value);setSelection(value.selection);setPermission(value.permissionMode);setError("");setStale(false);}).catch(()=>{if(live)setError("Execution settings could not be loaded.");});
+    void rpc.call("getExecution",{}).then(value=>{if(!live)return;if(dirty){if(saved?.revision !== value.revision){setStale(true);setError("Configuration changed while you were editing. Reload before saving.");}return;}setSaved(value);setTarget({projectId:value.projectId,environmentId:value.environmentId});setSelection(value.selection);setPermission(value.permissionMode);setError("");setStale(false);}).catch(()=>{if(live)setError("Execution settings could not be loaded.");});
     return ()=>{live=false;};
   },[rpc,refreshKey,dirty,saved?.revision]);
-  const ready=!!saved?.projectId&&!!saved?.environmentId;
-  const routing=saved?.environmentId?{kind:"environment" as const,environmentId:saved.environmentId}:undefined;
+  const ready=!!target.projectId&&!!target.environmentId;
+  const routing=target.environmentId?{kind:"environment" as const,environmentId:target.environmentId}:undefined;
+  const environments=options?.environments.filter(e=>e.projectId===target.projectId)??[];
   const save=async()=>{
     if(!saved||!ready||busy||stale)return;setBusy(true);setError("");setNotice("");
     try {
-      const value=await rpc.call("setExecution",{expectedRevision:saved.revision,selection:{...selection,permissionMode:permission,projectId:saved.projectId,environmentId:saved.environmentId}});
+      const value=await rpc.call("setExecution",{expectedRevision:saved.revision,selection:{...selection,permissionMode:permission,projectId:target.projectId,environmentId:target.environmentId}});
       setSaved(value);setSelection(value.selection);setPermission(value.permissionMode);setDirty(false);setNotice("Execution settings saved. Existing evidence keeps its original provider and model.");onSaved();
     } catch(e) {setError(e instanceof Error?e.message.slice(0,300):"Execution settings could not be saved.");}
     finally {setBusy(false);}
   };
-  return <section className="si-root si-execution" aria-label="Self improve execution settings"><details><summary>Execution · {saved?.selection.providerId||"Choose a BB provider"}{saved?.selection.model?` / ${saved.selection.model}`:""}</summary>
+  return <section className="si-root si-execution" aria-label="Self improve execution settings"><details open={!saved?.selection.model||undefined}><summary>Execution · {saved?.selection.providerId||"Choose a BB provider"}{saved?.selection.model?` / ${saved.selection.model}`:""}</summary>
     <p>Use your existing BB sign-in and provider routing. Ordinary workspace instructions and tools may remain available.</p>
-    {!ready&&<p>Choose a worker project and environment in Self improve’s Configuration setting first. Provider choices are resolved for that environment.</p>}
+    <p>Agent work runs in the environment you choose here, with its ordinary tools. A scratch environment is safest: in accept-edits mode agents can change its files.</p>
     <div className="si-header-actions">
+      <label className="si-filter"><span>Project</span><select value={target.projectId} disabled={busy||stale||!options} onChange={e=>{setTarget({projectId:e.target.value,environmentId:""});setDirty(true);setNotice("");}}>
+        <option value="">{options?"Choose a project":"Loading…"}</option>{options?.projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+      <label className="si-filter"><span>Environment</span><select value={target.environmentId} disabled={busy||stale||!target.projectId} onChange={e=>{setTarget({...target,environmentId:e.target.value});setDirty(true);setNotice("");}}>
+        <option value="">{target.projectId&&!environments.length?"No ready environments":"Choose an environment"}</option>{environments.map(e=><option key={e.id} value={e.id}>{e.label}</option>)}</select></label>
       <ProviderModelPicker value={selection} onChange={value=>{setSelection(value);setDirty(true);setNotice("");}} routing={routing} disabled={!ready||busy||stale}/>
       <PermissionModePicker providerId={selection.providerId} value={permission} onChange={value=>{setPermission(value);setDirty(true);setNotice("");}} routing={routing} disabled={!ready||!selection.providerId||busy||stale}/>
       <button className="si-button si-button-primary" onClick={()=>void save()} disabled={!ready||!selection.providerId||!selection.model||busy||!dirty||stale}>{busy?"Saving…":"Save execution"}</button>

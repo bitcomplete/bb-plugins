@@ -17,6 +17,8 @@ export const rpcContract = defineRpcContract({
   cancelRevalidation: { input:cancelRevalidationSchema, output:z.custom<ReturnType<RevalidationOwnerApi["cancel"]>>() },
   startRevalidationChat: { input:z.object({planId:id,projectId:id}).strict(), output:z.object({threadId:id}) },
   getExecution: { input: z.object({}).strict(), output: z.custom<ExecutionSettingsView>() },
+  workerOptions: { input: z.object({}).strict(), output: z.custom<{ projects: Array<{ id: string; name: string }>; environments: Array<{ id: string; projectId: string; label: string }> }>() },
+  findProblems: { input: z.object({}).strict(), output: z.object({ jobId: z.string() }) },
   setExecution: { input: z.object({expectedRevision:z.string().min(1).max(200),selection:executionSelectionSchema}).strict(), output: z.custom<ExecutionSettingsView>() },
   dashboard: { input: z.object({}).strict(), output: z.custom<DashboardData>() },
   retest: { input: z.object({ solutionId: id, expectedVersion: z.number().int().positive(), reason: z.string().trim().min(1).max(1000) }).strict(), output: z.object({ jobId: id }) },

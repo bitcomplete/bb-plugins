@@ -16,6 +16,8 @@ export interface DashboardData {
   runs: Array<{ id: string; stage: string; status: string; startedAt: number; endedAt: number | null; counts: Record<string, number>; errors: string[] }>;
   versions: Record<string, number>;
   activation?: Record<string, { status: "revalidation-required"; reason: string }>;
+  /** First-run checklist state. */
+  setup?: { worker: boolean; model: boolean; mined: boolean; scheduled: boolean; testCases: boolean; minerQueued: boolean };
   health: { enabled: boolean; issues: string[]; workerProjectId?: string; publicationRepositories?: string[] };
   costs: {
     totals: Array<{ currency: string; reportedMicros: number; estimatedMicros: number; unknownAttempts: number; unknownExternalCosts?: number; attempts: number }>;
@@ -46,6 +48,7 @@ export interface ExportArtifact { artifactId: string; files: Array<{ path: strin
 export interface DashboardApi extends Partial<PublicationApi>, Partial<RevalidationApi> {
   dashboard(input: Record<string, never>): Promise<DashboardData>;
   retest(input: { solutionId: string; expectedVersion: number; reason: string }): Promise<{ jobId: string }>;
+  findProblems?(input: Record<string, never>): Promise<{ jobId: string }>;
   startChat(input: { kind: Selection["kind"]; id: string; projectId: string }): Promise<{ threadId: string }>;
   createObjective(input: ObjectiveInput): Promise<{ id: string }>;
   performance(input: { solutionId?: string }): Promise<{ points: PerformancePoint[] }>;
