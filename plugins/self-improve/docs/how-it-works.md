@@ -44,6 +44,12 @@ The intended impact screen keeps three facts distinct: **evidence**, **distribut
 
 **Revalidate** will start with a skeptical claim, help clarify measurable criteria in BB chat, freeze a versioned plan, and test the unchanged artifact. It will distinguish replay, new challenges and independent held-out proof, then record supported/contradicted/inconclusive outcomes separately from execution failures. Fixing the artifact creates a new revision needing new validation.
 
+The revalidation engine is in place on the server; its dashboard wizard is not built yet. Each test case runs twice in fresh BB threads, once without the solution's instruction and once with it, and the server scores exact answers. A result covers only the frozen plan, test cases and setup it ran on:
+
+- A run blocked or failed for an operational reason (a setup change, a budget or concurrency limit, the plugin being turned off) has no verdict.
+- An answer that isn't the required JSON counts as a failed case. If the answer without the instruction is unreadable, comparisons against it are inconclusive.
+- The latest run of the latest plan version decides the claim's standing. A later passing run replaces an earlier failed one; both stay in the history.
+
 Both complete workflows remain **pending in this preview**. Existing basic retest and draft export controls are foundations. A draft PR is submitted for review; it is not published, listed or active. This pending work remains part of the delivery scope.
 
 The solution detail shows **Tested on**, **Requires**, and **Not yet tested**. New inventor and scout proposals carry an unverified declaration of dependencies, assumptions and proposed package checks. Older records without a declaration remain unknown. The panel does not claim a tested environment until package conformance evidence is available. Provider/model, plugin, skill or configuration changes can require revalidation. Prompts and reviews help reveal assumptions; testing the advertised package/configuration establishes the actual scope.
