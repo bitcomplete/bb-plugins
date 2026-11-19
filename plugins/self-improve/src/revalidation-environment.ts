@@ -58,12 +58,13 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     promise.then(value => { signal.removeEventListener("abort", abort); resolve(value); }, error => { signal.removeEventListener("abort", abort); reject(error); });
   });
 }
-/** A host answering that the version call does not exist or is unsupported, as opposed to a transient failure. */
+/**
+ * A host whose HTTP API answers that the version call does not exist or is not implemented. Decided by status only:
+ * error wording (or a transport error such as ENOTFOUND) can describe a transient failure, which must be retried.
+ */
 function versionUnsupported(error: unknown): boolean {
-  const value = error as { status?: unknown; code?: unknown; message?: unknown } | null;
-  if (value && (value.status === 404 || value.status === 405 || value.status === 501)) return true;
-  const text = `${typeof value?.code === "string" ? value.code : ""} ${typeof value?.message === "string" ? value.message : ""}`;
-  return /not[ _-]?found|unsupported|not[ _-]?implemented|unknown[ _-]?method/i.test(text);
+  const status = (error as { status?: unknown } | null)?.status;
+  return status === 404 || status === 405 || status === 501;
 }
 /** Unknown entries are bounded text; a long dependency name must not make a plan impossible to freeze. */
 const unknown = (prefix: string, name: string) => `${prefix}:${name}`.slice(0, 500).trimEnd();

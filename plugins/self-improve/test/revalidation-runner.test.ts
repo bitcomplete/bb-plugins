@@ -217,11 +217,12 @@ describe("BB-native revalidation runner",()=>{
     const restarted=createRevalidationRunner(f.options);expect(()=>restarted.recover("next-boot")).not.toThrow();expect(interrupt).toHaveBeenCalled();
     interrupt.mockRestore();resolve({output:"fixture-answer-one"});f.setHook(async()=>({output:"fixture-answer-two"}));await pending;
   });
-  it("is inconclusive, not supported, when no baseline answer was readable",async()=>{
+  it("stops early without a verdict when an unreadable baseline makes every criterion unanswerable",async()=>{
     const f=await fixture();f.setHook(async()=>"```json\n{\"output\":\"fixture-answer-one\"}\n```");
     await f.runner.handle(f.ctx);
-    const state=f.core.plans.getRun(f.queued.id);
-    expect(state.run.status).toBe("completed");expect(state.run.verdict).not.toBe("supported");expect(state.result?.verdict).toBe("inconclusive");
+    expect(f.requests).toHaveLength(1);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",verdict:null,reason:"revalidation-baseline-answer-unreadable (case case-a, baseline)"});
+    expect(f.store.list("revalidation-receipts")).toHaveLength(1);
   });
   it("keeps the stop reason when the condition clears before the arm ends",async()=>{
     const f=await fixture();f.setHook((_r,signal)=>new Promise((_resolve,reject)=>{signal?.addEventListener("abort",()=>reject(Object.assign(new Error("x"),{code:"native-task-aborted"})));}));
@@ -243,14 +244,15 @@ describe("BB-native revalidation runner",()=>{
       expect(f.core.plans.getRun(f.queued.id).run.status).toBe("completed");
     }finally{vi.useRealTimers();}
   });
-  it("is inconclusive when only some baseline answers are unreadable, rather than contradicting the claim",async()=>{
+  it("never contradicts a claim because some baseline answers were unreadable",async()=>{
     const f=await fixture(d=>{d.sample!.minimumPairs=1;});f.setHook(async request=>{
       const input=JSON.parse(request.input).input,treatment=request.instructions.includes(f.content);
       if(!treatment&&input==="First test task")return "```json\n{}\n```";
       return {output:input==="First test task"?"fixture-answer-one":"fixture-answer-two"};
     });
     await f.runner.handle(f.ctx);
-    expect(f.core.plans.getRun(f.queued.id).result?.verdict).toBe("inconclusive");
+    const state=f.core.plans.getRun(f.queued.id);
+    expect(state.run.verdict).not.toBe("contradicted");expect(state.run).toMatchObject({status:"blocked",reason:expect.stringMatching(/^revalidation-baseline-answer-unreadable/)});
   });
   it("labels a binding refusal inside native admission as that refusal",async()=>{
     const f=await fixture(),execute=f.native.execute.getMockImplementation()!;
@@ -291,5 +293,33 @@ describe("BB-native revalidation runner",()=>{
       expect(f.requests).toHaveLength(0);expect(f.store.get("revalidation-progress",f.queued.id)).toBeNull();
       expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-shared-concurrency-unavailable (case case-a, baseline)"});
     }finally{vi.useRealTimers();}
+  });
+  it("blocks at the run deadline while waiting for concurrency room",async()=>{
+    const f=await fixture(d=>{d.limits!.maxDurationMs=60_000;});f.options.hasCapacity=()=>false;const runner=createRevalidationRunner(f.options);
+    vi.useFakeTimers({toFake:["setTimeout"]});
+    try{
+      const pending=runner.handle(f.ctx);
+      for(let t=1;t<=14;t++){f.setTime(NOW+t*5000);await vi.advanceTimersByTimeAsync(5000);}
+      await pending;
+      expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-shared-concurrency-unavailable (case case-a, baseline)"});
+    }finally{vi.useRealTimers();}
+  });
+  it("keeps the stop reason when the run is stopped mid-wait and clears the waiting note",async()=>{
+    const f=await fixture();f.options.hasCapacity=()=>false;const runner=createRevalidationRunner(f.options);
+    vi.useFakeTimers({toFake:["setTimeout"]});
+    try{
+      const pending=runner.handle(f.ctx);await vi.advanceTimersByTimeAsync(5000);
+      f.disable();runner.enforce();await vi.advanceTimersByTimeAsync(5000);await pending;
+      expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:expect.stringMatching(/^revalidation-execution-disabled/)});
+      expect(f.store.get("revalidation-progress",f.queued.id)).toBeNull();expect(f.requests).toHaveLength(0);
+    }finally{vi.useRealTimers();}
+  });
+  it("clears a waiting note left by a crash when recovering the run",async()=>{
+    const f=await fixture();let release!:()=>void;f.setHook(()=>new Promise(resolve=>{release=()=>resolve({output:"x"});}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    f.store.put("revalidation-progress",f.queued.id,{waitingFor:"shared-concurrency",sinceMs:NOW});
+    createRevalidationRunner(f.options).recover("next-boot");
+    expect(f.store.get("revalidation-progress",f.queued.id)).toBeNull();
+    release();await pending;
   });
 });

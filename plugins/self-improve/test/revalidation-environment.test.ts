@@ -127,3 +127,9 @@ it("records a BB version call the host does not support as a stable unknown", as
   const first = await f.observer.check(environment), second = await f.observer.check(environment);
   expect(first.bbVersion).toBeNull(); expect(first.unknowns).toContain("bb-version-not-observed"); expect(second.digest).toBe(first.digest);
 });
+it("retries a transient version failure even when its wording mentions not found", async () => {
+  const f = fixture(); f.methods.system.version.mockRejectedValueOnce(Object.assign(new Error("machine not found"), { status: 503 }));
+  await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
+  f.methods.system.version.mockRejectedValueOnce(Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }));
+  await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
+});

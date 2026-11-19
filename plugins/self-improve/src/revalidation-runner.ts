@@ -19,6 +19,10 @@ const answerSchema=z.object({output:z.string().max(8000)}).strict();
 const inputSchema=z.object({kind:z.literal("revalidation"),revalidationRunId:z.string().min(1).max(200),solutionId:z.string().max(250).optional()}).strict();
 class RunnerFailure extends Error { constructor(readonly code:string){super(code);} }
 function fail(code:string):never{throw new RunnerFailure(code);}
+/** Whether a criterion's measurement compares against the baseline arm (and so needs a readable baseline answer). */
+function usesBaseline(c:FrozenRevalidationPlan["definition"]["criteria"][number],value:FrozenRevalidationPlan):boolean{
+  return value.workload!.definition.measurements.find(m=>m.criterionId===c.id)?.kind==="regression-count"||c.statistic!=="treatment";
+}
 /** A bounded, fixed-vocabulary code from a native, adapter or observer error; free-form messages are never recorded. */
 function errorCode(error:unknown):string|null{
   if(error instanceof Error&&error.name==="TimeoutError")return "observation-timeout";
@@ -36,7 +40,7 @@ const TASK_INSTRUCTIONS="Perform the supplied test task. Return only JSON {outpu
 const MAX_NATIVE_INSTRUCTIONS=32768;
 const treatmentInstructions=(artifact:string)=>`${TASK_INSTRUCTIONS}\n\nAdditional instruction:\n${artifact}`;
 /** Ended runs keep reconciling late native reports for this long, at this interval, then stop being scanned. */
-const ENVIRONMENT_RETRIES=2,ENVIRONMENT_RETRY_MS=2000,CAPACITY_POLL_MS=5000,CAPACITY_WAIT_LIMIT_MS=10*60*1000;
+const ENVIRONMENT_RETRIES=2,ENVIRONMENT_RETRY_MS=2000,CAPACITY_POLL_MS=5000,CAPACITY_WAIT_LIMIT_MS=10*60*1000,CAPACITY_WAIT_RUN_LIMIT_MS=30*60*1000;
 /** What a running run is currently waiting for, shown in the plan detail; removed when the wait ends. */
 export const PROGRESS="revalidation-progress";
 /** Ended runs reconciled per sweep, so a restart spreads its catch-up over several minutes. */
@@ -74,6 +78,8 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
   const stopCodes=new Map<string,string>();
   /** Runs whose last reconciliation failed, and runs past the reconciliation window that are never scanned again. */
   const failing=new Set<string>(),settled=new Set<string>();
+  /** Total time each active run has spent waiting for shared concurrency; it holds the builder queue meanwhile. */
+  const waited=new Map<string,number>();
   /** Case and arm in flight per run, so an operational failure names where it happened. */
   const position=new Map<string,{caseId:string;arm:"baseline"|"treatment"}>();
   const journal=(runId:string)=>store.get<ExecutionJournal>(JOURNALS,runId);
@@ -202,13 +208,14 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
    */
   async function waitForCapacity(j:ExecutionJournal,signal:AbortSignal){
     if(!options.hasCapacity||options.hasCapacity())return;
-    const since=now();store.put(PROGRESS,j.runId,{waitingFor:"shared-concurrency",sinceMs:since});
+    const since=now(),before=waited.get(j.runId)??0;store.put(PROGRESS,j.runId,{waitingFor:"shared-concurrency",sinceMs:since});
     try{
       while(!options.hasCapacity()){
-        if(now()-since+CAPACITY_POLL_MS>CAPACITY_WAIT_LIMIT_MS||now()+CAPACITY_POLL_MS>=j.deadlineAtMs)fail("revalidation-shared-concurrency-unavailable");
+        const spent=now()-since;
+        if(spent+CAPACITY_POLL_MS>CAPACITY_WAIT_LIMIT_MS||before+spent+CAPACITY_POLL_MS>CAPACITY_WAIT_RUN_LIMIT_MS||now()+CAPACITY_POLL_MS>=j.deadlineAtMs)fail("revalidation-shared-concurrency-unavailable");
         await bounded(new Promise<void>(resolve=>setTimeout(resolve,CAPACITY_POLL_MS)),signal);current(j);
       }
-    }finally{store.remove(PROGRESS,j.runId);}
+    }finally{store.remove(PROGRESS,j.runId);waited.set(j.runId,before+now()-since);}
   }
   function validateProtocol(value:FrozenRevalidationPlan,runId:string){
     const {definition:def,workload}=value;if(!workload)fail("revalidation-workload-unavailable");
@@ -233,7 +240,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     let state=revalidation.plans.getRun(runId);
     if(!["queued","running"].includes(state.run.status))return {revalidation:1,terminal:1};
     if(state.run.status==="running"){
-      revalidation.executor.interrupt({runId,expectedVersion:state.version});revoke(runId,"revalidation-interrupted");usage(runId,"interrupted");return {revalidation:1,blocked:1};
+      revalidation.executor.interrupt({runId,expectedVersion:state.version});store.remove(PROGRESS,runId);revoke(runId,"revalidation-interrupted");usage(runId,"interrupted");return {revalidation:1,blocked:1};
     }
     // A disabled plugin leaves queued runs queued; Services retries deferred jobs with backoff.
     if(disposed||!options.allowed())throw new Deferred("revalidation-execution-disabled");
@@ -274,6 +281,9 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
           const receipt:RevalidationCaseReceipt={id:stableId("revalidation-receipt",taskId),runId,taskId,caseId:c.id,arm,binding:j.binding,threadId:response.threadId,requestId:response.requestId,turnId:response.turnId,promptHash,nativeRequestDigest:requestDigest,outputDigest:sha(answer??response.text),passed:answer!==null&&answer===c.expected,answerFormat:answer===null?"invalid":"valid",providerId:response.providerId,model:response.model,modelIdentitySource:"requested-selection",observedAtMs:now()};
           if(receipts.some(r=>r.threadId===receipt.threadId||r.requestId===receipt.requestId||r.turnId===receipt.turnId))fail("revalidation-reused-native-receipt");
           current(j);if(!store.insert(RECEIPTS,receipt.id,receipt))fail("revalidation-receipt-already-recorded");receipts.push(receipt);usage(runId,"partial-or-complete-native-observations");
+          // When every criterion compares against the baseline, one unreadable baseline answer already makes the result
+          // inconclusive; stop before paying for arms that cannot change it. Receipts and usage so far are kept.
+          if(arm==="baseline"&&receipt.answerFormat==="invalid"&&receipts.length<value.workload!.definition.cases.length*2&&value.definition.criteria.every(c=>usesBaseline(c,value)))fail("revalidation-baseline-answer-unreadable");
         }
       }
       await environment(j,signal);
@@ -289,8 +299,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       const refs=receipts.map(r=>r.id);
       revalidation.executor.complete({runId,lease:j.lease,binding:j.binding,observations:value.definition.criteria.map(c=>{
         const kind=value.workload!.definition.measurements.find(m=>m.criterionId===c.id)!.kind;
-        const usesBaseline=kind==="regression-count"||c.statistic!=="treatment";
-        return {unusable:usesBaseline&&invalid.baseline>0?"baseline-answer-format-invalid" as const:null,criterionId:c.id,metric:c.metric,unit:c.unit,baseline:kind==="exact-pass-rate"?rate(baseline):0,treatment:kind==="exact-pass-rate"?rate(treatment):regressions,pairs,exposure:null,exposureUnit:null,receiptRefs:refs};
+        return {unusable:usesBaseline(c,value)&&invalid.baseline>0?"baseline-answer-format-invalid" as const:null,criterionId:c.id,metric:c.metric,unit:c.unit,baseline:kind==="exact-pass-rate"?rate(baseline):0,treatment:kind==="exact-pass-rate"?rate(treatment):regressions,pairs,exposure:null,exposureUnit:null,receiptRefs:refs};
       }),evidence:{kind:value.definition.mode==="replay"?"exploratory-replay":"exploratory-challenge",receiptRefs:refs,limitations:["Ordinary BB/provider/user/workspace context and tools may remain; no enforced isolation or causal claim.","Only exact answers on the frozen prompt cases were compared; packaged skill/plugin portability was not tested.","Provider/model identity is the requested selection; native billing remains incomplete.",
         ...(invalid.baseline||invalid.treatment?[`Answers not in the required format: ${invalid.baseline} baseline${invalid.baseline?" (baseline comparisons inconclusive)":""}, ${invalid.treatment} treatment (scored as failed).`]:[])]},usage:{calls:operations(runId).filter(o=>o.admittedAtMs!==null).length,elapsedMs:Math.max(0,now()-j.startedAtMs),costMicros:null,currency:value.definition.limits!.currency}});
       usage(runId,"completed");return {revalidation:1,completed:1,pairs};
@@ -319,7 +328,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       }
       revoke(runId,"revalidation-terminal");usage(runId,reason);
       return {revalidation:1,operationalFailure:1};
-    } finally {if(controller)controller.abort();active.delete(runId);position.delete(runId);stopCodes.delete(runId);}
+    } finally {if(controller)controller.abort();active.delete(runId);position.delete(runId);stopCodes.delete(runId);waited.delete(runId);}
   }
   return {
     admissionGuard,dispatchGuard,
@@ -332,7 +341,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       // Runs at startup: one damaged run must not prevent the plugin from starting or other runs from recovering.
       for(const entry of store.entries<RevalidationRun>("revalidation-runs")){
         if(entry.value.status!=="running"||active.has(entry.key))continue;
-        try{const j=journal(entry.key);if(j?.boot===boot)continue;revalidation.executor.interrupt({runId:entry.key,expectedVersion:entry.version});revoke(entry.key,"revalidation-interrupted");usage(entry.key,"interrupted");}
+        try{const j=journal(entry.key);if(j?.boot===boot)continue;revalidation.executor.interrupt({runId:entry.key,expectedVersion:entry.version});store.remove(PROGRESS,entry.key);revoke(entry.key,"revalidation-interrupted");usage(entry.key,"interrupted");}
         catch{failed++;}
       }
       return failed;
