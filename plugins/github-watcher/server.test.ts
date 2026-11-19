@@ -304,6 +304,15 @@ describe("the tool", () => {
     expect(harness.registrations.services.map((s) => s.name)).toEqual(["watches"]);
   });
 
+  it("tells a thread a mid-step wait spans a turn and not to poll gh in a loop", async () => {
+    const { harness } = await setup(WITH_HOOKS);
+    const instructions = harness.registrations.agentTools.find((t: { name: string }) => t.name === "github_watch")?.instructions ?? "";
+    expect(instructions).toContain("may span a turn boundary");
+    expect(instructions).toContain("checks rollup");
+    expect(instructions).toContain("sleep loop");
+    expect(instructions).toContain("gh pr checks --watch");
+  });
+
   it("records a watch under the name GitHub uses, is a no-op the second time, and stops at the limit", async () => {
     const { bb, harness, tool, text, rows, github } = await setup(WITH_HOOKS);
     expect(harness.registrations.services.map((s) => s.name)).toEqual(["watches"]);
