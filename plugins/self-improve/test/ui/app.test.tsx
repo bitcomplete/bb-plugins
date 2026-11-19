@@ -8,13 +8,13 @@ import { problem, vote } from "../domain/fixtures.js";
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
 const snapshot = (): DashboardData => ({ problems: [problem()], solutions: [], ranking: [], runs: [], versions: {}, health: { enabled: false, issues: [] }, costs: { totals: [] }, votes: [vote()] });
-async function page(context = { projectId: "project-1" as string | null }) {
+async function page(context = { projectId: "project-1" as string | null }, overrides: Record<string, (input: any) => unknown> = {}) {
   const app = await loadPluginApp(() => import("../../app.js"));
   const panel = app.navPanels.find(p => p.id === "self-improve");
   if (!panel) throw new Error("Missing Self improve navigation panel");
   const slot = renderSlot(panel, { subPath: "" }, { context, rpc: {
     getExecution: () => ({revision:"config-v1",projectId:"project-1",environmentId:"worker-env",selection:{providerId:"codex",model:"selected",reasoningLevel:"high"},permissionMode:"accept-edits"}),
-    dashboard: snapshot, startChat: () => ({ threadId: "scoped-chat" }), performance: () => ({ points: [] }),
+    dashboard: snapshot, startChat: () => ({ threadId: "scoped-chat" }), performance: () => ({ points: [] }), publications: () => ({publications:[]}), ...overrides,
   } });
   cleanups.push(() => slot.lifecycle.unmount());
   await slot.findByRole("button", { name: /Open problem/ });
@@ -58,4 +58,26 @@ it("routes the shared provider/model and permission pickers to the worker enviro
   expect(permission.getAttribute("data-routing-id")).toBe("worker-env");
   expect(permission.getAttribute("data-provider-id")).toBe("codex");
   expect(slot.getByRole("button",{name:"Save execution",hidden:true})).toHaveProperty("disabled",true);
+});
+
+
+it("connects publication list, history and explicit remote check through the installed app page", async () => {
+  const observation={id:"check-1",publicationId:"publication",draftId:"draft",solutionId:"solution",revision:"r1",bundleSha256:"a".repeat(64),sequence:1,observedAtMs:1000,releaseTag:null,
+    review:{state:"open",url:"https://github.com/org/repo/pull/7",headCommit:"b".repeat(40),submittedCommitChanged:false},
+    repository:{state:"unconfirmed",commit:null,url:null},release:{state:"not-requested",tag:null,commit:null,url:null,prerelease:null},issues:[]};
+  const slot=await page({projectId:"project-1"},{
+    publications:()=>({publications:[{id:"publication",solutionId:"solution",revision:"r1",draftId:"draft",repository:"org/repo",directory:"plugins/fix",submission:"submitted-for-review",url:"https://github.com/org/repo/pull/7",latest:null}]}),
+    publicationHistory:()=>({observations:[]}), reconcilePublication:()=>observation,
+  });
+  fireEvent.click(slot.getByRole("tab",{name:"Performance"}));
+  await slot.findByRole("button",{name:"Check publication"});
+  expect(slot.inspection.rpcCalls.filter(call=>call.method==="publications").map(call=>call.input)).toEqual([{}]);
+  expect(slot.inspection.rpcCalls.some(call=>call.method==="reconcilePublication")).toBe(false);
+  fireEvent.click(slot.getByRole("button",{name:"Show recorded history"}));
+  await slot.findByText("No recorded remote observations.");
+  expect(slot.inspection.rpcCalls.find(call=>call.method==="publicationHistory")?.input).toEqual({publicationId:"publication"});
+  expect(slot.inspection.rpcCalls.some(call=>call.method==="reconcilePublication")).toBe(false);
+  fireEvent.click(slot.getByRole("button",{name:"Check publication"}));
+  await slot.findAllByText(/PR open/);
+  expect(slot.inspection.rpcCalls.filter(call=>call.method==="reconcilePublication").map(call=>call.input)).toEqual([{publicationId:"publication"}]);
 });

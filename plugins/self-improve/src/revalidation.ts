@@ -2,72 +2,26 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Actor, Store } from "./store.js";
 import { stableId, stableJson } from "./domain/shared.js";
-import { executionSelectionSchema } from "./native-execution.js";
-
-const id = z.string().min(1).max(200).regex(/^[A-Za-z0-9_.:-]+$/);
-const prose = z.string().min(1).max(4000).refine(value => !!value.trim() && !value.includes("\0"));
-const digest = z.string().regex(/^[a-f0-9]{64}$/);
-const finite = z.number().finite();
-const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const requirement = z.enum(["exploratory", "observational", "held-out", "causal"]);
-export const revalidationTargetSchema = z.object({
-  solutionId: id, namespace: z.enum(["native-evaluation-artifacts", "built-artifacts", "validated-artifacts"]),
-  artifactId: id, revision: id, artifactDigest: digest,
-}).strict();
-export const revalidationCriterionSchema = z.object({
-  id, role: z.enum(["primary", "guardrail"]), required: z.boolean(),
-  evaluator: z.enum(["numeric-comparison-v1", "unsupported"]), metric: prose, unit: prose,
-  statistic: z.enum(["treatment", "difference", "relative-change"]),
-  threshold: z.object({ operator: z.enum(["at-least", "at-most"]), value: finite }).strict(),
-  unsupportedReason: prose.nullable(),
-}).strict().refine(c => c.evaluator === "unsupported" ? c.unsupportedReason !== null : c.unsupportedReason === null,
-  "Unsupported criteria need an explicit reason; numeric criteria cannot declare one");
-export const revalidationEnvironmentSchema = z.object({
-  declaredNonsecret: z.literal(true),
-  dependencies: z.array(z.object({ kind: z.enum(["plugin", "skill", "tool", "runtime"]), name: prose, version: prose, setup: prose }).strict()).max(100),
-  configuration: z.array(z.object({ name: prose, value: prose }).strict()).max(100),
-  untested: z.array(prose).max(100), execution: executionSelectionSchema,
-}).strict();
-export const revalidationDefinitionSchema = z.object({
-  target: revalidationTargetSchema, mode: z.enum(["replay", "challenge", "new-environment"]),
-  concern: prose, // Deliberately not trimmed or rewritten: preserve the owner's skepticism verbatim.
-  claim: z.object({ id, text: prose, scope: prose, originalEvidenceRefs: z.array(prose).max(100), requiredEvidence: requirement }).strict(),
-  comparator: prose.nullable(), workload: z.object({ description: prose, manifestDigest: digest }).strict().nullable(),
-  criteria: z.array(revalidationCriterionSchema).max(100),
-  sample: z.object({ minimumPairs: count.positive(), minimumExposure: finite.positive().nullable(), exposureUnit: prose.nullable() }).strict()
-    .refine(s => (s.minimumExposure === null) === (s.exposureUnit === null), "Exposure requires both amount and unit").nullable(),
-  environment: revalidationEnvironmentSchema.nullable(),
-  limits: z.object({ maxDurationMs: count.positive(), maxCalls: count.positive(), maxCostMicros: count.nullable(),
-    currency: z.string().regex(/^[A-Z]{3}$/), allowUnknownCost: z.boolean() }).strict().nullable(),
-}).strict().refine(d => new Set(d.criteria.map(c => c.id)).size === d.criteria.length, "Criterion IDs must be unique");
-export const createRevalidationSchema = z.object({ requestId: id, definition: revalidationDefinitionSchema }).strict();
-export const reviseRevalidationSchema = z.object({ planId: id, expectedVersion: count.positive(), definition: revalidationDefinitionSchema }).strict();
-export const freezeRevalidationSchema = z.object({ planId: id, expectedVersion: count.positive() }).strict();
-export const queueRevalidationSchema = z.object({ planId: id, version: count.positive(), requestId: id }).strict();
-export type RevalidationTarget = z.infer<typeof revalidationTargetSchema>;
-export type RevalidationDefinition = z.infer<typeof revalidationDefinitionSchema>;
-export type RevalidationEnvironment = z.infer<typeof revalidationEnvironmentSchema>;
-export type EvidenceRequirement = z.infer<typeof requirement>;
-export interface RevalidationPlan { id: string; version: number; previousVersion: number | null; definition: RevalidationDefinition; createdAtMs: number; actor: Actor }
-export interface FrozenRevalidationPlan { planId: string; version: number; planDigest: string; definition: RevalidationDefinition;
-  artifact: { target: RevalidationTarget; content: string }; environmentDigest: string; workloadDigest: string; frozenAtMs: number }
-export interface RevalidationBinding { planDigest: string; artifactDigest: string; environmentDigest: string; workloadDigest: string }
-export type RevalidationExecutionStatus = "queued" | "running" | "blocked" | "failed" | "cancelled" | "completed";
-export type ClaimVerdict = "supported" | "contradicted" | "inconclusive";
-export interface RevalidationRun { id: string; planId: string; planVersion: number; sequence: number; requestId: string; binding: RevalidationBinding;
-  status: RevalidationExecutionStatus; verdict: ClaimVerdict | null; createdAtMs: number; startedAtMs: number | null; endedAtMs: number | null; reason: string | null }
-const observationSchema = z.object({ criterionId: id, metric: prose, unit: prose, baseline: finite.nullable(), treatment: finite.nullable(),
-  pairs: count, exposure: finite.nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100) }).strict();
+import { revalidationIdSchema as id, revalidationProseSchema as prose, revalidationDigestSchema as digest,
+  revalidationCountSchema as count, revalidationRequirementSchema as requirement, revalidationDefinitionSchema,
+  revalidationEnvironmentSchema, revalidationTargetSchema, createRevalidationSchema, reviseRevalidationSchema,
+  freezeRevalidationSchema, queueRevalidationSchema, REVALIDATION_PROTOCOL, revalidationWorkloadRefSchema, revalidationUsageJournalInputSchema,
+  type RevalidationTarget, type RevalidationDefinition, type RevalidationEnvironment, type EvidenceRequirement,
+  type RevalidationPlan, type FrozenRevalidationPlan, type RevalidationBinding, type RevalidationRun,
+  type RevalidationObservation, type RevalidationEvidence, type RevalidationUsage, type CriterionAssessment,
+  type ClaimVerdict, type RevalidationResult, type RevalidationWorkloadRef, type RevalidationWorkloadSnapshot, type RevalidationUsageJournalInput, type RevalidationUsageJournalEntry,
+} from "./revalidation-contract.js";
+export * from "./revalidation-contract.js";
+import { validateWorkloadSnapshot } from "./revalidation-workload.js";
+import { validateObservedRevalidationEnvironment, type ObservedRevalidationEnvironment } from "./revalidation-environment.js";
+export interface RevalidationOptions { redact: (value: string) => string; now?: () => number;
+  workloads?: { resolve(reference: RevalidationWorkloadRef): RevalidationWorkloadSnapshot };
+  environmentSnapshots?: { resolve(environment: RevalidationEnvironment): ObservedRevalidationEnvironment } }
+const observationSchema = z.object({ criterionId: id, metric: prose, unit: prose, baseline: z.number().finite().nullable(), treatment: z.number().finite().nullable(),
+  pairs: count, exposure: z.number().finite().nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100) }).strict();
 const evidenceSchema = z.object({ kind: z.enum(["exploratory-replay", "exploratory-challenge", "observational"]),
   receiptRefs: z.array(prose).min(1).max(100), limitations: z.array(prose).min(1).max(100) }).strict();
 const usageSchema = z.object({ calls: count, elapsedMs: count, costMicros: count.nullable(), currency: z.string().regex(/^[A-Z]{3}$/) }).strict();
-export type RevalidationObservation = z.infer<typeof observationSchema>;
-export type RevalidationEvidence = z.infer<typeof evidenceSchema>;
-export type RevalidationUsage = z.infer<typeof usageSchema>;
-export interface CriterionAssessment { criterionId: string; status: "threshold-met" | "threshold-not-met" | "inconclusive"; value: number | null; reason: string | null }
-export interface RevalidationResult { runId: string; binding: RevalidationBinding; verdict: ClaimVerdict; observations: RevalidationObservation[];
-  criteria: CriterionAssessment[]; evidence: RevalidationEvidence; usage: RevalidationUsage; observedAtMs: number }
-export interface RevalidationOptions { redact: (value: string) => string; now?: () => number }
 const hash = (value: unknown): string => createHash("sha256").update(stableJson(value)).digest("hex");
 const contentDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 export const revalidationEnvironmentDigest = (environment: RevalidationEnvironment): string => hash(revalidationEnvironmentSchema.parse(environment));
@@ -119,7 +73,17 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
   function freezeRecord(planId: string, version: number): FrozenRevalidationPlan {
     const frozen = store.get<FrozenRevalidationPlan>("revalidation-frozen", versionKey(planId, version));
     if (!frozen) throw new Error("revalidation-plan-not-frozen");
-    const expected = hash({ planId, version, definition: frozen.definition, artifact: frozen.artifact });
+    // Version 1 digests remain interpretable, but never gain executable capabilities.
+    if (frozen.schemaVersion !== undefined && frozen.schemaVersion !== 2) throw new Error("revalidation-frozen-version-unsupported");
+    if (frozen.schemaVersion === 2) {
+      if (frozen.protocol !== REVALIDATION_PROTOCOL || !frozen.workload || !frozen.observedEnvironment) throw new Error("revalidation-frozen-capability-missing");
+      validateWorkloadSnapshot(frozen.workload); validateObservedRevalidationEnvironment(frozen.observedEnvironment);
+      const ref = revalidationWorkloadRefSchema.parse(frozen.definition.workload);
+      if (frozen.workload.id !== ref.id || frozen.workload.version !== ref.version || frozen.workload.manifestDigest !== ref.manifestDigest || frozen.workload.definition.description !== ref.description ||
+        frozen.observedEnvironment.declaredEnvironmentDigest !== frozen.environmentDigest || frozen.environmentObservationDigest !== frozen.observedEnvironment.digest) throw new Error("revalidation-frozen-input-changed");
+    }
+    const expected = frozen.schemaVersion === 2 ? hash({ schemaVersion: 2, protocol: frozen.protocol, planId, version, definition: frozen.definition, artifact: frozen.artifact,
+      workload: frozen.workload, observedEnvironment: frozen.observedEnvironment }) : hash({ planId, version, definition: frozen.definition, artifact: frozen.artifact });
     if (frozen.planDigest !== expected || contentDigest(frozen.artifact.content) !== frozen.definition.target.artifactDigest ||
       frozen.environmentDigest !== revalidationEnvironmentDigest(frozen.definition.environment!) || frozen.workloadDigest !== frozen.definition.workload?.manifestDigest) throw new Error("revalidation-frozen-input-changed");
     return frozen;
@@ -129,7 +93,7 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
     if (!value) throw new Error("revalidation-run-missing"); return value;
   }
   function binding(frozen: FrozenRevalidationPlan): RevalidationBinding {
-    return { planDigest: frozen.planDigest, artifactDigest: frozen.definition.target.artifactDigest, environmentDigest: frozen.environmentDigest, workloadDigest: frozen.workloadDigest };
+    return { ...(frozen.schemaVersion === 2 ? {protocol:frozen.protocol,environmentObservationDigest:frozen.environmentObservationDigest} : {}), planDigest: frozen.planDigest, artifactDigest: frozen.definition.target.artifactDigest, environmentDigest: frozen.environmentDigest, workloadDigest: frozen.workloadDigest };
   }
   function updateRun(value: RevalidationRun, actor: Actor, reason: string): RevalidationRun {
     store.edit("revalidation-runs", value.id, store.version("revalidation-runs", value.id), value, actor, reason); return value;
@@ -149,6 +113,19 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
       const next = updateRun({ ...current, status, verdict: null, reason, endedAtMs: now() }, actor, reason);
       store.remove("revalidation-leases", runId); return next;
     });
+  }
+  function workloadCapabilityIssue(frozen: FrozenRevalidationPlan): string | null {
+    const workload=frozen.workload!.definition, def=frozen.definition;
+    if (def.sample!.minimumExposure !== null) return "exposure-measurement-unavailable";
+    if (def.sample!.minimumPairs > workload.cases.length) return "insufficient-planned-pairs";
+    if (def.limits!.maxCalls < workload.cases.length * 2) return "insufficient-planned-calls";
+    if (workload.measurements.length !== def.criteria.length) return "workload-measurement-mismatch";
+    for (const criterion of def.criteria) {
+      const measurement=workload.measurements.find(m=>m.criterionId===criterion.id);
+      if (!measurement || measurement.kind === "exact-pass-rate" && criterion.unit !== "proportion" ||
+        measurement.kind === "regression-count" && (criterion.unit !== "cases" || criterion.statistic !== "treatment")) return "workload-measurement-mismatch";
+    }
+    return null;
   }
   const plans = {
     create(raw: z.infer<typeof createRevalidationSchema>, actor: Actor): RevalidationPlan {
@@ -186,10 +163,24 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
         const value = plan(input.planId), def = definition(value.definition), key = versionKey(value.id, value.version);
         if (store.get("revalidation-frozen", key)) return freezeRecord(value.id, value.version);
         if (!def.comparator || !def.workload || !def.environment || !def.sample || !def.limits || !def.criteria.some(c => c.role === "primary" && c.required)) throw new Error("revalidation-plan-incomplete");
-        const snapshot = artifact(def.target);
-        const frozen: FrozenRevalidationPlan = { planId: value.id, version: value.version, definition: def, artifact: snapshot,
-          planDigest: hash({ planId: value.id, version: value.version, definition: def, artifact: snapshot }),
-          environmentDigest: revalidationEnvironmentDigest(def.environment), workloadDigest: def.workload.manifestDigest, frozenAtMs: now() };
+        const reference = revalidationWorkloadRefSchema.safeParse(def.workload);
+        if (!reference.success || !options.workloads) throw new Error("revalidation-workload-unavailable-create-new-version");
+        if (!def.limits.moneyLimitMode) throw new Error("revalidation-money-mode-required-create-new-version");
+        if (!options.environmentSnapshots) throw new Error("revalidation-environment-observation-unavailable");
+        const snapshot = artifact(def.target), workload = validateWorkloadSnapshot(options.workloads.resolve(reference.data));
+        if (workload.id !== reference.data.id || workload.version !== reference.data.version || workload.manifestDigest !== reference.data.manifestDigest || workload.definition.description !== reference.data.description) throw new Error("revalidation-workload-reference-changed");
+        privateText(workload.definition);
+        const observedEnvironment = validateObservedRevalidationEnvironment(options.environmentSnapshots.resolve(def.environment));
+        const environmentDigest = revalidationEnvironmentDigest(def.environment);
+        if (observedEnvironment.declaredEnvironmentDigest !== environmentDigest) throw new Error("revalidation-environment-observation-changed");
+        privateText(observedEnvironment);
+        // Observed identity is also immutable within a plan: re-freezing a revision
+        // must not move an unresolved contradiction to a newly observed environment.
+        const previousObservations = store.list<FrozenRevalidationPlan>("revalidation-frozen").filter(p=>p.planId===value.id && p.schemaVersion===2);
+        if (previousObservations.some(p=>p.environmentObservationDigest!==observedEnvironment.digest)) throw new Error("revalidation-new-observed-environment-needs-new-plan");
+        const frozen: FrozenRevalidationPlan = { schemaVersion:2, protocol:REVALIDATION_PROTOCOL, planId: value.id, version: value.version, definition: def, artifact: snapshot, workload, observedEnvironment,
+          planDigest: hash({ schemaVersion:2, protocol:REVALIDATION_PROTOCOL, planId: value.id, version: value.version, definition: def, artifact: snapshot, workload, observedEnvironment }),
+          environmentDigest, environmentObservationDigest:observedEnvironment.digest, workloadDigest:workload.manifestDigest, frozenAtMs: now() };
         store.createAudited("revalidation-frozen", key, frozen, actor, "Freeze criteria and exact artifact before execution"); return frozen;
       });
     },
@@ -225,8 +216,10 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
     history(planId: string) { head(planId); return { versions: store.list<RevalidationPlan>("revalidation-plans").filter(p => p.id === planId).sort((a, b) => a.version - b.version),
       runs: store.list<RevalidationRun>("revalidation-runs").filter(r => r.planId === planId).sort((a, b) => a.sequence - b.sequence),
       results: store.list<RevalidationResult>("revalidation-results").filter(r => run(r.runId).planId === planId) }; },
+    usage(runId: string) { run(runId); return store.list<RevalidationUsageJournalEntry>("revalidation-run-usage").filter(e=>e.runId===runId).sort((a,b)=>a.sequence-b.sequence); },
     getRun(runId: string) { return { run: run(runId), version: store.version("revalidation-runs", runId), result: store.get<RevalidationResult>("revalidation-results", runId) }; },
-    promotionGate(input: { target: RevalidationTarget; claims: Array<{ id: string; scope: string; requiredEvidence: EvidenceRequirement }>; environmentDigest: string }) {
+    promotionGate(input: { target: RevalidationTarget; claims: Array<{ id: string; scope: string; requiredEvidence: EvidenceRequirement }>; environmentDigest: string; environmentObservationDigest?: string }) {
+      if (input.environmentObservationDigest !== undefined) digest.parse(input.environmentObservationDigest);
       revalidationTargetSchema.parse(input.target); digest.parse(input.environmentDigest);
       const reasons: string[] = [];
       if (!input.claims.length) reasons.push("no-claims-selected");
@@ -245,6 +238,10 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
           // runs in one environment. Revisions cannot silently narrow it away.
           const generalChallenge = history.versions.some(p => p.definition.mode === "challenge");
           if (environment !== null && !matchesEnvironment && !generalChallenge) continue;
+          const matchesObservation = frozen?.schemaVersion === 2 && frozen.environmentObservationDigest === input.environmentObservationDigest;
+          // A known different observed environment is its own scope. Unfrozen
+          // drafts and general concerns still apply until resolved.
+          if (matchesEnvironment && frozen?.schemaVersion === 2 && input.environmentObservationDigest !== undefined && !matchesObservation && !generalChallenge) continue;
           if (store.get("revalidation-stale", key)) { reasons.push(`${claim.id}:stale`); continue; }
           const latest = history.runs.filter(r => r.planVersion === current.version).at(-1);
           if (!frozen || !latest) {
@@ -257,7 +254,10 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
           // A resolved general challenge supplies positive evidence only for its
           // actual frozen environment; another advertised environment needs its own.
           if (matchesEnvironment) {
-            if (!qualifies(result.evidence.kind, claim.requiredEvidence)) reasons.push(`${claim.id}:insufficient-evidence-class`);
+            if (frozen.schemaVersion !== 2) reasons.push(`${claim.id}:legacy-evidence-needs-revalidation`);
+            else if (input.environmentObservationDigest === undefined) reasons.push(`${claim.id}:environment-observation-required`);
+            else if (!matchesObservation) { /* A resolved general concern proves only its tested observation. */ }
+            else if (!qualifies(result.evidence.kind, claim.requiredEvidence)) reasons.push(`${claim.id}:insufficient-evidence-class`);
             else if (result.verdict === "supported") supportedEnvironment = true;
           }
         }
@@ -277,10 +277,48 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
         const frozen = freezeRecord(current.planId, current.planVersion); privateText(frozen.definition); privateText(frozen.artifact.content);
         const reason = head(current.planId).version !== current.planVersion ? "plan-superseded" : store.get("revalidation-stale", versionKey(current.planId, current.planVersion)) ? "claim-scope-stale" :
           frozen.definition.criteria.some(c => c.evaluator === "unsupported") ? "unsupported-criterion" :
-          ["held-out", "causal"].includes(frozen.definition.claim.requiredEvidence) ? "required-evidence-capability-unavailable" : null;
+          frozen.definition.claim.requiredEvidence !== "exploratory" ? "required-evidence-capability-unavailable" :
+          frozen.schemaVersion !== 2 || frozen.protocol !== REVALIDATION_PROTOCOL || !frozen.workload || !frozen.observedEnvironment ? "legacy-plan-needs-new-version-and-workload" :
+          !frozen.definition.limits?.moneyLimitMode ? "money-mode-unavailable-create-new-version" :
+          frozen.definition.limits.moneyLimitMode === "hard" ? "hard-cost-limit-unavailable" :
+          !frozen.definition.limits.allowUnknownCost ? "unknown-native-cost-not-authorized" : workloadCapabilityIssue(frozen);
         if (reason) return { run: finishOperational(current.id, "blocked", reason, { kind: "service", id: "revalidation-executor" }), lease: null };
         const lease = randomUUID(); store.put("revalidation-leases", current.id, { lease });
         return { run: updateRun({ ...current, status: "running", startedAtMs: now() }, { kind: "service", id: "revalidation-executor" }, "Start exact frozen revalidation"), lease };
+      });
+    },
+    assertActive(input: {runId:string;lease:string}) {
+      const current=run(input.runId);
+      if (current.status !== "running" || store.get<{lease:string}>("revalidation-leases",input.runId)?.lease !== input.lease) throw new Error("revalidation-stale-executor");
+      return {run:current,frozen:freezeRecord(current.planId,current.planVersion)};
+    },
+    interrupt(input: {runId:string;expectedVersion:number;reason?:string}): RevalidationRun {
+      return store.transaction(()=>{
+        if (store.version("revalidation-runs",input.runId)!==input.expectedVersion) throw new Error("revalidation-run-version-conflict");
+        const current=run(input.runId),reason=input.reason??"interrupted-needs-new-run";
+        if (current.status === "blocked" && current.reason === reason) return current;
+        if (current.status !== "running") throw new Error("revalidation-run-not-running");
+        const lease=store.get<{lease:string}>("revalidation-leases",input.runId)?.lease;
+        if (!lease) throw new Error("revalidation-stale-executor");
+        return finishOperational(input.runId,"blocked",reason,{kind:"service",id:"revalidation-recovery"},lease);
+      });
+    },
+    recordUsage(raw: RevalidationUsageJournalInput): RevalidationUsageJournalEntry {
+      const input=revalidationUsageJournalInputSchema.parse(raw); privateText(input);
+      return store.transaction(()=>{
+        const current=run(input.runId);
+        if (!same(input.binding,current.binding)) throw new Error("revalidation-usage-binding-mismatch");
+        const frozen=freezeRecord(current.planId,current.planVersion);
+        if (input.usage.currency !== frozen.definition.limits!.currency) throw new Error("revalidation-usage-currency-mismatch");
+        const entryId=stableId("revalidation-usage",[input.runId,input.requestId]), existing=store.get<RevalidationUsageJournalEntry>("revalidation-run-usage",entryId);
+        if (existing) {
+          const {id:_,sequence:__,recordedAtMs:___,...previous}=existing;
+          if (!same(previous,input)) throw new Error("revalidation-usage-request-conflict"); return existing;
+        }
+        const sequence=(store.get<number>("revalidation-usage-sequence",input.runId)??0)+1;
+        const value:RevalidationUsageJournalEntry={...input,id:entryId,sequence,recordedAtMs:now()};
+        store.createAudited("revalidation-run-usage",entryId,value,{kind:"service",id:"revalidation-accounting"},"Append usage observation; scientific results remain unchanged");
+        store.put("revalidation-usage-sequence",input.runId,sequence);return value;
       });
     },
     block(input: { runId: string; reason: string; lease?: string }) { return finishOperational(input.runId, "blocked", input.reason, { kind: "service", id: "revalidation-executor" }, input.lease); },

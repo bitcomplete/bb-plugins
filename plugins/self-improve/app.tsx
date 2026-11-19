@@ -26,7 +26,14 @@ function SelfImprovePage() {
     }
     previousConnection.current = connection;
   }, [connection, refresh]);
-  const api = useMemo<DashboardApi>(() => ({
+  const api = useMemo<Required<DashboardApi>>(() => ({
+    revalidationOverview: input => rpc.call("revalidationOverview", input),
+    revalidationPlan: input => rpc.call("revalidationPlan", input),
+    editRevalidationDraft: input => rpc.call("editRevalidationDraft", input),
+    freezeRevalidation: input => rpc.call("freezeRevalidation", input),
+    queueRevalidation: input => rpc.call("queueRevalidation", input),
+    cancelRevalidation: input => rpc.call("cancelRevalidation", input),
+    startRevalidationChat: input => rpc.call("startRevalidationChat", input),
     dashboard: input => rpc.call("dashboard", input),
     retest: input => rpc.call("retest", input),
     startChat: input => rpc.call("startChat", input),
@@ -34,6 +41,9 @@ function SelfImprovePage() {
     performance: input => rpc.call("performance", input),
     exportSolution: input => rpc.call("exportSolution", input),
     publishExport: input => rpc.call("publishExport", input),
+    publications: input => rpc.call("publications", input),
+    publicationHistory: input => rpc.call("publicationHistory", input),
+    reconcilePublication: input => rpc.call("reconcilePublication", input),
   }), [rpc]);
   return <><ExecutionSettings refreshKey={refreshKey} onSaved={refresh}/><Dashboard key={projectId ?? "no-project"} api={api} projectId={projectId} refreshKey={refreshKey}
     onOpenThread={id => navigate.toThread(id)}

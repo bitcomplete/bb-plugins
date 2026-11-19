@@ -1,3 +1,4 @@
+import type { RevalidationApi } from "../revalidation-api.js";
 import type { PublicationApi } from "../publication-view.js";
 import type { ActivityCostView } from "../activity-view.js";
 import type { Problem, RankedSolution, Solution, Verification, Vote } from "../domain/types.js";
@@ -41,7 +42,7 @@ export interface ObjectiveInput {
   metric?: { name: string; unit: string; target: number; direction: "lower" | "higher" };
 }
 export interface ExportArtifact { artifactId: string; files: Array<{ path: string; content: string }>; status: "draft"; bundleSha256: string }
-export interface DashboardApi extends Partial<PublicationApi> {
+export interface DashboardApi extends Partial<PublicationApi>, Partial<RevalidationApi> {
   dashboard(input: Record<string, never>): Promise<DashboardData>;
   retest(input: { solutionId: string; expectedVersion: number; reason: string }): Promise<{ jobId: string }>;
   startChat(input: { kind: Selection["kind"]; id: string; projectId: string }): Promise<{ threadId: string }>;

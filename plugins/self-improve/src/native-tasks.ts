@@ -32,6 +32,8 @@ export interface NativeTaskSettlement extends NativeTaskIdentity {
 export interface NativeTaskHooks {
   /** Must be idempotent by taskId: recovery may repeat a reservation whose acknowledgement was lost. */
   beforeStart?(task: NativeTaskIdentity): Promise<void>;
+  /** Synchronous server-owned guard after durable dispatch identity checks; public metadata grants no authority. */
+  beforeDispatch?(record: Readonly<NativeTaskRecord>): void;
   /** Must upsert by taskId/status. A later recovery can settle an uncertain dispatch. No prompt or output is supplied. */
   onSettled?(task: NativeTaskSettlement): Promise<void>;
 }
@@ -58,7 +60,7 @@ export interface NativeTaskDispatch {
 }
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 const NS = "native-tasks", INDEX = "native-task-threads", RETIREMENTS = "native-task-retirements", SETTLEMENTS = "native-task-settlements", RECONCILE = "native-task-reconcile";
-const retirementSchema = z.object({ taskId: id, retiredAtMs: z.number().finite().nonnegative(), neverDispatched: z.literal(true) }).strict();
+const retirementSchema = z.object({ taskId: id, retiredAtMs: z.number().finite().nonnegative(), neverDispatched: z.literal(true), reasonCode: z.string().regex(/^[a-z0-9][a-z0-9-]{0,99}$/).optional() }).strict();
 export class NativeTaskError extends Error { constructor(readonly code: string) { super(code); this.name = "NativeTaskError"; } }
 const fail = (code: string): never => { throw new NativeTaskError(code); };
 function identity(record: NativeTaskRecord): NativeTaskIdentity {
@@ -76,6 +78,9 @@ function bounded<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
 /** One fresh BB thread per task. No vendor protocol, native tool filtering or context-isolation guarantee. */
 export class NativeTaskRunner implements TaskRunner {
   private readonly locks = new Map<string, Promise<unknown>>();
+  private readonly taskControllers = new Map<string, AbortController>();
+  /** Reason codes for in-flight work revoked by this process; reconciliation-driven cancellation keeps its timeout/abort code. */
+  private readonly revokedReasons = new Map<string, string>();
   private readonly disposeSignal = new AbortController();
   private readonly now: () => number;
   private cleanupSweep: Promise<NativeCleanupResult> | null = null;
@@ -94,6 +99,31 @@ export class NativeTaskRunner implements TaskRunner {
       } else this.options.store.put(RETIREMENTS, taskId, { taskId, retiredAtMs: this.now(), neverDispatched: true }, this.now());
       return true;
     });
+  }
+  /** Trusted cancellation of named work only. Durable revocation precedes any cleanup RPC. */
+  revoke(taskIds: readonly string[], reasonCode: string): void {
+    if (!Array.isArray(taskIds) || !taskIds.length || taskIds.length > 100 || taskIds.some(taskId => !id.safeParse(taskId).success) || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(reasonCode)) return fail("native-task-revocation-invalid");
+    const selected = [...new Set(taskIds)];
+    this.options.store.transaction(() => {
+      for (const taskId of selected) {
+        const record = this.read(taskId);
+        if (!record) {
+          const previous = this.options.store.get(RETIREMENTS, taskId);
+          if (previous !== null) {
+            const parsed = retirementSchema.safeParse(previous);
+            if (!parsed.success || parsed.data.taskId !== taskId) return fail("native-task-retirement-invalid");
+          } else this.options.store.put(RETIREMENTS, taskId, { taskId, retiredAtMs: this.now(), neverDispatched: true, reasonCode }, this.now());
+        } else if (!["completed", "failed", "cancelled"].includes(record.state)) {
+          this.write({ ...record, active: false, state: "cancelled", error: reasonCode, endedAtMs: this.now() });
+        }
+      }
+    });
+    for (const taskId of selected) {
+      const controller = this.taskControllers.get(taskId);
+      if (controller) { this.revokedReasons.set(taskId, reasonCode); controller.abort(); }
+    }
+    // A failed stop/archive/settlement remains durable for the existing fair reconciler.
+    queueMicrotask(() => { void this.reconcileCleanup({ maxTasks: selected.length, timeoutMs: 5000 }).catch(() => {}); });
   }
   private notRetired(taskId: string): void {
     if (this.options.store.get(RETIREMENTS, taskId) !== null) fail("native-task-retired-before-dispatch");
@@ -142,6 +172,10 @@ export class NativeTaskRunner implements TaskRunner {
       if (dispatch.requestedExecution.providerId !== record.providerId) return fail("native-task-binding-mismatch");
       this.executionBinding(record, dispatch.requestedExecution);
       const bound = { ...record, threadId: thread.id, resolvedEnvironmentId: thread.environmentId ?? record.resolvedEnvironmentId, state: "running" as const, cleanupPending: true };
+      const guarded: unknown = this.options.hooks?.beforeDispatch?.(Object.freeze({ ...bound }));
+      if (guarded && typeof (guarded as { then?: unknown }).then === "function") {
+        void Promise.resolve(guarded).catch(() => {}); return fail("native-task-dispatch-guard-must-be-synchronous");
+      }
       this.write(bound); return bound;
     });
   }
@@ -271,6 +305,7 @@ export class NativeTaskRunner implements TaskRunner {
       return record;
     });
     const controller = new AbortController();
+    this.taskControllers.set(request.id, controller);
     const remaining = record.state === "completed" ? timeoutMs : Math.max(1, record.deadlineAtMs - this.now());
     const timer = setTimeout(() => controller.abort(), remaining);
     const combined = AbortSignal.any([controller.signal, this.disposeSignal.signal, ...(externalSignal ? [externalSignal] : [])]);
@@ -335,7 +370,8 @@ export class NativeTaskRunner implements TaskRunner {
       return { ...identity(record), ...finalTurn, threadId: record.threadId!, text, promptHash: record.promptHash, endedAtMs: record.endedAtMs!, modelIdentitySource: "requested-selection" };
     } catch (error) {
       record = this.read(request.id)!;
-      const code = externalSignal?.aborted || this.disposeSignal.signal.aborted ? "native-task-aborted" : controller.signal.aborted || this.now() >= record.deadlineAtMs ? "native-task-timeout" : error instanceof NativeTaskError ? error.code : "native-task-sdk-unavailable";
+      const revokedReason = this.revokedReasons.get(request.id);
+      const code = revokedReason && record.state === "cancelled" ? revokedReason : externalSignal?.aborted || this.disposeSignal.signal.aborted ? "native-task-aborted" : controller.signal.aborted || this.now() >= record.deadlineAtMs ? "native-task-timeout" : error instanceof NativeTaskError ? error.code : "native-task-sdk-unavailable";
       if (record.state !== "completed" && record.state !== "failed" && record.state !== "cancelled") {
         const uncertain = record.dispatched && !record.threadId && !["native-task-admission-denied"].includes(code);
         this.write({ ...record, active: false, state: uncertain ? "uncertain" : code === "native-task-aborted" ? "cancelled" : "failed", error: code, endedAtMs: this.now() });
@@ -343,6 +379,7 @@ export class NativeTaskRunner implements TaskRunner {
       throw new NativeTaskError(code);
     } finally {
       clearTimeout(timer);
+      if (this.taskControllers.get(request.id) === controller) { this.taskControllers.delete(request.id); this.revokedReasons.delete(request.id); }
       const latest = this.read(request.id); if (latest?.active) this.write({ ...latest, active: false });
       await this.cleanup(request.id);
       await this.settled(request.id);
