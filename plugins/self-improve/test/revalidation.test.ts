@@ -109,6 +109,16 @@ describe("rule 7: standing", () => {
     f.tick(); f.core.plans.freeze({ planId: plan.id, expectedVersion: 2 }, worker, owner);
     expect(f.core.plans.standing("s-a", "fewer-errors").verdict).toBeNull();
   });
+  it("lets the most recently frozen plan for a claim decide, across plans", () => {
+    const f = setup(), { run } = f.queued();
+    f.core.executor.start(run.id); f.core.executor.complete(run.id, f.result("supported"));
+    f.tick(); const other = f.core.plans.create({ requestId: "chat-plan", definition: { ...f.definition, concern: "Another doubt" } }, chat);
+    f.core.plans.freeze({ planId: other.id, expectedVersion: 1 }, worker, owner);
+    expect(f.core.plans.standing("s-a", "fewer-errors")).toMatchObject({ verdict: null, planId: other.id });
+    const otherRun = f.core.plans.queue({ planId: other.id, version: 1, requestId: "other-run" }, owner);
+    f.core.executor.start(otherRun.id); f.core.executor.complete(otherRun.id, f.result("contradicted"));
+    expect(f.core.plans.standing("s-a", "fewer-errors")).toMatchObject({ verdict: "contradicted", runId: otherRun.id });
+  });
   it("returns the same run for a repeated queue request", () => {
     const f = setup(), { plan, run } = f.queued();
     expect(f.core.plans.queue({ planId: plan.id, version: 1, requestId: "run-1" }, owner)).toEqual(run);

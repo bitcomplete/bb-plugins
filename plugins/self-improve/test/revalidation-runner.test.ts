@@ -95,6 +95,11 @@ describe("rule 3: stops leave no verdict", () => {
     expect(f.state().run).toMatchObject({ status, verdict: null, reason: expect.stringMatching(reason) });
     expect(f.state().result).toBeNull();
   });
+  it("records no verdict when the run is cancelled during its last call", async () => {
+    const f = fixture(); f.setReply((_r, input, treatment) => { if (f.requests.length === 4) f.core.plans.cancel({ runId: f.run.id, reason: "Stop" }, owner); return { output: treatment ? (input === "First task" ? "one" : "two") : "x" }; });
+    await f.runner.handle(f.ctx);
+    expect(f.requests).toHaveLength(4); expect(f.state().run).toMatchObject({ status: "cancelled", verdict: null }); expect(f.state().result).toBeNull();
+  });
   it("names the error, case and arm when a native call fails", async () => {
     const f = fixture(); f.setReply(() => { if (f.requests.length === 2) throw Object.assign(new Error("x"), { code: "native-task-timeout" }); return { output: "x" }; });
     await f.runner.handle(f.ctx);

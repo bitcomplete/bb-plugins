@@ -142,16 +142,17 @@ export function createRevalidation(store: Store, options: { redact: (value: stri
         runs: planRuns, results: planRuns.flatMap(r => { const result = store.get<RevalidationResult>(NS.results, r.id); return result ? [result] : []; }) };
     },
     getRun(runId: string) { return { run: run(runId), result: store.get<RevalidationResult>(NS.results, runId) }; },
-    /** The latest completed run of the latest frozen version decides a claim's standing; earlier results stay in the history. */
+    /**
+     * Across every plan for the claim, the most recently frozen version decides: its latest completed run's verdict,
+     * or no standing until one completes. Earlier results stay in the history.
+     */
     standing(solutionId: string, claimId: string): { verdict: ClaimVerdict | null; planId: string | null; runId: string | null } {
-      let latest: { verdict: ClaimVerdict; planId: string; runId: string; frozenAtMs: number } | null = null;
-      for (const p of plans.list(solutionId).filter(p => p.definition.claim.id === claimId)) {
-        const frozenVersions = store.list<FrozenRevalidationPlan>(NS.frozen).filter(f => f.planId === p.id).sort((a, b) => b.version - a.version);
-        const newest = frozenVersions[0]; if (!newest) continue;
-        const completed = runs(p.id).filter(r => r.planVersion === newest.version && r.status === "completed").at(-1);
-        if (completed?.verdict && (!latest || newest.frozenAtMs >= latest.frozenAtMs)) latest = { verdict: completed.verdict, planId: p.id, runId: completed.id, frozenAtMs: newest.frozenAtMs };
-      }
-      return latest ? { verdict: latest.verdict, planId: latest.planId, runId: latest.runId } : { verdict: null, planId: null, runId: null };
+      const planIds = new Set(plans.list(solutionId).filter(p => p.definition.claim.id === claimId).map(p => p.id));
+      const newest = store.list<FrozenRevalidationPlan>(NS.frozen).filter(f => planIds.has(f.planId))
+        .sort((a, b) => b.frozenAtMs - a.frozenAtMs || b.version - a.version)[0];
+      if (!newest) return { verdict: null, planId: null, runId: null };
+      const completed = runs(newest.planId).filter(r => r.planVersion === newest.version && r.status === "completed").at(-1);
+      return { verdict: completed?.verdict ?? null, planId: newest.planId, runId: completed?.id ?? null };
     },
   };
 
