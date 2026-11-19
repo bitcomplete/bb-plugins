@@ -31,7 +31,8 @@ export function applyImprovement(store: Store, input: { solutionId: string; arti
     if (!artifact || artifact.solutionId !== input.solutionId || artifact.kind !== "instruction" || typeof artifact.content !== "string" || sha(artifact.content) !== artifact.artifactDigest) throw new Error("Tested instruction not found for this solution");
     const previous = store.get<AppliedImprovement>(NS, input.solutionId);
     const value: AppliedImprovement = { solutionId: input.solutionId, artifactId: input.artifactId, revision: artifact.revision, artifactDigest: artifact.artifactDigest, content: artifact.content,
-      attemptId: input.attemptId, source: input.source, enabled: true, appliedAtMs: previous?.artifactId === input.artifactId ? previous.appliedAtMs : now, updatedAtMs: now };
+      // An automatic re-apply never turns back on an improvement the owner disabled.
+      attemptId: input.attemptId, source: input.source, enabled: input.source === "automatic" && previous ? previous.enabled : true, appliedAtMs: previous?.artifactId === input.artifactId ? previous.appliedAtMs : now, updatedAtMs: now };
     if (previous) store.edit(NS, input.solutionId, store.version(NS, input.solutionId), value, actor, input.source === "automatic" ? "Apply a tested improvement automatically" : "Apply a tested improvement");
     else store.createAudited(NS, input.solutionId, value, actor, input.source === "automatic" ? "Apply a tested improvement automatically" : "Apply a tested improvement");
     return value;

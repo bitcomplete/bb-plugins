@@ -44,3 +44,11 @@ it("sends improvements to every project except the worker project unless project
   expect(projectReceivesImprovements("worker", [], "worker")).toBe(false);
   expect(projectReceivesImprovements("p2", ["p1"], "worker")).toBe(false);
 });
+
+it("never re-enables an improvement the owner disabled when a later test applies it automatically", () => {
+  const f = fixture(), id = f.artifact("s1", "Text");
+  applyImprovement(f.store, { solutionId: "s1", artifactId: id, attemptId: "a1", source: "automatic" }, service);
+  setImprovementEnabled(f.store, "s1", false, owner);
+  expect(applyImprovement(f.store, { solutionId: "s1", artifactId: id, attemptId: "a2", source: "automatic" }, service).enabled).toBe(false);
+  expect(applyImprovement(f.store, { solutionId: "s1", artifactId: id, attemptId: "a2", source: "owner" }, owner).enabled).toBe(true);
+});
