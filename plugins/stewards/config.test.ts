@@ -358,10 +358,14 @@ describe("playbooks", () => {
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/writeEnv/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/changes what the ticket needs/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/escalated as a `decision`/u);
-    // BB-267: a by-hand configure step outside the repos is an escalation too.
-    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/a `configure` escalation raised in the spec turn/u);
+    // BB-267 / BB-368: a by-hand configure step outside the repos is an
+    // escalation, named in the spec with its trigger and raised when it happens.
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/a `configure` escalation/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/kind: "decision"/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/resolution: "done"/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/Name it in the spec turn with the trigger that makes it doable/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/a pull request opening, a merge, a deploy/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/raise the escalation when that trigger has happened/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/never a README line or a closing-comment follow-up/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/raise that step again/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/the user's to grant/u);

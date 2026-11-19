@@ -500,6 +500,11 @@ describe("the nightly prompt", () => {
     expect(wake).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
     expect(wake).toMatch(/corrected at spec approval/u);
     expect(STANDING_RULES.join("\n")).toMatch(/even when the ticket or spec says the owner produces or seals it by hand/u);
+    // BB-368: a by-hand step is named in the spec with its trigger and raised
+    // as a configure escalation when the trigger has happened.
+    expect(STANDING_RULES.join("\n")).toMatch(/named in the spec turn with the trigger that makes it doable/u);
+    expect(STANDING_RULES.join("\n")).toMatch(/a pull request opening, a merge, a deploy/u);
+    expect(STANDING_RULES.join("\n")).toMatch(/raised as a `configure` escalation when that trigger has happened/u);
   });
 
   it("carries the rule that the plugin merges a gate-met pull request (BB-257)", () => {
@@ -629,6 +634,10 @@ describe("the decide-list listing in the wakes (BB-135)", () => {
     expect(wake).toContain('"A cross-repo contract" [project] — hooks.md');
     expect(wake).toContain('Deciding entry: "Identity and access" [user].');
     expect(wake).toContain("Rule: a `user` entry wins");
+    // BB-368: the project steward meets item 5 on a step named with its trigger
+    // and does not decline for deferring the escalation to that trigger.
+    expect(wake).toMatch(/named in the spec with the trigger that makes it doable/u);
+    expect(wake).toMatch(/do not decline for deferring the escalation to its trigger/u);
   });
 
   it("prints the listing on a plugin-filed approve-pr need in the project wake", () => {

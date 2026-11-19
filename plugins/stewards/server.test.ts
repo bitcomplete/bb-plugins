@@ -13503,12 +13503,15 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
     const wrap = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
     expect(wrap).toMatch(/Every pull request is merged and deployed/u);
-    // BB-267: a by-hand configure step is an escalation with followThrough, not
-    // folded into the closing comment; an "unchanged" provide-secret reopens it.
+    // BB-267 / BB-368: a by-hand configure step is named in the spec with its
+    // trigger and raised at wrap-up if it is still undone, keeping the binding
+    // open with followThrough; an "unchanged" provide-secret reopens it.
     expect(wrap).toMatch(/A by-hand step outside the repos that the feature needs to work/u);
+    expect(wrap).toMatch(/named in the spec turn with the trigger that makes it doable/u);
+    expect(wrap).toMatch(/a pull request opening, a merge, a deploy/u);
     expect(wrap).toMatch(/kind: "decision"/u);
     expect(wrap).toMatch(/resolution: "done"/u);
-    expect(wrap).toMatch(/keep the binding open with followThrough until its `configure` escalation is done/u);
+    expect(wrap).toMatch(/keep the binding open with followThrough until it is done/u);
     expect(wrap).toMatch(/"unchanged" has not provided the value: raise that step again/u);
   });
 
