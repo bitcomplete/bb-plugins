@@ -7775,14 +7775,15 @@ describe("needs you items", () => {
     expect(t.githubMerges).toHaveLength(1);
   });
 
-  it("does not match a refusal recorded before the draft field existed (BB-373)", async () => {
+  it("clears a pre-BB-373 draft refusal once the pull request is ready (BB-373)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    // A refusal recorded by the pre-BB-373 code, whose key had no draft field.
+    // A refusal recorded by the pre-BB-373 code, under the old three-field
+    // key, whose cause was the draft state.
     t.hooks.store.escalate({
       bindingId: b.id,
       kind: "stuck",
-      question: "Could not merge acme/web#7: Pull Request is still a draft",
+      question: "Could not merge acme/web#7: PUT /repos/acme/web/pulls/7/merge failed: 405 Pull Request is still a draft",
       meanwhile: "The plugin does not retry the same gate; the pull request stays open.",
       route: "steward",
       recommendation: null,
@@ -7791,6 +7792,45 @@ describe("needs you items", () => {
       data: { mergeRefusal: true, mergeKey: ["aaaaaaa1", "1:aaaaaaa1", "owner-reviewed"].join("|") },
     });
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toHaveLength(1);
+  });
+
+  it("keeps blocking a pre-BB-373 conflict refusal on the same head (BB-373)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // A real refusal recorded before the change: the head has not moved, so
+    // it still blocks the merge.
+    t.hooks.store.escalate({
+      bindingId: b.id,
+      kind: "stuck",
+      question: "Could not merge acme/web#7: Pull request is not mergeable: the merge conflict must be resolved",
+      meanwhile: "The plugin does not retry the same gate; the pull request stays open.",
+      route: "steward",
+      recommendation: null,
+      url: "https://github.com/acme/web/pull/7",
+      headSha: "aaaaaaa1",
+      data: { mergeRefusal: true, mergeKey: ["aaaaaaa1", "1:aaaaaaa1", "owner-reviewed"].join("|") },
+    });
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.binding(b.id)!.nonActions["merge-refused"]).toBeDefined();
+  });
+
+  it("records no refusal when GitHub still sees a draft, then merges once it clears (BB-373)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // The snapshot says ready, but the merge races a draft mark: GitHub
+    // refuses with 405. No refusal is recorded and no stuck is raised.
+    t.setMergePullError("PUT /repos/acme/web/pulls/7/merge failed: 405 Pull Request is still a draft");
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] }, draft: false }));
+    await t.ring("linear", "uuid-12");
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck")).toHaveLength(0);
+    expect(t.hooks.store.binding(b.id)!.nonActions["pull-draft"]).toBeDefined();
+    // The same head and marker on the next look retries and merges.
+    t.setMergePullError(null);
     await t.ring("linear", "uuid-12");
     expect(t.githubMerges).toHaveLength(1);
   });

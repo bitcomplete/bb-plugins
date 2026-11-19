@@ -9352,6 +9352,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // GitHub and records no refusal; it merges on the first look after
           // the pull request is marked ready.
           const isDraft = pull.pull?.draft === true;
+          // A merge GitHub refused because it still sees a draft (a race
+          // between the look and the merge): no refusal is recorded, and the
+          // gate-met stuck check must not fire for it either.
+          let draftRefused = false;
           // A steward's own merge item (a refused merge) is left alone while a
           // worker still runs; the plugin files its own only when none does.
           // BB-256: a standing merge hold is not a stuck loop, so the plugin
@@ -9477,6 +9481,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   // request is still open, so the worker that owns the rest is
                   // not retired mid-sequence.
                   if (openOwnPulls.length <= 1) await archiveParkedWorkers(b);
+                } else if (isDraftRefusal(result.message)) {
+                  // BB-373: GitHub still sees a draft (a race between the look
+                  // and the merge). Record no refusal, so the next look
+                  // retries once it is marked ready, and raise no stuck.
+                  bb.log.warn(`stewards: plugin merge of ${pull.key} refused as a draft; waiting for it to be marked ready`);
+                  draftRefused = true;
+                  decline(b, "pull-draft", pull.key);
                 } else if (isHeadMovedRefusal(result.message)) {
                   // A push landed between the look and the merge. GitHub
                   // refused it with 409; the next look judges the new head.
@@ -9514,7 +9525,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // running and no item is open, so the plugin is neither merging it
           // nor waiting on a person; after the window it is stuck. A retarget
           // episode is criterion 4's, not this one.
-          if (mergedBase === null && !mergeHeld && !mergedThisLook && !isDraft && gateMetStuckMs > 0) {
+          if (mergedBase === null && !mergeHeld && !mergedThisLook && !isDraft && !draftRefused && gateMetStuckMs > 0) {
             const unattended = assessWorker(store.workers(b.id)).reason === null && store.openNeeds(b.id).length === 0;
             if (unattended) {
               pullStuckState.set(lc(pull.key), "gate-met");
@@ -10775,6 +10786,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return /failed: 409\b/u.test(message) || /Head branch was modified/iu.test(message);
     }
 
+    /**
+     * GitHub's refusal when the merge was attempted while the pull request
+     * was still a draft (405 "Pull Request is still a draft", BB-373). A
+     * snapshot that said it was ready can race a draft mark, so this is a
+     * wait, not a `stuck` refusal.
+     */
+    function isDraftRefusal(message: string): boolean {
+      return /still a draft/iu.test(message);
+    }
+
     /** Where a pull request's base branch points, for the stacked-PR hold (BB-264). */
     type BaseDisposition =
       | { kind: "default" }
@@ -10828,26 +10849,34 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The key a refused merge is recorded against (BB-257): the head sha, the
-     * reviewer marker and lane that made the gate met, and the draft flag
-     * (BB-373). A refusal under the same key is not retried, so a conflict or
-     * branch protection is one escalation per refusal, not one per look; a
-     * push, a new review round or the pull request leaving draft changes the
-     * key and a fresh attempt follows.
+     * The key a refused merge is recorded against (BB-257): the head sha and
+     * the reviewer marker and lane that made the gate met. A refusal under the
+     * same key is not retried, so a conflict or branch protection is one
+     * escalation per refusal, not one per look; a push or a new review round
+     * changes the key and a fresh attempt follows.
      */
-    function mergeAttemptKey(g: ReturnType<typeof prGate>, draft: boolean): string {
-      return [g.headSha ?? "", markerKey(g.marker) ?? "", g.lane ?? "", draft ? "draft" : "ready"].join("|");
+    function mergeAttemptKey(g: ReturnType<typeof prGate>): string {
+      return [g.headSha ?? "", markerKey(g.marker) ?? "", g.lane ?? ""].join("|");
     }
 
     /**
      * The refusal already recorded for this gate, if any: a merge the plugin
      * attempted and GitHub refused, kept as a `stuck` escalation on the
-     * binding. Its presence stops a retry loop; the head, a gate input or the
-     * draft flag changing makes a new key, so the next look attempts again.
+     * binding. Its presence stops a retry loop; the head or a gate input
+     * changing makes a new key, so the next look attempts again. A refusal
+     * recorded while the pull request was still a draft is cleared once it is
+     * not a draft (BB-373), so the next look retries; a real refusal
+     * (conflict, branch protection) still blocks the same head.
      */
     function mergeRefusalFor(b: Binding, pull: EntitySnapshot, g: ReturnType<typeof prGate>): Escalation | null {
-      const key = mergeAttemptKey(g, pull.pull?.draft === true);
-      return store.escalations(b.id, 50).find((x) => x.kind === "stuck" && x.data.mergeRefusal === true && x.data.mergeKey === key) ?? null;
+      const key = mergeAttemptKey(g);
+      const refusal = store.escalations(b.id, 50).find((x) => x.kind === "stuck" && x.data.mergeRefusal === true && x.data.mergeKey === key) ?? null;
+      if (refusal === null) return null;
+      // BB-373: the refusal's question is the only marker a record made
+      // before this change carries, and a draft refusal must not outlive the
+      // draft state.
+      if (pull.pull?.draft !== true && isDraftRefusal(refusal.question)) return null;
+      return refusal;
     }
 
     /**
@@ -10857,7 +10886,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * retry or re-raise.
      */
     async function raiseMergeRefusal(b: Binding, pull: EntitySnapshot, g: ReturnType<typeof prGate>, message: string, changes: Change[]): Promise<void> {
-      const key = mergeAttemptKey(g, pull.pull?.draft === true);
+      const key = mergeAttemptKey(g);
       const note = `The plugin could not merge ${pull.key}: ${message}`;
       store.note(b.id, note);
       changes.push({ text: note, actionable: true });
