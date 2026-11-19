@@ -39,7 +39,7 @@ DAIR discovery uses `dair.endpoint` and explicit `searchTool`, `queryArgument` a
 
 Weekly discovery uses `weeklyTool`, optional `weeklyArguments` and `weeklyResultsPath`. Missing or incompatible DAIR access falls back directly to **arXiv**. Article text and credibility measures that cannot be obtained stay unknown; the plugin does not fabricate eligibility metrics. Authenticated DAIR validation remains part of delivery work.
 
-`laya` contains `enabled` (default `false`), an optional endpoint and `minConfidence` (default `0.8`, allowed 0.8–1). It requires scheduling enabled and `budgets.allowUnknown:true` because infrastructure cost is not automatically invoiced. The detector consumes a bounded, redacted recent window asynchronously, excludes this plugin's workers and can queue an earlier mining pass. A failure or uncertain response does not suppress the 15-minute fallback. Enable only an endpoint you intend to receive that context.
+`laya` contains `enabled` (default `false`), an optional endpoint and `minConfidence` (default `0.8`, allowed 0.8–1). It requires scheduling enabled and `budgets.allowUnknown` left at `true`. The detector consumes a bounded, redacted recent window asynchronously, excludes this plugin's workers and can queue an earlier mining pass. A failure or uncertain response does not suppress the 15-minute fallback. Enable only an endpoint you intend to receive that context.
 
 ## Held-out evaluation
 

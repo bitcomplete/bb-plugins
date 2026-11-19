@@ -9,7 +9,7 @@ Start with `bb self-improve doctor` and `bb self-improve status` in the intended
 | Provider/model missing | Configure the worker project/environment, then use the dashboard's **Execution** pickers. |
 | Authentication failure | Use the selected provider's supported BB sign-in/routing diagnostics. There is no Self improve model API-key pool to repair. |
 | Worker environment missing | Supply real BB project/environment IDs. A directory string alone is not a registered environment. |
-| Unknown native costs not authorized | Inspect [cost limits](costs.md), then explicitly choose whether to enable `budgets.allowUnknown`. Adding API token prices does not price a subscription. |
+| Unknown native costs not authorized | `budgets.allowUnknown` is set to `false`, which pauses agent work. Remove it or set it to `true`; see [costs](costs.md). |
 | Budget/admission refused | Inspect shared native/chat/detector observations, unknown reports and reservations before raising limits. |
 | Configuration changed while editing | Reload **Execution** settings before saving; do not overwrite newer settings with a stale selection. |
 | Chat became inactive | Reopen it from the ledger after privacy/execution changes. Old history is retained; old tool authorization is not reused. |

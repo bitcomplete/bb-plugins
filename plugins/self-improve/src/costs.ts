@@ -3,7 +3,7 @@ import { stableId, stableJson } from "./domain/shared.js";
 export interface Price { input: number; output: number; cacheRead: number; cacheWrite: number; version: string }
 export interface CostPolicy {
   currency: string; dailyMicros: number | null; monthlyMicros: number | null;
-  maxDailyCalls: number; allowUnknown: boolean; prices: Record<string, Price>;
+  maxDailyCalls: number | null; allowUnknown: boolean; prices: Record<string, Price>;
   scopeLimitsMicros?: Record<string, number>;
 }
 export interface Reservation { id: string; model: string; inputBound: number; outputBound: number; scope: string; runId?: string; solutionId?: string; accountId?: string; workerId?: string }
@@ -70,7 +70,7 @@ export class Accounting {
       const day = new Date(now).toISOString().slice(0,10), month = day.slice(0,7);
       const entries = this.store.list<CostEvent>("cost-reservations");
       const today = entries.filter(e => new Date(e.at).toISOString().startsWith(day));
-      if (today.length >= p.maxDailyCalls) throw new Error("daily-call-budget-exhausted");
+      if (p.maxDailyCalls !== null && today.length >= p.maxDailyCalls) throw new Error("daily-call-budget-exhausted");
       const external=effectiveExternal(this.store.list<ExternalCostRecord>("external-costs"));
       const linked=new Map(external.filter(e=>e.record.attemptId).map(e=>[e.record.attemptId!,e]));
       const budget: BudgetEntry[]=entries.map(e=>({at:e.at,currency:e.currency,scope:e.scope,solutionId:e.solutionId,amountMicros:linked.get(e.id)?.amountMicros??e.amountMicros??e.maxMicros,unknownUnbounded:!linked.has(e.id)&&e.amountMicros===null&&e.maxMicros===0&&e.price===null}));

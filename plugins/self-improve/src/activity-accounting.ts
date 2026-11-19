@@ -151,10 +151,10 @@ export class ActivityAccounting {
   }
   private check(input:{atMs:number;scope:string;solutionId?:string;currency:string;additionalMicros:number;unknown:boolean;additionalCalls:number}):void {
     const p=this.options.policy(),today=day(input.atMs),month=today.slice(0,7);
-    if(!/^[A-Z]{3}$/.test(p.currency)||!Number.isSafeInteger(p.maxDailyCalls)||p.maxDailyCalls<1||[p.dailyMicros,p.monthlyMicros,...Object.values(p.scopeLimitsMicros??{})].some(v=>v!==null&&!safe(v)))throw new Error("activity-policy-invalid");
+    if(!/^[A-Z]{3}$/.test(p.currency)||p.maxDailyCalls!==null&&(!Number.isSafeInteger(p.maxDailyCalls)||p.maxDailyCalls<1)||[p.dailyMicros,p.monthlyMicros,...Object.values(p.scopeLimitsMicros??{})].some(v=>v!==null&&!safe(v)))throw new Error("activity-policy-invalid");
     const state=this.snapshot(),monthly=state.entries.filter(e=>day(e.atMs).startsWith(month)),daily=monthly.filter(e=>day(e.atMs)===today);
     if(!p.allowUnknown&&(input.unknown||state.unknownAt.some(at=>day(at).startsWith(month))||monthly.some(e=>e.unknown)))throw new Error("activity-cost-unknown-not-authorized");
-    if(sum([state.calls.filter(c=>day(c.atMs)===today).length,input.additionalCalls])>p.maxDailyCalls)throw new Error("daily-call-budget-exhausted");
+    if(p.maxDailyCalls!==null&&sum([state.calls.filter(c=>day(c.atMs)===today).length,input.additionalCalls])>p.maxDailyCalls)throw new Error("daily-call-budget-exhausted");
     const scopes=[input.scope,...(input.solutionId?[`solution:${input.solutionId}`]:[])],moneyLimited=p.dailyMicros!==null||p.monthlyMicros!==null||scopes.some(s=>p.scopeLimitsMicros?.[s]!==undefined);
     if(moneyLimited&&(input.currency!==p.currency||monthly.some(e=>e.currency!==p.currency&&(e.micros>0||e.unknown))))throw new Error("budget-currency-mismatch");
     if(moneyLimited&&[...state.ambiguousOwners].some(owner=>state.samples.some(s=>s.owner===owner&&day(s.atMs).startsWith(month))||state.calls.some(c=>c.owner===owner&&day(c.atMs).startsWith(month))))throw new Error("activity-cost-attribution-ambiguous");

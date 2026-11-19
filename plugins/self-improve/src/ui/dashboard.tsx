@@ -1,4 +1,4 @@
-import { ActivityCosts } from "./activity-costs.js";
+import { ActivityCosts, RecentAgentRuns } from "./activity-costs.js";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Problem, Solution, Vote } from "../domain/types.js";
 import type { DashboardApi, DashboardData, Selection } from "./types.js";
@@ -147,6 +147,7 @@ export function Dashboard({api,projectId,refreshKey,renderChat,onOpenThread}:{
         <div><span className="si-metric-label"><Glyph kind="check"/>Established solutions</span><strong>{groups.established.length}</strong><small>{groups.established.filter(s=>s.status==="proven").length} with measured improvement</small></div>
         <div><span className="si-metric-label">Tracked cost</span>{data.costs.totals.length?data.costs.totals.map(t=><strong className="si-cost-total" key={t.currency}>{money(t.reportedMicros+t.estimatedMicros,t.currency)}</strong>):<strong className="si-metric-empty">{data.costs.activity?.unknownBillingActivities ? "Billing unknown" : "No cost records yet"}</strong>}<small>Owner-reported charges + estimates{unknown>0?`; ${unknown} unknown`:""}{data.costs.pending?.length?`; ${data.costs.pending.length} pending`:""}</small>{(data.costs.unmeteredAccessRequests??0)>0&&<small>{data.costs.unmeteredAccessRequests} research access requests without per-request prices</small>}<ActivityCosts value={data.costs.activity}/></div>
       </section>
+      <RecentAgentRuns runs={data.costs.recentRuns} titles={Object.fromEntries(data.solutions.map(s=>[s.id,s.title]))}/>
       <div className="si-tabs" role="tablist" aria-label="Ledger view">{TABS.map((t,index)=><button key={t.id} id={`${id}-${t.id}`} role="tab" aria-selected={tab===t.id} aria-controls={`${id}-panel`} tabIndex={tab===t.id?0:-1} onClick={()=>changeTab(t.id)} onKeyDown={e=>{const next=e.key==="ArrowRight"?(index+1)%TABS.length:e.key==="ArrowLeft"?(index+TABS.length-1)%TABS.length:e.key==="Home"?0:e.key==="End"?TABS.length-1:null;if(next!==null){e.preventDefault();changeTab(TABS[next]!.id);document.getElementById(`${id}-${TABS[next]!.id}`)?.focus();}}}>{t.label}{t.id!=="performance"&&<span>{groups[t.id].length}</span>}</button>)}</div>
       <section id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-${tab}`} className="si-panel">
         {tab==="performance"?<Performance api={api} solutions={data.solutions} refreshKey={loadSequence.current}/>:<>

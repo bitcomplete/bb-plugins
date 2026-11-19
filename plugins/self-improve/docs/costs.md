@@ -1,6 +1,15 @@
 # What did the improvement cost?
 
-A useful change can still cost too much to discover. Self improve tracks native tasks, editing conversations, detector activity, attempts and owner-recorded expenses. Missing cost remains missing.
+Self improve records every agent session it starts: which stage started it (mining, research, invention, ranking, a build or test, a revalidation run), which run and solution it belongs to, and the tokens and cost BB reported for it. Editing conversations, detector activity and expenses you record are tracked too. Nothing is blocked to save money by default; the point is that you can always see what each action used.
+
+## Where to look
+
+- **Recent agent work** on the dashboard lists each run, newest first, with its sessions, tokens and any reported cost.
+- **BB usage** under a solution or an impact observation totals the agent work attributed to it.
+- A revalidation plan shows each of its runs and what it used.
+- `bb self-improve costs` prints the records; `activity-costs.json` in the plugin's data directory has the same activity data.
+
+BB reports usage per session after the fact, so the numbers can lag a few minutes behind the work. A missing report is shown as missing, never as free.
 
 ## Read the labels
 
@@ -16,24 +25,20 @@ The dashboard keeps observed BB session amounts separate from charges and estima
 
 Native usage records retain task, thread, requested provider/model, public request/root-turn observations and optional session usage. The requested model is not proof of every hidden retry's actual model. Missing reports, later missing amounts and counter resets remain qualified. A subscription is not converted into an invented API invoice.
 
-## Set an admission policy
+## Optional limits
+
+Agent work is allowed by default. If you want limits, set them under `budgets`:
 
 | Field in `budgets` | Meaning |
 | --- | --- |
-| `currency` | Currency for thresholds, default `USD`. No invented exchange rates. |
-| `dailyMicros`, `monthlyMicros` | Observed spending thresholds in millionths of the currency; `null` means no monetary threshold. |
-| `maxDailyCalls` | Shared admissions/observed-request threshold per UTC day, default `100`. It is not a count of every provider-internal retry. |
-| `allowUnknown` | Explicitly authorize native work whose final cost cannot be bounded in advance. Defaults to `false`. |
-| `scopeLimitsMicros` | Optional daily stage or `solution:<id>` thresholds. |
-| `prices` | Versioned price inputs for retained legacy/detector estimates; they do not price native subscription usage. |
+| `maxDailyCalls` | Cap on agent sessions started per UTC day. `null` (the default) means no cap. |
+| `dailyMicros`, `monthlyMicros` | Stop starting new work once observed spending reaches this amount, in millionths of `currency`. `null` (the default) means no limit. |
+| `scopeLimitsMicros` | Optional daily amounts for one stage or one `solution:<id>`. |
+| `allowUnknown` | Agent work whose cost BB reports only afterwards. `true` by default; `false` pauses all agent work. |
+| `currency` | Currency for the amounts above, default `USD`. |
+| `prices` | Price inputs for older estimate records; they do not price subscription usage. |
 
-Revalidation runs count as `builder` work for the solution being retested, so they draw on the same `builder` and `solution:<id>` thresholds as its builds and retests. A large revalidation can use up that solution's daily allowance. A run is refused before any call when `allowUnknown` is `false`.
-
-One currency unit is 1,000,000 micros. Native agent work requires `allowUnknown:true` even if `prices` names the selected model. That setting is a spending decision, not evidence that the operation is free.
-
-Native task admissions have durable identity, call and concurrency checks. Manual chat uses observed-budget preflight: BB's inline dispatch hook has no stable request ID, so repeated hook checks are not counted as new turns. Initial conversation admission is recorded once; later requests/root turns come from public events. Reporting lag, concurrent turns, Send-now overrides, edits and compaction limit enforcement.
-
-These controls can stop **future admissions** using available reports. They cannot guarantee a dollar ceiling for an opaque native turn already running. Cancellation and elapsed-time limits are best effort. BB owns provider routing, retry and failover; the plugin reports unsupported accounting precision honestly.
+Limits stop new work from starting once the reported usage reaches them. A session already running finishes, and reports can lag, so a limit can be passed by the work in flight. Revalidation runs count as `builder` work for the solution being tested.
 
 ## Research and infrastructure
 

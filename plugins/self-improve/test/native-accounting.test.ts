@@ -44,6 +44,11 @@ describe("BB-native task admission and cost observations",()=>{
     await expect(reloaded.beforeStart({...identity(),model:"different"})).rejects.toThrow("identity-conflict");
     await expect(reloaded.beforeStart(identity("second"))).rejects.toThrow("daily-call-budget-exhausted");
   });
+  it("applies no daily cap unless one is configured",async()=>{
+    const {accounting}=fixture({maxDailyCalls:null},1000);
+    for(let i=0;i<150;i++)await accounting.beforeStart(identity(`task-${i}`));
+    expect(accounting.summary().nativeAdmissions).toBe(150);
+  });
   it("retains a slot for unresolved dispatch and failed cleanup until runner reconciliation settles it",async()=>{
     const {accounting}=fixture({},1);await accounting.beforeStart(identity());
     await accounting.onSettled(settled(identity(),{status:"uncertain",threadId:null,cleanupPending:false}));

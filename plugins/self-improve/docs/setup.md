@@ -24,7 +24,7 @@ Ordinary provider/workspace instructions and tools may remain. A dedicated envir
 
 Add names or identifiers to remove in `redactedNames`. Review the scope of the source material: the worker project chooses where analysis executes; it does not filter all observed source projects.
 
-`budgets.allowUnknown` defaults to `false`. Native agent work requires an explicit choice to allow unknown costs, because BB may report usage without a complete bill. Set call and observed-spending thresholds you are comfortable with before opting in. [Costs](costs.md) explains what those limits can enforce.
+Agent work is allowed by default and every session is tracked; see [costs](costs.md) for where to see what each action used and for optional limits.
 
 The remaining settings are:
 

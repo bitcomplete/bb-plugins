@@ -12,8 +12,10 @@ export const policySchema = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/).default("USD"),
   dailyMicros: z.number().int().nonnegative().nullable().default(null),
   monthlyMicros: z.number().int().nonnegative().nullable().default(null),
-  maxDailyCalls: z.number().int().min(1).max(100000).default(100),
-  allowUnknown: z.boolean().default(false),
+  /** Optional cap on agent calls per UTC day; null (the default) means no cap. Spending is always tracked. */
+  maxDailyCalls: z.number().int().min(1).max(100000).nullable().default(null),
+  /** Agent work whose cost BB reports only afterwards. Allowed by default; set false to require configured prices. */
+  allowUnknown: z.boolean().default(true),
   prices: z.record(z.string(), price).default({}),
   scopeLimitsMicros: z.record(z.string(), z.number().int().nonnegative()).optional(),
 }).strict();

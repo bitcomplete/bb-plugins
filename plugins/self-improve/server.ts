@@ -8,7 +8,7 @@ import { NativeTaskRunner } from "./src/native-tasks.js";
 import { NativeAccounting } from "./src/native-accounting.js";
 import { NativeMiner } from "./src/native-miner.js";
 import { NativeChatManager } from "./src/native-chat.js";
-import { activityCostView } from "./src/activity-view.js";
+import { activityCostView, recentAgentRuns } from "./src/activity-view.js";
 import { stableId } from "./src/domain/shared.js";
 import { ActivityAccounting } from "./src/activity-accounting.js";
 import { nativeExecution, executionSelectionSchema, type ExecutionSettingsView } from "./src/native-execution.js";
@@ -187,7 +187,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   const workerSelection=()=>{const parsed=executionSelectionSchema.safeParse({providerId:config.providerId,model:config.model,projectId:config.projectId,
     environmentId:config.environmentId,permissionMode:config.permissionMode,...(config.reasoningLevel===undefined?{}:{reasoningLevel:config.reasoningLevel}),...(config.serviceTier===undefined?{}:{serviceTier:config.serviceTier})});return parsed.success?parsed.data:null;};
   const revalidationRunner=createRevalidationRunner({store,revalidation,runner:nativeTasks,selection:workerSelection,
-    allowed:()=>values.enabled&&configurationError===null&&config.budgets.allowUnknown&&!publicationStop.signal.aborted,
+    allowed:()=>values.enabled&&configurationError===null&&!publicationStop.signal.aborted,
     privacyGeneration:()=>privacyGeneration,taskTimeoutMs:()=>config.taskTimeoutMs});
   const ordinaryBuilder=runtime.handlers.builder;
   runtime.handlers.builder=ctx=>ctx.job.input.kind==="revalidation"?revalidationRunner.handle(ctx):ordinaryBuilder(ctx);
@@ -241,7 +241,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     configurationError, exportError, store.get<{issue:string}>("native-execution-health","latest")?.issue,
     !config.providerId && "Choose a BB provider", !config.model && "Choose a model",
     !config.projectId && "Choose a worker project", !config.environmentId && "Choose a worker environment",
-    !config.budgets.allowUnknown && "Allow unknown native costs before starting agent work; BB reports are not final invoices",
+    !config.budgets.allowUnknown && "Agent work is paused because unknown native costs are not allowed in budgets",
     "Native tests are exploratory. Automatic adoption requires independently verified held-out isolation, which this BB execution path does not provide",
     !values.evaluationSuite && "Configure development cases to run build experiments",
     !config.taskOutcomeSource && "No structured task-outcome provider configured; terminal task history is unavailable",
@@ -283,7 +283,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     problems: store.list<Problem>("problems"), solutions: store.list<Solution>("solutions"), votes: store.list("votes"),
     ranking: store.get<RankedSolution[]>("solution-ranking", "latest") ?? [], runs: store.runs().map(run=>({...run,costs:activity.forRun(run.id)})),
     versions: Object.fromEntries(["problems", "solutions"].flatMap(ns => store.entries(ns).map(e => [`${ns}:${e.key}`, e.version]))),
-    health: { enabled: values.enabled, issues: issues(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolutionHistory(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
+    health: { enabled: values.enabled, issues: issues(), workerProjectId:config.projectId,publicationRepositories:config.publicationRepositories }, costs: {...accounting.summary(),activity:activityCostView(activity.summary()),recentRuns:recentAgentRuns(activity.summary()),activityBySolution:Object.fromEntries(store.list<Solution>("solutions").map(solution=>[solution.id,activityCostView(activity.forSolutionHistory(solution.id))])),unmeteredAccessRequests:store.list<{cached?:boolean}>("access-costs").filter(c=>!c.cached).length}, objectives: listObjectives(store),
     activation: Object.fromEntries(store.list<ValidatedArtifact>("validated-artifacts").map(artifact => [artifact.solutionId, {
       status: "revalidation-required" as const,
       reason: "Historical validation does not establish the BB-native execution boundary. This version is not contributed to new turns; existing provider sessions may retain earlier instructions.",

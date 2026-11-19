@@ -1,6 +1,6 @@
 import type { RevalidationApi } from "../revalidation-api.js";
 import type { PublicationApi } from "../publication-view.js";
-import type { ActivityCostView } from "../activity-view.js";
+import type { ActivityCostView, AgentRunUsage } from "../activity-view.js";
 import type { Problem, RankedSolution, Solution, Verification, Vote } from "../domain/types.js";
 
 export interface RetestRecord {
@@ -24,6 +24,7 @@ export interface DashboardData {
     unmeteredAccessRequests?: number;
     activity?: ActivityCostView;
     activityBySolution?: Record<string, ActivityCostView>;
+    recentRuns?: AgentRunUsage[];
   };
   votes?: Vote[];
   retests?: RetestRecord[];

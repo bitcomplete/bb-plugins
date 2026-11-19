@@ -86,7 +86,7 @@ export class NativeAccounting implements NativeTaskHooks {
       if(previous){if(!same(previous.identity,supplied))throw new Error("native-accounting-identity-conflict");return;}
       const p=this.options.policy(),limit=this.options.maxConcurrent();
       if(!Number.isSafeInteger(limit)||limit<1||limit>1000)throw new Error("native-accounting-concurrency-invalid");
-      if(!Number.isSafeInteger(p.maxDailyCalls)||p.maxDailyCalls<1||!/^([A-Z]{3})$/.test(p.currency))throw new Error("native-accounting-policy-invalid");
+      if(p.maxDailyCalls!==null&&(!Number.isSafeInteger(p.maxDailyCalls)||p.maxDailyCalls<1)||!/^([A-Z]{3})$/.test(p.currency))throw new Error("native-accounting-policy-invalid");
       for(const value of [p.dailyMicros,p.monthlyMicros,...Object.values(p.scopeLimitsMicros??{})])if(value!==null&&!safe(value))throw new Error("native-accounting-policy-invalid");
       // Native dispatch has no preflight monetary bound, including when an old API price is configured.
       if(!p.allowUnknown)throw new Error("native-cost-unknown-not-authorized");
@@ -94,7 +94,7 @@ export class NativeAccounting implements NativeTaskHooks {
       if(records.filter(occupying).length>=limit)throw new Error("native-concurrency-exhausted");
       const legacy=this.legacy.summary(),today=day(now),month=today.slice(0,7);
       const legacyAttempts=this.options.store.list<{at:number}>("cost-reservations");
-      if(records.filter(r=>day(r.admittedAtMs)===today).length+legacyAttempts.filter(r=>day(r.at)===today).length>=p.maxDailyCalls)throw new Error("daily-call-budget-exhausted");
+      if(p.maxDailyCalls!==null&&records.filter(r=>day(r.admittedAtMs)===today).length+legacyAttempts.filter(r=>day(r.at)===today).length>=p.maxDailyCalls)throw new Error("daily-call-budget-exhausted");
       const tasks=records.map(record=>this.view(record));
       const entries=this.budgetEntries(legacy,tasks);
       const monthly=entries.filter(e=>day(e.at).startsWith(month)),daily=monthly.filter(e=>day(e.at)===today);

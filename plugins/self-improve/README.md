@@ -63,7 +63,7 @@ Those full workflows are **planned, not delivered in this preview**. The existin
 
 BB usage receipts identify tasks, conversations and reported session amounts. Reports may be incomplete; subscription tokens do not become an invented API invoice. Historical estimates and owner-entered charges keep their labels. Spending thresholds stop further work using available observations; they cannot guarantee a dollar ceiling on a native turn already running.
 
-Read [costs and budgets](docs/costs.md) before enabling agent work.
+Every agent session is tracked with the tokens and cost BB reports; [costs](docs/costs.md) shows where to see it and how to set optional limits.
 
 ## Read next
 
