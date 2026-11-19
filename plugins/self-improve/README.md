@@ -49,7 +49,7 @@ The package currently declares BB `>=0.49` and SDK `>=0.6.132`; that declaration
 
 The **miner** looks for recurring symptoms every 15 minutes. Optional asynchronous Laya detection can request an earlier pass from recent redacted context. It excludes this plugin's workers and keeps the scheduled fallback.
 
-The **scout** uses DAIR and then direct **arXiv**, without OpenAlex. Missing article text or credibility metrics remain unknown. The **inventor** gets a fresh problem-only input from this plugin, with no papers or prior solutions added. It must state assumptions and dependencies; ordinary native context limits still apply.
+The **scout** uses DAIR and then direct **arXiv**. Missing article text or credibility metrics remain unknown. The **inventor** gets a fresh problem-only input from this plugin, with no papers or prior solutions added. It must state assumptions and dependencies; ordinary native context limits still apply.
 
 The **solution ranker** considers the proposed effect, feasibility, effort and prior attempts. The **builder** currently proposes reusable instructions and compares development-case outputs through BB. Those results are exploratory; this native execution path has no verified held-out isolation and cannot automatically adopt them. The **verifier** records qualified observational evidence where the required history exists.
 

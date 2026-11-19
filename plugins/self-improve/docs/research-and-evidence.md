@@ -20,13 +20,9 @@ If full text is unavailable, Strength stays unknown and the assessment is labele
 
 The research cache holds the extracted public text. Assessment evidence records its hash, URL and short quotes; cached model-assessment results do not duplicate the full article. Read the derived `reports/research.md` digest or `reports/research.json` under the plugin's data directory for paper versions, assessment scope, estimates and reasons for deferral. `access-costs.jsonl` records research access separately from monetary accounting; see [costs](costs.md).
 
-## Design influences
+## Research results don't transfer automatically
 
-[Self-Improvement Memory](https://arxiv.org/html/2611.18856v1) informed the use of problem-keyed history: diagnoses, modifications, predictions, evaluation context and outcomes. This plugin additionally retains rejected, failed and removed attempts. The inventor is a separate design choice: this plugin gives it fresh problem input without that history. Ordinary BB/provider/workspace instructions and tools may remain; this is not enforced global context isolation.
-
-[Dream-RSI: Recursive Self-Improvement through Evolving Worlds](https://arxiv.org/abs/2609.14858) motivates questions about selection efficiency and the cost of discovery. It does not establish that this plugin's ranking or cadence improves outcomes. A replay simulator or learned controller would need its own controlled evaluation; neither is implied by the current ranking implementation.
-
-The papers' benchmark results do not transfer automatically to another model, provider, repository or task. The loop preserves provenance so a reviewer can distinguish a research inspiration, an estimated benefit, a held-out result and a longitudinal observation.
+A paper's benchmark result doesn't carry over to another model, provider, repository or task. Every candidate keeps its provenance, so you can tell a research idea apart from an estimated benefit, a held-out result or a longer-term observation.
 
 ## What would count as evidence here?
 

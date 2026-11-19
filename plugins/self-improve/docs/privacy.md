@@ -43,7 +43,7 @@ The dashboard inherits the selected chat thread's permissions. It does not prese
 
 Self improve contributes no ledger tools to its autonomous workers. For an authorized ledger chat, it contributes `self_improve_read`, `self_improve_edit` and `self_improve_retest`. Those tools paginate reads, limit edits to permitted fields and notes, and preserve the evaluation gates for re-testing. They cannot write trusted receipts or replace active artifacts.
 
-These contribution rules control this plugin's tools. They do not remove tools supplied by BB, the provider, the workspace or another plugin. The current execution path uses BB threads and existing authentication; it has no private model gateway that filters all tool responses. Historical gateway experiments are not validation of this native boundary.
+These contribution rules control this plugin's tools. They do not remove tools supplied by BB, the provider, the workspace or another plugin. The current execution path uses BB threads and existing authentication; it has no private model gateway that filters all tool responses.
 
 Use a dedicated scratch worker environment and an appropriate BB permission mode. A minimal workspace reduces incidental dependencies, but does not establish filesystem/process isolation or independent held-out testing. Provider startup and native execution can carry additional context. These limits are why native development experiments remain exploratory and automatic adoption stays blocked.
 

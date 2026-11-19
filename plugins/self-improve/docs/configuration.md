@@ -37,7 +37,7 @@ Self improve scopes its own ledger-tool contributions. Other BB, provider, works
 
 DAIR discovery uses `dair.endpoint` and explicit `searchTool`, `queryArgument` and optional `resultsPath`. Configure the separate `dairToken` secret. `bb self-improve doctor --research-tools` requests the authenticated tool schemas; it is a network operation, not an offline diagnostic.
 
-Weekly discovery uses `weeklyTool`, optional `weeklyArguments` and `weeklyResultsPath`. Missing or incompatible DAIR access falls back directly to **arXiv**. There is no OpenAlex path. Article text and credibility measures that cannot be obtained stay unknown; the plugin does not fabricate eligibility metrics. Authenticated DAIR validation remains part of delivery work.
+Weekly discovery uses `weeklyTool`, optional `weeklyArguments` and `weeklyResultsPath`. Missing or incompatible DAIR access falls back directly to **arXiv**. Article text and credibility measures that cannot be obtained stay unknown; the plugin does not fabricate eligibility metrics. Authenticated DAIR validation remains part of delivery work.
 
 `laya` contains `enabled` (default `false`), an optional endpoint and `minConfidence` (default `0.8`, allowed 0.8–1). It requires scheduling enabled and `budgets.allowUnknown:true` because infrastructure cost is not automatically invoiced. The detector consumes a bounded, redacted recent window asynchronously, excludes this plugin's workers and can queue an earlier mining pass. A failure or uncertain response does not suppress the 15-minute fallback. Enable only an endpoint you intend to receive that context.
 
