@@ -56,3 +56,11 @@ it("rejects conflicting intent retries and stale revisions without writes",()=>{
   expect(()=>f.edit({...f.input,action:"revise",requestId:"stale",planId:first.plan.id,expectedVersion:7},owner)).toThrow("revalidation-version-conflict");
   expect(f.snapshot()).toEqual(before);
 });
+it("keeps the current tests when a revision omits the workload, and detaches them only on explicit null",()=>{
+  const f=fixture(),first=f.edit(f.input,owner);
+  const {workload:_,...withoutWorkload}={...f.input,action:"revise" as const,planId:first.plan.id,expectedVersion:1,requestId:"criteria-only",definition:{...f.input.definition,concern:"Only the concern changed"}};
+  const kept=f.edit(withoutWorkload as EditRevalidationDraft,owner);
+  expect(kept.plan.definition.workload).toMatchObject({id:first.workload!.id,version:1});expect(f.workloads.history(first.workload!.id)).toHaveLength(1);
+  const detached=f.edit({...withoutWorkload,requestId:"detach",expectedVersion:2,workload:null} as EditRevalidationDraft,owner);
+  expect(detached.plan.definition.workload).toBeNull();
+});

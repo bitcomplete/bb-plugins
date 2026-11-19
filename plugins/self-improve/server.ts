@@ -190,7 +190,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   };
   revalidationRunner=createRevalidationRunner({store,revalidation,runner:nativeTasks,activity,execution,
     privacyGeneration:()=>privacyGeneration,redact:clean,observeEnvironment:revalidationEnvironment.observe,
-    allowed:()=>configurationError===null&&!publicationStop.signal.aborted,taskTimeoutMs:()=>config.taskTimeoutMs});
+    allowed:()=>values.enabled&&configurationError===null&&!publicationStop.signal.aborted,taskTimeoutMs:()=>config.taskTimeoutMs});
   const ordinaryBuilder=runtime.handlers.builder;
   runtime.handlers.builder=ctx=>ctx.job.input.kind==="revalidation"?revalidationRunner!.handle(ctx):ordinaryBuilder(ctx);
   const services = new Services(bb, store, runtime.handlers, async () => values.enabled && configurationError === null, changed);
@@ -416,7 +416,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       const text=JSON.stringify(modelLedgerRead(result,privacy()));
       return Buffer.byteLength(text)<=200000?text:JSON.stringify({error:"Plan exceeds the chat response limit; inspect or simplify its tests in the owner interface."});
     }});
-  bb.agents.registerTool({name:"self_improve_revalidation_edit",description:"Create or revise a skeptical claim's draft criteria and planned exact-answer tests for this solution. The workload field supplies planned tests; definition.workload must be null because the server assigns its immutable identity. Preserve the current claim and environment on revision; a different claim or environment needs a new plan. Cannot freeze, run or write outcomes.",
+  bb.agents.registerTool({name:"self_improve_revalidation_edit",description:"Create or revise a skeptical claim's draft criteria and planned exact-answer tests for this solution. The workload field supplies planned tests; on revision omit it to keep the current tests, or pass null to detach them. definition.workload must be null because the server assigns its immutable identity. Preserve the current claim and environment on revision; a different claim or environment needs a new plan. Cannot freeze, run or write outcomes.",
     parameters:editRevalidationDraftSchema,execute:(input,context)=>{
       requireRevalidationChat(context.threadId,input.definition.target.solutionId);
       const result=editRevalidationDraft(input,{kind:"chat",id:context.threadId});changed();

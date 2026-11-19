@@ -146,6 +146,9 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
       return store.transaction(() => {
         if (head(input.planId).version !== input.expectedVersion) throw new Error("revalidation-version-conflict");
         const old = plan(input.planId);
+        // Chat cannot cancel, so its draft edits must not supersede a frozen run that is queued or spending.
+        // The owner may supersede deliberately; the run is then blocked as plan-superseded.
+        if (actor.kind === "chat" && store.list<RevalidationRun>("revalidation-runs").some(r => r.planId === input.planId && r.planVersion === old.version && (r.status === "queued" || r.status === "running"))) throw new Error("revalidation-run-active-cancel-first");
         if (!same(old.definition.target, def.target) || !same(old.definition.claim, def.claim)) throw new Error("revalidation-new-claim-needs-new-plan");
         // A different environment is a separate question, not a way to move an unresolved
         // contradiction out of its original scope. Null drafts may still be clarified.

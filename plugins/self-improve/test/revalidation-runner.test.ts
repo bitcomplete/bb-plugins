@@ -139,4 +139,24 @@ describe("BB-native revalidation runner",()=>{
     expect(f.requests).toHaveLength(0);expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",verdict:null});
   });
 
+  it("reports a run that exceeds its time limit as blocked by the time limit, not as a native failure",async()=>{
+    const f=await fixture();f.setHook(async()=>{f.setTime(NOW+60001);throw new Error("native-task-timeout");});
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-time-limit",verdict:null});
+  });
+  it("blocks rather than fails a running run on graceful shutdown",async()=>{
+    const f=await fixture();let resolve!:(value:unknown)=>void;f.setHook(()=>new Promise(r=>{resolve=r;}));
+    const pending=f.runner.handle(f.ctx);await vi.waitFor(()=>expect(f.requests).toHaveLength(1));
+    f.runner.dispose();resolve({output:"fixture-answer-one"});await pending;
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"interrupted-needs-new-run",verdict:null});
+  });
+  it("does not let a chat draft revision revoke a queued run of the frozen version",()=>fixture().then(f=>{
+    expect(()=>f.core.plans.revise({planId:f.plan.id,expectedVersion:1,definition:{...f.definition,concern:"A new doubt"}},{kind:"chat",id:"chat-thread"})).toThrow("revalidation-run-active-cancel-first");
+    expect(f.core.plans.get(f.plan.id).plan.version).toBe(1);
+  }));
+  it("reconciles usage only for ended runs and stays idempotent",async()=>{
+    const f=await fixture();await f.runner.handle(f.ctx);
+    f.runner.reconcileUsage();const before=f.core.plans.usage(f.queued.id);
+    f.setTime(NOW+120000);f.runner.reconcileUsage();expect(f.core.plans.usage(f.queued.id)).toEqual(before);
+  });
 });

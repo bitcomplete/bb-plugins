@@ -103,7 +103,7 @@ export class NativeTaskRunner implements TaskRunner {
   /** Trusted cancellation of named work only. Durable revocation precedes any cleanup RPC. */
   revoke(taskIds: readonly string[], reasonCode: string): void {
     if (!Array.isArray(taskIds) || !taskIds.length || taskIds.length > 100 || taskIds.some(taskId => !id.safeParse(taskId).success) || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(reasonCode)) return fail("native-task-revocation-invalid");
-    const selected = [...new Set(taskIds)];
+    const selected = [...new Set(taskIds)], revokedNow = new Set<string>();
     this.options.store.transaction(() => {
       for (const taskId of selected) {
         const record = this.read(taskId);
@@ -115,12 +115,15 @@ export class NativeTaskRunner implements TaskRunner {
           } else this.options.store.put(RETIREMENTS, taskId, { taskId, retiredAtMs: this.now(), neverDispatched: true, reasonCode }, this.now());
         } else if (!["completed", "failed", "cancelled"].includes(record.state)) {
           this.write({ ...record, active: false, state: "cancelled", error: reasonCode, endedAtMs: this.now() });
+          revokedNow.add(taskId);
         }
       }
     });
     for (const taskId of selected) {
       const controller = this.taskControllers.get(taskId);
-      if (controller) { this.revokedReasons.set(taskId, reasonCode); controller.abort(); }
+      if (!controller) continue;
+      if (revokedNow.has(taskId)) this.revokedReasons.set(taskId, reasonCode);
+      controller.abort();
     }
     // A failed stop/archive/settlement remains durable for the existing fair reconciler.
     queueMicrotask(() => { void this.reconcileCleanup({ maxTasks: selected.length, timeoutMs: 5000 }).catch(() => {}); });

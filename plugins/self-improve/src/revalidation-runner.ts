@@ -79,7 +79,8 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     const run=revalidation.plans.getRun(runId).run,j=journal(runId),value=revalidation.plans.get(run.planId,run.planVersion).frozen;
     if(!value?.definition.limits)return;
     const ops=operations(runId),currency=value.definition.limits.currency,cost=costState(runId,currency);
-    const observation={calls:ops.filter(o=>o.admittedAtMs!==null).length,elapsedMs:j?Math.max(0,(run.endedAtMs??now())-j.startedAtMs):0,costMicros:null,currency};
+    // Elapsed time is only recorded once the run has ended, so repeated observations of a running run stay idempotent.
+    const observation={calls:ops.filter(o=>o.admittedAtMs!==null).length,elapsedMs:j&&run.endedAtMs!==null&&run.endedAtMs!==undefined?Math.max(0,run.endedAtMs-j.startedAtMs):0,costMicros:null,currency};
     const unknownReasons=["native-billing-incomplete",reason,...(cost.ambiguous?["shared-session-attribution"]:[]),...(cost.otherCurrency?["multiple-cost-currencies"]:[])];
     const taskIds=ops.map(o=>o.taskId).sort(),observedCostFloorMicros=cost.hasObservation?cost.known:null;
     revalidation.executor.recordUsage({runId,requestId:stableId("revalidation-usage",{runId,observation,taskIds,unknownReasons,observedCostFloorMicros}),binding:run.binding,usage:observation,taskIds,unknownReasons,observedCostFloorMicros});
@@ -146,7 +147,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     if(state.run.status==="running"){
       revalidation.executor.interrupt({runId,expectedVersion:state.version});revoke(runId,"revalidation-interrupted");usage(runId,"interrupted");return {revalidation:1,blocked:1};
     }
-    let j:ExecutionJournal|null=null,controller:AbortController|null=null;
+    let j:ExecutionJournal|null=null,controller:AbortController|null=null,deadline:AbortSignal|null=null;
     try {
       const value=frozen(state.run);validateProtocol(value,runId);
       const started=revalidation.executor.start({runId,expectedVersion:state.version});
@@ -156,7 +157,8 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       j={runId,binding:started.run.binding,boot:ctx.boot,serviceJobId:ctx.job.id,serviceRunId:ctx.job.runId??null,lease:started.lease,privacyGeneration:options.privacyGeneration(),startedAtMs,deadlineAtMs:startedAtMs+value.definition.limits!.maxDurationMs,taskIds:ids};
       if(!store.insert(JOURNALS,runId,j))fail("revalidation-execution-already-recorded");
       controller=new AbortController();active.set(runId,controller);
-      const signal=AbortSignal.any([ctx.signal,controller.signal,AbortSignal.timeout(Math.max(1,j.deadlineAtMs-now()))]);
+      deadline=AbortSignal.timeout(Math.max(1,j.deadlineAtMs-now()));
+      const signal=AbortSignal.any([ctx.signal,controller.signal,deadline]);
       await environment(j,signal);
       const receipts:RevalidationCaseReceipt[]=[];
       for(const [index,c] of value.workload!.definition.cases.entries()){
@@ -190,9 +192,12 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       usage(runId,"completed");return {revalidation:1,completed:1,pairs};
     } catch(error){
       state=revalidation.plans.getRun(runId);
-      const reason=error instanceof RunnerFailure?error.code:ctx.signal.aborted||controller?.signal.aborted?"revalidation-execution-aborted":"revalidation-native-execution-failed";
-      if(["queued","running"].includes(state.run.status)){
-        if(error instanceof RunnerFailure)revalidation.executor.block({runId,reason,...(j?{lease:j.lease}:{})});
+      const timedOut=deadline?.aborted===true||(j!==null&&now()>=j.deadlineAtMs);
+      const reason=disposed?"interrupted-needs-new-run":timedOut?"revalidation-time-limit":error instanceof RunnerFailure?error.code:ctx.signal.aborted||controller?.signal.aborted?"revalidation-execution-aborted":"revalidation-native-execution-failed";
+      // Shutdown follows the restart rule: blocked, needing an explicit new run, never a failed hypothesis.
+      if(disposed&&state.run.status==="running"){try{revalidation.executor.interrupt({runId,expectedVersion:state.version});}catch{/* recovery on next boot */}}
+      else if(["queued","running"].includes(state.run.status)){
+        if(error instanceof RunnerFailure||timedOut)revalidation.executor.block({runId,reason,...(j?{lease:j.lease}:{})});
         else if(j)revalidation.executor.fail({runId,reason,lease:j.lease});
         else revalidation.executor.block({runId,reason});
       }
@@ -206,7 +211,13 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       const operation=execute(ctx,runId);locks.set(runId,operation);void operation.finally(()=>{if(locks.get(runId)===operation)locks.delete(runId);}).catch(()=>{});return operation;},
     cancel(runId:string){if(revalidation.plans.getRun(runId).run.status!=="cancelled")fail("revalidation-owner-cancellation-required");revoke(runId,"revalidation-owner-cancelled");usage(runId,"owner-cancelled");},
     recover(boot:string){for(const entry of store.entries<RevalidationRun>("revalidation-runs")){if(entry.value.status!=="running"||active.has(entry.key))continue;const j=journal(entry.key);if(j?.boot===boot)continue;revalidation.executor.interrupt({runId:entry.key,expectedVersion:entry.version});revoke(entry.key,"revalidation-interrupted");usage(entry.key,"interrupted");}},
-    reconcileUsage(){for(const j of store.list<ExecutionJournal>(JOURNALS))usage(j.runId,"reconciled-native-usage");},
+    reconcileUsage(){
+      // Late native reports for ended runs; running runs record usage after every receipt. One bad run does not stop the sweep.
+      for(const j of store.list<ExecutionJournal>(JOURNALS)){
+        if(active.has(j.runId))continue;
+        try{if(!["queued","running"].includes(revalidation.plans.getRun(j.runId).run.status))usage(j.runId,"reconciled-native-usage");}catch{/* retried next sweep */}
+      }
+    },
     dispose(){disposed=true;for(const runId of active.keys())revoke(runId,"revalidation-disposed");},
   };
 }

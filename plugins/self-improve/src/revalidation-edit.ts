@@ -24,7 +24,7 @@ export function createRevalidationDraftEditor(store: Store, plans: ReturnType<ty
       // Keep the complete edit atomic: rejection of a plan must not leave orphan workload revisions.
       const oldReference = prior?.definition.workload;
       const oldWorkload = oldReference && "id" in oldReference ? workloads.get(oldReference.id, oldReference.version) : null;
-      const workload = input.workload === null ? null : oldWorkload && stableJson(oldWorkload.definition) === stableJson(input.workload) ? oldWorkload
+      const workload = input.workload === undefined ? oldWorkload : input.workload === null ? null : oldWorkload && stableJson(oldWorkload.definition) === stableJson(input.workload) ? oldWorkload
         : oldWorkload ? workloads.revise({id:oldWorkload.id, expectedVersion:oldWorkload.version, definition:input.workload}, actor)
         : workloads.create({requestId:receiptKey, definition:input.workload}, actor);
       const reference = workload ? {id:workload.id,version:workload.version,manifestDigest:workload.manifestDigest,description:workload.definition.description} : null;
