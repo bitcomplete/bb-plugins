@@ -23,7 +23,7 @@ function requireActor(actor: Actor, ownerOnly: boolean): void {
 
 /**
  * Revalidation plans, runs and results. `plans` is the owner/chat domain; `executor` is used only by the server's runner.
- * Rules this module enforces are listed in reviews/revalidation-must-hold.md (owner authority, frozen integrity, honest verdicts).
+ * The guarantees it enforces are listed in docs/revalidation.md (owner authority, frozen integrity, honest verdicts).
  */
 export function createRevalidation(store: Store, options: { redact: (value: string) => string; now?: () => number }) {
   const now = () => options.now?.() ?? Date.now();

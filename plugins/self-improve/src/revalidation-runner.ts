@@ -56,7 +56,7 @@ export interface RevalidationRunnerOptions {
   privacyGeneration: () => string; taskTimeoutMs: () => number; now?: () => number;
 }
 
-/** Runs queued revalidation plans on the builder service. See reviews/revalidation-must-hold.md. */
+/** Runs queued revalidation plans on the builder service. See docs/revalidation.md. */
 export function createRevalidationRunner(options: RevalidationRunnerOptions) {
   const { store, revalidation } = options, now = () => options.now?.() ?? Date.now();
   const active = new Map<string, Promise<Record<string, number>>>();

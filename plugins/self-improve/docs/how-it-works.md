@@ -48,7 +48,9 @@ The revalidation engine is in place on the server; its dashboard wizard is not b
 
 - Answers must be JSON `{"output": "..."}`, optionally in one code fence. Anything else counts as a failed case, and the result shows how many answers were unreadable.
 - A verdict is recorded only when every call finished. If you cancel, the plugin is turned off, the worker settings change, the time limit passes or a call fails, the run stops with a reason and no verdict.
-- The latest completed run of the latest frozen plan decides the claim's standing. Earlier results stay in the history.
+- The most recently frozen plan for a claim decides its standing, through its latest completed run. Earlier results stay in the history.
+
+[What revalidation guarantees](revalidation.md) lists the full set of guarantees and limits.
 
 Both complete workflows remain **pending in this preview**. Existing basic retest and draft export controls are foundations. A draft PR is submitted for review; it is not published, listed or active. This pending work remains part of the delivery scope.
 

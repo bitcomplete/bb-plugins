@@ -9,7 +9,6 @@ import { evaluateInstruction, sealManifest, createEvaluationModel, recoverInterr
 import type { NativeExecution, NativeTaskReceipt, NativeTaskRequest } from "../src/native-tasks.js";
 import { NOW, solution } from "./domain/fixtures.js";
 
-// Native architecture migration: see reviews/delivery/native-legacy-evaluation-test-mapping.md.
 // These fixtures assert development observations only; no test flag grants isolation or adoption.
 const dbs: Database.Database[] = [], dirs: string[] = [];
 afterEach(() => { dbs.splice(0).forEach(db => db.close()); dirs.splice(0).forEach(path => rmSync(path, { recursive: true, force: true })); });
