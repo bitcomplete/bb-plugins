@@ -8,6 +8,8 @@ export type SourceSdk = Pick<BbPluginApi["sdk"],"threads"|"projects"|"plugins">;
 export interface SourceCoverage { source:string;complete:boolean;reason:string|null }
 export interface TaskOutcomeSource { pluginId:string;method:string }
 export interface TaskOutcomeResult {runs:TaskRun[];complete:boolean;reason?:string|null}
+/** Only the event types the miner reads. Streaming deltas make up most of a long thread and are never used. */
+export const MINED_TYPES=["client/turn/requested","turn/input/accepted","turn/started","item/completed","provider/error","turn/completed","provider/modelFallback"] as const;
 export interface SourceInput {
   now:number;lookbackMs?:number;pageSize?:number;maxPages?:number;signal?:AbortSignal;
   /** Pages of mined event types read per thread (default 200, i.e. 20,000 events). */
@@ -151,8 +153,6 @@ export async function collectSources(sdk:SourceSdk,input:SourceInput):Promise<So
     try{const result=await taskOutcomeSource();for(const run of result.runs){if(run.originPluginId!=="self-improve"&&run.occurredAtMs>=since&&run.occurredAtMs<=input.now)taskRuns.push(run);}addCoverage("task-outcomes",result.complete,result.complete?null:result.reason??"partial-structured-history");}
     catch{stop();addCoverage("task-outcomes",false,"structured-task-history-unavailable");}
   }else addCoverage("task-outcomes",false,"Public task statuses do not establish terminal failed/blocked outcomes or complete run counts");
-  // Only the event types the miner reads. Streaming deltas make up most of a long thread and are never used.
-  const MINED_TYPES=["client/turn/requested","turn/input/accepted","turn/started","item/completed","provider/error","turn/completed","provider/modelFallback"] as const;
   // Thread history has its own budget, independent of how many threads a pass lists: 200 pages of filtered events.
   const eventMaxPages=input.eventMaxPages??200;
   async function eventPages(id:string,after=0,turnStarts=false):Promise<Row[]>{

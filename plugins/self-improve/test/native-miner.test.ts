@@ -38,7 +38,7 @@ describe("native miner", () => {
     const request = f.execute.mock.calls[0]![0], input = JSON.parse(request.input);
     expect(request).toMatchObject({ stage: "miner", runId: "run-original", execution: { providerId: provider }, privacyGeneration: "generation-1", instructions: NATIVE_MINER_INSTRUCTION });
     expect(request).not.toHaveProperty("messages"); expect(request).not.toHaveProperty("max_tokens");
-    expect(input.events[0].excerpt).toContain("EVENT_EXCERPT_ONLY"); expect(request.input).not.toContain("ClientCorp");
+    expect(input.events[0].preview).toContain("EVENT_EXCERPT_ONLY"); expect(input.threadId).toBe("source-thread"); expect(request.input).not.toContain("ClientCorp");
     const saved = JSON.stringify(f.store.list("native-mining-operations"));
     expect(saved).not.toContain("EVENT_EXCERPT_ONLY"); expect(saved).not.toContain("ClientCorp"); expect(saved).not.toContain(NATIVE_MINER_INSTRUCTION);
     expect(f.miner.owns("owned-thread")).toBe(true); expect(f.miner.owns("source-thread")).toBe(false);
