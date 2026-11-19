@@ -100,21 +100,25 @@ describe("the shipped skills' stacked-PR rule (BB-264)", () => {
   });
 });
 
-// BB-267: a by-hand step outside the repos that a feature needs (an app scope,
-// a webhook, a registry entry, a firewall rule) is a configure escalation, and
-// the project steward fails item 5 on a spec that leaves it as a README line
-// or a follow-up.
-describe("the shipped stewards skill's by-hand configure step (BB-267)", () => {
-  it("raises it as an escalation, not a README line, and fails item 5 when a spec leaves it undocumented", () => {
+// BB-267 / BB-368: a by-hand step outside the repos that a feature needs (an
+// app scope, a webhook, a registry entry, a firewall rule) is named in the
+// spec turn with the trigger that makes it doable and escalated when that
+// trigger has happened; the project steward meets item 5 on a named step and
+// fails it on a README line or a follow-up with no trigger.
+describe("the shipped stewards skill's by-hand configure step (BB-267, BB-368)", () => {
+  it("names the step with its trigger in the spec, escalates at the trigger, and meets item 5 on the name", () => {
     expect(stewardsSkill).toContain("A by-hand step outside the repos the feature needs to work");
-    expect(stewardsSkill).toMatch(/an app scope, a webhook, a registry entry, a firewall rule/u);
-    expect(stewardsSkill).toMatch(/a `configure`\s+escalation raised in the spec turn/u);
+    expect(stewardsSkill).toMatch(/an\s+app scope, a webhook, a registry entry, a firewall rule/u);
+    expect(stewardsSkill).toMatch(/Name it in the spec turn with the\s+trigger that makes it doable/u);
+    expect(stewardsSkill).toMatch(/a pull request opening, a merge, a deploy/u);
+    expect(stewardsSkill).toMatch(/raise the escalation when that trigger has happened/u);
     expect(stewardsSkill).toMatch(/kind:\s+"decision"/u);
     expect(stewardsSkill).toMatch(/never a README\s+line or a closing-comment follow-up/u);
     expect(stewardsSkill).toMatch(/raise that step again/u);
     expect(stewardsSkill).toMatch(/the user's to grant/u);
-    expect(stewardsSkill).toMatch(/never decides it itself/u);
-    expect(stewardsSkill).toMatch(/Fail checklist item 5/u);
+    expect(stewardsSkill).toMatch(/never\s+decides it itself/u);
+    expect(stewardsSkill).toMatch(/Checklist item 5 is met\s+when the spec names a by-hand step/u);
+    expect(stewardsSkill).toMatch(/do not decline a\s+spec for deferring it to its trigger/u);
     expect(stewardsSkill).toMatch(/must be raised again\s+rather than settling/u);
   });
 });
