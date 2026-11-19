@@ -49,6 +49,9 @@ export const NON_ACTION_CODES = [
   "merge-refused",
   "head-moved",
   "gate-not-met",
+  // BB-373: a gate-met draft pull request is not sent to GitHub; it merges
+  // once it is marked ready.
+  "pull-draft",
   // The owner's two named cases.
   "binding-ended-closed",
   "needs-decline-closed",
@@ -93,6 +96,7 @@ const NON_ACTION_TEXT: Record<NonActionCode, (detail: string | null, day: string
   "merge-refused": (d) => `GitHub refused the merge${d === null ? "" : ` of ${d}`}`,
   "head-moved": (d) => `The head moved between the look and the merge${d === null ? "" : ` of ${d}`}`,
   "gate-not-met": (d) => `The merge gate${d === null ? "" : ` for ${d}`} is not met`,
+  "pull-draft": (d) => `The pull request${d === null ? "" : ` ${d}`} is a draft; the plugin merges it once it is marked ready`,
   "binding-ended-closed": (d) => `Closed because the binding ended (${d ?? "ended"})`,
   "needs-decline-closed": (d) => `Closed the spec approval because the spec was declined${d === null ? "" : ` (${d})`}`,
   "wait-slack-unsent": (d) => `Ask on Slack sent nothing: the person was not found or Slack was unavailable${d === null ? "" : ` (${d})`}`,

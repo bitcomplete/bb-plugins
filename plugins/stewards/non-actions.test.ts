@@ -397,6 +397,14 @@ describe("the declining branches record their reason (BB-335)", () => {
     written(t, b, "gate-not-met");
   });
 
+  it("pull-draft: the gate-met pull request is a draft", async () => {
+    const t = await setup();
+    const b = await gateMetTicket(t, { draft: true });
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    written(t, b, "pull-draft");
+  });
+
   it("binding-ended-closed: an ending closes an open item", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed" }));
@@ -446,7 +454,7 @@ describe("the declining branches record their reason (BB-335)", () => {
       "config-unreadable", "project-disabled", "no-playbook", "entity-unreadable", "entity-gone", "stay-ended", "other-binding-open",
       "ending-in-progress", "follow-through-ran-out", "nothing-to-do", "deferred", "worker-busy", "pull-foreign-owner", "pull-closed",
       "merge-held", "retarget-needed", "merge-steward-filed", "worker-running", "merge-paused", "parked-owns-another", "base-not-default",
-      "merge-refused", "head-moved", "gate-not-met", "binding-ended-closed", "needs-decline-closed", "wait-slack-unsent",
+      "merge-refused", "head-moved", "gate-not-met", "pull-draft", "binding-ended-closed", "needs-decline-closed", "wait-slack-unsent",
     ];
     expect([...tested].sort()).toEqual([...NON_ACTION_CODES].sort());
   });
