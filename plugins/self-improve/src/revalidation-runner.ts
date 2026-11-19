@@ -36,7 +36,7 @@ const TASK_INSTRUCTIONS="Perform the supplied test task. Return only JSON {outpu
 const MAX_NATIVE_INSTRUCTIONS=32768;
 const treatmentInstructions=(artifact:string)=>`${TASK_INSTRUCTIONS}\n\nAdditional instruction:\n${artifact}`;
 /** Ended runs keep reconciling late native reports for this long, at this interval, then stop being scanned. */
-const ENVIRONMENT_RETRIES=2,ENVIRONMENT_RETRY_MS=2000;
+const ENVIRONMENT_RETRIES=2,ENVIRONMENT_RETRY_MS=2000,CAPACITY_WAIT_MS=5000;
 /** Ended runs reconciled per sweep, so a restart spreads its catch-up over several minutes. */
 const USAGE_RECONCILE_BATCH=20;
 const USAGE_RECONCILE_WINDOW_MS=7*24*60*60*1000,USAGE_RECONCILE_INTERVAL_MS=15*60*1000;
@@ -56,6 +56,8 @@ export interface RevalidationRunnerOptions {
   execution:()=>NativeExecution;privacyGeneration:()=>string;redact:(value:string)=>string;
   observeEnvironment:(environment:RevalidationEnvironment,signal?:AbortSignal)=>Promise<ObservedRevalidationEnvironment>;
   allowed:()=>boolean;taskTimeoutMs:()=>number;now?:()=>number;
+  /** Whether BB's shared native concurrency limit has room; the runner waits for room instead of losing the run. */
+  hasCapacity?:()=>boolean;
   /** Global budgets.allowUnknown; native work is refused by shared admission without it. */
   allowUnknownCost?:()=>boolean;
 }
@@ -68,6 +70,8 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
   const cleaned=new Set<string>(),lastReconciled=new Map<string,number>();
   /** First reason this runner refused or stopped a run's work; it outranks the generic error that surfaces later. */
   const stopCodes=new Map<string,string>();
+  /** Runs whose last reconciliation failed, and runs past the reconciliation window that are never scanned again. */
+  const failing=new Set<string>(),settled=new Set<string>();
   /** Case and arm in flight per run, so an operational failure names where it happened. */
   const position=new Map<string,{caseId:string;arm:"baseline"|"treatment"}>();
   const journal=(runId:string)=>store.get<ExecutionJournal>(JOURNALS,runId);
@@ -242,6 +246,11 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
           const promptHash=sha(`${instructions}\n\nTask input (untrusted data):\n${JSON.stringify({input})}`);
           const requestDigest=sha(stableJson({execution:request.execution,promptHash,stage:request.stage,runId,solutionId:request.solutionId,privacyGeneration:request.privacyGeneration,timeoutMs,maxReplyCharacters:request.maxReplyCharacters}));
           const op:Operation={taskId,runId,caseId:c.id,arm,binding:j.binding,requestDigest,promptHash,admittedAtMs:null};
+          // Other stages can briefly fill the shared concurrency limit; wait for room within the deadline rather than block.
+          while(options.hasCapacity&&!options.hasCapacity()){
+            if(now()+CAPACITY_WAIT_MS>=j.deadlineAtMs)fail("revalidation-shared-concurrency-unavailable");
+            await bounded(new Promise<void>(resolve=>setTimeout(resolve,CAPACITY_WAIT_MS)),signal);current(j);
+          }
           current(j);checkMoney(runId,value.definition.limits!);if(!store.insert(OPERATIONS,taskId,op))fail("revalidation-operation-already-recorded");
           const response=await completeText(runner,request,signal);current(j);signal.throwIfAborted();
           // A reply in the wrong shape is an answer that fails the case: a treatment that breaks the format is a regression to measure.
@@ -258,18 +267,21 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
       // A pair counts only when the baseline answered in the required format: an unreadable baseline says nothing about
       // the solution, so it must not let a run look supported. An unreadable treatment answer still counts as a failure,
       // because breaking the answer format is a regression the test should catch. Too few usable pairs is inconclusive.
+      // Any unreadable baseline answer makes the comparison unsound in either direction, so the run reports zero usable
+      // pairs and the domain records it as inconclusive. An unreadable treatment answer still counts as a failed case,
+      // because breaking the answer format is a regression the test should catch. Rates always cover every case.
       const arm=(caseId:string,which:"baseline"|"treatment")=>receipts.find(r=>r.caseId===caseId&&r.arm===which)!;
-      const usable=value.workload!.definition.cases.filter(c=>arm(c.id,"baseline").answerFormat!=="invalid");
-      const pairs=usable.length,baseline=usable.filter(c=>arm(c.id,"baseline").passed).length,treatment=usable.filter(c=>arm(c.id,"treatment").passed).length;
-      const regressions=usable.filter(c=>arm(c.id,"baseline").passed&&!arm(c.id,"treatment").passed).length;
+      const cases=value.workload!.definition.cases;
       const invalid={baseline:receipts.filter(r=>r.arm==="baseline"&&r.answerFormat==="invalid").length,treatment:receipts.filter(r=>r.arm==="treatment"&&r.answerFormat==="invalid").length};
-      const rate=(count:number)=>pairs===0?0:count/pairs;
+      const pairs=invalid.baseline>0?0:cases.length,baseline=cases.filter(c=>arm(c.id,"baseline").passed).length,treatment=cases.filter(c=>arm(c.id,"treatment").passed).length;
+      const regressions=cases.filter(c=>arm(c.id,"baseline").passed&&!arm(c.id,"treatment").passed).length;
+      const rate=(count:number)=>count/cases.length;
       const refs=receipts.map(r=>r.id);
       revalidation.executor.complete({runId,lease:j.lease,binding:j.binding,observations:value.definition.criteria.map(c=>{
         const kind=value.workload!.definition.measurements.find(m=>m.criterionId===c.id)!.kind;
         return {criterionId:c.id,metric:c.metric,unit:c.unit,baseline:kind==="exact-pass-rate"?rate(baseline):0,treatment:kind==="exact-pass-rate"?rate(treatment):regressions,pairs,exposure:null,exposureUnit:null,receiptRefs:refs};
       }),evidence:{kind:value.definition.mode==="replay"?"exploratory-replay":"exploratory-challenge",receiptRefs:refs,limitations:["Ordinary BB/provider/user/workspace context and tools may remain; no enforced isolation or causal claim.","Only exact answers on the frozen prompt cases were compared; packaged skill/plugin portability was not tested.","Provider/model identity is the requested selection; native billing remains incomplete.",
-        ...(invalid.baseline||invalid.treatment?[`Answers not in the required format: ${invalid.baseline} baseline (pair excluded), ${invalid.treatment} treatment (scored as failed).`]:[])]},usage:{calls:operations(runId).filter(o=>o.admittedAtMs!==null).length,elapsedMs:Math.max(0,now()-j.startedAtMs),costMicros:null,currency:value.definition.limits!.currency}});
+        ...(invalid.baseline||invalid.treatment?[`Answers not in the required format: ${invalid.baseline} baseline${invalid.baseline?" (result inconclusive)":""}, ${invalid.treatment} treatment (scored as failed).`]:[])]},usage:{calls:operations(runId).filter(o=>o.admittedAtMs!==null).length,elapsedMs:Math.max(0,now()-j.startedAtMs),costMicros:null,currency:value.definition.limits!.currency}});
       usage(runId,"completed");return {revalidation:1,completed:1,pairs};
     } catch(error){
       state=revalidation.plans.getRun(runId);
@@ -316,17 +328,22 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     },
     /** Late native reports for recently ended runs, each at most every 15 minutes. Returns how many runs could not be reconciled. */
     reconcileUsage(){
-      let failed=0,done=0;
+      let attempts=0;
       for(const j of store.list<ExecutionJournal>(JOURNALS)){
-        if(done>=USAGE_RECONCILE_BATCH)break;
-        if(active.has(j.runId)||now()-(lastReconciled.get(j.runId)??-Infinity)<USAGE_RECONCILE_INTERVAL_MS)continue;
+        if(attempts>=USAGE_RECONCILE_BATCH)break;
+        if(active.has(j.runId)||settled.has(j.runId)||now()-(lastReconciled.get(j.runId)??-Infinity)<USAGE_RECONCILE_INTERVAL_MS)continue;
+        // The attempt time is recorded first, so a run that keeps failing is retried at the normal interval, not every sweep.
+        lastReconciled.set(j.runId,now());
+        if(now()-j.startedAtMs>USAGE_RECONCILE_WINDOW_MS+j.deadlineAtMs-j.startedAtMs){settled.add(j.runId);failing.delete(j.runId);continue;}
         try{
           const run=revalidation.plans.getRun(j.runId).run;
-          if(["queued","running"].includes(run.status)||(run.endedAtMs!=null&&now()-run.endedAtMs>USAGE_RECONCILE_WINDOW_MS))continue;
-          done++;usage(j.runId,"reconciled-native-usage");lastReconciled.set(j.runId,now());
-        }catch{failed++;}
+          if(["queued","running"].includes(run.status))continue;
+          if(run.endedAtMs!=null&&now()-run.endedAtMs>USAGE_RECONCILE_WINDOW_MS){settled.add(j.runId);failing.delete(j.runId);continue;}
+          attempts++;usage(j.runId,"reconciled-native-usage");failing.delete(j.runId);
+        }catch{attempts++;failing.add(j.runId);}
       }
-      return failed;
+      // Reported until each failing run either succeeds or ages out, regardless of which runs this sweep reached.
+      return failing.size;
     },
     /** Stop in-flight work for any active run that may no longer proceed (disabled, selection or plan changed). */
     enforce(){

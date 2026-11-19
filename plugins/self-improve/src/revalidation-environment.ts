@@ -101,8 +101,9 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
     const pluginIds = [...new Set(environment.dependencies.filter(item => item.kind === "plugin").map(item => item.name))].sort();
     const skillIds = [...new Set(environment.dependencies.filter(item => item.kind === "skill").map(item => item.name))].sort();
     const [versionResult, pluginsResult, skillsResult] = await Promise.all([
-      // The BB version is context, not a declared dependency: a host that cannot report it records a stable unknown.
-      read(() => sdk.system.version({ signal })).catch(error => { if (signal.aborted) throw error; return null; }), pluginIds.length ? optional(() => sdk.plugins.list({ signal })) : null,
+      // A host without a version API records a stable unknown; a failed read on a host that has one is retried, never
+      // folded into the fingerprint, so one flaky read cannot look like a changed BB version.
+      typeof sdk.system?.version === "function" ? optional(() => sdk.system.version({ signal })) : null, pluginIds.length ? optional(() => sdk.plugins.list({ signal })) : null,
       skillIds.length ? optional(() => sdk.skills.list({ projectId: selection.projectId, environmentId: selection.environmentId, signal })) : null,
     ]);
     let bbVersion: string | null = null;

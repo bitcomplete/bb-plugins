@@ -66,6 +66,8 @@ export class NativeAccounting implements NativeTaskHooks {
     const timeout=options.collectionTimeoutMs??4000;
     if(!Number.isSafeInteger(timeout)||timeout<1||timeout>60000)throw new Error("native-accounting-timeout-invalid");
   }
+  /** Whether a native task could be admitted now under the shared concurrency limit; a hint, not a reservation. */
+  hasCapacity():boolean { const limit=this.options.maxConcurrent(); return this.records().filter(occupying).length<limit; }
   private records():Record[] {
     return this.options.store.entries(NS).map(({key,value})=>{
       const record=recordSchema.parse(value);if(record.identity.taskId!==key)throw new Error("native-accounting-record-invalid");return record;

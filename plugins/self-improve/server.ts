@@ -192,7 +192,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   revalidationRunner=createRevalidationRunner({store,revalidation,runner:nativeTasks,activity,execution,
     privacyGeneration:()=>privacyGeneration,redact:clean,observeEnvironment:revalidationEnvironment.check,
     allowed:()=>values.enabled&&configurationError===null&&!publicationStop.signal.aborted,taskTimeoutMs:()=>config.taskTimeoutMs,
-    allowUnknownCost:()=>config.budgets.allowUnknown});
+    allowUnknownCost:()=>config.budgets.allowUnknown,hasCapacity:()=>nativeAccounting.hasCapacity()});
   const ordinaryBuilder=runtime.handlers.builder;
   runtime.handlers.builder=ctx=>ctx.job.input.kind==="revalidation"?revalidationRunner!.handle(ctx):ordinaryBuilder(ctx);
   const services = new Services(bb, store, runtime.handlers, async () => values.enabled && configurationError === null, changed);

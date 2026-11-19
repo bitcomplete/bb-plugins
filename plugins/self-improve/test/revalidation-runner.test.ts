@@ -243,4 +243,28 @@ describe("BB-native revalidation runner",()=>{
       expect(f.core.plans.getRun(f.queued.id).run.status).toBe("completed");
     }finally{vi.useRealTimers();}
   });
+  it("is inconclusive when only some baseline answers are unreadable, rather than contradicting the claim",async()=>{
+    const f=await fixture(d=>{d.sample!.minimumPairs=1;});f.setHook(async request=>{
+      const input=JSON.parse(request.input).input,treatment=request.instructions.includes(f.content);
+      if(!treatment&&input==="First test task")return "```json\n{}\n```";
+      return {output:input==="First test task"?"fixture-answer-one":"fixture-answer-two"};
+    });
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).result?.verdict).toBe("inconclusive");
+  });
+  it("labels a binding refusal inside native admission as that refusal",async()=>{
+    const f=await fixture(),execute=f.native.execute.getMockImplementation()!;
+    f.native.execute.mockImplementation(async(request,signal)=>{try{return await execute({...request,execution:{...request.execution,model:"other-model"}},signal);}catch{throw Object.assign(new Error("x"),{code:"native-task-admission-denied"});}});
+    await f.runner.handle(f.ctx);
+    expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-operation-binding-mismatch (case case-a, baseline)"});
+  });
+  it("waits for shared concurrency room instead of losing the run",async()=>{
+    const f=await fixture();let room=false;f.options.hasCapacity=()=>room;const runner=createRevalidationRunner(f.options);
+    vi.useFakeTimers({toFake:["setTimeout"]});
+    try{
+      const pending=runner.handle(f.ctx);await vi.advanceTimersByTimeAsync(5000);expect(f.requests).toHaveLength(0);
+      room=true;await vi.advanceTimersByTimeAsync(5000);await pending;
+      expect(f.core.plans.getRun(f.queued.id).run.status).toBe("completed");
+    }finally{vi.useRealTimers();}
+  });
 });

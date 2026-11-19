@@ -72,12 +72,12 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
   }
   // Frozen records are written once; a record whose store version is unchanged since it was verified needs no rehash.
   // This keeps the check cheap inside BB's dispatch hook, where it runs before every arm.
-  const verifiedFrozen = new Map<string, number>();
+  const verifiedFrozen = new Map<string, string>();
   function freezeRecord(planId: string, version: number): FrozenRevalidationPlan {
     const key = versionKey(planId, version), frozen = store.get<FrozenRevalidationPlan>("revalidation-frozen", key);
     if (!frozen) throw new Error("revalidation-plan-not-frozen");
-    const storedVersion = store.version("revalidation-frozen", key);
-    if (verifiedFrozen.get(key) === storedVersion) return frozen;
+    const verifiedAs = `${store.version("revalidation-frozen", key)}:${frozen.planDigest}`;
+    if (verifiedFrozen.get(key) === verifiedAs) return frozen;
     // Version 1 digests remain interpretable, but never gain executable capabilities.
     if (frozen.schemaVersion !== undefined && frozen.schemaVersion !== 2) throw new Error("revalidation-frozen-version-unsupported");
     if (frozen.schemaVersion === 2) {
@@ -91,7 +91,7 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
       workload: frozen.workload, observedEnvironment: frozen.observedEnvironment }) : hash({ planId, version, definition: frozen.definition, artifact: frozen.artifact });
     if (frozen.planDigest !== expected || contentDigest(frozen.artifact.content) !== frozen.definition.target.artifactDigest ||
       frozen.environmentDigest !== revalidationEnvironmentDigest(frozen.definition.environment!) || frozen.workloadDigest !== frozen.definition.workload?.manifestDigest) throw new Error("revalidation-frozen-input-changed");
-    verifiedFrozen.set(key, storedVersion);
+    verifiedFrozen.set(key, verifiedAs);
     return frozen;
   }
   function run(runId: string): RevalidationRun {

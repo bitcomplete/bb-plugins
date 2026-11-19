@@ -111,10 +111,14 @@ it("compares without recording when used as a drift check",async()=>{
   for(let i=0;i<5;i++)expect((await f.observer.check(environment)).digest).toBe(recorded.digest);
   expect(f.store.list("revalidation-observed-environments")).toEqual(before);expect(f.observer.resolve(environment).digest).toBe(recorded.digest);
 });
-it("treats a failed environment read as unavailable and an unreadable BB version as a stable unknown", async () => {
+it("treats a failed environment or BB version read as unavailable, and a host without a version API as a stable unknown", async () => {
   const f = fixture(); f.methods.environments.get.mockRejectedValueOnce(new Error("boom"));
   await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
-  f.methods.system.version.mockRejectedValue(new Error("offline"));
-  const first = await f.observer.check(environment), second = await f.observer.check(environment);
+  f.methods.system.version.mockRejectedValueOnce(new Error("offline"));
+  await expect(f.observer.check(environment)).rejects.toThrow("revalidation-environment-observation-unavailable");
+  const withVersion = await f.observer.check(environment);
+  const noApi = createRevalidationEnvironmentObserver({ ...f.options, sdk: { ...f.methods, system: {} } as unknown as RevalidationEnvironmentSdk });
+  const first = await noApi.check(environment), second = await noApi.check(environment);
   expect(first.bbVersion).toBeNull(); expect(first.unknowns).toContain("bb-version-not-observed"); expect(second.digest).toBe(first.digest);
+  expect(withVersion.bbVersion).toBe("0.49.0");
 });
