@@ -23,14 +23,16 @@ wait` by default). If that command is unavailable, comment the question on the
 ticket or pull request you were given and put it in your final message, then
 end the turn.
 
-**Ending a turn to wait.** When you end a turn waiting on something that will
-wake you — a reviewer's round, the approver, checks, a build, a deployment,
-the steward's answer — call `worker_park { waitingOn: "<what you wait on>" }`
-as your last action. The plugin then leaves this worker unarchived, shows it
-as parked, and wakes it when the thing happens. A turn that ends without the
-call is a plain finish: the plugin treats the worker as done and archives it,
-whatever its final message says. Do not rely on the words "waiting" or
-"parked" in your final message.
+**Ending a turn to wait.** The flow is not one turn: a step that waits on
+something outside it may end the turn and resume from the wake. When you end
+a turn waiting on something that will wake you — a reviewer's round, the
+approver, checks, a build, a deployment, the steward's answer — call
+`worker_park { waitingOn: "<what you wait on>" }` as your last action. The
+plugin then leaves this worker unarchived, shows it as parked, and wakes it
+when the thing happens. A turn that ends without the call is a plain finish:
+the plugin treats the worker as done and archives it, whatever its final
+message says. Do not rely on the words "waiting" or "parked" in your final
+message.
 
 The project-specific parts are the project's, not this skill's: which
 repos depend on which, each repo's test command, the restart note, the
@@ -177,9 +179,13 @@ Sibling PR: <the pull request this is one half of, or omit when it stands alone.
 - Not tested: <what, and why> (omit if nothing).
 ```
 
-Mark it ready (not draft) once checks pass, move the ticket to **In
-Review** with `ticket_update { key, state }`, and comment the PR URL on the
-ticket with `ticket_comment`.
+Mark it ready (not draft) once checks pass. Wait for the checks the way this
+server waits on GitHub, never with a `sleep` loop over `gh` (`gh pr checks`,
+`gh pr view`): if a watching tool is available, use it and continue this step
+from the wake in the next turn; otherwise use one blocking watch such as
+`gh pr checks --watch`. Then move the ticket to **In Review** with
+`ticket_update { key, state }`, and comment the PR URL on the ticket with
+`ticket_comment`.
 
 ## Get it reviewed
 
@@ -357,7 +363,10 @@ they need resolving, push, **confirm a `pull_request` run exists for the new
 head** (`gh run list -R <repo> --commit <sha> --event pull_request`; if none
 appears within about two minutes, re-trigger without changing the head with
 `gh pr close <n> && gh pr reopen <n>`, and if still none tell the steward),
-wait for the checks, and merge. Neither
+then wait for the checks the way this server waits on GitHub, never with a
+`sleep` loop over `gh`: if a watching tool is available, use it and continue
+this step from the wake in the next turn; otherwise use one blocking watch
+such as `gh pr checks --watch`, and merge. Neither
 approval needs renewing for that, and the reviewer does not need another
 round. Do not post asking how to proceed and do not wait for the queue of
 other PRs to drain. If the base branch moves again before you merge, do it
