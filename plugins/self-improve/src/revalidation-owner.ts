@@ -5,6 +5,7 @@ import type { createRevalidationWorkloads } from "./revalidation-workload.js";
 import type { createRevalidationDraftEditor } from "./revalidation-edit.js";
 import type { createRevalidationEnvironmentObserver } from "./revalidation-environment.js";
 import { stableJson } from "./domain/shared.js";
+import { PROGRESS } from "./revalidation-runner.js";
 import type { createRevalidationRunner } from "./revalidation-runner.js";
 import type { ExecutionSelection } from "./native-execution.js";
 import type { Solution } from "./domain/types.js";
@@ -67,6 +68,7 @@ export function createRevalidationOwnerApi(options:RevalidationOwnerOptions){
       }
       return {...selected,...history,workload:reference&&"id" in reference?workloads.get(reference.id,reference.version):null,
         runVersions:Object.fromEntries(history.runs.map(run=>[run.id,domain.plans.getRun(run.id).version])),
+        waiting:Object.fromEntries(history.runs.flatMap(run=>{const value=store.get<{waitingFor:string;sinceMs:number}>(PROGRESS,run.id);return value?[[run.id,value]]:[];})),
         usageByRun:Object.fromEntries(history.runs.map(run=>[run.id,usage.get(run.id)??[]]))};
     },
     // A revision can supersede a running plan; stop its in-flight work now rather than when the arm ends.

@@ -80,7 +80,9 @@ export type ClaimVerdict = "supported" | "contradicted" | "inconclusive";
 export interface RevalidationRun { id: string; planId: string; planVersion: number; sequence: number; requestId: string; binding: RevalidationBinding;
   status: RevalidationExecutionStatus; verdict: ClaimVerdict | null; createdAtMs: number; startedAtMs: number | null; endedAtMs: number | null; reason: string | null }
 const observationSchema = z.object({ criterionId: id, metric: prose, unit: prose, baseline: finite.nullable(), treatment: finite.nullable(),
-  pairs: count, exposure: finite.nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100) }).strict();
+  pairs: count, exposure: finite.nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100),
+  /** Set when the measurement cannot be compared, e.g. an unreadable baseline answer for a baseline-dependent statistic. */
+  unusable: z.enum(["baseline-answer-format-invalid"]).nullable().optional() }).strict();
 const evidenceSchema = z.object({ kind: z.enum(["exploratory-replay", "exploratory-challenge", "observational"]),
   receiptRefs: z.array(prose).min(1).max(100), limitations: z.array(prose).min(1).max(100) }).strict();
 const usageSchema = z.object({ calls: count, elapsedMs: count, costMicros: count.nullable(), currency: z.string().regex(/^[A-Z]{3}$/) }).strict();

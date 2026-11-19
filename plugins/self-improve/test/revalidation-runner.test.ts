@@ -267,4 +267,29 @@ describe("BB-native revalidation runner",()=>{
       expect(f.core.plans.getRun(f.queued.id).run.status).toBe("completed");
     }finally{vi.useRealTimers();}
   });
+  it("marks only baseline comparisons unusable when a baseline answer is unreadable",async()=>{
+    const f=await fixture(d=>{d.criteria[0]!.statistic="treatment";d.criteria[0]!.threshold={operator:"at-least",value:1};});
+    f.setHook(async request=>{
+      const input=JSON.parse(request.input).input,treatment=request.instructions.includes(f.content);
+      if(!treatment&&input==="First test task")return "```json\n{}\n```";
+      return {output:input==="First test task"?"fixture-answer-one":"fixture-answer-two"};
+    });
+    await f.runner.handle(f.ctx);
+    const result=f.core.plans.getRun(f.queued.id).result!;
+    expect(result.criteria.find(c=>c.criterionId==="success")).toMatchObject({status:"threshold-met",value:1});
+    expect(result.criteria.find(c=>c.criterionId==="regressions")).toMatchObject({status:"inconclusive",reason:"baseline-answer-format-invalid"});
+    expect(result.verdict).toBe("inconclusive");
+  });
+  it("waits visibly for shared concurrency room for at most ten minutes",async()=>{
+    const f=await fixture(d=>{d.limits!.maxDurationMs=3_600_000;});f.options.hasCapacity=()=>false;const runner=createRevalidationRunner(f.options);
+    vi.useFakeTimers({toFake:["setTimeout"]});
+    try{
+      const pending=runner.handle(f.ctx);await vi.advanceTimersByTimeAsync(5000);
+      expect(f.store.get("revalidation-progress",f.queued.id)).toMatchObject({waitingFor:"shared-concurrency"});
+      for(let t=0;t<130;t++){f.setTime(NOW+t*5000);await vi.advanceTimersByTimeAsync(5000);}
+      await pending;
+      expect(f.requests).toHaveLength(0);expect(f.store.get("revalidation-progress",f.queued.id)).toBeNull();
+      expect(f.core.plans.getRun(f.queued.id).run).toMatchObject({status:"blocked",reason:"revalidation-shared-concurrency-unavailable (case case-a, baseline)"});
+    }finally{vi.useRealTimers();}
+  });
 });

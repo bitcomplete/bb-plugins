@@ -58,6 +58,13 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     promise.then(value => { signal.removeEventListener("abort", abort); resolve(value); }, error => { signal.removeEventListener("abort", abort); reject(error); });
   });
 }
+/** A host answering that the version call does not exist or is unsupported, as opposed to a transient failure. */
+function versionUnsupported(error: unknown): boolean {
+  const value = error as { status?: unknown; code?: unknown; message?: unknown } | null;
+  if (value && (value.status === 404 || value.status === 405 || value.status === 501)) return true;
+  const text = `${typeof value?.code === "string" ? value.code : ""} ${typeof value?.message === "string" ? value.message : ""}`;
+  return /not[ _-]?found|unsupported|not[ _-]?implemented|unknown[ _-]?method/i.test(text);
+}
 /** Unknown entries are bounded text; a long dependency name must not make a plan impossible to freeze. */
 const unknown = (prefix: string, name: string) => `${prefix}:${name}`.slice(0, 500).trimEnd();
 const snapshots = "revalidation-observed-environments", heads = "revalidation-environment-observation-heads", cursors = "revalidation-environment-observation-cursors";
@@ -101,9 +108,13 @@ export function createRevalidationEnvironmentObserver(options: { sdk: Revalidati
     const pluginIds = [...new Set(environment.dependencies.filter(item => item.kind === "plugin").map(item => item.name))].sort();
     const skillIds = [...new Set(environment.dependencies.filter(item => item.kind === "skill").map(item => item.name))].sort();
     const [versionResult, pluginsResult, skillsResult] = await Promise.all([
-      // A host without a version API records a stable unknown; a failed read on a host that has one is retried, never
+      // A host that does not support the version call records a stable unknown. Any other failed read is retried, never
       // folded into the fingerprint, so one flaky read cannot look like a changed BB version.
-      typeof sdk.system?.version === "function" ? optional(() => sdk.system.version({ signal })) : null, pluginIds.length ? optional(() => sdk.plugins.list({ signal })) : null,
+      typeof sdk.system?.version === "function" ? read(() => sdk.system.version({ signal })).catch(error => {
+        if (signal.aborted) throw error;
+        if (versionUnsupported(error)) return null;
+        throw new Error("revalidation-environment-observation-unavailable");
+      }) : null, pluginIds.length ? optional(() => sdk.plugins.list({ signal })) : null,
       skillIds.length ? optional(() => sdk.skills.list({ projectId: selection.projectId, environmentId: selection.environmentId, signal })) : null,
     ]);
     let bbVersion: string | null = null;

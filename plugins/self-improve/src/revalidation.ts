@@ -18,7 +18,9 @@ export interface RevalidationOptions { redact: (value: string) => string; now?: 
   workloads?: { resolve(reference: RevalidationWorkloadRef): RevalidationWorkloadSnapshot };
   environmentSnapshots?: { resolve(environment: RevalidationEnvironment): ObservedRevalidationEnvironment } }
 const observationSchema = z.object({ criterionId: id, metric: prose, unit: prose, baseline: z.number().finite().nullable(), treatment: z.number().finite().nullable(),
-  pairs: count, exposure: z.number().finite().nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100) }).strict();
+  pairs: count, exposure: z.number().finite().nonnegative().nullable(), exposureUnit: prose.nullable(), receiptRefs: z.array(prose).min(1).max(100),
+  /** Set when the measurement cannot be compared, e.g. an unreadable baseline answer for a baseline-dependent statistic. */
+  unusable: z.enum(["baseline-answer-format-invalid"]).nullable().optional() }).strict();
 const evidenceSchema = z.object({ kind: z.enum(["exploratory-replay", "exploratory-challenge", "observational"]),
   receiptRefs: z.array(prose).min(1).max(100), limitations: z.array(prose).min(1).max(100) }).strict();
 const usageSchema = z.object({ calls: count, elapsedMs: count, costMicros: count.nullable(), currency: z.string().regex(/^[A-Z]{3}$/) }).strict();
@@ -361,6 +363,7 @@ export function createRevalidation(store: Store, options: RevalidationOptions) {
           else if (!o) reason = "missing-observation";
           else if (o.metric !== c.metric || o.unit !== c.unit) throw new Error("revalidation-metric-unit-mismatch");
           else if (o.receiptRefs.some(ref => !evidence.receiptRefs.includes(ref))) throw new Error("revalidation-observation-receipt-mismatch");
+          else if (o.unusable) reason = o.unusable;
           else if (o.pairs < sample.minimumPairs || sample.minimumExposure !== null && (o.exposure === null || o.exposure < sample.minimumExposure || o.exposureUnit !== sample.exposureUnit)) reason = "insufficient-exposure";
           else if (o.baseline === null || o.treatment === null) reason = "missing-comparison";
           else if (c.statistic === "relative-change" && o.baseline === 0) reason = "zero-comparator";

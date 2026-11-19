@@ -36,7 +36,9 @@ const TASK_INSTRUCTIONS="Perform the supplied test task. Return only JSON {outpu
 const MAX_NATIVE_INSTRUCTIONS=32768;
 const treatmentInstructions=(artifact:string)=>`${TASK_INSTRUCTIONS}\n\nAdditional instruction:\n${artifact}`;
 /** Ended runs keep reconciling late native reports for this long, at this interval, then stop being scanned. */
-const ENVIRONMENT_RETRIES=2,ENVIRONMENT_RETRY_MS=2000,CAPACITY_WAIT_MS=5000;
+const ENVIRONMENT_RETRIES=2,ENVIRONMENT_RETRY_MS=2000,CAPACITY_POLL_MS=5000,CAPACITY_WAIT_LIMIT_MS=10*60*1000;
+/** What a running run is currently waiting for, shown in the plan detail; removed when the wait ends. */
+export const PROGRESS="revalidation-progress";
 /** Ended runs reconciled per sweep, so a restart spreads its catch-up over several minutes. */
 const USAGE_RECONCILE_BATCH=20;
 const USAGE_RECONCILE_WINDOW_MS=7*24*60*60*1000,USAGE_RECONCILE_INTERVAL_MS=15*60*1000;
@@ -193,6 +195,21 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
     signal.throwIfAborted();current(j);
     if(observed.digest!==value.environmentObservationDigest||observed.declaredEnvironmentDigest!==value.environmentDigest)fail("revalidation-environment-changed");
   }
+  /**
+   * Other stages can briefly fill BB's shared concurrency limit. Wait for room, visibly and for at most
+   * CAPACITY_WAIT_LIMIT_MS, because this run holds the one-at-a-time builder queue while it waits.
+   * The check is a hint: a slot taken between here and admission still blocks the run with the admission reason.
+   */
+  async function waitForCapacity(j:ExecutionJournal,signal:AbortSignal){
+    if(!options.hasCapacity||options.hasCapacity())return;
+    const since=now();store.put(PROGRESS,j.runId,{waitingFor:"shared-concurrency",sinceMs:since});
+    try{
+      while(!options.hasCapacity()){
+        if(now()-since+CAPACITY_POLL_MS>CAPACITY_WAIT_LIMIT_MS||now()+CAPACITY_POLL_MS>=j.deadlineAtMs)fail("revalidation-shared-concurrency-unavailable");
+        await bounded(new Promise<void>(resolve=>setTimeout(resolve,CAPACITY_POLL_MS)),signal);current(j);
+      }
+    }finally{store.remove(PROGRESS,j.runId);}
+  }
   function validateProtocol(value:FrozenRevalidationPlan,runId:string){
     const {definition:def,workload}=value;if(!workload)fail("revalidation-workload-unavailable");
     if(def.claim.requiredEvidence!=="exploratory")fail("revalidation-evidence-capability-unavailable");
@@ -238,6 +255,7 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
         const arms=(index%2?["treatment","baseline"]:["baseline","treatment"]) as Array<"baseline"|"treatment">;
         for(const arm of arms){
           position.set(runId,{caseId:c.id,arm});
+          await waitForCapacity(j,signal);
           await environment(j,signal);
           const instructions=arm==="treatment"?treatmentInstructions(value.artifact.content):TASK_INSTRUCTIONS;
           const input=JSON.stringify({input:c.input}),taskId=stableId("revalidation-task",[runId,c.id,arm]);
@@ -246,11 +264,6 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
           const promptHash=sha(`${instructions}\n\nTask input (untrusted data):\n${JSON.stringify({input})}`);
           const requestDigest=sha(stableJson({execution:request.execution,promptHash,stage:request.stage,runId,solutionId:request.solutionId,privacyGeneration:request.privacyGeneration,timeoutMs,maxReplyCharacters:request.maxReplyCharacters}));
           const op:Operation={taskId,runId,caseId:c.id,arm,binding:j.binding,requestDigest,promptHash,admittedAtMs:null};
-          // Other stages can briefly fill the shared concurrency limit; wait for room within the deadline rather than block.
-          while(options.hasCapacity&&!options.hasCapacity()){
-            if(now()+CAPACITY_WAIT_MS>=j.deadlineAtMs)fail("revalidation-shared-concurrency-unavailable");
-            await bounded(new Promise<void>(resolve=>setTimeout(resolve,CAPACITY_WAIT_MS)),signal);current(j);
-          }
           current(j);checkMoney(runId,value.definition.limits!);if(!store.insert(OPERATIONS,taskId,op))fail("revalidation-operation-already-recorded");
           const response=await completeText(runner,request,signal);current(j);signal.throwIfAborted();
           // A reply in the wrong shape is an answer that fails the case: a treatment that breaks the format is a regression to measure.
@@ -264,24 +277,22 @@ export function createRevalidationRunner(options:RevalidationRunnerOptions){
         }
       }
       await environment(j,signal);
-      // A pair counts only when the baseline answered in the required format: an unreadable baseline says nothing about
-      // the solution, so it must not let a run look supported. An unreadable treatment answer still counts as a failure,
-      // because breaking the answer format is a regression the test should catch. Too few usable pairs is inconclusive.
-      // Any unreadable baseline answer makes the comparison unsound in either direction, so the run reports zero usable
-      // pairs and the domain records it as inconclusive. An unreadable treatment answer still counts as a failed case,
-      // because breaking the answer format is a regression the test should catch. Rates always cover every case.
+      // An unreadable baseline answer makes any baseline comparison unsound in either direction, so those criteria are
+      // marked unusable and recorded as inconclusive with that reason. Criteria on the treatment alone stay measurable.
+      // An unreadable treatment answer counts as a failed case: breaking the answer format is a regression to catch.
       const arm=(caseId:string,which:"baseline"|"treatment")=>receipts.find(r=>r.caseId===caseId&&r.arm===which)!;
       const cases=value.workload!.definition.cases;
       const invalid={baseline:receipts.filter(r=>r.arm==="baseline"&&r.answerFormat==="invalid").length,treatment:receipts.filter(r=>r.arm==="treatment"&&r.answerFormat==="invalid").length};
-      const pairs=invalid.baseline>0?0:cases.length,baseline=cases.filter(c=>arm(c.id,"baseline").passed).length,treatment=cases.filter(c=>arm(c.id,"treatment").passed).length;
+      const pairs=cases.length,baseline=cases.filter(c=>arm(c.id,"baseline").passed).length,treatment=cases.filter(c=>arm(c.id,"treatment").passed).length;
       const regressions=cases.filter(c=>arm(c.id,"baseline").passed&&!arm(c.id,"treatment").passed).length;
       const rate=(count:number)=>count/cases.length;
       const refs=receipts.map(r=>r.id);
       revalidation.executor.complete({runId,lease:j.lease,binding:j.binding,observations:value.definition.criteria.map(c=>{
         const kind=value.workload!.definition.measurements.find(m=>m.criterionId===c.id)!.kind;
-        return {criterionId:c.id,metric:c.metric,unit:c.unit,baseline:kind==="exact-pass-rate"?rate(baseline):0,treatment:kind==="exact-pass-rate"?rate(treatment):regressions,pairs,exposure:null,exposureUnit:null,receiptRefs:refs};
+        const usesBaseline=kind==="regression-count"||c.statistic!=="treatment";
+        return {unusable:usesBaseline&&invalid.baseline>0?"baseline-answer-format-invalid" as const:null,criterionId:c.id,metric:c.metric,unit:c.unit,baseline:kind==="exact-pass-rate"?rate(baseline):0,treatment:kind==="exact-pass-rate"?rate(treatment):regressions,pairs,exposure:null,exposureUnit:null,receiptRefs:refs};
       }),evidence:{kind:value.definition.mode==="replay"?"exploratory-replay":"exploratory-challenge",receiptRefs:refs,limitations:["Ordinary BB/provider/user/workspace context and tools may remain; no enforced isolation or causal claim.","Only exact answers on the frozen prompt cases were compared; packaged skill/plugin portability was not tested.","Provider/model identity is the requested selection; native billing remains incomplete.",
-        ...(invalid.baseline||invalid.treatment?[`Answers not in the required format: ${invalid.baseline} baseline${invalid.baseline?" (result inconclusive)":""}, ${invalid.treatment} treatment (scored as failed).`]:[])]},usage:{calls:operations(runId).filter(o=>o.admittedAtMs!==null).length,elapsedMs:Math.max(0,now()-j.startedAtMs),costMicros:null,currency:value.definition.limits!.currency}});
+        ...(invalid.baseline||invalid.treatment?[`Answers not in the required format: ${invalid.baseline} baseline${invalid.baseline?" (baseline comparisons inconclusive)":""}, ${invalid.treatment} treatment (scored as failed).`]:[])]},usage:{calls:operations(runId).filter(o=>o.admittedAtMs!==null).length,elapsedMs:Math.max(0,now()-j.startedAtMs),costMicros:null,currency:value.definition.limits!.currency}});
       usage(runId,"completed");return {revalidation:1,completed:1,pairs};
     } catch(error){
       state=revalidation.plans.getRun(runId);

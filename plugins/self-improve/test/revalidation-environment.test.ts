@@ -122,3 +122,8 @@ it("treats a failed environment or BB version read as unavailable, and a host wi
   expect(first.bbVersion).toBeNull(); expect(first.unknowns).toContain("bb-version-not-observed"); expect(second.digest).toBe(first.digest);
   expect(withVersion.bbVersion).toBe("0.49.0");
 });
+it("records a BB version call the host does not support as a stable unknown", async () => {
+  const f = fixture(); f.methods.system.version.mockRejectedValue(Object.assign(new Error("method not found"), { status: 404 }));
+  const first = await f.observer.check(environment), second = await f.observer.check(environment);
+  expect(first.bbVersion).toBeNull(); expect(first.unknowns).toContain("bb-version-not-observed"); expect(second.digest).toBe(first.digest);
+});
