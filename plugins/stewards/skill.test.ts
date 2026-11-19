@@ -162,3 +162,36 @@ describe("the shipped build-tickets skill's cleanup report (BB-357)", () => {
     expect(buildTicketsSkill).toMatch(/in this ticket's\nscope or a filed follow-up ticket, naming its key/u);
   });
 });
+
+// BB-362: a local-only project has no label, so the onboarding skill asks
+// about `bb-managed` only when a label-based source is in use.
+describe("the onboarding skill's label question (BB-362)", () => {
+  it("asks about the label only when the project lists a Linear team or a GitHub issue repo", () => {
+    expect(onboardingSkill).toMatch(/ask only when the\s+project lists a Linear team or a GitHub repo it files issues in/u);
+    expect(onboardingSkill).toMatch(/a\s+local-only project adopts by state and needs no label/u);
+  });
+});
+
+// BB-364: the onboarding skill must work on a stock bb with no Linear plugin
+// and no repos.json: the survey reports Linear `available: false` without
+// derailing the interview, the interview asks for the time zone and the local
+// prefix, and it never asks about Linear teams or labels when there is no
+// Linear.
+describe("the onboarding skill's stock-install path (BB-364)", () => {
+  it("handles a no-Linear survey, asks for the zone and prefix, and never assumes repos.json", () => {
+    expect(onboardingSkill).toMatch(/the Linear section reads `available: false`/u);
+    expect(onboardingSkill).toMatch(/do not ask about Linear teams or\s+labels at all/u);
+    expect(onboardingSkill).toMatch(/the local ticket key prefix/u);
+    expect(onboardingSkill).toMatch(/no\s+`repos\.json`/u);
+    // init is told not to ask Linear on a stock install.
+    expect(onboardingSkill).toMatch(/run `init` with no `--teams`/u);
+    expect(onboardingSkill).toMatch(/--timezone[\s\S]*?--prefix/u);
+  });
+
+  it("splits the guidance landing and decide-list paths for a native single-repo project", () => {
+    expect(onboardingSkill).toMatch(/on a native single-repo project commit the\s+branch and open the guidance pull request on the repo yourself/u);
+    expect(onboardingSkill).toMatch(/the paths are relative to the repo root/u);
+    // The bare multi-repo-only instruction is gone.
+    expect(onboardingSkill).not.toMatch(/publish with `workspace_publish_guidance`, and open a\s+pull request/u);
+  });
+});

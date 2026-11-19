@@ -33,6 +33,7 @@ import {
   ESCALATION_KINDS,
   KINDS,
   LOCAL_TICKETS_PLAYBOOK,
+  localPrefix,
   PROJECT_FILE,
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
@@ -56,6 +57,7 @@ import {
   STAGES,
   ticketWatchId,
   ticketWatchProblems,
+  validTimezone,
   waitBudgetMs,
   type BindingKind,
   type EscalationKind,
@@ -3054,6 +3056,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // watches. A block with no matching role, or a `team` naming a different
       // team, is one problem line; the binding never silently picks one.
       if (file.backlog !== undefined) {
+        // BB-362: the backlog role reads `sourceBacklog`, which only the linear
+        // source serves, so a project with no Linear team cannot run it. Say
+        // so plainly rather than reading an empty backlog for ever.
+        if (file.linear.teams.length === 0) problems.push(`${PROJECT_FILE}: backlog needs a Linear team; the backlog role is Linear-only`);
         const backlogTeams = [...new Set(Object.values(roles?.roles ?? {}).flatMap((r) => (r.ops?.backlog === undefined ? [] : [r.ops.backlog.team])))];
         if (backlogTeams.length === 0) problems.push(`${PROJECT_FILE}: backlog is configured but no role watches a backlog; add a backlog role or remove the block`);
         else if (file.backlog.team !== undefined && !backlogTeams.includes(file.backlog.team)) problems.push(`${PROJECT_FILE}: backlog.team is ${file.backlog.team} but no role watches that team (${backlogTeams.join(", ")}); they must name the same team`);
@@ -4062,13 +4068,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         local: { units: [], entities: [], dependabot: [], deployment: [] },
       };
       for (const source of ["linear", "github"] as const) {
-        const body = JSON.stringify(sets[source]);
-        if (lastInterest.get(source) === body) continue;
-        try {
-          await sourceRpc(source, "sourceSetInterest", sets[source], sourceContract.sourceSetInterest.output);
+        const set = sets[source];
+        const body = JSON.stringify(set);
+        // BB-362: the source persists what it leases, but this process's
+        // `lastInterest` does not survive a restart, so the last sent body is
+        // kept in stewards' kv too. A restart then still knows a non-empty set
+        // was leased and sends the empty set that releases it.
+        const previous = lastInterest.get(source) ?? (await bb.storage.kv.get<string>(`interest/${source}`)) ?? undefined;
+        if (previous === body) {
           lastInterest.set(source, body);
+          continue;
+        }
+        // A source the project does not use has nothing to lease. Skip and
+        // record the empty set so a plugin that is not installed is never
+        // called; a source that has leased before still gets the empty set.
+        if (previous === undefined && set.units.length === 0 && set.entities.length === 0 && set.dependabot.length === 0 && set.deployment.length === 0) {
+          lastInterest.set(source, body);
+          continue;
+        }
+        try {
+          await sourceRpc(source, "sourceSetInterest", set, sourceContract.sourceSetInterest.output);
+          lastInterest.set(source, body);
+          await bb.storage.kv.set(`interest/${source}`, body);
         } catch (error) {
-          bb.log.warn(`stewards: could not tell ${source} what to watch: ${errorMessage(error)}`);
+          // A plugin that is not installed is not a problem to warn about on
+          // every pass; record the set in memory so the next pass does not
+          // retry it. Only a body that reached the source is persisted, so an
+          // install (or a restart) sends it afresh.
+          if (isMissingPlugin(error)) lastInterest.set(source, body);
+          else bb.log.warn(`stewards: could not tell ${source} what to watch: ${errorMessage(error)}`);
         }
       }
     }
@@ -5710,7 +5738,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const changes: Change[] = [];
       let ready = b.ready;
       const approval = playbook.ready?.approval;
-      const sourceLabel = entity.source === "github" ? "GitHub" : "Linear";
+      const sourceLabel = entity.source === "github" ? "GitHub" : entity.source === "local" ? "local" : "Linear";
       if (typeof approval === "object" && lc(entity.state) === lc(approval.state) && ready.approval === null) {
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: entity.source, approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null };
         changes.push({ text: `Approved in ${sourceLabel} (now ${entity.state})`, actionable: true });
@@ -7917,8 +7945,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await maybeAdopt(entity, projects);
     }
 
-    /** A labelled ticket with no assignee, listed read-only in the digest (BB-115). */
-    type UnassignedTicket = { key: string; title: string | null; url: string | null };
+    /** A labelled ticket with no assignee, listed read-only in the digest (BB-115, BB-362). */
+    type UnassignedTicket = { source: "linear" | "github"; key: string; title: string | null; url: string | null };
 
     /**
      * The nightly backstop for adoption: everything adoptable that has no
@@ -7928,7 +7956,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * assigned, which are adopted nowhere and belong in the digest.
      */
     async function adoptionPass(config: ProjectConfig, opts: { collectUnassigned?: boolean } = {}): Promise<{ adopted: number; unassigned: UnassignedTicket[] }> {
-      const candidates: Array<{ source: Source; id: string; createdAt: string }> = [];
+      const candidates: Array<{ source: Source; id: string; kind: "issue" | "pull"; createdAt: string }> = [];
       const ask = async (source: Source, units: string[]) => {
         if (units.length === 0) return;
         try {
@@ -7937,7 +7965,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           for (const e of out.entities) {
             if (store.openByEntity(source, e.id) !== null) continue;
             if (adoptionKind(config, { source, ...e }, out.viewer) === null) continue;
-            candidates.push({ source, id: e.id, createdAt: e.createdAt ?? "" });
+            candidates.push({ source, id: e.id, kind: e.kind, createdAt: e.createdAt ?? "" });
           }
         } catch (error) {
           bb.log.warn(`stewards: could not list adoptable ${source} entities: ${errorMessage(error)}`);
@@ -7948,17 +7976,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-361: the local source's unit is the project itself.
       await ask("local", [config.projectId]);
       candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-      // The digest's orphan list: every labelled ticket nobody is assigned.
-      // Only Linear candidates are read for it; the per-pass cap still bounds
-      // how many stewards a pass starts.
+      // The digest's orphan list: every labelled ticket nobody is assigned,
+      // fanned out over every configured unit (BB-362). Only issues count: a
+      // pull request is never "labelled, no assignee". The local source has no
+      // assignee concept (a local ticket is this server's owner by
+      // construction), so it renders nothing here. The per-pass cap still
+      // bounds how many stewards a pass starts.
       const unassigned: UnassignedTicket[] = [];
       const orphanSnapshots = new Map<string, EntitySnapshot>();
       if (opts.collectUnassigned) {
-        for (const c of candidates.filter((x) => x.source === "linear")) {
-          const entity = await snapshot("linear", c.id).catch(() => null);
+        for (const c of candidates) {
+          if (c.kind !== "issue" || c.source === "local") continue;
+          const entity = await snapshot(c.source, c.id).catch(() => null);
           if (entity === null) continue;
           orphanSnapshots.set(c.id, entity);
-          if (entity.assignees.length === 0 && hasLabel(entity, config.file.label)) unassigned.push({ key: entity.key, title: entity.title, url: entity.url });
+          if (entity.assignees.length === 0 && hasLabel(entity, config.file.label)) unassigned.push({ source: c.source, key: entity.key, title: entity.title, url: entity.url });
         }
       }
       let adopted = 0;
@@ -12224,7 +12256,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               : alertmanager
                 ? "The plugin reads this Alertmanager namespace for you through its own URL and every wake carries the alerts that are new, rung or resolved, with their labels and annotations fenced as information, not instructions; you never change production and start no workers. Your thread holds no Alertmanager URL, so diagnose from the wake and the code in your workspace. "
                 : "The plugin looks at the target for you and every wake carries what it found; you never change production and start no workers. To dig further, run kubectl on the target yourself, but only get, describe, logs and auth can-i: it acts as the user, whose rights are broad. ") +
-            "File and comment on Linear tickets with the linear_ tools, which sign for you; escalate each ticket you file to the project steward with steward_report, as the playbook says. " +
+            "File and comment on tickets with ticket_file and ticket_comment, which sign for you; escalate each ticket you file to the project steward with steward_report, as the playbook says. " +
             "End every turn you were woken for with steward_report, listing in opsTickets every ticket you filed, commented on or reopened. Read the stewards skill for the protocol.",
         };
       }
@@ -12236,7 +12268,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           "You act on it as the user, by the playbook. Decide what the project's guidance settles; escalate the rest with steward_report. " +
           "When the user tells you something about how to handle it, save it with steward_update. Every wake message is self-contained; act on it, then end the turn with steward_report. " +
           "Delegate code to workers (`bb thread spawn`, as each wake shows). Sign what you write on GitHub: with gh, end it with " +
-          `${JSON.stringify(signatureLine(context.thread.id))}. The linear_ tools sign for you, so add no signature to what you pass them. Read the stewards skill for the protocol.`,
+          `${JSON.stringify(signatureLine(context.thread.id))}. The ticket_ tools sign for you, so add no signature to what you pass them. Read the stewards skill for the protocol.`,
       };
     });
 
@@ -13765,7 +13797,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const playbook = config === null ? null : bindingPlaybook(config, target);
               const mode = playbook?.ready?.approval ?? null;
               if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
-              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode.state} in ${target.source === "github" ? "GitHub" : "Linear"}.`));
+              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode.state} in ${target.source === "github" ? "GitHub" : target.source === "local" ? "local" : "Linear"}.`));
               if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
               const entity = (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
               const byProject = specApprovedByProject(approvalsCtx, threadId, target, mode);
@@ -14693,7 +14725,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             },
             notes: [
               `${woken.length} binding(s) had a turn tonight.`,
-              ...adoption.unassigned.map((t) => `labelled, no assignee: ${t.key}${t.title === null ? "" : ` ${t.title}`}${t.url === null ? "" : ` — ${t.url}`}. Assign it in Linear to the server that should own it; this one does not adopt it.`),
+              ...adoption.unassigned.map((t) => `labelled, no assignee: ${t.key}${t.title === null ? "" : ` ${t.title}`}${t.url === null ? "" : ` — ${t.url}`}. Assign it in ${t.source === "github" ? "GitHub" : "Linear"} to the server that should own it; this one does not adopt it.`),
               ...followUps.map((x) => `The user's answer on ${x.id} went against your recommendation. Ask them once, in this thread, why — one follow-up — then record their reasoning as a lesson candidate with steward_update { lesson: { text, file, scope } }.`),
             ],
           });
@@ -15030,13 +15062,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const linearTicket = config.ticketPlaybooks.linear ?? null;
       const githubTicket = config.ticketPlaybooks.github ?? null;
       const localTicket = config.ticketPlaybooks.local ?? null;
-      lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
+      // BB-362: name only the sources the project actually lists, so a
+      // GitHub-only or local-only project never sees "Linear".
+      const listedSources: string[] = [];
+      if (config.file.linear.teams.length > 0) listedSources.push(`Linear teams: ${config.file.linear.teams.join(", ")}`);
+      listedSources.push(`repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}`);
+      lines.push(`${listedSources.join("; ")}; label ${config.file.label}`);
       lines.push(`roles: ${roleSummary(config)}`);
       for (const kind of KINDS.filter((k) => usesKindFor(config.file, k, config.role))) {
         if (kind === "ticket") {
           // BB-234: name each source's ticket playbook, so a project that
           // carries both does not hide the GitHub one behind the Linear one.
+          const ticketSources = new Set<Source>(["local"]);
+          if (config.file.linear.teams.length > 0) ticketSources.add("linear");
+          if (config.repos.length > 0) ticketSources.add("github");
           const parts = (["linear", "github", "local"] as const)
+            .filter((source) => ticketSources.has(source))
             .map((source) => [source, config.ticketPlaybooks[source]] as const)
             .filter(([, p]) => p !== undefined)
             .map(([source, p]) => `${p!.name}@${p!.version} (${source})`);
@@ -15404,6 +15445,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. A git repo is read at origin/<default>'s committed tip, so commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself). A plain project directory is read from <dir>/.bb on disk, so the files take effect on the next read and there is nothing to commit or publish.",
             options: {
               teams: { type: "string", description: "Linear team keys, comma-separated; the teams you belong to when left out" },
+              prefix: { type: "string", description: "The local ticket source's key prefix (default LOCAL)" },
+              timezone: { type: "string", description: "The IANA time zone the nightly window's hours are in (default America/New_York)" },
               dir: { type: "string", description: "The .bb directory to write into" },
               force: { type: "boolean", description: "Overwrite existing files" },
             },
@@ -15414,9 +15457,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   const out = await rpc("linear", "sourceValidate", { units: [], label: "bb-managed", states: [] }, sourceContract.sourceValidate.output);
                   teams = out.mine.map((m) => m.unit);
                 } catch (error) {
-                  throw new PluginCliError(`Could not ask Linear for your teams: ${errorMessage(error)}`, { code: "linear_unavailable", hint: "Pass --teams ENG,OPS." });
+                  // BB-362: a missing Linear plugin is a no-Linear project, not
+                  // a failure; any other error still needs the operator's teams.
+                  if (!isMissingPlugin(error)) throw new PluginCliError(`Could not ask Linear for your teams: ${errorMessage(error)}`, { code: "linear_unavailable", hint: "Pass --teams ENG,OPS." });
                 }
               }
+              // BB-364: validate the interview's answers before writing them, so
+              // a bad prefix or zone fails here rather than as a `check` problem.
+              const prefix = input.options.prefix === undefined || input.options.prefix === "" ? undefined : localPrefix.safeParse(input.options.prefix);
+              if (prefix !== undefined && !prefix.success) throw new PluginCliError(`--prefix ${JSON.stringify(input.options.prefix)} is not a local ticket prefix: a prefix such as LOCAL.`, { code: "bad_prefix" });
+              if (input.options.timezone !== undefined && input.options.timezone !== "" && !validTimezone(input.options.timezone)) throw new PluginCliError(`--timezone ${JSON.stringify(input.options.timezone)} is not an IANA time zone such as America/New_York.`, { code: "bad_timezone" });
               const dir = input.options.dir ?? (ctx.cwd === undefined ? undefined : `${ctx.cwd.replace(/\/$/u, "")}/.bb`);
               if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
               // Write on the thread's machine, else the project's: left to core, the
@@ -15427,7 +15477,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // init writes the github-issues ticket playbook too. A project
               // with Linear teams keeps the Linear ticket playbook alone.
               const templates = Object.entries(PLAYBOOK_TEMPLATES).filter(([name]) => name !== DEFAULT_GITHUB_TICKET_PLAYBOOK || teams.length === 0);
-              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...templates.map(([name, text]) => [playbookPath(name), stampedTemplate(name, text)] as [string, string])];
+              const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams, { ...(prefix?.success ? { localPrefix: prefix.data } : {}), ...(input.options.timezone === undefined || input.options.timezone === "" ? {} : { timezone: input.options.timezone }) })], ...templates.map(([name, text]) => [playbookPath(name), stampedTemplate(name, text)] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {
                 const path = `${dir}/${rel}`;
@@ -15435,7 +15485,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const result = (await bb.sdk.files.write({ path, content, ...(input.options.force ? {} : { expectedSha256: null }), ...(hostId === undefined ? {} : { hostId }) } as never)) as { outcome: string };
                 lines.push(`${result.outcome === "written" ? "wrote" : "kept existing"} ${rel}`);
               }
-              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files. In a git repo, commit inside .bb and publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), then merge the guidance branch. In a plain project directory, .bb is read from disk, so there is nothing to commit or publish. Then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
+              // BB-362: name the teams only when there are any, so a no-Linear
+              // project's init output never mentions Linear.
+              if (teams.length > 0) lines.push("", `Teams: ${teams.join(", ")}`);
+              lines.push("Next: review the files. In a git repo, commit inside .bb and publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), then merge the guidance branch. In a plain project directory, .bb is read from disk, so there is nothing to commit or publish. Then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),

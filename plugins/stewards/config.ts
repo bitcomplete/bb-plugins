@@ -193,7 +193,8 @@ export const DEPS_PRS_PLAYBOOK = "deps-prs";
 
 export const playbookName = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/u, "a playbook name: lowercase letters, digits and dashes");
 
-function validTimezone(tz: string): boolean {
+/** Whether a string is an IANA time zone the runtime accepts (BB-364: `init` validates the interview's answer before writing it). */
+export function validTimezone(tz: string): boolean {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: tz });
     return true;
@@ -570,7 +571,7 @@ export const projectFileSchema = z
     });
     if (file.ops.targets.length === 0) return;
     // A ticket filed outside the project's teams is never adopted, so the project steward could not act on it.
-    if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a Linear team to file tickets in: set ops.team or linear.teams" });
+    if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a filing target to file tickets in: set ops.team to a Linear team key, a GitHub owner/repo, or a local unit" });
     // A repo target (BB-235) is checked against the repo set by
     // `filingTargetProblems`, which the caller runs where repos are known; a
     // team key is checked here against the project's own teams.

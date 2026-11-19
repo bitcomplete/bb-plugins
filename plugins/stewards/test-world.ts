@@ -56,6 +56,8 @@ export function world() {
   const missingLabels = new Map<string, string[]>();
   /** The Linear teams `sourceValidate` reports as the viewer's, for `init` with no `--teams` (BB-234). */
   let linearMine: Array<{ unit: string; name: string }> = [{ unit: "ENG", name: "Engineering" }];
+  /** BB-364: when true, every Linear RPC is a missing-plugin 404, as on a stock install with no Linear plugin. */
+  let linearUnavailable = false;
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
   const sourceDeployments = new Map<string, unknown[]>();
   /** Files the fake github serves, by `lowercased repo path ref` (BB-132). */
@@ -275,6 +277,8 @@ export function world() {
   const callRpc = async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
     const input = (args.input ?? {}) as Record<string, unknown>;
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
+    // BB-364: a stock install has no Linear plugin; every Linear call is a 404.
+    if (linearUnavailable && args.pluginId === SOURCE_PLUGIN_IDS.linear) throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
     let out: unknown;
     if (args.pluginId === "push-notifications") {
       // BB-253: the fake serves the two published RPCs the stewards plugin
@@ -674,7 +678,7 @@ export function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setSpawnError: (value: string | null) => { spawnError = value; }, setSpawnDelayMs: (value: number) => { spawnDelayMs = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubReviewerRequests, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, realtimeOpens, setVoiceBaseUrl: (value: string) => { voiceBaseUrl = value; }, setVoiceServicePresent: (value: boolean) => { voiceServicePresent = value; }, setVoiceServiceReady: (value: boolean, message?: string) => { voiceServiceReady = value; if (message !== undefined) voiceServiceMessage = message; }, setVoiceSettingsThrow: (value: string | null) => { voiceSettingsThrow = value; }, setVoiceRealtimeRefusal: (value: string | null) => { voiceRealtimeRefusal = value; }, now: () => now, advance: (ms: number) => (now += ms), backlog, setBacklog: (issues: Array<Record<string, unknown>>) => { backlog = issues; }, setBacklogUnsupported: (value: boolean) => { backlogUnsupported = value; }, setBacklogError: (value: string | null) => { backlogError = value; }, setBacklogTruncated: (value: boolean) => { backlogTruncated = value; }, linearWrites, setLinearWriteError: (value: string | null) => { linearWriteError = value; }, setSlackStatus: (value: { user: { id: string; name: string } | null; hooks: { configured: boolean; connected: boolean } } | null) => { slackStatus = value; }, setGithubPoller: (value: { starved: boolean; lastError: string | null; nextPollAt: number; intervalMs?: number } | null) => { githubPoller = value; }, setLinearPoller: (value: { starved: boolean; lastError: string | null; nextPollAt: number; intervalMs?: number } | null) => { linearPoller = value; } };
+  return { files, writes, writtenContent, fileContents, repos, primary, entities, projectList, dependabotAlerts, dependabotGraphEmpty, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, labelEnsureCalls, labelsEnsured, labelEnsureFailures, setLabelEnsureUnavailable: (value: boolean) => { labelEnsureUnavailable = value; }, setPushUnavailable: (value: boolean) => { pushUnavailable = value; }, setLabelEnsureThrow: (value: string | null) => { labelEnsureThrow = value; }, setLayout: (value: "primary" | "directory") => { layout = value; primary = value === "directory" ? null : { dir: "bb", url: "https://github.com/acme/bb.git" }; }, viewers, setLinearMine: (teams: Array<{ unit: string; name: string }>) => { linearMine = teams; }, setLinearUnavailable: (value: boolean) => { linearUnavailable = value; }, setMissingStates: (source: "linear" | "github", unit: string, states: string[]) => { missingStates.set(`${source}:${unit.toLowerCase()}`, states); }, setMissingLabel: (source: "linear" | "github", unit: string, labels: string[]) => { missingLabels.set(`${source}:${unit.toLowerCase()}`, labels); }, rpcCalls, githubTrees, githubBranchProtection, githubLabels, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, setSpawnError: (value: string | null) => { spawnError = value; }, setSpawnDelayMs: (value: number) => { spawnDelayMs = value; }, setMoveHeadOnMerge: (value: boolean) => { moveHeadOnMerge = value; }, setPullDetailsError: (value: string | null) => { pullDetailsError = value; }, setRetryConflict: (value: boolean) => { retryConflict = value; }, setRetryQueued: (value: boolean) => { retryQueued = value; }, threads, deletes, sections, usage, metadata, spawns, sends, retries, retryEvents, queuedDeletes, userTurns, githubComments, githubReviews, githubReviewerRequests, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubBranches, githubFiles, githubFileContents, githubDispatches, setMergeDispatchError: (value: string | null) => { mergeDispatchError = value; }, github, sdk, uiPreferences, uiPreferencesWrites, realtimeOpens, setVoiceBaseUrl: (value: string) => { voiceBaseUrl = value; }, setVoiceServicePresent: (value: boolean) => { voiceServicePresent = value; }, setVoiceServiceReady: (value: boolean, message?: string) => { voiceServiceReady = value; if (message !== undefined) voiceServiceMessage = message; }, setVoiceSettingsThrow: (value: string | null) => { voiceSettingsThrow = value; }, setVoiceRealtimeRefusal: (value: string | null) => { voiceRealtimeRefusal = value; }, now: () => now, advance: (ms: number) => (now += ms), backlog, setBacklog: (issues: Array<Record<string, unknown>>) => { backlog = issues; }, setBacklogUnsupported: (value: boolean) => { backlogUnsupported = value; }, setBacklogError: (value: string | null) => { backlogError = value; }, setBacklogTruncated: (value: boolean) => { backlogTruncated = value; }, linearWrites, setLinearWriteError: (value: string | null) => { linearWriteError = value; }, setSlackStatus: (value: { user: { id: string; name: string } | null; hooks: { configured: boolean; connected: boolean } } | null) => { slackStatus = value; }, setGithubPoller: (value: { starved: boolean; lastError: string | null; nextPollAt: number; intervalMs?: number } | null) => { githubPoller = value; }, setLinearPoller: (value: { starved: boolean; lastError: string | null; nextPollAt: number; intervalMs?: number } | null) => { linearPoller = value; } };
 }
 
 export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set", seedNavigation?: string | null | "fail-list" | "fail-set", prepare?: (w: ReturnType<typeof world>) => void) {
@@ -691,7 +695,8 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
     throw new Error("the preferences store is down");
   };
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: SHIPPED_SKILLS, settings });
-  await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
+  const pluginDeps = { now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra };
+  await createStewardsPlugin(pluginDeps)(bb);
   const hooks = testHooks.get("stewards")!;
   // The local per-project switch is off by default; tests that are not about
   // the switch itself run with p1 switched on, as a project whose owner did.
@@ -702,6 +707,21 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
       await new Promise((r) => setTimeout(r, 5));
       await hooks.settle();
     }
+  };
+  /**
+   * A plugin restart against the same persisted settings, kv and database
+   * (BB-362): the new plugin's in-memory state is fresh, the kv survives.
+   */
+  const restart = async () => {
+    const next = await harness.lifecycle.reload((nextBb) => createStewardsPlugin(pluginDeps)(nextBb));
+    const nextHooks = testHooks.get("stewards")!;
+    const nextFlush = async () => {
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+        await nextHooks.settle();
+      }
+    };
+    return { bb: next.bb, harness: next.harness, hooks: nextHooks, flush: nextFlush };
   };
   const ring = async (source: "linear" | "github", id: string) => {
     await harness.callRpc("stewardsRing", { source, id }, { experimental_caller: { kind: "plugin", pluginId: SOURCE_PLUGIN_IDS[source] } });
@@ -830,5 +850,5 @@ export async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<
       },
     });
   };
-  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned, createdReviewer, escalationNeed };
+  return { ...w, bb, harness, hooks, flush, restart, ring, tool, list, idle, created, createdOwned, createdReviewer, escalationNeed };
 }
