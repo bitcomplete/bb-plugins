@@ -5,6 +5,8 @@ manages it until it is done**, and production a thread that watches it and
 files what goes wrong. The thread, a **steward**, acts on the entity
 as you, by a playbook the project keeps in `.bb`, and you steer it only from
 bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
+[GETTING-STARTED.md](GETTING-STARTED.md) is the shortest route to a working
+install on a stock bb: one repository, no Linear, no hooks service.
 
 ## What it does
 
