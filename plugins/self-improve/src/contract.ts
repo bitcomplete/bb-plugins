@@ -1,6 +1,7 @@
 import { executionSelectionSchema, type ExecutionSettingsView } from "./native-execution.js";
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import type { AppliedImprovement } from "./improvements.js";
 import type { DashboardData, PerformancePoint, ExportArtifact } from "./ui/types.js";
 import type { PublicationObservation } from "./publication-state.js";
 import type { PublicationSummary } from "./publication-view.js";
@@ -19,6 +20,9 @@ export const rpcContract = defineRpcContract({
   getExecution: { input: z.object({}).strict(), output: z.custom<ExecutionSettingsView>() },
   workerOptions: { input: z.object({}).strict(), output: z.custom<{ projects: Array<{ id: string; name: string }>; environments: Array<{ id: string; projectId: string; label: string }> }>() },
   findProblems: { input: z.object({}).strict(), output: z.object({ jobId: z.string() }) },
+  applyImprovement: { input: z.object({ solutionId: id }).strict(), output: z.custom<AppliedImprovement>() },
+  setImprovementEnabled: { input: z.object({ solutionId: id, enabled: z.boolean() }).strict(), output: z.custom<AppliedImprovement>() },
+  setAutoApply: { input: z.object({ autoApply: z.boolean() }).strict(), output: z.object({ autoApply: z.boolean() }) },
   setExecution: { input: z.object({expectedRevision:z.string().min(1).max(200),selection:executionSelectionSchema}).strict(), output: z.custom<ExecutionSettingsView>() },
   dashboard: { input: z.object({}).strict(), output: z.custom<DashboardData>() },
   retest: { input: z.object({ solutionId: id, expectedVersion: z.number().int().positive(), reason: z.string().trim().min(1).max(1000) }).strict(), output: z.object({ jobId: id }) },

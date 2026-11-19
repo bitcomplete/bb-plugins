@@ -30,6 +30,8 @@ export const configSchema = z.object({
   projectId: z.string().default(""),
   environmentId: z.string().default(""),
   scopeProjectIds: z.array(z.string().min(1)).default([]),
+  /** Apply improvements that pass their test runs without waiting for the owner. Each can still be disabled. */
+  autoApply: z.boolean().default(true),
   taskOutcomeSource: z.object({pluginId:z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,127}$/).refine(id=>id!=="self-improve","Task history must come from a separate producer"),method:z.string().regex(/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/)}).strict().optional(),
   publicationRepositories: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/)).max(100).default([]),
   budgets: policySchema.default(() => policySchema.parse({})),

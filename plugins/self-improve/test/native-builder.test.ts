@@ -20,11 +20,17 @@ function setup(){
   return {store,candidate,execute,options,context};
 }
 describe("BB-native builder adoption boundary",()=>{
-  it("exposes exploratory gain separately from the blocked adoption gate",async()=>{
+  it("applies a fix that passes its test runs automatically, without writing held-out proof records",async()=>{
     const {options,context,candidate,store}=setup();const build=createBuilder(options);
-    expect(await build(context,candidate,false)).toMatchObject({exploratory:1,completed:1,gainObserved:1,adoptionBlocked:1,adopted:0});
-    expect(store.get("build-decisions","job")).toMatchObject({status:"adoption-blocked",executionStatus:"completed",observationVerdict:"gain-without-regression"});
+    expect(await build(context,candidate,false)).toMatchObject({exploratory:1,completed:1,gainObserved:1,applied:1,adopted:1});
+    expect(store.get("build-decisions","job")).toMatchObject({status:"applied",executionStatus:"completed",observationVerdict:"gain-without-regression"});
+    expect(store.get("applied-improvements",candidate.id)).toMatchObject({solutionId:candidate.id,source:"automatic",enabled:true});
     expect(store.list("trusted-evaluations")).toEqual([]);expect(store.list("validated-artifacts")).toEqual([]);expect(store.list("baseline-anchors")).toEqual([]);
+  });
+  it("leaves a passing fix waiting for the owner when automatic applying is off",async()=>{
+    const {options,context,candidate,store}=setup();const build=createBuilder({...options,config:()=>({...options.config(),autoApply:false})});
+    expect(await build(context,candidate,false)).toMatchObject({completed:1,gainObserved:1,applied:0,adopted:0});
+    expect(store.get("build-decisions","job")).toMatchObject({status:"passed-awaiting-apply"});expect(store.list("applied-improvements")).toEqual([]);
   });
   it("preserves the prior decision when a retry selects a different candidate or request",async()=>{
     const {options,context,candidate,store,execute}=setup(),build=createBuilder(options);
@@ -40,17 +46,17 @@ describe("BB-native builder adoption boundary",()=>{
     expect(await createBuilder(options)(context,candidate,false)).toEqual({riskDecisions:1});
     expect(execute).not.toHaveBeenCalled();
   });
-  it.each([true,false])("leaves the automatic queue after completed observations (gain=%s) without adopting",async gain=>{
+  it.each([true,false])("leaves the automatic queue after completed observations (gain=%s), applying only a gain",async gain=>{
     const {options,context,candidate,store,execute}=setup(),build=createBuilder(options);
     if(!gain){const implementation=execute.getMockImplementation()!;execute.mockImplementation(async request=>({...await implementation(request),...(request.instructions.startsWith("Propose one")?{}:{text:JSON.stringify({output:"WRONG"})})}));}
-    expect(await build(context,candidate,false)).toMatchObject({completed:1,gainObserved:Number(gain),adopted:0});
+    expect(await build(context,candidate,false)).toMatchObject({completed:1,gainObserved:Number(gain),adopted:Number(gain)});
     expect(store.get("solutions",candidate.id)).toMatchObject({candidateState:"built",status:null,validatedWith:null,wiring:null});
     const nextContext={...context,job:{...context.job,id:"next-job",runId:"run-two"}};
     expect(await build(nextContext,candidate,false)).toEqual({deferred:1});expect(execute).toHaveBeenCalledTimes(3);
     // Original job recovery stays idempotent despite the changed queue disposition.
-    expect(await build(context,candidate,false)).toMatchObject({completed:1,adopted:0});expect(execute).toHaveBeenCalledTimes(3);
+    expect(await build(context,candidate,false)).toMatchObject({completed:1,adopted:Number(gain)});expect(execute).toHaveBeenCalledTimes(3);
     const next={...solution("next"),directionKey:"another-direction",mechanism:"A different candidate"};store.put("solutions",next.id,next);
-    expect(await build({...nextContext,job:{...nextContext.job,id:"different-candidate-job"}},next,false)).toMatchObject({completed:1,adopted:0});
+    expect(await build({...nextContext,job:{...nextContext.job,id:"different-candidate-job"}},next,false)).toMatchObject({completed:1});
     expect(execute).toHaveBeenCalledTimes(6);expect(store.list("trusted-evaluations")).toEqual([]);
   });
   it("retains operational failure history but permits a new bounded job after admission recovers",async()=>{
@@ -60,7 +66,7 @@ describe("BB-native builder adoption boundary",()=>{
     expect(store.get("solutions",candidate.id)).toMatchObject({candidateState:"proposed",attempts:[{outcome:"execution-error"}]});
     const failed=store.list("native-evaluation-attempts")[0],failedTask=execute.mock.calls[0]![0].id;
     const next={...context,job:{...context.job,id:"recovered-job",runId:"run-two"}};
-    expect(await build(next,candidate,false)).toMatchObject({completed:1,adopted:0});
+    expect(await build(next,candidate,false)).toMatchObject({completed:1});
     expect(execute).toHaveBeenCalledTimes(4);expect(execute.mock.calls[1]![0].id).not.toBe(failedTask);
     expect(store.list("native-evaluation-attempts")).toContainEqual(failed);
     expect(store.get("solutions",candidate.id)).toMatchObject({attempts:[{outcome:"execution-error"},{outcome:"built"}]});

@@ -33,7 +33,7 @@ The `dairToken` and `evaluationSuite` settings are secret settings and are not r
 | Native agent stage | A task-specific plugin prompt under the selected BB execution permissions. Ordinary BB/provider/workspace tools and context may remain. |
 | Editing chat | Native BB thread permissions plus this plugin's bounded read, edit and re-test tools. Other tools may remain available. |
 | Held-out evaluation receipt | Historical receipts identify an exact artifact revision. The native preview creates no passing held-out receipt. |
-| Native adoption | Blocked until an appropriate independent validation boundary exists. Historical activation is withheld from new instruction contributions. |
+| Applied improvements | Instruction text from fixes that passed their test runs, added to turns in the projects that receive improvements. You can disable each one or turn off automatic applying. |
 | Export draft | Produces inspectable text files. It does not install or publish. |
 | Create draft PR | Explicit owner review of the exact bundle fingerprint and an allowed repository/new directory. |
 

@@ -1,3 +1,4 @@
+import { applyImprovement } from "./improvements.js";
 import type { Store } from "./store.js";
 import type { Config } from "./config.js";
 import { Deferred, type StageContext } from "./services.js";
@@ -40,7 +41,6 @@ export function createBuilder(options:BuilderOptions) {
     const {store}=options,config=options.config(),rawSuite=options.suite(),execution=structuredClone(options.execution());
     const selected=store.get<Solution>("solutions",candidate.id);if(!selected)throw new Error("native-builder-candidate-missing");candidate=selected;
     if(!rawSuite)throw new Deferred("configure-development-evaluation-suite");
-    if(!config.scopeProjectIds.length)throw new Deferred("configure-instruction-project-scope");
     if(context.job.input.execution!==undefined&&stableJson(context.job.input.execution)!==stableJson(execution))throw new Deferred("retest-execution-changed");
     const attemptId=stableId("native-build-attempt",context.job.id),saved=store.get<NativeEvaluationAttempt>("native-evaluation-attempts",attemptId);
     if(saved&&(saved.solutionId!==candidate.id||saved.revision!==context.job.id))throw new Error("native-builder-job-identity-changed");
@@ -58,8 +58,12 @@ export function createBuilder(options:BuilderOptions) {
     // The evaluator durably records running work before dispatch. Publish the decision only after
     // it accepts this immutable request, so a rejected retry cannot overwrite prior attribution.
     const attempt=await evaluateInstruction({store,attemptId,solutionId:candidate.id,revision:context.job.id,suite,runner:options.runner,execution,runId,privacyGeneration,currentPrivacyGeneration:options.privacyGeneration,
-      scopeProjectIds:config.scopeProjectIds,timeoutMs:config.taskTimeoutMs,...(source?{retestArtifactId:source.id}:{}),signal:context.signal,privacy:options.privacy,history:()=>linkedProposalHistory(store,candidate)});
-    store.put("build-decisions",context.job.id,{solutionId:candidate.id,attemptId,status:"adoption-blocked",reasons:[attempt.adoptionGate.reason],execution,executionStatus:attempt.status,observationVerdict:attempt.observationVerdict,artifactId:attempt.artifactId,evidenceKind:attempt.evidenceKind});
-    return {tested:1,exploratory:1,completed:Number(attempt.status==="completed"),gainObserved:Number(attempt.observationVerdict==="gain-without-regression"),adoptionBlocked:1,adopted:0,failed:Number(attempt.status==="failed"),cancelled:Number(attempt.status==="cancelled"),interrupted:Number(attempt.status==="interrupted")};
+      // An empty list means every project except the worker project receives improvements.
+      scopeProjectIds:config.scopeProjectIds.length?config.scopeProjectIds:["all-projects"],timeoutMs:config.taskTimeoutMs,...(source?{retestArtifactId:source.id}:{}),signal:context.signal,privacy:options.privacy,history:()=>linkedProposalHistory(store,candidate)});
+    // A fix that beat the run without it, with no regressions, is applied automatically unless the owner turned that off.
+    const passed=attempt.status==="completed"&&attempt.observationVerdict==="gain-without-regression"&&!!attempt.artifactId;
+    const applied=passed&&config.autoApply?applyImprovement(store,{solutionId:candidate.id,artifactId:attempt.artifactId!,attemptId,source:"automatic"},{kind:"service",id:"native-builder"}):null;
+    store.put("build-decisions",context.job.id,{solutionId:candidate.id,attemptId,status:applied?"applied":passed?"passed-awaiting-apply":"not-passed",reasons:applied||passed?[]:[attempt.observationVerdict],execution,executionStatus:attempt.status,observationVerdict:attempt.observationVerdict,artifactId:attempt.artifactId,evidenceKind:attempt.evidenceKind});
+    return {tested:1,exploratory:1,completed:Number(attempt.status==="completed"),gainObserved:Number(passed),applied:Number(!!applied),adoptionBlocked:0,adopted:Number(!!applied),failed:Number(attempt.status==="failed"),cancelled:Number(attempt.status==="cancelled"),interrupted:Number(attempt.status==="interrupted")};
   };
 }

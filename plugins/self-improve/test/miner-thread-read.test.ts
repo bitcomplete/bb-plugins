@@ -47,3 +47,19 @@ it("refuses callers that are not an active search, and Self improve's own thread
     expect(f.harness.inspection.registrations.agentConfigurationProvider!({ thread: { id: "build-thread" }, project: { id: "p" }, provider: { id: "codex", model: "m" } } as never)).toMatchObject({ tools: [] });
   } finally { await f.harness.lifecycle.dispose(); }
 });
+
+it("adds applied improvements to turns outside the worker project, and stops once disabled", async () => {
+  const f = await fixture(); try {
+    const content = "Keep the original request payload when retrying.";
+    f.store.put("native-evaluation-artifacts", "artifact", { solutionId: "s1", revision: "r1", kind: "instruction", content, artifactDigest: sha(content) });
+    f.store.put("build-decisions", "job", { solutionId: "s1", attemptId: "a1", status: "passed-awaiting-apply", artifactId: "artifact" });
+    const configure = (projectId: string) => f.harness.inspection.registrations.agentConfigurationProvider!({ thread: { id: "user-thread" }, project: { id: projectId }, provider: { id: "codex", model: "m" } } as never) as { instructions?: string };
+    expect(configure("p1").instructions).toBeUndefined();
+    await f.harness.behavior.callRpc("applyImprovement", { solutionId: "s1" });
+    expect(configure("p1").instructions).toContain(content);
+    await f.harness.behavior.callRpc("setImprovementEnabled", { solutionId: "s1", enabled: false });
+    expect(configure("p1").instructions).toBeUndefined();
+    const dashboard = await f.harness.behavior.callRpc("dashboard", {}) as { improvements: { applied: Array<{ enabled: boolean; usage: { turns: number } }> } };
+    expect(dashboard.improvements.applied[0]).toMatchObject({ enabled: false, usage: { turns: 1 } });
+  } finally { await f.harness.lifecycle.dispose(); }
+});

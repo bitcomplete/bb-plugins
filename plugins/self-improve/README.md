@@ -4,7 +4,7 @@
 
 Self improve gives your BB agents a learning ledger: problems worth solving, possible fixes, the experiments behind them, and the cost of finding out. Failed attempts stay in the story.
 
-> **Draft preview.** BB-native execution is being integrated and validated. You can review the ledgers and configuration experience; this is not a completed release or a claim of real-world improvement. Native build experiments are exploratory. Automatic held-out adoption and the full Promote/Revalidate workflows remain unfinished.
+> **Draft preview.** BB-native execution is being integrated and validated. You can review the ledgers and configuration experience; this is not a completed release or a claim of real-world improvement. Fixes that pass their test runs are applied to agent turns automatically, and each can be disabled. The full Promote/Revalidate screens remain unfinished.
 
 ![The target lifecycle: problems, research and invention, ranking, exploratory tests, impact tracking, then planned promotion and claim-driven revalidation.](docs/images/learning-loop.svg)
 

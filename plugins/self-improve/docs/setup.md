@@ -58,6 +58,6 @@ Enable scheduling after you have inspected the manual path. Mining runs every 15
 
 ## Know what to expect next
 
-A fresh install will not produce established improvements through native automatic adoption: verified held-out isolation is still missing. Historical established records keep their evidence and show activation qualifications. Basic re-tests preserve earlier results.
+Fixes that pass their test runs are applied automatically; see [applying improvements](how-it-works.md#applying-improvements). Turn off **Apply tested improvements automatically** under Improvements on the dashboard to approve each one yourself.
 
 The complete impact-screen **Promote** and claim-driven **Revalidate** workflows are pending. Draft skill/plugin export is not proof of publication, installation or portability. Do not create dummy proof records to make these actions available.

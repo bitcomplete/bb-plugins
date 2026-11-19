@@ -16,6 +16,10 @@ export interface DashboardData {
   runs: Array<{ id: string; stage: string; status: string; startedAt: number; endedAt: number | null; counts: Record<string, number>; errors: string[] }>;
   versions: Record<string, number>;
   activation?: Record<string, { status: "revalidation-required"; reason: string }>;
+  /** Improvements added to agent turns, and passing fixes waiting to be applied. */
+  improvements?: { autoApply: boolean; scope: "listed-projects" | "all-except-worker";
+    applied: Array<{ solutionId: string; revision: string; content: string; source: "automatic" | "owner"; enabled: boolean; appliedAtMs: number; updatedAtMs: number; waiting: boolean; usage: { turns: number; lastAtMs: number | null } }>;
+    awaiting: string[] };
   /** First-run checklist state. */
   setup?: { worker: boolean; model: boolean; mined: boolean; scheduled: boolean; testCases: boolean; minerQueued: boolean;
     /** How the most recent search for problems ended. */
@@ -51,6 +55,9 @@ export interface DashboardApi extends Partial<PublicationApi>, Partial<Revalidat
   dashboard(input: Record<string, never>): Promise<DashboardData>;
   retest(input: { solutionId: string; expectedVersion: number; reason: string }): Promise<{ jobId: string }>;
   findProblems?(input: Record<string, never>): Promise<{ jobId: string }>;
+  applyImprovement?(input: { solutionId: string }): Promise<unknown>;
+  setImprovementEnabled?(input: { solutionId: string; enabled: boolean }): Promise<unknown>;
+  setAutoApply?(input: { autoApply: boolean }): Promise<{ autoApply: boolean }>;
   startChat(input: { kind: Selection["kind"]; id: string; projectId: string }): Promise<{ threadId: string }>;
   createObjective(input: ObjectiveInput): Promise<{ id: string }>;
   performance(input: { solutionId?: string }): Promise<{ points: PerformancePoint[] }>;

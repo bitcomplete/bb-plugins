@@ -13,7 +13,7 @@ A hypothesis, a test result and a measured improvement are different records. Se
 | Scout | 02:15 | DAIR/direct-arXiv proposals and source provenance. |
 | Inventor | 02:15 | Fresh problem-led hypotheses with assumptions and dependencies. |
 | Solution ranker | 03:00 | An explained queue after both proposal streams finish. |
-| Builder | 03:15 | Exploratory development-case attempts; native adoption remains blocked. |
+| Builder | 03:15 | Tests candidate fixes on development cases and applies those that pass. |
 | Verifier | 04:00 | Qualified observation windows and provider/model revisit work. |
 
 Daily times use the server's local timezone. BB owns service scheduling and restart behavior. Durable jobs and task identities preserve attribution across retries. A queued or deferred job is not a completed experiment.
@@ -32,7 +32,15 @@ The solution ranker assesses fit, benefit, testability, feasibility, safety and 
 
 The native builder proposes reusable instructions and compares exact development-case outputs through BB threads. It retains the attempted revision, execution identity and result. It does not dispatch held-out cases, create independent isolation proof or automatically adopt a passing development result.
 
-Historical adoption/evaluation records remain readable. They do not authorize new native activation: the dashboard shows **revalidation required**, and new turns do not receive those historical artifacts from the plugin. Existing provider conversations may still retain earlier instructions.
+## Applying improvements
+
+A fix is a short instruction text. When it passes its test runs (better than without it, no regressions) it is applied, unless you turned off **Apply tested improvements automatically**.
+
+Applied improvements reach agents through BB's plugin hook: when a turn starts, BB asks Self improve for anything to add, and Self improve returns the text of its enabled improvements. Nothing is written to disk, and no skill or plugin is installed. Turns in every project except the worker project receive them, or only the projects listed in `scopeProjectIds`. At most 10 improvements and about 2,000 characters are added per turn; the rest show as waiting.
+
+The **Improvements** panel on the dashboard lists each applied improvement, how many turns received it, and Disable/Enable. Disabling takes effect from the next turn. Turns that already ran keep what they received.
+
+Records from earlier versions of the plugin stay readable and show **revalidation required**; they are not applied.
 
 A basic **Re-test solution** request preserves previous evidence and reuses an already-pending job for the same revision. Successful job execution does not mean the claim passed. Native exploratory results remain **needs review** with the adoption gate blocked; failures and inconclusive work stay separate.
 

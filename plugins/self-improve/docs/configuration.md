@@ -13,7 +13,8 @@ Read public configuration with `bb self-improve config`. The settings editor or 
 | `permissionMode` | `accept-edits` | Requested BB permission mode; BB/provider capabilities still govern execution. |
 | `projectId`, `environmentId` | Empty | Existing BB worker project and environment to reuse. Configure these before using the host pickers. |
 | `taskTimeoutMs` | `120000` | Autonomous task deadline; range 1,000–900,000 ms. Cancellation is best effort at the provider boundary. |
-| `scopeProjectIds` | `[]` | Intended instruction scope and retained historical scope. Native activation is currently withheld pending valid proof. |
+| `scopeProjectIds` | `[]` | Projects whose turns receive applied improvements. Empty means every project except the worker project. |
+| `autoApply` | `true` | Apply fixes that pass their test runs without waiting for you. Each applied improvement can still be disabled. |
 | `concurrency` | `3` | Concurrent native task admission/mining limit, range 1–20. Manual conversations are a separate execution path. |
 | `maxThreadsPerRun` | `1000` | Discovery page budget, range 1–10,000; not an exact combined active/archived thread cap. |
 | `maxEventsPerSession` | `500` | Events per analysis, range 10–500. |
@@ -47,7 +48,7 @@ The current native builder tests reusable instruction candidates against **devel
 
 The `evaluationSuite` secret retains the schema `id`, `development` (1–50 cases) and `heldOut` (3–100 cases). Cases contain `id`, `familyId`, `input` and `expected`, with disjoint task IDs, families and normalized inputs across the two sets. Outputs use exact comparison. Keep private cases out of chats and public reports.
 
-**The native path does not dispatch held-out cases or satisfy the isolation gate.** Development replay can record baseline/treatment observations, but automatic adoption stays blocked. Passing a toy fixture demonstrates plumbing, not independent proof or longitudinal efficacy. Historical direct-model receipts remain historical; they do not validate the new execution environment.
+**Test runs use development cases in ordinary BB threads.** A fix is applied when it beats the run without it with no regressions; that is exploratory evidence, not held-out proof. Passing a toy fixture demonstrates plumbing, not independent proof or longitudinal efficacy. Historical direct-model receipts remain historical; they do not validate the new execution environment.
 
 ## Publish a reviewed export
 
