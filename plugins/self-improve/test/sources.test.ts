@@ -23,6 +23,16 @@ describe("read-only source ingestion",()=>{
     const api=sdk([row("turn/started",{},1),row("item/completed",{item:{type:"agentMessage",text:"work"}},2)],[{id:"t1",originPluginId:null,parentThreadId:"parent"},{id:"parent",originPluginId:"self-improve",parentThreadId:null}]);
     expect((await collectSources(api,options)).sessions).toEqual([]);
   });
+  it("reads a long thread in full, asking only for the event types it uses",async()=>{
+    // 3,000 streaming deltas around 1,500 completed messages: far more than ten pages of raw events.
+    const events:unknown[]=[row("turn/started",{},1)];let seq=2;
+    for(let i=0;i<1500;i++){events.push(row("item/agentMessage/delta",{delta:"x"},seq++),row("item/agentMessage/delta",{delta:"y"},seq++),row("item/completed",{item:{type:"agentMessage",text:`message ${i}`}},seq++));}
+    const api=sdk(events),spy=vi.spyOn(api.threads.events,"list");
+    const result=await collectSources(api,{...options,maxPages:10});
+    expect(result.coverage.filter(c=>c.source==="thread:t1")).toEqual([{source:"thread:t1",complete:true,reason:null}]);
+    expect(result.sessions[0].events).toHaveLength(1500);
+    expect(spy.mock.calls.every(([args])=>{const types=(args as unknown as {types?:string[]}).types;return Array.isArray(types)&&!types.includes("item/agentMessage/delta");})).toBe(true);
+  });
   it("reuses committed per-session/day cursors without writing them",async()=>{
     const api=sdk([row("turn/started",{},1),row("item/completed",{item:{type:"agentMessage",text:"old"}},2),row("item/completed",{item:{type:"agentMessage",text:"new"}},3)]);
     const readCursor=vi.fn((key:string)=>key===stableId("cursor",["t1","2026-11-18"])?{sequence:2}:null);

@@ -10,6 +10,8 @@ export interface TaskOutcomeSource { pluginId:string;method:string }
 export interface TaskOutcomeResult {runs:TaskRun[];complete:boolean;reason?:string|null}
 export interface SourceInput {
   now:number;lookbackMs?:number;pageSize?:number;maxPages?:number;signal?:AbortSignal;
+  /** Pages of mined event types read per thread (default 200, i.e. 20,000 events). */
+  eventMaxPages?:number;
   readCursor:(key:string)=>{sequence:number}|null;
   redact:(text:string)=>string;
   dayFor?:(atMs:number)=>string;
@@ -149,21 +151,25 @@ export async function collectSources(sdk:SourceSdk,input:SourceInput):Promise<So
     try{const result=await taskOutcomeSource();for(const run of result.runs){if(run.originPluginId!=="self-improve"&&run.occurredAtMs>=since&&run.occurredAtMs<=input.now)taskRuns.push(run);}addCoverage("task-outcomes",result.complete,result.complete?null:result.reason??"partial-structured-history");}
     catch{stop();addCoverage("task-outcomes",false,"structured-task-history-unavailable");}
   }else addCoverage("task-outcomes",false,"Public task statuses do not establish terminal failed/blocked outcomes or complete run counts");
+  // Only the event types the miner reads. Streaming deltas make up most of a long thread and are never used.
+  const MINED_TYPES=["client/turn/requested","turn/input/accepted","turn/started","item/completed","provider/error","turn/completed","provider/modelFallback"] as const;
+  // Thread history has its own budget, independent of how many threads a pass lists: 200 pages of filtered events.
+  const eventMaxPages=input.eventMaxPages??200;
   async function eventPages(id:string,after=0,turnStarts=false):Promise<Row[]>{
     // A new reader starts from recent events, so years of unrelated history cannot
     // exhaust the page budget before it reaches the requested window.
     if(after===0&&!turnStarts){
       const recent:Row[]=[];let before:number|undefined;
-      for(let page=0;page<maxPages;page++){
-        stop();const batch=await sdk.threads.events.list({threadId:id,...(before!==undefined?{beforeSeq:String(before)}:{}),limit:String(pageSize),order:"desc",signal:input.signal});
+      for(let page=0;page<eventMaxPages;page++){
+        stop();const batch=await sdk.threads.events.list({threadId:id,...(before!==undefined?{beforeSeq:String(before)}:{}),limit:String(pageSize),order:"desc",types:MINED_TYPES,signal:input.signal});
         let crossed=false;
         for(const event of batch){if(!Number.isSafeInteger(event.seq)||(before!==undefined&&event.seq>=before))throw new Error("event pagination did not advance");before=event.seq;recent.push(event as unknown as Row);if(event.createdAt<since)crossed=true;}
         if(batch.length<pageSize||crossed)return recent.reverse();
       }throw new Error("recent event page limit");
     }
     const all:Row[]=[];let cursor=after;
-    for(let page=0;page<maxPages;page++){
-      stop();const batch=await sdk.threads.events.list({threadId:id,afterSeq:String(cursor),limit:String(pageSize),order:"asc",signal:input.signal,...(turnStarts?{types:["turn/started","client/turn/requested","turn/input/accepted","provider/modelFallback"] as const}:{})});
+    for(let page=0;page<eventMaxPages;page++){
+      stop();const batch=await sdk.threads.events.list({threadId:id,afterSeq:String(cursor),limit:String(pageSize),order:"asc",signal:input.signal,types:MINED_TYPES,...(turnStarts?{types:["turn/started","client/turn/requested","turn/input/accepted","provider/modelFallback"] as const}:{})});
       if(!Array.isArray(batch))throw new Error("invalid events");
       for(const event of batch){if(!Number.isSafeInteger(event.seq)||event.seq<=cursor)throw new Error("event pagination did not advance");cursor=event.seq;all.push(event as unknown as Row);}
       if(batch.length<pageSize)return all;
