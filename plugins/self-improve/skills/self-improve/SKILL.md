@@ -1,6 +1,6 @@
 ---
 name: self-improve
-description: Inspect or operate the Self improve plugin: its problems and fixes, applied improvements, test runs, costs, or a failed run. Use for this plugin's operations, not ordinary code review or generic self-improvement advice.
+description: "Inspect or operate the Self improve plugin: its problems and fixes, applied improvements, test runs, costs, or a failed run. Use for this plugin's operations, not ordinary code review or generic self-improvement advice."
 ---
 
 # Self improve
