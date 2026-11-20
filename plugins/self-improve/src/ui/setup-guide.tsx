@@ -1,14 +1,14 @@
 import { useState } from "react";
 import type { DashboardApi, DashboardData } from "./types.js";
+import { stageErrorHelp } from "../stage-errors.js";
 
-const ERRORS: Record<string, string> = { "invalid-model-json": "the model's answer couldn't be read", "configure-bb-provider-model-project-environment": "Execution isn't set up" };
 /** One line saying whether a search is running, or how the last one ended. */
 export function searchStatus(setup: NonNullable<DashboardData["setup"]>, now = Date.now()): string | null {
   if (setup.minerQueued) return "Looking for problems in your recent threads…";
   const last = setup.lastSearch; if (!last) return null;
   const minutes = Math.max(0, Math.round((now - last.endedAtMs) / 60000));
   const when = minutes < 1 ? "just now" : minutes < 60 ? `${minutes} min ago` : new Date(last.endedAtMs).toLocaleString();
-  if (last.status === "failed") return `Last search failed ${when}: ${last.error ? ERRORS[last.error] ?? last.error : "unknown error"}. Try again.`;
+  if (last.status === "failed") return `Last search failed ${when}: ${last.error ? stageErrorHelp(last.error) : "unknown error"}. Try again.`;
   const found = last.problems ? `found ${last.problems} new ${last.problems === 1 ? "problem" : "problems"}` : last.votes ? `found ${last.votes} more ${last.votes === 1 ? "sign" : "signs"} of known problems` : "found nothing new";
   return `Last search ${when}: looked at ${last.sessions} ${last.sessions === 1 ? "conversation" : "conversations"} and ${found}.`;
 }

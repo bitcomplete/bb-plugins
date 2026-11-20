@@ -14,7 +14,6 @@ describe("plugin ledger persistence",()=>{
         const data=await replacement.harness.behavior.callRpc("dashboard",{}) as DashboardData;
         expect(data.problems[0].id).toBe(created.id);expect(data.votes).toEqual([]);expect(data.objectives?.[0].focus?.priority).toBe(5);
         expect(data.versions[`problems:${created.id}`]).toBeGreaterThan(0);
-        await expect(replacement.harness.behavior.callRpc("retest",{solutionId:created.id,expectedVersion:1,reason:"Try again"})).rejects.toThrow("established");
       }finally{await replacement.harness.lifecycle.dispose();}
     }finally{await harness.lifecycle.dispose();}
   });

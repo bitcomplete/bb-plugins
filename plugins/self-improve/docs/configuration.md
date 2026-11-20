@@ -53,4 +53,4 @@ The `evaluationSuite` secret retains the schema `id`, `development` (1–50 case
 
 `enabled` controls scheduled enqueueing; manual stage requests remain explicit queued work. `budgets` controls shared admission and observation thresholds; see [costs](costs.md).
 
-The exact schema is [config.ts](../src/config.ts), and registered commands/settings are in [server.ts](../server.ts).
+The exact schema is [config.ts](../src/config.ts). Settings are defined in [server/wiring.ts](../server/wiring.ts) and commands in [server/cli.ts](../server/cli.ts). An invalid value is refused with the field that failed, for example `Invalid configuration at budgets.currency`; keys from earlier versions that no longer configure anything are ignored.

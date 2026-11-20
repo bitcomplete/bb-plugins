@@ -58,6 +58,8 @@ export interface RuntimeOptions {
   dair?: () => PaperSearch | undefined;
   weeklyIssue?: () => Promise<Paper[]>;
   build: (ctx: StageContext, candidate: Solution) => Promise<Record<string, number>>;
+  /** Runs builder jobs queued for a revalidation plan (job input kind "revalidation"). */
+  revalidation?: StageHandler;
 }
 const jobSnapshotSchema=z.object({snapshotId:z.string().min(1),explicitSnapshotId:z.string().min(1).nullable(),stage:z.string().min(1)}).strict();
 const rankingBindingSchema=z.object({taskId:z.string().min(1),runId:z.string().min(1),inputFingerprint:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
@@ -89,7 +91,8 @@ export class Runtime {
     this.handlers = {
       miner: ctx => this.mine(ctx), "problem-ranker": ctx => this.rankProblems(ctx),
       scout: ctx => this.research(ctx, "scout"), inventor: ctx => this.research(ctx, "inventor"),
-      "solution-ranker": ctx => this.rankCandidates(ctx), builder: ctx => this.build(ctx),
+      "solution-ranker": ctx => this.rankCandidates(ctx),
+      builder: ctx => ctx.job.input.kind === "revalidation" && options.revalidation ? options.revalidation(ctx) : this.build(ctx),
       // Kept registered so existing schedules and queued jobs settle; it has no work of its own.
       verifier: async () => ({}),
     };

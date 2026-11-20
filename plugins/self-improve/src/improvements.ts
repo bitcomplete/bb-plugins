@@ -51,9 +51,17 @@ export function setImprovementEnabled(store: Store, solutionId: string, enabled:
   });
 }
 
-/** Whether a project receives improvements: the configured list, or every project except the worker project when none is set. */
+/** Which projects receive improvements: the configured list, or every project except the worker project when none is set. */
+export function improvementScope(scopeProjectIds: readonly string[]): "listed-projects" | "all-except-worker" {
+  return scopeProjectIds.length ? "listed-projects" : "all-except-worker";
+}
+/** Whether one project receives improvements, by the rule in improvementScope. */
 export function projectReceivesImprovements(projectId: string, scopeProjectIds: readonly string[], workerProjectId: string): boolean {
-  return scopeProjectIds.length ? scopeProjectIds.includes(projectId) : projectId !== workerProjectId;
+  return improvementScope(scopeProjectIds) === "listed-projects" ? scopeProjectIds.includes(projectId) : projectId !== workerProjectId;
+}
+/** The scope recorded with a tested instruction: the listed project IDs, or "all-projects" for every project except the worker project. */
+export function recordedImprovementScope(scopeProjectIds: readonly string[]): string[] {
+  return improvementScope(scopeProjectIds) === "listed-projects" ? [...scopeProjectIds] : ["all-projects"];
 }
 
 /** The enabled improvements one turn receives, oldest first, within the size bounds; the rest wait. */

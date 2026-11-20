@@ -23,18 +23,22 @@ async function atomic(path: string, text: string): Promise<void> {
 /** The DB is authoritative; any interrupted publication is recreated on the next sweep. */
 export class Exports {
   private current: Promise<void> = Promise.resolve();
-  constructor(readonly store: Store, readonly directory: string,readonly accounting?:Accounting, readonly activity?: Pick<ActivityAccounting,"summary"|"forRun">) {}
+  constructor(readonly store: Store, readonly directory: string,readonly accounting?:Accounting, readonly activity?: Pick<ActivityAccounting,"report">) {}
   flush(): Promise<void> {
     this.current = this.current.catch(() => {}).then(async () => {
       const s = this.store;
-      const snapshots = s.transaction(() => ({
-        problems: s.list("problems"), solutions: s.list("solutions"), votes: s.list("votes"), costs: this.accounting?.summary().events ?? s.list("costs"), externalCosts:s.list("external-costs"),
-        activity: this.activity?.summary(),
-        runs: s.runs().map(run=>({...run,costs:this.accounting?.forRun(run.id).totals??[],...(this.activity?{activityCosts:this.activity.forRun(run.id)}:{})})), ranking: s.get<ProblemRanking>("ranking", "latest"),
+      const snapshots = s.transaction(() => {
+        // One read of charges and usage, filtered per run below.
+        const charges = this.accounting?.report(), usage = this.activity?.report();
+        return {
+        problems: s.list("problems"), solutions: s.list("solutions"), votes: s.list("votes"), costs: charges?.summary().events ?? s.list("costs"), externalCosts:s.list("external-costs"),
+        activity: usage?.summary(),
+        runs: s.runs().map(run=>({...run,costs:charges?.forRun(run.id).totals??[],...(usage?{activityCosts:usage.forRun(run.id)}:{})})), ranking: s.get<ProblemRanking>("ranking", "latest"),
         solutionRanking: s.get<RankedSolution[]>("solution-ranking", "latest") ?? [],
         papers:s.list<Paper>("papers"),assessments:s.list<PaperAssessment&{snapshotId:string}>("paper-assessments").filter(a=>a.snapshotId===s.get("snapshot","latest")),
         research:s.list<{snapshotId:string;warnings:string[]}>("research-results").filter(r=>r.snapshotId===s.get("snapshot","latest")),accessCosts:s.list("access-costs"),
-      }));
+      };
+      });
       await mkdir(this.directory, { recursive: true });
       await mkdir(join(this.directory, "reports"), { recursive: true });
       await mkdir(join(this.directory, "runs"), { recursive: true });

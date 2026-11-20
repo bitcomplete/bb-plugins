@@ -1,6 +1,6 @@
 # When the loop needs attention
 
-Start with `bb self-improve doctor` and `bb self-improve status` in the intended BB instance. A quiet ledger can mean no eligible evidence, a deferred prerequisite or a failed run.
+Start with `bb self-improve doctor` and `bb self-improve status` in the intended BB instance. A failed or waiting run lists what to check next to its recorded codes. A quiet ledger can mean no eligible evidence, a deferred prerequisite or a failed run.
 
 | What you see | What to check |
 | --- | --- |

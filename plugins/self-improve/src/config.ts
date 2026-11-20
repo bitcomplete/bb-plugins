@@ -40,17 +40,26 @@ export const configSchema = z.object({
   maxEventsPerSession: z.number().int().min(10).max(500).default(500),
   laya: z.object({ enabled: z.boolean().default(false), endpoint: z.string().url().optional(), minConfidence: z.number().min(.8).max(1).default(.8) }).strict().default(() => ({ enabled: false, minConfidence: .8 })),
   dair: z.object({ endpoint: z.string().url().default("https://academy.dair.ai/api/mcp"), searchTool: z.string().max(128).optional(), queryArgument: z.string().max(128).optional(), resultsPath: z.array(z.string().max(100)).max(20).optional(), weeklyTool:z.string().max(128).optional(), weeklyArguments:z.record(z.string(),z.unknown()).optional(), weeklyResultsPath:z.array(z.string().max(100)).max(20).optional() }).strict().default(() => ({ endpoint: "https://academy.dair.ai/api/mcp" })),
-  experimentalParentLinks: z.boolean().default(false),
-  experimentalMatchAudit: z.boolean().default(false),
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export const defaultConfig = () => configSchema.parse({});
 /** Settings saved by earlier versions may still carry these keys; they no longer configure anything and are dropped. */
-const RETIRED_KEYS = ["publicationRepositories"] as const;
+const RETIRED_KEYS = ["publicationRepositories", "experimentalParentLinks", "experimentalMatchAudit"] as const;
+/** Validates a configuration value, naming the first failing field (for example `budgets.currency`). */
+export function checkConfig(value: unknown): Config {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    value = { ...value as Record<string, unknown> };
+    for (const key of RETIRED_KEYS) delete (value as Record<string, unknown>)[key];
+  }
+  const result = configSchema.safeParse(value);
+  if (result.success) return result.data;
+  const issue = result.error.issues[0]!;
+  throw new Error(`Invalid configuration${issue.path.length ? ` at ${issue.path.join(".")}` : ""}: ${issue.message}`);
+}
 export function parseConfig(raw: string): Config {
-  const value: unknown = JSON.parse(raw);
-  if (value && typeof value === "object" && !Array.isArray(value)) for (const key of RETIRED_KEYS) delete (value as Record<string, unknown>)[key];
-  return configSchema.parse(value);
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error("Invalid configuration: not valid JSON"); }
+  return checkConfig(value);
 }
 export function parseCostPolicy(raw: unknown): CostPolicy { return policySchema.parse(raw); }
 export const defaultWeights = DEFAULT_RANKING_CONFIG;

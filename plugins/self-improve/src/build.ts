@@ -1,4 +1,4 @@
-import { applyImprovement } from "./improvements.js";
+import { applyImprovement, recordedImprovementScope } from "./improvements.js";
 import type { Store } from "./store.js";
 import type { Config } from "./config.js";
 import { Deferred, type StageContext } from "./services.js";
@@ -52,8 +52,7 @@ export function createBuilder(options:BuilderOptions) {
     // The evaluator durably records running work before dispatch. Publish the decision only after
     // it accepts this immutable request, so a rejected retry cannot overwrite prior attribution.
     const attempt=await evaluateInstruction({store,attemptId,solutionId:candidate.id,revision:context.job.id,suite,runner:options.runner,execution,runId,privacyGeneration,currentPrivacyGeneration:options.privacyGeneration,
-      // An empty list means every project except the worker project receives improvements.
-      scopeProjectIds:config.scopeProjectIds.length?config.scopeProjectIds:["all-projects"],timeoutMs:config.taskTimeoutMs,signal:context.signal,privacy:options.privacy,history:()=>linkedProposalHistory(store,candidate)});
+      scopeProjectIds:recordedImprovementScope(config.scopeProjectIds),timeoutMs:config.taskTimeoutMs,signal:context.signal,privacy:options.privacy,history:()=>linkedProposalHistory(store,candidate)});
     // A fix that beat the run without it, with no regressions, is applied automatically unless the owner turned that off.
     const passed=attempt.status==="completed"&&attempt.observationVerdict==="gain-without-regression"&&!!attempt.artifactId;
     const applied=passed&&config.autoApply?applyImprovement(store,{solutionId:candidate.id,artifactId:attempt.artifactId!,attemptId,source:"automatic"},{kind:"service",id:"native-builder"}):null;
