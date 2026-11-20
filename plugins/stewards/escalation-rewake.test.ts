@@ -112,6 +112,34 @@ describe("BB-374: a binding that ends a turn with a routed escalation open is re
     expect(second.t.hooks.store.binding(second.parent.id)).toMatchObject({ escalationRewakeId: null, escalationRewakeCount: 0 });
   });
 
+  it("does not count busy turn ends as unanswered re-wakes", async () => {
+    const { t, parent, escalation } = await parentWithRoutedChild();
+    // Four turn ends, each a minute apart, with no re-wake ever firing.
+    for (let i = 0; i < 4; i++) {
+      await t.tool("steward_report", report(), parent.threadId!);
+      await t.idle(parent.threadId!);
+      t.advance(60_000);
+    }
+    const after = t.hooks.store.binding(parent.id)!;
+    expect(after.escalationRewakeId).toBe(escalation.id);
+    expect(after.escalationRewakeCount).toBe(0);
+    expect(t.hooks.store.openEscalations(parent.id).filter((x) => x.kind === "stuck")).toHaveLength(0);
+  });
+
+  it("does not re-wake with a stale line once the escalation closes elsewhere", async () => {
+    const { t, parent, escalation } = await parentWithRoutedChild();
+    await t.tool("steward_report", report(), parent.threadId!);
+    await t.idle(parent.threadId!);
+    const before = t.sends.filter((s) => s.threadId === parent.threadId).length;
+    // Close it outside the parent's own turn, as a child binding ending does.
+    t.hooks.store.resolve(escalation.id, "The binding ended.", "plugin", false);
+    t.advance(31 * 60_000);
+    await t.hooks.requeueTick();
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === parent.threadId).length).toBe(before);
+    expect(t.hooks.store.binding(parent.id)).toMatchObject({ escalationRewakeId: null, escalationRewakeCount: 0 });
+  });
+
   it("raises stuck after repeated unanswered re-wakes for the same escalation", async () => {
     const { t, parent, escalation } = await parentWithRoutedChild();
     for (let i = 0; i < 3; i++) {

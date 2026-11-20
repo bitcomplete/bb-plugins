@@ -258,6 +258,17 @@ export const WAKE_RETRY_MAX_ATTEMPTS = 3;
 export const START_WORKER_WAKE = "The ready gate passed on your last turn and nothing holds you: start the worker.";
 
 /**
+ * BB-374: the "What changed" line for an escalation still routed to a binding.
+ * Built from what is open at the moment of the wake, never stored, so a
+ * resolution elsewhere cannot leave a stale line.
+ */
+function escalationRewakeLine(routed: ReadonlyArray<{ escalation: Escalation; from: Binding | null }>): string {
+  const ids = [...new Set(routed.map((r) => r.escalation.id))].sort();
+  const froms = [...new Set(routed.map((r) => r.from?.entityKey).filter((k): k is string => k !== undefined && k !== null))];
+  return `Escalation${ids.length === 1 ? "" : "s"} ${ids.join(", ")} ${ids.length === 1 ? "is" : "are"} still routed to you${froms.length === 0 ? "" : ` from ${froms.join(", ")}`}; decide or forward ${ids.length === 1 ? "it" : "them"}, or the work ${ids.length === 1 ? "it holds" : "they hold"} stays blocked.`;
+}
+
+/**
  * The requested reviewers a binding's open delegate wait(s) name, joined, or
  * null when it has none (BB-338). The names are read from the escalation's
  * `meanwhile`, never re-derived from GitHub.
@@ -5918,6 +5929,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (stage === "build" && b.stage === "spec" && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
         changes.push({ text: `Moved into a build stage (${phase}) before the ready gate passed`, actionable: true });
       }
+      // BB-374: a routed escalation's clock. The "What changed" line is built
+      // from what is open now, never a stored note, so a resolution elsewhere
+      // (a child's binding ending, say) cannot leave a stale line. When none is
+      // open, the run is cleared and a requeue pulled forward for it is pushed
+      // back, so a closed escalation does not wake the binding. The reads are
+      // taken only for a binding with a run under way, so a reconcile that has
+      // nothing to do with an escalation adds none.
+      if (b.escalationRewakeId !== null) {
+        const routedNow = routedEscalations(escalationsCtx, b);
+        if (routedNow.length === 0) {
+          b = store.patch(b.id, {
+            escalationRewakeCount: 0,
+            escalationRewakeId: null,
+            escalationRewakeAt: null,
+            ...(b.requeueAt !== null && b.requeueAt <= now() ? { requeueAt: now() + playbook.requeueDefaultMs } : {}),
+          });
+        } else {
+          changes.push({ text: escalationRewakeLine(routedNow), actionable: false });
+          if (b.escalationRewakeAt !== null && (b.requeueAt === null || b.requeueAt > b.escalationRewakeAt)) b = store.patch(b.id, { requeueAt: b.escalationRewakeAt });
+        }
+      }
       if (b.requeueAt !== null && b.requeueAt <= now()) changes.push({ text: "Requeue time came", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
       // A note queued while the steward was busy, or kept quiet, can say what
@@ -9653,23 +9685,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const ids = [...new Set(routed.map((r) => r.escalation.id))].sort();
       const key = ids.join(",");
-      // The first turn end schedules the first re-wake and does not count;
-      // each later turn end with the same run still open is one unanswered
-      // re-wake.
       const sameRun = b.escalationRewakeId === key && b.escalationRewakeAt !== null;
-      const count = sameRun ? b.escalationRewakeCount + 1 : 0;
-      const at = now() + ESCALATION_REWAKE_MS;
-      const fresh = store.patch(b.id, {
+      // A turn end counts as an unanswered re-wake only once the scheduled
+      // re-wake has actually come. Any other turn end leaves the count and the
+      // scheduled time alone, so a busy parent (a child report, a worker
+      // finish, a comment) is not mistaken for one ignoring the escalation.
+      const fired = sameRun && b.escalationRewakeAt! <= (b.wokeAt ?? 0);
+      const count = fired ? b.escalationRewakeCount + 1 : sameRun ? b.escalationRewakeCount : 0;
+      const at = fired || !sameRun ? now() + ESCALATION_REWAKE_MS : b.escalationRewakeAt!;
+      store.patch(b.id, {
         escalationRewakeCount: count,
         escalationRewakeId: key,
         escalationRewakeAt: at,
-        // Never delay an earlier wake (a deployment deadline, say); only pull a
-        // later one forward.
+        // Restore the clock another wake may have pushed out; never delay an
+        // earlier wake (a deployment deadline, say).
         requeueAt: Math.min(b.requeueAt ?? at, at),
       });
-      const froms = [...new Set(routed.map((r) => r.from?.entityKey).filter((k): k is string => k !== undefined && k !== null))];
-      const line = `Escalation${ids.length === 1 ? "" : "s"} ${ids.join(", ")} ${ids.length === 1 ? "is" : "are"} still routed to you${froms.length === 0 ? "" : ` from ${froms.join(", ")}`}; decide or forward ${ids.length === 1 ? "it" : "them"}, or the work ${ids.length === 1 ? "it holds" : "they hold"} stays blocked.`;
-      if (!fresh.pending.some((n) => n.text === line)) store.note(fresh.id, line, true);
+      // The "What changed" line is built at wake time from what is open then,
+      // never stored here, so a resolution elsewhere cannot leave a stale line.
       if (count >= ESCALATION_REWAKE_STUCK_AFTER && !store.openEscalations(b.id).some((x) => x.kind === "stuck")) {
         const rewakeWord = count === 1 ? "re-wake" : "re-wakes";
         await raise(b, "stuck", `Escalation${ids.length === 1 ? "" : "s"} ${ids.join(", ")} has been routed to ${b.entityKey} through ${count} ${rewakeWord} without a decision or a forward. Decide it or pass it up; the child is blocked until then.`, "Waiting.");
