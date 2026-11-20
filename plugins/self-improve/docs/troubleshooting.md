@@ -27,8 +27,6 @@ BB owns supported provider retries and account failover. Self improve retains na
 
 Optional Laya failure should not disable periodic mining. Diagnose the detector separately; enabling it does not make its infrastructure free.
 
-Current fixture tests do not establish that Claude Code, Codex, every host version, or every configuration works end to end. The delivered preview needs its own installation and real-provider evidence.
-
 ## Share a useful report
 
-Include the revision, BB version, stage/job or solution ID, redacted diagnostic code, expected behavior and whether it reproduces in scratch. Keep credentials, private transcripts and sealed evaluation cases out. Generalized descriptions and evidence pointers are usually enough to start.
+Include the revision, BB version, stage/job or solution ID, redacted diagnostic code, expected behavior and whether it reproduces. Keep credentials, private transcripts and sealed evaluation cases out. Generalized descriptions and evidence pointers are usually enough to start.
