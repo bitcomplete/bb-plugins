@@ -1,0 +1,56 @@
+import { ExecutionSettings } from "./src/ui/execution-settings.js";
+import { LoopIcon } from "./src/ui/loop-icon.js";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { definePluginApp, ThreadChat, useBbContext, useBbNavigate, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
+import type { rpcContract } from "./src/contract.js";
+import { Dashboard } from "./src/ui/dashboard.js";
+import type { DashboardApi } from "./src/ui/types.js";
+
+function SelfImprovePage() {
+  const rpc = useRpc<typeof rpcContract>();
+  const { projectId } = useBbContext();
+  const navigate = useBbNavigate();
+  const connection = useRealtimeConnectionState();
+  const connectedBefore = useRef(false), previousConnection = useRef(connection);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refresh = useCallback(() => {
+    if (timer.current !== null) return;
+    timer.current = setTimeout(() => { timer.current = null; setRefreshKey(key => key + 1); }, 120);
+  }, []);
+  useEffect(() => () => { if (timer.current !== null) clearTimeout(timer.current); }, []);
+  useRealtime("self-improve:changed", refresh);
+  useEffect(() => {
+    if (connection === "connected") {
+      if (connectedBefore.current && previousConnection.current !== "connected") refresh();
+      connectedBefore.current = true;
+    }
+    previousConnection.current = connection;
+  }, [connection, refresh]);
+  const api = useMemo<Required<DashboardApi>>(() => ({
+    revalidationOverview: input => rpc.call("revalidationOverview", input),
+    revalidationPlan: input => rpc.call("revalidationPlan", input),
+    editRevalidationDraft: input => rpc.call("editRevalidationDraft", input),
+    freezeRevalidation: input => rpc.call("freezeRevalidation", input),
+    queueRevalidation: input => rpc.call("queueRevalidation", input),
+    cancelRevalidation: input => rpc.call("cancelRevalidation", input),
+    startRevalidationChat: input => rpc.call("startRevalidationChat", input),
+    dashboard: input => rpc.call("dashboard", input),
+    findProblems: input => rpc.call("findProblems", input),
+    problemReport: input => rpc.call("problemReport", input),
+    applyImprovement: input => rpc.call("applyImprovement", input),
+    setImprovementEnabled: input => rpc.call("setImprovementEnabled", input),
+    setAutoApply: input => rpc.call("setAutoApply", input),
+    startChat: input => rpc.call("startChat", input),
+    createObjective: input => rpc.call("createObjective", input),
+  }), [rpc]);
+  return <Dashboard key={projectId ?? "no-project"} api={api} projectId={projectId} refreshKey={refreshKey}
+    settings={<ExecutionSettings refreshKey={refreshKey} onSaved={refresh}/>}
+    onOpenThread={id => navigate.toThread(id)}
+    renderChat={threadId => <ThreadChat key={threadId} threadId={threadId} variant="compact" layout="contained" permissionPolicy="inherit"/>}/>;
+}
+
+export default definePluginApp(app => {
+  app.experimental_icons.register({ name: "self-improve-loop", component: LoopIcon });
+  app.slots.navPanel({ id: "self-improve", title: "Self improve", icon: "self-improve-loop", path: "self-improve", component: SelfImprovePage });
+});

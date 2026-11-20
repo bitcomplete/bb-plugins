@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="1220" viewBox="0 0 760 1220" role="img" aria-labelledby="title desc">
+  <title id="title">Self improve: find problems, test fixes, apply what works</title>
+  <desc id="desc">Self improve finds problems in your BB threads, proposes fixes from research and invention, ranks them, tests them with and without each fix, and applies the ones that pass to agent turns. Every applied fix can be disabled, and causes outside the agent get a report to send.</desc>
+  <defs>
+    <linearGradient id="paper" x2="1" y2="1"><stop stop-color="#f8fbf6"/><stop offset="1" stop-color="#eaf3ed"/></linearGradient>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="m1 1 6 3.5-6 3.5" fill="none" stroke="#739586" stroke-width="1.5"/></marker>
+    <style>text{font-family:Inter,ui-sans-serif,system-ui,sans-serif}.label{font-size:28px;font-weight:650;fill:#193b2e}.detail{font-size:21px;fill:#526e60}.line{fill:none;stroke:#739586;stroke-width:2;marker-end:url(#arrow)}.box{fill:#fff;stroke:#b6cec0;stroke-width:1.5}</style>
+  </defs>
+  <rect width="760" height="1220" rx="28" fill="url(#paper)"/>
+  <rect x="42" y="35" width="194" height="35" rx="17.5" fill="#d9ece0"/>
+  <text x="60" y="59" fill="#286c53" font-size="17" font-weight="650" letter-spacing="1.5">SELF IMPROVE</text>
+  <text x="42" y="132" fill="#193b2e" font-size="40" font-weight="650" letter-spacing="-1.2">Make the next attempt better.</text>
+  <text x="44" y="176" class="detail">Ideas become useful when you can inspect the evidence.</text>
+
+  <path class="line" d="M380 294v32H205v21"/>
+  <path class="line" d="M380 294v32h175v21"/>
+  <path class="line" d="M205 440v26h175v30"/>
+  <path class="line" d="M555 440v26H380"/>
+  <path class="line" d="M380 570v42"/>
+  <path class="line" d="M380 710v42"/>
+  <path class="line" d="M380 849v55H208v53"/>
+  <path class="line" d="M380 904h172v53"/>
+  <path class="line" d="M700 1016h28V804h-31"/>
+  <path class="line" d="M62 1016H26V804h31"/>
+
+  <rect class="box" x="60" y="218" width="640" height="82" rx="17"/>
+  <text x="88" y="253" class="label">Find + prioritize problems</text>
+  <text x="88" y="281" class="detail">15-minute miner · optional Laya · owner goals</text>
+
+  <rect class="box" x="60" y="348" width="290" height="94" rx="17"/>
+  <text x="86" y="386" class="label">Scout</text>
+  <text x="86" y="418" class="detail">DAIR → direct arXiv</text>
+  <rect class="box" x="410" y="348" width="290" height="94" rx="17"/>
+  <text x="436" y="386" class="label">Invent</text>
+  <text x="436" y="418" class="detail">Fresh problem input</text>
+
+  <rect class="box" x="60" y="498" width="640" height="74" rx="17"/>
+  <text x="88" y="531" class="label">Rank ideas</text>
+  <text x="88" y="559" class="detail">Learn from prior attempts</text>
+  <rect class="box" x="60" y="614" width="640" height="98" rx="17"/>
+  <text x="88" y="652" class="label">Build + test</text>
+  <text x="88" y="684" class="detail">With and without each fix · apply the ones that pass</text>
+
+  <rect x="60" y="754" width="640" height="96" rx="17" fill="#245f49"/>
+  <text x="88" y="793" fill="#fff" font-size="29" font-weight="650">Applied to agent turns</text>
+  <text x="88" y="825" fill="#d4e9dc" font-size="21">Every fix, its tests and its cost stay visible</text>
+
+  <rect x="42" y="928" width="676" height="220" rx="20" fill="#f7faf7" stroke="#9cb7a6" stroke-width="1.5"/>
+  <rect x="64" y="914" width="330" height="29" rx="14" fill="#e0ece3"/>
+  <text x="78" y="935" fill="#466951" font-size="17" font-weight="650">YOU STAY IN CONTROL</text>
+  <rect class="box" x="62" y="960" width="290" height="110" rx="15"/>
+  <text x="82" y="997" class="label">Disable</text>
+  <text x="82" y="1028" class="detail">Any applied fix,</text>
+  <text x="82" y="1055" class="detail">from the next turn</text>
+  <rect class="box" x="408" y="960" width="290" height="110" rx="15"/>
+  <text x="428" y="997" class="label">Report</text>
+  <text x="428" y="1028" class="detail">Causes in plugins,</text>
+  <text x="428" y="1055" class="detail">skills or BB</text>
+  <text x="65" y="1115" fill="#526e60" font-size="20">Or switch off automatic applying and approve each fix.</text>
+  <text x="44" y="1186" fill="#607b6b" font-size="17">Test results come from ordinary BB threads: good evidence, not isolated proof</text>
+</svg>
