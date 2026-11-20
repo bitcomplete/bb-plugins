@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { candidateEligibility, rankSolutions, checkAdoption, revisitSolutions, removalCandidates } from "../../src/domain/solutions.js";
-import type { HeldOutProof } from "../../src/domain/types.js";
+import { candidateEligibility, rankSolutions } from "../../src/domain/solutions.js";
 import { DAY, NOW, problem, solution } from "./fixtures.js";
 
 describe("candidate ranking is not adoption", () => {
@@ -45,30 +44,3 @@ describe("candidate ranking is not adoption", () => {
   });
 });
 
-describe("held-out and lifecycle gates", () => {
-  const proof = (): HeldOutProof => ({ manifestCommit: "a".repeat(40), manifestCommittedAtMs: NOW - DAY, patchCreatedAtMs: NOW, proposerVisibleTaskIds: ["visible"], heldOutTaskIds: ["held"], proposerVisibleFamilyIds: ["visible-family"], heldOutFamilyIds: ["held-family"], isolationVerified: true, passed: true, proofRef: "evaluator-proof-1" });
-  it("requires committed-before-change, disjoint tasks/families and enforced isolation", () => {
-    expect(checkAdoption(proof()).eligible).toBe(true);
-    expect(checkAdoption({ ...proof(), heldOutTaskIds: ["visible"] }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), heldOutFamilyIds: ["visible-family"] }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), isolationVerified: false }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), manifestCommittedAtMs: NOW + 1 }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), heldOutTaskIds: [] }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), heldOutTaskIds: [""] }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), passed: "yes" as never }).eligible).toBe(false);
-    expect(checkAdoption({ ...proof(), manifestCommit: "a".repeat(41) }).eligible).toBe(false);
-  });
-  it("flags only active/proven solutions after a model/provider change", () => {
-    const s = solution(); s.status = "proven"; s.validatedWith = { provider: "p", model: "old" };
-    expect(revisitSolutions([s], { provider: "p", model: "old" })).toEqual([]);
-    expect(revisitSolutions([s], { provider: "p", model: "new" })[0]!.solutionId).toBe(s.id);
-    expect(s.status).toBe("proven");
-  });
-  it("checks wiring before recommending removal and never mutates a lifecycle", () => {
-    const s = solution(); s.problemIds = []; s.status = "active";
-    expect(removalCandidates([s])[0]).toMatchObject({ solutionId: s.id, classification: "not-wired", ownerApprovalRequired: true });
-    s.wiring = { location: "plugin/skill", activatedAtMs: NOW, executionCount: 3, undo: "Remove the configured skill entry" };
-    expect(removalCandidates([s])[0]!.classification).toBe("unsupported");
-    expect(s.status).toBe("active");
-  });
-});

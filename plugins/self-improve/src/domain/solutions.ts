@@ -1,4 +1,4 @@
-import type { Eligibility, HeldOutProof, ModelIdentity, Problem, RankedProblem, RankedSolution, Solution, SolutionRubric } from "./types.js";
+import type { Eligibility, Problem, RankedProblem, RankedSolution, Solution, SolutionRubric } from "./types.js";
 import { DAY_MS, compareIds, finite, stableJson, text, unique } from "./shared.js";
 import { resolveProblemId } from "./problems.js";
 import { candidateDirectionKey, candidateDerivation, untestedCandidate } from "./candidates.js";
@@ -98,32 +98,4 @@ export function rankSolutions(candidates: Solution[], problems: Problem[], prior
   let rank = 0;
   for (const result of results) if (result.eligible) result.rank = ++rank;
   return results;
-}
-
-/** This checks declared proof metadata. The trusted runtime must independently produce it. */
-export function checkAdoption(proof: HeldOutProof | null): Eligibility {
-  if (proof === null) return { eligible: false, reasons: ["held-out proof is absent"] };
-  const reasons: string[] = [];
-  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(proof.manifestCommit)) reasons.push("held-out manifest needs a committed revision");
-  if (!Number.isFinite(proof.manifestCommittedAtMs) || proof.manifestCommittedAtMs < 0 || !Number.isFinite(proof.patchCreatedAtMs) || proof.patchCreatedAtMs < 0 || proof.manifestCommittedAtMs >= proof.patchCreatedAtMs) reasons.push("held-out manifest must be committed before the patch");
-  if (!proof.heldOutTaskIds.length || !proof.heldOutFamilyIds.length) reasons.push("held-out task/family sets must be nonempty");
-  if (proof.heldOutTaskIds.some(id => proof.proposerVisibleTaskIds.includes(id))) reasons.push("held-out tasks overlap proposer-visible tasks");
-  if (proof.heldOutFamilyIds.some(id => proof.proposerVisibleFamilyIds.includes(id))) reasons.push("held-out families overlap proposer-visible families");
-  if ([...proof.heldOutTaskIds, ...proof.heldOutFamilyIds, ...proof.proposerVisibleTaskIds, ...proof.proposerVisibleFamilyIds].some(id => typeof id !== "string" || !id.trim())) reasons.push("task/family identifiers must be nonempty");
-  if (proof.isolationVerified !== true) reasons.push("held-out access isolation was not verified");
-  if (proof.passed !== true) reasons.push("held-out evaluation did not pass");
-  if (!proof.proofRef.trim()) reasons.push("held-out proof has no evidence reference");
-  return { eligible: reasons.length === 0, reasons };
-}
-
-export function revisitSolutions(solutions: Solution[], current: ModelIdentity): Array<{ solutionId: string; from: ModelIdentity | null; to: ModelIdentity; reason: string }> {
-  text(current.model, "model"); text(current.provider, "provider");
-  return solutions.filter(s => s.status === "active" || s.status === "proven").filter(s => stableJson(s.validatedWith) !== stableJson(current)).map(s => ({ solutionId: s.id, from: s.validatedWith, to: { ...current }, reason: s.validatedWith ? "model/provider changed; independently reassess retain, revise, replace or remove" : "validation model/provider was not recorded; reassess" })).sort((a, b) => compareIds(a.solutionId, b.solutionId));
-}
-
-export function removalCandidates(solutions: Solution[]): Array<{ solutionId: string; classification: "not-wired" | "unsupported"; evidence: string[]; undo: string | null; cost: "requires-cost-rollup"; ownerApprovalRequired: true }> {
-  return solutions.filter(s => s.status !== "removed" && s.problemIds.length === 0 && s.status !== "proven").map(s => {
-    const wired = s.wiring !== null && s.wiring.activatedAtMs !== null && s.wiring.executionCount > 0;
-    return { solutionId: s.id, classification: wired ? "unsupported" as const : "not-wired" as const, evidence: ["no linked problem", "no proven outcome", wired ? `recorded executions: ${s.wiring!.executionCount}` : "no confirmed execution"], undo: s.wiring?.undo ?? null, cost: "requires-cost-rollup" as const, ownerApprovalRequired: true as const };
-  }).sort((a, b) => compareIds(a.solutionId, b.solutionId));
 }
