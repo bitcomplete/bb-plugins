@@ -29,8 +29,7 @@ export function ExecutionSettings({ refreshKey, onSaved }: { refreshKey: number;
     finally {setBusy(false);}
   };
   return <section className="si-root si-execution" aria-label="Self improve execution settings"><details open={!saved?.selection.model||undefined}><summary>Execution · {saved?.selection.providerId||"Choose a BB provider"}{saved?.selection.model?` / ${saved.selection.model}`:""}</summary>
-    <p>Use your existing BB sign-in and provider routing. Ordinary workspace instructions and tools may remain available.</p>
-    <p>Agent work runs in the environment you choose here, with its ordinary tools. A scratch environment is safest: in accept-edits mode agents can change its files.</p>
+    <p>Agent work runs in the environment you choose here, with its ordinary tools. A scratch environment is safest: in accept-edits mode agents can change its files. Self improve uses your existing BB sign-in.</p>
     <div className="si-header-actions">
       <label className="si-filter"><span>Project</span><select value={target.projectId} disabled={busy||stale||!options} onChange={e=>{setTarget({projectId:e.target.value,environmentId:""});setDirty(true);setNotice("");}}>
         <option value="">{options?"Choose a project":"Loading…"}</option>{options?.projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>

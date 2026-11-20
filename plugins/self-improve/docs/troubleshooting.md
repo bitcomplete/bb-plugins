@@ -18,7 +18,7 @@ Start with `bb self-improve doctor` and `bb self-improve status` in the intended
 | Awaiting research snapshot | Finish problem ranking, scout and inventor against the same snapshot before ranking solutions. |
 | Paper credibility pending | Required source evidence is missing; unknown citation measures do not satisfy a gate. |
 | No eligible solution | Read assessment reasons, dependencies and prior attempts. |
-| Native adoption blocked | Expected preview limit: development replay is exploratory and held-out isolation is unverified. Do not manufacture proof records. |
+| A fix passed but isn't applied | **Apply tested improvements automatically** is off (approve it under Improvements), the fix was disabled, or the per-turn limit is full (it shows as waiting). |
 | **No performance observations** | No qualified measurement windows have been recorded. A successful test job is not longitudinal efficacy. |
 | **PENDING** / insufficient exposure | Inspect source coverage, runtime identity, instruction exposure and window duration. |
 | Re-test already queued | The same revision already has work in flight; earlier results remain available. |

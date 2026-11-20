@@ -1,81 +1,49 @@
-# How the loop works
+# How it works
 
-A hypothesis, a test result and a measured improvement are different records. Self improve links them so you can inspect how a claim was reached.
+![Problems are found in your threads, fixes are proposed and tested, and the ones that pass are applied.](images/learning-loop.svg)
 
-![Current exploration and the planned graduation/revalidation lifecycle.](images/learning-loop.svg)
+## The stages
 
-## Seven services
-
-| Service | Default schedule | Output |
+| Stage | When it runs with scheduling on | What it does |
 | --- | --- | --- |
-| Miner | Every 15 minutes; reconciliation at 01:00 | Generalized problems, symptoms and evidence-linked votes. |
-| Problem ranker | 02:00 | A weighted snapshot, owner focus and wildcard slots. |
-| Scout | 02:15 | DAIR/direct-arXiv proposals and source provenance. |
-| Inventor | 02:15 | Fresh problem-led hypotheses with assumptions and dependencies. |
-| Solution ranker | 03:00 | An explained queue after both proposal streams finish. |
-| Builder | 03:15 | Tests candidate fixes on development cases and applies those that pass. |
-| Verifier | 04:00 | Qualified observation windows and provider/model revisit work. |
+| Miner (Find problems) | Every 15 minutes, plus a daily catch-up at 01:00 | A search agent reads recent threads and records failures worth learning from. |
+| Problem ranker | 02:00 | Orders problems by how often and how recently they happen, plus your focus. |
+| Scout | 02:15 | Looks for relevant research (DAIR, then arXiv) and proposes fixes from it. |
+| Inventor | 02:15 | Proposes fixes from the problem alone. |
+| Solution ranker | 03:00 | Orders candidate fixes by expected benefit, effort and risk. |
+| Builder | 03:15 | Tests the top candidate on your development cases and applies it if it passes. |
+| Verifier | 04:00 | Measures how often a fixed problem shows up before and after. It does not yet cover fixes applied by the builder. |
 
-Daily times use the server's local timezone. BB owns service scheduling and restart behavior. Durable jobs and task identities preserve attribution across retries. A queued or deferred job is not a completed experiment.
+Times use the BB server's local timezone. Each stage can also be run by hand with `bb self-improve run --stage <stage>`. Self improve's own threads are never treated as problems.
 
-Optional Laya detection asynchronously examines recent redacted context and can request mining sooner. It is an early hint, not a verdict, and never replaces periodic mining. This plugin's own worker activity is excluded from the learning signal.
+## Finding problems
 
-## Follow a problem through the ledger
+The search agent gets each recent conversation as an index of its events (your messages, assistant replies, tool calls and their status, errors) and reads whatever it needs with a read-only tool: full text, surrounding turns, earlier history, or other threads the conversation refers to. It records a failure only when it can point to a specific event, such as a correction you made, a tool error or a retry. Long conversations are analysed in parts across searches, so nothing is skipped.
 
-A **problem** has symptoms, working causes and evidence pointers. A **solution** has a mechanism, linked problems, predicted effect, test plan, attempts and provenance. Prior rejected, failed and removed attempts remain useful history. Deduplication keeps source provenance.
+Each problem keeps its symptoms, likely cause, where that cause seems to be, and the events it came from.
 
-Problem scores use weighted observations, decay and source caps. Owner goals and focus are separate inputs, not fabricated observations. The scout reads available research; missing full text or credibility evidence stays unknown. The inventor receives only the sanitized problem and task from this plugin, without papers or earlier solutions. Ordinary BB/provider/workspace context can remain, so “fresh input” does not mean enforced global isolation.
+## Testing fixes
 
-The solution ranker assesses fit, benefit, testability, feasibility, safety and effort, including prior history and portability assumptions. Those scores are estimates.
+A fix is a short instruction for your agents. The builder runs each of your development test cases twice in fresh BB threads, once without the fix and once with it, and compares the answers with the expected ones. A fix passes when it gets more cases right and none wrong that were right without it.
 
-## What testing currently proves
-
-The native builder proposes reusable instructions and compares exact development-case outputs through BB threads. It retains the attempted revision, execution identity and result. It does not dispatch held-out cases, create independent isolation proof or automatically adopt a passing development result.
+Test threads run with your normal BB setup, so they can see ordinary BB and workspace context. Treat results as good evidence, not isolated proof.
 
 ## Applying improvements
 
-A fix is a short instruction text. When it passes its test runs (better than without it, no regressions) it is applied, unless you turned off **Apply tested improvements automatically**.
+A fix that passes is applied, unless you turned off **Apply tested improvements automatically**; then it waits under Improvements with an **Apply** button.
 
-Applied improvements reach agents through BB's plugin hook: when a turn starts, BB asks Self improve for anything to add, and Self improve returns the text of its enabled improvements. Nothing is written to disk, and no skill or plugin is installed. Turns in every project except the worker project receive them, or only the projects listed in `scopeProjectIds`. At most 10 improvements and about 2,000 characters are added per turn; the rest show as waiting.
+Applied fixes reach agents through BB's plugin hook: when a turn starts, BB asks Self improve for anything to add, and Self improve returns the text of its enabled improvements. Nothing is written to disk and no skill or plugin is installed. Turns in every project except the worker project receive them, or only the projects listed in `scopeProjectIds`. At most 10 improvements and about 2,000 characters are added per turn; any beyond that show as waiting.
 
-The **Improvements** panel on the dashboard lists each applied improvement, how many turns received it, and Disable/Enable. Disabling takes effect from the next turn. Turns that already ran keep what they received.
-
-Records from earlier versions of the plugin stay readable and show **revalidation required**; they are not applied.
+The **Improvements** panel lists each applied fix, how many turns received it and what it adds, with **Disable** and **Enable**. A change takes effect from the next turn.
 
 ## Problems outside the agent
 
-The search also notes where each problem's cause seems to be: how the agent worked, a plugin, a skill, BB itself, or a setting. Self improve only changes the instructions it adds to turns, so for a cause in a plugin, skill, BB or a setting it can work around the problem but not fix it. The problem view then offers **Write a report**: what happens, where, the likely cause, the evidence, any workaround in use and suggested fixes, ready to copy. For a plugin installed from GitHub it also links **Open an issue** in that plugin's repository. Self improve never edits code or files it doesn't own.
+When a problem's cause seems to be in a plugin, a skill, BB itself or a setting, Self improve can work around it with an instruction but not fix it. The problem view offers **Draft a report to send**: what happens, where, the likely cause, the evidence, any workaround in use and suggested fixes, ready to copy. For a plugin installed from GitHub it also links **Open an issue** in that plugin's repository. Self improve never edits code or files it doesn't own.
 
-A basic **Re-test solution** request preserves previous evidence and reuses an already-pending job for the same revision. Successful job execution does not mean the claim passed. Native exploratory results remain **needs review** with the adoption gate blocked; failures and inconclusive work stay separate.
+## Checking a claim again
 
-## The full target lifecycle
+If you doubt that a fix really helps, a revalidation plan tests it again on cases you choose. The engine runs on the server; there is no screen for it yet, but the editing chat can draft plans. See [revalidation](revalidation.md).
 
-The intended impact screen keeps three facts distinct: **evidence**, **distribution**, and **activation**.
+## Where things are stored
 
-**Promote** will select an exact verified revision, supported claims and intended scope; package it as a skill/plugin; review dependencies and the exact files; validate the packaged artifact; and submit to an explicit repository. Actual repository publication/release, optional marketplace listing and activation are separate states. Later versions preserve earlier releases and evidence.
-
-**Revalidate** will start with a skeptical claim, help clarify measurable criteria in BB chat, freeze a versioned plan, and test the unchanged artifact. It will distinguish replay, new challenges and independent held-out proof, then record supported/contradicted/inconclusive outcomes separately from execution failures. Fixing the artifact creates a new revision needing new validation.
-
-The revalidation engine is in place on the server; its dashboard wizard is not built yet. You (or the editing chat) write test cases, each an input and the exact expected answer, plus pass criteria. You freeze the plan, which records the exact instruction and your worker settings, and queue it. Each case runs twice in fresh BB threads, once without the instruction and once with it, and the server scores the answers:
-
-- Answers must be JSON `{"output": "..."}`, optionally in one code fence. Anything else counts as a failed case, and the result shows how many answers were unreadable.
-- A verdict is recorded only when every call finished. If you cancel, the plugin is turned off, the worker settings change, the time limit passes or a call fails, the run stops with a reason and no verdict.
-- The most recently frozen plan for a claim decides its standing, through its latest completed run. Earlier results stay in the history.
-
-[What revalidation guarantees](revalidation.md) lists the full set of guarantees and limits.
-
-Both complete workflows remain **pending in this preview**. Existing basic retest and draft export controls are foundations. A draft PR is submitted for review; it is not published, listed or active. This pending work remains part of the delivery scope.
-
-The solution detail shows **Tested on**, **Requires**, and **Not yet tested**. New inventor and scout proposals carry an unverified declaration of dependencies, assumptions and proposed package checks. Older records without a declaration remain unknown. The panel does not claim a tested environment until package conformance evidence is available. Provider/model, plugin, skill or configuration changes can require revalidation. Prompts and reviews help reveal assumptions; testing the advertised package/configuration establishes the actual scope.
-
-## Read performance carefully
-
-The verifier compares relevant symptom votes per fully mined selected session-day, with selection capped at one session per task/day. Typical baseline and follow-up windows span seven days around historical activation. Minimum exposure, coverage, model identity and instruction-exposure evidence qualify the result.
-
-**SOLVED**, **REDUCED**, **NO EFFECT**, **WORSE** and **PENDING** are observation verdicts, not proof that a nonrandomized change caused an effect. Charts retain counts, rates, gaps, confounders and cost snapshots. No data means no measurement, not zero failures or proven success.
-
-## Keep the receipts
-
-SDK-owned SQLite stores versions, jobs, costs, attempts and audit history. JSON/JSONL/Markdown reports are derived exports, not an editing API. Use the dashboard, audited chat tools or documented CLI to make changes.
-
-Fixture checks, real-model runs and longitudinal efficacy are separate evidence. None substitutes for the others, and interrupted experiments remain unknown until their state is recovered.
+Everything lives in the plugin's own database, with an audit history of every change. Reports in the plugin's data directory are read-only exports. Make changes through the dashboard, the editing chat or the CLI.

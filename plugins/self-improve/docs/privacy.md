@@ -18,7 +18,7 @@ Ledger chat reads also apply the current privacy policy to a fresh structured co
 
 Revalidation test cases, including their expected answers, are stored as you wrote them and are sent to the model only as the case input; expected answers never are. Agent threads with shell access, such as the editing chat or a test run under a permissive worker permission mode, can call Self improve's owner actions through `bb plugin rpc call` and read its data, including expected answers. BB does not yet tell a plugin whether a call came from the app or from inside a thread. Choose a worker permission mode you trust for revalidation. Model answers are not stored: each run keeps a SHA-256 fingerprint of the answer and whether it matched. A short answer such as `42` can be recovered from its fingerprint by anyone who can read the plugin's database.
 
-Owner-selected evaluation fixtures retain their exact values. The native preview dispatches development cases only; it does not dispatch held-out cases or establish that ordinary BB/provider context cannot expose them. Keep private fixtures out of worker environments and conversations. Instructions are validated again before evaluation or review and rejected if the current policy disallows them; they are never redacted into a different instruction under an existing digest. Public paper citation metadata retains its separate public provenance.
+Your test cases are stored exactly as you wrote them. Only development cases are sent to test threads, as case inputs; expected answers stay on the server. Test threads can see ordinary BB and workspace context, so keep private material out of worker environments.
 
 Public research has a separate cache. The scout can cache extracted public arXiv article text. Its assessment records retain the versioned URL, text hash and bounded exact quotations, not another full-text copy. Article text remains untrusted input; a citation cannot authorize a tool call or a change.
 
@@ -32,7 +32,6 @@ The `dairToken` and `evaluationSuite` settings are secret settings and are not r
 | Owner problem/goal form | Records owner intent. It does not create observed evidence. |
 | Native agent stage | A task-specific plugin prompt under the selected BB execution permissions. Ordinary BB/provider/workspace tools and context may remain. |
 | Editing chat | Native BB thread permissions plus this plugin's bounded read, edit and re-test tools. Other tools may remain available. |
-| Held-out evaluation receipt | Historical receipts identify an exact artifact revision. The native preview creates no passing held-out receipt. |
 | Applied improvements | Instruction text from fixes that passed their test runs, added to turns in the projects that receive improvements. You can disable each one or turn off automatic applying. |
 | Export draft | Produces inspectable text files. It does not install or publish. |
 | Create draft PR | Explicit owner review of the exact bundle fingerprint and an allowed repository/new directory. |
@@ -47,7 +46,7 @@ Self improve contributes no ledger tools to its autonomous workers. For an autho
 
 These contribution rules control this plugin's tools. They do not remove tools supplied by BB, the provider, the workspace or another plugin. The current execution path uses BB threads and existing authentication; it has no private model gateway that filters all tool responses.
 
-Use a dedicated scratch worker environment and an appropriate BB permission mode. A minimal workspace reduces incidental dependencies, but does not establish filesystem/process isolation or independent held-out testing. Provider startup and native execution can carry additional context. These limits are why native development experiments remain exploratory and automatic adoption stays blocked.
+Use a dedicated scratch worker environment and a permission mode you trust. Agent sessions run there with that environment's ordinary tools.
 
 ## Export safely
 
@@ -57,4 +56,4 @@ A **skill** carries project scope as instructions. That is guidance, not an acce
 
 The dashboard's download is a JSON bundle containing file paths and content. Preview text is escaped. **Create draft PR** is a separate, explicit action: select an allowed `owner/repo` destination, choose a new directory, and confirm that you reviewed the files, evidence and destination. The server verifies the exact bundle digest and active artifact revision before submitting a draft review PR. It never merges or installs the result.
 
-This basic export path is a foundation for the planned **Promote** workflow. A draft PR does not prove release, marketplace listing, portability or activation. The full Promote and claim-driven Revalidate workflows remain unfinished, and historical proof does not validate the new native environment.
+Export works for fixes recorded by the older proof path; fixes applied by the builder cannot be exported yet. A draft PR is a review submission, not a release or an installation.

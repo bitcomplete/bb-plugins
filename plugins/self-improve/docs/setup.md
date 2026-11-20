@@ -1,63 +1,49 @@
-# Your first learning loop
+# Setup
 
-Start with a problem you can explain. A useful first result is a clear ledger entry and a traceable attempt, even when the experiment is inconclusive.
+## First run
 
-## Prepare a scratch preview
+Open **Self improve** in the sidebar. **Get started** lists what's needed and ticks each step off.
 
-Follow the [local build/install recipe](../README.md#try-the-draft-in-scratch-bb) in a disposable BB instance with separate data and worker environment. Use ports such as `48886` and `48887`, not the live server's `38886`. Setting a different plugin source path alone does not isolate BB.
+1. **Choose where agent work runs.** Under **Execution**, pick a project and environment. Agent sessions run there with that environment's ordinary tools, and in accept-edits mode they can change its files, so a scratch environment is safest.
+2. **Choose a provider and model**, and a permission mode, then **Save execution**. Self improve uses your existing BB sign-in; there is no separate API key.
+3. **Find problems now.** The search reads the last two days of your threads. The line next to the button says when it is running and what the last search found.
 
-The final preview revision still needs its installation and real-provider checks. Until those are recorded, treat this as a development recipe, not an already-verified onboarding result.
+After setup, Execution moves behind the **Settings** button at the top of the dashboard.
 
-Run `bb self-improve doctor` and `bb self-improve status` in that scratch instance. The plugin starts with scheduling disabled. You can inspect empty ledgers and enter goals before enabling background learning.
+You can also add a problem or goal yourself with **Add problem / goal**, for example "time to a targeted test result, seconds, lower than 30". **Focus on this** makes research look at it first.
 
-## Choose where work runs
+## Test cases
 
-In **Settings → Plugins → Self improve**, the `config` JSON names an existing worker `projectId` and `environmentId`. Use a dedicated scratch environment appropriate for the material you are analyzing. `scopeProjectIds` records intended improvement scope; this preview withholds historical artifacts from new native instruction contributions.
+Fixes are only tested, and so only applied, when you give Self improve some development test cases: inputs with the exact answer you expect. Put them in the `evaluationSuite` secret setting (**Settings → Plugins → Self improve**):
 
-Open **Self improve → Execution** above the dashboard. Use BB's provider/model picker and permission picker, then select **Save execution**. Choices are resolved for the configured environment. If configuration changes while you edit, reload before saving.
-
-Sign in through the selected provider's normal BB workflow. Existing BB routing and supported failover belong to BB. There is no Self improve model-account setting or separate model API key. Do not copy another installation's credentials into scratch.
-
-Ordinary provider/workspace instructions and tools may remain. A dedicated environment reduces incidental dependencies; it is not proof that an agent cannot reach held-out tests.
-
-## Set privacy and cost preferences
-
-Add names or identifiers to remove in `redactedNames`. Review the scope of the source material: the worker project chooses where analysis executes; it does not filter all observed source projects.
-
-Agent work is allowed by default and every session is tracked; see [costs](costs.md) for where to see what each action used and for optional limits.
-
-The remaining settings are:
-
-| Setting | Purpose |
-| --- | --- |
-| `enabled` | Enables scheduled enqueueing and optional detector calls. Defaults to `false`. Explicit manual requests still queue work. |
-| `dairToken` | Optional secret DAIR token, separate from BB model authentication. |
-| `evaluationSuite` | Secret JSON containing development and held-out cases. Native experiments use development cases only; the held-out gate stays blocked. |
-
-No evaluation suite is needed simply to add a problem or explore the ledgers. An unavailable task-outcome source remains a visible coverage gap; see [task outcome sources](task-outcomes.md).
-
-## Add something worth improving
-
-Choose **Add problem / goal**. For a problem, describe what happened and what you expected. For a goal, add a metric, unit, target and direction. For example: “time to targeted test result,” seconds, `30`, lower. This is an example input, not a measured result.
-
-**Focus on this** directs the next research snapshot without fabricating observed votes. Select a record and use **Explore and edit in chat** to investigate it with BB's own conversation UI. Edits retain versions and audit reasons.
-
-## Run a small pass
-
-```sh
-bb self-improve run --stage miner
-bb self-improve status
-bb self-improve costs
+```json
+{
+  "id": "my-cases",
+  "development": [
+    { "id": "retry-payload", "familyId": "retries", "input": "A request failed with a timeout. Retry it.", "expected": "Retried with the original payload" },
+    { "id": "test-scope", "familyId": "tests", "input": "Run only the tests for src/store.ts.", "expected": "npx vitest run test/store.test.ts" }
+  ],
+  "heldOut": []
+}
 ```
 
-Queueing is not completion. Inspect the run for success, deferral or failure; finding no new evidence can be a correct result.
+Each case runs once without the fix and once with it; the server compares answers exactly. Up to 50 development cases. Choose cases that reflect the problems you care about.
 
-For research, run **problem-ranker**, then **scout** and **inventor**. Both streams must finish against the same snapshot before **solution-ranker**. A builder request needs an eligible candidate and development cases; any result remains exploratory in this preview.
+## Scheduling
 
-Enable scheduling after you have inspected the manual path. Mining runs every 15 minutes. The daily stages use the BB server's local timezone. Optional Laya provides asynchronous early hints without replacing that schedule.
+Turn on **Run scheduled improvements** to search every 15 minutes and run research, ranking and testing daily (in the BB server's local timezone). Without it, nothing runs in the background; **Find problems now** and `bb self-improve run --stage <stage>` still work.
 
-## Know what to expect next
+Optional Laya detection can trigger an earlier search from recent activity; see [configuration](configuration.md).
 
-Fixes that pass their test runs are applied automatically; see [applying improvements](how-it-works.md#applying-improvements). Turn off **Apply tested improvements automatically** under Improvements on the dashboard to approve each one yourself.
+## Privacy
 
-The complete impact-screen **Promote** and claim-driven **Revalidate** workflows are pending. Draft skill/plugin export is not proof of publication, installation or portability. Do not create dummy proof records to make these actions available.
+Add names to hide in `redactedNames`. Text is redacted before it reaches the search agent or is stored. See [privacy](privacy.md).
+
+## From the command line
+
+```sh
+bb self-improve doctor     # what's set up and what's missing
+bb self-improve run --stage miner
+bb self-improve status     # runs and their results
+bb self-improve costs
+```

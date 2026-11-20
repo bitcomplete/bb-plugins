@@ -4,7 +4,7 @@ Self improve supports a paired comparison of **abstract** and **concrete** probl
 
 This is a workflow for collecting evidence. Installing the plugin does not mean an experiment has run or that one wording is better.
 
-**Native preview limit:** discovery and development replay can collect exploratory observations. The native builder does not dispatch held-out cases or automatically adopt results, so a new native development run cannot satisfy the study's trusted-build or measured-reduction outcome by itself. Missing qualifying outcomes remain missing.
+**Limit:** a wording study counts trusted builds and measured reductions, which only the older proof path records. Builds that test and apply fixes today are not counted, so a study can collect discovery and relevance data but not its build outcomes yet.
 
 ## Decide before collecting
 

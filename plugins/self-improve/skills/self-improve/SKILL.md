@@ -1,49 +1,34 @@
 ---
 name: self-improve
-description: Inspect Self improve learning ledgers, model costs, experiments and validation gaps, or diagnose a Self improve service run. Use for this plugin's operations, not ordinary code review or generic self-improvement advice.
+description: Inspect or operate the Self improve plugin: its problems and fixes, applied improvements, test runs, costs, or a failed run. Use for this plugin's operations, not ordinary code review or generic self-improvement advice.
 ---
 
 # Self improve
 
-Inspect durable state with `bb self-improve doctor`, `status`, `problems`,
-`solutions`, `report`, and `costs`. Read command help before configuration changes.
-The dashboard provides manual goals, record chat, basic retesting and draft exports.
-Full impact-screen Promote and claim-driven Revalidate workflows remain pending in
-this preview; do not present their design as implemented behavior.
+Self improve finds failures in BB threads, proposes fixes (short instructions for
+agents), tests them on the owner's development cases with and without the fix, and
+applies the ones that do better with no regressions. Applied fixes are added to agent
+turns through the plugin's `agents.configure` hook; nothing is written to disk. Each
+can be disabled from the dashboard's Improvements panel, and automatic applying can
+be switched off (`autoApply`).
 
-All agent work uses BB-native threads, BB provider/model/permission selection and
-existing BB authentication/routing. There is no plugin-owned model gateway or
-vendor API-key pool. Use supported BB sign-in and failover routes; never copy
-another installation's secrets. Ordinary BB/provider/workspace context and tools
-may remain. Fresh problem-only inventor input is not enforced global isolation.
+Inspect state with `bb self-improve doctor`, `status`, `problems`, `solutions` and
+`costs`. Queue work with `bb self-improve run --stage <stage>` (miner,
+problem-ranker, scout, inventor, solution-ranker, builder, verifier) and then read
+the run in `status`. Queued is not finished, and a search that finds nothing new can
+be a correct result.
 
-Separate hypotheses, exploratory development replay, independent held-out proof
-and longitudinal measurements. The current native builder does not send held-out
-cases or establish proposer isolation; automatic native adoption stays blocked.
-Historical evidence keeps its original execution identity and does not authorize
-new native activation. A completed job is not a passing claim.
+In the editing chat, read before editing and use the audited ledger tools. Do not
+change the database directly, invent evidence or results, or edit expected answers
+in test cases. Test results come from ordinary BB threads, so they are exploratory
+evidence, not isolated proof.
 
-Read prior attempts, including rejected/failed/removed directions, before a repeat.
-Use audited ledger tools in the record chat. Do not mutate the database, fabricate
-votes, mint proof receipts, relabel a result as proven, or read sealed fixtures.
-Before/after observations retain denominators, uncertainty and confounders.
+When a problem's cause is in a plugin, skill, BB or a setting, Self improve can only
+work around it with an instruction; the problem view offers a report to send to the
+maintainer. Do not edit other plugins, skills or settings on the owner's behalf.
 
-For authorized service work, queue `bb self-improve run --stage <stage>` and inspect
-the resulting run. Stages: miner, problem-ranker, scout, inventor, solution-ranker,
-builder, verifier. Preserve snapshot/task attribution through retries. Scheduling
-is disabled by default; native work additionally requires explicit unknown-cost
-authorization. Read the policy before changing it.
+Every agent session is tracked with the tokens and cost BB reports. Agent work is
+allowed by default; daily caps and spending limits are optional settings. Missing
+cost reports are unknown, not zero.
 
-BB session costs are optional observations, not subscription invoices. Tokens are
-not repriced as an API bill. Shared sessions can overlap filtered solution totals;
-unknown cost is not zero. Spending thresholds stop future admissions using available
-reports and cannot promise a hard dollar ceiling on already-running native work.
-
-Exports are reviewable drafts. Preparing one does not itself authorize external
-publication, installation, activation or pushes. Follow the owner's existing scope
-and any review/announcement hold. A draft PR is submitted, not published. Preserve
-exact revisions, supported claims, dependencies and evidence; fixes need new
-validation. Use scratch BB for preview checks and keep live data/credentials out.
-
-For setup, read `docs/setup.md` from the plugin source; execution and evaluation
-limits are in `docs/configuration.md`, and accounting semantics in `docs/costs.md`.
+Setup: `docs/setup.md`. Settings: `docs/configuration.md`. Costs: `docs/costs.md`.

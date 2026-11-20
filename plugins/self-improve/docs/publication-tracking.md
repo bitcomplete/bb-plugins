@@ -23,4 +23,4 @@ Each check appends an observation with its time and exact commit when available.
 
 If a repository is removed from the allowlist, saved history stays readable, but new remote checks are refused. Restore access deliberately before checking again.
 
-These checks are one part of the planned **Promote** workflow. They do not establish portability, claim validity, marketplace availability or activation. The complete packaging, promotion and claim-driven revalidation flows are still in development.
+These checks report what happened to a submission. They do not install anything or confirm that a fix works elsewhere.

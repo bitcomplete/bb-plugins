@@ -60,7 +60,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
     enabled: { type: "boolean", label: "Run scheduled improvements", default: false },
     config: { type: "string", label: "Configuration (JSON)", experimental_multiline: true, default: JSON.stringify(defaultConfig(), null, 2) },
     dairToken: { type: "string", secret: true, label: "DAIR OAuth access token" },
-    evaluationSuite: { type: "string", secret: true, label: "Development evaluation suite (JSON)", description: "Native experiments use development cases only. Reserved held-out cases are never sent to the native evaluator; adoption remains blocked without independently verified isolation." },
+    evaluationSuite: { type: "string", secret: true, label: "Development evaluation suite (JSON)", description: "Test cases for trying fixes: inputs with the exact expected answer. See the setup guide for the format." },
   });
   let values = await settings.get();
   const db = bb.storage.database(); bb.storage.migrate(db, MIGRATIONS); const store = new Store(db);
@@ -257,7 +257,6 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
       partialThreads && `${partialThreads} long ${partialThreads === 1 ? "thread was" : "threads were"} only partly read in the last search for problems.`,
       partialSources && "Task and schedule history from other plugins is only partly available, so some failures may be missed.",
       !config.taskOutcomeSource && "No task-outcome source is connected, so problems come from thread activity only.",
-      "Test results are exploratory: test runs share ordinary BB context, so they are not isolated proof.",
     ]);
   };
   /** Everything, with source-level detail, for the CLI doctor and status commands. */

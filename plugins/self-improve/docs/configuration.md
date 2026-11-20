@@ -42,13 +42,13 @@ Weekly discovery uses `weeklyTool`, optional `weeklyArguments` and `weeklyResult
 
 `laya` contains `enabled` (default `false`), an optional endpoint and `minConfidence` (default `0.8`, allowed 0.8–1). It requires scheduling enabled and `budgets.allowUnknown` left at `true`. The detector consumes a bounded, redacted recent window asynchronously, excludes this plugin's workers and can queue an earlier mining pass. A failure or uncertain response does not suppress the 15-minute fallback. Enable only an endpoint you intend to receive that context.
 
-## Held-out evaluation
+## Test cases
 
-The current native builder tests reusable instruction candidates against **development cases**. It uses BB threads with ordinary native context limits, not a private stateless model endpoint. It does not automatically patch arbitrary repositories.
+The builder tests candidate instructions against your **development cases** in ordinary BB threads. It never changes repositories.
 
-The `evaluationSuite` secret retains the schema `id`, `development` (1–50 cases) and `heldOut` (3–100 cases). Cases contain `id`, `familyId`, `input` and `expected`, with disjoint task IDs, families and normalized inputs across the two sets. Outputs use exact comparison. Keep private cases out of chats and public reports.
+The `evaluationSuite` secret retains the schema `id`, `development` (1–50 cases) and `heldOut` (0–100 cases, kept aside and not sent to test threads). Cases contain `id`, `familyId`, `input` and `expected`, with disjoint task IDs, families and normalized inputs across the two sets. Outputs use exact comparison. Keep private cases out of chats and public reports.
 
-**Test runs use development cases in ordinary BB threads.** A fix is applied when it beats the run without it with no regressions; that is exploratory evidence, not held-out proof. Passing a toy fixture demonstrates plumbing, not independent proof or longitudinal efficacy. Historical direct-model receipts remain historical; they do not validate the new execution environment.
+**Test runs use development cases in ordinary BB threads.** A fix is applied when it gets more cases right with no regressions. That is good evidence, not isolated proof. See [setup](setup.md#test-cases) for an example.
 
 ## Publish a reviewed export
 
