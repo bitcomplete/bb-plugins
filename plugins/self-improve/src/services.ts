@@ -16,7 +16,6 @@ const adapterDiagnostics = new Set([
   "invalid-url", "unsafe-ledger-text", "ledger-reference-disallowed",
 ]);
 const fixedDiagnostics = new Map([
-  ["injected-service-fault", "injected-service-fault"],
   ["unpriced-model: configure prices or explicitly allow unknown costs", "unpriced-model"],
   ["daily-call-budget-exhausted", "daily-call-budget-exhausted"],
   ["unknown-external-cost: report or explicitly allow unknown costs", "unknown-external-cost"],
@@ -54,17 +53,11 @@ export function dayKey(now = Date.now()) { return new Date(now).toISOString().sl
 export class Services {
   readonly boot = randomUUID();
   private recovered = false;
-  private faults = new Set<Stage>();
   constructor(readonly bb: BbPluginApi, readonly store: Store, readonly handlers: Record<Stage, StageHandler>, readonly enabled: () => Promise<boolean>, readonly changed: () => void) {}
   enqueue(stage: Stage, key?: string, input: Record<string, unknown> = {}): string {
     const now = Date.now();
     const runKey = key ?? (stage === "miner" ? `interval:${Math.floor(now/900000)}` : `day:${dayKey(now)}`);
     const id = this.store.enqueue(stage, runKey, input, now); this.changed(); return id;
-  }
-  injectFault(stage: Stage): void {
-    const dir = this.bb.server.experimental_dataDir;
-    if (!dir.includes("scratch") || new URL(this.bb.server.loopbackBaseUrl).port === "38886") throw new Error("fault-injection-requires-scratch");
-    this.faults.add(stage);
   }
   register(): void {
     for (const stage of STAGES) {
@@ -75,7 +68,6 @@ export class Services {
           const job = this.store.claim(stage, this.boot);
           if (!job) { await wait(1000, signal); continue; }
           try {
-            if (this.faults.delete(stage)) throw new Error("injected-service-fault");
             const counts = await this.handlers[stage]({ job, signal, boot: this.boot });
             if (signal.aborted) throw new Deferred("service-stopped");
             this.store.complete(job.id, this.boot, counts);

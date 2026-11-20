@@ -1,9 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile, lstat } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
-import { promisify } from "node:util";
 import type { Store } from "./store.js";
 import type { Attempt, ModelIdentity, Prediction, Solution } from "./domain/types.js";
 import { finite, stableId, stableJson, text, unique } from "./domain/shared.js";
@@ -22,33 +18,27 @@ export interface EvaluationModelIO {
   propose(input: ProposalInput): Promise<string>;
   run(input: { caseId:string; arm:"baseline"|"treatment"; input: string; instruction: string }): Promise<string>;
 }
-export interface ManifestInput { digest: string; content: string }
-export interface SealedManifest { commit: string; committedAtMs: number; manifestDigest: string; repository?: string }
-export interface BuiltArtifact {
-  id: string; solutionId: string; revision: string; kind: "instruction"; content: string; artifactDigest: string;
-  createdAtMs: number; model: ModelIdentity; builtWith: ModelIdentity; scopeProjectIds: string[]; evaluationId: string;
-  sourceArtifactId: string | null;
-}
-export interface EvaluationAttempt {
-  id: string; solutionId: string; revision: string; suiteId: string; requestDigest: string;
-  status: "running" | "passed" | "rejected" | "failed"; reason: string; startedAtMs: number; endedAtMs: number | null;
-  model: ModelIdentity; baselinePassed: number; treatmentPassed: number; regressions: number;
-  cases: number; completedExecutions: number; minimumGain: number; artifactId: string | null; evaluationId: string | null;
-  manifestDigest: string | null;
-}
 export interface EvaluationModelOptions {
   store:Store;runner:TaskRunner;attemptId:string;solutionId:string;runId:string;execution:NativeExecution;
   privacyGeneration:string;currentPrivacyGeneration:()=>string;signal:AbortSignal;privacy:()=>PrivacyPolicy;timeoutMs?:number;
 }
 export interface EvaluationOptions extends EvaluationModelOptions {
-  revision:string;suite:EvaluationSuite;scopeProjectIds:string[];minimumGain?:number;retestArtifactId?:string;now?:()=>number;
+  revision:string;suite:EvaluationSuite;scopeProjectIds:string[];minimumGain?:number;now?:()=>number;
   /** Trusted builder supplies all linked-problem attempts immediately before proposing. */
   history?: () => ProposalHistoryEntry[];
 }
-export interface ExploratoryArtifact extends Omit<BuiltArtifact,"evaluationId"> {
-  evidenceKind:"exploratory-development-replay";evaluationId:null;execution:NativeExecution;
+/** An instruction proposed and tested on development cases; applying it is a separate step (improvements.ts). */
+export interface ExploratoryArtifact {
+  id: string; solutionId: string; revision: string; kind: "instruction"; content: string; artifactDigest: string;
+  createdAtMs: number; model: ModelIdentity; builtWith: ModelIdentity; scopeProjectIds: string[];
+  sourceArtifactId: null; evidenceKind:"exploratory-development-replay";evaluationId:null;execution:NativeExecution;
 }
-export interface NativeEvaluationAttempt extends Omit<EvaluationAttempt,"status"> {
+export interface NativeEvaluationAttempt {
+  id: string; solutionId: string; revision: string; suiteId: string; requestDigest: string;
+  reason: string; startedAtMs: number; endedAtMs: number | null;
+  model: ModelIdentity; baselinePassed: number; treatmentPassed: number; regressions: number;
+  cases: number; completedExecutions: number; minimumGain: number; artifactId: string | null; evaluationId: string | null;
+  manifestDigest: string | null;
   status:"running"|"completed"|"failed"|"interrupted"|"cancelled";
   evidenceKind:"exploratory-development-replay";execution:NativeExecution;privacyGeneration:string;runId:string;
   observationVerdict:"gain-without-regression"|"gain-or-regression-target-not-met"|"inconclusive";
@@ -71,26 +61,6 @@ function validateSuite(suite: EvaluationSuite): void {
   if (suite.heldOut.flatMap(fixtureKeys).some(key => visible.has(key))) throw new Error("held-out task, family or input overlap");
   const inputs = suite.heldOut.map(f => fixtureKeys(f)[2]);
   if (new Set(inputs).size !== inputs.length) throw new Error("duplicate held-out input");
-}
-
-/** Fixed local git commands. Only call with the plugin's private data directory, never a caller-selected checkout. */
-export async function sealManifest(directory: string, manifest: ManifestInput): Promise<SealedManifest> {
-  if (!isAbsolute(directory)) throw new Error("evaluation directory must be absolute");
-  if (sha(manifest.content) !== manifest.digest) throw new Error("evaluation manifest digest mismatch");
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const stat = await lstat(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("evaluation directory is not a private directory");
-  const repository = await mkdtemp(join(directory, "sealed-"));
-  const exec = promisify(execFile);
-  const env = { PATH: "/usr/local/bin:/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
-  const git = (...args: string[]) => exec("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "user.name=Self improve evaluator", "-c", "user.email=self-improve@localhost", ...args], { cwd: repository, env, timeout: 10000, maxBuffer: 100000 });
-  await git("init", "--quiet", "--initial-branch=main");
-  await writeFile(join(repository, "manifest.json"), manifest.content, { mode: 0o400, flag: "wx" });
-  await git("add", "--", "manifest.json");
-  await git("commit", "--quiet", "--no-gpg-sign", "-m", "Seal held-out evaluation manifest");
-  const commit = (await git("rev-parse", "HEAD")).stdout.trim();
-  if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("invalid sealed manifest commit");
-  return { commit, committedAtMs: Date.now(), manifestDigest: manifest.digest, repository };
 }
 
 const operationSchema=z.object({taskId:z.string().min(1),runId:z.string().min(1),fingerprint:z.string().regex(/^[a-f0-9]{64}$/),outputDigest:z.string().nullable()}).strict();
@@ -161,15 +131,10 @@ export async function evaluateInstruction(input:EvaluationOptions):Promise<Nativ
   const scopes=unique(options.scopeProjectIds);if(!scopes.length||scopes.length>200)throw new Error("evaluation requires explicit project scope");scopes.forEach(id=>boundedId(id,"project ID"));
   const minimumGain=options.minimumGain??0.1;if(!Number.isFinite(minimumGain)||minimumGain<=0||minimumGain>1)throw new Error("evaluation minimum gain must be in (0,1]");
   const solution=store.get<Solution>("solutions",options.solutionId);if(!solution||solution.status==="removed")throw new Error("evaluation solution is absent or removed");
-  let sourceArtifact:BuiltArtifact|ExploratoryArtifact|null=null;
-  if(options.retestArtifactId){
-    sourceArtifact=store.get<ExploratoryArtifact>("native-evaluation-artifacts",options.retestArtifactId)??store.get<BuiltArtifact>("built-artifacts",options.retestArtifactId);
-    if(!sourceArtifact||sourceArtifact.solutionId!==solution.id||sha(sourceArtifact.content)!==sourceArtifact.artifactDigest)throw new Error("invalid retest artifact");
-  }
   const development=suite.development,privacyDigest=sha(stableJson(options.privacy())),model={provider:options.execution.providerId,model:options.execution.model};
   for(const fixture of development){assertLedgerText(fixture.input,{...options.privacy(),maxCharacters:16000});assertLedgerText(fixture.expected,{...options.privacy(),maxCharacters:8000});}
   // The manifest contains only development cases. No hidden fixture or expectation is copied into BB input or new plugin records.
-  const manifest={protocol:"bb-native-exploratory-v1",development,suiteId:suite.id,solutionId:solution.id,solution:solutionDefinition(solution),execution:options.execution,privacyGeneration:options.privacyGeneration,privacyDigest,scopes,minimumGain,timeoutMs:options.timeoutMs??120000,revision:options.revision,sourceArtifact:sourceArtifact?{id:sourceArtifact.id,digest:sourceArtifact.artifactDigest}:null};
+  const manifest={protocol:"bb-native-exploratory-v1",development,suiteId:suite.id,solutionId:solution.id,solution:solutionDefinition(solution),execution:options.execution,privacyGeneration:options.privacyGeneration,privacyDigest,scopes,minimumGain,timeoutMs:options.timeoutMs??120000,revision:options.revision,sourceArtifact:null};
   const requestDigest=sha(stableJson(manifest)),artifactId=stableId("native-artifact",[solution.id,options.revision]),lease=randomUUID();
   const attempt=store.transaction(()=>{
     current(options);
@@ -200,12 +165,12 @@ export async function evaluateInstruction(input:EvaluationOptions):Promise<Nativ
     assertActive();
     let artifact=store.get<ExploratoryArtifact>("native-evaluation-artifacts",artifactId);
     if(!artifact){
-      const content=sourceArtifact?.content??await io.propose({development:structuredClone(development),prediction:structuredClone(solution.prediction),mechanism:solution.mechanism,assumptions:structuredClone(solution.assumptions),testPlan:solution.testPlan,history:structuredClone(options.history?.()??solution.attempts.map(a=>({outcome:a.outcome,reason:a.reason,atMs:a.atMs,prediction:a.prediction,model:a.model,mechanism:solution.mechanism,solutionStatus:solution.status})))});
+      const content=await io.propose({development:structuredClone(development),prediction:structuredClone(solution.prediction),mechanism:solution.mechanism,assumptions:structuredClone(solution.assumptions),testPlan:solution.testPlan,history:structuredClone(options.history?.()??solution.attempts.map(a=>({outcome:a.outcome,reason:a.reason,atMs:a.atMs,prediction:a.prediction,model:a.model,mechanism:solution.mechanism,solutionStatus:solution.status})))});
       assertActive();assertInstructionText(content,options.privacy());
-      artifact={id:artifactId,solutionId:solution.id,revision:options.revision,kind:"instruction",content,artifactDigest:sha(content),createdAtMs:now(),model,builtWith:sourceArtifact?.builtWith??sourceArtifact?.model??model,scopeProjectIds:scopes,evaluationId:null,sourceArtifactId:sourceArtifact?.id??null,evidenceKind:"exploratory-development-replay",execution:options.execution};
+      artifact={id:artifactId,solutionId:solution.id,revision:options.revision,kind:"instruction",content,artifactDigest:sha(content),createdAtMs:now(),model,builtWith:model,scopeProjectIds:scopes,evaluationId:null,sourceArtifactId:null,evidenceKind:"exploratory-development-replay",execution:options.execution};
       store.transaction(()=>{assertActive();if(!store.insert("native-evaluation-artifacts",artifactId,artifact))throw new Error("native-evaluation-artifact-conflict");});
     }
-    if(artifact.solutionId!==solution.id||artifact.revision!==options.revision||sha(artifact.content)!==artifact.artifactDigest||stableJson(artifact.execution)!==stableJson(options.execution)||artifact.evaluationId!==null||artifact.evidenceKind!=="exploratory-development-replay"||artifact.sourceArtifactId!==(sourceArtifact?.id??null)||(sourceArtifact&&artifact.artifactDigest!==sourceArtifact.artifactDigest))throw new Error("native-evaluation-artifact-conflict");
+    if(artifact.solutionId!==solution.id||artifact.revision!==options.revision||sha(artifact.content)!==artifact.artifactDigest||stableJson(artifact.execution)!==stableJson(options.execution)||artifact.evaluationId!==null||artifact.evidenceKind!=="exploratory-development-replay"||artifact.sourceArtifactId!==null)throw new Error("native-evaluation-artifact-conflict");
     assertInstructionText(artifact.content,options.privacy());
     attempt.artifactId=artifactId;
     attempt.baselinePassed=0;attempt.treatmentPassed=0;attempt.regressions=0;attempt.completedExecutions=0;
@@ -250,26 +215,15 @@ export async function evaluateInstruction(input:EvaluationOptions):Promise<Nativ
   });
 }
 
-/** Startup fence: legacy held-out attempts fail; native development attempts can resume their original task bindings. */
+/** Startup fence: development attempts left running by a restart become interrupted and can resume their original task bindings. */
 export function recoverInterruptedEvaluations(store: Store, nowMs = Date.now()): number {
   finite(nowMs, "evaluation recovery time");
   return store.transaction(() => {
-    const interrupted = store.list<EvaluationAttempt>("evaluation-attempts").filter(a => a.status === "running");
-    for (const attempt of interrupted) {
-      attempt.status = "failed"; attempt.reason = "evaluation-interrupted"; attempt.endedAtMs = nowMs;
-      attempt.artifactId = null; attempt.evaluationId = null;
-      store.put("evaluation-attempts", attempt.id, attempt, nowMs);
-      const solution = store.get<Solution>("solutions", attempt.solutionId);
-      if (solution && !solution.attempts.some(a => a.id === attempt.id)) {
-        solution.attempts.push({ id: attempt.id, atMs: nowMs, directionKey: solution.directionKey, prediction: solution.prediction, outcome: "failed", reason: attempt.reason, evidenceIds: [attempt.id], model: attempt.model });
-        store.put("solutions", solution.id, solution, nowMs);
-      }
-    }
     const native=store.list<NativeEvaluationAttempt>("native-evaluation-attempts").filter(attempt=>attempt.status==="running");
     for(const attempt of native){
       store.put("native-evaluation-attempts",attempt.id,{...attempt,status:"interrupted",reason:"exploratory-evaluation-interrupted",endedAtMs:nowMs},nowMs);
       store.remove("native-evaluation-leases",attempt.id);
     }
-    return interrupted.length+native.length;
+    return native.length;
   });
 }

@@ -36,7 +36,6 @@ function SelfImprovePage() {
     cancelRevalidation: input => rpc.call("cancelRevalidation", input),
     startRevalidationChat: input => rpc.call("startRevalidationChat", input),
     dashboard: input => rpc.call("dashboard", input),
-    retest: input => rpc.call("retest", input),
     findProblems: input => rpc.call("findProblems", input),
     problemReport: input => rpc.call("problemReport", input),
     applyImprovement: input => rpc.call("applyImprovement", input),
@@ -44,12 +43,6 @@ function SelfImprovePage() {
     setAutoApply: input => rpc.call("setAutoApply", input),
     startChat: input => rpc.call("startChat", input),
     createObjective: input => rpc.call("createObjective", input),
-    performance: input => rpc.call("performance", input),
-    exportSolution: input => rpc.call("exportSolution", input),
-    publishExport: input => rpc.call("publishExport", input),
-    publications: input => rpc.call("publications", input),
-    publicationHistory: input => rpc.call("publicationHistory", input),
-    reconcilePublication: input => rpc.call("reconcilePublication", input),
   }), [rpc]);
   return <Dashboard key={projectId ?? "no-project"} api={api} projectId={projectId} refreshKey={refreshKey}
     settings={<ExecutionSettings refreshKey={refreshKey} onSaved={refresh}/>}

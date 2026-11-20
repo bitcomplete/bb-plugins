@@ -5,8 +5,6 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { Store, MIGRATIONS } from "../src/store.js";
 import { Runtime, type SolutionAssessment } from "../src/runtime.js";
 import { defaultConfig } from "../src/config.js";
-import { Accounting } from "../src/costs.js";
-import { reviewRevisits } from "../src/revisit.js";
 import type { NativeExecution, NativeTaskReceipt, NativeTaskRequest } from "../src/native-tasks.js";
 import type { StageContext } from "../src/services.js";
 import type { Solution } from "../src/domain/types.js";
@@ -30,9 +28,9 @@ function setup(providerId="codex") {
   const execution:NativeExecution={providerId,model:"selected",projectId:"project",environment:{type:"reuse",environmentId:"environment"},permissionMode:"accept-edits"};
   const privacy={clientNames:["PrivateClient"]};let generation="privacy-v1";
   const execute=vi.fn(async(request:NativeTaskRequest)=>receipt(request,request.stage==="inventor"?[]:scores()));
-  const build=vi.fn(async(_ctx:StageContext,_candidate:Solution,_retest:boolean)=>({built:1}));
+  const build=vi.fn(async(_ctx:StageContext,_candidate:Solution)=>({built:1}));
   const runtime=new Runtime({bb:{sdk:{}} as BbPluginApi,store,config:()=>config,privacy:()=>privacy,runner:{execute},execution:()=>execution,privacyGeneration:()=>generation,
-    accounting:new Accounting(store,()=>config.budgets),workers:()=>({owns:()=>false,analyze:async()=>({failures:[]})}),build});
+    workers:()=>({owns:()=>false,analyze:async()=>({failures:[]})}),build});
   vi.spyOn(runtime.arxiv,"search").mockResolvedValue([]);
   store.put("problems","p-a",problem());store.put("votes","v",vote());
   const candidate=solution();candidate.title="PrivateClient retry improvement";candidate.scores={fit:null,benefit:null,testability:null,feasibility:null,safety:null,effort:null};store.put("solutions",candidate.id,candidate);
@@ -51,8 +49,6 @@ describe("native runtime integration",()=>{
     f.store.put("native-evaluation-attempts",stableId("native-build-attempt","builder"),{solutionId:f.candidate.id});
     await f.runtime.handlers.builder(context("builder"));
     expect(f.build.mock.calls[0]?.[1]).toEqual(f.candidate);
-    const changed=context("builder");changed.job.input.solutionId=other.id;
-    await expect(f.runtime.handlers.builder(changed)).rejects.toThrow("builder-job-candidate-changed");
     expect(f.build).toHaveBeenCalledTimes(1);
   });
   it("advances past a completed exploratory build in a stale ranking",async()=>{
@@ -160,24 +156,5 @@ describe("native runtime integration",()=>{
     expect(await f.runtime.handlers["problem-ranker"](context("problem-ranker"))).toMatchObject({problems:1});
     expect(f.execute).not.toHaveBeenCalled();
     await expect(f.runtime.handlers.inventor(context("inventor"))).rejects.toThrow("configure-native-execution");
-  });
-  it("keeps a completed native revisit reviewed when the verifier runs again",async()=>{
-    const f=setup(),active={...f.candidate,status:"active" as const,candidateState:"built" as const,validatedWith:{provider:"claude-code",model:"selected"}};
-    f.store.put("solutions",active.id,active);
-    f.store.put("validated-artifacts",active.id,{solutionId:active.id,revision:"r1",kind:"instruction",content:"Keep the original payload",artifactDigest:"b".repeat(64),evaluationId:"proof-old",wiringLocation:"instruction",activatedAtMs:NOW});
-    await f.runtime.handlers.verifier(context("verifier"));expect(f.store.list("revisit-queue")).toHaveLength(1);
-    f.execute.mockImplementation(async request=>receipt(request,{decision:"retain",reason:"Retest the unchanged artifact on the selected provider"}));
-    const options={store:f.store,accounting:f.runtime.options.accounting,runner:{execute:f.execute},execution:f.execution,runId:"revisit-run",privacyGeneration:f.runtime.options.privacyGeneration(),currentPrivacyGeneration:f.runtime.options.privacyGeneration,privacy:f.privacy,signal:new AbortController().signal};
-    expect(await reviewRevisits(options)).toMatchObject({revisited:1,retests:1});
-    const reviewed=f.store.list("revisit-queue");expect(reviewed).toEqual([expect.objectContaining({status:"reviewed",reviewId:expect.any(String)})]);
-    await f.runtime.handlers.verifier(context("verifier","later"));expect(f.store.list("revisit-queue")).toEqual(reviewed);
-    expect(await reviewRevisits({...options,runId:"again"})).toMatchObject({revisited:0,retests:0});expect(f.execute).toHaveBeenCalledTimes(1);
-    expect(f.store.pending()).toHaveLength(1);
-  });
-  it("uses the selected BB provider for revalidation decisions without changing adoption",async()=>{
-    const f=setup();const active={...f.candidate,status:"active" as const,candidateState:"built" as const,validatedWith:{provider:"claude-code",model:"selected"}};
-    f.store.put("solutions",active.id,active);await f.runtime.handlers.verifier(context("verifier"));
-    expect(f.store.list("revisit-queue")).toEqual([expect.objectContaining({solutionId:active.id,to:{provider:"codex",model:"selected"}})]);
-    expect(f.store.get<Solution>("solutions",active.id)?.status).toBe("active");expect(f.execute).not.toHaveBeenCalled();
   });
 });

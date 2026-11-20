@@ -53,7 +53,7 @@ describe("builder history from linked problems", () => {
       const runner = capturedRunner(requests);
       const build = createBuilder({ store, directory, config: () => config, runner, execution:()=>execution, privacyGeneration:()=>"generation", suite: () => JSON.stringify(suite), privacy: () => ({ clientNames: [marker] }) });
       const context: StageContext = { job: { id: "history-job", key: "history", stage: "builder", input: {}, attempts: 1, createdAt: Date.now() }, boot: "boot", signal: new AbortController().signal };
-      expect(await build(context, candidate, false)).toMatchObject({ tested:1,completed:1,gainObserved:0,adopted:0,adoptionBlocked:1 });
+      expect(await build(context, candidate)).toMatchObject({ tested:1,completed:1,gainObserved:0,adopted:0,adoptionBlocked:1 });
       expect(requests).toHaveLength(3);
       const proposal = requests[0]!, data = promptData(proposal), serialized = JSON.stringify({instructions:proposal.instructions,input:proposal.input});
       expect(data.development).toEqual(suite.development);

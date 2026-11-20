@@ -65,4 +65,4 @@ The producer is responsible for recording actual outcomes and preserving provena
 
 The collector enforces the configured page budget, no more than 200 runs per page, and no more than 10,000 unique runs per collection. Invalid times, mismatched UTC days, page-size violations, conflicting facts, cursor cycles and unavailable RPCs all leave coverage incomplete. Validated observations from earlier pages remain useful; failed validation does not turn missing records into successful tasks.
 
-The normal miner stores deterministic task votes and run-count observations through its transactional checkpoints. Retrospectives use the same producer through their separate storage scope. No provider response can supply problem scores, trusted evaluation receipts or solution adoption decisions.
+The miner stores deterministic task votes and run-count observations through its transactional checkpoints. No provider response can supply problem scores, trusted evaluation receipts or solution adoption decisions.

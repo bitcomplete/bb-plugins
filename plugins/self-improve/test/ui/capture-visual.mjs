@@ -29,20 +29,9 @@ try {
       }
       captures.push({name:variant.name,png:(await page.screenshot({fullPage:false})).toString("base64")});
       if(variant.name==="desktop-light") {
-        await page.getByRole("tab",{name:/Established/}).click();
+        await page.getByRole("tab",{name:/Solutions/}).click();
         await page.getByRole("button",{name:/Open solution Retain/}).click();
-        await page.getByRole("button",{name:"Re-test solution"}).click();
-        await page.getByText("Re-test queued. Earlier results are preserved.").waitFor();
-        captures.push({name:"retest-fixture",png:(await page.screenshot({fullPage:false})).toString("base64")});
-        await page.getByRole("button",{name:"Export solution"}).click();
-        const publication=page.getByRole("region",{name:"Publish export for review"});
-        await publication.waitFor();
-        await publication.scrollIntoViewIfNeeded();
-        if(!await page.getByRole("button",{name:"Create draft PR"}).isDisabled())errors.push("publication must require explicit review before enabling");
-        captures.push({name:"publication-fixture",png:(await page.screenshot({fullPage:false})).toString("base64")});
-        await page.getByRole("tab",{name:"Performance"}).click();
-        await page.getByRole("table").waitFor();
-        captures.push({name:"performance-fixture",png:(await page.screenshot({fullPage:false})).toString("base64")});
+        captures.push({name:"solution-fixture",png:(await page.screenshot({fullPage:false})).toString("base64")});
       }
     }
     for(const diagram of [{name:"learning-loop",width:1200,height:590},{name:"evidence-ladder",width:1000,height:330}]){

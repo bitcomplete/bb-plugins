@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createBuilder } from "../src/build.js";
 import { defaultConfig } from "../src/config.js";
-import { Accounting } from "../src/costs.js";
 import { stableId } from "../src/domain/shared.js";
 import type { Solution } from "../src/domain/types.js";
 import type { NativeEvaluationAttempt, EvaluationSuite } from "../src/evaluation.js";
@@ -29,7 +28,7 @@ describe("completed native exploratory evaluation recovery",()=>{
         return {taskId:request.id,runId:request.runId,solutionId:request.solutionId,stage:request.stage,providerId:request.execution.providerId,model:request.execution.model,modelIdentitySource:"requested-selection",threadId:`thread-${request.id}`,requestId:"request",turnId:"turn",promptHash:"a".repeat(64),startedAtMs:NOW,endedAtMs:NOW+1,text:JSON.stringify(value)};
       }};
       const makeBuild=()=>createBuilder({store,config:()=>config,runner,execution:()=>execution,suite:()=>JSON.stringify(suite),privacy:()=>({}),privacyGeneration:()=>"generation"});
-      const makeRuntime=()=>new Runtime({bb:{sdk:{}} as BbPluginApi,store,config:()=>config,privacy:()=>({}),runner,execution:()=>execution,privacyGeneration:()=>"generation",accounting:new Accounting(store,()=>config.budgets),workers:()=>({owns:()=>false,analyze:async()=>({failures:[]})}),build:makeBuild()});
+      const makeRuntime=()=>new Runtime({bb:{sdk:{}} as BbPluginApi,store,config:()=>config,privacy:()=>({}),runner,execution:()=>execution,privacyGeneration:()=>"generation",workers:()=>({owns:()=>false,analyze:async()=>({failures:[]})}),build:makeBuild()});
       const context:StageContext={job:{id:"build-job",stage:"builder",key:"build",input:{},attempts:1,createdAt:NOW,runId:"first-run"},boot:"first",signal:new AbortController().signal};
       expect(await makeRuntime().handlers.builder(context)).toMatchObject({completed:1,adopted:0,adoptionBlocked:1});
       const id=stableId("native-build-attempt",context.job.id),attempt=store.get<NativeEvaluationAttempt>("native-evaluation-attempts",id)!;

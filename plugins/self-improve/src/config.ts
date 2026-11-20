@@ -33,7 +33,6 @@ export const configSchema = z.object({
   /** Apply improvements that pass their test runs without waiting for the owner. Each can still be disabled. */
   autoApply: z.boolean().default(true),
   taskOutcomeSource: z.object({pluginId:z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,127}$/).refine(id=>id!=="self-improve","Task history must come from a separate producer"),method:z.string().regex(/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/)}).strict().optional(),
-  publicationRepositories: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/)).max(100).default([]),
   budgets: policySchema.default(() => policySchema.parse({})),
   ranking: rankingSchema.default(() => structuredClone(DEFAULT_RANKING_CONFIG)),
   redactedNames: z.array(z.string().min(1)).default([]),
@@ -46,6 +45,12 @@ export const configSchema = z.object({
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export const defaultConfig = () => configSchema.parse({});
-export function parseConfig(raw: string): Config { return configSchema.parse(JSON.parse(raw)); }
+/** Settings saved by earlier versions may still carry these keys; they no longer configure anything and are dropped. */
+const RETIRED_KEYS = ["publicationRepositories"] as const;
+export function parseConfig(raw: string): Config {
+  const value: unknown = JSON.parse(raw);
+  if (value && typeof value === "object" && !Array.isArray(value)) for (const key of RETIRED_KEYS) delete (value as Record<string, unknown>)[key];
+  return configSchema.parse(value);
+}
 export function parseCostPolicy(raw: unknown): CostPolicy { return policySchema.parse(raw); }
 export const defaultWeights = DEFAULT_RANKING_CONFIG;

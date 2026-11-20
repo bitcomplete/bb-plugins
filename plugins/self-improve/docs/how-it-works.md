@@ -12,7 +12,7 @@
 | Inventor | 02:15 | Proposes fixes from the problem alone. |
 | Solution ranker | 03:00 | Orders candidate fixes by expected benefit, effort and risk. |
 | Builder | 03:15 | Tests the top candidate on your development cases and applies it if it passes. |
-| Verifier | 04:00 | Measures how often a fixed problem shows up before and after. It does not yet cover fixes applied by the builder. |
+| Verifier | 04:00 | Has no work of its own; it stays registered so existing schedules and queued jobs settle. |
 
 Times use the BB server's local timezone. Each stage can also be run by hand with `bb self-improve run --stage <stage>`. Self improve's own threads are never treated as problems.
 

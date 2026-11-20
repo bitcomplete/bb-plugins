@@ -31,10 +31,8 @@ The `dairToken` and `evaluationSuite` settings are secret settings and are not r
 | Paper, web result, mined text or model completion | Data to inspect; it cannot grant permission or create trusted proof. |
 | Owner problem/goal form | Records owner intent. It does not create observed evidence. |
 | Native agent stage | A task-specific plugin prompt under the selected BB execution permissions. Ordinary BB/provider/workspace tools and context may remain. |
-| Editing chat | Native BB thread permissions plus this plugin's bounded read, edit and re-test tools. Other tools may remain available. |
+| Editing chat | Native BB thread permissions plus this plugin's bounded read and edit tools. Other tools may remain available. |
 | Applied improvements | Instruction text from fixes that passed their test runs, added to turns in the projects that receive improvements. You can disable each one or turn off automatic applying. |
-| Export draft | Produces inspectable text files. It does not install or publish. |
-| Create draft PR | Explicit owner review of the exact bundle fingerprint and an allowed repository/new directory. |
 
 The inventor receives a fresh, minimal problem prompt from this plugin. That is the scope of its zero-shot input, not a promise that the BB thread has no other instructions or tools. The ranker sees estimates and prior attempts. Neither can turn its own prediction into trusted evaluation evidence.
 
@@ -42,18 +40,8 @@ The dashboard inherits the selected chat thread's permissions. It does not prese
 
 ## Plugin permissions are not global tool isolation
 
-Self improve contributes no ledger tools to its autonomous workers. For an authorized ledger chat, it contributes `self_improve_read`, `self_improve_edit` and `self_improve_retest`. Those tools paginate reads, limit edits to permitted fields and notes, and preserve the evaluation gates for re-testing. They cannot write trusted receipts or replace active artifacts.
+Self improve contributes no ledger tools to its autonomous workers. For an authorized ledger chat, it contributes `self_improve_read` and `self_improve_edit`, plus the revalidation draft tools for a chat opened on a solution. Those tools paginate reads and limit edits to permitted fields and notes. They cannot change test results or applied improvements.
 
 These contribution rules control this plugin's tools. They do not remove tools supplied by BB, the provider, the workspace or another plugin. The current execution path uses BB threads and existing authentication; it has no private model gateway that filters all tool responses.
 
 Use a dedicated scratch worker environment and a permission mode you trust. Agent sessions run there with that environment's ordinary tools.
-
-## Export safely
-
-Export requires an active or proven solution, confirmed wiring execution, a matching trusted evaluation receipt and the exact validated artifact revision. File paths are bounded relative paths; content and metadata pass publication privacy checks. The bundle includes evidence and exact undo context.
-
-A **skill** carries project scope as instructions. That is guidance, not an access-control boundary. An exported **plugin** enforces explicit project selection and starts disabled. Review a draft before applying it elsewhere: a pass on one model, provider or project is not proof on another.
-
-The dashboard's download is a JSON bundle containing file paths and content. Preview text is escaped. **Create draft PR** is a separate, explicit action: select an allowed `owner/repo` destination, choose a new directory, and confirm that you reviewed the files, evidence and destination. The server verifies the exact bundle digest and active artifact revision before submitting a draft review PR. It never merges or installs the result.
-
-Export works for fixes recorded by the older proof path; fixes applied by the builder cannot be exported yet. A draft PR is a review submission, not a release or an installation.

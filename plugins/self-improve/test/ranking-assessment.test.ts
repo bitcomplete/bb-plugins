@@ -4,7 +4,6 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { Store, MIGRATIONS } from "../src/store.js";
 import { Runtime, type FocusedSolutionRanking, type SolutionAssessment } from "../src/runtime.js";
 import { defaultConfig } from "../src/config.js";
-import type { Accounting } from "../src/costs.js";
 import type { NativeExecution, NativeTaskRequest } from "../src/native-tasks.js";
 import type { StageContext } from "../src/services.js";
 import type { Problem, Solution } from "../src/domain/types.js";
@@ -39,7 +38,7 @@ async function setup() {
   const db = new Database(":memory:"); dbs.push(db); MIGRATIONS.forEach(sql => db.exec(sql)); const store = new Store(db);
   const config = { ...defaultConfig(), providerId:"codex",model: "ranking-model",projectId:"project",environmentId:"environment" }, privacy: PrivacyPolicy = { clientNames: ["PrivateClient"] };
   const runtime = new Runtime({ bb: { sdk: {} } as BbPluginApi, store, config: () => config, privacy: () => privacy,
-    runner:{execute:async()=>{throw new Error("ranking completion is mocked");}},execution:():NativeExecution=>({projectId:config.projectId,environment:{type:"reuse",environmentId:config.environmentId},providerId:config.providerId,model:config.model,permissionMode:"accept-edits"}),privacyGeneration:()=>"privacy-one", accounting: {} as Accounting,
+    runner:{execute:async()=>{throw new Error("ranking completion is mocked");}},execution:():NativeExecution=>({projectId:config.projectId,environment:{type:"reuse",environmentId:config.environmentId},providerId:config.providerId,model:config.model,permissionMode:"accept-edits"}),privacyGeneration:()=>"privacy-one", 
     workers: () => { throw new Error("ranking must not start workers"); }, build: async () => { throw new Error("ranking must not build"); } });
   const p = problem(); p.aliases = ["legacy-candidate", "legacy-history"];
   const candidate = solution(); candidate.problemIds = ["legacy-candidate"];

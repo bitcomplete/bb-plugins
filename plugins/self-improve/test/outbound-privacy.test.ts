@@ -4,11 +4,8 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { modelProblemContext, modelSolutionContext, type PrivacyPolicy } from "../src/adapters/privacy.js";
 import type { NativeExecution, NativeTaskReceipt, NativeTaskRequest } from "../src/native-tasks.js";
 import { defaultConfig } from "../src/config.js";
-import { Accounting } from "../src/costs.js";
 import type { Solution } from "../src/domain/types.js";
 import { createEvaluationModel, evaluateInstruction, type EvaluationOptions, type EvaluationSuite } from "../src/evaluation.js";
-import { createWordingGenerator, preregisterStudy, runWordingPair } from "../src/experiments.js";
-import { reviewRevisits } from "../src/revisit.js";
 import { Runtime } from "../src/runtime.js";
 import type { StageContext } from "../src/services.js";
 import { Store, MIGRATIONS } from "../src/store.js";
@@ -42,7 +39,6 @@ function retainedSolution(): Solution {
   s.attempts = [{ id: "private-attempt-id", atMs: NOW, directionKey: s.directionKey, prediction: structuredClone(s.prediction), outcome: "failed", reason: `${marker} still lost data`, evidenceIds: ["private-event-id"], model: { provider: "provider", model: "old" } }];
   return s;
 }
-function accounting(store: Store) { return new Accounting(store, () => defaultConfig().budgets); }
 
 describe("current-policy outbound privacy", () => {
   it("projects safe context without altering public citations, structure or retained history", () => {
@@ -60,7 +56,7 @@ describe("current-policy outbound privacy", () => {
     store.put("problems", p.id, p); store.put("solutions", s.id, s); store.put("solutions", removed.id, removed); store.put("votes", "v-one", vote());
     const { runner, requests } = transport(request=>request.stage==="inventor"?[]:{scores:solution().scores,reasons:solution().scoreReasons});
     const config = { ...defaultConfig(),providerId:execution.providerId, model: "model",projectId:"project",environmentId:"environment" };
-    const runtime = new Runtime({ bb: { sdk: {} } as BbPluginApi, store, config: () => config, privacy: () => privacy, runner,execution:()=>execution,privacyGeneration:()=>"generation", accounting: accounting(store), workers: () => ({ owns: () => false, analyze: async () => ({ failures: [] }) }), build: async () => ({}) });
+    const runtime = new Runtime({ bb: { sdk: {} } as BbPluginApi, store, config: () => config, privacy: () => privacy, runner,execution:()=>execution,privacyGeneration:()=>"generation", workers: () => ({ owns: () => false, analyze: async () => ({ failures: [] }) }), build: async () => ({}) });
     await runtime.handlers["problem-ranker"](context("problem-ranker"));
     const snapshotId = store.get<string>("snapshot", "latest")!;
     const snapshot = store.get("problem-snapshots", snapshotId);
@@ -93,26 +89,6 @@ describe("current-policy outbound privacy", () => {
     expect(requests).toEqual([]);
   });
 
-  it("redacts revisit context while preserving the instruction and the original validation identity", async () => {
-    const store = database(), s = retainedSolution(); s.status = "active"; s.validatedWith = { provider: "provider", model: "old" };
-    const artifact = { revision: "original-revision", content: "Preserve request data." };
-    store.put("solutions", s.id, s); store.put("problems", "p-a", problem("p-a", `${marker} loses data`)); store.put("validated-artifacts", s.id, artifact);
-    const { runner, requests } = transport({ decision: "retain", reason: "Retest the original instruction" });
-    await reviewRevisits({ ...nativeOptions(store,runner), accounting: accounting(store),privacy });
-    expect(requests).toHaveLength(1); expect(JSON.stringify(requests)).not.toContain(marker); expect(data(requests[0]!).instruction).toBe(artifact.content);
-    expect(store.get("validated-artifacts", s.id)).toEqual(artifact); expect(store.get<Solution>("solutions", s.id)?.validatedWith).toEqual(s.validatedWith);
-    expect(store.get<Solution>("solutions", s.id)?.attempts).toEqual(s.attempts);
-  });
-
-  it("rejects a newly disallowed revisit instruction before dispatch or review persistence", async () => {
-    const store = database(), s = solution(); s.status = "active"; s.validatedWith = { provider: "provider", model: "old" };
-    const artifact = { revision: "original-revision", content: `Preserve ${marker} data.` };
-    store.put("solutions", s.id, s); store.put("validated-artifacts", s.id, artifact);
-    const { runner, requests } = transport({ decision: "retain", reason: "Retest" });
-    await expect(reviewRevisits({ ...nativeOptions(store,runner), accounting: accounting(store),privacy })).rejects.toThrow(/disallowed/);
-    expect(requests).toEqual([]); expect(store.list("revisit-reviews")).toEqual([]); expect(store.get("validated-artifacts", s.id)).toEqual(artifact); expect(store.get("solutions", s.id)).toEqual(s);
-  });
-
   it("rejects disallowed fixture bytes before the native proposer dispatches",async()=>{
     const {runner,requests}=transport({instruction:"Preserve data."}),io=createEvaluationModel({...nativeOptions(database(),runner),attemptId:"fixture-policy",solutionId:"s-a",privacy:()=>privacy});
     const s=solution();
@@ -120,41 +96,4 @@ describe("current-policy outbound privacy", () => {
     expect(requests).toEqual([]);
   });
 
-  it("rechecks current instruction policy before replaying an existing exploratory artifact",async()=>{
-    const store=database(),s=solution();store.put("solutions",s.id,s);
-    const {runner,requests}=transport(request=>request.instructions.startsWith("Propose one")?{instruction:`Preserve ${marker} request data.`}:{output:"ok"});
-    const suite:EvaluationSuite={id:"suite",development:[{id:"dev",familyId:"family",input:"visible task",expected:"ok"}],heldOut:[]};
-    const options:EvaluationOptions={...nativeOptions(store,runner),attemptId:"first",solutionId:s.id,revision:"first",scopeProjectIds:["project"],suite,privacy:()=>({})};
-    const first=await evaluateInstruction(options),original=store.get("native-evaluation-artifacts",first.artifactId!)!;expect(first.status).toBe("completed");
-    requests.splice(0);
-    expect(await evaluateInstruction({...options,attemptId:"replay",revision:"replay",retestArtifactId:first.artifactId!,privacy:()=>privacy,privacyGeneration:"tightened",currentPrivacyGeneration:()=>"tightened"})).toMatchObject({status:"failed",artifactId:null,observationVerdict:"inconclusive"});
-    expect(requests).toEqual([]);expect(store.get("native-evaluation-artifacts",first.artifactId!)).toEqual(original);expect(store.list("trusted-evaluations")).toEqual([]);
-  });
-
-  it("revalidates failed wording evidence under the retry policy without changing the snapshot", async () => {
-    const store = database(), p = problem("p-a", `${marker} loses payloads`); store.put("problems", p.id, p); store.put("votes", "v-one", vote());
-    preregisterStudy(store, { id: "study", startsAtMs: NOW + DAY, endsAtMs: NOW + 4 * DAY, sampleSize: 1, seed: "seed" }, { kind: "owner", id: "owner" }, NOW);
-    let fail = true;
-    const { runner, requests } = transport(() => { if (fail) throw new Error("dummy generation failure"); return { abstract: "Retain immutable data", concrete: "Keep original retry payloads" }; });
-    const generate = (policy: PrivacyPolicy) => createWordingGenerator({...nativeOptions(store,runner),experimentId:"study",privacy:policy});
-    const research = vi.fn(async () => ({candidates:[],papers:[]}));
-    const options = { ...nativeOptions(store,runner), experimentId: "study", problemId: p.id, voteIds: ["v-one"], research, now: () => NOW + 2 * DAY };
-    await expect(runWordingPair({ ...options, generate: generate({}) })).rejects.toThrow("experiment-pair-failed");
-    expect(requests).toHaveLength(1); expect(data(requests[0]!).causes).toEqual([p.causes[0]!.text]);
-    expect(data(requests[0]!)).toEqual({ causes: p.causes.map(c => c.text), symptoms: p.symptoms.map(s => s.text), observations: [{ kind: "tool_error" }] });
-    const saved = store.list<{ evidence: unknown; evidenceDigest: string }>("experiment-pairs-private")[0]!;
-    const retry = vi.fn(generate(privacy)); fail = false;
-    await expect(runWordingPair({ ...options, generate: retry, privacy })).rejects.toThrow("experiment-execution-changed");
-    expect(retry).not.toHaveBeenCalled(); expect(requests).toHaveLength(1); expect(research).not.toHaveBeenCalled();
-    expect(store.list<{ evidence: unknown; evidenceDigest: string }>("experiment-pairs-private")[0]).toMatchObject({ evidence: saved.evidence, evidenceDigest: saved.evidenceDigest });
-    await runWordingPair({ ...options, generate: generate({}) });
-    expect(requests).toHaveLength(2); expect(requests[1]).toEqual(requests[0]); expect(research).toHaveBeenCalledTimes(2);
-  });
-
-  it("rejects newly forbidden wording on first send even when the generator is used directly", async () => {
-    const { runner, requests } = transport({ abstract: "General", concrete: "Specific" });
-    const evidence = { problemId: "private-problem-id", voteIds: ["private-vote-id"], causes: [`${marker} loses data`], symptoms: ["Missing payload"], observations: [] };
-    await expect(createWordingGenerator({...nativeOptions(database(),runner),experimentId:"study",privacy})(evidence)).rejects.toThrow(/disallowed/);
-    expect(requests).toEqual([]);
-  });
 });

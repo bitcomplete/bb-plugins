@@ -61,15 +61,6 @@ describe("BB-native exploratory instruction evaluation",()=>{
     expect(await evaluateInstruction({...c.options,signal:controller.signal})).toMatchObject({status:"cancelled",adoptionGate:{status:"blocked"}});
     expect(c.store.get("solutions","s-a")).toMatchObject({candidateState:"proposed",attempts:[{outcome:"execution-error",reason:"exploratory-evaluation-cancelled"}]});
   });
-  it("replays an unchanged artifact without proposing or overwriting historical evidence",async()=>{
-    const {options,store,execute}=setup(),content="Use the established instruction without changes.";
-    const historical={id:"historical",solutionId:"s-a",revision:"old-revision",kind:"instruction",content,artifactDigest:createHash("sha256").update(content).digest("hex"),createdAtMs:NOW-1,model:{provider:"old",model:"old"},builtWith:{provider:"old",model:"old"},scopeProjectIds:["project"],evaluationId:"old-proof",sourceArtifactId:null};
-    store.put("built-artifacts","historical",historical);store.put("trusted-evaluations","old-proof",{status:"passed",executionCount:6});
-    const result=await evaluateInstruction({...options,retestArtifactId:"historical"});expect(execute).toHaveBeenCalledTimes(2);
-    const artifact=store.get<ExploratoryArtifact>("native-evaluation-artifacts",result.artifactId!)!;
-    expect(artifact).toMatchObject({content,artifactDigest:historical.artifactDigest,sourceArtifactId:"historical",builtWith:historical.builtWith,evaluationId:null});
-    expect(store.get("built-artifacts","historical")).toEqual(historical);expect(store.get("trusted-evaluations","old-proof")).toEqual({status:"passed",executionCount:6});
-  });
   it("fences an interrupted turn and resumes the original task/run binding after recovery",async()=>{
     const {options,store,execute}=setup();let release!:(receipt:NativeTaskReceipt)=>void;
     execute.mockImplementationOnce(request=>new Promise(resolve=>{release=resolve;}));

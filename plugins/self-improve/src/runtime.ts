@@ -1,19 +1,15 @@
-import type { ActivityCostView } from "./activity-view.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Store } from "./store.js";
 import { stableId } from "./store.js";
-import type { Accounting } from "./costs.js";
-import { resolveSolutionHistory } from "./solution-history.js";
 import type { NativeExecution, NativeTaskRequest, TaskRunner } from "./native-tasks.js";
 import { Deferred, dayKey, type StageContext, type StageHandler } from "./services.js";
-import type { EvaluationWindow, ModelIdentity, Problem, ProblemRanking, RankedSolution, SessionSelection, Solution, Stage, Vote } from "./domain/types.js";
+import type { ModelIdentity, Problem, ProblemRanking, RankedSolution, SessionSelection, Solution, Stage, Vote } from "./domain/types.js";
 import { rankProblems } from "./domain/votes.js";
-import { rankSolutions, revisitSolutions } from "./domain/solutions.js";
+import { rankSolutions } from "./domain/solutions.js";
 import { mergeLedgers, resolveProblemId } from "./domain/problems.js";
-import { observationWindow, type SessionExposure } from "./domain/verification.js";
 import { selectSessions } from "./domain/selection.js";
 import { DAY_MS, stableId as domainId, stableJson, unique } from "./domain/shared.js";
 import { mineBatch, readLedgers, writeLedgers, type MiningInput } from "./stages/mining.js";
@@ -23,22 +19,18 @@ import { completeJson } from "./native-model.js";
 import { ArxivClient, type ResearchState } from "./adapters/research.js";
 import { assertLedgerText, modelProblemContext, modelSolutionContext, redact, type PrivacyPolicy } from "./adapters/privacy.js";
 import { listObjectives } from "./objectives.js";
-import { recordPerformance } from "./performance.js";
-import { nativeRevisitIdentity } from "./revisit.js";
-import type { ValidatedArtifact } from "./publication.js";
-import type { BuiltArtifact, EvaluationAttempt, NativeEvaluationAttempt } from "./evaluation.js";
+import type { NativeEvaluationAttempt } from "./evaluation.js";
 import type { Paper } from "./adapters/types.js";
 
 interface Snapshot { id: string; day: string; atMs: number; ranking: ProblemRanking; problems: Problem[]; focusProblemIds: string[] }
-export interface MinedSessionExposure extends SessionExposure {
+export interface MinedSessionExposure {
+  sessionId: string; atMs: number; originPluginId: string | null;
   day: string; taskId: string | null; complete: boolean; observedThroughSequence: number; minedThroughSequence: number;
   projectId: string | null; model: ModelIdentity | null; minedAtMs: number; policyVersion: "mined-session-day-v1";
 }
 export interface MiningCoverageWindow { id: string; fromMs: number; toMs: number; atMs: number; complete: boolean; policyVersion: "mined-session-day-v1"; reasons: string[] }
 interface SessionMetadata { sessionId: string; day: string; projectId: string | null; providerId: string | null; model: string | null; firstSequence: number; lastSequence: number; complete: boolean; reasons: string[] }
 interface ModelBinding { threadId: string; boundAtMs: number; projectId: string; model: ModelIdentity }
-interface WiringExecution extends ModelBinding { solutionId: string; revision: string; atMs: number; eventId: string }
-interface Baseline { solutionId: string; activatedAtMs: number; window: EvaluationWindow; model: ModelIdentity; scopeProjectIds: string[]; evidenceRefs: string[] }
 export interface FocusedSolutionRanking extends RankedSolution { focusPriority: number; qualityScore: number | null; selectionBasis: "owner-focus" | "observed-problem-priority" }
 export interface SolutionAssessment {
   id: string; solutionId: string; snapshotId: string; runId: string; atMs: number; model: ModelIdentity;
@@ -55,19 +47,6 @@ function canonicalProblemIds(problems: Problem[], ids: string[]): string[] {
 function needsAssessment(candidate: Solution): boolean {
   return candidate.status === null && candidate.candidateState !== "rejected" && candidate.candidateState !== "built" && Object.values(candidate.scores).some(v => v === null);
 }
-function covered(startMs: number, endMs: number, scans: MiningCoverageWindow[]): boolean {
-  let cursor = startMs;
-  for (const scan of scans.filter(s => s.complete && s.policyVersion === "mined-session-day-v1" && s.atMs >= s.toMs).sort((a,b) => a.fromMs-b.fromMs)) {
-    if (scan.toMs <= cursor || scan.fromMs > cursor) continue;
-    cursor = Math.max(cursor,scan.toMs); if (cursor >= endMs) return true;
-  }
-  return false;
-}
-function sessionDayWindow(startMs: number, endMs: number, sessions: MinedSessionExposure[], votes: Vote[], solution: Solution): EvaluationWindow {
-  const days = sessions.filter(s => s.complete && s.policyVersion === "mined-session-day-v1").map(s => ({ ...s, sessionId: `${s.sessionId}:${s.day}` }));
-  const observations = votes.map(v => v.evidence.kind === "thread" ? { ...v, evidence: { ...v.evidence, sessionId: `${v.evidence.sessionId}:${v.day}` } } : v);
-  return observationWindow(startMs,endMs,days,observations,solution.problemIds,solution.prediction.symptomIds);
-}
 export interface RuntimeWorkers {
   owns(id: string): boolean;
   analyze: (session: Parameters<MiningInput["analyze"]>[0], events: Parameters<MiningInput["analyze"]>[1], problems: Problem[], options: { signal: AbortSignal; runId: string }) => ReturnType<MiningInput["analyze"]>;
@@ -75,10 +54,10 @@ export interface RuntimeWorkers {
 export interface RuntimeOptions {
   bb: BbPluginApi; store: Store; config: () => Config; privacy: () => PrivacyPolicy;
   runner: TaskRunner; execution: () => NativeExecution; privacyGeneration: () => string;
-  accounting: Accounting; activityCosts?: (solutionId: string) => ActivityCostView; workers: () => RuntimeWorkers;
+  workers: () => RuntimeWorkers;
   dair?: () => PaperSearch | undefined;
   weeklyIssue?: () => Promise<Paper[]>;
-  build: (ctx: StageContext, candidate: Solution, retest: boolean) => Promise<Record<string, number>>;
+  build: (ctx: StageContext, candidate: Solution) => Promise<Record<string, number>>;
 }
 const jobSnapshotSchema=z.object({snapshotId:z.string().min(1),explicitSnapshotId:z.string().min(1).nullable(),stage:z.string().min(1)}).strict();
 const rankingBindingSchema=z.object({taskId:z.string().min(1),runId:z.string().min(1),inputFingerprint:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
@@ -110,7 +89,9 @@ export class Runtime {
     this.handlers = {
       miner: ctx => this.mine(ctx), "problem-ranker": ctx => this.rankProblems(ctx),
       scout: ctx => this.research(ctx, "scout"), inventor: ctx => this.research(ctx, "inventor"),
-      "solution-ranker": ctx => this.rankCandidates(ctx), builder: ctx => this.build(ctx), verifier: ctx => this.verify(ctx),
+      "solution-ranker": ctx => this.rankCandidates(ctx), builder: ctx => this.build(ctx),
+      // Kept registered so existing schedules and queued jobs settle; it has no work of its own.
+      verifier: async () => ({}),
     };
   }
   get store() { return this.options.store; }
@@ -367,87 +348,13 @@ export class Runtime {
   }
   private async build(ctx: StageContext): Promise<Record<string, number>> {
     this.configured();
-    const retest = typeof ctx.job.input.solutionId === "string";
     const ranking = this.store.get<RankedSolution[]>("solution-ranking", "latest") ?? [];
     // The original native attempt owns its candidate even when a newer ranking arrives.
-    const attempt = this.store.get<NativeEvaluationAttempt>("native-evaluation-attempts", domainId("native-build-attempt", ctx.job.id))
-      ?? this.store.get<EvaluationAttempt>("evaluation-attempts", ctx.job.id);
-    if (attempt && retest && attempt.solutionId !== ctx.job.input.solutionId) throw new Error("builder-job-candidate-changed");
-    const id = attempt?.solutionId ?? (retest ? String(ctx.job.input.solutionId) : ranking.find(r => { const solution = this.store.get<Solution>("solutions", r.solutionId); return r.eligible && solution?.status === null && solution.candidateState !== "built"; })?.solutionId);
+    const attempt = this.store.get<NativeEvaluationAttempt>("native-evaluation-attempts", domainId("native-build-attempt", ctx.job.id));
+    const id = attempt?.solutionId ?? ranking.find(r => { const solution = this.store.get<Solution>("solutions", r.solutionId); return r.eligible && solution?.status === null && solution.candidateState !== "built"; })?.solutionId;
     if (!id) return { candidates: 0 };
     const candidate = this.store.get<Solution>("solutions", id);
     if (!candidate) throw new Error("candidate-missing");
-    return this.options.build(ctx, candidate, retest);
-  }
-  private async verify(ctx: StageContext): Promise<Record<string, number>> {
-    const now = Date.now(), ledgers = readLedgers(this.store), sessions = this.store.list<MinedSessionExposure>("session-exposure");
-    let configuredModel:ModelIdentity|null=null,configuredExecution:NativeExecution|null=null;
-    try { configuredExecution=this.selectedExecution();configuredModel={provider:configuredExecution.providerId,model:configuredExecution.model}; } catch(error) { if(!(error instanceof Deferred))throw error; }
-    const scans = this.store.list<MiningCoverageWindow>("mining-coverage");
-    const allExecutions = this.store.list<WiringExecution>("wiring-executions");
-    const builtArtifacts = this.store.list<BuiltArtifact>("built-artifacts");
-    let measured = 0, pending = 0;
-    for (const solution of ledgers.solutions.filter(s => s.status === "active" || s.status === "proven" || s.status === "fixing")) {
-      const artifact = this.store.get<ValidatedArtifact>("validated-artifacts", solution.id);
-      if (!artifact || solution.wiring?.activatedAtMs === null || !solution.wiring || now <= solution.wiring.activatedAtMs) continue;
-      const anchor = this.store.get<{activatedAtMs:number;artifactDigest:string}>("baseline-anchors", solution.id);
-      const activation = anchor?.artifactDigest === artifact.artifactDigest ? anchor.activatedAtMs : artifact.activatedAtMs;
-      const beforeEnd = Math.floor(activation / DAY_MS) * DAY_MS, beforeStart = Math.max(0,beforeEnd-7*DAY_MS);
-      const completedDay = Math.floor(now/DAY_MS)*DAY_MS, treatmentStart = Math.ceil(activation/DAY_MS)*DAY_MS;
-      const afterEnd = completedDay > treatmentStart ? completedDay : now;
-      const afterStart = completedDay > treatmentStart ? Math.max(treatmentStart,afterEnd-7*DAY_MS) : activation;
-      if (beforeEnd <= beforeStart || afterEnd <= afterStart) continue;
-      const built = builtArtifacts.find(a => a.solutionId === solution.id && a.revision === artifact.revision && a.evaluationId === artifact.evaluationId);
-      const scopes = unique(built?.scopeProjectIds ?? []), gaps: string[] = [];
-      if (!scopes.length) gaps.push("immutable instruction project scope is unavailable");
-      const relevant = sessions.filter(s => s.originPluginId !== "self-improve" && (!s.projectId || scopes.includes(s.projectId)));
-      const beforeSessions = relevant.filter(s => s.atMs >= beforeStart && s.atMs < beforeEnd);
-      const afterSessions = relevant.filter(s => s.atMs >= afterStart && s.atMs < afterEnd);
-      const baselineId = domainId("baseline",[solution.id,activation]);
-      const fixed = this.store.get<Baseline>("verification-baselines",baselineId);
-      const beforeGaps: string[] = [], afterGaps: string[] = [];
-      const qualify = (items: MinedSessionExposure[], start: number, end: number, errors: string[]) => {
-        if (!covered(start,end,scans)) errors.push("complete source/mining coverage does not span the window");
-        if (items.some(s => s.policyVersion !== "mined-session-day-v1" || !s.complete || s.minedThroughSequence < s.observedThroughSequence)) errors.push("selected session mining is incomplete or unverified");
-        if (items.some(s => !s.taskId || !s.projectId)) errors.push("session task or project identity is unknown");
-        if (items.some(s => !s.model?.provider || !s.model.model)) errors.push("historical runtime provider/model is unknown");
-      };
-      if (!fixed) qualify(beforeSessions,beforeStart,beforeEnd,beforeGaps);
-      qualify(afterSessions,afterStart,afterEnd,afterGaps);
-      const beforeModels = unique(beforeSessions.filter(s => s.model).map(s => stableJson(s.model)));
-      const afterModels = unique(afterSessions.filter(s => s.model).map(s => stableJson(s.model)));
-      const baselineModel: ModelIdentity | null = fixed?.model ?? (beforeModels.length === 1 ? JSON.parse(beforeModels[0]!) as ModelIdentity : null);
-      if (!fixed && beforeModels.length !== 1) beforeGaps.push("baseline has no single observed runtime provider/model");
-      if (afterModels.length !== 1 || !baselineModel || afterModels[0] !== stableJson(baselineModel)) afterGaps.push("baseline and treatment runtime provider/model are incompatible");
-      if (fixed && stableJson(fixed.scopeProjectIds) !== stableJson(scopes)) gaps.push("project scope differs from the fixed baseline");
-      const revisions = new Set([artifact.revision,...builtArtifacts.filter(a => a.solutionId === solution.id && a.artifactDigest === artifact.artifactDigest).map(a => a.revision)]);
-      const executions = allExecutions.filter(e => e.solutionId === solution.id && revisions.has(e.revision));
-      if (afterSessions.some(s => !executions.some(e => e.threadId === s.sessionId && e.projectId === s.projectId && stableJson(e.model) === stableJson(s.model) && e.boundAtMs <= s.atMs && e.atMs >= s.atMs && e.atMs < Math.min(afterEnd,Date.parse(`${s.day}T00:00:00Z`)+DAY_MS)))) afterGaps.push("some treatment session-days lack completed instruction exposure");
-      const before = fixed?.window ?? sessionDayWindow(beforeStart,beforeEnd,beforeSessions,ledgers.votes,solution);
-      const after = sessionDayWindow(afterStart,afterEnd,afterSessions,ledgers.votes,solution);
-      const evidenceRefs = unique([`artifact:${artifact.revision}`,...scans.filter(s => s.complete && s.toMs > beforeStart && s.fromMs < afterEnd).map(s => `scan:${s.id}`),...beforeSessions.map(s => `session-day:${s.sessionId}:${s.day}`),...afterSessions.map(s => `session-day:${s.sessionId}:${s.day}`),...executions.map(e => `execution:${e.eventId}`)]);
-      if (!fixed && !beforeGaps.length && before.sessions >= 30 && baselineModel && scopes.length) this.store.put("verification-baselines",baselineId,{ solutionId: solution.id, activatedAtMs: activation, window: before, model: baselineModel, scopeProjectIds: scopes, evidenceRefs } satisfies Baseline,now);
-      gaps.push(...beforeGaps.map(g => `baseline: ${g}`),...afterGaps.map(g => `treatment: ${g}`));
-      const model = baselineModel ?? { provider: "unobserved", model: "unobserved" };
-      const confounders = ["Before/after observation is not randomized", "Denominator is fully mined selected session-days, capped at one session per task/day", "Held-out evaluation and production runtime environments can differ"];
-      const costs = this.options.accounting.forSolutionIds(resolveSolutionHistory(this.store,solution.id).solutionIds).totals;
-      const performance = recordPerformance(this.store, { measurementKey: this.runId(ctx), solutionId: solution.id, solutionRevision: artifact.revision, before, after, model,
-        costs: costs.map(c => ({ currency: c.currency, reportedMicros: c.reportedMicros, estimatedMicros: c.estimatedMicros, unknownAttempts: c.unknownAttempts+c.unknownExternalCosts })),
-        ...(this.options.activityCosts ? { activityCosts: this.options.activityCosts(solution.id) } : {}),
-        confounders, evidenceGaps: unique(gaps), evidenceRefs, observedAtMs: now,
-      });
-      this.store.put("verifications", solution.id, performance.verification);
-      if (performance.verification.verdict === "PENDING") pending++; else measured++;
-      // Held-out adoption and observational efficacy remain separate statuses.
-      if (performance.verification.verdict === "WORSE") this.store.put("solutions", solution.id, { ...solution, status: "fixing" });
-      else if (["SOLVED","REDUCED"].includes(performance.verification.verdict)) this.store.put("solutions", solution.id, { ...solution, status: "proven" });
-    }
-    if (configuredModel&&configuredExecution) for (const revisit of revisitSolutions(this.store.list<Solution>("solutions"), configuredModel)) {
-      const solution=this.store.get<Solution>("solutions",revisit.solutionId)!;
-      const artifact=this.store.get<ValidatedArtifact>("validated-artifacts",revisit.solutionId);
-      const reviewId=artifact?nativeRevisitIdentity(this.store,solution,artifact,configuredExecution,this.options.privacyGeneration(),this.options.privacy()).id:null;
-      if(!reviewId||!this.store.get("revisit-reviews",reviewId))this.store.put("revisit-queue",stableId("revisit",JSON.stringify(revisit)),{...revisit,atMs:now});
-    }
-    return { measured, pending };
+    return this.options.build(ctx, candidate);
   }
 }

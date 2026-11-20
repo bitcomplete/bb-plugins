@@ -19,13 +19,7 @@ Start with `bb self-improve doctor` and `bb self-improve status` in the intended
 | Paper credibility pending | Required source evidence is missing; unknown citation measures do not satisfy a gate. |
 | No eligible solution | Read assessment reasons, dependencies and prior attempts. |
 | A fix passed but isn't applied | **Apply tested improvements automatically** is off (approve it under Improvements), the fix was disabled, or the per-turn limit is full (it shows as waiting). |
-| **No performance observations** | No qualified measurement windows have been recorded. A successful test job is not longitudinal efficacy. |
-| **PENDING** / insufficient exposure | Inspect source coverage, runtime identity, instruction exposure and window duration. |
-| Re-test already queued | The same revision already has work in flight; earlier results remain available. |
-| Historical artifact requires revalidation | Prior direct-model proof does not establish native execution validity. New native contributions are withheld. |
-| Export refused | Inspect revision, evidence, eligibility and privacy. New exploratory results are not eligible verified artifacts. |
-| Draft PR creation fails | Inspect the explicitly authorized repository/directory and existing server `gh` access. A draft PR is a submission, not publication. |
-| No Promote/Revalidate wizard | The complete impact-screen workflows are still pending; the current basic retest/export actions are narrower. |
+| Solution marked **From an earlier version · not applied** | Its record comes from an earlier version of Self improve. It is kept for history and is not added to turns. |
 
 ## Recover without losing attribution
 
