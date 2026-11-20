@@ -215,6 +215,9 @@ describe("a steward's wake", () => {
     const wake = formatWake(wakeInput({ binding, routedToMe: [{ escalation: x, from: binding }] }));
     expect(wake).toMatch(/resolve, cites: \[lesson ids or guidance unit ids\]/u);
     expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids or guidance unit ids\]/u);
+    // BB-374: the line says the user cannot see it until it is forwarded, and
+    // that an owner-only decision is passed up, not left open.
+    expect(wake).toContain('Until you forward it, the user cannot see it and the child\'s "waiting on the owner" is not true yet. A decision only the owner can make is passed up rather than left open.');
   });
 
   it("names the reviewer's sha and the head when the approval is on an earlier commit", () => {

@@ -808,6 +808,22 @@ export type ReadyConfig = Omit<z.infer<typeof readySchema>, "approval"> & { appr
 export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
 
 /**
+ * BB-374: how long after a binding's turn ends with an escalation still routed
+ * to it before the plugin re-wakes it. On the order of the reconcile interval
+ * (`DEFAULT_TIMING.sweepMs`), not the two-day requeue, so a parent that neither
+ * decides nor forwards a child's escalation cannot sit on it for days. A
+ * plugin constant, never a `project.json` key.
+ */
+export const ESCALATION_REWAKE_MS = 30 * 60_000;
+
+/**
+ * BB-374: unanswered re-wakes for the same escalation, in a row, before the
+ * plugin raises `stuck` exactly as it does for missed reports. A plugin
+ * constant, never a `project.json` key.
+ */
+export const ESCALATION_REWAKE_STUCK_AFTER = 2;
+
+/**
  * One deployment rule's match: the merged pull request's repo, and optionally
  * the changed paths it must touch. A rule whose `when` matches the merge is
  * the one whose strategy decides whether a deployment carries it.
