@@ -5939,11 +5939,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b.escalationRewakeId !== null) {
         const routedNow = routedEscalations(escalationsCtx, b);
         if (routedNow.length === 0) {
+          // Push the pulled-forward requeue back when it is the escalation's
+          // own (or already due); an earlier deadline is left alone.
+          const escalationOwnRequeue = b.requeueAt !== null && (b.requeueAt <= now() || b.requeueAt === b.escalationRewakeAt);
           b = store.patch(b.id, {
             escalationRewakeCount: 0,
             escalationRewakeId: null,
             escalationRewakeAt: null,
-            ...(b.requeueAt !== null && b.requeueAt <= now() ? { requeueAt: now() + playbook.requeueDefaultMs } : {}),
+            ...(escalationOwnRequeue ? { requeueAt: now() + playbook.requeueDefaultMs } : {}),
           });
         } else {
           changes.push({ text: escalationRewakeLine(routedNow), actionable: false });

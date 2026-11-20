@@ -140,6 +140,25 @@ describe("BB-374: a binding that ends a turn with a routed escalation open is re
     expect(t.hooks.store.binding(parent.id)).toMatchObject({ escalationRewakeId: null, escalationRewakeCount: 0 });
   });
 
+  it("does not leave a pulled-forward requeue after a sweep clears the run", async () => {
+    const { t, parent, escalation } = await parentWithRoutedChild();
+    await t.tool("steward_report", report(), parent.threadId!);
+    await t.idle(parent.threadId!);
+    // Close it elsewhere, then let a reconcile (the sweep) land before the
+    // clock, while the pulled-forward requeue is still in the future.
+    t.hooks.store.resolve(escalation.id, "The binding ended.", "plugin", false);
+    t.advance(5 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.binding(parent.id)).toMatchObject({ escalationRewakeId: null, escalationRewakeCount: 0 });
+    // The 30m mark wakes nobody: the escalation's own requeue is gone.
+    const before = t.sends.filter((s) => s.threadId === parent.threadId).length;
+    t.advance(31 * 60_000);
+    await t.hooks.requeueTick();
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === parent.threadId).length).toBe(before);
+  });
+
   it("raises stuck after repeated unanswered re-wakes for the same escalation", async () => {
     const { t, parent, escalation } = await parentWithRoutedChild();
     for (let i = 0; i < 3; i++) {
