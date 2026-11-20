@@ -912,7 +912,20 @@ export const LOCAL_TICKET_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS local_comments_ticket ON local_comments (ticket_id, created_at)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS];
+// BB-374: the run of unanswered re-wakes for an escalation routed to a binding.
+// `escalation_rewake_id` is the sorted, comma-joined ids of the routed
+// escalations the run is counting, so a different escalation starts a fresh
+// run; `escalation_rewake_count` is how many re-wakes have gone unanswered in
+// that run; `escalation_rewake_at` is when the last re-wake was scheduled, so
+// the first turn end (which schedules the first one) does not itself count.
+// Append-only and defaulted: an old row reads as no run.
+export const ESCALATION_REWAKE_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN escalation_rewake_count INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE bindings ADD COLUMN escalation_rewake_id TEXT`,
+  `ALTER TABLE bindings ADD COLUMN escalation_rewake_at INTEGER`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1118,6 +1131,12 @@ export type Binding = {
   awaitingReport: boolean;
   wokeAt: number | null;
   missedReports: number;
+  /** BB-374: the sorted, comma-joined ids of the routed escalations the re-wake run is counting, or null. */
+  escalationRewakeId: string | null;
+  /** BB-374: unanswered re-wakes in the current run for `escalationRewakeId`. */
+  escalationRewakeCount: number;
+  /** BB-374: when the plugin last scheduled a re-wake for the run, or null before the first. */
+  escalationRewakeAt: number | null;
   /** The wake turn under way reported actor "other": archive the thread when it goes idle. */
   archiveWhenIdle: boolean;
   /** A wrap-up or stop turn is under way: "terminal" or "detach". */
@@ -1239,6 +1258,9 @@ function rowToBinding(r: BindingRow): Binding {
     awaitingReport: Number(r.awaiting_report) === 1,
     wokeAt: num("woke_at"),
     missedReports: Number(r.missed_reports ?? 0),
+    escalationRewakeId: str("escalation_rewake_id"),
+    escalationRewakeCount: Number(r.escalation_rewake_count ?? 0),
+    escalationRewakeAt: num("escalation_rewake_at"),
     archiveWhenIdle: Number(r.archive_when_idle ?? 0) === 1,
     ending: str("ending"),
     endingAt: num("ending_at"),
@@ -1319,6 +1341,9 @@ const COLUMNS = {
   awaitingReport: "awaiting_report",
   wokeAt: "woke_at",
   missedReports: "missed_reports",
+  escalationRewakeId: "escalation_rewake_id",
+  escalationRewakeCount: "escalation_rewake_count",
+  escalationRewakeAt: "escalation_rewake_at",
   archiveWhenIdle: "archive_when_idle",
   ending: "ending",
   endingAt: "ending_at",

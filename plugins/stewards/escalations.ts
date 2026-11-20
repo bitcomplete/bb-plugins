@@ -23,6 +23,20 @@ export function routedTo(ctx: EscalationsContext, b: Binding): Array<{ escalatio
   return ctx.store.children(b.id).flatMap((child) => ctx.store.openEscalations(child.id).filter((x) => x.route === "parent").map((escalation) => ({ escalation, from: child })));
 }
 
+/**
+ * Every open escalation `b` is the one to decide: its children's route-`parent`
+ * ones and its own workers' route-`steward` ones (BB-374). These are the
+ * escalations a `steward_report` may not call "waiting on the user", and the
+ * ones a turn that ends without deciding or forwarding is re-woken about. A
+ * child's `from` names it; a worker's own is null (it is the binding itself).
+ */
+export function routedEscalations(ctx: EscalationsContext, b: Binding): Array<{ escalation: Escalation; from: Binding | null }> {
+  return [
+    ...routedTo(ctx, b),
+    ...ctx.store.openEscalations(b.id).filter((x) => x.route === "steward").map((escalation) => ({ escalation, from: null })),
+  ];
+}
+
 /** Where an escalation goes next, above where it is. */
 export function nextRoute(ctx: EscalationsContext, b: Binding, from: EscalationRoute | null): EscalationRoute {
   if (from === null) {

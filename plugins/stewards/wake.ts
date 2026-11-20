@@ -683,7 +683,7 @@ export function formatWake(input: WakeInput): string {
     for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "user" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
-      out.push("  Decide it with steward_update { binding, guidance, resolve, cites: [lesson ids or guidance unit ids] }, or pass it up with steward_update { binding, forward, recommendation, cites: [lesson ids or guidance unit ids] }.");
+      out.push("  Decide it with steward_update { binding, guidance, resolve, cites: [lesson ids or guidance unit ids] }, or pass it up with steward_update { binding, forward, recommendation, cites: [lesson ids or guidance unit ids] }. Until you forward it, the user cannot see it and the child's \"waiting on the owner\" is not true yet. A decision only the owner can make is passed up rather than left open.");
     }
     out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
