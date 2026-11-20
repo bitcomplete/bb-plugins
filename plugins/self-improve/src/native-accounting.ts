@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { Accounting, type CostPolicy } from "./costs.js";
 import { stableJson } from "./domain/shared.js";
 import type { Store } from "./store.js";
 import type { NativeTaskHooks, NativeTaskIdentity, NativeTaskSettlement } from "./native-tasks.js";
@@ -24,7 +23,6 @@ function micros(amount:number):number {
   if(!Number.isFinite(amount)||amount<0)throw new Error("native-cost-amount-invalid");
   const value=Math.ceil(amount*1_000_000);if(!safe(value))throw new Error("native-cost-amount-invalid");return value;
 }
-const day = (at:number) => new Date(time.parse(at)).toISOString().slice(0,10);
 const same = (a:NativeTaskIdentity,b:NativeTaskIdentity) => stableJson(identitySchema.parse(a))===stableJson(identitySchema.parse(b));
 function identity(task:NativeTaskSettlement):NativeTaskIdentity {
   return {taskId:task.taskId,stage:task.stage,providerId:task.providerId,model:task.model,startedAtMs:task.startedAtMs,
@@ -34,9 +32,9 @@ const binding = (record:Record) => ({taskId:record.identity.taskId,threadId:reco
 const occupying = (record:Record):boolean => !record.settlement || record.settlement.cleanupPending || (record.settlement.dispatched && record.settlement.threadId===null);
 
 export interface NativeAccountingOptions {
-  store:Store; sdk:NativeUsageSdk; policy:()=>CostPolicy; maxConcurrent:()=>number; now?:()=>number;
-  usage?:NativeUsageLedger; legacy?:Accounting; collectionTimeoutMs?:number;
-  /** Additional shared-budget gate, synchronous inside the admission transaction. */
+  store:Store; sdk:NativeUsageSdk; maxConcurrent:()=>number; now?:()=>number;
+  usage?:NativeUsageLedger; collectionTimeoutMs?:number;
+  /** The shared budget gate (ActivityAccounting.nativeGuard), run synchronously inside the admission transaction. */
   admissionGuard?:(task:NativeTaskIdentity,atMs:number)=>void;
 }
 export interface NativeCostSession {
@@ -52,16 +50,16 @@ export interface NativeAccountingTask extends NativeTaskIdentity {
   /** Even when every session reports a cost, BB does not promise final billing coverage. */
   billingCompleteness:"unknown"|"not-dispatched";
 }
-interface BudgetEntry { at:number; currency:string; micros:number; unknown:boolean; scope:string; solutionId?:string }
 
-/** Admission controls and BB observations. Does not price tokens or enforce an in-flight dollar ceiling. */
+/**
+ * BB usage for Self improve's agent tasks: the source of truth for their tokens and reported costs.
+ * Admission here enforces the concurrency limit; budgets are checked once, by the shared admission guard.
+ */
 export class NativeAccounting implements NativeTaskHooks {
   readonly usage:NativeUsageLedger;
-  readonly legacy:Accounting;
   private readonly now:()=>number;
   constructor(readonly options:NativeAccountingOptions) {
     this.usage=options.usage??new NativeUsageLedger(options.store);
-    this.legacy=options.legacy??new Accounting(options.store,options.policy);
     this.now=options.now??Date.now;
     const timeout=options.collectionTimeoutMs??4000;
     if(!Number.isSafeInteger(timeout)||timeout<1||timeout>60000)throw new Error("native-accounting-timeout-invalid");
@@ -84,36 +82,9 @@ export class NativeAccounting implements NativeTaskHooks {
     this.options.store.transaction(()=>{
       const previous=this.read(task.taskId);
       if(previous){if(!same(previous.identity,supplied))throw new Error("native-accounting-identity-conflict");return;}
-      const p=this.options.policy(),limit=this.options.maxConcurrent();
+      const limit=this.options.maxConcurrent();
       if(!Number.isSafeInteger(limit)||limit<1||limit>1000)throw new Error("native-accounting-concurrency-invalid");
-      if(p.maxDailyCalls!==null&&(!Number.isSafeInteger(p.maxDailyCalls)||p.maxDailyCalls<1)||!/^([A-Z]{3})$/.test(p.currency))throw new Error("native-accounting-policy-invalid");
-      for(const value of [p.dailyMicros,p.monthlyMicros,...Object.values(p.scopeLimitsMicros??{})])if(value!==null&&!safe(value))throw new Error("native-accounting-policy-invalid");
-      // Native dispatch has no preflight monetary bound, including when an old API price is configured.
-      if(!p.allowUnknown)throw new Error("native-cost-unknown-not-authorized");
-      const records=this.records();
-      if(records.filter(occupying).length>=limit)throw new Error("native-concurrency-exhausted");
-      const legacy=this.legacy.summary(),today=day(now),month=today.slice(0,7);
-      const legacyAttempts=this.options.store.list<{at:number}>("cost-reservations");
-      if(p.maxDailyCalls!==null&&records.filter(r=>day(r.admittedAtMs)===today).length+legacyAttempts.filter(r=>day(r.at)===today).length>=p.maxDailyCalls)throw new Error("daily-call-budget-exhausted");
-      const tasks=records.map(record=>this.view(record));
-      const entries=this.budgetEntries(legacy,tasks);
-      const monthly=entries.filter(e=>day(e.at).startsWith(month)),daily=monthly.filter(e=>day(e.at)===today);
-      const scopes=[task.stage,...(task.solutionId?[`solution:${task.solutionId}`]:[])];
-      const scopeLimited=scopes.some(scope=>p.scopeLimitsMicros?.[scope]!==undefined);
-      const moneyLimited=p.dailyMicros!==null||p.monthlyMicros!==null||scopeLimited;
-      if(moneyLimited&&monthly.some(e=>e.currency!==p.currency&&(e.micros>0||e.unknown)))throw new Error("budget-currency-mismatch");
-      if(moneyLimited){
-        const sessions=new Map<string,NativeAccountingTask[]>();
-        for(const task of tasks)for(const session of task.usage?.sessions??[]){
-          const key=stableJson([task.providerId,session.providerSessionId]);sessions.set(key,[...(sessions.get(key)??[]),task]);
-        }
-        if([...sessions.values()].some(shared=>shared.length>1&&shared.some(task=>day(task.admittedAtMs).startsWith(month))))throw new Error("native-cost-attribution-ambiguous");
-      }
-      const total=(xs:BudgetEntry[])=>add(xs.filter(e=>e.currency===p.currency).map(e=>e.micros));
-      // At equality no further unbounded work is admitted. Zero disables admissions.
-      if(p.dailyMicros!==null&&total(daily)>=p.dailyMicros)throw new Error("daily-cost-budget-exhausted");
-      if(p.monthlyMicros!==null&&total(monthly)>=p.monthlyMicros)throw new Error("monthly-cost-budget-exhausted");
-      for(const scope of scopes){const value=p.scopeLimitsMicros?.[scope];if(value!==undefined&&total(daily.filter(e=>e.scope===scope||`solution:${e.solutionId}`===scope))>=value)throw new Error("scope-cost-budget-exhausted");}
+      if(this.records().filter(occupying).length>=limit)throw new Error("native-concurrency-exhausted");
       this.options.admissionGuard?.(supplied,now);
       this.write({identity:supplied,admittedAtMs:now,settlement:null,collectionIssue:null});
     });
@@ -207,35 +178,32 @@ export class NativeAccounting implements NativeTaskHooks {
     return {...record.identity,admittedAtMs:record.admittedAtMs,settlement:settled,occupyingSlot:occupying(record),durationMs:settled?settled.endedAtMs-record.identity.startedAtMs:null,
       usage,sessions,unknownReasons:[...new Set(unknownReasons)],collectionIssue:record.collectionIssue,billingCompleteness:settled&&!settled.dispatched?"not-dispatched":"unknown"};
   }
-  private budgetEntries(legacy:ReturnType<Accounting["summary"]>,tasks:NativeAccountingTask[]):BudgetEntry[] {
-    const entries:BudgetEntry[]=[...legacy.events.map(e=>({at:e.at,currency:e.currency,micros:e.amountMicros??("maxMicros" in e?e.maxMicros:0),unknown:e.amountMicros===null,scope:e.scope,solutionId:e.solutionId})),
-      ...legacy.pending.map(e=>({at:e.at,currency:e.currency,micros:e.maxMicros,unknown:true,scope:e.scope,solutionId:e.solutionId}))];
-    // A provider session unexpectedly reused by two fresh threads must not be summed twice.
-    const shared=new Map<string,BudgetEntry>();
-    for(const task of tasks)for(const session of task.sessions){
-      const key=stableJson([task.providerId,session.providerSessionId,session.currency]),old=shared.get(key);
-      const value={at:task.admittedAtMs,currency:session.currency,micros:session.observedFloorMicros,unknown:true,scope:task.stage,solutionId:task.solutionId};
-      if(!old)shared.set(key,value);
-      else shared.set(key,{...old,micros:Math.max(old.micros,value.micros),at:Math.min(old.at,value.at)});
-    }
-    return [...entries,...shared.values()];
-  }
-  summary() { return this.rollup(()=>true); }
-  forRun(runId:string) { id.parse(runId);return this.rollup(task=>task.runId===runId); }
-  forSolution(solutionId:string) { id.parse(solutionId);return this.rollup(task=>task.solutionId===solutionId); }
+  summary() { return this.report().summary(); }
+  forRun(runId:string) { return this.report().forRun(runId); }
+  forSolution(solutionId:string) { id.parse(solutionId);return this.rollup(task=>task.solutionId===solutionId,this.views()); }
   /** Exact-ID union: one rollup keeps shared cumulative sessions deduplicated. */
-  forSolutionIds(solutionIds:readonly string[]) {
-    if(!solutionIds.length)throw new Error("empty-solution-history");
-    for(const solutionId of solutionIds)id.parse(solutionId);
-    const selected=new Set(solutionIds);return this.rollup(task=>task.solutionId!==undefined&&selected.has(task.solutionId));
+  forSolutionIds(solutionIds:readonly string[]) { return this.report().forSolutionIds(solutionIds); }
+  /** Reads every task once; the returned views filter that one read. */
+  report() {
+    const all=this.views();
+    return {
+      summary:()=>this.rollup(()=>true,all),
+      forRun:(runId:string)=>{id.parse(runId);return this.rollup(task=>task.runId===runId,all);},
+      forSolutionIds:(solutionIds:readonly string[])=>{
+        if(!solutionIds.length)throw new Error("empty-solution-history");
+        for(const solutionId of solutionIds)id.parse(solutionId);
+        const selected=new Set(solutionIds);return this.rollup(task=>task.solutionId!==undefined&&selected.has(task.solutionId),all);
+      },
+    };
   }
-  private rollup(filter:(task:{runId?:string;solutionId?:string})=>boolean) {
-    const all=this.records().map(record=>this.view(record)),tasks=all.filter(filter);
-    const legacyAll=this.legacy.summary(),legacy={...legacyAll,events:legacyAll.events.filter(filter),pending:legacyAll.pending.filter(filter)};
+  private views():NativeAccountingTask[] { return this.records().map(record=>this.view(record)); }
+  private rollup(filter:(task:{runId?:string;solutionId?:string})=>boolean,all:readonly NativeAccountingTask[]) {
+    // Copies, so qualifying one filtered view never changes another view of the same read.
+    const tasks=all.filter(filter).map(task=>({...task,unknownReasons:[...task.unknownReasons]}));
     const ownership=new Map<string,Set<string>>();
     for(const task of all)for(const session of task.usage?.sessions??[]){const key=stableJson([task.providerId,session.providerSessionId]);const set=ownership.get(key)??new Set();set.add(task.taskId);ownership.set(key,set);}
     for(const task of tasks)if(task.usage?.sessions.some(s=>(ownership.get(stableJson([task.providerId,s.providerSessionId]))?.size??0)>1))task.unknownReasons.push("provider-session-shared-between-tasks");
-    const currencies=[...new Set([...legacy.events,...legacy.pending].map(e=>e.currency).concat(tasks.flatMap(t=>t.sessions.map(s=>s.currency))))].sort();
+    const currencies=[...new Set(tasks.flatMap(t=>t.sessions.map(s=>s.currency)))].sort();
     const totals=currencies.map(currency=>{
       const native=new Map<string,{latest:number;floor:number}>();
       let attributionAmbiguous=false,missingLatest=false;
@@ -245,10 +213,9 @@ export class NativeAccounting implements NativeTaskHooks {
         if(session.latestReportedMicros===null)missingLatest=true;
         native.set(key,{latest:Math.max(old?.latest??0,session.latestReportedMicros??0),floor:Math.max(old?.floor??0,session.observedFloorMicros)});
       }
-      return {currency,legacyReportedMicros:add(legacy.events.filter(e=>e.currency===currency&&e.basis==="reported").map(e=>e.amountMicros??0)),legacyEstimatedMicros:add(legacy.events.filter(e=>e.currency===currency&&e.basis==="estimated").map(e=>e.amountMicros??0)),legacyReservedMicros:add(legacy.pending.filter(e=>e.currency===currency).map(e=>e.maxMicros)),
-        nativeLatestReportedSessionMicros:attributionAmbiguous||missingLatest?null:add([...native.values()].map(v=>v.latest)),nativeObservedFloorMicros:add([...native.values()].map(v=>v.floor))};
+      return {currency,nativeLatestReportedSessionMicros:attributionAmbiguous||missingLatest?null:add([...native.values()].map(v=>v.latest)),nativeObservedFloorMicros:add([...native.values()].map(v=>v.floor))};
     });
-    return {tasks,totals,legacy:{events:legacy.events,pending:legacy.pending},nativeAdmissions:tasks.length,nativeOccupyingSlots:tasks.filter(t=>t.occupyingSlot).length,nativeUnknownBillingTasks:tasks.filter(t=>t.billingCompleteness==="unknown").length,
-      limitations:["Native costs are optional BB provider-session reports, not invoices or subscription charges. Native tokens are not priced using legacy API prices.","Observed cost floors retain the maximum reported snapshot per session; decreases, missing reports and session reuse do not establish a complete lifetime cost.","Native monetary thresholds stop future admissions using observed floors plus legacy amounts/reservations. They cannot cap work already dispatched or bound unreported retries.","Admissions and reports are attributed to the task's admission date in UTC. Shared sessions have ambiguous per-task attribution; filtered totals must not be added together.","Native and legacy amounts retain separate evidence labels. Missing reports, pending work and unknown currency are never displayed as free."]};
+    return {tasks,totals,nativeAdmissions:tasks.length,nativeOccupyingSlots:tasks.filter(t=>t.occupyingSlot).length,nativeUnknownBillingTasks:tasks.filter(t=>t.billingCompleteness==="unknown").length,
+      limitations:["Native costs are optional BB provider-session reports, not invoices or subscription charges. Native tokens are not priced using legacy API prices.","Observed cost floors retain the maximum reported snapshot per session; decreases, missing reports and session reuse do not establish a complete lifetime cost.","Monetary thresholds are checked once, by the shared admission gate, using observed floors plus owner-recorded charges and reservations. They cannot cap work already dispatched or bound unreported retries.","Admissions and reports are attributed to the task's admission date in UTC. Shared sessions have ambiguous per-task attribution; filtered totals must not be added together.","Native and legacy amounts retain separate evidence labels. Missing reports, pending work and unknown currency are never displayed as free."]};
   }
 }

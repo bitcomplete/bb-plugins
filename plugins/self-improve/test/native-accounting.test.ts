@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Accounting, type CostPolicy } from "../src/costs.js";
 import { NativeAccounting } from "../src/native-accounting.js";
+import { ActivityAccounting } from "../src/activity-accounting.js";
 import type { NativeTaskIdentity, NativeTaskSettlement } from "../src/native-tasks.js";
 import type { NativeUsageSdk } from "../src/native-usage.js";
 import { MIGRATIONS, Store } from "../src/store.js";
@@ -23,14 +24,18 @@ function fixture(extra:Partial<CostPolicy>={},concurrency=3){
   const list=vi.fn(async(input:{threadId:string;afterSeq?:string})=>(rows.get(input.threadId)??[]).filter(r=>r.seq>Number(input.afterSeq??-1)));
   const sdk={threads:{events:{list}}} as unknown as NativeUsageSdk;
   const legacy=new Accounting(store,()=>policy);
-  const options={store,sdk,policy:()=>policy,maxConcurrent:()=>concurrency,now:()=>now,legacy};
-  return {store,policy,legacy,rows,list,sdk,options,accounting:new NativeAccounting(options),clock:(value:number)=>{now=value;}};
+  // Budgets are checked by the shared guard, installed here as the server installs it.
+  let activity:ActivityAccounting;
+  const options={store,sdk,maxConcurrent:()=>concurrency,now:()=>now,admissionGuard:(task:NativeTaskIdentity,atMs:number)=>activity.nativeGuard(task,atMs)};
+  const accounting=new NativeAccounting(options);
+  activity=new ActivityAccounting({store,policy:()=>policy,legacy:()=>legacy,native:()=>accounting,chats:()=>[],now:()=>now});
+  return {store,policy,legacy,rows,list,sdk,options,accounting,clock:(value:number)=>{now=value;}};
 }
 
 describe("BB-native task admission and cost observations",()=>{
   it("requires explicit unknown-cost admission even if a legacy API price exists",async()=>{
     const {accounting,policy,store}=fixture({allowUnknown:false,prices:{"selected-model":{input:1,output:1,cacheRead:1,cacheWrite:1,version:"api"}}});
-    await expect(accounting.beforeStart(identity())).rejects.toThrow("native-cost-unknown-not-authorized");
+    await expect(accounting.beforeStart(identity())).rejects.toThrow("activity-cost-unknown-not-authorized");
     expect(store.list("native-accounting-tasks")).toEqual([]);
     policy.allowUnknown=true;await accounting.beforeStart(identity());
     expect(accounting.summary()).toMatchObject({nativeAdmissions:1,nativeOccupyingSlots:1,nativeUnknownBillingTasks:1,totals:[]});
@@ -73,7 +78,7 @@ describe("BB-native task admission and cost observations",()=>{
     rows.set("thread-task",[cost("thread-task",0,1),cost("thread-task",1,2)]);
     await accounting.beforeStart(task);await accounting.onSettled(settled(task));await accounting.onSettled(settled(task));
     const summary=accounting.summary();expect(summary.nativeAdmissions).toBe(1);
-    expect(summary.totals).toEqual([{currency:"USD",legacyReportedMicros:0,legacyEstimatedMicros:0,legacyReservedMicros:0,nativeLatestReportedSessionMicros:2_000_000,nativeObservedFloorMicros:2_000_000}]);
+    expect(summary.totals).toEqual([{currency:"USD",nativeLatestReportedSessionMicros:2_000_000,nativeObservedFloorMicros:2_000_000}]);
     expect(summary.nativeUnknownBillingTasks).toBe(1);expect(summary.tasks[0]!.usage!.historyCaughtUp).toBe(true);
     expect(summary.tasks[0]!.unknownReasons).toContain("final-billing-coverage-unavailable");
   });
@@ -102,7 +107,7 @@ describe("BB-native task admission and cost observations",()=>{
     await expect(accounting.beforeStart(identity())).rejects.toThrow("daily-cost-budget-exhausted");
     policy.dailyMicros=null;await accounting.beforeStart(identity());await accounting.onSettled(settled());
     await expect(accounting.beforeStart(identity("next"))).rejects.toThrow("daily-call-budget-exhausted");
-    expect(accounting.summary().legacy.events).toHaveLength(1);
+    expect(legacy.summary().events).toHaveLength(1);
   });
   it("respects daily/monthly and solution thresholds without inventing a reservation maximum",async()=>{
     const {accounting,rows,policy,clock}=fixture({scopeLimitsMicros:{"solution:solution":1_000_000}});
@@ -146,7 +151,7 @@ describe("BB-native task admission and cost observations",()=>{
     for(const taskId of ["a","b"]){const task=identity(taskId);rows.set(`thread-${taskId}`,[cost(`thread-${taskId}`,0,2)]);await accounting.beforeStart(task);await accounting.onSettled(settled(task));}
     const summary=accounting.summary();expect(summary.totals[0]!.nativeLatestReportedSessionMicros).toBeNull();expect(summary.totals[0]!.nativeObservedFloorMicros).toBe(2_000_000);
     expect(summary.tasks.every(t=>t.unknownReasons.includes("provider-session-shared-between-tasks"))).toBe(true);
-    policy.dailyMicros=10_000_000;await expect(accounting.beforeStart(identity("next"))).rejects.toThrow("native-cost-attribution-ambiguous");
+    policy.dailyMicros=10_000_000;await expect(accounting.beforeStart(identity("next"))).rejects.toThrow("activity-cost-attribution-ambiguous");
   });
   it("does not recollect or churn rows when terminal settlements replay after reload",async()=>{
     const {accounting,rows,list,store,options}=fixture();

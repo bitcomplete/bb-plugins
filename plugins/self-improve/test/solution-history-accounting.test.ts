@@ -22,7 +22,7 @@ function fixture() {
   const list = vi.fn(async (input: { threadId: string; afterSeq?: string }) => (rows.get(input.threadId) ?? []).filter(row => row.seq > Number(input.afterSeq ?? -1)));
   const sdk = { threads: { events: { list } } } as unknown as NativeUsageSdk;
   const legacy = new Accounting(store, () => policy);
-  const native = new NativeAccounting({ store, sdk, legacy, policy: () => policy, maxConcurrent: () => 100, now: () => NOW });
+  const native = new NativeAccounting({ store, sdk, maxConcurrent: () => 100, now: () => NOW });
   const options = { store, policy: () => policy, legacy: () => legacy, native: () => native, chats: () => chats, now: () => NOW };
   const activity = new ActivityAccounting(options);
   const family = (id = "canonical", aliases = ["alias-a", "alias-b"]) => store.put("solutions", id, { ...solution(id), aliases }, NOW);
@@ -68,7 +68,7 @@ describe("solution history accounting", () => {
     expect(canonical.legacy.events.map(event => event.solutionId).sort()).toEqual(["alias-a", "canonical", "canonical"]);
     expect(canonical.legacy.pending.map(event => event.solutionId)).toEqual(["alias-b"]);
     expect(canonical.legacy.totals).toMatchObject([{ reportedMicros: 30, estimatedMicros: 5, reservedMicros: 7 }]);
-    expect(canonical.native.totals).toMatchObject([{ legacyReportedMicros: 30, legacyEstimatedMicros: 5, legacyReservedMicros: 7, nativeObservedFloorMicros: 3_000_000 }]);
+    expect(canonical.native.totals).toMatchObject([{ nativeObservedFloorMicros: 3_000_000 }]);
     expect(canonical.totals).toMatchObject([{ sharedNativeAndChatObservedFloorMicros: 6_000_000 }]);
     expect(canonical.calls).toEqual({ legacyAdmissions: 2, nativeAdmissions: 2, initialChatAdmissions: 1, observedChatRequests: 1, observedChatRootTurns: 1, totalAdmissionsAndObservedRequests: 5 });
     expect(f.activity.forSolution("canonical").native.tasks.map(task => task.taskId)).toEqual(["native-canonical"]);

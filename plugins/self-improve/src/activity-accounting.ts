@@ -48,7 +48,7 @@ const limitations=[
   "Chat cost-floor increases use the UTC date of the observation. Native task floors use admission dates. Delayed reports, counter resets and reused sessions do not establish complete period billing.",
 ] as const;
 
-/** Install both guards; this is the shared boundary for native, legacy/Laya and manual chat work. */
+/** The one budget check for agent tasks, the Laya detector and editing chats, and the combined usage views. Install both guards. */
 export class ActivityAccounting {
   constructor(readonly options:ActivityAccountingOptions) {}
   private now():number {return checkTime((this.options.now??Date.now)());}
@@ -117,8 +117,9 @@ export class ActivityAccounting {
         completedRootTurns:new Set(chat.turns.filter(t=>t.completed).map(t=>t.turnId)).size,billingCompleteness:"unknown" as const,unknownReasons:[...new Set(unknownReasons)]};
     });
   }
-  private snapshot() {
-    const legacy=this.options.legacy().summary(),native=this.options.native().summary(),chats=this.chatViews(),initials=this.initials();
+  private reads() { return {legacy:this.options.legacy().report(),native:this.options.native().report()}; }
+  private snapshot(reads=this.reads()) {
+    const legacy=reads.legacy.summary(),native=reads.native.summary(),chats=this.chatViews(),initials=this.initials();
     const calls:Call[]=this.options.store.list<{id:string;at:number;scope:string;solutionId?:string;runId?:string}>("cost-reservations").map(r=>({id:`legacy:${r.id}`,owner:`legacy:${r.id}`,atMs:r.at,scope:r.scope,solutionId:r.solutionId,runId:r.runId}));
     for(const task of native.tasks)calls.push({id:`native:${task.taskId}`,owner:`native:${task.taskId}`,atMs:task.admittedAtMs,scope:task.stage,solutionId:task.solutionId,runId:task.runId});
     for(const initial of initials)calls.push({id:`chat-initial:${initial.chatId}`,owner:`chat:${initial.chatId}`,atMs:initial.atMs,scope:"chat",solutionId:initial.solutionId,runId:initial.runId});
@@ -147,7 +148,7 @@ export class ActivityAccounting {
     for(const sample of samples){const key=stableJson([sample.providerId,sample.sessionId,sample.currency]),prior=floors.get(key)??0;entries.push({...sample,micros:Math.max(0,sample.micros-prior)});floors.set(key,Math.max(prior,sample.micros));}
     const ambiguousOwners=new Set([...ownership.values()].filter(set=>set.size>1).flatMap(set=>[...set]));
     const unknownAt=[...native.tasks.filter(t=>t.billingCompleteness==="unknown").map(t=>t.admittedAtMs),...initials.map(i=>i.atMs),...chats.flatMap(c=>[c.createdAtMs,...c.requests.map(r=>r.atMs),...c.costObservations.map(r=>r.atMs)])];
-    return {legacy,native,chats,initials,calls,entries,samples,ambiguousOwners,unknownAt};
+    return {reads,legacy,native,chats,initials,calls,entries,samples,ambiguousOwners,unknownAt};
   }
   private check(input:{atMs:number;scope:string;solutionId?:string;currency:string;additionalMicros:number;unknown:boolean;additionalCalls:number}):void {
     const p=this.options.policy(),today=day(input.atMs),month=today.slice(0,7);
@@ -164,20 +165,27 @@ export class ActivityAccounting {
     if(p.monthlyMicros!==null&&exhausted(amount(monthly),p.monthlyMicros))throw new Error("monthly-cost-budget-exhausted");
     for(const scope of scopes){const limit=p.scopeLimitsMicros?.[scope];if(limit!==undefined&&exhausted(amount(daily.filter(e=>e.scope===scope||`solution:${e.solutionId}`===scope)),limit))throw new Error("scope-cost-budget-exhausted");}
   }
-  summary(){return this.rollup(()=>true);}
-  forRun(id:string){checkId(id);return this.rollup(item=>item.runId===id,{runId:id});}
+  summary(){return this.report().summary();}
+  forRun(id:string){return this.report().forRun(id);}
   /** Exact original identity, retained for immutable historical callers. */
-  forSolution(id:string){checkId(id);return this.rollup(item=>item.solutionId===id,{solutionIds:[id]});}
+  forSolution(id:string){checkId(id);return this.rollup(item=>item.solutionId===id,{solutionIds:[id]},this.snapshot());}
   /** Live owner view over canonical identity and aliases; never relabels stored execution facts. */
-  forSolutionHistory(id:string) {
-    return this.options.store.transaction(()=>{
-      const solutionHistory=resolveSolutionHistory(this.options.store,id),selected=new Set(solutionHistory.solutionIds);
-      return {...this.rollup(item=>item.solutionId!==undefined&&selected.has(item.solutionId),solutionHistory),solutionHistory};
-    });
+  forSolutionHistory(id:string){return this.report().forSolutionHistory(id);}
+  /** Reads usage, chats and owner-recorded charges once; the returned views filter that one read. */
+  report() {
+    const state=this.snapshot();
+    return {
+      summary:()=>this.rollup(()=>true,undefined,state),
+      forRun:(id:string)=>{checkId(id);return this.rollup(item=>item.runId===id,{runId:id},state);},
+      forSolutionHistory:(id:string)=>this.options.store.transaction(()=>{
+        const solutionHistory=resolveSolutionHistory(this.options.store,id),selected=new Set(solutionHistory.solutionIds);
+        return {...this.rollup(item=>item.solutionId!==undefined&&selected.has(item.solutionId),solutionHistory,state),solutionHistory};
+      }),
+    };
   }
-  private rollup(filter:Filter,selection?:{runId:string}|{solutionIds:readonly string[]}) {
-    const state=this.snapshot(),legacy=!selection?state.legacy:"runId" in selection?this.options.legacy().forRun(selection.runId):this.options.legacy().forSolutionIds(selection.solutionIds),
-      selectedNative=!selection?state.native:"runId" in selection?this.options.native().forRun(selection.runId):this.options.native().forSolutionIds(selection.solutionIds);
+  private rollup(filter:Filter,selection:{runId:string}|{solutionIds:readonly string[]}|undefined,state:ReturnType<ActivityAccounting["snapshot"]>) {
+    const legacy=!selection?state.legacy:"runId" in selection?state.reads.legacy.forRun(selection.runId):state.reads.legacy.forSolutionIds(selection.solutionIds),
+      selectedNative=!selection?state.native:"runId" in selection?state.reads.native.forRun(selection.runId):state.reads.native.forSolutionIds(selection.solutionIds);
     const native={...selectedNative,
       tasks:selectedNative.tasks.map(task=>({...task,unknownReasons:[...task.unknownReasons,...(state.ambiguousOwners.has(`native:${task.taskId}`)?["provider-session-shared-between-activities"]:[])]})),
       totals:selectedNative.totals.map(total=>({...total,nativeLatestReportedSessionMicros:selectedNative.tasks.some(task=>state.ambiguousOwners.has(`native:${task.taskId}`)&&task.sessions.some(session=>session.currency===total.currency))?null:total.nativeLatestReportedSessionMicros})),

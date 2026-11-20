@@ -71,8 +71,7 @@ export default async function plugin(bb: BbPluginApi): Promise<void> {
   let activity: ActivityAccounting;
   const accounting = new Accounting(store, () => config.budgets, admission => activity.legacyGuard(admission));
   accounting.recoverInterrupted();
-  const nativeAccounting = new NativeAccounting({ store, sdk: bb.sdk, legacy: accounting,
-    policy: () => config.budgets, maxConcurrent: () => config.concurrency,
+  const nativeAccounting = new NativeAccounting({ store, sdk: bb.sdk, maxConcurrent: () => config.concurrency,
     admissionGuard: (admission, atMs) => activity.nativeGuard(admission, atMs) });
   const nativeTasks = new NativeTaskRunner({ store, sdk: bb.sdk, currentPrivacyGeneration: () => privacyGeneration, hooks: nativeAccounting.hooks() });
   const chats = new NativeChatManager({ store, sdk: bb.sdk, execution, privacy,

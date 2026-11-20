@@ -5,7 +5,7 @@ Self improve records every agent session it starts: which stage started it (mini
 ## Where to look
 
 - **Recent agent work** on the dashboard lists each run, newest first, with its sessions, tokens and any reported cost.
-- **BB usage** under a solution or an impact observation totals the agent work attributed to it.
+- **BB usage** under a solution totals the agent work attributed to it.
 - A revalidation plan shows each of its runs and what it used.
 - `bb self-improve costs` prints the records; `activity-costs.json` in the plugin's data directory has the same activity data.
 
@@ -38,7 +38,7 @@ Agent work is allowed by default. If you want limits, set them under `budgets`:
 | `currency` | Currency for the amounts above, default `USD`. |
 | `prices` | Price inputs for older estimate records; they do not price subscription usage. |
 
-Limits stop new work from starting once the reported usage reaches them. A session already running finishes, and reports can lag, so a limit can be passed by the work in flight. Revalidation runs count as `builder` work for the solution being tested.
+Limits are checked in one place, before each agent session, editing-chat message or detector request starts, against everything together: BB-reported usage, recorded charges and reservations. They stop new work from starting once the reported usage reaches them. A session already running finishes, and reports can lag, so a limit can be passed by the work in flight. Revalidation runs count as `builder` work for the solution being tested.
 
 ## Research and infrastructure
 

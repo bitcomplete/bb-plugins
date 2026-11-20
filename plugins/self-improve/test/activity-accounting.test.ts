@@ -23,7 +23,7 @@ function fixture(extra:Partial<CostPolicy>={}){
   const sdk={threads:{events:{list:async(input:{threadId:string;afterSeq?:string})=>(rows.get(input.threadId)??[]).filter(row=>row.seq>Number(input.afterSeq??-1))}}} as unknown as NativeUsageSdk;
   let activity:ActivityAccounting;
   const legacy=new Accounting(store,()=>policy,input=>activity.legacyGuard(input));
-  const native=new NativeAccounting({store,sdk,legacy,policy:()=>policy,maxConcurrent:()=>100,now:()=>now,admissionGuard:(identity,at)=>activity.nativeGuard(identity,at)});
+  const native=new NativeAccounting({store,sdk,maxConcurrent:()=>100,now:()=>now,admissionGuard:(identity,at)=>activity.nativeGuard(identity,at)});
   const options={store,policy:()=>policy,legacy:()=>legacy,native:()=>native,chats:()=>chats,now:()=>now};
   activity=new ActivityAccounting(options);
   const addChat=(chatId="chat",reports:ReturnType<typeof report>[]=[],extra:Partial<ActivityChatConversation>={})=>{

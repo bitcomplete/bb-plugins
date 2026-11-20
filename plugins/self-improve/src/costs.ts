@@ -27,7 +27,6 @@ export interface ExternalCostEvent {
   reportedCreditsMicros: number; externalRecordId: string;
 }
 interface EffectiveExternal { record: ExternalCostRecord; root: ExternalCostRecord; amountMicros: number | null; creditsMicros: number }
-interface BudgetEntry { at: number; currency: string; amountMicros: number; unknownUnbounded: boolean; scope: string; solutionId?: string }
 const valid = (n: number) => Number.isSafeInteger(n) && n >= 0;
 function bounded(value: string, name: string, limit = 200): void {
   if (typeof value !== "string" || !value.trim() || value.length > limit || /[\x00-\x1f\x7f]/.test(value)) throw new Error(`invalid-${name}`);
@@ -48,6 +47,10 @@ function effectiveExternal(records: ExternalCostRecord[]): EffectiveExternal[] {
     return {record,root,creditsMicros,amountMicros:record.amountMicros===null?null:record.amountMicros-creditsMicros};
   });
 }
+/**
+ * Owner-recorded charges (`bb self-improve costs --record`) and reservations for metered infrastructure
+ * such as the Laya detector. Agent tasks and chats are measured from BB usage (NativeAccounting).
+ */
 export class Accounting {
   constructor(readonly store: Store, readonly policy: () => CostPolicy, readonly admissionGuard?: AccountingAdmissionGuard) {}
   /** Called once after a process restart, before any new calls. Retain reserved headroom for unknown bills. */
@@ -66,25 +69,8 @@ export class Accounting {
     if (!valid(maxMicros)) throw new Error("cost-bound-overflow");
     this.store.transaction(() => {
       if (this.store.get("cost-reservations", request.id)) throw new Error("duplicate-attempt-id");
+      // Budgets across owner-recorded charges, agent tasks and editing chats are checked once, by the shared guard.
       this.admissionGuard?.({ request, atMs: now, currency: p.currency, maxMicros, unknown: !price });
-      const day = new Date(now).toISOString().slice(0,10), month = day.slice(0,7);
-      const entries = this.store.list<CostEvent>("cost-reservations");
-      const today = entries.filter(e => new Date(e.at).toISOString().startsWith(day));
-      if (p.maxDailyCalls !== null && today.length >= p.maxDailyCalls) throw new Error("daily-call-budget-exhausted");
-      const external=effectiveExternal(this.store.list<ExternalCostRecord>("external-costs"));
-      const linked=new Map(external.filter(e=>e.record.attemptId).map(e=>[e.record.attemptId!,e]));
-      const budget: BudgetEntry[]=entries.map(e=>({at:e.at,currency:e.currency,scope:e.scope,solutionId:e.solutionId,amountMicros:linked.get(e.id)?.amountMicros??e.amountMicros??e.maxMicros,unknownUnbounded:!linked.has(e.id)&&e.amountMicros===null&&e.maxMicros===0&&e.price===null}));
-      for(const e of external.filter(e=>!e.record.attemptId))budget.push({at:e.root.occurredAtMs,currency:e.record.currency,scope:e.record.scope,solutionId:e.record.solutionId,amountMicros:e.amountMicros??0,unknownUnbounded:e.amountMicros===null});
-      const monthly=budget.filter(e=>new Date(e.at).toISOString().startsWith(month)), daily=monthly.filter(e=>new Date(e.at).toISOString().startsWith(day));
-      if(!p.allowUnknown&&monthly.some(e=>e.currency===p.currency&&e.unknownUnbounded))throw new Error("unknown-external-cost: report or explicitly allow unknown costs");
-      if((p.dailyMicros!==null||p.monthlyMicros!==null)&&monthly.some(e=>e.currency!==p.currency&&(e.amountMicros>0||e.unknownUnbounded)))throw new Error("budget-currency-mismatch: reconcile external charges in the configured budget currency without invented exchange rates");
-      const total=(xs:BudgetEntry[])=>sum(xs.filter(e=>e.currency===p.currency).map(e=>e.amountMicros));
-      if (p.dailyMicros !== null && sum([total(daily),maxMicros]) > p.dailyMicros) throw new Error("daily-cost-budget-exhausted");
-      if (p.monthlyMicros !== null && sum([total(monthly),maxMicros]) > p.monthlyMicros) throw new Error("monthly-cost-budget-exhausted");
-      for (const scope of [request.scope, request.solutionId && `solution:${request.solutionId}`].filter((v): v is string => !!v)) {
-        const limit = p.scopeLimitsMicros?.[scope];
-        if (limit !== undefined && sum([total(daily.filter(e => e.scope === scope || `solution:${e.solutionId}` === scope)),maxMicros]) > limit) throw new Error("scope-cost-budget-exhausted");
-      }
       this.store.put("cost-reservations", request.id, { ...request, at: now, currency: p.currency, price: price ?? null, maxMicros, amountMicros: null, status: "reserved" });
     });
   }
@@ -161,24 +147,37 @@ export class Accounting {
       return record;
     });
   }
-  forRun(id:string) { bounded(id,"run-id");return this.rollup(e=>e.runId===id); }
-  forSolution(id:string) { bounded(id,"solution-id");return this.rollup(e=>e.solutionId===id); }
+  forRun(id:string) { bounded(id,"run-id");return this.rollup(e=>e.runId===id,this.read()); }
+  forSolution(id:string) { bounded(id,"solution-id");return this.rollup(e=>e.solutionId===id,this.read()); }
   /** Exact-ID union for a caller-resolved solution family. Retains every original attribution. */
   forSolutionIds(ids:readonly string[]) {
     if(!ids.length)throw new Error("empty-solution-history");
     for(const id of ids)bounded(id,"solution-id");
-    const selected=new Set(ids);return this.rollup(e=>e.solutionId!==undefined&&selected.has(e.solutionId));
+    const selected=new Set(ids);return this.rollup(e=>e.solutionId!==undefined&&selected.has(e.solutionId),this.read());
   }
-  summary() { return this.rollup(()=>true); }
-  private rollup(filter:(record:{runId?:string;solutionId?:string})=>boolean) {
-    const externalRecords=this.store.list<ExternalCostRecord>("external-costs"),effective=effectiveExternal(externalRecords);
+  summary() { return this.rollup(()=>true,this.read()); }
+  /** Reads the records once; the returned views filter that one read. */
+  report() {
+    const records=this.read();
+    return { summary:()=>this.rollup(()=>true,records), forRun:(id:string)=>{bounded(id,"run-id");return this.rollup(e=>e.runId===id,records);},
+      forSolutionIds:(ids:readonly string[])=>{
+        if(!ids.length)throw new Error("empty-solution-history");
+        for(const id of ids)bounded(id,"solution-id");
+        const selected=new Set(ids);return this.rollup(e=>e.solutionId!==undefined&&selected.has(e.solutionId),records);
+      } };
+  }
+  private read() {
+    return { external:this.store.list<ExternalCostRecord>("external-costs"), costs:this.store.list<CostEvent>("costs"), reservations:this.store.list<CostEvent>("cost-reservations") };
+  }
+  private rollup(filter:(record:{runId?:string;solutionId?:string})=>boolean,records:ReturnType<Accounting["read"]>) {
+    const externalRecords=records.external,effective=effectiveExternal(externalRecords);
     const linked=new Map(effective.filter(e=>e.record.attemptId).map(e=>[e.record.attemptId!,e]));
-    const modelEvents=this.store.list<CostEvent>("costs").filter(filter).map(e=>{
+    const modelEvents=records.costs.filter(filter).map(e=>{
       const actual=linked.get(e.id);return actual?{...e,basis:"reported" as const,amountMicros:actual.amountMicros,externalRecordId:actual.record.id,reportedCreditsMicros:actual.creditsMicros}:{...e,reportedCreditsMicros:0};
     });
     const externalEvents:ExternalCostEvent[]=effective.filter(e=>!e.record.attemptId&&filter(e.record)).map(e=>({id:e.record.id,at:e.root.occurredAtMs,endedAt:e.record.recordedAtMs,currency:e.record.currency,basis:e.record.basis,amountMicros:e.amountMicros,scope:e.record.scope,source:e.record.source,reference:e.record.reference,status:"recorded",...(e.record.runId?{runId:e.record.runId}:{}),...(e.record.solutionId?{solutionId:e.record.solutionId}:{}),reportedCreditsMicros:e.creditsMicros,externalRecordId:e.record.id}));
     const events=[...modelEvents,...externalEvents].sort((a,b)=>a.at-b.at||a.id.localeCompare(b.id));
-    const pending=this.store.list<CostEvent>("cost-reservations").filter(e=>e.status==="reserved"&&filter(e));
+    const pending=records.reservations.filter(e=>e.status==="reserved"&&filter(e));
     const currencies = [...new Set([...events,...pending].map(e => e.currency))].sort();
     return {
       totals: currencies.map(currency => {
