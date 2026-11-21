@@ -7703,45 +7703,56 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (p.pull === null || p.pull.merged === true || lc(p.state) === "closed" || lc(p.state) === "merged") continue;
           const key = lc(p.key);
           if (seen.has(key)) continue;
-          // A pull request already moved away from this binding is not this
-          // binding's orphan any more.
+          seen.add(key);
+          // BB-386: a handled pull request is not looked at again. The mark is
+          // the primary record; the handoff row and a filed (or resolved) need
+          // cover rows that predate the mark table.
+          if (store.pullRehomeMarked(p.key, b.id)) continue;
           const handoff = store.pullHandoff(p.key);
           if (handoff !== null && handoff.toBindingId !== b.id) {
-            seen.add(key);
+            store.markPullRehome(p.key, b.id);
             continue;
           }
           const what = `${p.key} has no steward: adopt it under a ticket, or close it`;
-          // A need already filed, or one the owner has resolved, is the record;
-          // do not re-file or re-wake on every sweep.
           if (store.needs(b.id, true).some((n) => n.kind === "decide" && n.url === (p.url ?? "") && n.what === what)) {
-            seen.add(key);
+            store.markPullRehome(p.key, b.id);
+            continue;
+          }
+          // The author and the own set do not change, so a teammate's pull
+          // request is refused from the stored snapshot, before any read.
+          ownPulls ??= await ownPullKeys(b, store.workers(b.id), observed);
+          if (!serverOpenedPull(p, ownPulls, login)) {
+            store.markPullRehome(p.key, b.id);
             continue;
           }
           // Re-read fresh: a merge or close after the binding ended would
-          // otherwise read as open in the frozen snapshot.
+          // otherwise read as open in the frozen snapshot. A merged or closed
+          // result is handled and marked, so it is not fetched again.
           const fresh = await snapshot("github", p.key).catch(() => null);
-          if (fresh === null || fresh.pull === null || fresh.pull.merged === true || lc(fresh.state) === "closed" || lc(fresh.state) === "merged") continue;
-          ownPulls ??= await ownPullKeys(b, store.workers(b.id), observed);
-          if (!serverOpenedPull(fresh, ownPulls, login)) continue;
-          seen.add(key);
+          if (fresh === null || fresh.pull === null || fresh.pull.merged === true || lc(fresh.state) === "closed" || lc(fresh.state) === "merged") {
+            store.markPullRehome(p.key, b.id);
+            continue;
+          }
           const target = pullFixesKeys(fresh)
             .map((k) => store.find(k, projectId))
             .find((t): t is Binding => t !== null && t.endedAt === null && t.id !== b.id) ?? null;
           if (target !== null) {
             store.handOffPull(p.key, target.id, b.id);
             scheduleReconcile(target.id);
+            store.markPullRehome(p.key, b.id);
             bb.log.info(`stewards: re-homed ${p.key} from ended ${b.entityKey} to ${target.entityKey}`);
             continue;
           }
           store.fileNeed({
             bindingId: b.id,
             kind: "decide",
-            url: fresh.url ?? "",
+            url: p.url ?? "",
             what,
             how: `The binding that opened it (${b.entityKey}) ended while it was still open.`,
             why: "Re-homing found no open binding whose ticket this pull request fixes or closes.",
             filedBy: "plugin",
           });
+          store.markPullRehome(p.key, b.id);
           await wakeProject(projectId, `${p.key} has no steward`, { digestDue: false, notes: [what] });
         }
       }

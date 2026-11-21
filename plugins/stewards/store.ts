@@ -941,7 +941,20 @@ export const HANDOFF_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS pull_handoffs_to ON pull_handoffs (to_binding_id)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS];
+// BB-386: an ended binding's pull request that re-homing has already looked at
+// (re-homed, named in a need, or found merged/closed, or a teammate's). One row
+// per (pull key, binding), so a later sweep does not re-read it; the same pull
+// request under a different ended binding is still considered.
+export const REHOME_MARK_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS pull_rehome_marks (
+     pull_key TEXT NOT NULL,
+     binding_id TEXT NOT NULL,
+     at INTEGER NOT NULL,
+     PRIMARY KEY (pull_key, binding_id)
+   )`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -2971,6 +2984,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // query each time.
   let handoffToList: Map<string, PullHandoff[]> | null = null;
 
+  // BB-386: the re-homing marks. Absent on a legacy store, like the handoffs.
+  const hasRehomeMarks = db.prepare("SELECT 1 AS one FROM sqlite_master WHERE type = 'table' AND name = 'pull_rehome_marks'").get() !== undefined;
+  const rehomeMarkStmts = hasRehomeMarks
+    ? {
+        has: db.prepare<[string, string], { n: number }>("SELECT COUNT(*) AS n FROM pull_rehome_marks WHERE pull_key = ? AND binding_id = ?"),
+        mark: db.prepare("INSERT INTO pull_rehome_marks (pull_key, binding_id, at) VALUES (?, ?, ?) ON CONFLICT(pull_key, binding_id) DO NOTHING"),
+      }
+    : null;
+
   // BB-358: the learned Slack mappings and the DM log. The mapping is keyed by
   // the GitHub login or Linear user id; the value is a Slack user id or the
   // `not_on_slack` flag. No email is written. The DM log is the per-person,
@@ -3025,6 +3047,17 @@ export function createStore(db: Database.Database, now: () => number, options: S
         }
       }
       return handoffToList.get(bindingId) ?? [];
+    },
+
+    /** BB-386: whether re-homing already handled this pull request for this binding. */
+    pullRehomeMarked(pullKey: string, bindingId: string): boolean {
+      if (rehomeMarkStmts === null) return false;
+      return (rehomeMarkStmts.has.get(pullKey.toLowerCase(), bindingId)?.n ?? 0) > 0;
+    },
+    /** BB-386: record that re-homing handled this pull request for this binding. */
+    markPullRehome(pullKey: string, bindingId: string): void {
+      if (rehomeMarkStmts === null) return;
+      rehomeMarkStmts.mark.run(pullKey.toLowerCase(), bindingId, now());
     },
 
     /** Run a synchronous handler as one operation, publishing at most one signal per project (BB-90). */

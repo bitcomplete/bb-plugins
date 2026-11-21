@@ -2640,6 +2640,44 @@ describe("a binding never ends with open work (BB-386)", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(false);
   });
 
+  it("does not re-read a teammate's or a closed orphan pull request on a later sweep", async () => {
+    const snapshots = (t: Awaited<ReturnType<typeof setup>>, id: string) => t.rpcCalls.filter((c) => c.method === "sourceSnapshot" && c.pluginId === SOURCE_PLUGIN_IDS.github && (c.input as { id?: string }).id === id).length;
+    // A teammate's pull request that names the ticket is never fetched by
+    // re-homing, so two sweeps cost the same reads.
+    const teammate = await setup();
+    teammate.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    teammate.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)", author: "sam" }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await teammate.ring("linear", "uuid-12");
+    // Unconfigure the ticket and pause stewards, so adoption leaves the ended
+    // binding alone and only re-homing could read the pull request.
+    teammate.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", labels: [], linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    await (teammate.hooks.settings as unknown as { experimental_set(v: Record<string, unknown>): Promise<unknown> }).experimental_set({ paused: true });
+    teammate.hooks.store.patch(teammate.hooks.store.find("ENG-12")!.id, { endedAt: teammate.now(), endReason: "terminal" });
+    await teammate.hooks.sweep();
+    await teammate.flush();
+    const teammateReads = snapshots(teammate, "acme/web#7");
+    await teammate.hooks.sweep();
+    await teammate.flush();
+    expect(snapshots(teammate, "acme/web#7")).toBe(teammateReads);
+
+    // A server-opened pull request that has since closed is read once and then
+    // recorded as handled.
+    const closed = await setup();
+    closed.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    closed.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane" }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await closed.ring("linear", "uuid-12");
+    closed.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", labels: [], linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    await (closed.hooks.settings as unknown as { experimental_set(v: Record<string, unknown>): Promise<unknown> }).experimental_set({ paused: true });
+    closed.hooks.store.patch(closed.hooks.store.find("ENG-12")!.id, { endedAt: closed.now(), endReason: "terminal" });
+    closed.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane", state: "closed" }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await closed.hooks.sweep();
+    await closed.flush();
+    const closedReads = snapshots(closed, "acme/web#7");
+    await closed.hooks.sweep();
+    await closed.flush();
+    expect(snapshots(closed, "acme/web#7")).toBe(closedReads);
+  });
+
   it("keeps follow-through on through a wrap-up report that does not settle the open pull request, and names the orphan on the overdue path", async () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
