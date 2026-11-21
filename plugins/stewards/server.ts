@@ -37,6 +37,7 @@ import {
   PROJECT_FILE,
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
+  backlogPlaybookName,
   durationSchema,
   ESCALATION_REWAKE_MS,
   ESCALATION_REWAKE_STUCK_AFTER,
@@ -128,6 +129,7 @@ import {
   sourceContract,
   stewardsContract,
   workflowRunSchema,
+  type BacklogIssue,
   type DependabotAlert,
   type DependabotSeverity,
   type Deployment,
@@ -138,7 +140,7 @@ import {
   type WorkflowRun,
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
-import { backlogTriageParamsSchema, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
+import { backlogTriageParamsSchema, BACKLOG_COMMENT_WINDOW_MS, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
 import { TICKET_TOOL_NAMES, createTicketWatches, formatTicket, registerTicketTools, ticketUnits } from "./ticket-tools.js";
 import { createLocalSource, isLocalState, LOCAL_PARKED, LOCAL_STATES, localStateType, type LocalSource, type LocalTicket } from "./local-source.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
@@ -158,7 +160,7 @@ import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, LOCAL_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -1321,6 +1323,8 @@ type ProjectConfig = {
   depsAlerts: Playbook | null;
   /** The Dependabot pull request playbook, when it parses. */
   depsPrs: Playbook | null;
+  /** The backlog watch's playbook (BB-378), when it parses; null falls back to the ops playbook. */
+  backlog: Playbook | null;
   /** The playbooks a role's declared pull watches name, by name, when they parse (BB-164). */
   watchPlaybooks: Map<string, Playbook>;
   /** GitHub repos from the project's repos.json, as owner/repo, less github.exclude. */
@@ -3082,6 +3086,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const names = new Map(kinds.filter((k) => k !== "ticket").map((k) => [k, playbookNameFor(file, k)] as const));
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
+      // BB-378: the backlog watch's own playbook, so the Stage 2 triage rules
+      // load separately from the ops watch.
+      const backlogName = backlogPlaybookName(file);
       // BB-234: a project may carry both a Linear and a GitHub ticket
       // playbook. An explicitly named ticket playbook is required; with none
       // named, either default may serve and at least one must exist, so an
@@ -3113,7 +3120,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // be loaded even before the binding exists, so `initiative.md` (or any
       // other ticket playbook a local ticket names) is read here.
       for (const t of localSource?.list(projectId) ?? []) adoptedTicketNames.add(t.playbook);
-      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, ...watchNames, ...ticketWatchNames, ...adoptedTicketNames])].map(playbookPath));
+      const texts = await source.readFiles([...new Set([...names.values(), ...ticketCandidates, ...ticketExtras, depsAlertsName, depsPrsName, backlogName, ...watchNames, ...ticketWatchNames, ...adoptedTicketNames])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       const ticketPlaybooks: Partial<Record<Source, Playbook>> = {};
       /**
@@ -3212,6 +3219,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       const depsAlerts = await loadOptional(depsAlertsName);
       const depsPrs = await loadOptional(depsPrsName);
+      // BB-378: `backlog.md` is optional like the dependency playbooks, but a
+      // server that watches a backlog without it falls back to the ops playbook
+      // and says so, rather than running the Stage 2 rules under a different
+      // name.
+      const backlog = await loadOptional(backlogName);
+      // A file that exists but does not parse is already a problem above; only a
+      // genuinely missing file gets the fallback line.
+      if (backlog === null && roleBacklogTargets(role).length > 0 && (texts.get(playbookPath(backlogName)) ?? null) === null) {
+        problems.push(`${playbookPath(backlogName)} does not exist; the backlog watch runs the ops playbook (${playbookNameFor(file, "ops")}) until it is written`);
+      }
 
       /**
        * A role's declared pull-watch playbooks (BB-164). A name that is
@@ -3318,7 +3335,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // of the load paths reached it.
       const warnedPlaybooks = new Set<string>();
       const loadedPlaybooks: Playbook[] = [];
-      for (const p of [...Object.values(playbooks), depsAlerts, depsPrs, ...watchPlaybooks.values()]) {
+      for (const p of [...Object.values(playbooks), depsAlerts, depsPrs, backlog, ...watchPlaybooks.values()]) {
         if (p === undefined || p === null) continue;
         loadedPlaybooks.push(p);
         if (warnedPlaybooks.has(p.name)) continue;
@@ -3336,7 +3353,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A local ticket may name any loaded ticket playbook (`initiative`, say),
       // not only one whose own `source` is local.
       for (const p of watchPlaybooks.values()) if (p.kind === "ticket") ticketByName.set(p.name, p);
-      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, ticketPlaybooks, ticketByName, localPrefix: file.localPrefix ?? DEFAULT_LOCAL_PREFIX, depsAlerts, depsPrs, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, roleNames, playbooks, ticketPlaybooks, ticketByName, localPrefix: file.localPrefix ?? DEFAULT_LOCAL_PREFIX, depsAlerts, depsPrs, backlog, watchPlaybooks, repos, enabled, problems, warnings, hints, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -3361,6 +3378,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           for (const playbook of Object.values(config.playbooks)) if (playbook !== null && playbook !== undefined) names.add(playbook.name);
           if (config.depsAlerts !== null) names.add(config.depsAlerts.name);
           if (config.depsPrs !== null) names.add(config.depsPrs.name);
+          if (config.backlog !== null) names.add(config.backlog.name);
           for (const name of config.watchPlaybooks.keys()) names.add(name);
           const paths = ["AGENTS.md", ...[...names].map(playbookPath)];
           const files = await config.source.readFiles(paths);
@@ -3549,6 +3567,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b.kind === "ops") {
         const target = parseOpsTargetKey(b.entityId);
         if (target?.kind === "dependabot") return config.depsAlerts;
+        // BB-378: a backlog target runs its own playbook, falling back to the
+        // ops one when `backlog.md` is missing.
+        if (target?.kind === "backlog") return config.backlog ?? playbookFor(config, "ops");
       }
       if (b.kind === "pr" && adoptedByWatch(config, b) !== null) return playbookForWatchName(config, b.playbook);
       if (b.kind === "ticket" && b.adoptedBy !== null) return ticketWatchPlaybook(config, b.playbook);
@@ -6588,7 +6609,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (target.kind === "backlog") {
-        await reconcileBacklog(b, config, playbook, target);
+        await reconcileBacklog(b, config, playbook, target, force);
         return;
       }
       const before = b.opsLook;
@@ -6667,16 +6688,49 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /** What changed between two backlog looks (BB-378), as the mechanical tier weighs it. */
+    function backlogChanges(before: BacklogLook | null, after: BacklogLook, isBound: (issue: BacklogIssue) => boolean): Change[] {
+      if (after.error !== null) return before === null || before.error === null ? [{ text: `Cannot read the backlog of ${after.team}: ${after.error}`, actionable: false }] : [];
+      const changes: Change[] = [];
+      if (before !== null && before.error !== null) changes.push({ text: `The backlog of ${after.team} is readable again`, actionable: false });
+      const was = new Map((before?.issues ?? []).map((i) => [i.id, i]));
+      const current = new Set(after.issues.map((i) => i.id));
+      for (const issue of after.issues) {
+        const prev = was.get(issue.id);
+        if (prev === undefined) {
+          changes.push({ text: `New issue: ${issue.key} — ${issue.title ?? "(no title)"}`, actionable: true });
+          continue;
+        }
+        // A change on an issue already bound in this project belongs to its own
+        // steward, not the backlog watch; the Linear doorbell already rang for
+        // the team, so only un-adopted issues are the backlog steward's.
+        if (isBound(issue)) continue;
+        const fields: string[] = [];
+        if ((prev.title ?? "") !== (issue.title ?? "")) fields.push(`title "${prev.title ?? ""}" → "${issue.title ?? ""}"`);
+        if ((prev.priority ?? "") !== (issue.priority ?? "")) fields.push(`priority ${prev.priority ?? "none"} → ${issue.priority ?? "none"}`);
+        const beforeLabels = [...prev.labels].sort().join(", ");
+        const afterLabels = [...issue.labels].sort().join(", ");
+        if (beforeLabels !== afterLabels) fields.push(`labels ${beforeLabels || "(none)"} → ${afterLabels || "(none)"}`);
+        if (fields.length > 0) changes.push({ text: `Changed: ${issue.key} — ${fields.join("; ")}`, actionable: true });
+      }
+      for (const issue of before?.issues ?? []) {
+        if (current.has(issue.id)) continue;
+        changes.push({ text: `No longer in the backlog: ${issue.key} — ${issue.title ?? "(no title)"}`, actionable: true });
+      }
+      return changes;
+    }
+
     /**
-     * The backlog binding's look: read the team's whole backlog and keep it for
-     * the digest. It wakes no steward thread in Stage 1, and writes nothing to
-     * Linear. A failure is logged once and queued as a project note, so the
-     * project steward sees a problem line rather than an empty report.
+     * The backlog binding's look: read the team's whole open backlog and keep it
+     * for the digest, then spawn and wake the steward thread the way
+     * `reconcileDeps` does (BB-378). It writes nothing to Linear on this path.
      */
-    async function reconcileBacklog(b: Binding, config: ProjectConfig, playbook: Playbook, target: BacklogTarget): Promise<void> {
+    async function reconcileBacklog(b: Binding, config: ProjectConfig, playbook: Playbook, target: BacklogTarget, force: WakeReason | null): Promise<void> {
       const before = b.backlogLook;
       const look = await lookAtBacklog(target);
-      store.patch(b.id, { backlogLook: look, playbookVersion: playbook.version, requeueAt: now() + playbook.requeueDefaultMs });
+      const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
+      const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
+      b = store.patch(b.id, { backlogLook: look, requeueAt });
       if (look.error !== null) {
         if (before?.error !== look.error) {
           bb.log.warn(`stewards: cannot read the backlog of ${target.team}: ${look.error}`);
@@ -6685,6 +6739,54 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (look.truncated) bb.log.warn(`stewards: the backlog of ${target.team} was truncated by the source's hard cap`);
+
+      const isBound = (issue: BacklogIssue): boolean => store.find(issue.key, config.projectId) !== null || store.find(issue.id, config.projectId) !== null;
+      const changes = backlogChanges(before, look, isBound);
+      if (requeueCame) changes.push({ text: look.issues.length > 0 ? "Requeue time came, with tickets still in the backlog" : "Requeue time came: a scheduled look", actionable: true });
+      if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
+      }
+      b = store.patch(b.id, { playbookVersion: playbook.version });
+      const keep = () => {
+        for (const c of changes) if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+      };
+      // A steward that has never been woken is due its first turn as soon as the backlog can be read.
+      const reason = force ?? (b.threadId === null ? "adopted" : null);
+      if (reason === null && !changes.some((c) => c.actionable)) {
+        keep();
+        return;
+      }
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId);
+      if (deferred || (info !== null && busy(info.status))) {
+        keep();
+        if (reason !== null && reason !== "changed" && reason !== "adopted") store.note(b.id, `Due: ${reason}`);
+        return;
+      }
+      const block = config.file.backlog;
+      const text = formatBacklogWake({
+        reason: reason ?? (requeueCame && loudQueued === 0 ? "requeue" : "changed"),
+        binding: b,
+        playbook,
+        look,
+        triage: block?.triage ?? false,
+        commentsPerWeek: block?.commentsPerWeek ?? 1,
+        staleDays: block?.staleDays ?? 14,
+        escalations: store.openEscalations(b.id),
+        ledger: store.backlogWrites(config.projectId, { team: target.team, since: now() - BACKLOG_COMMENT_WINDOW_MS }),
+        changes: [...new Set(changes.map((c) => c.text))],
+      });
+      const delivery = await deliverWake(b, config, playbook, text);
+      if (delivery === false) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), lastWakeReason: reason, pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      noteRespawn(b, delivery.respawned);
+      // The steward now has the workers' reports: archive the finished ones (BB-47).
+      await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     /** The same turn for a Dependabot alert target: re-list the open alerts and wake on what changed. */
@@ -7232,7 +7334,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const wanted = new Map<string, { target: OpsTarget; playbook: Playbook }>();
       const opsPlaybook = playbookFor(config, "ops");
       if (opsPlaybook !== null) for (const target of roleOpsTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
-      if (opsPlaybook !== null) for (const target of roleBacklogTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
+      // BB-378: a backlog target runs `backlog.md` when it loaded, the ops
+      // playbook otherwise, so a project without it behaves as before.
+      const backlogPlaybook = config.backlog ?? opsPlaybook;
+      if (backlogPlaybook !== null) for (const target of roleBacklogTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: backlogPlaybook });
       if (config.depsAlerts !== null) for (const target of roleDepsTargets(config.role, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
       // BB-295: only this project's ops bindings, open and ended, read narrow.
       // `store.all(config.projectId).filter(kind === "ops")` parsed every
@@ -15248,6 +15353,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       lines.push(`deps-alerts: ${config.depsAlerts === null ? `no playbook (${depsAlertsPlaybookName(config.file)}); the dependency watch is off` : `${config.depsAlerts.name}@${config.depsAlerts.version}`}`);
       lines.push(`deps-prs: ${config.depsPrs === null ? `no playbook (${depsPrsPlaybookName(config.file)}); Dependabot pull requests are not adopted` : `${config.depsPrs.name}@${config.depsPrs.version}`}`);
+      // BB-378: the backlog watch's own playbook, listed when the project
+      // configures a backlog or this server watches one.
+      if (config.file.backlog !== undefined || roleBacklogTargets(config.role).length > 0) {
+        const backlogWatched = roleBacklogTargets(config.role).length > 0;
+        lines.push(`backlog: ${config.backlog === null ? `no playbook (${backlogPlaybookName(config.file)})${backlogWatched ? "; the backlog watch runs the ops playbook" : ""}` : `${config.backlog.name}@${config.backlog.version}`}`);
+      }
       // The pull watches this server runs, synthesized Dependabot first, so
       // `check` shows the shape and `list` shows which one adopted a binding
       // (BB-164).

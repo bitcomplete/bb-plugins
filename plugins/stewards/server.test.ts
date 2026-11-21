@@ -12343,7 +12343,7 @@ describe("the backlog watch (BB-334)", () => {
 
   it("creates exactly one ops binding for the role's team and reads the whole backlog through sourceBacklog", async () => {
     const { t, binding } = await watching();
-    expect(binding()).toMatchObject({ kind: "ops", entityKey: "backlog/BB", title: "Backlog watch: BB", threadId: null, endedAt: null });
+    expect(binding()).toMatchObject({ kind: "ops", entityKey: "backlog/BB", title: "Backlog watch: BB", threadId: expect.any(String), endedAt: null });
     expect(t.hooks.store.openOfKind("p1", "ops").filter((b) => b.entityId === "backlog/BB")).toHaveLength(1);
     expect(t.hooks.store.binding(binding()!.id)!.backlogLook).toMatchObject({ team: "BB", error: null, unsupported: false, issues: [expect.objectContaining({ key: "BB-1" })] });
   });
@@ -12438,14 +12438,184 @@ describe("the backlog watch (BB-334)", () => {
     // A sweep stores a newer look while the digest is being assembled and sent.
     const originalSend = t.sdk.threads.send;
     t.harness.sdk.stub("threads.send", async (args: { threadId: string; input: Array<{ text: string }> }) => {
-      const current = t.hooks.store.binding(binding.id)!;
-      t.hooks.store.patch(binding.id, { backlogLook: { ...current.backlogLook!, issues: [...current.backlogLook!.issues, backlogIssue({ id: "i2", key: "BB-2" })] } });
+      // Only the project steward's digest moves the look; the backlog
+      // steward's own nightly wake is sent first (BB-378).
+      if (args.input.some((i) => i.text.includes("### Backlog"))) {
+        const current = t.hooks.store.binding(binding.id)!;
+        t.hooks.store.patch(binding.id, { backlogLook: { ...current.backlogLook!, issues: [...current.backlogLook!.issues, backlogIssue({ id: "i2", key: "BB-2" })] } });
+      }
       return originalSend(args);
     });
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     // The snapshot is the report's ids, so BB-2 is not silently counted as already seen.
     expect(t.hooks.store.binding(binding.id)!.backlogSnapshot).toMatchObject({ ids: ["i1"] });
+  });
+});
+
+describe("the backlog steward thread (BB-378)", () => {
+  const backlogIssue = (over: Record<string, unknown> = {}) => ({
+    id: "uuid-1",
+    key: "BB-1",
+    title: "Fix login",
+    state: "Backlog",
+    stateType: "backlog",
+    unit: "BB",
+    labels: [],
+    assignees: [],
+    priority: null,
+    estimate: null,
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-01T00:00:00Z",
+    ...over,
+  });
+
+  const BACKLOG_WATCH = `---
+name: backlog
+kind: ops
+source: linear
+may: []
+models:
+  steward: claude/claude-sonnet-5-5/medium
+requeue-default: 1d
+---
+
+Watch the team's whole open backlog and triage the un-adopted tickets that need it.`;
+
+  /** A project with one backlog role, the backlog playbook (or none) and one read of team BB. */
+  async function watching(options: { issues?: Array<Record<string, unknown>>; backlogPlaybook?: string | null; triage?: boolean } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: options.triage ?? true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    if (options.backlogPlaybook !== null) t.files[playbookPath("backlog")] = options.backlogPlaybook ?? BACKLOG_WATCH;
+    t.setBacklog(options.issues ?? [backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = () => t.hooks.store.byEntity("ops", "backlog/BB")!;
+    return { t, binding };
+  }
+
+  /** The last wake the backlog steward got: its spawn prompt on the first turn, a send after. */
+  const backlogWake = (t: Awaited<ReturnType<typeof watching>>["t"], threadId: string): string => {
+    const sent = t.sends.filter((s) => s.threadId === threadId).at(-1);
+    if (sent !== undefined) return sent.text;
+    return String(t.spawns.find((s) => s.id === threadId)?.prompt ?? "");
+  };
+
+  it("loads backlog.md as its own playbook and lists it in check", async () => {
+    const { t, binding } = await watching();
+    expect(binding().playbook).toBe("backlog");
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(check.lines.some((l) => /^backlog: backlog@[0-9a-f]+$/u.test(l))).toBe(true);
+  });
+
+  it("falls back to the ops playbook and says so when backlog.md is missing", async () => {
+    const { t, binding } = await watching({ backlogPlaybook: null });
+    expect(binding().playbook).toBe("ops-watch");
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { lines: string[] };
+    expect(check.lines).toContain("problem: stewards/playbooks/backlog.md does not exist; the backlog watch runs the ops playbook (ops-watch) until it is written");
+    expect(check.lines.some((l) => l.startsWith("backlog: no playbook (backlog)"))).toBe(true);
+  });
+
+  it("spawns the steward thread on the first good read, titled Backlog watch: BB", async () => {
+    const { t, binding } = await watching();
+    const b = binding();
+    expect(b.threadId).toBeTruthy();
+    const spawn = t.spawns.find((s) => s.title === "Backlog watch: BB");
+    expect(spawn).toBeDefined();
+    const prompt = backlogWake(t, b.threadId!);
+    expect(prompt).toMatch(/# Backlog watch: BB/u);
+    expect(prompt).toMatch(/You have just been made the backlog steward/u);
+  });
+
+  it("gives an existing binding with no thread one on the next reconcile", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = BACKLOG_WATCH;
+    // A binding created before BB-378: it exists with a stored look and no thread.
+    t.hooks.store.create({ projectId: "p1", source: "ops", entityId: "backlog/BB", entityKey: "backlog/BB", url: null, title: "Backlog watch: BB", kind: "ops", playbook: "ops-watch", playbookVersion: "v1", parentBindingId: null, phase: "watching", stage: null });
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.byEntity("ops", "backlog/BB")!.threadId).toBeTruthy();
+  });
+
+  it("wakes on a new issue and says what changed", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    t.setBacklog([backlogIssue(), backlogIssue({ id: "uuid-2", key: "BB-2", title: "Add SSO" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(backlogWake(t, thread)).toContain("New issue: BB-2 — Add SSO");
+  });
+
+  it("wakes when an issue leaves the backlog", async () => {
+    const { t, binding } = await watching({ issues: [backlogIssue(), backlogIssue({ id: "uuid-2", key: "BB-2", title: "Add SSO" })] });
+    const thread = binding().threadId!;
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(backlogWake(t, thread)).toContain("No longer in the backlog: BB-2 — Add SSO");
+  });
+
+  it("wakes on an un-adopted issue whose labels, priority or title changed", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    t.setBacklog([backlogIssue({ title: "Fix login with SSO", priority: "High", labels: ["bug"] })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const wake = backlogWake(t, thread);
+    expect(wake).toContain("Changed: BB-1");
+    expect(wake).toContain("title");
+    expect(wake).toContain("priority");
+    expect(wake).toContain("labels");
+  });
+
+  it("ignores a change on an issue already bound in this project", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    // BB-1 is bound to a ticket steward, so its own changes are not the backlog watch's.
+    t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-1", entityKey: "BB-1", url: null, title: "Fix login", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.setBacklog([backlogIssue({ title: "Fix login with SSO" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(backlogWake(t, thread)).not.toContain("Changed: BB-1");
+  });
+
+  it("wakes on the daily requeue even when nothing changed", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    t.advance(2 * 86_400_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(backlogWake(t, thread)).toContain("Requeue time came");
+  });
+
+  it("writes a wake with the look, the changes, the ledger, the limits and the playbook body", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    // A refused and an accepted write in the rolling window.
+    t.hooks.store.addBacklogWrite({ id: "btw-1", projectId: "p1", team: "BB", issueId: "uuid-1", issueKey: "BB-1", at: t.now() - 60_000, outcome: "accepted", kind: "label", detail: { labels: ["bug"] }, reason: null });
+    t.hooks.store.addBacklogWrite({ id: "btw-2", projectId: "p1", team: "BB", issueId: "uuid-2", issueKey: "BB-2", at: t.now() - 30_000, outcome: "refused", kind: "triage", detail: {}, reason: "the priority was set by a person" });
+    t.advance(2 * 86_400_000);
+    await t.hooks.sweep();
+    await t.flush();
+    const wake = backlogWake(t, thread);
+    expect(wake).toMatch(/# Backlog watch: BB/u);
+    expect(wake).toContain("#### BB-1 — Fix login");
+    expect(wake).toContain("Backlog · priority none · assignee unassigned · labels none · age 15d");
+    expect(wake).toContain("Requeue time came");
+    expect(wake).toContain("Accepted BB-1: label");
+    expect(wake).toContain("Refused BB-2: triage — the priority was set by a person");
+    expect(wake).toContain("`backlog.triage` is on; the plugin offers `backlog_triage`");
+    expect(wake).toContain("Comments: 1 per ticket per rolling seven days");
+    expect(wake).toContain("Stale window: 14 days");
+    expect(wake).toContain("Watch the team's whole open backlog");
+    expect(wake).toContain("`backlog_triage` is the only Linear write available to you");
+    expect(wake).toContain("`steward_report` ends the turn");
   });
 });
 
