@@ -217,8 +217,8 @@ describe("the liveness and stuck predicates", () => {
 
   it("pins the bb-plugins#294 shape: a pr binding's own open PR with a free-text wait is not a live source", () => {
     // #294's steward was parked on "the dompurify fix on main" with its own open
-    // pull request and no other source; pullWatchCounts is false, so the report
-    // path marks the binding noWakeSource.
+    // pull request and no other source; pullWatchCounts is false, so the
+    // derivation marks the binding noWakeSource.
     const pr = pull({ labels: ["bb-managed"], author: "jane" });
     const ownPulls = 1;
     const source: WakeSourceInput = { ...noSources, pullRequestWatch: pullWatchCounts("pr", ownPulls, false) };

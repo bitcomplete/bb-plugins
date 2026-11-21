@@ -9918,6 +9918,23 @@ describe("ops stewards", () => {
     return { t, c, steward, wakes };
   }
 
+  // BB-375: an ops binding does not run `assessBinding`, so the report keeps
+  // writing its `noWakeSource` (the one remaining report-time write); a
+  // ticket or pull-request report leaves the column to the reconcile.
+  it("writes the no-wake-source mark at report time for an ops binding (BB-375)", async () => {
+    const { t, steward } = await watched();
+    const ops = steward()!;
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply" }, ops.id);
+    expect(report.error).toBe(false);
+    expect(report.text).toContain("Nothing the plugin tracks will deliver this wait");
+    // The ops carve-out: the report writes the column, since no ops reconcile does.
+    expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(true);
+    // Clearing the wait clears the mark on the next report.
+    const cleared = await t.tool("steward_report", { phase: "watching", summary: "Nothing waiting.", nextAction: "Watch", actor: "steward", waitingOn: "" }, ops.id);
+    expect(cleared.error).toBe(false);
+    expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(false);
+  });
+
   it("watches a configured target, files one ticket for a crash loop, and comments on it while it keeps crashing", async () => {
     const { t, c, steward, wakes } = await watched();
     const [project] = t.spawns;
@@ -15124,6 +15141,8 @@ describe("a wait with no wake source (BB-154)", () => {
   it("marks a wait with no source, carries the nudge, and counts the requeue run", async () => {
     const { t, steward } = await bound();
     await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    // BB-375: the report no longer writes the column; a reconcile derives it.
+    await t.hooks.reconcilePass("p1");
     const b = t.hooks.store.find("ENG-12")!;
     expect(b.noWakeSource).toBe(true);
     // The report that set the wait was an adoption wake, not a requeue.
@@ -15220,13 +15239,15 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     const { t, steward } = await bound();
     const res = await t.tool("steward_report", waitReport("the vendor's reply"), steward);
     expect(res.error).toBe(false);
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
     expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
     expect(res.text).toContain("Name what will in this turn");
     expect(res.text).not.toContain("You will be woken when something actionable changes");
     // The new sentence already says to name a source before ending the turn;
     // a trailing "End the turn now." would contradict it.
     expect(res.text).not.toContain("End the turn now");
+    // BB-375: the report reply derives the sentence; only a reconcile writes the column.
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
   it("names an open binding the free text mentions, with the exact hold call", async () => {
@@ -15295,10 +15316,29 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     await t.ring("linear", "uuid-12");
     const res = await t.tool("steward_report", { phase: "Done", summary: "Merged.", nextAction: "Nothing", actor: "steward", waitingOn: "the vendor's reply", followThrough: "watch the deploy" }, steward);
     expect(res.error).toBe(false);
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
     expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
     expect(res.text).toContain("stays open to follow through");
     expect(res.text).not.toContain("End the turn now");
+    // BB-375: the report no longer writes the column; a reconcile derives it.
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+  });
+
+  // BB-375 (BB-291 criterion 4): the report derives the no-wake-source sentence
+  // for its reply and stores nothing. The column the rows and the wake read is
+  // written only by the reconcile, from the one assessment.
+  it("leaves the noWakeSource column to the reconcile, not the report (BB-375)", async () => {
+    const { t, steward } = await bound();
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    const res = await t.tool("steward_report", waitReport("the vendor's reply"), steward);
+    expect(res.error).toBe(false);
+    // The reply warns in the turn the wait is set...
+    expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
+    // ...but the report changed nothing in the column.
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    // Only a reconcile writes it.
+    await t.hooks.reconcilePass("p1");
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 });
 
@@ -15552,6 +15592,8 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
+    // BB-375: only a reconcile writes the column now.
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
@@ -15567,6 +15609,8 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "the dompurify fix on main", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("acme/web#7")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
+    // BB-375: only a reconcile writes the column now.
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find("acme/web#7")!.noWakeSource).toBe(true);
   });
 
@@ -15585,6 +15629,8 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "need_approve" });
+    // BB-375: only a reconcile writes the column now.
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
@@ -15598,13 +15644,15 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "prod#430 checks", wait: { kind: "pull", ref: "acme/web#430" } }, steward);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "pull", ref: "acme/web#430" });
+    // BB-375: only a reconcile writes the column now.
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 });
 
 // BB-333 (criterion 4 of BB-291) PR 2: the typed-wait shadow derivation. The
 // four fixtures assert the result derived from the stored wait kind on a
-// reconcile, beside `noWakeSource`, which stays the report-time flag.
+// reconcile, beside `noWakeSource`, which only a reconcile writes (BB-375).
 describe("the typed wait's shadow derivation (BB-333)", () => {
   const base = { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" as const };
   const noReview = comment({ id: "r1", author: "jane", body: `<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T15:00:00Z" });
@@ -16929,6 +16977,8 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     expect(b.kind).toBe("pr");
     const report = await t.tool("steward_report", { phase: "open", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the dompurify fix on main", requeueAfter: "1m" }, b.threadId!);
     expect(report.error).toBe(false);
+    // BB-375: the report no longer writes the column; a reconcile derives it.
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find("acme/web#7")!.noWakeSource).toBe(true);
   });
 
@@ -16940,6 +16990,8 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply", requeueAfter: "1m" }, b.threadId!);
     expect(report.error).toBe(false);
+    // BB-375: the report no longer writes the column; a reconcile derives it.
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
@@ -17124,7 +17176,7 @@ describe("bb stewards wait-divergences (BB-333)", () => {
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
     // Seed the state the way the shadow reconcile writes it: a typed wait that
-    // derives a stall the report-time flag did not, and the other direction
+    // derives a stall the stored flag did not, and the other direction
     // under a second binding.
     t.hooks.store.recordWaitDivergence({ bindingId: b.id, derived: true, reported: false, waitKind: "person", waitLive: false, inputs: {} }, 1_000);
     t.hooks.store.recordWaitDivergence({ bindingId: "bnd_other", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 2_000);

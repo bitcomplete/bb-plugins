@@ -695,8 +695,10 @@ evidence it is safe, in shadow:
 decide-list mark and the recorded project approvals the `approvals.ts` path
 omits), the worker state (an explicit `parked`, distinct from `running`) and
 the liveness (wake source, idle, stall from the observable rows, not the
-report-time `noWakeSource` flag). `compare` runs the predicates the
-assessment will replace and returns every disagreement.
+stored `noWakeSource` flag, which only a reconcile writes for a ticket or
+pull request; an ops binding's report still writes it, BB-375). `compare`
+runs the predicates the assessment will replace and returns every
+disagreement.
 - `reconcile.ts` calls it on every binding inside a try/catch that can never
   change the reconcile's own result, stores the latest assessment per binding
   in `assessments`, and logs each distinct divergence to
