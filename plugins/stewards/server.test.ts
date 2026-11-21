@@ -2678,6 +2678,46 @@ describe("a binding never ends with open work (BB-386)", () => {
     expect(snapshots(closed, "acme/web#7")).toBe(closedReads);
   });
 
+  it("re-homes a handed-off pull request whose new owner also ended, and names it", async () => {
+    const t = await handoffWorld();
+    const handed = await t.tool("steward_report", { phase: "In Progress", summary: "Handing off.", nextAction: "Wait", actor: "steward", handOff: { pull: "acme/web#7", to: "ENG-13" } }, t.a.threadId!);
+    expect(handed.error).toBe(false);
+    // The target observes the handed-off pull request before it ends.
+    await t.ring("linear", "uuid-13");
+    // Both bindings end, and no open binding fixes #7.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", labels: [], linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started", labels: [] }));
+    await (t.hooks.settings as unknown as { experimental_set(v: Record<string, unknown>): Promise<unknown> }).experimental_set({ paused: true });
+    t.hooks.store.patch(t.a.id, { endedAt: t.now(), endReason: "terminal" });
+    t.hooks.store.patch(t.b.id, { endedAt: t.now(), endReason: "terminal" });
+    await t.hooks.sweep();
+    await t.flush();
+    const need = t.hooks.store.openNeeds(t.b.id).find((n) => n.kind === "decide" && /has no steward/u.test(n.what) && /acme\/web#7/u.test(n.what));
+    expect(need).toBeDefined();
+  });
+
+  it("does not mark a re-homing read that failed, so the orphan is named on a later sweep", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane" }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const a = t.hooks.store.find("ENG-12")!;
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", labels: [] }));
+    await (t.hooks.settings as unknown as { experimental_set(v: Record<string, unknown>): Promise<unknown> }).experimental_set({ paused: true });
+    t.hooks.store.patch(a.id, { endedAt: t.now(), endReason: "terminal" });
+    // A failed read is not a handled orphan.
+    t.setSnapshotError("acme/web#7", true);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.pullRehomeMarked("acme/web#7", a.id)).toBe(false);
+    expect(t.hooks.store.openNeeds(a.id).some((n) => n.kind === "decide" && /has no steward/u.test(n.what))).toBe(false);
+    // Once the read succeeds, the orphan is named.
+    t.setSnapshotError("acme/web#7", false);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.openNeeds(a.id).some((n) => n.kind === "decide" && /has no steward/u.test(n.what))).toBe(true);
+  });
+
   it("keeps follow-through on through a wrap-up report that does not settle the open pull request, and names the orphan on the overdue path", async () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };

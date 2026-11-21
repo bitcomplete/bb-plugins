@@ -7703,16 +7703,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (p.pull === null || p.pull.merged === true || lc(p.state) === "closed" || lc(p.state) === "merged") continue;
           const key = lc(p.key);
           if (seen.has(key)) continue;
-          seen.add(key);
-          // BB-386: a handled pull request is not looked at again. The mark is
-          // the primary record; the handoff row and a filed (or resolved) need
-          // cover rows that predate the mark table.
-          if (store.pullRehomeMarked(p.key, b.id)) continue;
+          // BB-386: a pull request handed away is not this binding's to handle.
+          // Do not add it to `seen` (a later ended binding is its owner now)
+          // and do not mark it, so the owner's own iteration still runs.
           const handoff = store.pullHandoff(p.key);
-          if (handoff !== null && handoff.toBindingId !== b.id) {
-            store.markPullRehome(p.key, b.id);
-            continue;
-          }
+          if (handoff !== null && handoff.toBindingId !== b.id) continue;
+          seen.add(key);
+          // A handled pull request is not looked at again. The mark is the
+          // primary record; a filed (or resolved) need covers rows that predate
+          // the mark table.
+          if (store.pullRehomeMarked(p.key, b.id)) continue;
           const what = `${p.key} has no steward: adopt it under a ticket, or close it`;
           if (store.needs(b.id, true).some((n) => n.kind === "decide" && n.url === (p.url ?? "") && n.what === what)) {
             store.markPullRehome(p.key, b.id);
@@ -7726,10 +7726,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             continue;
           }
           // Re-read fresh: a merge or close after the binding ended would
-          // otherwise read as open in the frozen snapshot. A merged or closed
-          // result is handled and marked, so it is not fetched again.
+          // otherwise read as open in the frozen snapshot. A read that fails is
+          // left unmarked, so the orphan is looked at again rather than
+          // dropped; a merged or closed result is marked so it is not fetched
+          // again.
           const fresh = await snapshot("github", p.key).catch(() => null);
-          if (fresh === null || fresh.pull === null || fresh.pull.merged === true || lc(fresh.state) === "closed" || lc(fresh.state) === "merged") {
+          if (fresh === null) continue;
+          if (fresh.pull === null || fresh.pull.merged === true || lc(fresh.state) === "closed" || lc(fresh.state) === "merged") {
             store.markPullRehome(p.key, b.id);
             continue;
           }
