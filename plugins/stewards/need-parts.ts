@@ -148,13 +148,14 @@ export const MERGE_WORKAROUND_MARK = "Workaround";
  * is not met, or the pull request is the user's to decide). The item is never
  * refused: the owner still receives it, marked.
  */
-export function mergeWorkaroundParts(input: { key: string; lane: string | null; gateMet: boolean; decision: "project" | "user" }): { why: string; details: string } | null {
+export function mergeWorkaroundParts(input: { key: string; lane: string | null; headSha: string | null; gateMet: boolean; decision: "project" | "user" }): { why: string; details: string } | null {
   if (!input.gateMet || input.decision !== "project") return null;
   const lane = input.lane === null || input.lane === "" ? "lane unknown" : input.lane;
-  const verdict = "gate met: no binding can merge";
+  const sha = input.headSha === null || input.headSha === "" ? "the current head" : input.headSha.slice(0, 7);
+  const verdict = `gate met at ${sha} (${lane}), decide: ${input.decision}`;
   return {
-    why: `${MERGE_WORKAROUND_MARK}: ${input.key}'s lane gate is already met (${lane}), so the owner's merge is not the gate. ${verdict}.`,
-    details: `This item is a workaround: ${input.key} is gate-met (${lane}) and the decide list routes it to the project steward, so no owner approval or merge is needed. The plugin still delivers it to you. Verdict: ${verdict}.`,
+    why: `${MERGE_WORKAROUND_MARK}: ${input.key}'s lane gate is already met (${lane}) at ${sha}, so the owner's merge is not the gate. The plugin still delivers it to you; merge it with bb stewards merge ${input.key}.`,
+    details: `This item is a workaround: ${input.key} is gate-met (${lane}) at ${sha} and the decide list routes it to the project steward, so the owner's approval or merge is not the gate. Merge it with bb stewards merge ${input.key}. Verdict: ${verdict}.`,
   };
 }
 

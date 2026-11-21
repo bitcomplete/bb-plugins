@@ -14141,23 +14141,53 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /**
+     * BB-386 fix 4: whether an escalation or question is an ask to merge a
+     * pull request. A gate-met `stuck` escalation is one; otherwise the ask
+     * must name a merge in its question or its choices, so an unrelated
+     * question about the same gate-met pull request is left alone.
+     */
+    function asksToMerge(input: { kind: string | null; data: Record<string, unknown>; question: string; choices: readonly string[] }): boolean {
+      if (input.kind === "stuck" && input.data.pullStuck === "gate-met") return true;
+      return /\bmerge\b/iu.test([input.question, ...input.choices].join(" "));
+    }
+
+    /** The observed pull request an ask names by its url or by a key in its text (BB-386 fix 4). */
+    function referencedPull(target: Binding, observed: Observed, url: string | null | undefined, text: string): EntitySnapshot | null {
+      const pulls = observedPulls(target, observed);
+      const wanted = lc(url ?? "");
+      if (wanted !== "") {
+        const byUrl = pulls.find((p) => [p.url, p.key].some((v) => v !== null && lc(v) === wanted));
+        if (byUrl !== undefined) return byUrl;
+      }
+      const hay = lc(text);
+      const byKey = pulls.find((p) => hay.includes(lc(p.key)) || (p.url !== null && hay.includes(lc(p.url))));
+      if (byKey !== undefined) return byKey;
+      // A bare "#N" with no repo, when exactly one observed pull has that number.
+      const number = /#(\d+)/u.exec(text)?.[1];
+      if (number !== undefined) {
+        const matches = pulls.filter((p) => /#(\d+)$/u.exec(p.key)?.[1] === number);
+        if (matches.length === 1) return matches[0]!;
+      }
+      return null;
+    }
+
+    /**
      * BB-386 fix 4: the workaround marker and gate verdict for a project
-     * steward's ask that names a pull request whose lane gate is already met
-     * and whose decide list routes it to the project steward. The item still
+     * steward's ask to merge a pull request whose lane gate is already met and
+     * whose decide list routes it to the project steward. The item still
      * reaches the owner; the marker and the gate's verdict are attached to it,
      * so the owner sees the real state instead of a made-up reason. Returns
-     * null when the ask is legitimate: no pull request is named, the gate is
-     * not met, or the pull request is the user's to decide.
+     * null when no pull request is named, the gate is not met, or the pull
+     * request is the user's to decide. The caller passes only a merge ask.
      */
-    async function mergeWorkaroundFor(target: Binding, url: string | null | undefined): Promise<{ why: string; details: string; data: Record<string, unknown> } | null> {
-      const wanted = lc(url ?? "");
+    async function mergeWorkaroundFor(target: Binding, url: string | null | undefined, text: string): Promise<{ why: string; details: string; data: Record<string, unknown> } | null> {
       const observed = target.lastSnapshot;
-      if (wanted === "" || observed === null) return null;
-      const pull = observedPulls(target, observed).find((p) => [p.url, p.key].some((v) => v !== null && lc(v) === wanted)) ?? null;
+      if (observed === null) return null;
+      const pull = referencedPull(target, observed, url, text);
       if (pull === null) return null;
       const decisions = (await loadConfig(target.projectId))?.file.bigDecisions ?? [];
       const gate = assessedGate(store, target, pull, now(), decisions);
-      const parts = mergeWorkaroundParts({ key: pull.key, lane: gate.lane, gateMet: gate.gateMet, decision: gate.decision });
+      const parts = mergeWorkaroundParts({ key: pull.key, lane: gate.lane, headSha: gate.headSha, gateMet: gate.gateMet, decision: gate.decision });
       if (parts === null) return null;
       return { ...parts, data: { workaround: true, gateMet: true, gateLane: gate.lane, gateDecision: gate.decision } };
     }
@@ -14306,9 +14336,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (askResolution === "secret" && input.ask.variable === undefined && input.ask.setting === undefined) {
                 throw new Error("A secret question needs the variable name (variable), or a stewards secret setting (setting).");
               }
-              // BB-386 fix 4: the project steward's own ask about a gate-met
-              // pull request on a `project`-routed lane is a workaround too.
-              const workaround = target === null ? null : await mergeWorkaroundFor(target, input.ask.url);
+              // BB-386 fix 4: the project steward's own ask to merge a
+              // gate-met pull request on a `project`-routed lane is a
+              // workaround too. Only a merge ask is marked, and the pull
+              // request is found by the url or by a key in the question.
+              const mergeAsk = target !== null && asksToMerge({ kind: null, data: {}, question: input.ask.question, choices: input.ask.choices ?? [] });
+              const workaround = target === null || !mergeAsk ? null : await mergeWorkaroundFor(target, input.ask.url, input.ask.question);
               const q = store.ask({
                 projectId: projectOf!,
                 bindingId: target?.id ?? null,
@@ -14718,8 +14751,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // list routes it to the project steward is asking a workaround.
             // The item still reaches the owner; it carries the marker and the
             // gate's verdict so the owner sees the real state, never a made-up
-            // reason.
-            const workaround = route === "user" && !approvalToUser && !prToUser ? await mergeWorkaroundFor(target, forwarding.url ?? input.url) : null;
+            // reason. Only a merge ask is marked; an unrelated question about
+            // the same pull request keeps its own why.
+            const mergeAsk = route === "user" && !approvalToUser && !prToUser && asksToMerge({ kind: forwarding.kind, data: forwarding.data, question: forwarding.question, choices: forwarding.choices });
+            const workaround = mergeAsk ? await mergeWorkaroundFor(target, forwarding.url ?? input.url, forwarding.question) : null;
             const q =
               approvalToUser || prToUser || route !== "user"
                 ? null

@@ -5450,6 +5450,22 @@ describe("questions to the user", () => {
       return { esc, result: await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "text" }, t.project) };
     }
 
+    /** The project steward forwards a decision escalation the test wrote about the pull request. */
+    async function forwardDecision(t: Awaited<ReturnType<typeof withDecide>>, question: string, entry?: string) {
+      const b = t.binding();
+      const esc = t.hooks.store.escalate({
+        bindingId: b.id,
+        kind: "decision",
+        question,
+        meanwhile: "Wait.",
+        route: "project",
+        recommendation: null,
+        projectId: "p1",
+        url: "https://github.com/acme/web/pull/7",
+      });
+      return { esc, result: await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "text", ...(entry === undefined ? {} : { entry }) }, t.project) };
+    }
+
     it("marks the forwarded item and still delivers it to the owner", async () => {
       const t = await withDecide([projectEntry]);
       const { result } = await forwardStuck(t);
@@ -5457,10 +5473,10 @@ describe("questions to the user", () => {
       const q = t.hooks.store.question(t.qid(result.text))!;
       // The item reaches the owner (open, never refused).
       expect(q.status).toBe("open");
-      // The marker and the gate's verdict are attached.
+      // The marker and the gate's verdict are attached, and it names the real merge path.
       expect(q.why).toContain("Workaround");
-      expect(q.why).toContain("gate met: no binding can merge");
-      expect(q.details).toContain("no binding can merge");
+      expect(q.why).toContain("bb stewards merge acme/web#7");
+      expect(q.details).toContain("gate met at aaaaaaa (no-review), decide: project");
       expect(q.data.workaround).toBe(true);
       expect(q.data.gateMet).toBe(true);
     });
@@ -5485,6 +5501,17 @@ describe("questions to the user", () => {
       expect(q.data.workaround).toBeUndefined();
     });
 
+    it("leaves an unrelated question about the same gate-met pull request unmarked and keeps its why", async () => {
+      const t = await withDecide([projectEntry]);
+      const { result } = await forwardDecision(t, "Add the repo secret before this deploys?", "A cross-repo contract other repos implement");
+      expect(result.error, result.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(result.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).not.toContain("Workaround");
+      expect(q.why).toContain("A cross-repo contract other repos implement");
+      expect(q.data.workaround).toBeUndefined();
+    });
+
     it("marks the project steward's own ask about a gate-met project-lane pull request", async () => {
       const t = await withDecide([projectEntry]);
       const asked = await t.tool("steward_update", { binding: "ENG-12", ask: { question: "Merge acme/web#7?", url: "https://github.com/acme/web/pull/7", resolution: "choice", choices: ["Merge", "Close"] } }, t.project);
@@ -5492,7 +5519,16 @@ describe("questions to the user", () => {
       const q = t.hooks.store.question(t.qid(asked.text))!;
       expect(q.status).toBe("open");
       expect(q.why).toContain("Workaround");
-      expect(q.why).toContain("gate met: no binding can merge");
+      expect(q.data.workaround).toBe(true);
+    });
+
+    it("finds the pull request by a key in the question when the ask has no url", async () => {
+      const t = await withDecide([projectEntry]);
+      const asked = await t.tool("steward_update", { binding: "ENG-12", ask: { question: "Merge acme/web#7?", resolution: "text" } }, t.project);
+      expect(asked.error, asked.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(asked.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).toContain("Workaround");
       expect(q.data.workaround).toBe(true);
     });
   });
