@@ -221,6 +221,27 @@ describe("the full Assessment across binding kinds and stages", () => {
   it("pins the worker state: a parked finished worker is `parked`, in flight but not running", () => {
     expect(assess(matrix("ticket", "build")).worker).toEqual({ state: "parked", inFlight: true, running: false, parked: true, reason: null });
   });
+
+  // The matrix fixture's second open own pull suppresses `idleInActiveStage` in
+  // every stage, so the matrix alone cannot show the stage gate. This names the
+  // second pull's absence and pins the stage's own effect on the assessment:
+  // `idleBase`/`idle` are true only in the active stages, and the
+  // `idleInActiveStage` compare surface appears only there.
+  it("pins the stage's own effect on idleBase, idle and the idleInActiveStage surface when the second open own pull is absent (named: about its absence)", () => {
+    const cases: Array<["spec" | "build" | "review" | null, boolean]> = [
+      ["spec", false],
+      ["build", true],
+      ["review", true],
+      [null, false],
+    ];
+    for (const [stage, idle] of cases) {
+      const i = onlyGateMetAt(stage);
+      const a = assess(i);
+      expect(a.liveness.idleBase, String(stage)).toBe(idle);
+      expect(a.liveness.idle, String(stage)).toBe(idle);
+      expect(compare(i, a).some((d) => d.surface === "idleInActiveStage"), String(stage)).toBe(idle);
+    }
+  });
 });
 
 // BB-377 criterion 1: the wait and stall half of the full Assessment, on
@@ -280,14 +301,17 @@ describe("the compare surface list (BB-292)", () => {
   it("registers all seven surfaces across the divergence fixtures", () => {
     const union = new Set<string>([
       ...surfaceNames(matrix("ticket", "build")),
-      ...surfaceNames(onlyGateMet()),
+      ...surfaceNames(onlyGateMetAt("build")),
       ...surfaceNames(projectApproved()),
       ...surfaceNames(noWakeSourceFlag()),
     ]);
     expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "hasLiveWakeSource", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
   });
 
-  it("pins workerInFlight, runningWorkerReason and hasLiveWakeSource on a parked worker", () => {
+  // DIVERGENCE: `workerInFlight` counts the parked `finished` worker in flight,
+  // `runningWorkerReason` says nobody is mid-turn, and `hasLiveWakeSource` says
+  // no tracked source is live; the assessment names the one state `parked`.
+  it("DIVERGENCE: a parked worker is in flight, not mid-turn and no live source at once", () => {
     const d = new Map(compare(matrix("ticket", "build"), assess(matrix("ticket", "build"))).map((x) => [x.surface, x]));
     expect(d.get("workerInFlight")).toMatchObject({ old: "in-flight", new: "parked" });
     expect(d.get("runningWorkerReason")).toMatchObject({ old: "not-mid-turn", new: "parked" });
@@ -295,8 +319,11 @@ describe("the compare surface list (BB-292)", () => {
     expect(d.get("idleInActiveStage")).toBeUndefined();
   });
 
-  it("pins idleInActiveStage when the second open own pull is absent (named: about its absence)", () => {
-    const i = onlyGateMet();
+  // DIVERGENCE: `idleInActiveStage` calls the binding idle when its only open
+  // own pull request is gate-met, while the parked worker is in flight to
+  // `workerInFlight`; the assessment names the one state `parked`.
+  it("DIVERGENCE: idleInActiveStage calls a gate-met-only binding idle while the parked worker is in flight (named: about the second pull's absence)", () => {
+    const i = onlyGateMetAt("build");
     const d = compare(i, assess(i));
     expect(d.find((x) => x.surface === "idleInActiveStage")).toMatchObject({ old: "idle", new: "parked" });
   });
@@ -329,11 +356,13 @@ describe("the compare surface list (BB-292)", () => {
   });
 });
 
-/** The matrix fixture without its second open own pull (named: about its absence). */
-function onlyGateMet(): AssessmentInput {
+/** The matrix fixture without its second open own pull, at one stage (or none); its absence is the point. */
+function onlyGateMetAt(stage: "spec" | "build" | "review" | null): AssessmentInput {
   const first = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");
+  const phase = stage === null ? "In Progress" : PHASE[stage];
   return input({
-    observed: { entity: issue({ state: "In Progress" }), pulls: [first] },
+    binding: binding({ stage, phase }),
+    observed: { entity: issue({ state: phase }), pulls: [first] },
     ownPulls: own(first),
     decisions: new Map([["acme/web#7", "user"]]),
     workers: [parkedWorker()],

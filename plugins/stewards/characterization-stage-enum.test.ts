@@ -85,12 +85,18 @@ describe("atWork: a case per STAGES value plus no stage, with and without a runn
       lastSnapshot: null,
       ...over,
     }) as Binding;
+  // A last snapshot with a second open own pull request, so the binding is not
+  // finished and its stage is what the predicate reads.
+  const openSecond = {
+    entity: issue(),
+    pulls: [pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }, { merged: true }), pull({ key: "acme/web#8", url: "https://github.com/acme/web/pull/8", state: "open" })],
+  };
 
-  it("is false in the spec stage, true in build and review, false with no stage", () => {
-    expect(atWork(binding({ stage: "spec" }))).toBe(false);
-    expect(atWork(binding({ stage: "build" }))).toBe(true);
-    expect(atWork(binding({ stage: "review" }))).toBe(true);
-    expect(atWork(binding({ stage: null }))).toBe(false);
+  it("is false in the spec stage, true in build and review, false with no stage, with a second open own pull in the snapshot", () => {
+    expect(atWork(binding({ stage: "spec", lastSnapshot: openSecond }))).toBe(false);
+    expect(atWork(binding({ stage: "build", lastSnapshot: openSecond }))).toBe(true);
+    expect(atWork(binding({ stage: "review", lastSnapshot: openSecond }))).toBe(true);
+    expect(atWork(binding({ stage: null, lastSnapshot: openSecond }))).toBe(false);
   });
 
   it("is true for a cleared-to-start binding whatever its stage, including no stage", () => {
@@ -98,14 +104,20 @@ describe("atWork: a case per STAGES value plus no stage, with and without a runn
     expect(atWork(binding({ stage: null, clearedToStart: true }))).toBe(true);
   });
 
-  it("is false for a binding whose work is finished with no worker still running", () => {
+  it("is false for a binding whose work is finished with no worker still running (named: about the second open own pull's absence)", () => {
     const finished = binding({ stage: "build", noMorePulls: true, lastSnapshot: { entity: issue(), pulls: [pull({}, { merged: true })] } });
     expect(atWork(finished)).toBe(false);
   });
 
-  it("is true for the same finished binding while a running worker is passed", () => {
+  it("is true for the same finished binding while a running worker is passed (named: about the second open own pull's absence)", () => {
     const finished = binding({ stage: "build", noMorePulls: true, lastSnapshot: { entity: issue(), pulls: [pull({}, { merged: true })] } });
     expect(atWork(finished, { runningWorker: true })).toBe(true);
+  });
+
+  it("is true for a noMorePulls binding while a second own pull request is still open, even with no running worker", () => {
+    const b = binding({ stage: "build", noMorePulls: true, lastSnapshot: openSecond });
+    expect(atWork(b)).toBe(true);
+    expect(atWork(b, { runningWorker: false })).toBe(true);
   });
 });
 
