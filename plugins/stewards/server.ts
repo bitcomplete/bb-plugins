@@ -151,7 +151,7 @@ import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuid
 import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter, type GithubTreeEntry } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
-import { waitingOnNamesWorker } from "./sidebar.js";
+import { reportWaitsOnWorker } from "./sidebar.js";
 import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 import { WAIT_REFUSAL_MESSAGE, waitInputSchema, waitPhrase, waitSchema, validateWait, type Wait, type WaitContext, type WaitKind } from "./wait.js";
 import { PROJECT_CHANGED } from "./channels.js";
@@ -10129,12 +10129,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // reads. The whole idle handler is one coalesced turn (BB-95), so the
         // signal that refetches is published after the note lands, never before.
         const finished = store.binding(worker.bindingId);
-        // BB-152: a `waitingOn` that names this worker is a hand-off the
-        // steward is still waiting on. Its finish is a wake, not a quiet note:
-        // the steward checks whether what it waited on (a merge, an apply)
-        // happened and does it itself or escalates, never re-waiting on a
-        // worker that is over.
-        const waitedOn = finished !== null && waitingOnNamesWorker(finished.status?.waitingOn ?? null, worker);
+        // BB-152: a `waitingOn` that names this worker, or a typed `worker`
+        // wait on it (BB-333), is a hand-off the steward is still waiting on.
+        // Its finish is a wake, not a quiet note: the steward checks whether
+        // what it waited on (a merge, an apply) happened and does it itself or
+        // escalates, never re-waiting on a worker that is over. The idle rule
+        // is no fallback here: an open own pull request suppresses it.
+        const waitedOn = finished !== null && reportWaitsOnWorker(finished.status?.waitingOn ?? null, finished.wait, worker);
         // BB-329: the park is the worker's own `worker_park` call, never a
         // regex on its final text. A plain finish is done; a parked one is
         // kept unarchived for its next turn.
