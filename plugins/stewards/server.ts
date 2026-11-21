@@ -13437,8 +13437,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // request the report stores nothing: the reconcile's own patch is the
           // column's sole writer. An ops binding is the one carve-out (BB-375):
           // it does not run `assessBinding`, so the report keeps writing the
-          // column for it. This is the last report-time `noWakeSource` write; a
-          // follow-up ticket removes it once the ops read cost is settled.
+          // column for it. This is the last report-time `noWakeSource` write;
+          // BB-379 removes it once the ops read cost is settled.
           let derivedStalled: boolean | null = null;
           if (current.wait !== null && current.lastSnapshot !== null && playbook !== null && config !== null) {
             try {
@@ -13471,7 +13471,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           b = store.patch(b.id, {
             // BB-375: the ops carve-out, the one remaining report-time write of
             // the flag; a ticket or pull-request report leaves it to the
-            // reconcile (see the comment above).
+            // reconcile (see the comment above; BB-379 removes it).
             ...(b.source === "ops" ? { noWakeSource } : {}),
             requeueWakeCount: stall.state.count,
             requeueWaitText: stall.state.waitText,

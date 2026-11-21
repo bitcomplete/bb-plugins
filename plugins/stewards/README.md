@@ -506,8 +506,8 @@ install on a stock bb: one repository, no Linear, no hooks service.
   the same sentence for its reply in the turn the wait is set, so the steward
   can act then, but stores nothing. An ops binding is the one carve-out: it
   does not run the assessment, so the report still writes the column for it
-  (the last report-time write, removed once the ops read cost is settled). The
-  mark clears when a source appears or the wait is cleared.
+  (the last report-time write; BB-379 removes it once the ops read cost is
+  settled). The mark clears when a source appears or the wait is cleared.
   Separately, the plugin counts consecutive wakes
   whose reason was `requeue` and whose report ended with the same trimmed
   `waitingOn`; at two (one plugin constant, not a `project.json` key) it
