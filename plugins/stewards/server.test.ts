@@ -12822,7 +12822,7 @@ describe("the backlog promotion write (BB-385)", () => {
     t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
     t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
     for (const ticket of options.tickets ?? [{ key: "BB-1" }]) {
-      t.entities.set(ticket.key, issue({ id: ticket.key === "BB-1" ? "uuid-1" : `uuid-${ticket.key}`, key: ticket.key, unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null, ...(ticket.over ?? {}) }));
+      t.entities.set(ticket.key, issue({ id: ticket.key === "BB-1" ? "uuid-1" : `uuid-${ticket.key}`, key: ticket.key, unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null, blockedBy: [], ...(ticket.over ?? {}) }));
     }
     return { t, binding };
   }
@@ -12869,6 +12869,44 @@ describe("the backlog promotion write (BB-385)", () => {
     const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
     expect(ledger).toHaveLength(1);
     expect(ledger[0]).toMatchObject({ outcome: "refused", kind: "promote", reason: "WIP full" });
+  });
+
+  it("does not count In Review against the WIP limit, only Todo and In Progress", async () => {
+    const { t } = await promoting({ block: { wipLimit: 1 }, backlog: [backlogIssue({ id: "uuid-1", key: "BB-1", state: "In Review", stateType: "started" }), backlogIssue({ id: "uuid-2", key: "BB-2" })], tickets: [{ key: "BB-2" }] });
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.key).toBe("BB-2");
+  });
+
+  it("promotes at most one ticket per pass, even with room under the limit", async () => {
+    const { t } = await promoting({ backlog: [backlogIssue({ key: "BB-1" }), backlogIssue({ id: "uuid-2", key: "BB-2" })], tickets: [{ key: "BB-1" }, { key: "BB-2" }] });
+    const first = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(first.error).toBe(false);
+    const second = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(second.error).toBe(true);
+    expect(second.text).toMatch(/already promoted one ticket this pass/u);
+    expect(t.linearWrites.filter((w) => w.method === "sourceUpdateIssue")).toHaveLength(1);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger.filter((e) => e.outcome === "accepted" && e.kind === "promote")).toHaveLength(1);
+    expect(ledger.filter((e) => e.outcome === "refused" && e.reason === "already promoted one ticket this pass")).toHaveLength(1);
+  });
+
+  it("refuses a truncated backlog read rather than promoting on part of it", async () => {
+    const { t } = await promoting({ promote: true });
+    t.setBacklogTruncated(true);
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/truncated/u);
+    expect(t.linearWrites).toEqual([]);
+    expect(t.hooks.store.backlogWrites("p1", { team: "BB" })[0]).toMatchObject({ outcome: "refused", kind: "promote" });
+  });
+
+  it("fails closed when the issue read does not report blockers", async () => {
+    const { t } = await promoting({ tickets: [{ key: "BB-1", over: { blockedBy: undefined } }] });
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/did not report its blockers/u);
+    expect(t.linearWrites).toEqual([]);
   });
 
   it("never promotes an adopted, blocked or not-ready-looking ticket", async () => {
@@ -12934,7 +12972,7 @@ describe("the backlog promotion write (BB-385)", () => {
     const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
     t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
     t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
-    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null }));
+    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null, blockedBy: [] }));
     await t.tool("backlog_promote", {}, "thr_backlog");
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();

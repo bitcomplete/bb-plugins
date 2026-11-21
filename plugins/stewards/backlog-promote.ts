@@ -77,10 +77,13 @@ export type PromoteDecision = { ok: true; plan: PromotePlan; candidate: BacklogP
 
 const sameTeam = (issue: BacklogPromoteIssue, config: PromoteConfig): boolean => issue.unit.trim().toUpperCase() === config.team.trim().toUpperCase();
 
-/** Whether an issue's state is Todo or In Progress, by Linear's state type or by its name. */
+/**
+ * Whether an issue sits in Todo or In Progress, the two states the WIP
+ * ceiling counts. This is by state name, not state type: "In Review" is a
+ * `started` state in Linear's BB team, and a ticket in review is not work in
+ * progress for the ceiling.
+ */
 export function isTodoOrInProgress(issue: BacklogPromoteIssue): boolean {
-  const type = (issue.stateType ?? "").trim().toLowerCase();
-  if (type === "unstarted" || type === "started") return true;
   const name = issue.state.trim().toLowerCase();
   return name === "todo" || name === "in progress";
 }
@@ -119,14 +122,24 @@ export function wipCount(issues: readonly BacklogPromoteIssue[], config: Promote
   return issues.filter((issue) => sameTeam(issue, config) && isTodoOrInProgress(issue)).length;
 }
 
+const createdAtMs = (issue: BacklogPromoteIssue): number => {
+  const t = issue.createdAt === null ? Number.NaN : Date.parse(issue.createdAt);
+  return Number.isNaN(t) ? Number.POSITIVE_INFINITY : t;
+};
+
 /**
  * The eligible tickets in promotion order: un-adopted Backlog tickets in the
- * watched team, ordered by the owner's priority and then the source's own
- * order (Linear's manual order). A stable sort keeps the source order within
- * one priority, so the plugin never ranks a ticket above what the owner set.
+ * watched team, ordered by the owner's priority and then oldest first (the
+ * `createdAt` Linear already returns), with the key as a final tiebreak. The
+ * plugin never ranks a ticket above what the owner set by hand.
+ *
+ * The tiebreak is explicit because `sourceBacklog` sets no `orderBy` and
+ * Linear returns newest `createdAt` first, so keeping the source order would
+ * promote the newest ticket, the opposite of the criterion.
  */
 export function orderedCandidates(issues: readonly BacklogPromoteIssue[], config: PromoteConfig): BacklogPromoteIssue[] {
-  return issues.filter((issue) => sameTeam(issue, config) && isBacklogState(issue) && !isAdopted(issue, config)).sort((a, b) => (PRIORITY_RANK[(a.priority ?? "").trim().toLowerCase()] ?? 4) - (PRIORITY_RANK[(b.priority ?? "").trim().toLowerCase()] ?? 4));
+  const rank = (issue: BacklogPromoteIssue): number => PRIORITY_RANK[(issue.priority ?? "").trim().toLowerCase()] ?? 4;
+  return issues.filter((issue) => sameTeam(issue, config) && isBacklogState(issue) && !isAdopted(issue, config)).sort((a, b) => rank(a) - rank(b) || createdAtMs(a) - createdAtMs(b) || a.key.localeCompare(b.key));
 }
 
 /** The one plan a promotion writes: Todo, the adoption label, and this server's own login. */

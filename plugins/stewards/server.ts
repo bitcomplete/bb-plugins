@@ -12935,6 +12935,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // The opt-in is read on every call, never only at registration.
             if (!promoteConfig.promote) return toolError(new Error("backlog.promote is off; the backlog steward promotes nothing."));
 
+            // At most one promotion per pass: an accepted promotion recorded
+            // since this wake began refuses a second one, even when the WIP
+            // count still has room. A pass is one wake, and `wokeAt` is when
+            // the current one was delivered.
+            const passStart = binding.wokeAt ?? 0;
+            if (store.backlogWrites(projectId, { team }).some((w) => w.outcome === "accepted" && w.kind === "promote" && w.at >= passStart)) {
+              const reason = "already promoted one ticket this pass";
+              record("refused", promoteRefusedDetail(input), reason, "", "");
+              return toolError(new Error(reason));
+            }
+
             // Fail closed: a backlog that cannot be read is refused, and no
             // Linear write happens.
             let out: z.infer<typeof sourceContract.sourceBacklog.output>;
@@ -12947,6 +12958,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
             if (out.unsupported || out.errors.length > 0) {
               const reason = `the backlog could not be read: ${out.unsupported ? "the linear source does not support sourceBacklog" : out.errors.join("; ")}`;
+              record("refused", promoteRefusedDetail(input), reason, "", "");
+              return toolError(new Error(reason));
+            }
+            // A truncated read is only part of the backlog, so the WIP count
+            // and the ordering would be wrong; refuse rather than promote on it.
+            if (out.truncated) {
+              const reason = "the backlog read was truncated; no promotion";
               record("refused", promoteRefusedDetail(input), reason, "", "");
               return toolError(new Error(reason));
             }
@@ -12973,7 +12991,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 record("refused", promoteRefusedDetail(input), reason, "", candidate.key);
                 return toolError(new Error(reason));
               }
-              const detail: PromoteDetail = { description: snap.description, blockedBy: snap.blockedBy ?? [] };
+              // Fail closed on a source that did not read relations: absent
+              // `blockedBy` means the fact is unknown, not that there is none.
+              if (snap.blockedBy === undefined) {
+                const reason = `${candidate.key} did not report its blockers; no promotion`;
+                record("refused", promoteRefusedDetail(input), reason, "", candidate.key);
+                return toolError(new Error(reason));
+              }
+              const detail: PromoteDetail = { description: snap.description, blockedBy: snap.blockedBy };
               details.set(candidate.key, detail);
               // Read no further than the first ticket that could be promoted.
               if (candidateEligible(candidate, detail)) break;

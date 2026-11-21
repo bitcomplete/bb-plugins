@@ -598,8 +598,9 @@ pass to Todo, adds the adoption label and assigns it to this server's login,
 so the ordinary ticket steward adopts and specifies it with no hand step.
 The plugin picks the ticket: the top-ordered ready-looking un-adopted Backlog
 ticket, ordered by the owner's priority (urgent, high, medium, low, then
-none) and then Linear's own order, so it never ranks a ticket above what the
-owner set by hand. It ignores a `key` that is not that ticket. It never
+none) and then oldest `createdAt` first, with the key as a final tiebreak,
+so it never ranks a ticket above what the owner set by hand. It ignores a
+`key` that is not that ticket. It never
 promotes a ticket that already carries an adoption label, has any assignee or
 is an initiative; one in a non-Backlog state; one with an open `blockedBy`;
 or one whose title or description is empty. It never edits a description,

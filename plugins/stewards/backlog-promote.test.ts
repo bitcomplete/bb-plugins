@@ -80,14 +80,16 @@ describe("the WIP limit (BB-385)", () => {
   const todo = (over: Partial<BacklogPromoteIssue> = {}) => issue({ key: `BB-${Math.random()}`, state: "Todo", stateType: "unstarted", ...over });
   const inProgress = (over: Partial<BacklogPromoteIssue> = {}) => issue({ key: `BB-${Math.random()}`, state: "In Progress", stateType: "started", ...over });
 
-  it("counts Todo and In Progress by state type or name, not Backlog or Done", () => {
+  it("counts only Todo and In Progress by name, not In Review or another started state", () => {
     const issues = [todo(), inProgress(), issue({ state: "Backlog", stateType: "backlog" }), issue({ state: "Done", stateType: "completed" })];
     expect(wipCount(issues, config())).toBe(2);
-    // A renamed state still counts by type, and a null type still counts by name.
-    expect(isTodoOrInProgress(issue({ state: "Ready", stateType: "unstarted" }))).toBe(true);
-    expect(isTodoOrInProgress(issue({ state: "Doing", stateType: "started" }))).toBe(true);
+    expect(isTodoOrInProgress(issue({ state: "Todo", stateType: "unstarted" }))).toBe(true);
+    expect(isTodoOrInProgress(issue({ state: "In Progress", stateType: "started" }))).toBe(true);
     expect(isTodoOrInProgress(issue({ state: "Todo", stateType: null }))).toBe(true);
-    expect(isTodoOrInProgress(issue({ state: "In Progress", stateType: null }))).toBe(true);
+    // In Review is a `started` state in the BB team, but it is not work in progress for the ceiling.
+    expect(isTodoOrInProgress(issue({ state: "In Review", stateType: "started" }))).toBe(false);
+    expect(isTodoOrInProgress(issue({ state: "Doing", stateType: "started" }))).toBe(false);
+    expect(isTodoOrInProgress(issue({ state: "Ready", stateType: "unstarted" }))).toBe(false);
     expect(isTodoOrInProgress(issue({ state: "Backlog", stateType: "backlog" }))).toBe(false);
   });
 
@@ -168,17 +170,18 @@ describe("the candidate rules (BB-385)", () => {
 });
 
 describe("the ordering (BB-385)", () => {
-  it("orders by the owner's priority, then the source's own order, and never changes priority", () => {
+  it("orders by the owner's priority, then oldest first, and never changes priority", () => {
     const issues = [
-      issue({ key: "BB-1", priority: "Low" }),
-      issue({ key: "BB-2", priority: "Urgent" }),
-      issue({ key: "BB-3", priority: null }),
-      issue({ key: "BB-4", priority: "High" }),
-      issue({ key: "BB-5", priority: "Medium" }),
-      // Two tickets of the same priority keep the source's order.
-      issue({ key: "BB-6", priority: "High" }),
+      issue({ key: "BB-1", priority: "Low", createdAt: "2026-10-05T00:00:00Z" }),
+      issue({ key: "BB-2", priority: "Urgent", createdAt: "2026-10-06T00:00:00Z" }),
+      issue({ key: "BB-3", priority: null, createdAt: "2026-10-07T00:00:00Z" }),
+      // The source returns newest `createdAt` first (Linear's own order): the
+      // two High tickets are passed newest-first and must come out oldest-first.
+      issue({ key: "BB-4", priority: "High", createdAt: "2026-10-09T00:00:00Z" }),
+      issue({ key: "BB-5", priority: "Medium", createdAt: "2026-10-03T00:00:00Z" }),
+      issue({ key: "BB-6", priority: "High", createdAt: "2026-10-08T00:00:00Z" }),
     ];
-    expect(orderedCandidates(issues, config()).map((i) => i.key)).toEqual(["BB-2", "BB-4", "BB-6", "BB-5", "BB-1", "BB-3"]);
+    expect(orderedCandidates(issues, config()).map((i) => i.key)).toEqual(["BB-2", "BB-6", "BB-4", "BB-5", "BB-1", "BB-3"]);
     // The plan carries no priority, so a promotion never writes one.
     const result = decide({ issues, details: detailsOf(issues.map((i) => [i.key, {}])) });
     expect(result.ok).toBe(true);

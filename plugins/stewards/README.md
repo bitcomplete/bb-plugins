@@ -121,8 +121,9 @@ install on a stock bb: one repository, no Linear, no hooks service.
   it moves one ticket to Todo, adds the adoption label and assigns it to this
   server, then the ordinary ticket steward adopts it. The plugin, not the
   model, picks the ticket — the top-ordered ready-looking un-adopted Backlog
-  ticket, by the owner's priority and then Linear's own order — and ignores a
-  `key` that is not that ticket. It refuses when Todo plus In Progress is at
+  ticket, by the owner's priority and then oldest `createdAt` first, with the
+  key as a final tiebreak (Linear returns newest first, so the tiebreak is
+  explicit) — and ignores a `key` that is not that ticket. It refuses when Todo plus In Progress is at
   or over `backlog.wipLimit`, never edits a description, cancels, closes or
   changes a priority, and never promotes an adopted ticket, one in a
   non-Backlog state, or one with an open `blockedBy` (the linear snapshot now
